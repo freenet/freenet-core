@@ -32,8 +32,23 @@ pub(crate) const SLOW_INIT_THRESHOLD: Duration = Duration::from_secs(1);
 /// Initializations older than this are considered stale and will be cleaned up.
 pub(crate) const STALE_INIT_THRESHOLD: Duration = Duration::from_secs(30);
 
+/// Maximum number of UPDATE operations that can be queued while a contract is initializing.
+/// Operations beyond this limit are rejected with `InitCheckResult::QueueFull`.
+pub(crate) const MAX_QUEUED_OPS_PER_CONTRACT: usize = 100;
+
+/// Maximum number of contracts that can be initializing simultaneously.
+/// Attempts beyond this limit return `Err(InitTrackerError::TooManyConcurrentInits)`.
+pub(crate) const MAX_CONCURRENT_INITIALIZATIONS: usize = 50;
+
 use either::Either;
 use freenet_stdlib::prelude::*;
+
+/// Errors returned by fallible `ContractInitTracker` operations.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InitTrackerError {
+    #[error("too many concurrent contract initializations (limit: {limit})")]
+    TooManyConcurrentInits { limit: usize },
+}
 
 /// Result of checking whether a contract is being initialized
 #[derive(Debug)]
@@ -43,6 +58,8 @@ pub(crate) enum InitCheckResult {
     /// Operation was queued because contract is initializing
     /// Contains the current queue size after adding this operation
     Queued { queue_size: usize },
+    /// The per-contract queue is full; this operation is rejected
+    QueueFull,
     /// Cannot perform PUT while contract is already initializing
     PutDuringInit,
 }
@@ -130,6 +147,11 @@ impl ContractInitTracker {
             return InitCheckResult::PutDuringInit;
         }
 
+        // Enforce per-contract queue limit (DoS protection)
+        if state.queued_ops.len() >= MAX_QUEUED_OPS_PER_CONTRACT {
+            return InitCheckResult::QueueFull;
+        }
+
         // Queue the UPDATE operation
         state.queued_ops.push(QueuedOperation {
             update,
@@ -151,8 +173,19 @@ impl ContractInitTracker {
     /// Mark a contract as starting initialization.
     ///
     /// This should be called when a new contract is being stored for the first time.
+    /// Returns `Err(InitTrackerError::TooManyConcurrentInits)` if the concurrent
+    /// initialization limit has been reached.
     /// `now_nanos` is the current time from the caller's time source.
-    pub fn start_initialization(&mut self, key: ContractKey, now_nanos: u64) {
+    pub fn start_initialization(
+        &mut self,
+        key: ContractKey,
+        now_nanos: u64,
+    ) -> Result<(), InitTrackerError> {
+        if self.states.len() >= MAX_CONCURRENT_INITIALIZATIONS {
+            return Err(InitTrackerError::TooManyConcurrentInits {
+                limit: MAX_CONCURRENT_INITIALIZATIONS,
+            });
+        }
         self.states.insert(
             key,
             InitState {
@@ -160,6 +193,7 @@ impl ContractInitTracker {
                 started_at_nanos: now_nanos,
             },
         );
+        Ok(())
     }
 
     /// Mark initialization as complete and return any queued operations.
@@ -289,7 +323,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key, 1_000_000);
+        tracker.start_initialization(key, 1_000_000).unwrap();
 
         let state = make_test_state(&[1, 2, 3]);
         let result = tracker.check_and_maybe_queue(
@@ -308,7 +342,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key, 1_000_000);
+        tracker.start_initialization(key, 1_000_000).unwrap();
 
         let state = make_test_state(&[1, 2, 3]);
         let result = tracker.check_and_maybe_queue(
@@ -328,7 +362,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key, 1_000_000);
+        tracker.start_initialization(key, 1_000_000).unwrap();
 
         for i in 0..3 {
             let state = make_test_state(&[i]);
@@ -354,7 +388,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key, 1_000_000);
+        tracker.start_initialization(key, 1_000_000).unwrap();
 
         // Queue some operations
         for i in 0..2 {
@@ -380,7 +414,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key, 1_000_000);
+        tracker.start_initialization(key, 1_000_000).unwrap();
 
         // Queue some operations
         for i in 0..3 {
@@ -423,7 +457,7 @@ mod tests {
 
         assert!(!tracker.is_initializing(&key));
 
-        tracker.start_initialization(key, 1_000_000);
+        tracker.start_initialization(key, 1_000_000).unwrap();
         assert!(tracker.is_initializing(&key));
 
         tracker.complete_initialization(&key, 2_000_000);
@@ -435,7 +469,7 @@ mod tests {
         let mut tracker = ContractInitTracker::new();
         let key = make_test_key();
 
-        tracker.start_initialization(key, 1_000_000);
+        tracker.start_initialization(key, 1_000_000).unwrap();
 
         let delta = StateDelta::from(vec![10, 20, 30]);
         let result = tracker.check_and_maybe_queue(
@@ -458,7 +492,7 @@ mod tests {
         let key = make_test_key();
 
         // Start initialization at t=0
-        tracker.start_initialization(key, 0);
+        tracker.start_initialization(key, 0).unwrap();
 
         // Queue an operation
         let state = make_test_state(&[1, 2, 3]);
@@ -486,7 +520,7 @@ mod tests {
 
         // Start initialization at t=100s
         let start_nanos = 100_000_000_000;
-        tracker.start_initialization(key, start_nanos);
+        tracker.start_initialization(key, start_nanos).unwrap();
 
         // At t=101s, with 3600s threshold, nothing is stale
         let stale = tracker
@@ -504,9 +538,9 @@ mod tests {
         let key2 = make_contract_key_with_code(&[2]);
         let key3 = make_contract_key_with_code(&[3]);
 
-        tracker.start_initialization(key1, 0);
-        tracker.start_initialization(key2, 1_000_000);
-        tracker.start_initialization(key3, 2_000_000);
+        tracker.start_initialization(key1, 0).unwrap();
+        tracker.start_initialization(key2, 1_000_000).unwrap();
+        tracker.start_initialization(key3, 2_000_000).unwrap();
 
         assert_eq!(tracker.initializing_count(), 3);
 
@@ -526,10 +560,10 @@ mod tests {
         let key1 = make_contract_key_with_code(&[1]);
         let key2 = make_contract_key_with_code(&[2]);
 
-        tracker.start_initialization(key1, 1_000_000);
+        tracker.start_initialization(key1, 1_000_000).unwrap();
         assert_eq!(tracker.initializing_count(), 1);
 
-        tracker.start_initialization(key2, 2_000_000);
+        tracker.start_initialization(key2, 2_000_000).unwrap();
         assert_eq!(tracker.initializing_count(), 2);
 
         tracker.complete_initialization(&key1, 3_000_000);
@@ -558,7 +592,7 @@ mod tests {
 
         let start = 1_000_000_000; // 1 second
         let end = 1_500_000_000; // 1.5 seconds
-        tracker.start_initialization(key, start);
+        tracker.start_initialization(key, start).unwrap();
         let info = tracker.complete_initialization(&key, end).unwrap();
 
         assert_eq!(info.init_duration, Duration::from_millis(500));
@@ -573,7 +607,7 @@ mod tests {
             let mut tracker = ContractInitTracker::new();
             let key = make_test_key();
 
-            tracker.start_initialization(key, 100);
+            tracker.start_initialization(key, 100).unwrap();
 
             let state = make_test_state(&[42]);
             tracker.check_and_maybe_queue(
@@ -608,7 +642,7 @@ mod tests {
             let mut tracker = ContractInitTracker::new();
             let key = make_test_key();
 
-            tracker.start_initialization(key, start);
+            tracker.start_initialization(key, start).unwrap();
 
             let state = make_test_state(&[99]);
             tracker.check_and_maybe_queue(
@@ -662,5 +696,112 @@ mod tests {
         let code = ContractCode::from(code_bytes.to_vec());
         let params = Parameters::from(vec![5, 6, 7, 8]);
         ContractKey::from_params_and_code(&params, &code)
+    }
+
+    #[test]
+    fn test_queue_overflow() {
+        let mut tracker = ContractInitTracker::new();
+        let key = make_test_key();
+
+        tracker.start_initialization(key, 1_000_000).unwrap();
+
+        // Fill the queue to exactly the limit
+        for i in 0..MAX_QUEUED_OPS_PER_CONTRACT {
+            let state = make_test_state(&[i as u8]);
+            let result = tracker.check_and_maybe_queue(
+                &key,
+                false,
+                Either::Left(state),
+                RelatedContracts::default(),
+                2_000_000 + i as u64,
+            );
+            assert!(
+                matches!(result, InitCheckResult::Queued { .. }),
+                "Expected Queued at index {i}, got {:?}",
+                result
+            );
+        }
+        assert_eq!(tracker.queued_count(&key), MAX_QUEUED_OPS_PER_CONTRACT);
+
+        // The next operation must be rejected
+        let state = make_test_state(&[255]);
+        let result = tracker.check_and_maybe_queue(
+            &key,
+            false,
+            Either::Left(state),
+            RelatedContracts::default(),
+            3_000_000,
+        );
+        assert!(
+            matches!(result, InitCheckResult::QueueFull),
+            "Expected QueueFull after limit, got {:?}",
+            result
+        );
+
+        // Queue count must not have changed
+        assert_eq!(tracker.queued_count(&key), MAX_QUEUED_OPS_PER_CONTRACT);
+    }
+
+    #[test]
+    fn test_concurrent_init_limit() {
+        let mut tracker = ContractInitTracker::new();
+
+        // Fill to exactly the concurrent init limit using distinct keys
+        for i in 0..MAX_CONCURRENT_INITIALIZATIONS {
+            let code = ContractCode::from(vec![i as u8, (i >> 8) as u8, 0, 1]);
+            let params = Parameters::from(vec![0, 0, 0, i as u8]);
+            let key = ContractKey::from_params_and_code(&params, &code);
+            tracker
+                .start_initialization(key, 1_000_000 + i as u64)
+                .unwrap_or_else(|_| panic!("Expected Ok at index {i}"));
+        }
+        assert_eq!(tracker.initializing_count(), MAX_CONCURRENT_INITIALIZATIONS);
+
+        // One more should fail
+        let overflow_code = ContractCode::from(vec![99, 99, 99, 99]);
+        let overflow_params = Parameters::from(vec![99, 99, 99, 99]);
+        let overflow_key = ContractKey::from_params_and_code(&overflow_params, &overflow_code);
+        let result = tracker.start_initialization(overflow_key, 9_999_999);
+        assert!(
+            matches!(result, Err(InitTrackerError::TooManyConcurrentInits { .. })),
+            "Expected TooManyConcurrentInits, got {:?}",
+            result
+        );
+
+        // Tracker count must be unchanged
+        assert_eq!(tracker.initializing_count(), MAX_CONCURRENT_INITIALIZATIONS);
+    }
+
+    #[test]
+    fn test_normal_ops_within_limit_work() {
+        let mut tracker = ContractInitTracker::new();
+        let key = make_test_key();
+        const N: usize = 10;
+        const { assert!(N < MAX_QUEUED_OPS_PER_CONTRACT) };
+
+        tracker.start_initialization(key, 1_000_000).unwrap();
+
+        for i in 0..N {
+            let state = make_test_state(&[i as u8]);
+            let result = tracker.check_and_maybe_queue(
+                &key,
+                false,
+                Either::Left(state),
+                RelatedContracts::default(),
+                2_000_000 + i as u64,
+            );
+            assert!(
+                matches!(result, InitCheckResult::Queued { queue_size } if queue_size == i + 1),
+                "Expected Queued {{ queue_size: {} }}, got {:?}",
+                i + 1,
+                result
+            );
+        }
+
+        assert_eq!(tracker.queued_count(&key), N);
+
+        let completion = tracker.complete_initialization(&key, 10_000_000).unwrap();
+        assert_eq!(completion.queued_ops.len(), N);
+        assert!(!tracker.is_initializing(&key));
     }
 }
