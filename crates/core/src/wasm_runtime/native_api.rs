@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use super::contract_store::ContractStore;
-use super::engine::MAX_WASM_MEMORY_BYTES;
 use super::runtime::InstanceInfo;
 use super::secrets_store::SecretsStore;
 use crate::contract::storages::Storage;
@@ -70,11 +69,11 @@ pub(super) type InstanceId = i64;
 ///
 /// - A negative offset is passed (would access before WASM memory)
 /// - Pointer arithmetic overflows (offset + size exceeds usize::MAX)
-/// - Access range exceeds the runtime's maximum memory limit (256 MiB by default)
+/// - Access range exceeds the instance's current allocated memory size
 ///
-/// The validation prevents potentially unsafe pointer arithmetic while allowing
-/// legitimate memory growth via the `memory.grow` instruction. The WASM engine's
-/// guard pages provide an additional layer of protection.
+/// The validation uses the live memory size (refreshed from the wasmtime Caller
+/// before each host call) rather than the theoretical maximum, making the bounds
+/// check as tight as the actual allocation at call time.
 pub mod error_codes {
     /// Operation succeeded (or returned count/length).
     pub const SUCCESS: i32 = 0;
@@ -326,30 +325,31 @@ fn current_instance_id() -> InstanceId {
 /// This function validates that the pointer arithmetic is safe. It checks for:
 /// - Negative offsets (which would access memory before WASM linear memory)
 /// - Overflow when adding offset + size
-/// - Access exceeding the maximum allowed WASM memory limit
+/// - Access exceeding the instance's current allocated memory size
 /// - Overflow when adding start_ptr + ptr
 ///
-/// Note: WASM memory can grow dynamically via the `memory.grow` instruction between
-/// host function calls. The cached mem_size from instance creation may become stale,
-/// so we validate against the runtime's maximum memory limit (256 MiB by default)
-/// rather than the initial allocation. The WASM engine's guard pages provide additional
-/// protection against actual out-of-bounds access.
+/// The `mem_size` parameter reflects the live memory size at the moment of the call.
+/// Every host function calls `refresh_mem_addr_from_caller` before invoking this helper,
+/// which reads the current memory extent directly from the wasmtime `Caller`. This
+/// ensures `mem_size` is always up to date, even after `memory.grow` instructions.
+/// Using the live size (rather than the engine's theoretical maximum of 256 MiB) makes
+/// the bounds check as tight as possible for the current allocation.
 ///
 /// # Arguments
 /// * `ptr` - Offset from the start of WASM memory (provided by WASM module)
 /// * `start_ptr` - Base address of WASM linear memory (from InstanceInfo)
 /// * `size` - Size of the data to be accessed (in bytes)
-/// * `_mem_size` - Initial memory size (not used due to dynamic growth; kept for API compatibility)
+/// * `mem_size` - Current live memory size in bytes (refreshed before each host call)
 ///
 /// # Returns
-/// * `Some(*mut T)` - Valid pointer within maximum memory limit
+/// * `Some(*mut T)` - Valid pointer within current memory bounds
 /// * `None` - Pointer would be out of bounds or overflow
 #[inline(always)]
 fn validate_and_compute_ptr<T>(
     ptr: i64,
     start_ptr: i64,
     size: usize,
-    _mem_size: usize,
+    mem_size: usize,
 ) -> Option<*mut T> {
     // Check for negative offset (invalid - would access before WASM memory)
     if ptr < 0 {
@@ -362,11 +362,15 @@ fn validate_and_compute_ptr<T>(
     // Check for overflow when adding size to offset
     let end_offset = ptr_usize.checked_add(size)?;
 
-    // Verify the entire access range is within the maximum allowed memory.
-    // Uses the same limit enforced by the engine's ResourceLimiter (256 MiB by default).
-    if end_offset > MAX_WASM_MEMORY_BYTES {
+    // Verify the entire access range is within the instance's current allocated memory.
+    // `mem_size` is the live size refreshed from the wasmtime Caller immediately before
+    // this call, so it accurately reflects any memory.grow that occurred during execution.
+    // As a defence-in-depth, mem_size is also bounded by the engine's ResourceLimiter
+    // at 256 MiB (DEFAULT_MAX_MEMORY_PAGES × WASM_PAGE_SIZE), so this check is always
+    // at least as tight as the theoretical maximum.
+    if end_offset > mem_size {
         tracing::warn!(
-            "Memory bounds violation: access range [{ptr_usize}, {end_offset}) exceeds max memory limit {MAX_WASM_MEMORY_BYTES}"
+            "Memory bounds violation: access range [{ptr_usize}, {end_offset}) exceeds current memory size {mem_size}"
         );
         return None;
     }
@@ -376,7 +380,6 @@ fn validate_and_compute_ptr<T>(
     let host_ptr = start_ptr.checked_add(ptr)?;
 
     // Safe to return the computed pointer
-    // The WASM engine's guard pages will trap if the access is truly out of bounds
     Some(host_ptr as *mut T)
 }
 
@@ -399,9 +402,11 @@ pub(super) mod log {
             return;
         };
         // SAFETY: `ptr` was validated by `validate_and_compute_ptr` to be within the
-        // WASM linear memory bounds, and WASM contracts produce valid UTF-8 log messages.
-        let msg =
-            unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len as _)) };
+        // WASM linear memory bounds. The bytes come from an untrusted WASM contract and
+        // may not be valid UTF-8, so we use from_utf8_lossy which replaces invalid byte
+        // sequences with U+FFFD rather than invoking undefined behavior.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let msg = String::from_utf8_lossy(bytes);
         tracing::info!(target: "contract", contract = %info.value().key(), "{msg}");
     }
 }
