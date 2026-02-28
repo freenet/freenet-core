@@ -100,11 +100,8 @@ impl ContractHandler for NetworkContractHandler {
     where
         Self: Sized + 'static,
     {
-        // Use logical cores minus 1 so the Tokio event loop and OS always have a thread.
-        // WASM execution is CPU-bound, so hyperthreads don't help much; leaving one free
-        // also approximates physical core count on hyperthreaded machines.
-        // Hard cap at 8: each executor holds compiled WASM modules and state-store handles,
-        // so adding executors beyond physical core count wastes memory with no throughput gain.
+        // Reserve one logical core for the Tokio event loop and OS scheduling.
+        // WASM execution is CPU-bound, so the pool naturally can't exceed useful parallelism.
         let parallelism = std::thread::available_parallelism()
             .unwrap_or(NonZeroUsize::new(4).unwrap())
             .get()
@@ -115,8 +112,8 @@ impl ContractHandler for NetworkContractHandler {
         let pool_size = std::env::var("FREENET_RUNTIME_POOL_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .and_then(|n| NonZeroUsize::new(n.clamp(1, 8)))
-            .unwrap_or_else(|| NonZeroUsize::new(parallelism.clamp(1, 8)).unwrap());
+            .and_then(NonZeroUsize::new)
+            .unwrap_or_else(|| NonZeroUsize::new(parallelism).unwrap());
 
         tracing::info!(pool_size = %pool_size, "Creating RuntimePool");
 
