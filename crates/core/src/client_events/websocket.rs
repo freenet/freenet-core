@@ -624,10 +624,7 @@ async fn websocket_commands(
         }
     };
 
-    // Increase max message size to 100MB to handle contract uploads
-    // Default is ~64KB which is too small for WASM contracts
-    ws.max_message_size(100 * 1024 * 1024)
-        .on_upgrade(on_upgrade)
+    ws.max_message_size(1024 * 1024).on_upgrade(on_upgrade)
 }
 
 /// Send a synthetic Disconnect to the node so subscription cleanup always runs.
@@ -666,6 +663,11 @@ async fn websocket_interface(
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::Receiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
 
+    let mut conn_state = ConnectionState {
+        encoding_protoc,
+        reassembly: super::ws_streaming::ChunkReassemblyBuffer::new(),
+    };
+
     // If a token was provided but is invalid (stale/expired), immediately send an error
     // to the client so it can refresh and get a new token. This prevents endless retry loops.
     if token_is_invalid {
@@ -688,9 +690,7 @@ async fn websocket_interface(
             }
         };
 
-        server_sink
-            .send(Message::Binary(serialized_error.into()))
-            .await?;
+        send_streaming_message(&mut server_sink, serialized_error).await?;
 
         tracing::debug!("Sent AUTH_TOKEN_INVALID error to client");
         // Don't close connection immediately - let client handle the error gracefully
@@ -761,9 +761,9 @@ async fn websocket_interface(
                     &request_sender,
                     &mut auth_token.as_mut().map(|t| t.0.clone()),
                     auth_token.as_mut().map(|t| t.1),
-                    encoding_protoc,
                     api_version,
                     &mut delegate_rate_limiter,
+                    &mut conn_state,
                 )
                 .await
                 {
@@ -843,7 +843,7 @@ async fn websocket_interface(
                         }
                     },
                 };
-                if let Err(err) = server_sink.send(Message::Binary(serialized_res.into())).await {
+                if let Err(err) = send_streaming_message(&mut server_sink, serialized_res).await {
                     tracing::debug!(err = %err, "error sending notification to client");
                     notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
                     return Err(err.into());
@@ -860,6 +860,29 @@ async fn websocket_interface(
             }
         }
     }
+}
+
+async fn send_streaming_message(
+    tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    serialized: Vec<u8>,
+) -> Result<(), axum::Error> {
+    use super::ws_streaming::{CHUNK_THRESHOLD, MAX_CHUNKS_PER_BATCH};
+    use bytes::Bytes;
+
+    let data = Bytes::from(serialized);
+    if data.len() > CHUNK_THRESHOLD {
+        let chunks = super::ws_streaming::chunk_payload(data);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            tx.send(Message::Binary(chunk)).await?;
+            if (i + 1) % MAX_CHUNKS_PER_BATCH == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    } else {
+        let wrapped = super::ws_streaming::wrap_complete(data);
+        tx.send(Message::Binary(wrapped)).await?;
+    }
+    Ok(())
 }
 
 async fn new_client_connection(
@@ -887,6 +910,11 @@ struct NewSubscription {
     callback: mpsc::Receiver<HostResult>,
 }
 
+struct ConnectionState {
+    encoding_protoc: EncodingProtocol,
+    reassembly: super::ws_streaming::ChunkReassemblyBuffer,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_client_request(
     client_id: ClientId,
@@ -894,11 +922,11 @@ async fn process_client_request(
     request_sender: &mpsc::Sender<ClientConnection>,
     auth_token: &mut Option<AuthToken>,
     attested_contract: Option<ContractInstanceId>,
-    encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
     rate_limiter: &mut DelegateRateLimiter,
+    conn_state: &mut ConnectionState,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
-    let msg = match msg {
+    let raw_msg = match msg {
         Ok(Message::Binary(data)) => data.to_vec(),
         Ok(Message::Text(data)) => data.as_bytes().to_vec(),
         Ok(Message::Close(_)) => return Err(None),
@@ -910,9 +938,28 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
 
+    let msg = match super::ws_streaming::parse_message(&raw_msg) {
+        Ok(super::ws_streaming::StreamMessage::Complete(payload)) => payload.to_vec(),
+        Ok(super::ws_streaming::StreamMessage::Chunk {
+            total_chunks,
+            payload,
+        }) => match conn_state.reassembly.receive_chunk(total_chunks, payload) {
+            Ok(Some(complete)) => complete,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(%client_id, error = %e, "streaming reassembly error");
+                return Err(Some(e.into()));
+            }
+        },
+        Err(e) => {
+            tracing::warn!(%client_id, error = %e, "streaming parse error");
+            return Err(Some(e.into()));
+        }
+    };
+
     // Try to deserialize the ClientRequest message
     let req = {
-        match encoding_protoc {
+        match conn_state.encoding_protoc {
             EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg) {
                 Ok(decoded) => decoded.into_owned(),
                 Err(err) => return Ok(Some(Message::Binary(err.into_fbs_bytes().into()))),
@@ -952,7 +999,7 @@ async fn process_client_request(
                 DelegateError::Missing(delegate_req.key().clone()),
             ))
             .into();
-            let serialized = match encoding_protoc {
+            let serialized = match conn_state.encoding_protoc {
                 EncodingProtocol::Flatbuffers => error
                     .into_fbs_bytes()
                     .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?,
@@ -980,7 +1027,7 @@ async fn process_client_request(
                 ),
             }
             .into();
-            let serialized = match encoding_protoc {
+            let serialized = match conn_state.encoding_protoc {
                 EncodingProtocol::Flatbuffers => error
                     .into_fbs_bytes()
                     .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?,
@@ -1148,7 +1195,7 @@ async fn process_host_response(
                 );
             }
 
-            let send_result = tx.send(Message::Binary(serialized_res.into())).await;
+            let send_result = send_streaming_message(tx, serialized_res).await;
 
             // Log WebSocket send result for UPDATE responses
             if let Some(key) = is_update_response {
@@ -1185,10 +1232,14 @@ async fn process_host_response(
             Ok(None)
         }
         None => {
-            let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
-                ErrorKind::NodeUnavailable.into(),
-            ))?;
-            tx.send(Message::Binary(result_error.into())).await?;
+            let error: ClientError = ErrorKind::NodeUnavailable.into();
+            let result_error = match encoding_protoc {
+                EncodingProtocol::Flatbuffers => error.into_fbs_bytes()?,
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Err::<HostResponse, ClientError>(error))?
+                }
+            };
+            send_streaming_message(tx, result_error).await?;
             tx.send(Message::Close(None)).await?;
             tracing::warn!(
                 client_id = %client_id,
