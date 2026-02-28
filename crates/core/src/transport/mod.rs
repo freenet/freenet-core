@@ -463,11 +463,16 @@ pub(crate) trait PeerConnectionApi: Send {
     /// using the provided `stream_id` (which should have the operations marker bit set)
     /// so that the receiver routes fragments through the orphan registry instead of
     /// the legacy InboundStream decode path.
+    ///
+    /// If `completion_tx` is provided, it will be signaled when the stream transfer
+    /// completes (success or failure). Used by the broadcast queue to track when the
+    /// actual data transfer finishes, not just when the send is enqueued.
     fn send_stream_data(
         &mut self,
         stream_id: crate::transport::peer_connection::StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 
     /// Pipes an inbound stream to the remote peer, forwarding fragments as they arrive.

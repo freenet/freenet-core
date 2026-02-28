@@ -27,7 +27,9 @@ use crate::node::network_bridge::handshake::{
 };
 use crate::node::network_bridge::priority_select;
 use crate::operations::connect::ConnectMsg;
-use crate::ring::{Location, PeerKey};
+use crate::ring::Location;
+#[cfg(feature = "simulation_tests")]
+use crate::ring::PeerKey;
 use crate::transport::{
     create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
     CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi, Socket, TransportError,
@@ -97,7 +99,6 @@ impl std::fmt::Display for EventLoopExitReason {
 
 impl std::error::Error for EventLoopExitReason {}
 
-#[derive(Debug)]
 pub(crate) enum P2pBridgeEvent {
     Message(PeerKeyLocation, Box<NetMessage>),
     NodeAction(NodeEvent),
@@ -106,6 +107,9 @@ pub(crate) enum P2pBridgeEvent {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
+        /// Optional completion signal for broadcast queue concurrency control.
+        /// Signaled when the actual stream transfer finishes (not just enqueue).
+        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     },
     /// Pipe an inbound stream to a target, forwarding fragments incrementally.
     PipeStream {
@@ -114,6 +118,37 @@ pub(crate) enum P2pBridgeEvent {
         inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
         metadata: Option<bytes::Bytes>,
     },
+}
+
+impl std::fmt::Debug for P2pBridgeEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(peer, msg) => f.debug_tuple("Message").field(peer).field(msg).finish(),
+            Self::NodeAction(action) => f.debug_tuple("NodeAction").field(action).finish(),
+            Self::StreamSend {
+                target_addr,
+                stream_id,
+                data,
+                metadata,
+                ..
+            } => f
+                .debug_struct("StreamSend")
+                .field("target_addr", target_addr)
+                .field("stream_id", stream_id)
+                .field("data_len", &data.len())
+                .field("has_metadata", &metadata.is_some())
+                .finish(),
+            Self::PipeStream {
+                target_addr,
+                outbound_stream_id,
+                ..
+            } => f
+                .debug_struct("PipeStream")
+                .field("target_addr", target_addr)
+                .field("outbound_stream_id", outbound_stream_id)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -188,6 +223,32 @@ impl P2pBridge {
                 );
             }
         }
+    }
+
+    /// Send stream data with an explicit completion signal.
+    ///
+    /// Like `NetworkBridge::send_stream` but allows passing a `completion_tx`
+    /// that will be signaled when the actual stream transfer finishes at the
+    /// transport layer. Used by the broadcast queue for concurrency control.
+    pub(super) async fn send_stream_with_completion(
+        &self,
+        target_addr: SocketAddr,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> super::ConnResult<()> {
+        self.ev_listener_tx
+            .send(P2pBridgeEvent::StreamSend {
+                target_addr,
+                stream_id,
+                data,
+                metadata,
+                completion_tx,
+            })
+            .await
+            .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
+        Ok(())
     }
 }
 
@@ -307,6 +368,7 @@ impl NetworkBridge for P2pBridge {
                 stream_id,
                 data,
                 metadata,
+                completion_tx: None,
             })
             .await
             .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
@@ -421,6 +483,10 @@ pub(in crate::node) struct P2pConnManager {
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
+    /// Global broadcast queue that serializes outbound broadcast streams
+    /// with bounded concurrency to prevent uplink saturation (issue #3337).
+    #[cfg(not(feature = "simulation_tests"))]
+    broadcast_queue: super::broadcast_queue::BroadcastQueue,
 }
 
 impl P2pConnManager {
@@ -513,6 +579,8 @@ impl P2pConnManager {
             congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
+            #[cfg(not(feature = "simulation_tests"))]
+            broadcast_queue: super::broadcast_queue::BroadcastQueue::new(),
         })
     }
 
@@ -578,6 +646,8 @@ impl P2pConnManager {
             congestion_config,
             blocked_addresses,
             broadcast_retries,
+            #[cfg(not(feature = "simulation_tests"))]
+            broadcast_queue,
         } = self;
 
         let (outbound_conn_handler, inbound_conn_handler, mut listen_task_handle) =
@@ -661,7 +731,15 @@ impl P2pConnManager {
             congestion_config, // Already used for connection handler, kept for struct completeness
             blocked_addresses,
             broadcast_retries,
+            #[cfg(not(feature = "simulation_tests"))]
+            broadcast_queue: broadcast_queue.clone(),
         };
+
+        // Start the broadcast queue worker (production only).
+        // In simulation tests, broadcasts are sent inline for deterministic ordering.
+        #[cfg(not(feature = "simulation_tests"))]
+        let _broadcast_worker_handle =
+            broadcast_queue.start_worker(ctx.bridge.clone(), op_manager.clone());
 
         // Track whether we exit via graceful shutdown (Disconnect or ClosedChannel)
         // vs unexpected stream end
@@ -1137,8 +1215,12 @@ impl P2pConnManager {
                             stream_id,
                             data,
                             metadata,
+                            completion_tx,
                         } => {
-                            // Route stream data to the per-connection channel
+                            // Route stream data to the per-connection channel.
+                            // If dispatch fails, signal completion_tx so the
+                            // broadcast queue releases its semaphore permit
+                            // immediately instead of waiting for the 120s timeout.
                             if let Some(peer_connection) = ctx.connections.get(&target_addr) {
                                 if let Err(e) = peer_connection
                                     .sender
@@ -1147,6 +1229,7 @@ impl P2pConnManager {
                                         stream_id,
                                         data,
                                         metadata,
+                                        completion_tx,
                                     }))
                                     .await
                                 {
@@ -1157,6 +1240,15 @@ impl P2pConnManager {
                                         phase = "error",
                                         "Failed to send stream data to peer connection"
                                     );
+                                    // The completion_tx is inside the failed send;
+                                    // extract and signal it so the permit is released.
+                                    if let Right(ConnEvent::StreamSend {
+                                        completion_tx: Some(tx),
+                                        ..
+                                    }) = e.0
+                                    {
+                                        let _ignored = tx.send(());
+                                    }
                                 }
                             } else {
                                 tracing::warn!(
@@ -1165,6 +1257,11 @@ impl P2pConnManager {
                                     phase = "error",
                                     "No connection found for stream send target"
                                 );
+                                // Signal completion so the broadcast queue permit
+                                // is released immediately.
+                                if let Some(tx) = completion_tx {
+                                    let _ignored = tx.send(());
+                                }
                             }
                         }
                         ConnEvent::PipeStream {
@@ -3569,12 +3666,14 @@ impl P2pConnManager {
                 stream_id,
                 data,
                 metadata,
+                completion_tx,
             }) => EventResult::Event(
                 ConnEvent::StreamSend {
                     target_addr,
                     stream_id,
                     data,
                     metadata,
+                    completion_tx,
                 }
                 .into(),
             ),
@@ -3879,22 +3978,20 @@ impl P2pConnManager {
         // Targets found - clear any pending retry state for this contract
         self.broadcast_retries.remove(&key);
 
-        // In production, spawn the heavy broadcast work off the event loop.
-        // Contract handler calls (summary + delta) and per-peer sends can
-        // take seconds under load; running inline blocks the event loop and
-        // causes peer channel backpressure deadlocks.
+        // In production, enqueue each target into the broadcast queue.
+        // The queue worker handles delta computation and streaming with bounded
+        // concurrency (default: 2 concurrent streams) to prevent uplink saturation.
         //
         // In simulation tests, call inline to preserve deterministic message
         // ordering — tokio::spawn in start_paused(true) changes broadcast
         // delivery order and breaks convergence.
         #[cfg(not(feature = "simulation_tests"))]
         {
-            let bridge = self.bridge.clone();
-            let op_manager = op_manager.clone();
-            tokio::spawn(async move {
-                Self::broadcast_state_to_peers(bridge, &op_manager, key, new_state, target_result)
+            for target in &target_result.targets {
+                self.broadcast_queue
+                    .enqueue(key, target.clone(), new_state.clone())
                     .await;
-            });
+            }
         }
         #[cfg(feature = "simulation_tests")]
         {
@@ -3911,9 +4008,10 @@ impl P2pConnManager {
 
     /// Send state change broadcasts to interested peers.
     ///
-    /// Extracted as a static method so it can be spawned off the event loop
-    /// when needed. In production, spawning prevents the event loop from
-    /// blocking during slow contract handler calls and per-peer sends.
+    /// Used only in simulation tests for inline (deterministic) broadcast ordering.
+    /// In production, the `BroadcastQueue` handles per-target sends with bounded
+    /// concurrency.
+    #[cfg(feature = "simulation_tests")]
     async fn broadcast_state_to_peers(
         bridge: P2pBridge,
         op_manager: &Arc<OpManager>,
@@ -4249,6 +4347,8 @@ pub(super) enum ConnEvent {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
+        /// Optional completion signal for broadcast queue concurrency control.
+        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     },
     /// Pipe an inbound stream to a peer, forwarding fragments as they arrive.
     /// Used for low-latency forwarding at intermediate nodes.
@@ -4347,6 +4447,7 @@ async fn handle_peer_channel_message(
                     stream_id,
                     data,
                     metadata,
+                    completion_tx,
                     ..
                 } => {
                     tracing::debug!(
@@ -4356,7 +4457,10 @@ async fn handle_peer_channel_message(
                         has_metadata = metadata.is_some(),
                         "[CONN_LIFECYCLE] Sending operations stream data to peer"
                     );
-                    if let Err(error) = conn.send_stream_data(stream_id, data, metadata).await {
+                    if let Err(error) = conn
+                        .send_stream_data(stream_id, data, metadata, completion_tx)
+                        .await
+                    {
                         tracing::error!(
                             to = %conn.remote_addr(),
                             stream_id = %stream_id,

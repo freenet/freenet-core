@@ -6,6 +6,8 @@ use std::time::Duration;
 use aes_gcm::Aes128Gcm;
 use bytes::Bytes;
 
+use tokio::sync::oneshot;
+
 use crate::{
     simulation::TimeSource,
     tracing::TransferDirection,
@@ -53,6 +55,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
+    completion_tx: Option<oneshot::Sender<()>>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let bytes_to_send = stream_to_send.len() as u64;
@@ -233,6 +236,11 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 elapsed.as_millis() as u64,
                 TransferDirection::Send,
             );
+            // Signal completion (error path) so broadcast queue can release permit
+            if let Some(tx) = completion_tx {
+                // Receiver may be dropped if queue timed out; ignore the error.
+                let _ignored = tx.send(());
+            }
             return Err(e);
         }
 
@@ -279,6 +287,12 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         Some(generic_stats.total_timeouts as u32),
         TransferDirection::Send,
     );
+
+    // Signal completion (success path) so broadcast queue can release permit
+    if let Some(tx) = completion_tx {
+        // Receiver may be dropped if queue timed out; ignore the error.
+        let _ignored = tx.send(());
+    }
 
     Ok(TransferStats {
         stream_id: stream_id.0 as u64,
@@ -633,6 +647,7 @@ mod tests {
             congestion_controller,
             time_source,
             None,
+            None,
         ));
 
         let mut inbound_bytes = Vec::with_capacity(message.len());
@@ -741,6 +756,7 @@ mod tests {
             congestion_controller,
             time_source,
             None,
+            None,
         ));
 
         // Wait for send task to complete
@@ -833,6 +849,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
             None,
         ));
 

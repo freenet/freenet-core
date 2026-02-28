@@ -2443,6 +2443,7 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
         _stream_id: crate::transport::peer_connection::StreamId,
         _data: bytes::Bytes,
         _metadata: Option<bytes::Bytes>,
+        _completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<(), crate::transport::TransportError>>
@@ -2450,6 +2451,10 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
                 + '_,
         >,
     > {
+        // Signal completion so callers awaiting the oneshot don't hang
+        if let Some(tx) = _completion_tx {
+            let _ignored = tx.send(());
+        }
         Box::pin(async { Ok(()) })
     }
 
