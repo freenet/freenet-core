@@ -4208,8 +4208,12 @@ impl SimNetwork {
                 tokio::time::sleep(event_wait).await;
             }
 
-            // Wait for events to fully propagate
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Wait for events to fully propagate.
+            // Must be long enough for broadcast retries (up to 3 retries × 3s backoff = 9s)
+            // plus subscription establishment and update forwarding. Recent routing changes
+            // (connect visited filter, acceptor diversity) can create topologies where
+            // subscriptions take longer to establish, making 2s insufficient.
+            tokio::time::sleep(Duration::from_secs(15)).await;
 
             // Convergence check
             let subscribed_count = {
