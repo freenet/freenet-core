@@ -4181,30 +4181,11 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
         }
     }
 
-    // In a 3-node topology (gateway, node-a, node-b), the upstream peer for
-    // node-b's subscription may be the gateway. The Unsubscribe message goes
-    // node-b → gateway, and the gateway may or may not chain-propagate to
-    // node-a depending on its own subscription state. If upstream peer
-    // registration failed silently during the subscribe handshake (source_addr
-    // was None or peer lookup failed), no Unsubscribe is sent at all.
-    //
-    // We assert on UnsubscribeSent (local observable) which proves the client
-    // disconnect triggered the unsubscribe path. UnsubscribeReceived depends
-    // on network delivery and chain propagation, which is timing-sensitive.
-    if unsubscribe_sent_count > 0 {
-        tracing::info!("UnsubscribeSent confirmed — disconnect triggered unsubscribe path");
-    }
-    if unsubscribe_received_count > 0 {
-        tracing::info!("UnsubscribeReceived confirmed — upstream received unsubscribe");
-    }
-
-    // At minimum, one of the unsubscribe events must have been observed.
-    // UnsubscribeSent proves node-b attempted to send, UnsubscribeReceived
-    // proves the upstream got it. Either confirms the disconnect → unsubscribe
-    // path works.
+    // The polling loop above waits up to 30s for UnsubscribeReceived.
+    // Assert the strong condition: upstream must have received the unsubscribe.
     assert!(
-        unsubscribe_sent_count > 0 || unsubscribe_received_count > 0,
-        "Client disconnect should trigger Unsubscribe upstream \
+        unsubscribe_received_count > 0,
+        "Upstream node should have received the Unsubscribe message after client disconnect \
          (sent={unsubscribe_sent_count}, received={unsubscribe_received_count})"
     );
 
