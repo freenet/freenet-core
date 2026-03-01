@@ -481,6 +481,8 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
         let config_var = format_ident!("config_{}", idx);
         let network_port_var = format_ident!("network_port_{}", idx);
         let ws_port_var = format_ident!("ws_port_{}", idx);
+        let attested_var = format_ident!("attested_contracts_{}", idx);
+        let api_clients_var = format_ident!("api_clients_{}", idx);
 
         builds.push(quote! {
             tracing::info!("Building node: {}", #node_label);
@@ -494,8 +496,10 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
             let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
             node_config.relay_ready_connections(Some(0));
             #connection_tuning
+            let (#api_clients_var, #attested_var) =
+                freenet::server::serve_client_api_with_listener_and_contracts(built_config.ws_api, ws_listener).await?;
             let (#node_var, #flush_handle_var) = node_config
-                .build_with_flush_handle(freenet::server::serve_client_api_with_listener(built_config.ws_api, ws_listener).await?)
+                .build_with_flush_handle(#api_clients_var)
                 .await?;
         });
     }
@@ -567,6 +571,7 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
         let location_var = format_ident!("location_{}", idx);
         let node_ip_var = format_ident!("node_ip_{}", idx);
         let flush_handle_var = format_ident!("flush_handle_{}", idx);
+        let attested_var = format_ident!("attested_contracts_{}", idx);
         let is_gw = is_gateway(args, node_label, idx);
 
         node_infos.push(quote! {
@@ -578,6 +583,7 @@ fn generate_context_creation_with_handles(args: &FreenetTestArgs) -> TokenStream
                 is_gateway: #is_gw,
                 location: #location_var,
                 ip: #node_ip_var,
+                attested_contracts: #attested_var,
             }
         });
 

@@ -2324,6 +2324,157 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
     Ok(())
 }
 
+/// E2E test: verifies that an attested contract is passed to the delegate process function.
+///
+/// This validates the fix from PR #1513 which ensured the `attested` parameter in
+/// the delegate's `process()` function is non-None when the client connects via
+/// WebSocket with a valid auth token linked to a contract (issue #1523).
+///
+/// Flow:
+/// 1. Pre-register a token → ContractInstanceId in the node's attested_contracts map
+/// 2. Connect via WebSocket with `Authorization: Bearer <token>` header
+/// 3. Register and invoke the `test-delegate-attested` WASM delegate
+/// 4. Assert the delegate received the correct ContractInstanceId bytes as `attested`
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway"],
+    timeout_secs = 120,
+    startup_wait_secs = 30,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> TestResult {
+    use freenet::dev_tool::AuthToken;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    const TEST_DELEGATE: &str = "test-delegate-attested";
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum InboundAppMessage {
+        CheckAttested,
+    }
+
+    #[derive(Debug, Deserialize)]
+    enum OutboundAppMessage {
+        Attested(Option<Vec<u8>>),
+    }
+
+    let gateway = ctx.node("gateway")?;
+
+    // Step 1: pre-register a token → contract-id in the node's attested_contracts map.
+    // This simulates a client that authenticated via an HTTP contract page before opening
+    // a WebSocket connection.
+    let token = AuthToken::from("test-attested-contract-token-e2e-12345".to_string());
+    let expected_contract_id = ContractInstanceId::new([42u8; 32]);
+    gateway.insert_attested_contract(token.clone(), expected_contract_id);
+
+    // Step 2: compile / load the delegate WASM
+    let params = Parameters::from(vec![]);
+    let delegate = load_delegate(TEST_DELEGATE, params.clone())?;
+    let delegate_key = delegate.key().clone();
+
+    // Step 3: connect via WebSocket carrying the Bearer token.
+    // The WebSocket proxy will look up the token in the shared attested_contracts map
+    // and attach the resolved ContractInstanceId to every subsequent request.
+    let ws_url = gateway.ws_url();
+    let mut ws_request = ws_url.as_str().into_client_request()?;
+    ws_request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", token.as_str()).parse()?,
+    );
+    let (stream, _) = connect_async(ws_request).await?;
+    let mut client = WebApi::start(stream);
+
+    // Step 4: register the delegate
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                delegate: delegate.clone(),
+                cipher: freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
+                nonce: freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(10), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, .. } => {
+            assert_eq!(key, delegate_key, "Delegate key mismatch on register");
+            tracing::info!("Delegate registered: {key}");
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Expected DelegateResponse on register, got {:?}", other),
+    }
+
+    // Step 5: send an ApplicationMessage that causes the delegate to echo back
+    // whatever bytes it received in the `attested` parameter.
+    let app_id = ContractInstanceId::new([0; 32]);
+    let payload = bincode::serialize(&InboundAppMessage::CheckAttested)?;
+    let app_msg = ApplicationMessage::new(app_id, payload);
+
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params,
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+            },
+        ))
+        .await?;
+
+    // Step 6: verify the delegate received the correct attested bytes
+    let resp = timeout(Duration::from_secs(10), client.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, values } => {
+            assert_eq!(key, delegate_key, "Delegate key mismatch in response");
+            ensure!(!values.is_empty(), "No output messages from delegate");
+
+            let app_msg = match &values[0] {
+                OutboundDelegateMsg::ApplicationMessage(m) => m,
+                other @ OutboundDelegateMsg::RequestUserInput(_)
+                | other @ OutboundDelegateMsg::ContextUpdated(_)
+                | other @ OutboundDelegateMsg::GetContractRequest(_)
+                | other @ OutboundDelegateMsg::PutContractRequest(_)
+                | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+                | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+                | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
+                    bail!("Expected ApplicationMessage, got {:?}", other)
+                }
+            };
+            assert!(app_msg.processed, "Message not marked as processed");
+
+            let response: OutboundAppMessage = bincode::deserialize(&app_msg.payload)?;
+            match response {
+                OutboundAppMessage::Attested(Some(bytes)) => {
+                    assert_eq!(
+                        bytes.as_slice(),
+                        expected_contract_id.as_bytes(),
+                        "Attested bytes do not match the expected ContractInstanceId"
+                    );
+                    tracing::info!(
+                        "SUCCESS: attested contract correctly passed to delegate process function"
+                    );
+                }
+                OutboundAppMessage::Attested(None) => {
+                    bail!(
+                        "Delegate received attested=None but expected Some(contract_id). \
+                         PR #1513 fix is not working: the attested contract was NOT \
+                         passed to the delegate process function."
+                    );
+                }
+            }
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Expected DelegateResponse, got {:?}", other),
+    }
+
+    Ok(())
+}
+
 /// Ensure a client-only peer receives PutResponse when the contract is seeded on a third hop.
 ///
 /// This test verifies that PUT responses are properly routed back through forwarding peers,
