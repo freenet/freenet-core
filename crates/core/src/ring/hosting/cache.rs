@@ -254,16 +254,16 @@ impl<T: TimeSource> HostingCache<T> {
         self.contracts.keys().cloned()
     }
 
-    /// Sweep for contracts past TTL, regardless of budget.
+    /// Sweep for contracts past TTL when the cache is over budget.
     ///
-    /// ALL contracts past `min_ttl` since their last access are evicted unless
-    /// the `should_retain` predicate returns `true` (e.g., contracts with
-    /// active client subscriptions are protected).
+    /// Only evicts when `current_bytes > budget_bytes`. Among over-budget
+    /// entries, contracts past `min_ttl` since their last access are evicted
+    /// (oldest first via LRU order) unless the `should_retain` predicate
+    /// returns `true` (e.g., contracts with active client subscriptions).
     ///
-    /// This ensures subscription renewal stops for contracts that are no longer
-    /// being accessed by users, even if the cache is under its byte budget.
-    /// Without this, contracts would persist indefinitely in an under-budget
-    /// cache, generating renewal traffic forever.
+    /// This is an LRU cache: contracts live indefinitely while under budget.
+    /// The TTL determines eviction *eligibility* when space is needed, not a
+    /// hard expiry.
     ///
     /// Returns contracts evicted from this cache.
     pub fn sweep_expired<F>(&mut self, should_retain: F) -> Vec<ContractKey>

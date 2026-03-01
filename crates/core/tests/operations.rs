@@ -4137,6 +4137,10 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
     // chain traverses multiple async hops (websocket → event loop → spawn →
     // interest lookup → notification channel → transport → network → receive)
     // so a single fixed sleep is insufficient under CI load.
+    //
+    // Note: tokio::time::Instant is fine here — this is a #[freenet_test]
+    // integration test with real nodes, not a DST simulation test. The
+    // TimeSource abstraction is only required within crates/core/src/.
     let instance_id = *contract_key.id();
     let mut unsubscribe_sent_count = 0;
     let mut unsubscribe_received_count = 0;

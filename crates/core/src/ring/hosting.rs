@@ -652,6 +652,9 @@ impl HostingManager {
     ///
     /// Contracts are protected from eviction if they have client subscriptions
     /// OR downstream subscribers (other peers relying on us for updates).
+    /// The downstream subscriber exemption is time-bounded: stale entries are
+    /// removed by `expire_stale_downstream_subscribers()` (called periodically)
+    /// after `SUBSCRIPTION_LEASE_DURATION` without renewal.
     /// Automatically removes persisted metadata for expired contracts.
     pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
         let expired = self.hosting_cache.write().sweep_expired(|key| {
