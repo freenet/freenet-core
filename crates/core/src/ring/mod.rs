@@ -804,19 +804,41 @@ impl Ring {
     ///
     /// The task respects existing backoff mechanisms to avoid subscription spam.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
-        // Add random initial delay (30-60 seconds) to prevent synchronized recovery
-        // across all peers. This avoids "thundering herd" problems and prevents the
-        // recovery task from firing at exactly the same time as test stabilization
-        // periods or other network operations that happen at fixed intervals.
-        let initial_delay = Duration::from_secs(GlobalRng::random_range(30u64..=60u64));
-        tokio::time::sleep(initial_delay).await;
+        // Wait for the first ring connection before starting subscription recovery.
+        // This replaces the old fixed 30-60s random delay. We poll every 2 seconds
+        // so that subscriptions for locally cached contracts start as soon as the
+        // node joins the ring — critical for serving GET requests from local cache
+        // (which requires an active subscription for freshness).
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if ring.open_connections() > 0 {
+                tracing::info!(
+                    hosted_contracts = ring.hosting_contract_keys().len(),
+                    "Ring connection established, starting subscription recovery for hosted contracts"
+                );
+                break;
+            }
+        }
+
+        // Small jitter (2-5s) after first connection to let the ring stabilize
+        // slightly before flooding with subscribe requests.
+        let jitter = Duration::from_secs(GlobalRng::random_range(2u64..=5u64));
+        tokio::time::sleep(jitter).await;
 
         let mut interval = tokio::time::interval(interval_duration);
-        // Skip the first immediate tick (we already waited above)
+        // Skip the first immediate tick (we run the first pass below)
         interval.tick().await;
 
+        // First pass runs immediately (no tick wait) to subscribe to hosted
+        // contracts ASAP after ring join.
+        let mut first_pass = true;
+
         loop {
-            interval.tick().await;
+            if first_pass {
+                first_pass = false;
+            } else {
+                interval.tick().await;
+            }
 
             // First, expire any stale subscriptions
             let expired = ring.expire_stale_subscriptions();

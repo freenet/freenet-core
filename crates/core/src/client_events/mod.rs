@@ -1133,7 +1133,48 @@ async fn process_open_request(
                         subscribe,
                         blocking_subscribe,
                     } => {
-                        let peer_id = ensure_peer_ready(&op_manager)?;
+                        // For one-shot GETs (subscribe=false), try local cache BEFORE
+                        // checking peer readiness. This allows serving persisted contract
+                        // state even when the node hasn't joined the ring yet — critical
+                        // for the HTTP web handler which uses subscribe=false.
+                        let peer_id = match ensure_peer_ready(&op_manager) {
+                            Ok(id) => id,
+                            Err(err) if !subscribe => {
+                                // Not joined yet — check if we can serve from local cache
+                                let local_result = op_manager
+                                    .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                                        instance_id: key,
+                                        return_contract_code,
+                                    })
+                                    .await;
+                                if let Ok(ContractHandlerEvent::GetResponse {
+                                    key: Some(full_key),
+                                    response:
+                                        Ok(StoreResponse {
+                                            state: Some(state),
+                                            contract,
+                                        }),
+                                }) = local_result
+                                {
+                                    if !return_contract_code || contract.is_some() {
+                                        tracing::info!(
+                                            client_id = %client_id,
+                                            contract = %full_key,
+                                            phase = "local_cache_pre_join",
+                                            "Serving locally cached contract state before network join"
+                                        );
+                                        return Ok(Some(Either::Left(QueryResult::GetResult {
+                                            key: full_key,
+                                            state,
+                                            contract,
+                                        })));
+                                    }
+                                }
+                                // No local cache — propagate the original error
+                                return Err(err);
+                            }
+                            Err(err) => return Err(err),
+                        };
 
                         // Query local store first. We use the result in two cases:
                         // 1. Error handling: if local storage has issues, fail fast
