@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::{future::Future, time::Instant};
 
 use crate::client_events::HostResult;
+use crate::config::GlobalExecutor;
 use crate::node::IsOperationCompleted;
 use crate::{
     contract::{ContractHandlerEvent, StoreResponse},
@@ -2020,32 +2021,43 @@ impl Operation for GetOp {
                             contract: contract.clone(),
                         });
                     } else {
-                        // Forward response to upstream, opportunistically caching
-                        // contract code so relay peers can serve future GET requests
-                        // with fetch_contract=true.
+                        // Forward response to upstream. Opportunistically cache contract
+                        // code so this relay peer can serve future GET requests with
+                        // fetch_contract=true. We don't call announce_contract_cached()
+                        // here because relay peers should not advertise contracts they
+                        // are not responsible for in the ring.
                         tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
                         if let Some(ref code) = contract {
-                            let cached = matches!(
-                                op_manager
-                                    .notify_contract_handler(ContractHandlerEvent::PutQuery {
-                                        key,
-                                        state: value.clone(),
-                                        related_contracts: RelatedContracts::default(),
-                                        contract: Some(code.clone()),
-                                    })
-                                    .await,
-                                Ok(ContractHandlerEvent::PutResponse {
-                                    new_value: Ok(_),
-                                    ..
-                                })
-                            );
-                            tracing::debug!(
-                                tx = %id,
-                                contract = %key,
-                                phase = "relay_cache",
-                                cached,
-                                "Relay peer contract code cache attempt"
-                            );
+                            if !op_manager.ring.is_hosting_contract(&key) {
+                                let om = op_manager.clone();
+                                let cache_key = key;
+                                let v = value.clone();
+                                let c = code.clone();
+                                GlobalExecutor::spawn(async move {
+                                    let key_str = cache_key.to_string();
+                                    let cached = matches!(
+                                        om.notify_contract_handler(
+                                            ContractHandlerEvent::PutQuery {
+                                                key: cache_key,
+                                                state: v,
+                                                related_contracts: RelatedContracts::default(),
+                                                contract: Some(c),
+                                            }
+                                        )
+                                        .await,
+                                        Ok(ContractHandlerEvent::PutResponse {
+                                            new_value: Ok(_),
+                                            ..
+                                        })
+                                    );
+                                    tracing::info!(
+                                        contract = %key_str,
+                                        phase = "relay_cache",
+                                        cached,
+                                        "Relay peer contract code cache attempt"
+                                    );
+                                });
+                            }
                         }
                         new_state = None;
                         return_msg = Some(GetMsg::Response {
