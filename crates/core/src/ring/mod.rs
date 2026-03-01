@@ -833,6 +833,14 @@ impl Ring {
         // contracts ASAP after ring join.
         let mut first_pass = true;
 
+        // Use a larger batch limit for the first few cycles to subscribe to all
+        // hosted contracts quickly after startup. With 10/cycle and 400+ contracts,
+        // it would take ~20 minutes to subscribe to everything. 100/cycle with
+        // 0-15s jitter spreads the load while getting subscriptions up in ~2 min.
+        const INITIAL_BATCH_LIMIT: usize = 100;
+        const INITIAL_CYCLES: usize = 5;
+        let mut cycle_count: usize = 0;
+
         loop {
             if first_pass {
                 first_pass = false;
@@ -878,8 +886,18 @@ impl Ring {
             let mut contracts_needing_renewal = ring.contracts_needing_renewal();
 
             if contracts_needing_renewal.is_empty() {
+                tracing::debug!(
+                    hosted = ring.hosting_contract_keys().len(),
+                    "No contracts needing subscription renewal"
+                );
                 continue;
             }
+
+            tracing::info!(
+                needing_renewal = contracts_needing_renewal.len(),
+                hosted = ring.hosting_contract_keys().len(),
+                "Starting subscription renewal cycle"
+            );
 
             // Skip renewal entirely when we have no ring connections.
             // Without connections we can't route Subscribe messages, so spawning
@@ -912,11 +930,18 @@ impl Ring {
             let sender = op_manager.to_event_listener.notifications_sender();
             let channel_remaining = sender.capacity();
             let channel_max = sender.max_capacity();
+            let base_limit = if cycle_count < INITIAL_CYCLES {
+                INITIAL_BATCH_LIMIT
+            } else {
+                Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL
+            };
+            cycle_count += 1;
+
             let batch_limit =
                 if channel_remaining < channel_max / Self::RENEWAL_DEFER_CAPACITY_FRACTION {
                     // Channel >50% full: allow a reduced batch (quarter of normal)
                     // so critical renewals still get through. Always attempt at least 1.
-                    let reduced = (Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL / 4).max(1);
+                    let reduced = (base_limit / 4).max(1);
                     tracing::warn!(
                         channel_remaining,
                         channel_max,
@@ -926,7 +951,7 @@ impl Ring {
                     );
                     reduced
                 } else {
-                    Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL
+                    base_limit
                 };
 
             let mut attempted = 0;

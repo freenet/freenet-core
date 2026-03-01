@@ -1258,10 +1258,22 @@ async fn process_open_request(
                             .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
+                        // Hosted contracts are actively maintained by the subscription
+                        // renewal system and receive UPDATE broadcasts via proximity cache.
+                        // Serve them from local cache even if subscription hasn't completed
+                        // yet (subscribe operations take time after startup).
+                        let is_hosted = full_key
+                            .as_ref()
+                            .map(|k| op_manager.ring.is_hosting_contract(k))
+                            .unwrap_or(false);
+
                         // Return local cache if we have valid state AND EITHER:
                         // 1. No connections (isolated node - can only use local cache), OR
-                        // 2. Actively subscribed (cache is fresh via subscription updates)
-                        if local_satisfies_request && (connection_count == 0 || is_subscribed) {
+                        // 2. Actively subscribed (cache is fresh via subscription updates), OR
+                        // 3. Contract is hosted (subscription renewal in progress, cache maintained)
+                        if local_satisfies_request
+                            && (connection_count == 0 || is_subscribed || is_hosted)
+                        {
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
 
