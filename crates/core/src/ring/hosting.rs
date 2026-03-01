@@ -518,7 +518,9 @@ impl HostingManager {
     /// Record a contract access in the hosting cache.
     ///
     /// This is the main entry point for adding contracts to the hosting cache.
-    /// ALL contracts in the hosting cache will have their subscriptions renewed.
+    /// Cached contracts are retained for durability (stale fallback) but only
+    /// those with active interest (client subscriptions or downstream subscribers)
+    /// will have their subscriptions renewed.
     ///
     /// Returns a `RecordAccessResult` containing:
     /// - `is_new`: Whether this contract was newly added (vs. refreshed existing)

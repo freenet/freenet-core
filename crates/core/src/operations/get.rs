@@ -3524,4 +3524,27 @@ mod tests {
             | other @ OpOutcome::Irrelevant => panic!("Expected ContractOpFailure, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_build_fallback_found_response() {
+        let id = Transaction::new::<GetMsg>();
+        let key = make_contract_key(1);
+        let instance_id = *key.id();
+        let state = WrappedState::new(vec![1, 2, 3]);
+        let msg = build_fallback_found_response(id, instance_id, key, state.clone(), None);
+        match msg {
+            GetMsg::Response {
+                id: resp_id,
+                instance_id: resp_iid,
+                result: GetMsgResult::Found { key: k, value },
+            } => {
+                assert_eq!(resp_id, id);
+                assert_eq!(resp_iid, instance_id);
+                assert_eq!(k, key);
+                assert_eq!(value.state, Some(state));
+                assert!(value.contract.is_none());
+            }
+            other => panic!("Expected Found response, got {other:?}"),
+        }
+    }
 }
