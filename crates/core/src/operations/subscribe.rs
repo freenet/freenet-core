@@ -379,6 +379,14 @@ pub(crate) async fn request_subscribe(
         htl: op_manager.ring.max_hops_to_live,
         visited,
         is_renewal,
+        requester_pub_key: Some(
+            op_manager
+                .ring
+                .connection_manager
+                .own_location()
+                .pub_key()
+                .clone(),
+        ),
     };
 
     // Emit telemetry for subscribe request initiation
@@ -835,24 +843,28 @@ impl Operation for SubscribeOp {
                 }
 
                 // New Request or Unsubscribe from another peer
-                let (is_renewal, msg_instance_id) = match msg {
+                let (is_renewal, msg_instance_id, msg_pub_key) = match msg {
                     SubscribeMsg::Request {
                         is_renewal,
                         instance_id,
+                        requester_pub_key,
                         ..
-                    } => (*is_renewal, *instance_id),
-                    SubscribeMsg::Unsubscribe { instance_id, .. } => (false, *instance_id),
+                    } => (*is_renewal, *instance_id, requester_pub_key.clone()),
+                    SubscribeMsg::Unsubscribe { instance_id, .. } => (false, *instance_id, None),
                     _ => unreachable!("Response case handled above"),
                 };
-                // Resolve requester's public key at init time, when the connection
-                // is freshest. This avoids addr->pubkey lookup failures during NAT
-                // traversal timing windows later at interest registration. (#2886)
-                let requester_pub_key = source_addr.and_then(|addr| {
-                    op_manager
-                        .ring
-                        .connection_manager
-                        .get_peer_by_addr(addr)
-                        .map(|pkl| pkl.pub_key().clone())
+                // Prefer the originator's public key carried in the message (propagated
+                // through relay hops) over address-based lookup. The address-based lookup
+                // only finds directly connected peers, which fails when the subscribe
+                // request was relayed through intermediary nodes (#3362).
+                let requester_pub_key = msg_pub_key.or_else(|| {
+                    source_addr.and_then(|addr| {
+                        op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_by_addr(addr)
+                            .map(|pkl| pkl.pub_key().clone())
+                    })
                 });
                 Ok(OpInitialization {
                     op: Self {
@@ -894,13 +906,21 @@ impl Operation for SubscribeOp {
                     htl,
                     visited,
                     is_renewal,
+                    requester_pub_key: msg_requester_pub_key,
                 } => {
+                    // Prefer the public key carried in the message (from originator)
+                    // over the one resolved at init time (which is the relay's key).
+                    let effective_pub_key = msg_requester_pub_key
+                        .as_ref()
+                        .or(self.requester_pub_key.as_ref());
+
                     tracing::debug!(
                         tx = %id,
                         %instance_id,
                         htl,
                         is_renewal,
                         requester_addr = ?self.requester_addr,
+                        has_msg_pub_key = msg_requester_pub_key.is_some(),
                         "subscribe: processing Request"
                     );
 
@@ -912,13 +932,14 @@ impl Operation for SubscribeOp {
                         // Updates propagate via proximity cache, not explicit tree.
                         if let Some(requester_addr) = self.requester_addr {
                             // Register the subscribing peer as a downstream subscriber.
-                            // Uses requester_pub_key (resolved at init time) to avoid
-                            // addr-based lookup failures during NAT timing windows. (#2886)
+                            // Uses effective_pub_key (from message or init-time resolution)
+                            // so interest registration succeeds even without a direct
+                            // connection to the requester (#3362).
                             register_downstream_subscriber(
                                 op_manager,
                                 &key,
                                 requester_addr,
-                                self.requester_pub_key.as_ref(),
+                                effective_pub_key,
                                 source_addr,
                                 id,
                                 "",
@@ -961,13 +982,14 @@ impl Operation for SubscribeOp {
                         // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
                         if let Some(requester_addr) = self.requester_addr {
                             // Register the subscribing peer as a downstream subscriber.
-                            // Uses requester_pub_key (resolved at init time) to avoid
-                            // addr-based lookup failures during NAT timing windows. (#2886)
+                            // Uses effective_pub_key (from message or init-time resolution)
+                            // so interest registration succeeds even without a direct
+                            // connection to the requester (#3362).
                             register_downstream_subscriber(
                                 op_manager,
                                 &key,
                                 requester_addr,
-                                self.requester_pub_key.as_ref(),
+                                effective_pub_key,
                                 source_addr,
                                 id,
                                 " (after contract wait)",
@@ -1060,6 +1082,7 @@ impl Operation for SubscribeOp {
                             htl: htl.saturating_sub(1),
                             visited: new_visited,
                             is_renewal: *is_renewal,
+                            requester_pub_key: msg_requester_pub_key.clone(),
                         }),
                         next_hop: Some(next_addr),
                         state: OpEnum::Subscribe(SubscribeOp {
@@ -1461,6 +1484,11 @@ mod messages {
             /// Whether this is a renewal (requester already has contract state).
             /// If true, responder skips sending state to save bandwidth.
             is_renewal: bool,
+            /// Transport public key of the original requester (originator).
+            /// Carried through relay hops so the fulfilling node can register
+            /// peer interest even without a direct connection to the requester.
+            #[serde(default)]
+            requester_pub_key: Option<crate::transport::TransportPublicKey>,
         },
         /// Response for a SUBSCRIBE operation. Routed hop-by-hop back to originator.
         /// Uses instance_id for routing (always available from the request).
