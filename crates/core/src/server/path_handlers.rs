@@ -84,8 +84,20 @@ pub(super) async fn contract_home(
             error_cause: format!("{err}"),
         })?;
     debug!("contract_home: Waiting for GET response");
-    let response = match response_recv.recv().await {
-        Some(HostCallbackResult::Result {
+    let recv_result =
+        tokio::time::timeout(std::time::Duration::from_secs(30), response_recv.recv()).await;
+    let response = match recv_result {
+        Err(_) => {
+            return Err(WebSocketApiError::NodeError {
+                error_cause: "GET request timed out after 30s".into(),
+            });
+        }
+        Ok(None) => {
+            return Err(WebSocketApiError::NodeError {
+                error_cause: "GET response channel closed (node may be shutting down)".into(),
+            });
+        }
+        Ok(Some(HostCallbackResult::Result {
             result:
                 Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                     contract,
@@ -93,7 +105,7 @@ pub(super) async fn contract_home(
                     ..
                 })),
             ..
-        }) => match contract {
+        })) => match contract {
             Some(contract) => {
                 let contract_key = contract.key();
                 let path = contract_web_path(contract_key.id());
@@ -161,20 +173,15 @@ pub(super) async fn contract_home(
                 return Err(WebSocketApiError::MissingContract { instance_id });
             }
         },
-        Some(HostCallbackResult::Result {
+        Ok(Some(HostCallbackResult::Result {
             result: Err(err), ..
-        }) => {
+        })) => {
             tracing::error!("error getting contract `{key}`: {err}");
             return Err(WebSocketApiError::AxumError {
                 error: err.kind().clone(),
             });
         }
-        None => {
-            return Err(WebSocketApiError::NodeError {
-                error_cause: format!("Contract not found: {key}"),
-            });
-        }
-        other => {
+        Ok(other) => {
             tracing::error!("Unexpected node response: {other:?}");
             return Err(WebSocketApiError::NodeError {
                 error_cause: format!("Unexpected response from node: {other:?}"),

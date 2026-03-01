@@ -117,12 +117,20 @@ impl Transaction {
     /// This will allow, for example, to compare against any older transactions,
     /// in order to remove them.
     pub fn ttl_transaction() -> Self {
+        Self::ttl_transaction_with_multiplier(1)
+    }
+
+    /// Like [`ttl_transaction`](Self::ttl_transaction) but with a custom TTL multiplier.
+    ///
+    /// Used for absolute timeout enforcement on operations that would otherwise
+    /// be exempt from garbage collection (e.g., `under_progress` operations).
+    pub fn ttl_transaction_with_multiplier(multiplier: u64) -> Self {
         let id = crate::config::GlobalSimulationTime::new_ulid();
         let ts = id.timestamp_ms();
-        const TTL_MS: u64 = crate::config::OPERATION_TTL.as_millis() as u64;
-        let ttl_epoch: u64 = ts - TTL_MS;
+        let ttl_ms = crate::config::OPERATION_TTL.as_millis() as u64 * multiplier;
+        let ttl_epoch: u64 = ts.saturating_sub(ttl_ms);
 
-        // Clear the ts significant bits of the ULID and replace them with the new cutoff ts.
+        // Clear the timestamp bits and replace with the cutoff timestamp.
         const TIMESTAMP_MASK: u128 = 0x00000000000000000000FFFFFFFFFFFFFFFF;
         let new_ulid = (id.0 & TIMESTAMP_MASK) | ((ttl_epoch as u128) << 80);
         Self {
@@ -917,6 +925,34 @@ mod tests {
         assert!(
             original_tx.id.timestamp_ms() - ttl_tx.id.timestamp_ms()
                 < crate::config::OPERATION_TTL.as_millis() as u64 + 5
+        );
+    }
+
+    #[test]
+    fn ttl_transaction_with_multiplier_produces_older_cutoff() {
+        let ttl_1x = Transaction::ttl_transaction();
+        let ttl_5x = Transaction::ttl_transaction_with_multiplier(5);
+
+        // 5x multiplier should produce an older (smaller timestamp) cutoff
+        assert!(ttl_5x < ttl_1x, "5x multiplier should be older than 1x");
+
+        // Verify the timestamp delta is approximately 4x OPERATION_TTL more
+        let diff = ttl_1x.id.timestamp_ms() - ttl_5x.id.timestamp_ms();
+        let expected = crate::config::OPERATION_TTL.as_millis() as u64 * 4;
+        assert!(
+            diff >= expected.saturating_sub(10) && diff <= expected + 10,
+            "Timestamp delta should be ~4x OPERATION_TTL, got {diff}ms vs expected {expected}ms"
+        );
+
+        // multiplier(1) should be equivalent to ttl_transaction()
+        let ttl_1x_via_multiplier = Transaction::ttl_transaction_with_multiplier(1);
+        let diff_1x = ttl_1x
+            .id
+            .timestamp_ms()
+            .abs_diff(ttl_1x_via_multiplier.id.timestamp_ms());
+        assert!(
+            diff_1x < 5,
+            "multiplier(1) should be ~equivalent to ttl_transaction(), diff={diff_1x}ms"
         );
     }
 

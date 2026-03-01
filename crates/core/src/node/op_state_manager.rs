@@ -1473,10 +1473,22 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                 // notice the use of reverse so the older transactions are removed instead of the newer ones
                 let older_than: Reverse<Transaction> = Reverse(Transaction::ttl_transaction());
+                // Absolute cutoff for under_progress ops: 5× normal TTL (5 minutes).
+                // Without this, operations stuck in under_progress are exempt from GC forever.
+                let absolute_cutoff: Reverse<Transaction> =
+                    Reverse(Transaction::ttl_transaction_with_multiplier(5));
                 for Reverse(tx) in ttl_set.split_off(&older_than).into_iter() {
                     if ops.under_progress.contains(&tx) {
-                        delayed.push(tx);
-                        continue;
+                        // Allow extended lifetime unless absolute timeout exceeded.
+                        // Reverse flips ordering: Reverse(tx) < absolute_cutoff means
+                        // tx is newer than the 5× TTL cutoff, so keep it alive.
+                        if Reverse(tx) < absolute_cutoff {
+                            delayed.push(tx);
+                            continue;
+                        }
+                        tracing::warn!(tx = %tx, "Cleaning up under_progress op that exceeded absolute timeout (5× TTL)");
+                        ops.under_progress.remove(&tx);
+                        // Fall through to normal cleanup below
                     }
                     if let Some(tx) = ops.completed.remove(&tx) {
                         tracing::debug!("Clean up timed out: {tx}");
