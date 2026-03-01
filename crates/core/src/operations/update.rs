@@ -1030,43 +1030,62 @@ impl Operation for UpdateOp {
                     }
 
                     tracing::debug!("Attempting contract value update - BroadcastToStreaming");
-                    let UpdateExecution {
-                        value: updated_value,
-                        summary: _summary,
-                        changed,
-                        ..
-                    } = update_contract(op_manager, *key, update_data, RelatedContracts::default())
-                        .await?;
-
-                    tracing::debug!("Contract successfully updated - BroadcastToStreaming");
-
-                    // NOTE: We intentionally do NOT refresh hosting TTL on UPDATE.
-                    // Only GET and SUBSCRIBE should extend hosting lifetime.
-
-                    // Emit telemetry: broadcast applied
-                    if let Some(event) = NetEventLog::update_broadcast_applied(
-                        id,
-                        &op_manager.ring,
+                    match update_contract(
+                        op_manager,
                         *key,
-                        &state_for_telemetry,
-                        &updated_value,
-                        changed,
-                    ) {
-                        op_manager.ring.register_events(Either::Left(event)).await;
-                    }
+                        update_data,
+                        RelatedContracts::default(),
+                    )
+                    .await
+                    {
+                        Ok(UpdateExecution {
+                            value: updated_value,
+                            summary: _summary,
+                            changed,
+                            ..
+                        }) => {
+                            tracing::debug!("Contract successfully updated - BroadcastToStreaming");
 
-                    if !changed {
-                        tracing::debug!(
-                            tx = %id,
-                            %key,
-                            "BroadcastToStreaming update produced no change"
-                        );
-                    } else {
-                        tracing::debug!(
-                            tx = %id,
-                            %key,
-                            "Successfully updated contract via BroadcastToStreaming"
-                        );
+                            // NOTE: We intentionally do NOT refresh hosting TTL on UPDATE.
+                            // Only GET and SUBSCRIBE should extend hosting lifetime.
+
+                            // Emit telemetry: broadcast applied
+                            if let Some(event) = NetEventLog::update_broadcast_applied(
+                                id,
+                                &op_manager.ring,
+                                *key,
+                                &state_for_telemetry,
+                                &updated_value,
+                                changed,
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+
+                            if !changed {
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    "BroadcastToStreaming update produced no change"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    tx = %id,
+                                    %key,
+                                    "Successfully updated contract via BroadcastToStreaming"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            // Broadcast updates are best-effort: if we can't apply the update
+                            // (e.g., missing contract parameters after restart), log and skip.
+                            // The contract will be obtained properly via GET eventually.
+                            tracing::debug!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "BroadcastToStreaming update skipped — contract not ready locally"
+                            );
+                        }
                     }
 
                     // Network peer propagation is automatic via BroadcastStateChange
