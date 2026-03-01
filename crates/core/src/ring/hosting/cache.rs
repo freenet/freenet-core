@@ -270,27 +270,35 @@ impl<T: TimeSource> HostingCache<T> {
     where
         F: Fn(&ContractKey) -> bool,
     {
+        if self.current_bytes <= self.budget_bytes {
+            // Under budget — nothing to evict. This is what makes it an LRU:
+            // contracts live indefinitely while we have space. The TTL only
+            // determines eviction eligibility when we need to free space.
+            return Vec::new();
+        }
+
         let now = self.time_source.now();
         let mut evicted = Vec::new();
 
-        // Evict ALL contracts past TTL (not just when over budget).
-        // This prevents stale contracts from accumulating and generating
-        // unbounded subscription renewal traffic.
+        // Over budget: evict past-TTL contracts (oldest first via LRU order)
+        // until we're back under budget.
         self.lru_order.retain(|key| {
+            if self.current_bytes <= self.budget_bytes {
+                return true; // back under budget, stop evicting
+            }
             if let Some(entry) = self.contracts.get(key) {
                 let age = now.saturating_duration_since(entry.last_accessed);
                 if age >= self.min_ttl && !should_retain(key) {
-                    // Past TTL and not retained — evict
                     let size = entry.size_bytes;
                     self.contracts.remove(key);
                     self.current_bytes = self.current_bytes.saturating_sub(size);
                     evicted.push(*key);
-                    false // remove from lru_order
+                    false
                 } else {
-                    true // keep
+                    true
                 }
             } else {
-                false // orphaned LRU entry, remove
+                false // orphaned LRU entry
             }
         });
 
@@ -596,13 +604,10 @@ mod tests {
         // Advance past TTL
         time.advance_time(Duration::from_secs(61));
 
-        // Sweep should evict ALL past-TTL entries (not just enough for budget)
+        // Sweep should evict oldest entry to get back under budget
         let evicted = cache.sweep_expired(|_| false);
-        assert_eq!(evicted.len(), 3);
-        assert!(evicted.contains(&key1));
-        assert!(evicted.contains(&key2));
-        assert!(evicted.contains(&key3));
-        assert_eq!(cache.current_bytes(), 0);
+        assert_eq!(evicted, vec![key1]);
+        assert_eq!(cache.current_bytes(), 200);
     }
 
     #[test]
@@ -623,14 +628,12 @@ mod tests {
         // Sweep with predicate that retains key1
         let evicted = cache.sweep_expired(|k| *k == key1);
 
-        // key1 should be retained, key2 and key3 evicted (all past TTL)
-        assert_eq!(evicted.len(), 2);
-        assert!(evicted.contains(&key2));
-        assert!(evicted.contains(&key3));
+        // key1 should be retained, key2 evicted to get under budget
+        assert_eq!(evicted, vec![key2]);
         assert!(cache.contains(&key1));
         assert!(!cache.contains(&key2));
-        assert!(!cache.contains(&key3));
-        assert_eq!(cache.current_bytes(), 100);
+        assert!(cache.contains(&key3));
+        assert_eq!(cache.current_bytes(), 200);
     }
 
     #[test]

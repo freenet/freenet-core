@@ -821,10 +821,10 @@ impl HostingManager {
                 continue;
             }
             // All hosted contracts get subscription renewal unconditionally.
-            // The hosting cache TTL naturally bounds this: contracts expire
-            // 8 minutes after their last genuine user access (GET/PUT),
-            // UNLESS they have active subscribers (client or downstream),
-            // which protects them from eviction via sweep_expired_hosting().
+            // The hosting cache is an LRU: contracts live indefinitely while
+            // under budget, and only become eviction candidates (oldest first)
+            // when the cache exceeds its byte budget. Active subscribers
+            // (client or downstream) protect contracts from eviction.
             //
             // We intentionally do NOT check should_unsubscribe_upstream() here
             // because interior peers (no clients, no downstream) still need
