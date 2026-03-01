@@ -1,5 +1,8 @@
 aider_stdlib_map.md
 
+# Cargo config (developer-local symlink for shared target dir)
+.cargo
+
 # Local tools and notes
 .local-tools/
 *.local/
