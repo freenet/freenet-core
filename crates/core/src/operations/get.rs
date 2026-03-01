@@ -1076,10 +1076,8 @@ impl Operation for GetOp {
                                     "Relay peer deferring local cache, forwarding GET for fresh state"
                                 );
                                 local_fallback = Some(lv);
-                                None
-                            } else {
-                                None
                             }
+                            None
                         } else {
                             local_value
                         };
@@ -1452,17 +1450,13 @@ impl Operation for GetOp {
                                             contract = %key,
                                             "Relay serving local cache as fallback (network returned NotFound)"
                                         );
-                                        return_msg = Some(GetMsg::Response {
+                                        return_msg = Some(build_fallback_found_response(
                                             id,
                                             instance_id,
-                                            result: GetMsgResult::Found {
-                                                key,
-                                                value: StoreResponse {
-                                                    state: Some(state),
-                                                    contract,
-                                                },
-                                            },
-                                        });
+                                            key,
+                                            state,
+                                            contract,
+                                        ));
                                     } else {
                                         tracing::warn!(
                                             tx = %id,
@@ -1589,17 +1583,13 @@ impl Operation for GetOp {
                                             contract = %key,
                                             "Relay serving local cache as fallback (max retries, network returned NotFound)"
                                         );
-                                        return_msg = Some(GetMsg::Response {
+                                        return_msg = Some(build_fallback_found_response(
                                             id,
                                             instance_id,
-                                            result: GetMsgResult::Found {
-                                                key,
-                                                value: StoreResponse {
-                                                    state: Some(state),
-                                                    contract,
-                                                },
-                                            },
-                                        });
+                                            key,
+                                            state,
+                                            contract,
+                                        ));
                                     } else {
                                         tracing::warn!(
                                             tx = %id,
@@ -2547,6 +2537,27 @@ impl Operation for GetOp {
     }
 }
 
+/// Build a `GetMsg::Response` with `Found` result from a local fallback cache entry.
+fn build_fallback_found_response(
+    id: Transaction,
+    instance_id: ContractInstanceId,
+    key: ContractKey,
+    state: WrappedState,
+    contract: Option<ContractContainer>,
+) -> GetMsg {
+    GetMsg::Response {
+        id,
+        instance_id,
+        result: GetMsgResult::Found {
+            key,
+            value: StoreResponse {
+                state: Some(state),
+                contract,
+            },
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_op_result(
     id: Transaction,
@@ -2708,17 +2719,7 @@ async fn try_forward_or_return(
                 contract = %key,
                 "Relay serving local cache as fallback (no forwarding targets)"
             );
-            let msg = GetMsg::Response {
-                id,
-                instance_id,
-                result: GetMsgResult::Found {
-                    key,
-                    value: StoreResponse {
-                        state: Some(state),
-                        contract,
-                    },
-                },
-            };
+            let msg = build_fallback_found_response(id, instance_id, key, state, contract);
             build_op_result(id, None, Some(msg), None, stats, upstream_addr, None, None)
         } else {
             tracing::warn!(
