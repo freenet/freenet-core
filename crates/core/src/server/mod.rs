@@ -303,6 +303,19 @@ pub async fn serve_client_api_with_listener(
     Ok([Box::new(gw), Box::new(ws_proxy)])
 }
 
+/// Like [`serve_client_api_with_listener`] but also returns the `AttestedContractMap`.
+///
+/// Use this in integration tests that need to pre-populate auth token → contract
+/// mappings in order to test delegate attestation behaviour (issue #1523).
+pub async fn serve_client_api_with_listener_and_contracts(
+    config: WebsocketApiConfig,
+    listener: std::net::TcpListener,
+) -> std::io::Result<([BoxedClient; 2], AttestedContractMap)> {
+    let (gw, ws_proxy) = serve_client_api_in_impl(config, Some(listener)).await?;
+    let attested_contracts = gw.attested_contracts.clone();
+    Ok(([Box::new(gw), Box::new(ws_proxy)], attested_contracts))
+}
+
 /// Serves the client API and returns the concrete types (for integration testing).
 /// This allows tests to access internal state like the attested_contracts map.
 pub async fn serve_client_api_for_test(
