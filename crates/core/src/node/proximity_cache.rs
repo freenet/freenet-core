@@ -44,6 +44,24 @@ pub struct ProximityCacheResult {
     pub overlapping_contracts: Vec<ContractInstanceId>,
 }
 
+impl ProximityCacheResult {
+    /// Shorthand for a response-only result with no overlapping contracts.
+    fn response_only(response: ProximityCacheMessage) -> Self {
+        Self {
+            response: Some(response),
+            overlapping_contracts: vec![],
+        }
+    }
+
+    /// Shorthand for a result with no response and no overlapping contracts.
+    fn empty() -> Self {
+        Self {
+            response: None,
+            overlapping_contracts: vec![],
+        }
+    }
+}
+
 /// Manages proximity-based cache tracking for UPDATE forwarding.
 ///
 /// Tracks:
@@ -192,11 +210,15 @@ impl ProximityCacheManager {
                 // Don't respond to responses - this prevents ping-pong.
                 // The is_response flag indicates the sender was already responding
                 // to our announcement, so they already know we have these contracts.
+                //
+                // Returning empty overlapping_contracts here means only the initial
+                // announcer's side triggers proactive state sync. This is intentional:
+                // if the responding peer has newer state, the CRDT merge at the
+                // broadcast recipient produces CurrentWon → emits its own
+                // BroadcastStateChange back — so stale state self-corrects within
+                // one round-trip.
                 if is_response {
-                    return ProximityCacheResult {
-                        response: None,
-                        overlapping_contracts: vec![],
-                    };
+                    return ProximityCacheResult::empty();
                 }
 
                 // Find contracts that are:
@@ -244,10 +266,9 @@ impl ProximityCacheManager {
                     "PROXIMITY_CACHE: Responding to cache state request"
                 );
 
-                ProximityCacheResult {
-                    response: Some(ProximityCacheMessage::CacheStateResponse { contracts }),
-                    overlapping_contracts: vec![],
-                }
+                ProximityCacheResult::response_only(ProximityCacheMessage::CacheStateResponse {
+                    contracts,
+                })
             }
 
             ProximityCacheMessage::CacheStateResponse { contracts } => {
@@ -589,6 +610,8 @@ mod tests {
             result.response.is_some(),
             "Expected reciprocal announcement for overlapping contract"
         );
+        assert_eq!(result.overlapping_contracts.len(), 1);
+        assert_eq!(result.overlapping_contracts[0], *key.id());
 
         if let Some(ProximityCacheMessage::CacheAnnounce {
             added,
@@ -636,6 +659,10 @@ mod tests {
             result.response.is_none(),
             "No response expected when contracts don't overlap"
         );
+        assert!(
+            result.overlapping_contracts.is_empty(),
+            "No overlapping contracts when contracts don't match"
+        );
     }
 
     #[test]
@@ -664,6 +691,12 @@ mod tests {
             result.response.is_some(),
             "Expected response for partial overlap"
         );
+        assert_eq!(
+            result.overlapping_contracts.len(),
+            1,
+            "Only contract X should overlap"
+        );
+        assert_eq!(result.overlapping_contracts[0], *key_x.id());
 
         if let Some(ProximityCacheMessage::CacheAnnounce {
             added,
@@ -734,6 +767,10 @@ mod tests {
         assert!(
             a_second_result.response.is_none(),
             "Ping-pong must terminate: A should not respond to B's reciprocal announcement"
+        );
+        assert!(
+            a_second_result.overlapping_contracts.is_empty(),
+            "is_response=true must not trigger proactive state sync"
         );
     }
 
@@ -964,6 +1001,8 @@ mod tests {
             a_result.response.is_some(),
             "CRITICAL: A must announce overlapping contracts when receiving CacheStateResponse"
         );
+        assert_eq!(a_result.overlapping_contracts.len(), 1);
+        assert_eq!(a_result.overlapping_contracts[0], *key.id());
 
         if let Some(ProximityCacheMessage::CacheAnnounce {
             added,
@@ -1009,6 +1048,10 @@ mod tests {
         assert!(
             result.response.is_none(),
             "No announcement needed when no contracts overlap"
+        );
+        assert!(
+            result.overlapping_contracts.is_empty(),
+            "No overlapping contracts when caches don't intersect"
         );
 
         // But B's contracts should still be tracked

@@ -87,9 +87,14 @@ pub(super) async fn contract_home(
     let recv_result =
         tokio::time::timeout(std::time::Duration::from_secs(30), response_recv.recv()).await;
     let response = match recv_result {
-        Err(_) | Ok(None) => {
+        Err(_) => {
             return Err(WebSocketApiError::NodeError {
-                error_cause: "GET request timed out".into(),
+                error_cause: "GET request timed out after 30s".into(),
+            });
+        }
+        Ok(None) => {
+            return Err(WebSocketApiError::NodeError {
+                error_cause: "GET response channel closed (node may be shutting down)".into(),
             });
         }
         Ok(Some(HostCallbackResult::Result {

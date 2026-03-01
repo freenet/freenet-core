@@ -1076,7 +1076,7 @@ where
                     if let Some((key, state)) =
                         get_contract_state_by_id(&op_manager, &instance_id).await
                     {
-                        tracing::info!(
+                        tracing::debug!(
                             contract = %key,
                             peer = %source_pub_key,
                             "Proximity cache overlap — broadcasting state to ensure neighbor is current"
@@ -1652,34 +1652,12 @@ async fn get_contract_state(
     op_manager: &Arc<OpManager>,
     key: &freenet_stdlib::prelude::ContractKey,
 ) -> Option<freenet_stdlib::prelude::WrappedState> {
-    use crate::contract::ContractHandlerEvent;
-
-    match op_manager
-        .notify_contract_handler(ContractHandlerEvent::GetQuery {
-            instance_id: *key.id(),
-            return_contract_code: false,
-        })
+    get_contract_state_by_id(op_manager, key.id())
         .await
-    {
-        Ok(ContractHandlerEvent::GetResponse {
-            response: Ok(store_response),
-            ..
-        }) => store_response.state,
-        Ok(ContractHandlerEvent::GetResponse {
-            response: Err(e), ..
-        }) => {
-            tracing::warn!(
-                contract = %key,
-                error = %e,
-                "Failed to get contract state"
-            );
-            None
-        }
-        _ => None,
-    }
+        .map(|(_, state)| state)
 }
 
-/// Get the contract state by instance ID, returning both the full ContractKey and state.
+/// Get the contract state by instance ID, returning both the full `ContractKey` and state.
 ///
 /// Used for proactive state sync when proximity cache discovers overlapping contracts,
 /// where we only have a `ContractInstanceId` (not a full `ContractKey`).

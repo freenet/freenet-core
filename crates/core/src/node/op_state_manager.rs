@@ -1479,8 +1479,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     Reverse(Transaction::ttl_transaction_with_multiplier(5));
                 for Reverse(tx) in ttl_set.split_off(&older_than).into_iter() {
                     if ops.under_progress.contains(&tx) {
-                        // Allow extended lifetime unless absolute timeout exceeded
-                        if Reverse(tx) >= absolute_cutoff {
+                        // Allow extended lifetime unless absolute timeout exceeded.
+                        // Reverse flips ordering: Reverse(tx) < absolute_cutoff means
+                        // tx is newer than the 5× TTL cutoff, so keep it alive.
+                        if Reverse(tx) < absolute_cutoff {
                             delayed.push(tx);
                             continue;
                         }
