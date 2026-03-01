@@ -1133,7 +1133,45 @@ async fn process_open_request(
                         subscribe,
                         blocking_subscribe,
                     } => {
-                        let peer_id = ensure_peer_ready(&op_manager)?;
+                        // Try local cache before requiring ring join for non-subscribe GETs.
+                        let peer_id = match ensure_peer_ready(&op_manager) {
+                            Ok(id) => id,
+                            Err(err) if !subscribe => {
+                                // Not joined yet — check if we can serve from local cache
+                                let local_result = op_manager
+                                    .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                                        instance_id: key,
+                                        return_contract_code,
+                                    })
+                                    .await;
+                                if let Ok(ContractHandlerEvent::GetResponse {
+                                    key: Some(full_key),
+                                    response:
+                                        Ok(StoreResponse {
+                                            state: Some(state),
+                                            contract,
+                                        }),
+                                }) = local_result
+                                {
+                                    if !return_contract_code || contract.is_some() {
+                                        tracing::info!(
+                                            client_id = %client_id,
+                                            contract = %full_key,
+                                            phase = "local_cache_pre_join",
+                                            "Serving locally cached contract state before network join"
+                                        );
+                                        return Ok(Some(Either::Left(QueryResult::GetResult {
+                                            key: full_key,
+                                            state,
+                                            contract,
+                                        })));
+                                    }
+                                }
+                                // No local cache — propagate the original error
+                                return Err(err);
+                            }
+                            Err(err) => return Err(err),
+                        };
 
                         // Query local store first. We use the result in two cases:
                         // 1. Error handling: if local storage has issues, fail fast
@@ -1217,12 +1255,35 @@ async fn process_open_request(
                             .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
+                        // Hosted contracts have subscription renewal in progress
+                        // via the background recovery loop. Between restart and
+                        // renewal completion the state may be briefly stale, but
+                        // serving it is strictly better than a network GET (94%
+                        // failure rate — see #3356). Once the subscription is
+                        // re-established, updates will keep the cache current.
+                        let is_hosted = full_key
+                            .as_ref()
+                            .map(|k| op_manager.ring.is_hosting_contract(k))
+                            .unwrap_or(false);
+
                         // Return local cache if we have valid state AND EITHER:
                         // 1. No connections (isolated node - can only use local cache), OR
-                        // 2. Actively subscribed (cache is fresh via subscription updates)
-                        if local_satisfies_request && (connection_count == 0 || is_subscribed) {
+                        // 2. Actively subscribed (cache is fresh via subscription updates), OR
+                        // 3. Contract is hosted (renewal in progress; may be briefly stale
+                        //    after restart, but network GETs are unreliable — see #3356)
+                        if local_satisfies_request
+                            && (connection_count == 0 || is_subscribed || is_hosted)
+                        {
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
+
+                            // Refresh hosting TTL on user GET — this is the
+                            // correct place to keep hosted contracts alive (not
+                            // in subscription renewal, which would create an
+                            // immortal-entry feedback loop).
+                            if is_hosted {
+                                op_manager.ring.touch_hosting(&full_key);
+                            }
 
                             tracing::debug!(
                                 client_id = %client_id,
@@ -1230,9 +1291,10 @@ async fn process_open_request(
                                 peer = %peer_id,
                                 contract = %full_key,
                                 is_subscribed,
+                                is_hosted,
                                 connection_count,
                                 phase = "local_cache",
-                                "Returning locally cached contract state (subscribed or isolated)"
+                                "Returning locally cached contract state"
                             );
 
                             // Handle subscription for locally found contracts

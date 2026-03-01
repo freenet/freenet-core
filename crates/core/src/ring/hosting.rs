@@ -648,6 +648,13 @@ impl HostingManager {
         self.is_subscribed(contract) || self.has_client_subscriptions(contract.id())
     }
 
+    /// Touch a contract in the hosting cache (refresh TTL without adding).
+    ///
+    /// Called when a user GET serves a hosted contract from local cache.
+    pub fn touch_hosting(&self, key: &ContractKey) {
+        self.hosting_cache.write().touch(key);
+    }
+
     /// Sweep for expired entries in the hosting cache.
     ///
     /// Contracts are protected from eviction if they have client subscriptions
@@ -658,9 +665,6 @@ impl HostingManager {
     /// Automatically removes persisted metadata for expired contracts.
     pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
         let expired = self.hosting_cache.write().sweep_expired(|key| {
-            // Retain contracts with active subscriptions of any kind:
-            // - Client subscriptions: local apps need updates
-            // - Downstream subscribers: network peers depend on us for updates
             self.has_client_subscriptions(key.id()) || self.has_downstream_subscribers(key)
         });
 
@@ -1454,7 +1458,6 @@ mod tests {
     fn test_contracts_needing_renewal_includes_hosted() {
         let manager = HostingManager::new();
         let contract = make_contract_key(1);
-        let client_id = crate::client_events::ClientId::next();
 
         // Add to hosting cache (simulating GET operation)
         manager.record_contract_access(contract, 1000, AccessType::Get);
@@ -1468,11 +1471,12 @@ mod tests {
         );
 
         // Also renewed with a client subscription
+        let client_id = crate::client_events::ClientId::next();
         manager.add_client_subscription(contract.id(), client_id);
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
             needs_renewal.contains(&contract),
-            "Hosted contract with client subscription should need renewal"
+            "Hosted contract should need renewal even without client interest"
         );
     }
 

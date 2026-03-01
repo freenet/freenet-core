@@ -1106,8 +1106,8 @@ impl Operation for SubscribeOp {
 
                             // Note: we intentionally do NOT call touch_hosting() here.
                             // Subscription renewal is internal maintenance, not user activity.
-                            // Only genuine user access (GET/PUT) should refresh the hosting
-                            // cache TTL, so contracts naturally expire when no longer requested.
+                            // Only genuine user access (GET) should refresh hosting TTL,
+                            // otherwise renewal creates an immortal-entry feedback loop.
 
                             tracing::info!(
                                 tx = %msg_id,
