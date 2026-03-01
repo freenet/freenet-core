@@ -1255,8 +1255,12 @@ async fn process_open_request(
                             .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
-                        // Hosted contracts are maintained by subscription renewal;
-                        // serve from cache even if subscribe hasn't completed yet.
+                        // Hosted contracts have subscription renewal in progress
+                        // via the background recovery loop. Between restart and
+                        // renewal completion the state may be briefly stale, but
+                        // serving it is strictly better than a network GET (94%
+                        // failure rate — see #3356). Once the subscription is
+                        // re-established, updates will keep the cache current.
                         let is_hosted = full_key
                             .as_ref()
                             .map(|k| op_manager.ring.is_hosting_contract(k))
@@ -1265,7 +1269,8 @@ async fn process_open_request(
                         // Return local cache if we have valid state AND EITHER:
                         // 1. No connections (isolated node - can only use local cache), OR
                         // 2. Actively subscribed (cache is fresh via subscription updates), OR
-                        // 3. Contract is hosted (subscription renewal in progress, cache maintained)
+                        // 3. Contract is hosted (renewal in progress; may be briefly stale
+                        //    after restart, but network GETs are unreliable — see #3356)
                         if local_satisfies_request
                             && (connection_count == 0 || is_subscribed || is_hosted)
                         {
