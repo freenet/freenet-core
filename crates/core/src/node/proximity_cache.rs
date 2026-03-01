@@ -32,6 +32,18 @@ use tracing::{debug, info, trace};
 use crate::message::ProximityCacheMessage;
 use crate::transport::TransportPublicKey;
 
+/// Result from handling a proximity cache message.
+///
+/// Contains an optional response message to send back, plus any contracts
+/// discovered to overlap with the neighbor's cache (for proactive state sync).
+pub struct ProximityCacheResult {
+    /// Optional response message to send back to the neighbor.
+    pub response: Option<ProximityCacheMessage>,
+    /// Contracts that both we and the neighbor have cached.
+    /// Used to trigger proactive state sync via `BroadcastStateChange`.
+    pub overlapping_contracts: Vec<ContractInstanceId>,
+}
+
 /// Manages proximity-based cache tracking for UPDATE forwarding.
 ///
 /// Tracks:
@@ -119,12 +131,13 @@ impl ProximityCacheManager {
 
     /// Process an incoming proximity cache message from a neighbor.
     ///
-    /// Returns an optional response message to send back.
+    /// Returns a [`ProximityCacheResult`] containing an optional response message
+    /// and any overlapping contracts discovered (for proactive state sync).
     pub fn handle_message(
         &self,
         from: &TransportPublicKey,
         message: ProximityCacheMessage,
-    ) -> Option<ProximityCacheMessage> {
+    ) -> ProximityCacheResult {
         match message {
             ProximityCacheMessage::CacheAnnounce {
                 added,
@@ -180,7 +193,10 @@ impl ProximityCacheManager {
                 // The is_response flag indicates the sender was already responding
                 // to our announcement, so they already know we have these contracts.
                 if is_response {
-                    return None;
+                    return ProximityCacheResult {
+                        response: None,
+                        overlapping_contracts: vec![],
+                    };
                 }
 
                 // Find contracts that are:
@@ -194,19 +210,24 @@ impl ProximityCacheManager {
                     .copied()
                     .collect();
 
-                if !overlapping.is_empty() {
+                let response = if !overlapping.is_empty() {
                     debug!(
                         peer = %from,
                         overlapping_count = overlapping.len(),
                         "PROXIMITY_CACHE: Responding with reciprocal announcement for shared contracts"
                     );
                     Some(ProximityCacheMessage::CacheAnnounce {
-                        added: overlapping,
+                        added: overlapping.clone(),
                         removed: vec![],
                         is_response: true, // Mark as response to prevent ping-pong
                     })
                 } else {
                     None
+                };
+
+                ProximityCacheResult {
+                    response,
+                    overlapping_contracts: overlapping,
                 }
             }
 
@@ -223,7 +244,10 @@ impl ProximityCacheManager {
                     "PROXIMITY_CACHE: Responding to cache state request"
                 );
 
-                Some(ProximityCacheMessage::CacheStateResponse { contracts })
+                ProximityCacheResult {
+                    response: Some(ProximityCacheMessage::CacheStateResponse { contracts }),
+                    overlapping_contracts: vec![],
+                }
             }
 
             ProximityCacheMessage::CacheStateResponse { contracts } => {
@@ -255,19 +279,24 @@ impl ProximityCacheManager {
                 //
                 // This uses is_response=true to prevent ping-pong loops - the peer receiving
                 // this announcement won't respond since they already know we requested their state.
-                if !overlapping.is_empty() {
+                let response = if !overlapping.is_empty() {
                     debug!(
                         peer = %from,
                         overlapping_count = overlapping.len(),
                         "PROXIMITY_CACHE: Announcing our overlapping contracts to peer"
                     );
                     Some(ProximityCacheMessage::CacheAnnounce {
-                        added: overlapping,
+                        added: overlapping.clone(),
                         removed: vec![],
                         is_response: true, // Prevent ping-pong
                     })
                 } else {
                     None
+                };
+
+                ProximityCacheResult {
+                    response,
+                    overlapping_contracts: overlapping,
                 }
             }
         }
@@ -495,10 +524,10 @@ mod tests {
         manager.on_contract_cached(&key2);
 
         // Handle cache state request
-        let response = manager.handle_message(&neighbor, ProximityCacheMessage::CacheStateRequest);
-        assert!(response.is_some());
+        let result = manager.handle_message(&neighbor, ProximityCacheMessage::CacheStateRequest);
+        assert!(result.response.is_some());
 
-        if let Some(ProximityCacheMessage::CacheStateResponse { contracts }) = response {
+        if let Some(ProximityCacheMessage::CacheStateResponse { contracts }) = result.response {
             assert_eq!(contracts.len(), 2);
             assert!(contracts.contains(key1.id()));
             assert!(contracts.contains(key2.id()));
@@ -555,9 +584,9 @@ mod tests {
         };
 
         // Node A should respond with a reciprocal announcement
-        let response = manager_a.handle_message(&node_b, announcement_from_b);
+        let result = manager_a.handle_message(&node_b, announcement_from_b);
         assert!(
-            response.is_some(),
+            result.response.is_some(),
             "Expected reciprocal announcement for overlapping contract"
         );
 
@@ -565,7 +594,7 @@ mod tests {
             added,
             removed,
             is_response,
-        }) = response
+        }) = result.response
         {
             assert_eq!(
                 added.len(),
@@ -602,9 +631,9 @@ mod tests {
             is_response: false,
         };
 
-        let response = manager_a.handle_message(&node_b, announcement);
+        let result = manager_a.handle_message(&node_b, announcement);
         assert!(
-            response.is_none(),
+            result.response.is_none(),
             "No response expected when contracts don't overlap"
         );
     }
@@ -630,14 +659,17 @@ mod tests {
             is_response: false,
         };
 
-        let response = manager_a.handle_message(&node_b, announcement);
-        assert!(response.is_some(), "Expected response for partial overlap");
+        let result = manager_a.handle_message(&node_b, announcement);
+        assert!(
+            result.response.is_some(),
+            "Expected response for partial overlap"
+        );
 
         if let Some(ProximityCacheMessage::CacheAnnounce {
             added,
             removed,
             is_response,
-        }) = response
+        }) = result.response
         {
             assert_eq!(
                 added.len(),
@@ -684,23 +716,23 @@ mod tests {
         };
 
         // Step 2: B receives A's announcement, generates reciprocal (with is_response=true)
-        let b_response = manager_b.handle_message(&key_a, a_announcement);
+        let b_result = manager_b.handle_message(&key_a, a_announcement);
         assert!(
-            b_response.is_some(),
+            b_result.response.is_some(),
             "B should respond with reciprocal announcement"
         );
 
         // Verify B's response has is_response=true
-        if let Some(ProximityCacheMessage::CacheAnnounce { is_response, .. }) = &b_response {
+        if let Some(ProximityCacheMessage::CacheAnnounce { is_response, .. }) = &b_result.response {
             assert!(is_response, "B's response should have is_response=true");
         }
 
         // Step 3: A receives B's response
-        let a_second_response = manager_a.handle_message(&key_b, b_response.unwrap());
+        let a_second_result = manager_a.handle_message(&key_b, b_result.response.unwrap());
 
         // Step 4: A should NOT respond again - the loop terminates due to is_response=true
         assert!(
-            a_second_response.is_none(),
+            a_second_result.response.is_none(),
             "Ping-pong must terminate: A should not respond to B's reciprocal announcement"
         );
     }
@@ -731,14 +763,14 @@ mod tests {
         };
 
         // B responds with both (reciprocal, is_response=true set automatically)
-        let b_response = manager_b.handle_message(&key_a, a_announcement);
-        assert!(b_response.is_some());
+        let b_result = manager_b.handle_message(&key_a, a_announcement);
+        assert!(b_result.response.is_some());
 
         if let Some(ProximityCacheMessage::CacheAnnounce {
             ref added,
             is_response,
             ..
-        }) = b_response
+        }) = b_result.response
         {
             assert_eq!(
                 added.len(),
@@ -749,9 +781,9 @@ mod tests {
         }
 
         // A receives B's response - should NOT respond because is_response=true
-        let a_second = manager_a.handle_message(&key_b, b_response.unwrap());
+        let a_second = manager_a.handle_message(&key_b, b_result.response.unwrap());
         assert!(
-            a_second.is_none(),
+            a_second.response.is_none(),
             "Ping-pong must terminate with multiple contracts"
         );
     }
@@ -781,9 +813,9 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        let response_to_x = manager_a.handle_message(&key_b, b_announces_x);
+        let result_x = manager_a.handle_message(&key_b, b_announces_x);
         assert!(
-            response_to_x.is_some(),
+            result_x.response.is_some(),
             "A should respond to initial X announcement"
         );
 
@@ -793,13 +825,13 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        let response_to_y = manager_a.handle_message(&key_b, b_announces_y);
+        let result_y = manager_a.handle_message(&key_b, b_announces_y);
         assert!(
-            response_to_y.is_some(),
+            result_y.response.is_some(),
             "A should respond to NEW contract Y even after X exchange completed"
         );
 
-        if let Some(ProximityCacheMessage::CacheAnnounce { added, .. }) = response_to_y {
+        if let Some(ProximityCacheMessage::CacheAnnounce { added, .. }) = result_y.response {
             assert_eq!(added.len(), 1);
             assert_eq!(added[0], *key_y.id(), "Response should be for contract Y");
         }
@@ -824,16 +856,16 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        let first_response = manager_a.handle_message(&key_b, announcement.clone());
+        let first_result = manager_a.handle_message(&key_b, announcement.clone());
         assert!(
-            first_response.is_some(),
+            first_result.response.is_some(),
             "First announcement should get response"
         );
 
         // Duplicate/retransmitted announcement from B (still not a response)
-        let second_response = manager_a.handle_message(&key_b, announcement);
+        let second_result = manager_a.handle_message(&key_b, announcement);
         assert!(
-            second_response.is_none(),
+            second_result.response.is_none(),
             "Duplicate announcement should not trigger response (already known)"
         );
     }
@@ -869,7 +901,7 @@ mod tests {
             removed: vec![],
             is_response: false,
         };
-        let b_response = manager_b.handle_message(&key_a, a_announcement);
+        let b_result = manager_b.handle_message(&key_a, a_announcement);
 
         // Now B knows about A
         let b_neighbors = manager_b.neighbors_with_contract(&key);
@@ -883,8 +915,8 @@ mod tests {
         );
 
         // B's response goes to A
-        assert!(b_response.is_some());
-        let _ = manager_a.handle_message(&key_b, b_response.unwrap());
+        assert!(b_result.response.is_some());
+        let _ = manager_a.handle_message(&key_b, b_result.response.unwrap());
 
         // Now A also knows about B - bidirectional awareness achieved!
         let a_neighbors = manager_a.neighbors_with_contract(&key);
@@ -926,10 +958,10 @@ mod tests {
         };
 
         // A handles the response - should return announcement for overlapping contract X
-        let a_announcement = manager_a.handle_message(&key_b, b_state_response);
+        let a_result = manager_a.handle_message(&key_b, b_state_response);
 
         assert!(
-            a_announcement.is_some(),
+            a_result.response.is_some(),
             "CRITICAL: A must announce overlapping contracts when receiving CacheStateResponse"
         );
 
@@ -937,7 +969,7 @@ mod tests {
             added,
             removed,
             is_response,
-        }) = a_announcement
+        }) = a_result.response
         {
             assert_eq!(
                 added.len(),
@@ -973,9 +1005,9 @@ mod tests {
             contracts: vec![*key_y.id()],
         };
 
-        let response = manager_a.handle_message(&key_b, b_state_response);
+        let result = manager_a.handle_message(&key_b, b_state_response);
         assert!(
-            response.is_none(),
+            result.response.is_none(),
             "No announcement needed when no contracts overlap"
         );
 
@@ -1015,17 +1047,17 @@ mod tests {
         ));
 
         // Step 2: B receives request, responds with its cache state
-        let b_response = manager_b.handle_message(&key_a, a_request.unwrap());
+        let b_result = manager_b.handle_message(&key_a, a_request.unwrap());
         assert!(matches!(
-            b_response,
+            b_result.response,
             Some(ProximityCacheMessage::CacheStateResponse { .. })
         ));
 
         // Step 3: A receives B's state response
         // CRITICAL: A should now announce its overlapping contracts back to B
-        let a_announcement = manager_a.handle_message(&key_b, b_response.unwrap());
+        let a_result = manager_a.handle_message(&key_b, b_result.response.unwrap());
         assert!(
-            a_announcement.is_some(),
+            a_result.response.is_some(),
             "A must announce overlapping contracts after receiving B's state"
         );
 
@@ -1035,10 +1067,10 @@ mod tests {
         assert_eq!(a_neighbors[0], key_b);
 
         // Step 4: B receives A's announcement
-        let b_final = manager_b.handle_message(&key_a, a_announcement.unwrap());
+        let b_final = manager_b.handle_message(&key_a, a_result.response.unwrap());
         // B should not respond (is_response=true prevents ping-pong)
         assert!(
-            b_final.is_none(),
+            b_final.response.is_none(),
             "B should not respond to A's announcement (is_response=true)"
         );
 
@@ -1069,8 +1101,8 @@ mod tests {
 
         // CacheStateRequest should return both
         let neighbor = make_pub_key(1);
-        let response = manager.handle_message(&neighbor, ProximityCacheMessage::CacheStateRequest);
-        if let Some(ProximityCacheMessage::CacheStateResponse { contracts }) = response {
+        let result = manager.handle_message(&neighbor, ProximityCacheMessage::CacheStateRequest);
+        if let Some(ProximityCacheMessage::CacheStateResponse { contracts }) = result.response {
             assert_eq!(contracts.len(), 2);
         } else {
             panic!("Expected CacheStateResponse");

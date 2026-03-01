@@ -131,6 +131,24 @@ impl Transaction {
         }
     }
 
+    /// Like [`ttl_transaction`](Self::ttl_transaction) but with a custom TTL multiplier.
+    ///
+    /// Used for absolute timeout enforcement on operations that would otherwise
+    /// be exempt from garbage collection (e.g., `under_progress` operations).
+    pub fn ttl_transaction_with_multiplier(multiplier: u64) -> Self {
+        let id = crate::config::GlobalSimulationTime::new_ulid();
+        let ts = id.timestamp_ms();
+        let ttl_ms = crate::config::OPERATION_TTL.as_millis() as u64 * multiplier;
+        let ttl_epoch: u64 = ts.saturating_sub(ttl_ms);
+
+        const TIMESTAMP_MASK: u128 = 0x00000000000000000000FFFFFFFFFFFFFFFF;
+        let new_ulid = (id.0 & TIMESTAMP_MASK) | ((ttl_epoch as u128) << 80);
+        Self {
+            id: Ulid(new_ulid),
+            parent: None,
+        }
+    }
+
     fn update(ty: TransactionType, id: Ulid, parent: Option<Ulid>) -> Self {
         const TYPE_MASK: u128 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00u128;
         // Clear the last byte

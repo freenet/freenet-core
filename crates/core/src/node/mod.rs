@@ -1059,15 +1059,41 @@ where
                     );
                     return Ok(None);
                 };
-                if let Some(response) = op_manager
+                let result = op_manager
                     .proximity_cache
-                    .handle_message(&source_pub_key, message.clone())
-                {
+                    .handle_message(&source_pub_key, message.clone());
+                if let Some(response) = result.response {
                     // Send response back to sender
                     let response_msg =
                         NetMessage::V1(NetMessageV1::ProximityCache { message: response });
                     if let Err(err) = conn_manager.send(source, response_msg).await {
                         tracing::error!(%err, %source, "Failed to send ProximityCache response");
+                    }
+                }
+                // Proactive state sync: broadcast our state for shared contracts
+                // so the neighbor gets current state if they're stale after restart.
+                for instance_id in result.overlapping_contracts {
+                    if let Some((key, state)) =
+                        get_contract_state_by_id(&op_manager, &instance_id).await
+                    {
+                        tracing::info!(
+                            contract = %key,
+                            peer = %source_pub_key,
+                            "Proximity cache overlap — broadcasting state to ensure neighbor is current"
+                        );
+                        if let Err(e) = op_manager
+                            .notify_node_event(NodeEvent::BroadcastStateChange {
+                                key,
+                                new_state: state,
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                contract = %instance_id,
+                                error = %e,
+                                "Failed to emit BroadcastStateChange for proximity sync"
+                            );
+                        }
                     }
                 }
                 return Ok(None);
@@ -1646,6 +1672,44 @@ async fn get_contract_state(
                 contract = %key,
                 error = %e,
                 "Failed to get contract state"
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Get the contract state by instance ID, returning both the full ContractKey and state.
+///
+/// Used for proactive state sync when proximity cache discovers overlapping contracts,
+/// where we only have a `ContractInstanceId` (not a full `ContractKey`).
+async fn get_contract_state_by_id(
+    op_manager: &Arc<OpManager>,
+    instance_id: &freenet_stdlib::prelude::ContractInstanceId,
+) -> Option<(
+    freenet_stdlib::prelude::ContractKey,
+    freenet_stdlib::prelude::WrappedState,
+)> {
+    use crate::contract::ContractHandlerEvent;
+
+    match op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            instance_id: *instance_id,
+            return_contract_code: false,
+        })
+        .await
+    {
+        Ok(ContractHandlerEvent::GetResponse {
+            key: Some(key),
+            response: Ok(store_response),
+        }) => store_response.state.map(|state| (key, state)),
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Err(e), ..
+        }) => {
+            tracing::warn!(
+                contract = %instance_id,
+                error = %e,
+                "Failed to get contract state by instance id"
             );
             None
         }
