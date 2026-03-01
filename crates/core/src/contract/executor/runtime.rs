@@ -920,7 +920,20 @@ where
             );
         }
         let params = if let Some(code) = &code {
-            code.params()
+            let p = code.params();
+            // Ensure params are persisted to state_store so they survive restarts.
+            // The code path (PUT via GET) always provides params in the container,
+            // but state_store.store() is only called for new contracts. If the contract
+            // already exists (merge path), commit_state_update() calls state_store.update()
+            // which doesn't write params. Persisting here covers all cases.
+            if let Err(e) = self.state_store.ensure_params(key, p.clone()).await {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to persist contract parameters to state_store"
+                );
+            }
+            p
         } else {
             self.state_store
                 .get_params(&key)

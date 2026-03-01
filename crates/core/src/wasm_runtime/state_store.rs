@@ -218,6 +218,25 @@ where
         Ok(r)
     }
 
+    /// Persist contract parameters to the backing store, unconditionally.
+    ///
+    /// This is idempotent — safe to call even if params are already stored.
+    /// Used to ensure params survive node restarts: the initial PUT path
+    /// writes params via `store()`, but subsequent code paths (merge, update)
+    /// go through `update()` which only writes state. Calling `ensure_params`
+    /// closes the gap where params could be lost after restart.
+    pub async fn ensure_params(
+        &self,
+        key: ContractKey,
+        params: Parameters<'static>,
+    ) -> Result<(), StateStoreError> {
+        self.store
+            .store_params(key, params)
+            .await
+            .map_err(|e| StateStoreError::Any(e.into()))?;
+        Ok(())
+    }
+
     /// Get a reference to the underlying storage backend.
     /// Used for hosting metadata persistence operations.
     pub fn inner(&self) -> &S {
@@ -746,5 +765,54 @@ mod tests {
             retrieved, state_v2,
             "State should be v2 after v3 update failed"
         );
+    }
+
+    // ============ ensure_params Tests ============
+
+    /// Regression test: params must survive even when only update() is called
+    /// after the initial store(). Simulates the scenario where a gateway restarts
+    /// and receives BroadcastToStreaming UPDATEs for contracts whose params were
+    /// only written once during the initial PUT.
+    #[tokio::test]
+    async fn test_ensure_params_persists_independently() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new_uncached(mock_storage);
+
+        let key = make_test_key();
+        let state = make_test_state(&[1, 2, 3]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Store state + params (initial PUT path)
+        store
+            .store(key, state.clone(), params.clone())
+            .await
+            .unwrap();
+        assert_eq!(store.get_params(&key).await.unwrap(), Some(params.clone()));
+
+        // ensure_params is idempotent — calling it again doesn't break anything
+        store.ensure_params(key, params.clone()).await.unwrap();
+        assert_eq!(store.get_params(&key).await.unwrap(), Some(params));
+    }
+
+    /// Test that ensure_params works for a contract that has state but no params.
+    /// This is the exact bug scenario: state was stored but params were lost.
+    #[tokio::test]
+    async fn test_ensure_params_fills_gap_when_params_missing() {
+        let mock_storage = MockStateStorage::new();
+        let store = StateStore::new_uncached(mock_storage.clone());
+
+        let key = make_test_key();
+        let state = make_test_state(&[1, 2, 3]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Simulate the bug: store state directly without params
+        mock_storage.seed_state(key, state);
+
+        // Params should be missing
+        assert_eq!(store.get_params(&key).await.unwrap(), None);
+
+        // ensure_params fills the gap
+        store.ensure_params(key, params.clone()).await.unwrap();
+        assert_eq!(store.get_params(&key).await.unwrap(), Some(params));
     }
 }
