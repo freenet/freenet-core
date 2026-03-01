@@ -1889,68 +1889,82 @@ mod tests {
     }
 
     /// A hosted contract with downstream subscribers must NOT be evicted
-    /// from the hosting cache even after TTL expires. Without this,
-    /// interior peers would drop hosting → stop renewal → lose upstream
-    /// subscription → downstream subscribers lose their feed.
+    /// from the hosting cache even after TTL expires and cache is over budget.
+    /// Without this, interior peers would drop hosting → stop renewal → lose
+    /// upstream subscription → downstream subscribers lose their feed.
+    ///
+    /// This test operates at the HostingCache level with MockTimeSrc so we
+    /// can actually advance time past TTL and verify the retain predicate.
     #[test]
     fn test_downstream_subscribers_protect_from_eviction() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(99);
+        use crate::ring::hosting::cache::HostingCache;
+        use crate::util::time_source::SharedMockTimeSource;
 
-        // Add contract to hosting cache via GET
-        manager.record_contract_access(contract, 1000, AccessType::Get);
-        assert!(manager.is_hosting_contract(&contract));
+        let time = SharedMockTimeSource::new();
+        let min_ttl = Duration::from_secs(60);
+        // Budget of 150 bytes with 2x100-byte entries = over budget
+        let mut cache = HostingCache::new(150, min_ttl, time.clone());
 
-        // Add a downstream subscriber (simulates another peer subscribing through us)
-        let peer = PeerKey(crate::transport::TransportPublicKey::from_bytes({
-            let mut bytes = [0u8; 32];
-            bytes[0] = 99;
-            bytes
-        }));
-        manager.add_downstream_subscriber(&contract, peer);
-        assert!(manager.has_downstream_subscribers(&contract));
+        let protected = make_contract_key(1);
+        let unprotected = make_contract_key(2);
 
-        // Force the cache entry past TTL by touching then sweeping
-        manager.hosting_cache.write().touch(&contract);
+        cache.record_access(protected, 100, AccessType::Get);
+        cache.record_access(unprotected, 100, AccessType::Get);
+        assert_eq!(cache.current_bytes(), 200); // over budget
 
-        // Advance time past TTL (the cache uses MockTimeSrc in test mode)
-        // Since we can't easily advance time with the default HostingManager,
-        // we verify the predicate directly: sweep_expired_hosting should
-        // retain this contract because of downstream subscribers.
-        let expired = manager.sweep_expired_hosting();
+        // Advance past TTL
+        time.advance_time(Duration::from_secs(61));
+
+        // Sweep with predicate that protects the first contract
+        // (simulates has_downstream_subscribers returning true)
+        let evicted = cache.sweep_expired(|k| *k == protected);
+
         assert!(
-            !expired.contains(&contract),
+            !evicted.contains(&protected),
             "Contract with downstream subscribers must not be evicted"
         );
         assert!(
-            manager.is_hosting_contract(&contract),
-            "Contract should still be in hosting cache"
+            evicted.contains(&unprotected),
+            "Unprotected contract should be evicted when over budget + past TTL"
         );
+        assert!(cache.contains(&protected));
     }
 
     /// A hosted contract with NO subscribers and NO clients SHOULD be
-    /// evictable after TTL expires (once time advances past the threshold).
+    /// evictable after TTL expires when the cache is over budget.
+    ///
+    /// Uses HostingCache with MockTimeSrc for time advancement.
     #[test]
     fn test_no_subscribers_allows_eviction() {
-        let manager = HostingManager::new();
+        use crate::ring::hosting::cache::HostingCache;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let time = SharedMockTimeSource::new();
+        let min_ttl = Duration::from_secs(60);
+        // Budget of 80 bytes, entry is 100 → over budget immediately
+        let mut cache = HostingCache::new(80, min_ttl, time.clone());
+
         let contract = make_contract_key(100);
+        cache.record_access(contract, 100, AccessType::Get);
+        assert!(cache.contains(&contract));
 
-        // Add to hosting cache
-        manager.record_contract_access(contract, 1000, AccessType::Get);
-        assert!(manager.is_hosting_contract(&contract));
-
-        // No downstream subscribers, no client subscriptions
-        assert!(!manager.has_downstream_subscribers(&contract));
-        assert!(!manager.has_client_subscriptions(contract.id()));
-
-        // Should NOT be protected by should_retain
-        // (actual eviction depends on time advancing past TTL)
-        let expired = manager.sweep_expired_hosting();
-        // With default InstantTimeSrc, TTL hasn't expired yet, so no eviction
+        // Under TTL: should not be evicted even though over budget
+        let evicted = cache.sweep_expired(|_| false);
         assert!(
-            !expired.contains(&contract),
-            "Contract within TTL should not be evicted yet"
+            evicted.is_empty(),
+            "Contract within TTL should not be evicted"
         );
+
+        // Advance past TTL
+        time.advance_time(Duration::from_secs(61));
+
+        // Now should be evicted (over budget + past TTL + no retain predicate)
+        let evicted = cache.sweep_expired(|_| false);
+        assert!(
+            evicted.contains(&contract),
+            "Contract past TTL with no subscribers should be evicted"
+        );
+        assert!(!cache.contains(&contract));
     }
 
     // =========================================================================
