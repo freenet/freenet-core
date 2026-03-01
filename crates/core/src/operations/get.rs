@@ -526,7 +526,7 @@ impl GetOp {
         }
     }
 
-    /// Extract the contract instance ID from the operation state, if available.
+    /// Extract the contract instance ID from the operation state.
     pub(crate) fn instance_id(&self) -> Option<ContractInstanceId> {
         match &self.state {
             Some(GetState::PrepareRequest(data)) => Some(data.instance_id),
@@ -1522,18 +1522,11 @@ impl Operation for GetOp {
                                                 .await;
                                         }
 
-                                        // Notify the client that the GET failed
-                                        op_manager
-                                            .send_client_result(
-                                                id,
-                                                Err(ErrorKind::OperationError {
-                                                    cause: format!(
-                                                        "contract {instance_id} not found after exhausting all peers"
-                                                    ).into(),
-                                                }
-                                                .into()),
-                                            )
-                                            .await;
+                                        notify_get_failed(
+                                            op_manager,
+                                            id,
+                                            &format!("contract {instance_id} not found after exhausting all peers"),
+                                        ).await;
                                         return_msg = None;
                                         new_state = None;
                                     }
@@ -1646,18 +1639,11 @@ impl Operation for GetOp {
                                                 .await;
                                         }
 
-                                        // Notify the client that the GET failed
-                                        op_manager
-                                            .send_client_result(
-                                                id,
-                                                Err(ErrorKind::OperationError {
-                                                    cause: format!(
-                                                        "contract {instance_id} not found after max retries"
-                                                    ).into(),
-                                                }
-                                                .into()),
-                                            )
-                                            .await;
+                                        notify_get_failed(
+                                            op_manager,
+                                            id,
+                                            &format!("contract {instance_id} not found after max retries"),
+                                        ).await;
                                         return_msg = None;
                                         new_state = None;
                                     }
@@ -2034,40 +2020,32 @@ impl Operation for GetOp {
                             contract: contract.clone(),
                         });
                     } else {
-                        // Forward response to upstream — and opportunistically cache
-                        // the contract code locally. This spreads WASM code through
-                        // the network as GET responses flow back, fixing the problem
-                        // where UPDATE-only subscribers lack the code needed to serve
-                        // future GET requests with fetch_contract=true.
+                        // Forward response to upstream, opportunistically caching
+                        // contract code so relay peers can serve future GET requests
+                        // with fetch_contract=true.
                         tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
                         if let Some(ref code) = contract {
-                            let cache_result = op_manager
-                                .notify_contract_handler(ContractHandlerEvent::PutQuery {
-                                    key,
-                                    state: value.clone(),
-                                    related_contracts: RelatedContracts::default(),
-                                    contract: Some(code.clone()),
-                                })
-                                .await;
-                            match cache_result {
+                            let cached = matches!(
+                                op_manager
+                                    .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                                        key,
+                                        state: value.clone(),
+                                        related_contracts: RelatedContracts::default(),
+                                        contract: Some(code.clone()),
+                                    })
+                                    .await,
                                 Ok(ContractHandlerEvent::PutResponse {
-                                    new_value: Ok(_), ..
-                                }) => {
-                                    tracing::debug!(
-                                        tx = %id,
-                                        contract = %key,
-                                        phase = "relay_cache",
-                                        "Cached contract code at relay peer"
-                                    );
-                                }
-                                _ => {
-                                    tracing::debug!(
-                                        tx = %id,
-                                        contract = %key,
-                                        "Failed to cache contract code at relay peer (non-fatal)"
-                                    );
-                                }
-                            }
+                                    new_value: Ok(_),
+                                    ..
+                                })
+                            );
+                            tracing::debug!(
+                                tx = %id,
+                                contract = %key,
+                                phase = "relay_cache",
+                                cached,
+                                "Relay peer contract code cache attempt"
+                            );
                         }
                         new_state = None;
                         return_msg = Some(GetMsg::Response {
@@ -2675,19 +2653,12 @@ async fn try_forward_or_return(
             "No peers to forward get request to and no upstream - local operation fails"
         );
 
-        // Notify the client that the GET failed
-        op_manager
-            .send_client_result(
-                id,
-                Err(ErrorKind::OperationError {
-                    cause: format!(
-                        "contract {instance_id} not found, no peers available to forward"
-                    )
-                    .into(),
-                }
-                .into()),
-            )
-            .await;
+        notify_get_failed(
+            op_manager,
+            id,
+            &format!("contract {instance_id} not found, no peers available to forward"),
+        )
+        .await;
 
         build_op_result(id, None, None, None, stats, upstream_addr, None)
     }
@@ -2697,6 +2668,19 @@ impl IsOperationCompleted for GetOp {
     fn is_completed(&self) -> bool {
         matches!(self.state, Some(GetState::Finished(_)))
     }
+}
+
+/// Notify the client that a GET operation failed with the given reason.
+async fn notify_get_failed(op_manager: &OpManager, tx: Transaction, reason: &str) {
+    op_manager
+        .send_client_result(
+            tx,
+            Err(ErrorKind::OperationError {
+                cause: reason.to_string().into(),
+            }
+            .into()),
+        )
+        .await;
 }
 
 mod messages {
