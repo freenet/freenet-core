@@ -504,10 +504,6 @@ impl HostingManager {
 
     /// Check if a contract has no local clients and no downstream subscribers,
     /// meaning we can safely unsubscribe upstream.
-    ///
-    /// Note: this does NOT check the hosting cache. Hosting cache membership
-    /// is handled separately in `contracts_needing_renewal()`, which always
-    /// renews subscriptions for hosted contracts regardless of this predicate.
     pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
         if self.has_client_subscriptions(contract.id()) {
             return false;
@@ -759,11 +755,12 @@ impl HostingManager {
     ///
     /// Returns contracts where:
     /// - We have an active subscription that will expire soon, OR
-    /// - We have client subscriptions but no active network subscription, OR
-    /// - We have hosted contracts without active subscriptions (THE FIX)
+    /// - We have client subscriptions but no active network subscription
     ///
-    /// This is the key fix: ALL hosted contracts get subscription renewal,
-    /// not just those with client subscriptions or soon-to-expire subscriptions.
+    /// Hosted contracts without active interest (no client subscriptions,
+    /// no downstream subscribers) are intentionally NOT renewed. Caching is
+    /// a durability mechanism (stale fallback); subscriptions are a freshness
+    /// mechanism for active consumers only.
     pub fn contracts_needing_renewal(&self) -> Vec<ContractKey> {
         let now = Instant::now();
         let renewal_threshold = now + SUBSCRIPTION_RENEWAL_INTERVAL;
@@ -809,34 +806,6 @@ impl HostingManager {
                     needs_renewal_set.insert(contract);
                 }
             }
-        }
-
-        // 3. THE FIX: All hosted contracts should have subscriptions renewed
-        // This ensures GET-triggered subscriptions don't expire without renewal
-        // Collect and sort for deterministic iteration order
-        let mut hosted_contracts: Vec<_> = self.hosting_cache.read().iter().collect();
-        hosted_contracts.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
-
-        for contract in hosted_contracts {
-            // Skip if has active subscription that's not expiring soon
-            if self
-                .active_subscriptions
-                .get(&contract)
-                .map(|exp| *exp > renewal_threshold)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            // All hosted contracts get subscription renewal unconditionally.
-            // The hosting cache is an LRU: contracts live indefinitely while
-            // under budget, and only become eviction candidates (oldest first)
-            // when the cache exceeds its byte budget. Active subscribers
-            // (client or downstream) protect contracts from eviction.
-            //
-            // We intentionally do NOT check should_unsubscribe_upstream() here
-            // because interior peers (no clients, no downstream) still need
-            // subscriptions for contracts they're hosting.
-            needs_renewal_set.insert(contract);
         }
 
         // Convert set to vec and sort for deterministic return order
@@ -1455,28 +1424,28 @@ mod tests {
     }
 
     #[test]
-    fn test_contracts_needing_renewal_includes_hosted() {
+    fn test_contracts_needing_renewal_excludes_hosted_only() {
         let manager = HostingManager::new();
         let contract = make_contract_key(1);
 
         // Add to hosting cache (simulating GET operation)
         manager.record_contract_access(contract, 1000, AccessType::Get);
 
-        // Hosted contracts should be renewed even without clients/downstream.
-        // contracts_needing_renewal() unconditionally includes hosted contracts.
+        // Hosted-only contracts should NOT be renewed — caching is for
+        // durability, subscriptions are for active consumers only.
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
-            needs_renewal.contains(&contract),
-            "Hosted contract should be renewed to maintain subscription freshness"
+            !needs_renewal.contains(&contract),
+            "Hosted-only contract should NOT be in renewal list"
         );
 
-        // Also renewed with a client subscription
+        // But a client subscription DOES trigger renewal
         let client_id = crate::client_events::ClientId::next();
         manager.add_client_subscription(contract.id(), client_id);
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
             needs_renewal.contains(&contract),
-            "Hosted contract should need renewal even without client interest"
+            "Contract with client subscription should need renewal"
         );
     }
 
@@ -1860,36 +1829,6 @@ mod tests {
         assert!(manager.should_unsubscribe_upstream(&contract));
         // InterestManager still tracks the peer — independent of unsubscribe decision
         assert!(interest.remove_peer_interest(&contract, &peer));
-    }
-
-    /// Hosted contracts get subscription renewal even without clients or
-    /// downstream subscribers. This prevents the hosting collapse where
-    /// interior peers drop subscriptions for contracts they're caching.
-    ///
-    /// Note: should_unsubscribe_upstream() still returns true for hosted
-    /// contracts without clients/downstream — the renewal bypass is in
-    /// contracts_needing_renewal(), not in the unsubscribe predicate.
-    #[test]
-    fn test_hosted_contract_renewed_despite_no_interest() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(42);
-
-        // Add contract to hosting cache via GET access
-        manager.record_contract_access(contract, 1000, AccessType::Get);
-        assert!(manager.is_hosting_contract(&contract));
-
-        // should_unsubscribe_upstream still returns true (no clients, no downstream)
-        assert!(
-            manager.should_unsubscribe_upstream(&contract),
-            "should_unsubscribe_upstream does not check hosting cache"
-        );
-
-        // But contracts_needing_renewal() includes it anyway
-        let renewals = manager.contracts_needing_renewal();
-        assert!(
-            renewals.contains(&contract),
-            "Hosted contract should be included in subscription renewals"
-        );
     }
 
     /// A hosted contract with downstream subscribers must NOT be evicted

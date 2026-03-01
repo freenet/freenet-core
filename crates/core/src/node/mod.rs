@@ -1072,10 +1072,17 @@ where
                 }
                 // Proactive state sync: broadcast our state for shared contracts
                 // so the neighbor gets current state if they're stale after restart.
+                // Only sync contracts we're actively interested in (receiving updates
+                // or have downstream subscribers) — skip cached-only contracts.
                 for instance_id in result.overlapping_contracts {
                     if let Some((key, state)) =
                         get_contract_state_by_id(&op_manager, &instance_id).await
                     {
+                        if !op_manager.ring.is_receiving_updates(&key)
+                            && !op_manager.ring.has_downstream_subscribers(&key)
+                        {
+                            continue;
+                        }
                         tracing::debug!(
                             contract = %key,
                             peer = %source_pub_key,

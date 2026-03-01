@@ -1537,7 +1537,6 @@ impl Ring {
             .remove_downstream_subscriber(contract, peer)
     }
 
-    #[allow(dead_code)] // Only used in tests
     pub fn has_downstream_subscribers(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.has_downstream_subscribers(contract)
     }

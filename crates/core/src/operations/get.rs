@@ -990,6 +990,7 @@ impl Operation for GetOp {
                             stats,
                             self.upstream_addr,
                             None,
+                            None,
                         );
                     } else {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
@@ -1062,6 +1063,25 @@ impl Operation for GetOp {
                                 }
                             }
                             _ => None,
+                        };
+
+                        // Relay peers in ReceivedRequest: prefer fresh network state,
+                        // local cache is fallback only. Store local value and forward.
+                        let local_value = if self.upstream_addr.is_some()
+                            && matches!(self.state, Some(GetState::ReceivedRequest))
+                        {
+                            if let Some(lv) = local_value {
+                                tracing::debug!(
+                                    tx = %id,
+                                    "Relay peer deferring local cache, forwarding GET for fresh state"
+                                );
+                                local_fallback = Some(lv);
+                                None
+                            } else {
+                                None
+                            }
+                        } else {
+                            local_value
                         };
 
                         if let Some((key, state, contract)) = local_value {
@@ -1258,6 +1278,7 @@ impl Operation for GetOp {
                                 op_manager,
                                 stats,
                                 self.upstream_addr,
+                                local_fallback,
                             )
                             .await;
                         }
@@ -1424,22 +1445,41 @@ impl Operation for GetOp {
                                             visited: new_visited.clone(),
                                         }));
                                 } else if let Some(requester_peer) = requester.clone() {
-                                    // No more peers to try, return NotFound to requester
-                                    tracing::warn!(
-                                        tx = %id,
-                                        %instance_id,
-                                        peer_addr = %this_peer,
-                                        target = %requester_peer,
-                                        tried = ?tried_peers,
-                                        skip = ?new_visited,
-                                        phase = "not_found",
-                                        "No other peers found while trying to get the contract, returning NotFound to requester"
-                                    );
-                                    return_msg = Some(GetMsg::Response {
-                                        id,
-                                        instance_id,
-                                        result: GetMsgResult::NotFound,
-                                    });
+                                    // No more peers to try — serve local fallback if available
+                                    if let Some((key, state, contract)) = local_fallback.take() {
+                                        tracing::info!(
+                                            tx = %id,
+                                            contract = %key,
+                                            "Relay serving local cache as fallback (network returned NotFound)"
+                                        );
+                                        return_msg = Some(GetMsg::Response {
+                                            id,
+                                            instance_id,
+                                            result: GetMsgResult::Found {
+                                                key,
+                                                value: StoreResponse {
+                                                    state: Some(state),
+                                                    contract,
+                                                },
+                                            },
+                                        });
+                                    } else {
+                                        tracing::warn!(
+                                            tx = %id,
+                                            %instance_id,
+                                            peer_addr = %this_peer,
+                                            target = %requester_peer,
+                                            tried = ?tried_peers,
+                                            skip = ?new_visited,
+                                            phase = "not_found",
+                                            "No other peers found while trying to get the contract, returning NotFound to requester"
+                                        );
+                                        return_msg = Some(GetMsg::Response {
+                                            id,
+                                            instance_id,
+                                            result: GetMsgResult::NotFound,
+                                        });
+                                    }
                                 } else {
                                     // Original requester - check for local fallback before failing
                                     if let Some((key, state, contract)) = local_fallback.take() {
@@ -1542,22 +1582,41 @@ impl Operation for GetOp {
                                 );
 
                                 if let Some(requester_peer) = requester.clone() {
-                                    // Return NotFound to requester
-                                    tracing::warn!(
-                                        tx = %id,
-                                        %instance_id,
-                                        peer_addr = %this_peer,
-                                        target = %requester_peer,
-                                        tried = ?tried_peers,
-                                        skip = ?visited,
-                                        phase = "not_found",
-                                        "No other peers found, returning NotFound to requester"
-                                    );
-                                    return_msg = Some(GetMsg::Response {
-                                        id,
-                                        instance_id,
-                                        result: GetMsgResult::NotFound,
-                                    });
+                                    // No more peers to try — serve local fallback if available
+                                    if let Some((key, state, contract)) = local_fallback.take() {
+                                        tracing::info!(
+                                            tx = %id,
+                                            contract = %key,
+                                            "Relay serving local cache as fallback (max retries, network returned NotFound)"
+                                        );
+                                        return_msg = Some(GetMsg::Response {
+                                            id,
+                                            instance_id,
+                                            result: GetMsgResult::Found {
+                                                key,
+                                                value: StoreResponse {
+                                                    state: Some(state),
+                                                    contract,
+                                                },
+                                            },
+                                        });
+                                    } else {
+                                        tracing::warn!(
+                                            tx = %id,
+                                            %instance_id,
+                                            peer_addr = %this_peer,
+                                            target = %requester_peer,
+                                            tried = ?tried_peers,
+                                            skip = ?visited,
+                                            phase = "not_found",
+                                            "No other peers found, returning NotFound to requester"
+                                        );
+                                        return_msg = Some(GetMsg::Response {
+                                            id,
+                                            instance_id,
+                                            result: GetMsgResult::NotFound,
+                                        });
+                                    }
                                     new_state = None;
                                 } else {
                                     // Original requester - check for local fallback before failing
@@ -1842,9 +1901,10 @@ impl Operation for GetOp {
                                 }
                             }
 
-                            // Auto-subscribe to receive updates for this contract
-                            // record_get_access already refreshed the hosting cache above
-                            if crate::ring::AUTO_SUBSCRIBE_ON_GET {
+                            // Auto-subscribe to receive updates for this contract.
+                            // Only the original requester subscribes — relay peers cache
+                            // for durability but don't subscribe (no freshness obligation).
+                            if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
                                 // Only start new subscription if not already subscribed
                                 if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
                                     let blocking = subscribe_requested && blocking_sub;
@@ -1926,9 +1986,10 @@ impl Operation for GetOp {
                                             }
                                         }
 
-                                        // Auto-subscribe to receive updates for this contract
-                                        // record_get_access already refreshed the hosting cache above
-                                        if crate::ring::AUTO_SUBSCRIBE_ON_GET {
+                                        // Auto-subscribe to receive updates for this contract.
+                                        // Only the original requester subscribes — relay peers cache
+                                        // for durability but don't subscribe (no freshness obligation).
+                                        if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
                                             // Only start new subscription if not already subscribed
                                             if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
                                                 let blocking = subscribe_requested && blocking_sub;
@@ -2480,11 +2541,13 @@ impl Operation for GetOp {
                 stats,
                 self.upstream_addr,
                 stream_data,
+                local_fallback,
             )
         })
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_op_result(
     id: Transaction,
     state: Option<GetState>,
@@ -2493,6 +2556,7 @@ fn build_op_result(
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
     stream_data: Option<(StreamId, bytes::Bytes)>,
+    local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
 ) -> Result<OperationResult, OpError> {
     // Determine the next hop for sending the message:
     // - For Response messages: route back to upstream_addr (who sent us the request)
@@ -2513,7 +2577,7 @@ fn build_op_result(
         result,
         stats,
         upstream_addr,
-        local_fallback: None, // Forwarding operations don't have local fallback
+        local_fallback,
     });
     let return_msg = msg.map(NetMessage::from);
     let op_state = output_op.map(OpEnum::Get);
@@ -2544,6 +2608,7 @@ async fn try_forward_or_return(
     op_manager: &OpManager,
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
+    local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
 ) -> Result<OperationResult, OpError> {
     tracing::warn!(
         tx = %id,
@@ -2633,29 +2698,50 @@ async fn try_forward_or_return(
             stats,
             upstream_addr,
             None,
+            local_fallback,
         )
     } else if upstream_addr.is_some() {
-        // No targets found and we don't have the contract - send NotFound back to requester
-        tracing::warn!(
-            tx = %id,
-            %instance_id,
-            phase = "not_found",
-            "No peers to forward get request to, returning NotFound to upstream"
-        );
-
-        build_op_result(
-            id,
-            None,
-            Some(GetMsg::Response {
+        // No targets found — check for local fallback before returning NotFound
+        if let Some((key, state, contract)) = local_fallback {
+            tracing::info!(
+                tx = %id,
+                contract = %key,
+                "Relay serving local cache as fallback (no forwarding targets)"
+            );
+            let msg = GetMsg::Response {
                 id,
                 instance_id,
-                result: GetMsgResult::NotFound,
-            }),
-            None,
-            stats,
-            upstream_addr,
-            None,
-        )
+                result: GetMsgResult::Found {
+                    key,
+                    value: StoreResponse {
+                        state: Some(state),
+                        contract,
+                    },
+                },
+            };
+            build_op_result(id, None, Some(msg), None, stats, upstream_addr, None, None)
+        } else {
+            tracing::warn!(
+                tx = %id,
+                %instance_id,
+                phase = "not_found",
+                "No peers to forward get request to, returning NotFound to upstream"
+            );
+            build_op_result(
+                id,
+                None,
+                Some(GetMsg::Response {
+                    id,
+                    instance_id,
+                    result: GetMsgResult::NotFound,
+                }),
+                None,
+                stats,
+                upstream_addr,
+                None,
+                None,
+            )
+        }
     } else {
         // Original requester with no forwarding targets - operation fails locally
         tracing::warn!(
@@ -2672,7 +2758,7 @@ async fn try_forward_or_return(
         )
         .await;
 
-        build_op_result(id, None, None, None, stats, upstream_addr, None)
+        build_op_result(id, None, None, None, stats, upstream_addr, None, None)
     }
 }
 
