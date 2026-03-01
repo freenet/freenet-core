@@ -1272,15 +1272,24 @@ async fn process_open_request(
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
 
+                            // Refresh hosting TTL on user GET — this is the
+                            // correct place to keep hosted contracts alive (not
+                            // in subscription renewal, which would create an
+                            // immortal-entry feedback loop).
+                            if is_hosted {
+                                op_manager.ring.touch_hosting(&full_key);
+                            }
+
                             tracing::debug!(
                                 client_id = %client_id,
                                 request_id = %request_id,
                                 peer = %peer_id,
                                 contract = %full_key,
                                 is_subscribed,
+                                is_hosted,
                                 connection_count,
                                 phase = "local_cache",
-                                "Returning locally cached contract state (subscribed or isolated)"
+                                "Returning locally cached contract state"
                             );
 
                             // Handle subscription for locally found contracts

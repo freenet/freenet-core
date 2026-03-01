@@ -805,16 +805,25 @@ impl Ring {
     /// The task respects existing backoff mechanisms to avoid subscription spam.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
         // Wait for the first ring connection before starting subscription recovery.
+        // Poll until the first ring connection appears (or timeout after 5 min).
         // This replaces the old fixed 30-60s random delay. We poll every 2 seconds
-        // so that subscriptions for locally cached contracts start as soon as the
-        // node joins the ring — critical for serving GET requests from local cache
-        // (which requires an active subscription for freshness).
+        // so subscriptions start as soon as the node joins the ring.
+        const MAX_WAIT: Duration = Duration::from_secs(300);
+        let wait_start = tokio::time::Instant::now();
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             if ring.open_connections() > 0 {
                 tracing::info!(
                     hosted_contracts = ring.hosting_contract_keys().len(),
-                    "Ring connection established, starting subscription recovery for hosted contracts"
+                    "Ring connection established, starting subscription recovery"
+                );
+                break;
+            }
+            if wait_start.elapsed() >= MAX_WAIT {
+                tracing::warn!(
+                    hosted_contracts = ring.hosting_contract_keys().len(),
+                    "No ring connections after {:?}, starting subscription recovery anyway",
+                    MAX_WAIT
                 );
                 break;
             }
@@ -1639,7 +1648,7 @@ impl Ring {
 
     /// Touch a contract in the hosting cache (refresh TTL without adding).
     ///
-    /// Called on user GET to keep hosted contracts alive in the LRU cache.
+    /// Called when a user GET serves a hosted contract from local cache.
     pub fn touch_hosting(&self, key: &ContractKey) {
         self.hosting_manager.touch_hosting(key)
     }

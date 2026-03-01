@@ -197,9 +197,9 @@ impl<T: TimeSource> HostingCache<T> {
 
     /// Touch/refresh a contract's timestamp without adding it if missing.
     ///
-    /// Refreshes the TTL and LRU position, indicating the contract
-    /// is actively receiving updates.
-    #[cfg(test)]
+    /// Called when a user GET serves a hosted contract from local cache.
+    /// This refreshes the TTL and LRU position so actively requested
+    /// contracts stay in the cache.
     pub fn touch(&mut self, key: &ContractKey) {
         if let Some(existing) = self.contracts.get_mut(key) {
             existing.last_accessed = self.time_source.now();
@@ -259,21 +259,19 @@ impl<T: TimeSource> HostingCache<T> {
     /// Only evicts when `current_bytes > budget_bytes`. Among over-budget
     /// entries, contracts past `min_ttl` since their last access are evicted
     /// (oldest first via LRU order) unless the `should_retain` predicate
-    /// returns `true` (e.g., contracts with active client subscriptions).
+    /// returns `true` (e.g., contracts with active client subscriptions or
+    /// downstream subscribers).
     ///
-    /// This is an LRU cache: contracts live indefinitely while under budget.
-    /// The TTL determines eviction *eligibility* when space is needed, not a
-    /// hard expiry.
-    ///
+    /// Uses `retain()` to preserve LRU ordering for non-evicted entries.
     /// Returns contracts evicted from this cache.
     pub fn sweep_expired<F>(&mut self, should_retain: F) -> Vec<ContractKey>
     where
         F: Fn(&ContractKey) -> bool,
     {
         if self.current_bytes <= self.budget_bytes {
-            // Under budget — nothing to evict. This is what makes it an LRU:
-            // contracts live indefinitely while we have space. The TTL only
-            // determines eviction eligibility when we need to free space.
+            // Under budget — nothing to evict. Contracts live indefinitely
+            // while we have space. TTL only determines eviction eligibility
+            // when we need to free space.
             return Vec::new();
         }
 

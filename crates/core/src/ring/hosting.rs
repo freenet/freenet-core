@@ -648,6 +648,13 @@ impl HostingManager {
         self.is_subscribed(contract) || self.has_client_subscriptions(contract.id())
     }
 
+    /// Touch a contract in the hosting cache (refresh TTL without adding).
+    ///
+    /// Called when a user GET serves a hosted contract from local cache.
+    pub fn touch_hosting(&self, key: &ContractKey) {
+        self.hosting_cache.write().touch(key);
+    }
+
     /// Sweep for expired entries in the hosting cache.
     ///
     /// Contracts are protected from eviction if they have client subscriptions
@@ -658,9 +665,6 @@ impl HostingManager {
     /// Automatically removes persisted metadata for expired contracts.
     pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
         let expired = self.hosting_cache.write().sweep_expired(|key| {
-            // Retain contracts with active subscriptions of any kind:
-            // - Client subscriptions: local apps need updates
-            // - Downstream subscribers: network peers depend on us for updates
             self.has_client_subscriptions(key.id()) || self.has_downstream_subscribers(key)
         });
 
