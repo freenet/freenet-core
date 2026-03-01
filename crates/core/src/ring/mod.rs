@@ -806,12 +806,12 @@ impl Ring {
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
         // Wait for the first ring connection before starting subscription recovery.
         // Poll until the first ring connection appears (or timeout after 5 min).
-        // This replaces the old fixed 30-60s random delay. We poll every 2 seconds
-        // so subscriptions start as soon as the node joins the ring.
+        // This replaces the old fixed 30-60s random delay. Sub-second polling
+        // keeps the sleep interruptible per code-style.md rules.
         const MAX_WAIT: Duration = Duration::from_secs(300);
         let wait_start = tokio::time::Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             if ring.open_connections() > 0 {
                 tracing::info!(
                     hosted_contracts = ring.hosting_contract_keys().len(),

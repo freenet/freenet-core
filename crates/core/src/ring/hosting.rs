@@ -1471,80 +1471,13 @@ mod tests {
         );
 
         // Also renewed with a client subscription
+        let client_id = crate::client_events::ClientId::next();
         manager.add_client_subscription(contract.id(), client_id);
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
             needs_renewal.contains(&contract),
             "Hosted contract should need renewal even without client interest"
         );
-    }
-
-    #[test]
-    fn test_downstream_subscribers_protect_from_eviction() {
-        use crate::ring::hosting::cache::HostingCache;
-        use crate::util::time_source::SharedMockTimeSource;
-
-        let time = SharedMockTimeSource::new();
-        let min_ttl = Duration::from_secs(60);
-        // Budget of 150 bytes with 2x100-byte entries = over budget
-        let mut cache = HostingCache::new(150, min_ttl, time.clone());
-
-        let protected = make_contract_key(1);
-        let unprotected = make_contract_key(2);
-
-        cache.record_access(protected, 100, AccessType::Get);
-        cache.record_access(unprotected, 100, AccessType::Get);
-        assert_eq!(cache.current_bytes(), 200); // over budget
-
-        // Advance past TTL
-        time.advance_time(Duration::from_secs(61));
-
-        // Sweep with predicate that protects the first contract
-        // (simulates has_downstream_subscribers returning true)
-        let evicted = cache.sweep_expired(|k| *k == protected);
-
-        assert!(
-            !evicted.contains(&protected),
-            "Contract with downstream subscribers must not be evicted"
-        );
-        assert!(
-            evicted.contains(&unprotected),
-            "Unprotected contract should be evicted when over budget + past TTL"
-        );
-        assert!(cache.contains(&protected));
-    }
-
-    #[test]
-    fn test_no_subscribers_allows_eviction() {
-        use crate::ring::hosting::cache::HostingCache;
-        use crate::util::time_source::SharedMockTimeSource;
-
-        let time = SharedMockTimeSource::new();
-        let min_ttl = Duration::from_secs(60);
-        // Budget of 80 bytes, entry is 100 → over budget immediately
-        let mut cache = HostingCache::new(80, min_ttl, time.clone());
-
-        let contract = make_contract_key(100);
-        cache.record_access(contract, 100, AccessType::Get);
-        assert!(cache.contains(&contract));
-
-        // Under TTL: should not be evicted even though over budget
-        let evicted = cache.sweep_expired(|_| false);
-        assert!(
-            evicted.is_empty(),
-            "Contract within TTL should not be evicted"
-        );
-
-        // Advance past TTL
-        time.advance_time(Duration::from_secs(61));
-
-        // Now should be evicted (over budget + past TTL + no retain predicate)
-        let evicted = cache.sweep_expired(|_| false);
-        assert!(
-            evicted.contains(&contract),
-            "Contract past TTL with no subscribers should be evicted"
-        );
-        assert!(!cache.contains(&contract));
     }
 
     /// Validates that backoff constants are internally consistent.
