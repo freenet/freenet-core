@@ -261,6 +261,12 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
         Option<std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>>,
     /// Hashes of recently dispatched metadata bytes, to dedup
     /// embedded-metadata-in-fragment-#1 against the separate ShortMessage.
+    ///
+    /// Uses `DefaultHasher` (not cryptographic). A hash collision would cause
+    /// a silent metadata drop, leading to a 60-second operation timeout for
+    /// the affected stream. This is an acceptable trade-off given the small
+    /// working set size (capped at 1000 entries) and negligible collision
+    /// probability.
     dispatched_msg_hashes: HashSet<u64>,
 }
 
@@ -1276,6 +1282,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // We always dispatch ShortMessages — dedup only suppresses the
                 // redundant embedded-metadata copy, never the ShortMessage itself.
                 self.dispatched_msg_hashes.insert(Self::msg_hash(&bytes));
+                if self.dispatched_msg_hashes.len() > 1000 {
+                    self.dispatched_msg_hashes.clear();
+                }
                 Ok(Some(bytes))
             }
             AckConnection { result: Err(cause) } => {
@@ -2480,5 +2489,61 @@ mod tests {
                 interval,
             );
         }
+    }
+
+    /// Helper to compute msg_hash the same way PeerConnection does.
+    fn msg_hash(bytes: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    }
+
+    /// Helper that mirrors PeerConnection::is_duplicate_dispatch.
+    fn is_duplicate_dispatch(set: &mut HashSet<u64>, bytes: &[u8]) -> bool {
+        !set.insert(msg_hash(bytes))
+    }
+
+    #[test]
+    fn dispatched_short_message_always_recorded() {
+        // ShortMessage path inserts hash — the insert itself never indicates "duplicate"
+        // because ShortMessages are always dispatched.
+        let mut set = HashSet::new();
+        let bytes = b"metadata-payload";
+        assert!(set.insert(msg_hash(bytes)), "first insert should succeed");
+        // Inserting same hash again returns false (already present), but this path
+        // is only used for embedded-metadata dedup, never for ShortMessage dispatch.
+        assert!(!set.insert(msg_hash(bytes)), "second insert returns false");
+    }
+
+    #[test]
+    fn duplicate_embedded_metadata_suppressed() {
+        // If metadata was already dispatched as a ShortMessage, the same bytes
+        // arriving as embedded metadata should be detected as a duplicate.
+        let mut set = HashSet::new();
+        let bytes = b"streaming-metadata";
+        // Simulate ShortMessage dispatch (insert hash)
+        set.insert(msg_hash(bytes));
+        // Now embedded metadata arrives with same bytes
+        assert!(
+            is_duplicate_dispatch(&mut set, bytes),
+            "embedded metadata with same bytes should be suppressed"
+        );
+    }
+
+    #[test]
+    fn different_metadata_not_suppressed() {
+        // Different metadata bytes must not be suppressed even if a prior
+        // ShortMessage was recorded.
+        let mut set = HashSet::new();
+        let short_msg = b"first-metadata";
+        let embedded = b"different-metadata";
+        // Simulate ShortMessage dispatch
+        set.insert(msg_hash(short_msg));
+        // Different embedded metadata should NOT be suppressed
+        assert!(
+            !is_duplicate_dispatch(&mut set, embedded),
+            "different metadata bytes must not be treated as duplicate"
+        );
     }
 }

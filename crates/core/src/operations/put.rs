@@ -670,8 +670,13 @@ impl Operation for PutOp {
                     );
 
                     // Step 1: Claim the stream from orphan registry (atomic dedup)
-                    let peer_addr =
-                        source_addr.expect("streaming PUT request must have source_addr");
+                    let peer_addr = match source_addr {
+                        Some(addr) => addr,
+                        None => {
+                            tracing::error!(tx = %id, "source_addr missing for streaming PUT request");
+                            return Err(OpError::UnexpectedOpState);
+                        }
+                    };
                     let stream_handle = match op_manager
                         .orphan_stream_registry()
                         .claim_or_wait(peer_addr, *stream_id, STREAM_CLAIM_TIMEOUT)
