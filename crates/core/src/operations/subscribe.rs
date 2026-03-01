@@ -453,10 +453,11 @@ async fn complete_local_subscription(
     // announce they seed this contract via ChangeInterests, our has_local_interest()
     // check will pass, and we'll register their peer interest, enabling direct
     // update broadcasts from them to us.
-    let became_interested = !op_manager.interest_manager.has_local_interest(&key);
-    op_manager.interest_manager.register_local_interest(&key);
-    if became_interested {
-        super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
+    if !is_renewal {
+        let became_interested = op_manager.interest_manager.add_local_client(&key);
+        if became_interested {
+            super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
+        }
     }
 
     // Notify client layer that subscription is complete.
@@ -1185,16 +1186,17 @@ impl Operation for SubscribeOp {
                                 // ChangeInterests for contracts they seed, the has_local_interest()
                                 // check in the ChangeInterests handler fails, preventing peer
                                 // interest registration and breaking update propagation.
-                                let became_interested =
-                                    !op_manager.interest_manager.has_local_interest(key);
-                                op_manager.interest_manager.register_local_interest(key);
-                                if became_interested {
-                                    super::broadcast_change_interests(
-                                        op_manager,
-                                        vec![*key],
-                                        vec![],
-                                    )
-                                    .await;
+                                if !self.is_renewal {
+                                    let became_interested =
+                                        op_manager.interest_manager.add_local_client(key);
+                                    if became_interested {
+                                        super::broadcast_change_interests(
+                                            op_manager,
+                                            vec![*key],
+                                            vec![],
+                                        )
+                                        .await;
+                                    }
                                 }
 
                                 // Emit telemetry for successful subscription

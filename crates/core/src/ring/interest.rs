@@ -1888,4 +1888,21 @@ mod tests {
         assert!(expired.is_empty(), "re-registration should have reset TTL");
         assert!(manager.get_peer_interest(&contract, &peer).is_some());
     }
+
+    #[test]
+    fn test_subscribe_registers_local_interest() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+
+        assert!(!manager.has_local_interest(&contract));
+
+        let became_interested = manager.add_local_client(&contract);
+        assert!(became_interested);
+        assert!(manager.has_local_interest(&contract));
+
+        // Second call should not report "became interested" (already was)
+        let became_interested_again = manager.add_local_client(&contract);
+        assert!(!became_interested_again);
+        assert!(manager.has_local_interest(&contract));
+    }
 }
