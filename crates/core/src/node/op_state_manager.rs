@@ -1297,6 +1297,16 @@ fn remove_get_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring
         if let Some((peer, contract_location)) = get_op.failure_routing_info() {
             report_timeout_failure(ring, tx, peer, contract_location);
         }
+        // Log GET timeout so failures are visible (previously silent)
+        if let Some(instance_id) = get_op.instance_id() {
+            tracing::warn!(
+                tx = %tx,
+                %instance_id,
+                elapsed_ms = tx.elapsed().as_millis(),
+                phase = "get_timeout",
+                "GET operation timed out without receiving a response"
+            );
+        }
         true
     } else {
         false

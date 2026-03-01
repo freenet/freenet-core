@@ -133,7 +133,7 @@ pub(crate) async fn request_get(
                     }),
             }) => {
                 if *fetch_contract && contract.is_none() {
-                    tracing::debug!(
+                    tracing::info!(
                         tx = %id,
                         %instance_id,
                         "GET: state available locally but contract code missing; will query peers"
@@ -523,6 +523,15 @@ impl GetOp {
             }
         } else {
             OpOutcome::Incomplete
+        }
+    }
+
+    /// Extract the contract instance ID from the operation state, if available.
+    pub(crate) fn instance_id(&self) -> Option<ContractInstanceId> {
+        match &self.state {
+            Some(GetState::PrepareRequest(data)) => Some(data.instance_id),
+            Some(GetState::AwaitingResponse(data)) => Some(data.instance_id),
+            _ => None,
         }
     }
 
@@ -1040,7 +1049,7 @@ impl Operation for GetOp {
                                     }),
                             }) => {
                                 if fetch_contract && contract.is_none() {
-                                    tracing::debug!(
+                                    tracing::info!(
                                         tx = %id,
                                         %instance_id,
                                         %this_peer,
@@ -1513,7 +1522,18 @@ impl Operation for GetOp {
                                                 .await;
                                         }
 
-                                        // Set result to None - to_host_result will return an error
+                                        // Notify the client that the GET failed
+                                        op_manager
+                                            .send_client_result(
+                                                id,
+                                                Err(ErrorKind::OperationError {
+                                                    cause: format!(
+                                                        "contract {instance_id} not found after exhausting all peers"
+                                                    ).into(),
+                                                }
+                                                .into()),
+                                            )
+                                            .await;
                                         return_msg = None;
                                         new_state = None;
                                     }
@@ -1626,6 +1646,18 @@ impl Operation for GetOp {
                                                 .await;
                                         }
 
+                                        // Notify the client that the GET failed
+                                        op_manager
+                                            .send_client_result(
+                                                id,
+                                                Err(ErrorKind::OperationError {
+                                                    cause: format!(
+                                                        "contract {instance_id} not found after max retries"
+                                                    ).into(),
+                                                }
+                                                .into()),
+                                            )
+                                            .await;
                                         return_msg = None;
                                         new_state = None;
                                     }
@@ -2002,8 +2034,41 @@ impl Operation for GetOp {
                             contract: contract.clone(),
                         });
                     } else {
-                        // Forward response to upstream
+                        // Forward response to upstream — and opportunistically cache
+                        // the contract code locally. This spreads WASM code through
+                        // the network as GET responses flow back, fixing the problem
+                        // where UPDATE-only subscribers lack the code needed to serve
+                        // future GET requests with fetch_contract=true.
                         tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
+                        if let Some(ref code) = contract {
+                            let cache_result = op_manager
+                                .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                                    key,
+                                    state: value.clone(),
+                                    related_contracts: RelatedContracts::default(),
+                                    contract: Some(code.clone()),
+                                })
+                                .await;
+                            match cache_result {
+                                Ok(ContractHandlerEvent::PutResponse {
+                                    new_value: Ok(_), ..
+                                }) => {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        contract = %key,
+                                        phase = "relay_cache",
+                                        "Cached contract code at relay peer"
+                                    );
+                                }
+                                _ => {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        contract = %key,
+                                        "Failed to cache contract code at relay peer (non-fatal)"
+                                    );
+                                }
+                            }
+                        }
                         new_state = None;
                         return_msg = Some(GetMsg::Response {
                             id,
@@ -2609,6 +2674,20 @@ async fn try_forward_or_return(
             phase = "not_found",
             "No peers to forward get request to and no upstream - local operation fails"
         );
+
+        // Notify the client that the GET failed
+        op_manager
+            .send_client_result(
+                id,
+                Err(ErrorKind::OperationError {
+                    cause: format!(
+                        "contract {instance_id} not found, no peers available to forward"
+                    )
+                    .into(),
+                }
+                .into()),
+            )
+            .await;
 
         build_op_result(id, None, None, None, stats, upstream_addr, None)
     }
