@@ -504,6 +504,10 @@ impl HostingManager {
 
     /// Check if a contract has no local clients and no downstream subscribers,
     /// meaning we can safely unsubscribe upstream.
+    ///
+    /// Note: this does NOT check the hosting cache. Hosting cache membership
+    /// is handled separately in `contracts_needing_renewal()`, which always
+    /// renews subscriptions for hosted contracts regardless of this predicate.
     pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
         if self.has_client_subscriptions(contract.id()) {
             return false;
@@ -644,21 +648,20 @@ impl HostingManager {
         self.is_subscribed(contract) || self.has_client_subscriptions(contract.id())
     }
 
-    /// Touch a contract in the hosting cache (refresh TTL without adding).
-    ///
-    /// Called when GET or SUBSCRIBE refreshes a hosted contract's TTL.
-    pub fn touch_hosting(&self, key: &ContractKey) {
-        self.hosting_cache.write().touch(key);
-    }
-
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Contracts with client subscriptions are protected from eviction.
+    /// Contracts are protected from eviction if they have client subscriptions
+    /// OR downstream subscribers (other peers relying on us for updates).
+    /// The downstream subscriber exemption is time-bounded: stale entries are
+    /// removed by `expire_stale_downstream_subscribers()` (called periodically)
+    /// after `SUBSCRIPTION_LEASE_DURATION` without renewal.
     /// Automatically removes persisted metadata for expired contracts.
     pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
         let expired = self.hosting_cache.write().sweep_expired(|key| {
-            // Retain contracts with client subscriptions - they need updates
-            self.has_client_subscriptions(key.id())
+            // Retain contracts with active subscriptions of any kind:
+            // - Client subscriptions: local apps need updates
+            // - Downstream subscribers: network peers depend on us for updates
+            self.has_client_subscriptions(key.id()) || self.has_downstream_subscribers(key)
         });
 
         // Clean up persisted metadata for expired contracts
@@ -820,12 +823,15 @@ impl HostingManager {
             {
                 continue;
             }
-            // Skip contracts with no local clients and no downstream subscribers —
-            // renewing would trigger an immediate unsubscribe, repeating every cycle.
-            if self.should_unsubscribe_upstream(&contract) {
-                continue;
-            }
-            // This hosted contract needs subscription renewal
+            // All hosted contracts get subscription renewal unconditionally.
+            // The hosting cache is an LRU: contracts live indefinitely while
+            // under budget, and only become eviction candidates (oldest first)
+            // when the cache exceeds its byte budget. Active subscribers
+            // (client or downstream) protect contracts from eviction.
+            //
+            // We intentionally do NOT check should_unsubscribe_upstream() here
+            // because interior peers (no clients, no downstream) still need
+            // subscriptions for contracts they're hosting.
             needs_renewal_set.insert(contract);
         }
 
@@ -1446,7 +1452,6 @@ mod tests {
 
     #[test]
     fn test_contracts_needing_renewal_includes_hosted() {
-        // This is the key test for the bug fix
         let manager = HostingManager::new();
         let contract = make_contract_key(1);
         let client_id = crate::client_events::ClientId::next();
@@ -1454,15 +1459,15 @@ mod tests {
         // Add to hosting cache (simulating GET operation)
         manager.record_contract_access(contract, 1000, AccessType::Get);
 
-        // No clients and no downstream — renewing would trigger an immediate
-        // unsubscribe, which would repeat on every renewal cycle
+        // Hosted contracts should be renewed even without clients/downstream.
+        // contracts_needing_renewal() unconditionally includes hosted contracts.
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
-            !needs_renewal.contains(&contract),
-            "Hosted contract with no interest should not be renewed"
+            needs_renewal.contains(&contract),
+            "Hosted contract should be renewed to maintain subscription freshness"
         );
 
-        // Add a client subscription — now it should need renewal
+        // Also renewed with a client subscription
         manager.add_client_subscription(contract.id(), client_id);
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
@@ -1851,6 +1856,115 @@ mod tests {
         assert!(manager.should_unsubscribe_upstream(&contract));
         // InterestManager still tracks the peer — independent of unsubscribe decision
         assert!(interest.remove_peer_interest(&contract, &peer));
+    }
+
+    /// Hosted contracts get subscription renewal even without clients or
+    /// downstream subscribers. This prevents the hosting collapse where
+    /// interior peers drop subscriptions for contracts they're caching.
+    ///
+    /// Note: should_unsubscribe_upstream() still returns true for hosted
+    /// contracts without clients/downstream — the renewal bypass is in
+    /// contracts_needing_renewal(), not in the unsubscribe predicate.
+    #[test]
+    fn test_hosted_contract_renewed_despite_no_interest() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(42);
+
+        // Add contract to hosting cache via GET access
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        assert!(manager.is_hosting_contract(&contract));
+
+        // should_unsubscribe_upstream still returns true (no clients, no downstream)
+        assert!(
+            manager.should_unsubscribe_upstream(&contract),
+            "should_unsubscribe_upstream does not check hosting cache"
+        );
+
+        // But contracts_needing_renewal() includes it anyway
+        let renewals = manager.contracts_needing_renewal();
+        assert!(
+            renewals.contains(&contract),
+            "Hosted contract should be included in subscription renewals"
+        );
+    }
+
+    /// A hosted contract with downstream subscribers must NOT be evicted
+    /// from the hosting cache even after TTL expires and cache is over budget.
+    /// Without this, interior peers would drop hosting → stop renewal → lose
+    /// upstream subscription → downstream subscribers lose their feed.
+    ///
+    /// This test operates at the HostingCache level with MockTimeSrc so we
+    /// can actually advance time past TTL and verify the retain predicate.
+    #[test]
+    fn test_downstream_subscribers_protect_from_eviction() {
+        use crate::ring::hosting::cache::HostingCache;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let time = SharedMockTimeSource::new();
+        let min_ttl = Duration::from_secs(60);
+        // Budget of 150 bytes with 2x100-byte entries = over budget
+        let mut cache = HostingCache::new(150, min_ttl, time.clone());
+
+        let protected = make_contract_key(1);
+        let unprotected = make_contract_key(2);
+
+        cache.record_access(protected, 100, AccessType::Get);
+        cache.record_access(unprotected, 100, AccessType::Get);
+        assert_eq!(cache.current_bytes(), 200); // over budget
+
+        // Advance past TTL
+        time.advance_time(Duration::from_secs(61));
+
+        // Sweep with predicate that protects the first contract
+        // (simulates has_downstream_subscribers returning true)
+        let evicted = cache.sweep_expired(|k| *k == protected);
+
+        assert!(
+            !evicted.contains(&protected),
+            "Contract with downstream subscribers must not be evicted"
+        );
+        assert!(
+            evicted.contains(&unprotected),
+            "Unprotected contract should be evicted when over budget + past TTL"
+        );
+        assert!(cache.contains(&protected));
+    }
+
+    /// A hosted contract with NO subscribers and NO clients SHOULD be
+    /// evictable after TTL expires when the cache is over budget.
+    ///
+    /// Uses HostingCache with MockTimeSrc for time advancement.
+    #[test]
+    fn test_no_subscribers_allows_eviction() {
+        use crate::ring::hosting::cache::HostingCache;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let time = SharedMockTimeSource::new();
+        let min_ttl = Duration::from_secs(60);
+        // Budget of 80 bytes, entry is 100 → over budget immediately
+        let mut cache = HostingCache::new(80, min_ttl, time.clone());
+
+        let contract = make_contract_key(100);
+        cache.record_access(contract, 100, AccessType::Get);
+        assert!(cache.contains(&contract));
+
+        // Under TTL: should not be evicted even though over budget
+        let evicted = cache.sweep_expired(|_| false);
+        assert!(
+            evicted.is_empty(),
+            "Contract within TTL should not be evicted"
+        );
+
+        // Advance past TTL
+        time.advance_time(Duration::from_secs(61));
+
+        // Now should be evicted (over budget + past TTL + no retain predicate)
+        let evicted = cache.sweep_expired(|_| false);
+        assert!(
+            evicted.contains(&contract),
+            "Contract past TTL with no subscribers should be evicted"
+        );
+        assert!(!cache.contains(&contract));
     }
 
     // =========================================================================

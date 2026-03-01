@@ -197,9 +197,9 @@ impl<T: TimeSource> HostingCache<T> {
 
     /// Touch/refresh a contract's timestamp without adding it if missing.
     ///
-    /// Called when UPDATE is received for a hosted contract.
-    /// This refreshes the TTL and LRU position, indicating the contract
+    /// Refreshes the TTL and LRU position, indicating the contract
     /// is actively receiving updates.
+    #[cfg(test)]
     pub fn touch(&mut self, key: &ContractKey) {
         if let Some(existing) = self.contracts.get_mut(key) {
             existing.last_accessed = self.time_source.now();
@@ -254,56 +254,53 @@ impl<T: TimeSource> HostingCache<T> {
         self.contracts.keys().cloned()
     }
 
-    /// Sweep for contracts that are over budget and past TTL.
+    /// Sweep for contracts past TTL when the cache is over budget.
     ///
-    /// The `should_retain` predicate is called for each candidate contract before eviction.
-    /// If it returns `true`, the contract is skipped (kept in cache) even if over TTL.
-    /// This allows protecting contracts with client subscriptions from eviction.
+    /// Only evicts when `current_bytes > budget_bytes`. Among over-budget
+    /// entries, contracts past `min_ttl` since their last access are evicted
+    /// (oldest first via LRU order) unless the `should_retain` predicate
+    /// returns `true` (e.g., contracts with active client subscriptions).
+    ///
+    /// This is an LRU cache: contracts live indefinitely while under budget.
+    /// The TTL determines eviction *eligibility* when space is needed, not a
+    /// hard expiry.
     ///
     /// Returns contracts evicted from this cache.
     pub fn sweep_expired<F>(&mut self, should_retain: F) -> Vec<ContractKey>
     where
         F: Fn(&ContractKey) -> bool,
     {
+        if self.current_bytes <= self.budget_bytes {
+            // Under budget — nothing to evict. This is what makes it an LRU:
+            // contracts live indefinitely while we have space. The TTL only
+            // determines eviction eligibility when we need to free space.
+            return Vec::new();
+        }
+
         let now = self.time_source.now();
         let mut evicted = Vec::new();
-        let mut skipped_keys = Vec::new();
 
-        // Only sweep if we're over budget
-        while self.current_bytes > self.budget_bytes && !self.lru_order.is_empty() {
-            if let Some(oldest_key) = self.lru_order.front().cloned() {
-                if let Some(oldest) = self.contracts.get(&oldest_key) {
-                    let age = now.saturating_duration_since(oldest.last_accessed);
-                    if age >= self.min_ttl {
-                        // Check if caller wants to retain this contract
-                        if should_retain(&oldest_key) {
-                            // Move to back of LRU (treat as recently accessed)
-                            self.lru_order.pop_front();
-                            skipped_keys.push(oldest_key);
-                            continue;
-                        }
-                        if let Some(removed) = self.contracts.remove(&oldest_key) {
-                            self.current_bytes =
-                                self.current_bytes.saturating_sub(removed.size_bytes);
-                            self.lru_order.pop_front();
-                            evicted.push(oldest_key);
-                        }
-                    } else {
-                        // Can't evict more - all remaining are within TTL
-                        break;
-                    }
+        // Over budget: evict past-TTL contracts (oldest first via LRU order)
+        // until we're back under budget.
+        self.lru_order.retain(|key| {
+            if self.current_bytes <= self.budget_bytes {
+                return true; // back under budget, stop evicting
+            }
+            if let Some(entry) = self.contracts.get(key) {
+                let age = now.saturating_duration_since(entry.last_accessed);
+                if age >= self.min_ttl && !should_retain(key) {
+                    let size = entry.size_bytes;
+                    self.contracts.remove(key);
+                    self.current_bytes = self.current_bytes.saturating_sub(size);
+                    evicted.push(*key);
+                    false
                 } else {
-                    self.lru_order.pop_front();
+                    true
                 }
             } else {
-                break;
+                false // orphaned LRU entry
             }
-        }
-
-        // Re-add skipped keys to back of LRU order
-        for key in skipped_keys {
-            self.lru_order.push_back(key);
-        }
+        });
 
         evicted
     }
@@ -636,8 +633,6 @@ mod tests {
         assert!(cache.contains(&key1));
         assert!(!cache.contains(&key2));
         assert!(cache.contains(&key3));
-
-        // key1 should now be at back of LRU (moved there when retained)
         assert_eq!(cache.current_bytes(), 200);
     }
 

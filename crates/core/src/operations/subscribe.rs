@@ -1104,10 +1104,10 @@ impl Operation for SubscribeOp {
                             op_manager.ring.subscribe(*key);
                             op_manager.ring.complete_subscription_request(key, true);
 
-                            // Refresh hosting TTL on subscription success.
-                            // This extends the hosting lifetime for contracts we're actively subscribed to.
-                            // (Unlike UPDATE, SUBSCRIBE is user-initiated so safe to extend TTL)
-                            op_manager.ring.touch_hosting(key);
+                            // Note: we intentionally do NOT call touch_hosting() here.
+                            // Subscription renewal is internal maintenance, not user activity.
+                            // Only genuine user access (GET/PUT) should refresh the hosting
+                            // cache TTL, so contracts naturally expire when no longer requested.
 
                             tracing::info!(
                                 tx = %msg_id,

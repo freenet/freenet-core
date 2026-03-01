@@ -163,10 +163,11 @@ mod tests {
         }
 
         let remaining = backoff.remaining_backoff(addr).unwrap();
-        // Must not exceed the 90s cap (allow a small margin for test execution time).
+        // Must not exceed the 90s cap + 20% jitter (TrackedBackoff applies ±20% jitter).
+        // Max possible: 90s * 1.2 = 108s.
         assert!(
-            remaining <= Duration::from_secs(90),
-            "Gateway backoff exceeded 90s cap: {remaining:?} — issue #3304"
+            remaining <= Duration::from_secs(108),
+            "Gateway backoff exceeded 90s cap + jitter: {remaining:?} — issue #3304"
         );
     }
 
