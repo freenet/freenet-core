@@ -1133,10 +1133,7 @@ async fn process_open_request(
                         subscribe,
                         blocking_subscribe,
                     } => {
-                        // For one-shot GETs (subscribe=false), try local cache BEFORE
-                        // checking peer readiness. This allows serving persisted contract
-                        // state even when the node hasn't joined the ring yet — critical
-                        // for the HTTP web handler which uses subscribe=false.
+                        // Try local cache before requiring ring join for non-subscribe GETs.
                         let peer_id = match ensure_peer_ready(&op_manager) {
                             Ok(id) => id,
                             Err(err) if !subscribe => {
@@ -1258,10 +1255,8 @@ async fn process_open_request(
                             .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
-                        // Hosted contracts are actively maintained by the subscription
-                        // renewal system and receive UPDATE broadcasts via proximity cache.
-                        // Serve them from local cache even if subscription hasn't completed
-                        // yet (subscribe operations take time after startup).
+                        // Hosted contracts are maintained by subscription renewal;
+                        // serve from cache even if subscribe hasn't completed yet.
                         let is_hosted = full_key
                             .as_ref()
                             .map(|k| op_manager.ring.is_hosting_contract(k))

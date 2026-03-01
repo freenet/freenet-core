@@ -1637,6 +1637,13 @@ impl Ring {
 
     // ==================== Hosting Cache Management ====================
 
+    /// Touch a contract in the hosting cache (refresh TTL without adding).
+    ///
+    /// Called on user GET to keep hosted contracts alive in the LRU cache.
+    pub fn touch_hosting(&self, key: &ContractKey) {
+        self.hosting_manager.touch_hosting(key)
+    }
+
     /// Sweep for expired entries in the hosting cache.
     ///
     /// Returns contracts evicted from this cache. Contracts with client
