@@ -1097,7 +1097,7 @@ async fn process_client_request(
     // would stall pings, subscriptions, and other responses).
     if let ClientRequest::DelegateOp(ref delegate_req) = req {
         let key_bytes: &[u8] = delegate_req.key().bytes();
-        if let Some(remaining) = conn_state.rate_limiter.check_backoff(key_bytes) {
+        if let Some(remaining) = rate_limiter.check_backoff(key_bytes) {
             tracing::warn!(
                 %client_id,
                 delegate_key = %delegate_req.key(),
