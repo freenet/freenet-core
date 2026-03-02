@@ -599,6 +599,31 @@ impl Operation for UpdateOp {
                                     tracing::warn!(tx = %id, error = %e, "failed to send ResyncRequest");
                                 }
                             }
+
+                            // Even though we couldn't apply the update locally (e.g.,
+                            // missing contract parameters at this relay node), we must
+                            // still forward the payload to downstream subscribers.
+                            // Without this, relay nodes that acquired a contract via
+                            // subscribe (without contract code) become black holes for
+                            // update notifications.
+                            tracing::info!(
+                                tx = %id,
+                                contract = %key,
+                                event = "relay_forward_on_local_failure",
+                                "Forwarding update to subscribers despite local apply failure"
+                            );
+                            if let Err(e) = op_manager
+                                .notify_node_event(
+                                    crate::message::NodeEvent::BroadcastStateChange {
+                                        key: *key,
+                                        new_state: state_for_telemetry.clone(),
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::warn!(tx = %id, error = %e, "failed to forward BroadcastStateChange");
+                            }
+
                             return Err(err);
                         }
                     };
