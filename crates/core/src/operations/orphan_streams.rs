@@ -17,10 +17,10 @@
 //!
 //! ```ignore
 //! // Transport layer: first fragment for unknown stream
-//! orphan_registry.register_orphan(stream_id, handle);
+//! orphan_registry.register_orphan(peer_addr, stream_id, handle);
 //!
 //! // Operations layer: metadata message arrives
-//! let handle = orphan_registry.claim_or_wait(stream_id, timeout).await?;
+//! let handle = orphan_registry.claim_or_wait(peer_addr, stream_id, timeout).await?;
 //! ```
 //!
 //! # Integration
@@ -29,6 +29,7 @@
 //! - Operations handlers call `claim_or_wait()` when metadata arrives
 //! - Periodic GC task cleans up expired orphans via `gc_expired()`
 
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -57,19 +58,27 @@ pub const STREAM_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// This registry enables safe handoff between the transport layer (which receives
 /// stream fragments) and the operations layer (which receives metadata messages).
+/// Key combining peer address and stream ID for collision-free lookups.
+///
+/// StreamIds are generated from thread-local counters per sender node, so
+/// different peers can independently generate the same StreamId. Scoping
+/// by `(SocketAddr, StreamId)` prevents collisions when two peers send
+/// streams with identical IDs to the same receiver.
+type StreamKey = (SocketAddr, StreamId);
+
 pub struct OrphanStreamRegistry {
     /// Streams awaiting metadata (arrived before RequestStreaming/ResponseStreaming).
-    /// Maps StreamId -> (StreamHandle, timestamp when registered).
-    orphan_streams: DashMap<StreamId, (StreamHandle, Instant)>,
+    /// Maps (peer_addr, StreamId) -> (StreamHandle, timestamp when registered).
+    orphan_streams: DashMap<StreamKey, (StreamHandle, Instant)>,
 
     /// Waiters for streams that haven't arrived yet (metadata arrived first).
-    /// Maps StreamId -> oneshot sender to deliver the StreamHandle.
-    stream_waiters: DashMap<StreamId, oneshot::Sender<StreamHandle>>,
+    /// Maps (peer_addr, StreamId) -> oneshot sender to deliver the StreamHandle.
+    stream_waiters: DashMap<StreamKey, oneshot::Sender<StreamHandle>>,
 
     /// Streams that have already been claimed. Used for deduplication when
     /// both the embedded metadata (in fragment #1) and the separate metadata
     /// message arrive — only the first one should be processed.
-    claimed_streams: DashMap<StreamId, ()>,
+    claimed_streams: DashMap<StreamKey, ()>,
 }
 
 impl OrphanStreamRegistry {
@@ -86,17 +95,28 @@ impl OrphanStreamRegistry {
     ///
     /// If someone is already waiting for this stream, the handle is delivered
     /// immediately. Otherwise, it's stored as an orphan until claimed or timeout.
-    pub fn register_orphan(&self, stream_id: StreamId, handle: StreamHandle) {
+    ///
+    /// `peer_addr` is the remote address of the peer that sent this stream,
+    /// used to scope lookups and prevent StreamId collisions across peers.
+    pub fn register_orphan(
+        &self,
+        peer_addr: SocketAddr,
+        stream_id: StreamId,
+        handle: StreamHandle,
+    ) {
+        let key = (peer_addr, stream_id);
         // Check if someone is already waiting for this stream
-        if let Some((_, waiter)) = self.stream_waiters.remove(&stream_id) {
+        if let Some((_, waiter)) = self.stream_waiters.remove(&key) {
             // Deliver to the waiter immediately
             if waiter.send(handle).is_err() {
                 tracing::warn!(
+                    %peer_addr,
                     stream_id = %stream_id,
                     "Failed to deliver orphan stream to waiter (receiver dropped)"
                 );
             } else {
                 tracing::debug!(
+                    %peer_addr,
                     stream_id = %stream_id,
                     "Delivered stream to waiting operation"
                 );
@@ -104,11 +124,11 @@ impl OrphanStreamRegistry {
         } else {
             // Store as orphan for later claim
             tracing::debug!(
+                %peer_addr,
                 stream_id = %stream_id,
                 "Registered orphan stream (metadata not yet received)"
             );
-            self.orphan_streams
-                .insert(stream_id, (handle, Instant::now()));
+            self.orphan_streams.insert(key, (handle, Instant::now()));
         }
     }
 
@@ -127,17 +147,22 @@ impl OrphanStreamRegistry {
     /// claimed this stream (deduplication).
     /// Returns `OrphanStreamError::Timeout` if the stream doesn't arrive within
     /// the timeout period.
+    /// `peer_addr` is the remote address of the peer that sent this stream,
+    /// used to scope lookups and prevent StreamId collisions across peers.
     pub async fn claim_or_wait(
         &self,
+        peer_addr: SocketAddr,
         stream_id: StreamId,
         timeout: Duration,
     ) -> Result<StreamHandle, OrphanStreamError> {
+        let key = (peer_addr, stream_id);
         // Atomic dedup: try to insert into claimed_streams. If already present,
         // another caller already claimed this stream.
         use dashmap::mapref::entry::Entry;
-        match self.claimed_streams.entry(stream_id) {
+        match self.claimed_streams.entry(key) {
             Entry::Occupied(_) => {
                 tracing::debug!(
+                    %peer_addr,
                     stream_id = %stream_id,
                     "Stream already claimed (dedup)"
                 );
@@ -149,8 +174,9 @@ impl OrphanStreamRegistry {
         }
 
         // Check if orphan exists
-        if let Some((_, (handle, _))) = self.orphan_streams.remove(&stream_id) {
+        if let Some((_, (handle, _))) = self.orphan_streams.remove(&key) {
             tracing::debug!(
+                %peer_addr,
                 stream_id = %stream_id,
                 "Claimed orphan stream immediately"
             );
@@ -159,9 +185,10 @@ impl OrphanStreamRegistry {
 
         // Register waiter
         let (tx, rx) = oneshot::channel();
-        self.stream_waiters.insert(stream_id, tx);
+        self.stream_waiters.insert(key, tx);
 
         tracing::debug!(
+            %peer_addr,
             stream_id = %stream_id,
             timeout_ms = timeout.as_millis(),
             "Waiting for stream to arrive"
@@ -171,6 +198,7 @@ impl OrphanStreamRegistry {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(handle)) => {
                 tracing::debug!(
+                    %peer_addr,
                     stream_id = %stream_id,
                     "Stream arrived while waiting"
                 );
@@ -178,10 +206,11 @@ impl OrphanStreamRegistry {
             }
             Ok(Err(_)) => {
                 // Sender was dropped (shouldn't happen in normal operation)
-                self.stream_waiters.remove(&stream_id);
+                self.stream_waiters.remove(&key);
                 // Remove our claim so a retry is possible
-                self.claimed_streams.remove(&stream_id);
+                self.claimed_streams.remove(&key);
                 tracing::warn!(
+                    %peer_addr,
                     stream_id = %stream_id,
                     "Stream waiter cancelled unexpectedly"
                 );
@@ -189,10 +218,11 @@ impl OrphanStreamRegistry {
             }
             Err(_) => {
                 // Timeout expired
-                self.stream_waiters.remove(&stream_id);
+                self.stream_waiters.remove(&key);
                 // Remove our claim so a retry is possible
-                self.claimed_streams.remove(&stream_id);
+                self.claimed_streams.remove(&key);
                 tracing::warn!(
+                    %peer_addr,
                     stream_id = %stream_id,
                     timeout_ms = timeout.as_millis(),
                     "Timeout waiting for stream"
@@ -210,20 +240,22 @@ impl OrphanStreamRegistry {
         let now = Instant::now();
         let mut expired_count = 0;
 
-        self.orphan_streams.retain(|stream_id, (handle, created)| {
-            if now.duration_since(*created) > ORPHAN_STREAM_TIMEOUT {
-                tracing::debug!(
-                    stream_id = %stream_id,
-                    age_secs = now.duration_since(*created).as_secs(),
-                    "Garbage collecting expired orphan stream"
-                );
-                handle.cancel();
-                expired_count += 1;
-                false
-            } else {
-                true
-            }
-        });
+        self.orphan_streams
+            .retain(|(peer_addr, stream_id), (handle, created)| {
+                if now.duration_since(*created) > ORPHAN_STREAM_TIMEOUT {
+                    tracing::debug!(
+                        %peer_addr,
+                        stream_id = %stream_id,
+                        age_secs = now.duration_since(*created).as_secs(),
+                        "Garbage collecting expired orphan stream"
+                    );
+                    handle.cancel();
+                    expired_count += 1;
+                    false
+                } else {
+                    true
+                }
+            });
 
         // Also prune claimed_streams to prevent unbounded growth.
         // Entries older than the orphan timeout can be safely removed since
@@ -327,6 +359,14 @@ mod tests {
     /// Age to use when simulating an expired orphan for GC tests.
     const EXPIRED_ORPHAN_AGE: Duration = Duration::from_secs(60);
 
+    fn dummy_addr() -> SocketAddr {
+        "127.0.0.1:9000".parse().unwrap()
+    }
+
+    fn dummy_addr_2() -> SocketAddr {
+        "127.0.0.2:9000".parse().unwrap()
+    }
+
     // Helper to create a test StreamHandle
     fn make_test_handle(stream_id: StreamId) -> StreamHandle {
         StreamHandle::new(stream_id, 1000)
@@ -344,14 +384,15 @@ mod tests {
         let registry = OrphanStreamRegistry::new();
         let stream_id = StreamId::next();
         let handle = make_test_handle(stream_id);
+        let addr = dummy_addr();
 
         // Register orphan
-        registry.register_orphan(stream_id, handle);
+        registry.register_orphan(addr, stream_id, handle);
         assert_eq!(registry.orphan_count(), 1);
 
         // Claim immediately
         let claimed = registry
-            .claim_or_wait(stream_id, Duration::from_secs(1))
+            .claim_or_wait(addr, stream_id, Duration::from_secs(1))
             .await;
         assert!(claimed.is_ok());
         assert_eq!(registry.orphan_count(), 0);
@@ -361,12 +402,13 @@ mod tests {
     async fn test_orphan_wait_then_register() {
         let registry = std::sync::Arc::new(OrphanStreamRegistry::new());
         let stream_id = StreamId::next();
+        let addr = dummy_addr();
 
         // Start waiting in background
         let registry_clone = registry.clone();
         let waiter = GlobalExecutor::spawn(async move {
             registry_clone
-                .claim_or_wait(stream_id, Duration::from_secs(5))
+                .claim_or_wait(addr, stream_id, Duration::from_secs(5))
                 .await
         });
 
@@ -376,7 +418,7 @@ mod tests {
 
         // Register orphan (should deliver to waiter)
         let handle = make_test_handle(stream_id);
-        registry.register_orphan(stream_id, handle);
+        registry.register_orphan(addr, stream_id, handle);
 
         // Waiter should succeed
         let result = waiter.await.unwrap();
@@ -389,17 +431,18 @@ mod tests {
         let registry = OrphanStreamRegistry::new();
         let stream_id = StreamId::next();
         let handle = make_test_handle(stream_id);
+        let addr = dummy_addr();
 
         // Register and claim once
-        registry.register_orphan(stream_id, handle);
+        registry.register_orphan(addr, stream_id, handle);
         let result = registry
-            .claim_or_wait(stream_id, Duration::from_secs(1))
+            .claim_or_wait(addr, stream_id, Duration::from_secs(1))
             .await;
         assert!(result.is_ok());
 
         // Second claim should return AlreadyClaimed immediately (no timeout wait)
         let result = registry
-            .claim_or_wait(stream_id, Duration::from_secs(5))
+            .claim_or_wait(addr, stream_id, Duration::from_secs(5))
             .await;
         assert!(matches!(result, Err(OrphanStreamError::AlreadyClaimed)));
     }
@@ -408,10 +451,11 @@ mod tests {
     async fn test_orphan_timeout() {
         let registry = OrphanStreamRegistry::new();
         let stream_id = StreamId::next();
+        let addr = dummy_addr();
 
         // Try to claim non-existent stream with short timeout
         let result = registry
-            .claim_or_wait(stream_id, WAITER_REGISTRATION_DELAY)
+            .claim_or_wait(addr, stream_id, WAITER_REGISTRATION_DELAY)
             .await;
 
         assert!(matches!(result, Err(OrphanStreamError::Timeout)));
@@ -422,11 +466,13 @@ mod tests {
         let registry = OrphanStreamRegistry::new();
         let stream_id = StreamId::next();
         let handle = make_test_handle(stream_id);
+        let addr = dummy_addr();
 
         // Insert with fake old timestamp by directly manipulating
-        registry
-            .orphan_streams
-            .insert(stream_id, (handle, Instant::now() - EXPIRED_ORPHAN_AGE));
+        registry.orphan_streams.insert(
+            (addr, stream_id),
+            (handle, Instant::now() - EXPIRED_ORPHAN_AGE),
+        );
 
         assert_eq!(registry.orphan_count(), 1);
 
@@ -440,13 +486,44 @@ mod tests {
         let registry = OrphanStreamRegistry::new();
         let stream_id = StreamId::next();
         let handle = make_test_handle(stream_id);
+        let addr = dummy_addr();
 
         // Register fresh orphan
-        registry.register_orphan(stream_id, handle);
+        registry.register_orphan(addr, stream_id, handle);
         assert_eq!(registry.orphan_count(), 1);
 
         // GC should preserve fresh stream
         registry.gc_expired();
         assert_eq!(registry.orphan_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_different_peers_same_stream_id_no_collision() {
+        let registry = OrphanStreamRegistry::new();
+        let stream_id = StreamId::next();
+        let addr_a = dummy_addr();
+        let addr_b = dummy_addr_2();
+
+        let handle_a = make_test_handle(stream_id);
+        let handle_b = make_test_handle(stream_id);
+
+        // Two different peers register orphans with the SAME StreamId
+        registry.register_orphan(addr_a, stream_id, handle_a);
+        registry.register_orphan(addr_b, stream_id, handle_b);
+        assert_eq!(registry.orphan_count(), 2);
+
+        // Claiming from peer A should succeed
+        let result_a = registry
+            .claim_or_wait(addr_a, stream_id, Duration::from_secs(1))
+            .await;
+        assert!(result_a.is_ok());
+
+        // Claiming from peer B should also succeed (not AlreadyClaimed)
+        let result_b = registry
+            .claim_or_wait(addr_b, stream_id, Duration::from_secs(1))
+            .await;
+        assert!(result_b.is_ok());
+
+        assert_eq!(registry.orphan_count(), 0);
     }
 }

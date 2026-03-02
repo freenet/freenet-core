@@ -297,7 +297,11 @@ impl NodeConfig {
             blocked_addresses: config.network_api.blocked_addresses.clone(),
             transient_budget: config.network_api.transient_budget,
             transient_ttl: Duration::from_secs(config.network_api.transient_ttl_secs),
-            relay_ready_connections: Some(3),
+            relay_ready_connections: if config.network_api.skip_load_from_network {
+                Some(0) // Local/test networks: disable relay gate
+            } else {
+                Some(3) // Production: require 3 relay-ready upstream peers
+            },
         })
     }
 

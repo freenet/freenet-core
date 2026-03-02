@@ -523,6 +523,7 @@ impl ConfigArgs {
                     .clone()
                     .unwrap_or_else(default_congestion_control),
                 bbr_startup_rate: self.network_api.bbr_startup_rate,
+                skip_load_from_network: self.network_api.skip_load_from_network,
             },
             ws_api: WebsocketApiConfig {
                 address: {
@@ -1000,6 +1001,12 @@ pub struct NetworkApiConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub bbr_startup_rate: Option<u64>,
+
+    /// When true, this node is part of a local/test network and does not load
+    /// gateways from the public index. Used to disable the relay-ready gate
+    /// and other production-only features.
+    #[serde(default)]
+    pub skip_load_from_network: bool,
 }
 
 impl NetworkApiConfig {

@@ -2207,9 +2207,16 @@ impl Operation for GetOp {
                     );
 
                     // Step 1: Claim the stream from orphan registry (atomic dedup)
+                    let peer_addr = match source_addr {
+                        Some(addr) => addr,
+                        None => {
+                            tracing::error!(tx = %id, "source_addr missing for streaming GET response");
+                            return Err(OpError::UnexpectedOpState);
+                        }
+                    };
                     let stream_handle = match op_manager
                         .orphan_stream_registry()
-                        .claim_or_wait(stream_id, STREAM_CLAIM_TIMEOUT)
+                        .claim_or_wait(peer_addr, stream_id, STREAM_CLAIM_TIMEOUT)
                         .await
                     {
                         Ok(handle) => handle,
