@@ -183,6 +183,7 @@ impl Ring {
         };
 
         let router = Arc::new(RwLock::new(Router::new(&[])));
+        crate::node::network_status::set_router(router.clone());
         task_monitor.register(
             "refresh_router",
             GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone())),

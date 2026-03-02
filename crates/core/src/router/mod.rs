@@ -86,6 +86,18 @@ pub(crate) struct RouterSnapshotInfo {
     pub connect_forward_peer_adjustments: Option<usize>,
 }
 
+/// Per-peer routing data for the dashboard detail page.
+pub(crate) struct PeerRoutingSnapshot {
+    /// (mean_adjustment, event_count) for the failure estimator.
+    pub failure_adjustment: Option<(f64, u64)>,
+    /// (mean_adjustment, event_count) for the response-time estimator.
+    pub response_time_adjustment: Option<(f64, u64)>,
+    /// (mean_adjustment, event_count) for the transfer-rate estimator.
+    pub transfer_rate_adjustment: Option<(f64, u64)>,
+    /// Prediction at the peer's own location (distance ≈ 0).
+    pub prediction_at_own_location: Option<RoutingPredictionInfo>,
+}
+
 /// # Usage
 /// Important when using this type:
 /// Need to periodically rebuild the Router using `history` for better predictions.
@@ -482,6 +494,38 @@ impl Router {
             connect_forward_curve: None,
             connect_forward_events: None,
             connect_forward_peer_adjustments: None,
+        }
+    }
+
+    /// Produce a per-peer routing snapshot for the dashboard detail page.
+    pub(crate) fn peer_snapshot(&self, peer: &PeerKeyLocation) -> PeerRoutingSnapshot {
+        let failure_adj = self
+            .failure_estimator
+            .peer_adjustments
+            .get(peer)
+            .map(|a| (a.mean(), a.event_count()));
+        let response_time_adj = self
+            .response_start_time_estimator
+            .peer_adjustments
+            .get(peer)
+            .map(|a| (a.mean(), a.event_count()));
+        let transfer_rate_adj = self
+            .transfer_rate_estimator
+            .peer_adjustments
+            .get(peer)
+            .map(|a| (a.mean(), a.event_count()));
+
+        // Compute a sample prediction at the peer's own location (distance=0)
+        let prediction = peer
+            .location()
+            .and_then(|loc| self.predict_routing_outcome(peer, loc).ok())
+            .map(RoutingPredictionInfo::from);
+
+        PeerRoutingSnapshot {
+            failure_adjustment: failure_adj,
+            response_time_adjustment: response_time_adj,
+            transfer_rate_adjustment: transfer_rate_adj,
+            prediction_at_own_location: prediction,
         }
     }
 
