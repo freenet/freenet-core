@@ -5,6 +5,7 @@
 
 use std::fmt::Write;
 
+use axum::extract::Path;
 use axum::response::{Html, IntoResponse};
 
 use crate::node::network_status::{self, format_ago, format_duration, html_escape};
@@ -12,6 +13,11 @@ use crate::node::network_status::{self, format_ago, format_duration, html_escape
 /// Handler for `GET /` — returns a self-contained HTML dashboard.
 pub(super) async fn homepage() -> impl IntoResponse {
     Html(homepage_html())
+}
+
+/// Handler for `GET /peer/{address}` — returns a detail page for a single peer.
+pub(super) async fn peer_detail(Path(address): Path<String>) -> impl IntoResponse {
+    Html(peer_detail_html(&address))
 }
 
 fn homepage_html() -> String {
@@ -336,7 +342,8 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
             .map(|l| format!("{:.4}", l))
             .unwrap_or_else(|| "—".to_string());
         rows.push_str(&format!(
-            r#"<tr><td><code>{addr}</code></td><td>{loc}</td><td>{ptype}</td><td>{connected}</td></tr>"#,
+            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'""><td><code>{addr}</code></td><td>{loc}</td><td>{ptype}</td><td>{connected}</td></tr>"#,
+            addr_enc = html_escape(&p.address.to_string()),
             addr = p.address,
             loc = loc,
             ptype = peer_type,
@@ -511,6 +518,36 @@ fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Strin
         )
     }
 
+    // UPDATE cell: show received broadcast count (single number) since
+    // subscription-streamed updates are push-based and don't have success/failure.
+    // If there are also routed updates (with success/fail), show both.
+    let update_cell = {
+        let routed = ops.updates.0 + ops.updates.1;
+        let received = ops.updates_received;
+        if routed > 0 {
+            // Both routed and received
+            format!(
+                r#"<div class="op-cell">
+                    <div class="op-name">UPDATE</div>
+                    <div><span class="op-ok">{ok}</span> <span class="op-fail">{fail}</span></div>
+                    <div class="op-received">{recv} received</div>
+                </div>"#,
+                ok = ops.updates.0,
+                fail = ops.updates.1,
+                recv = received,
+            )
+        } else {
+            // Only received (common for subscriber nodes)
+            format!(
+                r#"<div class="op-cell">
+                    <div class="op-name">UPDATE</div>
+                    <div class="op-count">{recv}</div>
+                </div>"#,
+                recv = received,
+            )
+        }
+    };
+
     format!(
         r#"<div class="card">
             <h2>Operations</h2>
@@ -520,7 +557,7 @@ fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Strin
         </div>"#,
         get = op_cell("GET", ops.gets.0, ops.gets.1),
         put = op_cell("PUT", ops.puts.0, ops.puts.1),
-        update = op_cell("UPDATE", ops.updates.0, ops.updates.1),
+        update = update_cell,
         subscribe = op_cell("SUBSCRIBE", ops.subscribes.0, ops.subscribes.1),
     )
 }
@@ -790,6 +827,8 @@ code {
     font-size: 0.85em;
     font-family: var(--font-mono);
 }
+.peer-row { cursor: pointer; transition: background 0.15s; }
+.peer-row:hover { background: var(--bg-tertiary); }
 .empty {
     color: var(--text-muted);
     font-size: 0.9rem;
@@ -821,6 +860,8 @@ code {
 .op-fail::before { content: "\2717 "; }
 [data-theme="light"] .op-ok { color: #059669; }
 [data-theme="light"] .op-fail { color: #dc2626; }
+.op-count { color: var(--text-primary); font-weight: 600; font-size: 1.1rem; }
+.op-received { color: var(--text-secondary); font-size: 0.7rem; margin-top: 0.15rem; }
 .app-list, .link-list {
     list-style: none;
     padding: 0;
@@ -925,6 +966,524 @@ document.addEventListener('DOMContentLoaded', function() {
         icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
     }
 });
+"##;
+
+// ─── Peer detail page ────────────────────────────────────────────────────────
+
+fn peer_detail_html(address_str: &str) -> String {
+    let snap = network_status::get_snapshot();
+
+    let peer = snap.as_ref().and_then(|s| {
+        s.peers
+            .iter()
+            .find(|p| p.address.to_string() == address_str)
+    });
+
+    let Some(peer) = peer else {
+        return format!(
+            r##"<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Peer Not Found — Freenet</title>
+<style>{CSS}{PEER_CSS}</style><script>{JS}</script>
+</head><body>
+<header>
+    <div class="header-left">
+        <a href="/" class="logo-link"><img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo"></a>
+        <a href="/" class="header-title">FREENET</a>
+        <span class="header-sep">/</span>
+        <span class="header-scope">Peer</span>
+    </div>
+    <div class="header-right">
+        <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark/light mode">
+            <span id="theme-icon">☀️</span>
+        </button>
+    </div>
+</header>
+<main>
+    <div class="card"><h2>Peer Not Found</h2><p class="empty">No connected peer with address <code>{addr}</code>. The peer may have disconnected.</p>
+    <p style="margin-top:0.75rem"><a href="/" style="color:var(--accent-light);font-family:var(--font-mono);font-size:0.85rem">&larr; Back to dashboard</a></p></div>
+</main></body></html>"##,
+            CSS = CSS,
+            PEER_CSS = PEER_CSS,
+            JS = JS,
+            addr = html_escape(address_str),
+        );
+    };
+
+    let peer_type = if peer.is_gateway { "Gateway" } else { "Peer" };
+    let loc_str = peer
+        .location
+        .map(|l| format!("{:.6}", l))
+        .unwrap_or_else(|| "—".to_string());
+
+    // Try to get router data
+    let router_lock = network_status::get_router();
+    let router_guard = router_lock.as_ref().map(|r| r.read());
+
+    let (router_snapshot, peer_routing) = match (&router_guard, &peer.peer_key_location) {
+        (Some(router), Some(pkl)) => (Some(router.snapshot()), Some(router.peer_snapshot(pkl))),
+        (Some(router), None) => (Some(router.snapshot()), None),
+        _ => (None, None),
+    };
+
+    // Build info card
+    let info_card = format!(
+        r#"<div class="card">
+            <h2>Peer Info</h2>
+            <div class="info-grid">
+                <div class="info-label">Address</div><div class="info-value"><code>{addr}</code></div>
+                <div class="info-label">Location</div><div class="info-value">{loc}</div>
+                <div class="info-label">Type</div><div class="info-value">{ptype}</div>
+                <div class="info-label">Connected</div><div class="info-value">{connected}</div>
+            </div>
+        </div>"#,
+        addr = html_escape(&peer.address.to_string()),
+        loc = loc_str,
+        ptype = peer_type,
+        connected = format_duration(peer.connected_secs),
+    );
+
+    // Build routing model status card
+    let model_card = if let Some(ref rs) = router_snapshot {
+        let total_events = rs.failure_events + rs.success_events;
+        let peer_failure_events = peer_routing
+            .as_ref()
+            .and_then(|pr| pr.failure_adjustment.map(|(_, c)| c))
+            .unwrap_or(0);
+        let peer_response_events = peer_routing
+            .as_ref()
+            .and_then(|pr| pr.response_time_adjustment.map(|(_, c)| c))
+            .unwrap_or(0);
+        let peer_transfer_events = peer_routing
+            .as_ref()
+            .and_then(|pr| pr.transfer_rate_adjustment.map(|(_, c)| c))
+            .unwrap_or(0);
+        format!(
+            r#"<div class="card">
+                <h2>Routing Model</h2>
+                <div class="info-grid">
+                    <div class="info-label">Prediction active</div><div class="info-value">{active}</div>
+                    <div class="info-label">Global events</div><div class="info-value">{total}</div>
+                    <div class="info-label">This peer: failure</div><div class="info-value">{pf} events</div>
+                    <div class="info-label">This peer: response time</div><div class="info-value">{pr} events</div>
+                    <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
+                </div>
+            </div>"#,
+            active = if rs.prediction_active { "Yes" } else { "No" },
+            total = total_events,
+            pf = peer_failure_events,
+            pr = peer_response_events,
+            pt = peer_transfer_events,
+        )
+    } else {
+        r#"<div class="card"><h2>Routing Model</h2><p class="empty">Router data not available</p></div>"#.to_string()
+    };
+
+    // Build SVG charts
+    let charts = if let Some(ref rs) = router_snapshot {
+        let failure_chart = build_estimator_chart(
+            "Failure Probability",
+            &rs.failure_curve,
+            peer_routing
+                .as_ref()
+                .and_then(|pr| pr.failure_adjustment.map(|(m, _)| m)),
+            peer.location,
+            "0.0",
+            "1.0",
+        );
+        let response_chart = build_estimator_chart(
+            "Response Time (s)",
+            &rs.response_time_curve,
+            peer_routing
+                .as_ref()
+                .and_then(|pr| pr.response_time_adjustment.map(|(m, _)| m)),
+            peer.location,
+            "0",
+            "auto",
+        );
+        let transfer_chart = build_estimator_chart(
+            "Transfer Rate (B/s)",
+            &rs.transfer_rate_curve,
+            peer_routing
+                .as_ref()
+                .and_then(|pr| pr.transfer_rate_adjustment.map(|(m, _)| m)),
+            peer.location,
+            "auto",
+            "0",
+        );
+        format!(
+            r#"<div class="card">
+                <h2>PAV Regression Curves</h2>
+                <p class="chart-legend">
+                    <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Global curve</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-peer"></span> Peer-adjusted curve</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-loc"></span> Peer location</span>
+                </p>
+                {failure_chart}
+                {response_chart}
+                {transfer_chart}
+            </div>"#,
+            failure_chart = failure_chart,
+            response_chart = response_chart,
+            transfer_chart = transfer_chart,
+        )
+    } else {
+        String::new()
+    };
+
+    // Build prediction summary card
+    let prediction_card = if let Some(ref pr) = peer_routing {
+        if let Some(ref pred) = pr.prediction_at_own_location {
+            format!(
+                r#"<div class="card">
+                    <h2>Prediction at Peer Location</h2>
+                    <div class="info-grid">
+                        <div class="info-label">Failure probability</div><div class="info-value">{fp:.4}</div>
+                        <div class="info-label">Response time</div><div class="info-value">{rt:.3}s</div>
+                        <div class="info-label">Expected total time</div><div class="info-value">{ett:.3}s</div>
+                        <div class="info-label">Transfer speed</div><div class="info-value">{ts:.0} B/s</div>
+                    </div>
+                </div>"#,
+                fp = pred.failure_probability,
+                rt = pred.time_to_response_start,
+                ett = pred.expected_total_time,
+                ts = pred.transfer_speed_bps,
+            )
+        } else {
+            r#"<div class="card"><h2>Prediction</h2><p class="empty">Insufficient data for prediction at this peer's location</p></div>"#.to_string()
+        }
+    } else {
+        String::new()
+    };
+
+    let snap_ref = snap.as_ref();
+    let version = snap_ref.map(|s| s.version.as_str()).unwrap_or("?");
+
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="5">
+    <title>Peer {addr} — Freenet</title>
+    <style>{CSS}{PEER_CSS}</style>
+    <script>{JS}</script>
+</head>
+<body>
+    <header>
+        <div class="header-left">
+            <a href="/" class="logo-link"><img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo"></a>
+            <a href="/" class="header-title">FREENET</a>
+            <span class="header-sep">/</span>
+            <span class="header-scope">Peer</span>
+            <span class="header-addr">{addr}</span>
+            <span class="badge">v{version}</span>
+        </div>
+        <div class="header-right">
+            <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark/light mode">
+                <span id="theme-icon">☀️</span>
+            </button>
+        </div>
+    </header>
+    <main>
+        {info_card}
+        {model_card}
+        {charts}
+        {prediction_card}
+    </main>
+</body>
+</html>"##,
+        addr = html_escape(&peer.address.to_string()),
+        CSS = CSS,
+        PEER_CSS = PEER_CSS,
+        JS = JS,
+        version = html_escape(version),
+        info_card = info_card,
+        model_card = model_card,
+        charts = charts,
+        prediction_card = prediction_card,
+    )
+}
+
+/// Build an SVG chart showing a PAV regression curve with optional per-peer adjustment.
+fn build_estimator_chart(
+    title: &str,
+    curve_points: &[(f64, f64)],
+    peer_adjustment: Option<f64>,
+    peer_location: Option<f64>,
+    _y_min_label: &str,
+    _y_max_label: &str,
+) -> String {
+    if curve_points.is_empty() {
+        return format!(
+            r#"<div class="chart-section"><h3>{title}</h3><div class="empty-chart">Awaiting routing events</div></div>"#,
+            title = title,
+        );
+    }
+
+    let w: f64 = 560.0;
+    let h: f64 = 200.0;
+    let pad_l: f64 = 50.0;
+    let pad_r: f64 = 10.0;
+    let pad_t: f64 = 10.0;
+    let pad_b: f64 = 30.0;
+    let plot_w = w - pad_l - pad_r;
+    let plot_h = h - pad_t - pad_b;
+
+    // Determine Y range from data
+    let y_vals: Vec<f64> = curve_points.iter().map(|(_, y)| *y).collect();
+    let mut y_min = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mut y_max = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    // Include peer-adjusted values in range if present
+    if let Some(adj) = peer_adjustment {
+        for (_, y) in curve_points {
+            let adjusted = y + adj;
+            y_min = y_min.min(adjusted);
+            y_max = y_max.max(adjusted);
+        }
+    }
+
+    // Add 10% padding and avoid zero-range
+    let range = y_max - y_min;
+    if range < 1e-10 {
+        y_min -= 0.5;
+        y_max += 0.5;
+    } else {
+        y_min -= range * 0.1;
+        y_max += range * 0.1;
+    }
+    let y_range = y_max - y_min;
+
+    // X is always distance [0.0, 0.5]
+    let x_min: f64 = 0.0;
+    let x_max: f64 = 0.5;
+    let x_range = x_max - x_min;
+
+    let to_svg_x = |x: f64| -> f64 { pad_l + ((x - x_min) / x_range) * plot_w };
+    let to_svg_y = |y: f64| -> f64 { pad_t + plot_h - ((y - y_min) / y_range) * plot_h };
+
+    let mut svg = format!(
+        r#"<div class="chart-section"><h3>{title}</h3>
+        <svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="chart-svg">"#,
+        title = title,
+        w = w as u32,
+        h = h as u32,
+    );
+
+    // Axes
+    write!(
+        svg,
+        r#"<line x1="{lx}" y1="{ty}" x2="{lx}" y2="{by}" stroke="var(--text-muted)" stroke-width="1"/>"#,
+        lx = pad_l,
+        ty = pad_t,
+        by = pad_t + plot_h,
+    )
+    .ok();
+    write!(
+        svg,
+        r#"<line x1="{lx}" y1="{by}" x2="{rx}" y2="{by}" stroke="var(--text-muted)" stroke-width="1"/>"#,
+        lx = pad_l,
+        by = pad_t + plot_h,
+        rx = pad_l + plot_w,
+    )
+    .ok();
+
+    // X-axis labels
+    for &x_tick in &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5] {
+        let sx = to_svg_x(x_tick);
+        write!(
+            svg,
+            r#"<text x="{sx:.0}" y="{y}" text-anchor="middle" class="axis-label">{v:.1}</text>"#,
+            sx = sx,
+            y = pad_t + plot_h + 18.0,
+            v = x_tick,
+        )
+        .ok();
+    }
+
+    // Y-axis labels (3 ticks)
+    for i in 0..=2 {
+        let frac = i as f64 / 2.0;
+        let y_val = y_min + frac * y_range;
+        let sy = to_svg_y(y_val);
+        let label = if y_val.abs() < 1e-3 && y_range < 10.0 {
+            format!("{:.3}", y_val)
+        } else if y_range < 1.0 {
+            format!("{:.2}", y_val)
+        } else {
+            format!("{:.0}", y_val)
+        };
+        write!(
+            svg,
+            r#"<text x="{x}" y="{sy:.0}" text-anchor="end" class="axis-label">{label}</text>"#,
+            x = pad_l - 4.0,
+            sy = sy,
+            label = label,
+        )
+        .ok();
+    }
+
+    // Global curve (blue stepped line)
+    if curve_points.len() >= 2 {
+        let mut path = String::new();
+        for (i, (x, y)) in curve_points.iter().enumerate() {
+            let sx = to_svg_x(*x);
+            let sy = to_svg_y(*y);
+            if i == 0 {
+                write!(path, "M{sx:.1},{sy:.1}").ok();
+            } else {
+                // Stepped: horizontal then vertical
+                let prev_y = to_svg_y(curve_points[i - 1].1);
+                write!(path, " L{sx:.1},{prev_y:.1} L{sx:.1},{sy:.1}").ok();
+            }
+        }
+        write!(
+            svg,
+            r#"<path d="{path}" fill="none" stroke="var(--accent-primary)" stroke-width="2" opacity="0.8"/>"#,
+            path = path,
+        )
+        .ok();
+    }
+
+    // Peer-adjusted curve (green stepped line)
+    if let Some(adj) = peer_adjustment {
+        if curve_points.len() >= 2 {
+            let mut path = String::new();
+            for (i, (x, y)) in curve_points.iter().enumerate() {
+                let sx = to_svg_x(*x);
+                let sy = to_svg_y(y + adj);
+                if i == 0 {
+                    write!(path, "M{sx:.1},{sy:.1}").ok();
+                } else {
+                    let prev_y = to_svg_y(curve_points[i - 1].1 + adj);
+                    write!(path, " L{sx:.1},{prev_y:.1} L{sx:.1},{sy:.1}").ok();
+                }
+            }
+            write!(
+                svg,
+                "<path d=\"{path}\" fill=\"none\" stroke=\"#34d399\" stroke-width=\"2\" opacity=\"0.8\"/>",
+                path = path,
+            )
+            .ok();
+        }
+    }
+
+    // Peer location marker (vertical dashed line)
+    if let Some(loc) = peer_location {
+        // Distance from peer to itself is 0, but contracts near the peer have small distances.
+        // Mark the peer's ring location on the x-axis as distance=0 (leftmost).
+        let _ = loc; // The peer itself is at distance 0 from contracts at its own location
+        let sx = to_svg_x(0.0);
+        write!(
+            svg,
+            "<line x1=\"{sx:.1}\" y1=\"{ty}\" x2=\"{sx:.1}\" y2=\"{by}\" stroke=\"#fbbf24\" stroke-width=\"1.5\" stroke-dasharray=\"4,3\" opacity=\"0.7\"/>",
+            sx = sx,
+            ty = pad_t,
+            by = pad_t + plot_h,
+        )
+        .ok();
+    }
+
+    svg.push_str("</svg></div>");
+    svg
+}
+
+const PEER_CSS: &str = r##"
+.logo-link, .header-title { text-decoration: none; }
+.logo-link:hover, a.header-title:hover { opacity: 0.8; }
+a.header-title {
+    background: linear-gradient(135deg, var(--accent-light) 0%, var(--accent-primary) 50%, var(--accent-dark) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 1.1rem;
+    letter-spacing: -0.02em;
+}
+.header-sep {
+    color: var(--text-muted);
+    font-size: 1rem;
+    margin: 0 0.15rem;
+}
+.header-addr {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+}
+.info-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.4rem 1.25rem;
+    font-size: 0.85rem;
+}
+.info-label {
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    align-self: center;
+}
+.info-value { font-family: var(--font-mono); }
+.chart-section { margin: 1rem 0; }
+.chart-section h3 {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-weight: 500;
+    text-transform: uppercase;
+    margin-bottom: 0.5rem;
+}
+.chart-svg {
+    display: block;
+    width: 100%;
+    max-width: 600px;
+}
+.chart-svg .axis-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--text-muted);
+}
+.chart-legend {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+.chart-key {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+.chart-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+}
+.chart-dot-global { background: var(--accent-primary); }
+.chart-dot-peer { background: #34d399; }
+.chart-dot-loc { background: #fbbf24; }
+.empty-chart {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 80px;
+    background: var(--bg-secondary);
+    border: 1px dashed var(--border-color);
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    font-family: var(--font-mono);
+}
 "##;
 
 #[cfg(test)]

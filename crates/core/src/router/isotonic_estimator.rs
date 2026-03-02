@@ -228,6 +228,20 @@ impl Adjustment {
     fn value(&self) -> f64 {
         self.sum / self.count as f64
     }
+
+    /// Mean adjustment value (sum / count).
+    pub(crate) fn mean(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum / self.count as f64
+        }
+    }
+
+    /// Number of events contributing to this adjustment.
+    pub(crate) fn event_count(&self) -> u64 {
+        self.count
+    }
 }
 
 // Tests

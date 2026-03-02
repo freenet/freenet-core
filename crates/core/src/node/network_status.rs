@@ -9,7 +9,23 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
+use crate::ring::PeerKeyLocation;
+use crate::router::Router;
+
 static NETWORK_STATUS: OnceLock<Arc<RwLock<NetworkStatus>>> = OnceLock::new();
+static ROUTER: OnceLock<Arc<parking_lot::RwLock<Router>>> = OnceLock::new();
+
+/// Store a reference to the Router for the dashboard.
+pub fn set_router(router: Arc<parking_lot::RwLock<Router>>) {
+    // OnceLock::set returns Err if already initialized; this is expected on repeated calls
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = ROUTER.set(router);
+}
+
+/// Get the Router reference (if set).
+pub(crate) fn get_router() -> Option<Arc<parking_lot::RwLock<Router>>> {
+    ROUTER.get().cloned()
+}
 
 /// Tracked network connection status for diagnostic display.
 pub struct NetworkStatus {
@@ -39,6 +55,7 @@ pub struct ConnectedPeer {
     pub is_gateway: bool,
     pub location: Option<f64>,
     pub connected_since: Instant,
+    pub peer_key_location: Option<PeerKeyLocation>,
 }
 
 /// Info about a subscribed contract.
@@ -55,6 +72,9 @@ pub struct OperationStats {
     pub puts: (u32, u32),
     pub updates: (u32, u32),
     pub subscribes: (u32, u32),
+    /// Count of broadcast updates received via subscription streaming.
+    /// These are push-based and don't have success/failure semantics.
+    pub updates_received: u32,
 }
 
 /// NAT traversal attempt counters.
@@ -137,7 +157,11 @@ pub fn record_gateway_failure(address: SocketAddr, reason: FailureReason) {
 }
 
 /// Record a successful peer connection.
-pub fn record_peer_connected(addr: SocketAddr, location: Option<f64>) {
+pub fn record_peer_connected(
+    addr: SocketAddr,
+    location: Option<f64>,
+    peer_key_location: Option<PeerKeyLocation>,
+) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             // Remove any existing entry for this address
@@ -148,6 +172,7 @@ pub fn record_peer_connected(addr: SocketAddr, location: Option<f64>) {
                 is_gateway,
                 location,
                 connected_since: Instant::now(),
+                peer_key_location,
             });
             s.gateway_failures.clear();
         }
@@ -217,6 +242,15 @@ pub fn record_op_result(op_type: OpType, success: bool) {
     }
 }
 
+/// Record a broadcast update received via subscription streaming.
+pub fn record_update_received() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.op_stats.updates_received = s.op_stats.updates_received.saturating_add(1);
+        }
+    }
+}
+
 /// Record a NAT traversal attempt.
 pub fn record_nat_attempt(success: bool) {
     if let Some(status) = NETWORK_STATUS.get() {
@@ -269,6 +303,7 @@ pub struct PeerSnapshot {
     pub is_gateway: bool,
     pub location: Option<f64>,
     pub connected_secs: u64,
+    pub peer_key_location: Option<PeerKeyLocation>,
 }
 
 /// Snapshot of a subscribed contract.
@@ -286,6 +321,8 @@ pub struct OpStatsSnapshot {
     pub puts: (u32, u32),
     pub updates: (u32, u32),
     pub subscribes: (u32, u32),
+    /// Broadcast updates received via subscription streaming.
+    pub updates_received: u32,
 }
 
 impl OpStatsSnapshot {
@@ -296,6 +333,7 @@ impl OpStatsSnapshot {
             .saturating_add(sum(self.puts))
             .saturating_add(sum(self.updates))
             .saturating_add(sum(self.subscribes))
+            .saturating_add(self.updates_received)
     }
 }
 
@@ -359,6 +397,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             is_gateway: p.is_gateway,
             location: p.location,
             connected_secs: now.duration_since(p.connected_since).as_secs(),
+            peer_key_location: p.peer_key_location.clone(),
         })
         .collect();
 
@@ -407,6 +446,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             puts: s.op_stats.puts,
             updates: s.op_stats.updates,
             subscribes: s.op_stats.subscribes,
+            updates_received: s.op_stats.updates_received,
         },
         nat_stats: NatStatsSnapshot {
             attempts: s.nat_stats.attempts,
@@ -589,6 +629,7 @@ mod tests {
                 is_gateway: true,
                 location: Some(0.5),
                 connected_since: Instant::now(),
+                peer_key_location: None,
             });
         }
         let snap = get_snapshot().unwrap();
@@ -602,6 +643,7 @@ mod tests {
                 is_gateway: false,
                 location: Some(0.3),
                 connected_since: Instant::now(),
+                peer_key_location: None,
             });
         }
         let snap = get_snapshot().unwrap();
@@ -719,7 +761,7 @@ mod tests {
         }
 
         // Connect a non-gateway peer, then record a NAT failure to a different peer
-        record_peer_connected(peer_addr, Some(0.5));
+        record_peer_connected(peer_addr, Some(0.5), None);
         record_gateway_failure(fail_addr, FailureReason::NatTraversalFailed);
         let snap = get_snapshot().unwrap();
 
@@ -748,7 +790,7 @@ mod tests {
         }
 
         // Connect only a gateway peer, then record NAT failure
-        record_peer_connected(gw_addr, None);
+        record_peer_connected(gw_addr, None, None);
         record_gateway_failure(fail_addr, FailureReason::NatTraversalFailed);
         let snap = get_snapshot().unwrap();
 

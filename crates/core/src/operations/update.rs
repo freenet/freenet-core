@@ -1075,6 +1075,7 @@ impl Operation for UpdateOp {
                                     "BroadcastToStreaming update produced no change"
                                 );
                             } else {
+                                crate::node::network_status::record_update_received();
                                 tracing::debug!(
                                     tx = %id,
                                     %key,

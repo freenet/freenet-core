@@ -105,6 +105,10 @@ impl HttpClientApi {
 
         let router = Router::new()
             .route("/", axum::routing::get(home_page::homepage))
+            .route(
+                "/peer/{address}",
+                axum::routing::get(home_page::peer_detail),
+            )
             .merge(v1::routes(config.clone()))
             .merge(v2::routes(config))
             .layer(Extension(attested_contracts.clone()))
