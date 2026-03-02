@@ -1834,7 +1834,14 @@ async fn handle_aborted_op(
                                 // policy in initial_join_procedure (issue #3304).
                                 // ±20% jitter to prevent thundering herd.
                                 let open_conns = op_manager.ring.open_connections();
-                                let effective = if open_conns > 0 {
+                                let effective = if open_conns == 0 {
+                                    // Isolated: use short 2-4s wait so we retry quickly.
+                                    let jitter_ms =
+                                        crate::config::GlobalRng::random_range(0u64..2000);
+                                    Duration::from_millis(2000 + jitter_ms)
+                                } else if open_conns
+                                    < op_manager.ring.connection_manager.min_connections
+                                {
                                     let jitter_ms = crate::config::GlobalRng::random_range(
                                         0u64..(connect::GATEWAY_BACKOFF_POLL_CAP.as_millis() / 5)
                                             as u64,

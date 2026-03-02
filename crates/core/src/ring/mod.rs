@@ -1770,9 +1770,9 @@ impl Ring {
         let mut last_health_check = Instant::now();
         const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
-        /// Duration of zero ring connections before escalating recovery.
-        const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
-        let mut zero_connections_since: Option<Instant> = None;
+        /// How often to re-clear backoff while at zero connections.
+        const ISOLATION_RECLEAR_INTERVAL: Duration = Duration::from_secs(10);
+        let mut last_isolation_clear: Option<Instant> = None;
 
         // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
         // which advances during suspend (unlike std/tokio Instant which use CLOCK_MONOTONIC).
@@ -1858,7 +1858,7 @@ impl Ring {
                         tracing::debug!(?error, "Failed to send DropAllConnections");
                         error
                     })?;
-                zero_connections_since = None;
+                last_isolation_clear = None;
             }
 
             // Periodic cleanup of expired backoff entries
@@ -1930,24 +1930,29 @@ impl Ring {
             // Expose to update check task for version mismatch decisions (#3204).
             crate::transport::set_open_connection_count(current_conn_count);
             if current_conn_count == 0 {
-                if let Some(since) = zero_connections_since {
-                    if since.elapsed() > ISOLATION_ESCALATION_THRESHOLD {
+                let should_clear = match last_isolation_clear {
+                    None => {
                         tracing::warn!(
                             is_gateway,
-                            isolated_for_secs = since.elapsed().as_secs(),
-                            "Node isolated with zero ring connections — resetting all backoff state"
+                            "Zero ring connections detected — resetting all backoff state"
                         );
-                        reset_all_backoff();
-                        zero_connections_since = Some(Instant::now());
+                        true
                     }
-                } else {
-                    zero_connections_since = Some(Instant::now());
-                    tracing::warn!(
-                        is_gateway,
-                        "Zero ring connections detected — starting isolation timer"
-                    );
+                    Some(last) if last.elapsed() > ISOLATION_RECLEAR_INTERVAL => {
+                        tracing::warn!(
+                            is_gateway,
+                            isolated_for_secs = last.elapsed().as_secs(),
+                            "Still isolated — re-clearing backoff state"
+                        );
+                        true
+                    }
+                    _ => false,
+                };
+                if should_clear {
+                    reset_all_backoff();
+                    last_isolation_clear = Some(Instant::now());
                 }
-            } else if zero_connections_since.take().is_some() {
+            } else if last_isolation_clear.take().is_some() {
                 tracing::info!(
                     connections = current_conn_count,
                     "Recovered from zero-connection state"

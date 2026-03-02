@@ -2395,7 +2395,15 @@ pub(crate) async fn initial_join_procedure(
                         // When we already have some ring connections, cap the wait at
                         // GATEWAY_BACKOFF_POLL_CAP so we re-check open_conns frequently.
                         // Apply ±20% jitter (24–36s) to prevent thundering herd.
-                        let effective_wait = if open_conns > 0 {
+                        let effective_wait = if open_conns == 0 {
+                            // Isolated: use short 2-4s wait as defense-in-depth.
+                            // connection_maintenance's reset_all_backoff() will
+                            // usually wake us via gateway_backoff_cleared first.
+                            let jitter_ms = GlobalRng::random_range(0u64..2000);
+                            Duration::from_millis(2000 + jitter_ms)
+                        } else if open_conns
+                            < op_manager.ring.connection_manager.min_connections
+                        {
                             let jitter_ms = GlobalRng::random_range(
                                 0u64..(GATEWAY_BACKOFF_POLL_CAP.as_millis() / 5) as u64,
                             );
