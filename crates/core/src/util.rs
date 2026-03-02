@@ -213,7 +213,7 @@ pub(crate) mod test {
     rnd_bytes!(large: { 1024 * 1024 * 2 } -> random_bytes_2mb);
 }
 
-#[derive(Clone, Copy, serde::Deserialize, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum EncodingProtocol {
     /// Flatbuffers
