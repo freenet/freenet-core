@@ -242,6 +242,7 @@ impl HostingManager {
     /// (in the hosting cache) until evicted by LRU.
     pub fn unsubscribe(&self, contract: &ContractKey) {
         if self.active_subscriptions.remove(contract).is_some() {
+            crate::node::network_status::record_subscription_removed(&format!("{contract}"));
             debug!(%contract, "unsubscribe: removed active subscription");
         }
     }
@@ -298,6 +299,9 @@ impl HostingManager {
         });
 
         if !expired.is_empty() {
+            for contract in &expired {
+                crate::node::network_status::record_subscription_removed(&format!("{contract}"));
+            }
             info!(
                 expired_count = expired.len(),
                 "expire_stale_subscriptions: expired stale subscriptions"
