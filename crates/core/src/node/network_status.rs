@@ -190,7 +190,6 @@ pub fn record_contract_updated(key_encoded: &str) {
 }
 
 /// Record a subscription removal.
-#[cfg(test)]
 pub fn record_subscription_removed(key_encoded: &str) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
