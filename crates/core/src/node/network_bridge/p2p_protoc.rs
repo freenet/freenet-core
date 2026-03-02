@@ -37,7 +37,7 @@ use crate::transport::{
 };
 use crate::{
     client_events::ClientId,
-    config::GlobalExecutor,
+    config::{GlobalExecutor, GlobalRng},
     contract::{
         ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
         WaitingResolution,
@@ -3885,10 +3885,12 @@ impl P2pConnManager {
     }
 
     /// Maximum retry attempts when a broadcast finds no targets.
-    const MAX_BROADCAST_RETRIES: u8 = 3;
+    const MAX_BROADCAST_RETRIES: u8 = 5;
 
     /// Base delay between broadcast retries (scaled by attempt number for linear backoff).
-    const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+    /// Total window: 2+4+6+8+10 = 30s, giving ChangeInterests/Summaries round-trips
+    /// ample time to complete and register peer interests.
+    const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 
     /// Notify interested network peers about a state change.
     ///
@@ -3940,7 +3942,9 @@ impl P2pConnManager {
                 );
                 // Schedule a delayed re-emission of BroadcastStateChange
                 let op_mgr = op_manager.clone();
-                let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
+                let base_delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
+                let jitter = GlobalRng::random_range(0.8f64..1.2);
+                let delay = base_delay.mul_f64(jitter);
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
                     if let Err(e) = op_mgr
