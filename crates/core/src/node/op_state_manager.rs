@@ -1161,11 +1161,24 @@ impl OpManager {
         messages
     }
 
-    /// Removes all tracked state for a peer that left the ring.
+    /// Called when a peer disconnects from the ring.
+    ///
+    /// We intentionally do NOT remove interest or proximity cache entries here.
+    /// Interest entries are TTL-managed (20 min expiry) and refreshed via the
+    /// Interests/Summaries heartbeat exchange on reconnection. Proximity cache
+    /// entries are replaced via CacheAnnounce on reconnection. Between disconnect
+    /// and reconnect, stale entries are harmless — `get_peer_by_pub_key()` only
+    /// resolves peers in `connections_by_location`, so broadcasts skip
+    /// disconnected peers automatically.
+    ///
+    /// Eagerly wiping state on every disconnect caused permanent interest loss
+    /// for peers with unstable connections (e.g. stale pending reservations
+    /// causing ~60s disconnect/reconnect cycles).
     pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
-        self.proximity_cache.on_peer_disconnected(pub_key);
-        self.interest_manager
-            .remove_all_peer_interests(&PeerKey::from(pub_key.clone()));
+        tracing::debug!(
+            peer = %pub_key,
+            "Ring connection lost — keeping interest and proximity entries (TTL-managed)"
+        );
     }
 }
 
