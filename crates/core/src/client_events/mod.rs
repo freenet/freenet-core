@@ -40,8 +40,6 @@ pub(crate) mod session_actor;
 mod test_correlation;
 #[cfg(feature = "websocket")]
 pub(crate) mod websocket;
-#[cfg(feature = "websocket")]
-pub(crate) mod ws_streaming;
 
 pub(crate) type BoxedClient = Box<dyn ClientEventsProxy + Send + 'static>;
 pub type HostResult = Result<HostResponse, ClientError>;
