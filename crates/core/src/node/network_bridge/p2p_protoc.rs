@@ -3944,55 +3944,72 @@ impl P2pConnManager {
         );
 
         if target_result.targets.is_empty() {
-            // When there are genuinely zero sources (no peers subscribed or in the
-            // proximity cache), retrying is pointless — nothing is "in-flight".
-            // Only retry when we had sources that failed to resolve to addresses,
-            // which suggests a transient lookup failure.
-            let has_potential_sources = target_result.proximity_found > 0
-                || target_result.interest_found > 0
-                || target_result.proximity_resolve_failed > 0
-                || target_result.interest_resolve_failed > 0;
+            let retry_count = self.broadcast_retries.entry(key).or_insert(0);
+            if *retry_count < Self::MAX_BROADCAST_RETRIES {
+                *retry_count += 1;
+                let attempt = *retry_count;
+                tracing::info!(
+                    contract = %key,
+                    self_addr = %self_addr,
+                    attempt,
+                    max_retries = Self::MAX_BROADCAST_RETRIES,
+                    "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
+                );
+                // Schedule a delayed re-emission of BroadcastStateChange
+                let op_mgr = op_manager.clone();
+                let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Err(e) = op_mgr
+                        .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                            key,
+                            new_state,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            contract = %key,
+                            error = %e,
+                            "Failed to re-emit BroadcastStateChange for retry"
+                        );
+                    }
+                });
+            } else {
+                // Retries exhausted. Track consecutive no-target cycles to
+                // suppress repetitive WARN logging after the first occurrence.
+                self.broadcast_retries.remove(&key);
 
-            if has_potential_sources {
-                let retry_count = self.broadcast_retries.entry(key).or_insert(0);
-                if *retry_count < Self::MAX_BROADCAST_RETRIES {
-                    *retry_count += 1;
-                    let attempt = *retry_count;
-                    tracing::info!(
-                        contract = %key,
-                        self_addr = %self_addr,
-                        attempt,
-                        max_retries = Self::MAX_BROADCAST_RETRIES,
-                        "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
-                    );
-                    // Schedule a delayed re-emission of BroadcastStateChange
-                    let op_mgr = op_manager.clone();
-                    let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        if let Err(e) = op_mgr
-                            .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                                key,
-                                new_state,
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                contract = %key,
-                                error = %e,
-                                "Failed to re-emit BroadcastStateChange for retry"
-                            );
-                        }
-                    });
-                } else {
-                    self.broadcast_retries.remove(&key);
+                // Evict oldest entry if at capacity to prevent unbounded growth.
+                if !self.broadcast_no_target_streak.contains_key(&key)
+                    && self.broadcast_no_target_streak.len() >= Self::MAX_BROADCAST_STREAK_ENTRIES
+                {
+                    if let Some(evict_key) = self.broadcast_no_target_streak.keys().next().cloned()
+                    {
+                        self.broadcast_no_target_streak.remove(&evict_key);
+                    }
+                }
+                let streak = self.broadcast_no_target_streak.entry(key).or_insert(0);
+                *streak = streak.saturating_add(1);
+                let current_streak = *streak;
+
+                if current_streak <= 1 {
                     tracing::warn!(
                         contract = %key,
                         self_addr = %self_addr,
                         "BROADCAST_NO_TARGETS: no targets found after {} retries, giving up",
                         Self::MAX_BROADCAST_RETRIES
                     );
-                    // Emit delivery summary for diagnostics
+                } else {
+                    tracing::debug!(
+                        contract = %key,
+                        self_addr = %self_addr,
+                        consecutive_misses = current_streak,
+                        "BROADCAST_NO_TARGETS: still no targets (suppressing repeated warns)"
+                    );
+                }
+
+                // Emit delivery summary for diagnostics (only on first miss per streak)
+                if current_streak <= 1 {
                     let update_tx =
                         crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
                     if let Some(log) = NetEventLog::broadcast_delivery_summary(
@@ -4009,38 +4026,6 @@ impl P2pConnManager {
                             .register_events(Either::Left(log))
                             .await;
                     }
-                }
-            } else {
-                // Genuinely zero sources — no subscribers exist for this contract.
-                // Track consecutive failures to suppress repetitive logging.
-                // Evict oldest entry if at capacity to prevent unbounded growth.
-                if !self.broadcast_no_target_streak.contains_key(&key)
-                    && self.broadcast_no_target_streak.len() >= Self::MAX_BROADCAST_STREAK_ENTRIES
-                {
-                    // Remove an arbitrary entry to make room.
-                    if let Some(evict_key) = self.broadcast_no_target_streak.keys().next().cloned()
-                    {
-                        self.broadcast_no_target_streak.remove(&evict_key);
-                    }
-                }
-                let streak = self.broadcast_no_target_streak.entry(key).or_insert(0);
-                *streak = streak.saturating_add(1);
-                let current_streak = *streak;
-
-                // Log at WARN for the first occurrence, then DEBUG to reduce noise.
-                if current_streak <= 1 {
-                    tracing::warn!(
-                        contract = %key,
-                        self_addr = %self_addr,
-                        "BROADCAST_NO_TARGETS: no subscribers for this contract"
-                    );
-                } else {
-                    tracing::debug!(
-                        contract = %key,
-                        self_addr = %self_addr,
-                        consecutive_misses = current_streak,
-                        "BROADCAST_NO_TARGETS: still no subscribers (suppressing repeated warns)"
-                    );
                 }
             }
             return;
