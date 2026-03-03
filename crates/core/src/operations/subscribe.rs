@@ -1111,8 +1111,8 @@ impl Operation for SubscribeOp {
                                 "subscribe: processing Subscribed response"
                             );
 
-                            // In the simplified lease-based model (2026-01 refactor), we register
-                            // our subscription locally. No upstream/downstream tree tracking.
+                            // Register our subscription locally. Relay nodes also register
+                            // downstream subscribers (see relay path below) to propagate updates.
                             op_manager.ring.subscribe(*key);
                             op_manager.ring.complete_subscription_request(key, true);
 
@@ -1165,8 +1165,25 @@ impl Operation for SubscribeOp {
 
                             // Forward response to requester or complete
                             if let Some(requester_addr) = self.requester_addr {
-                                // We're an intermediate node - forward response to the requester
-                                // State is NOT sent here - requester gets state via GET, not SUBSCRIBE
+                                // We're a relay node — register the upstream requester as a
+                                // downstream subscriber so update broadcasts propagate back
+                                // through us. The requester_addr is the direct connection we
+                                // received the original Request from, so the registration is
+                                // always deliverable. This creates the subscription relay tree:
+                                //   fulfilling_node → relay(us) → requester
+                                // Pass None for source_addr fallback because here source_addr
+                                // is the fulfilling node (Response sender), NOT the requester.
+                                // The primary lookup uses requester_pub_key (resolved at init).
+                                register_downstream_subscriber(
+                                    op_manager,
+                                    key,
+                                    requester_addr,
+                                    self.requester_pub_key.as_ref(),
+                                    None,
+                                    msg_id,
+                                    " (relay registration on Response)",
+                                );
+
                                 tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
                                 Ok(OperationResult::SendAndComplete {
                                     msg: NetMessage::from(SubscribeMsg::Response {

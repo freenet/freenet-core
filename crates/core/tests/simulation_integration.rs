@@ -3284,6 +3284,167 @@ fn test_subscription_broadcast_propagation() {
     );
 }
 
+/// Regression test for #3390: relay nodes must register upstream requester as
+/// downstream subscriber when forwarding a subscribe Response.
+///
+/// ## The Bug
+///
+/// When a subscribe routes through a relay (e.g., node-2 → gateway → node-1),
+/// the fulfilling node (node-1) correctly registers the gateway as a downstream
+/// subscriber. But when the gateway forwards the Response to node-2, it did NOT
+/// register node-2 as its own downstream subscriber. Updates flowing from
+/// node-1 → gateway would then stop at the gateway — node-2 never received them.
+///
+/// ## What This Test Does
+///
+/// 1. Node 1 PUTs a contract (becomes the seeder/fulfiller)
+/// 2. Node 2 SUBSCRIBES — the subscribe routes through the gateway to node 1
+/// 3. Node 1 sends an UPDATE
+/// 4. Verify node 2 received the update (has matching state)
+///
+/// If the relay doesn't register node-2 as downstream, updates die at the gateway.
+#[test_log::test]
+fn test_subscription_relay_propagation() {
+    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0xBEAD_FEED_3390;
+    const NETWORK_NAME: &str = "relay-sub-test";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        // 1 gateway + 3 nodes: node-1 puts, node-2 subscribes, gateway relays
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,  // 1 gateway
+            3,  // 3 regular nodes
+            7,  // max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0x39);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    // Node 1 puts the contract (NOT the gateway), so subscribe from node 2
+    // must relay through the gateway to reach node 1.
+    let operations = vec![
+        // Node 1 puts with subscribe=true (seeds the contract)
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, 0x01),
+                subscribe: true,
+            },
+        ),
+        // Node 2 subscribes — routes through gateway to node 1
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+        // Node 1 updates — should propagate: node-1 → gateway → node-2
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(100, 0xFE),
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(60),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let contract_key_str = format!("{:?}", contract_key);
+
+    // Extract per-peer states for this contract from logs
+    let peer_states: std::collections::BTreeMap<std::net::SocketAddr, String> =
+        rt.block_on(async {
+            let logs = logs_handle.lock().await;
+            let mut states = std::collections::BTreeMap::new();
+            for log in logs.iter() {
+                if let Some(key) = log.kind.contract_key() {
+                    if format!("{:?}", key) == contract_key_str {
+                        if let Some(hash) = log.kind.stored_state_hash() {
+                            states.insert(log.peer_id.addr, hash.to_string());
+                        }
+                    }
+                }
+            }
+            states
+        });
+
+    tracing::info!(
+        "Relay subscription test: contract {} has state on {} peers: {:?}",
+        contract_key_str,
+        peer_states.len(),
+        peer_states.keys().collect::<Vec<_>>()
+    );
+
+    // ASSERTION: At least 3 peers must have state (node-1 seeder + gateway relay + node-2 subscriber)
+    // Without the relay fix, only node-1 and gateway would have state (2 peers);
+    // node-2 wouldn't receive updates because the gateway didn't register it as downstream.
+    assert!(
+        peer_states.len() >= 3,
+        "BUG (#3390): Relay subscription failed! Only {} peer(s) have state for contract {}. \
+         Expected at least 3 (seeder + gateway relay + subscriber). \
+         The relay node (gateway) likely didn't register the subscriber as downstream. \
+         Peers with state: {:?}",
+        peer_states.len(),
+        contract_key_str,
+        peer_states.keys().collect::<Vec<_>>()
+    );
+
+    // Verify convergence (all peers have same state)
+    let unique_states: std::collections::HashSet<&String> = peer_states.values().collect();
+    assert!(
+        unique_states.len() == 1,
+        "State divergence in relay test! {} unique states across {} peers: {:?}",
+        unique_states.len(),
+        peer_states.len(),
+        peer_states
+    );
+
+    // Run StateVerifier for anomaly detection (per testing.md)
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "Anomaly report: {} anomalies across {} contracts",
+        report.anomalies.len(),
+        report.contracts_analyzed
+    );
+
+    tracing::info!(
+        "test_subscription_relay_propagation PASSED: {} peers converged via relay",
+        peer_states.len()
+    );
+}
+
 // =============================================================================
 // Long-Duration Simulation Tests (1 Hour Virtual Time)
 // =============================================================================
