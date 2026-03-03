@@ -5,7 +5,7 @@ name: CI
 # 2. Skip expensive jobs on main push - PR already validated
 # 3. Skip NAT validation for dependabot PRs - Test is sufficient for version bumps
 # 4. Run fast checks (Fmt, Clippy) in parallel for quick fail-fast
-# 5. Use merge_group to skip redundant tests before merge
+# 5. Run required checks in merge_group to satisfy branch protection
 # 6. Split unit/integration and simulation tests for parallelism
 # Estimated savings: ~25-30% reduction in CI costs
 
@@ -132,11 +132,11 @@ jobs:
     timeout-minutes: 30
     needs: fmt_check
     # Skip on:
-    # - merge_group: PR already passed full tests
     # - push to main: PR already validated code before merge (saves ~$0.08/push)
     # - release PRs: only bump versions, main already passed CI
+    # Note: merge_group MUST run — required status checks apply to merge queue entries
     if: |
-      github.event_name == 'pull_request' &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       !startsWith(github.head_ref, 'release/v')
 
     env:
@@ -235,7 +235,7 @@ jobs:
     needs: fmt_check
     # Same skip conditions as test_unit
     if: |
-      github.event_name == 'pull_request' &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       !startsWith(github.head_ref, 'release/v')
 
     env:
@@ -279,12 +279,12 @@ jobs:
     runs-on: ubicloud-standard-16
     timeout-minutes: 30
     # Skip on:
-    # - merge_group: PR already passed full tests
     # - push to main: PR already validated code before merge
     # - release PRs: only bump versions
     # - dependabot PRs: just version bumps, Test job is sufficient
+    # Note: merge_group MUST run — required status checks apply to merge queue entries
     if: |
-      github.event_name == 'pull_request' &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       !startsWith(github.head_ref, 'release/v') &&
       !startsWith(github.head_ref, 'dependabot/')
 
