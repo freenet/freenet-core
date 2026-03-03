@@ -482,6 +482,11 @@ pub(in crate::node) struct P2pConnManager {
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
+    /// Tracks how many consecutive broadcast cycles found zero targets per contract.
+    /// Used to suppress repetitive WARN logs after the first few failures.
+    /// Bounded to MAX_BROADCAST_STREAK_ENTRIES to prevent unbounded growth from
+    /// network-influenced contract keys.
+    broadcast_no_target_streak: HashMap<freenet_stdlib::prelude::ContractKey, u32>,
     /// Global broadcast queue that serializes outbound broadcast streams
     /// with bounded concurrency to prevent uplink saturation (issue #3337).
     #[cfg(not(feature = "simulation_tests"))]
@@ -578,6 +583,7 @@ impl P2pConnManager {
             congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
+            broadcast_no_target_streak: HashMap::new(),
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: super::broadcast_queue::BroadcastQueue::new(),
         })
@@ -645,6 +651,7 @@ impl P2pConnManager {
             congestion_config,
             blocked_addresses,
             broadcast_retries,
+            broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue,
         } = self;
@@ -730,6 +737,7 @@ impl P2pConnManager {
             congestion_config, // Already used for connection handler, kept for struct completeness
             blocked_addresses,
             broadcast_retries,
+            broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: broadcast_queue.clone(),
         };
@@ -3895,6 +3903,10 @@ impl P2pConnManager {
     /// Base delay between broadcast retries (scaled by attempt number for linear backoff).
     const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
+    /// Maximum entries in the no-target streak tracker. Prevents unbounded growth
+    /// from network-influenced contract keys.
+    const MAX_BROADCAST_STREAK_ENTRIES: usize = 256;
+
     /// Notify interested network peers about a state change.
     ///
     /// Echo-back is prevented by summary comparison: we skip peers whose cached
@@ -3963,36 +3975,65 @@ impl P2pConnManager {
                     }
                 });
             } else {
+                // Retries exhausted. Track consecutive no-target cycles to
+                // suppress repetitive WARN logging after the first occurrence.
                 self.broadcast_retries.remove(&key);
-                tracing::warn!(
-                    contract = %key,
-                    self_addr = %self_addr,
-                    "BROADCAST_NO_TARGETS: no targets found after {} retries, giving up",
-                    Self::MAX_BROADCAST_RETRIES
-                );
-                // Emit delivery summary for diagnostics
-                let update_tx =
-                    crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
-                if let Some(log) = NetEventLog::broadcast_delivery_summary(
-                    &update_tx,
-                    &op_manager.ring,
-                    key,
-                    &target_result,
-                    0,
-                    0,
-                    0,
-                ) {
-                    self.bridge
-                        .log_register
-                        .register_events(Either::Left(log))
-                        .await;
+
+                // Evict oldest entry if at capacity to prevent unbounded growth.
+                if !self.broadcast_no_target_streak.contains_key(&key)
+                    && self.broadcast_no_target_streak.len() >= Self::MAX_BROADCAST_STREAK_ENTRIES
+                {
+                    if let Some(evict_key) = self.broadcast_no_target_streak.keys().next().cloned()
+                    {
+                        self.broadcast_no_target_streak.remove(&evict_key);
+                    }
+                }
+                let streak = self.broadcast_no_target_streak.entry(key).or_insert(0);
+                *streak = streak.saturating_add(1);
+                let current_streak = *streak;
+
+                if current_streak <= 1 {
+                    tracing::warn!(
+                        contract = %key,
+                        self_addr = %self_addr,
+                        "BROADCAST_NO_TARGETS: no targets found after {} retries, giving up",
+                        Self::MAX_BROADCAST_RETRIES
+                    );
+                } else {
+                    tracing::debug!(
+                        contract = %key,
+                        self_addr = %self_addr,
+                        consecutive_misses = current_streak,
+                        "BROADCAST_NO_TARGETS: still no targets (suppressing repeated warns)"
+                    );
+                }
+
+                // Emit delivery summary for diagnostics (only on first miss per streak)
+                if current_streak <= 1 {
+                    let update_tx =
+                        crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+                    if let Some(log) = NetEventLog::broadcast_delivery_summary(
+                        &update_tx,
+                        &op_manager.ring,
+                        key,
+                        &target_result,
+                        0,
+                        0,
+                        0,
+                    ) {
+                        self.bridge
+                            .log_register
+                            .register_events(Either::Left(log))
+                            .await;
+                    }
                 }
             }
             return;
         }
 
-        // Targets found - clear any pending retry state for this contract
+        // Targets found - clear any pending retry and streak state for this contract
         self.broadcast_retries.remove(&key);
+        self.broadcast_no_target_streak.remove(&key);
 
         // In production, enqueue each target into the broadcast queue.
         // The queue worker handles delta computation and streaming with bounded
