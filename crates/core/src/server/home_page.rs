@@ -34,6 +34,7 @@ fn homepage_html() -> String {
     let peers_card = build_peers_card(&snap);
     let contracts_card = build_contracts_card(&snap);
     let ops_card = build_ops_card(&snap);
+    let transfer_card = build_transfer_card(&snap);
 
     format!(
         r##"<!DOCTYPE html>
@@ -66,6 +67,7 @@ fn homepage_html() -> String {
     <main>
         {status_card}
         {peers_card}
+        {transfer_card}
         {contracts_card}
         {ops_card}
 
@@ -97,6 +99,7 @@ fn homepage_html() -> String {
         uptime = uptime,
         status_card = status_card,
         peers_card = peers_card,
+        transfer_card = transfer_card,
         contracts_card = contracts_card,
         ops_card = ops_card,
     )
@@ -204,12 +207,53 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
             .to_string();
     };
 
-    let (dot_class, status_text) = if snap.open_connections > 0 {
-        let n = snap.open_connections;
-        let label = if n == 1 { "peer" } else { "peers" };
-        ("dot-green", format!("Connected ({n} {label})"))
-    } else {
-        ("dot-yellow", "Connecting...".to_string())
+    // Health banner — the primary "everything looks good" indicator
+    let health_banner = match snap.health {
+        network_status::HealthLevel::Healthy => {
+            let n = snap.open_connections;
+            let label = if n == 1 { "peer" } else { "peers" };
+            format!(
+                r#"<div class="health-banner health-good">
+                    <span class="health-icon">&#x2714;</span>
+                    <span>Node is healthy — connected to {n} {label}</span>
+                </div>"#,
+            )
+        }
+        network_status::HealthLevel::Degraded => {
+            let detail = if snap.gateway_only {
+                "Only connected to gateways — no peer-to-peer connections yet"
+            } else {
+                "Connected but NAT traversal is failing"
+            };
+            format!(
+                r#"<div class="health-banner health-degraded">
+                    <span class="health-icon">&#x26A0;</span>
+                    <span>{detail}</span>
+                </div>"#,
+            )
+        }
+        network_status::HealthLevel::Connecting => r#"<div class="health-banner health-connecting">
+                <span class="health-icon">&#x231B;</span>
+                <span>Connecting to the network...</span>
+            </div>"#
+            .to_string(),
+        network_status::HealthLevel::Trouble => {
+            let has_version_mismatch = snap
+                .failures
+                .iter()
+                .any(|f| f.reason_html.contains("Version mismatch"));
+            let detail = if has_version_mismatch {
+                "Version mismatch — update required"
+            } else {
+                "Unable to connect — check firewall and network settings"
+            };
+            format!(
+                r#"<div class="health-banner health-trouble">
+                    <span class="health-icon">&#x2716;</span>
+                    <span>{detail}</span>
+                </div>"#,
+            )
+        }
     };
 
     let spinner = if snap.open_connections == 0 {
@@ -218,16 +262,14 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         ""
     };
 
-    // Gateway-only warning
+    // Gateway-only warning (only when not connected to any peers)
     let gateway_warning = if snap.gateway_only {
         format!(
             r#"<div class="warning">
-                <strong>Only connected to gateway servers</strong> — no peer-to-peer connections.
-                This usually means a firewall is blocking incoming UDP connections on port <code>{port}</code>.
+                <strong>Firewall likely blocking incoming connections</strong> on UDP port <code>{port}</code>.
                 <ul>
                     <li>Configure your router to forward UDP port <code>{port}</code> to this computer.</li>
                     <li>Check that no software firewall (ufw, iptables, Windows Defender) is blocking Freenet.</li>
-                    <li>We plan to improve support for restrictive firewalls in a future release.</li>
                 </ul>
             </div>"#,
             port = snap.listening_port
@@ -236,24 +278,46 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         String::new()
     };
 
-    // NAT stats (suppress the detailed advice when the gateway warning already covers it)
+    // NAT stats with rolling trend
     let nat_html = if snap.nat_stats.attempts > 0 {
         let all_failed = snap.nat_stats.successes == 0;
         let class = if all_failed { " nat-fail" } else { "" };
-        // Only show the "try forwarding" advice if the gateway_only warning isn't already visible
         let extra = if all_failed && !snap.gateway_only {
             format!(
-                r#"<p class="nat-advice">All NAT traversal attempts have failed. Your firewall or router is likely blocking UDP connections. Try forwarding UDP port <code>{}</code> on your router.</p>"#,
+                r#"<p class="nat-advice">All NAT traversal attempts have failed. Try forwarding UDP port <code>{}</code> on your router.</p>"#,
                 snap.listening_port
             )
         } else {
             String::new()
         };
+
+        // Rolling trend: recent window stats and verdict badge
+        let (recent, verdict) = if snap.nat_stats.recent_attempts > 0 {
+            let rs = snap.nat_stats.recent_successes;
+            let ra = snap.nat_stats.recent_attempts;
+            let recent_rate = rs as f64 / ra as f64;
+            let (verdict_text, verdict_class) = if recent_rate > 0.5 {
+                ("Port appears open", "nat-verdict-good")
+            } else if rs == 0 {
+                ("Port may be blocked", "nat-verdict-bad")
+            } else {
+                ("Intermittent", "nat-verdict-warn")
+            };
+            (
+                format!(r#" <span class="nat-recent">({rs}/{ra} recent)</span>"#),
+                format!(r#"<span class="nat-verdict {verdict_class}">{verdict_text}</span>"#),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
         format!(
-            r#"<p class="nat-stat{class}">NAT hole punching: {s}/{a} successful</p>{extra}"#,
+            r#"<p class="nat-stat{class}">NAT hole punching: {s}/{a} successful{recent} {verdict}</p>{extra}"#,
             class = class,
             s = snap.nat_stats.successes,
             a = snap.nat_stats.attempts,
+            recent = recent,
+            verdict = verdict,
             extra = extra,
         )
     } else if snap.open_connections == 0 {
@@ -262,7 +326,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         String::new()
     };
 
-    // Failure diagnostics
+    // Failure diagnostics — demoted when connected (muted style, collapsed)
     let failures_html = if !snap.failures.is_empty() {
         let mut items = String::new();
         for f in &snap.failures {
@@ -271,16 +335,29 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
                 f.address, f.reason_html
             ));
         }
-        format!(
-            r#"<div class="diagnostics">
-                <h3>Connection Issues</h3>
-                <ul>{items}</ul>
-                <p class="attempts">Attempted {attempts} connection(s) over {elapsed}. Retrying...</p>
-            </div>"#,
-            items = items,
-            attempts = snap.connection_attempts,
-            elapsed = format_duration(snap.elapsed_secs),
-        )
+        if snap.open_connections > 0 {
+            // Demoted: muted style when node is otherwise connected
+            format!(
+                r#"<details class="diagnostics-muted">
+                    <summary>{n} recent connection attempt(s) failed <span class="muted-hint">(normal)</span></summary>
+                    <ul>{items}</ul>
+                </details>"#,
+                n = snap.failures.len(),
+                items = items,
+            )
+        } else {
+            // Prominent: when not connected, failures are actionable
+            format!(
+                r#"<div class="diagnostics">
+                    <h3>Connection Issues</h3>
+                    <ul>{items}</ul>
+                    <p class="attempts">Attempted {attempts} connection(s) over {elapsed}. Retrying...</p>
+                </div>"#,
+                items = items,
+                attempts = snap.connection_attempts,
+                elapsed = format_duration(snap.elapsed_secs),
+            )
+        }
     } else if snap.open_connections == 0 && snap.connection_attempts > 0 {
         format!(
             r#"<p class="attempts">Attempted {} connection(s) over {}. Retrying...</p>"#,
@@ -294,18 +371,59 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
     format!(
         r#"<div class="card">
             <h2>Connection Status</h2>
-            <div class="status-row"><span class="dot {dot_class}"></span> {status_text}</div>
+            {health_banner}
             {spinner}
             {gateway_warning}
             {nat_html}
             {failures_html}
         </div>"#,
-        dot_class = dot_class,
-        status_text = status_text,
+        health_banner = health_banner,
         spinner = spinner,
         gateway_warning = gateway_warning,
         nat_html = nat_html,
         failures_html = failures_html,
+    )
+}
+
+/// Format bytes as a human-readable string (e.g., "1.2 MB").
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    let Some(snap) = snap else {
+        return String::new();
+    };
+    if snap.bytes_uploaded == 0 && snap.bytes_downloaded == 0 && snap.open_connections == 0 {
+        return String::new();
+    }
+
+    format!(
+        r#"<div class="card">
+            <h2>Data Transfer</h2>
+            <div class="transfer-stat">
+                <span class="transfer-label">Uploaded</span>
+                <span class="transfer-value">{uploaded}</span>
+            </div>
+            <div class="transfer-stat">
+                <span class="transfer-label">Downloaded</span>
+                <span class="transfer-value">{downloaded}</span>
+            </div>
+        </div>"#,
+        uploaded = format_bytes(snap.bytes_uploaded),
+        downloaded = format_bytes(snap.bytes_downloaded),
     )
 }
 
@@ -341,12 +459,24 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
             .location
             .map(|l| format!("{:.4}", l))
             .unwrap_or_else(|| "—".to_string());
+        let sent = if p.bytes_sent > 0 {
+            format_bytes(p.bytes_sent)
+        } else {
+            "—".to_string()
+        };
+        let recv = if p.bytes_received > 0 {
+            format_bytes(p.bytes_received)
+        } else {
+            "—".to_string()
+        };
         rows.push_str(&format!(
-            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'""><td><code>{addr}</code></td><td>{loc}</td><td>{ptype}</td><td>{connected}</td></tr>"#,
+            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'"><td><code>{addr}</code></td><td>{loc}</td><td>{ptype}</td><td>{sent}</td><td>{recv}</td><td>{connected}</td></tr>"#,
             addr_enc = html_escape(&p.address.to_string()),
             addr = p.address,
             loc = loc,
             ptype = peer_type,
+            sent = sent,
+            recv = recv,
             connected = format_duration(p.connected_secs),
         ));
     }
@@ -357,7 +487,7 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
             {ring_svg}
             <div class="table-wrap">
                 <table>
-                    <thead><tr><th>Address</th><th>Location</th><th>Type</th><th>Connected</th></tr></thead>
+                    <thead><tr><th>Address</th><th>Location</th><th>Type</th><th>Sent</th><th>Recv</th><th>Connected</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>
@@ -769,6 +899,22 @@ main {
     color: #f87171;
 }
 [data-theme="light"] .nat-advice { color: #b91c1c; background: rgba(248, 113, 113, 0.08); }
+.nat-recent { color: var(--text-muted); font-size: 0.8rem; }
+.nat-verdict {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    margin-left: 0.3rem;
+    vertical-align: middle;
+}
+.nat-verdict-good { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+.nat-verdict-bad { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+.nat-verdict-warn { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+[data-theme="light"] .nat-verdict-good { color: #059669; background: rgba(5, 150, 105, 0.1); }
+[data-theme="light"] .nat-verdict-bad { color: #dc2626; background: rgba(220, 38, 38, 0.1); }
+[data-theme="light"] .nat-verdict-warn { color: #d97706; background: rgba(217, 119, 6, 0.1); }
 .diagnostics {
     background: rgba(251, 191, 36, 0.1);
     border: 1px solid rgba(251, 191, 36, 0.3);
@@ -877,6 +1023,85 @@ code {
     color: var(--text-secondary);
     font-size: 0.8rem;
     margin-top: 0.15rem;
+}
+/* ── Health banner ── */
+.health-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.6rem 0.9rem;
+    border-radius: 6px;
+    font-weight: 500;
+    font-size: 0.9rem;
+    margin-bottom: 0.75rem;
+}
+.health-icon { font-size: 1.1rem; flex-shrink: 0; }
+.health-good {
+    background: rgba(52, 211, 153, 0.12);
+    border: 1px solid rgba(52, 211, 153, 0.3);
+    color: #34d399;
+}
+[data-theme="light"] .health-good { color: #059669; background: rgba(52, 211, 153, 0.1); }
+.health-degraded {
+    background: rgba(251, 191, 36, 0.1);
+    border: 1px solid rgba(251, 191, 36, 0.3);
+    color: #fbbf24;
+}
+[data-theme="light"] .health-degraded { color: #92400e; }
+.health-connecting {
+    background: rgba(0, 127, 255, 0.08);
+    border: 1px solid rgba(0, 127, 255, 0.2);
+    color: var(--accent-light);
+}
+[data-theme="light"] .health-connecting { color: var(--accent-dark); }
+.health-trouble {
+    background: rgba(248, 113, 113, 0.1);
+    border: 1px solid rgba(248, 113, 113, 0.3);
+    color: #f87171;
+}
+[data-theme="light"] .health-trouble { color: #b91c1c; }
+/* ── Demoted diagnostics (when connected) ── */
+.diagnostics-muted {
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+.diagnostics-muted summary {
+    cursor: pointer;
+    font-family: var(--font-mono);
+}
+.diagnostics-muted summary:hover { color: var(--text-secondary); }
+.diagnostics-muted ul {
+    padding-left: 1.2rem;
+    margin: 0.4rem 0;
+    list-style: disc;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+}
+.diagnostics-muted li { margin-bottom: 0.25rem; }
+.muted-hint { opacity: 0.6; font-style: italic; }
+/* ── Transfer stats ── */
+.transfer-stat {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem;
+    background: var(--bg-secondary);
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+}
+.transfer-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-family: var(--font-mono);
+}
+.transfer-value {
+    font-size: 1.1rem;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
 }
 .note a { color: var(--accent-light); }
 [data-theme="light"] .note a { color: var(--accent-primary); }
@@ -1036,12 +1261,16 @@ fn peer_detail_html(address_str: &str) -> String {
                 <div class="info-label">Location</div><div class="info-value">{loc}</div>
                 <div class="info-label">Type</div><div class="info-value">{ptype}</div>
                 <div class="info-label">Connected</div><div class="info-value">{connected}</div>
+                <div class="info-label">Sent</div><div class="info-value">{sent}</div>
+                <div class="info-label">Received</div><div class="info-value">{recv}</div>
             </div>
         </div>"#,
         addr = html_escape(&peer.address.to_string()),
         loc = loc_str,
         ptype = peer_type,
         connected = format_duration(peer.connected_secs),
+        sent = format_bytes(peer.bytes_sent),
+        recv = format_bytes(peer.bytes_received),
     );
 
     // Build routing model status card
@@ -1490,7 +1719,7 @@ a.header-title {
 mod tests {
     use super::*;
     use crate::node::network_status::{
-        FailureSnapshot, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
+        FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
     };
     use std::net::SocketAddr;
 
@@ -1508,6 +1737,9 @@ mod tests {
             op_stats: OpStatsSnapshot::default(),
             nat_stats: NatStatsSnapshot::default(),
             gateway_only: false,
+            bytes_uploaded: 0,
+            bytes_downloaded: 0,
+            health: HealthLevel::Connecting,
         }
     }
 
@@ -1605,6 +1837,112 @@ mod tests {
             html.contains(r#"rel="icon" type="image/svg+xml" href="data:image/svg+xml,"#),
             "homepage should contain favicon data URI"
         );
+    }
+
+    #[test]
+    fn health_banner_shown_for_each_level() {
+        // Healthy
+        let mut snap = base_snapshot();
+        snap.health = HealthLevel::Healthy;
+        snap.open_connections = 3;
+        let html = build_status_card(&Some(snap));
+        assert!(html.contains("health-good"), "healthy banner missing");
+        assert!(html.contains("Node is healthy"));
+
+        // Degraded
+        let mut snap = base_snapshot();
+        snap.health = HealthLevel::Degraded;
+        snap.gateway_only = true;
+        snap.open_connections = 1;
+        let html = build_status_card(&Some(snap));
+        assert!(html.contains("health-degraded"), "degraded banner missing");
+
+        // Connecting
+        let snap = base_snapshot(); // default is Connecting
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("health-connecting"),
+            "connecting banner missing"
+        );
+
+        // Trouble
+        let mut snap = base_snapshot();
+        snap.health = HealthLevel::Trouble;
+        let html = build_status_card(&Some(snap));
+        assert!(html.contains("health-trouble"), "trouble banner missing");
+    }
+
+    #[test]
+    fn failures_demoted_when_connected() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 3;
+        snap.health = HealthLevel::Healthy;
+        snap.failures.push(FailureSnapshot {
+            address: "1.2.3.4:1234".parse().unwrap(),
+            reason_html: "NAT traversal failed".to_string(),
+        });
+        let html = build_status_card(&Some(snap));
+        // Should use <details> (collapsed) instead of prominent .diagnostics
+        assert!(
+            html.contains("diagnostics-muted"),
+            "failures should be demoted when connected"
+        );
+        assert!(
+            !html.contains(r#"class="diagnostics""#),
+            "should not use prominent diagnostics style"
+        );
+        assert!(
+            html.contains("(normal)"),
+            "should indicate failures are normal"
+        );
+    }
+
+    #[test]
+    fn failures_prominent_when_not_connected() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 0;
+        snap.health = HealthLevel::Connecting;
+        snap.failures.push(FailureSnapshot {
+            address: "1.2.3.4:1234".parse().unwrap(),
+            reason_html: "timeout".to_string(),
+        });
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains(r#"class="diagnostics""#),
+            "failures should be prominent when not connected"
+        );
+        assert!(!html.contains("diagnostics-muted"), "should not be demoted");
+    }
+
+    #[test]
+    fn transfer_card_shows_bytes() {
+        let mut snap = base_snapshot();
+        snap.bytes_uploaded = 1024 * 1024 * 5; // 5 MB
+        snap.open_connections = 1;
+        let html = build_transfer_card(&Some(snap));
+        assert!(html.contains("5.0 MB"), "should show formatted bytes");
+        assert!(html.contains("Uploaded"), "should show upload label");
+    }
+
+    #[test]
+    fn transfer_card_hidden_when_no_data() {
+        let snap = base_snapshot();
+        let html = build_transfer_card(&Some(snap));
+        assert!(
+            html.is_empty(),
+            "transfer card should be hidden with no data"
+        );
+    }
+
+    #[test]
+    fn format_bytes_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 3 / 2), "1.5 GB");
     }
 
     #[test]

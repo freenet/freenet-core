@@ -903,6 +903,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                         error
                     })? {
+                        // Record inbound bytes for non-streamed (short) messages
+                        super::TRANSPORT_METRICS.record_inbound_completed(
+                            self.remote_conn.remote_addr,
+                            msg.len() as u64,
+                        );
                         tracing::trace!(
                             peer_addr = %self.remote_conn.remote_addr,
                             packet_id,
@@ -931,9 +936,16 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // Also clean up streaming handle and registry
                     self.streaming_handles.remove(&stream_id);
                     self.streaming_registry.remove(stream_id);
+                    // Record inbound bytes for dashboard metrics
+                    let bytes_received = msg.len() as u64;
+                    super::TRANSPORT_METRICS.record_inbound_completed(
+                        self.remote_conn.remote_addr,
+                        bytes_received,
+                    );
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
+                        bytes = bytes_received,
                         "Stream finished"
                     );
                     return Ok(msg);
