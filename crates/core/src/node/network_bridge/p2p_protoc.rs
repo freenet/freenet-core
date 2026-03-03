@@ -484,6 +484,8 @@ pub(in crate::node) struct P2pConnManager {
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
     /// Tracks how many consecutive broadcast cycles found zero targets per contract.
     /// Used to suppress repetitive WARN logs after the first few failures.
+    /// Bounded to MAX_BROADCAST_STREAK_ENTRIES to prevent unbounded growth from
+    /// network-influenced contract keys.
     broadcast_no_target_streak: HashMap<freenet_stdlib::prelude::ContractKey, u32>,
     /// Global broadcast queue that serializes outbound broadcast streams
     /// with bounded concurrency to prevent uplink saturation (issue #3337).
@@ -3901,6 +3903,10 @@ impl P2pConnManager {
     /// Base delay between broadcast retries (scaled by attempt number for linear backoff).
     const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
+    /// Maximum entries in the no-target streak tracker. Prevents unbounded growth
+    /// from network-influenced contract keys.
+    const MAX_BROADCAST_STREAK_ENTRIES: usize = 256;
+
     /// Notify interested network peers about a state change.
     ///
     /// Echo-back is prevented by summary comparison: we skip peers whose cached
@@ -4007,6 +4013,16 @@ impl P2pConnManager {
             } else {
                 // Genuinely zero sources — no subscribers exist for this contract.
                 // Track consecutive failures to suppress repetitive logging.
+                // Evict oldest entry if at capacity to prevent unbounded growth.
+                if !self.broadcast_no_target_streak.contains_key(&key)
+                    && self.broadcast_no_target_streak.len() >= Self::MAX_BROADCAST_STREAK_ENTRIES
+                {
+                    // Remove an arbitrary entry to make room.
+                    if let Some(evict_key) = self.broadcast_no_target_streak.keys().next().cloned()
+                    {
+                        self.broadcast_no_target_streak.remove(&evict_key);
+                    }
+                }
                 let streak = self.broadcast_no_target_streak.entry(key).or_insert(0);
                 *streak = streak.saturating_add(1);
                 let current_streak = *streak;
