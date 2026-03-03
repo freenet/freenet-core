@@ -2552,4 +2552,92 @@ mod tests {
             "different metadata bytes must not be treated as duplicate"
         );
     }
+
+    /// Regression test for #3369: `last_received_nanos` is a struct field, not a local.
+    ///
+    /// Before the fix, `last_received_nanos` was a local variable in `recv()`,
+    /// initialized to `now()` on each call. When `peer_connection_listener`'s select
+    /// picked the outbound branch, `recv()` was cancelled and re-called, resetting the
+    /// timeout window indefinitely — the gateway could never detect a dead peer as long
+    /// as outbound traffic existed.
+    ///
+    /// After the fix, `last_received_nanos` is a struct field initialized once in `new()`
+    /// and only updated when an actual inbound packet arrives. This test verifies:
+    /// 1. The field is initialized to the creation-time timestamp
+    /// 2. The field persists and is not reset when time advances (unlike a local that
+    ///    would be re-initialized to `now()` on each recv() entry)
+    /// 3. Multiple time advances don't affect the stored value
+    #[tokio::test]
+    async fn last_received_nanos_is_persistent_field() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let time_source = SharedMockTimeSource::new();
+        let (_inbound_tx, inbound_rx) = fast_channel::bounded(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9999);
+
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+
+        let keypair = TransportKeypair::new();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+
+        let socket = Arc::new(TestSocket::new(
+            fast_channel::bounded::<(SocketAddr, Arc<[u8]>)>(16).0,
+        ));
+
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher,
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            time_source: time_source.clone(),
+        };
+
+        let creation_time = time_source.now_nanos();
+        let conn = PeerConnection::new(remote_conn);
+
+        // Field is initialized to creation-time timestamp
+        assert_eq!(
+            conn.last_received_nanos, creation_time,
+            "last_received_nanos should be set to creation time"
+        );
+
+        // Advance time and verify the field does NOT change.
+        // Before the fix, recv() would reinitialize a local `last_received_nanos = now()`
+        // on every call. As a struct field, it stays at the creation-time value until
+        // an actual inbound packet updates it.
+        for i in 0..5 {
+            time_source.advance_time(Duration::from_secs(10));
+            let now = time_source.now_nanos();
+            assert_ne!(now, creation_time, "time should have advanced");
+            assert_eq!(
+                conn.last_received_nanos, creation_time,
+                "last_received_nanos must not change without inbound packets \
+                 (iteration {i}, bug #3369). A local variable in recv() would \
+                 return now()={now} instead of the stored creation_time={creation_time}"
+            );
+        }
+    }
 }
