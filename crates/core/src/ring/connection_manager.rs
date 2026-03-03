@@ -62,8 +62,10 @@ const FAILED_ADDR_BASE_TTL: Duration = Duration::from_secs(300);
 const FAILED_ADDR_MAX_TTL: Duration = Duration::from_secs(3600);
 
 /// Compute the adaptive TTL for an address with `failure_count` repeated failures.
+/// First failure (count=1) uses the base TTL; each subsequent failure doubles it.
 fn failed_addr_ttl(failure_count: u32) -> Duration {
-    let multiplier = 1u64.checked_shl(failure_count).unwrap_or(u64::MAX);
+    let exponent = failure_count.saturating_sub(1);
+    let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
     let ttl_secs = FAILED_ADDR_BASE_TTL.as_secs().saturating_mul(multiplier);
     Duration::from_secs(ttl_secs.min(FAILED_ADDR_MAX_TTL.as_secs()))
 }
@@ -3635,5 +3637,116 @@ mod tests {
         assert_eq!(stats_after.successes, 0);
         assert_eq!(stats_after.failures, 0);
         assert!(stats_after.last_success.is_none());
+    }
+
+    // ============ failed_addr_ttl / adaptive TTL tests ============
+
+    #[test]
+    fn test_failed_addr_ttl_base_cases() {
+        // count=0 should never happen in practice, but should not panic
+        assert_eq!(failed_addr_ttl(0), Duration::from_secs(300));
+        // First failure (count=1): base TTL = 5 min
+        assert_eq!(failed_addr_ttl(1), Duration::from_secs(300));
+        // Second failure: 10 min
+        assert_eq!(failed_addr_ttl(2), Duration::from_secs(600));
+        // Third: 20 min
+        assert_eq!(failed_addr_ttl(3), Duration::from_secs(1200));
+        // Fourth: 40 min
+        assert_eq!(failed_addr_ttl(4), Duration::from_secs(2400));
+        // Fifth: would be 80 min, capped to 60 min
+        assert_eq!(failed_addr_ttl(5), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn test_failed_addr_ttl_cap_and_overflow() {
+        // High counts should cap at MAX_TTL, never panic
+        assert_eq!(failed_addr_ttl(100), FAILED_ADDR_MAX_TTL);
+        assert_eq!(failed_addr_ttl(u32::MAX), FAILED_ADDR_MAX_TTL);
+    }
+
+    #[test]
+    fn test_failed_addr_ttl_monotonic() {
+        // TTL should never decrease with increasing failure count
+        let mut prev = failed_addr_ttl(0);
+        for count in 1..=20 {
+            let current = failed_addr_ttl(count);
+            assert!(current >= prev, "TTL decreased at count={count}");
+            prev = current;
+        }
+    }
+
+    #[test]
+    fn test_record_and_query_failed_addrs() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let addr = make_addr(9001);
+
+        // No failures initially
+        assert!(cm.recently_failed_addrs().is_empty());
+
+        // Record a failure — addr should appear in the list
+        cm.record_failed_addr(addr);
+        let failed = cm.recently_failed_addrs();
+        assert!(failed.contains(&addr));
+
+        // Internal count should be 1 after first failure
+        let map = cm.recently_failed_addrs.read();
+        assert_eq!(map.get(&addr).unwrap().1, 1);
+    }
+
+    #[test]
+    fn test_record_failed_addr_accumulates_count() {
+        let cm = make_connection_manager(Some(make_addr(9100)), 1, 10, false);
+        let addr = make_addr(9101);
+
+        for expected in 1..=5u32 {
+            cm.record_failed_addr(addr);
+            let map = cm.recently_failed_addrs.read();
+            assert_eq!(map.get(&addr).unwrap().1, expected);
+        }
+    }
+
+    #[test]
+    fn test_clear_failed_addr_resets_count() {
+        let cm = make_connection_manager(Some(make_addr(9200)), 1, 10, false);
+        let addr = make_addr(9201);
+
+        cm.record_failed_addr(addr);
+        cm.record_failed_addr(addr);
+        assert_eq!(cm.recently_failed_addrs.read().get(&addr).unwrap().1, 2);
+
+        // Clear removes the entry entirely
+        cm.clear_failed_addr(addr);
+        assert!(cm.recently_failed_addrs.read().get(&addr).is_none());
+
+        // Re-recording starts from count=1
+        cm.record_failed_addr(addr);
+        assert_eq!(cm.recently_failed_addrs.read().get(&addr).unwrap().1, 1);
+    }
+
+    #[test]
+    fn test_cleanup_stale_failed_addrs_respects_adaptive_ttl() {
+        let cm = make_connection_manager(Some(make_addr(9300)), 1, 10, false);
+        let addr_once = make_addr(9301); // 1 failure → 5 min TTL
+        let addr_many = make_addr(9302); // 4 failures → 40 min TTL
+
+        cm.record_failed_addr(addr_once);
+        for _ in 0..4 {
+            cm.record_failed_addr(addr_many);
+        }
+
+        // Age both entries past 5 min but under 40 min
+        {
+            let mut map = cm.recently_failed_addrs.write();
+            for (_, (ts, _)) in map.iter_mut() {
+                *ts = Instant::now() - Duration::from_secs(400); // ~6.7 min
+            }
+        }
+
+        let removed = cm.cleanup_stale_failed_addrs();
+        assert_eq!(removed, 1, "only the single-failure entry should expire");
+
+        let remaining = cm.recently_failed_addrs();
+        assert!(!remaining.contains(&addr_once));
+        assert!(remaining.contains(&addr_many));
     }
 }
