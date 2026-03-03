@@ -980,21 +980,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             elapsed.as_secs_f64()
                         );
 
-                        // Check if keep-alive task is still alive
+                        // Diagnostic: check keepalive task state at timeout.
+                        // "still running" is the normal case — pings are being sent
+                        // but the remote isn't responding (NAT mapping expired, peer
+                        // crashed, etc.). "already finished" means the socket errored
+                        // before the idle timeout fired (rare).
                         if let Some(ref handle) = self.keep_alive_handle {
-                            if !handle.is_finished() {
-                                tracing::error!(
-                                    target: "freenet_core::transport::keepalive_timeout",
-                                    remote = ?self.remote_conn.remote_addr,
-                                    "Keep-alive task is STILL RUNNING despite timeout!"
-                                );
-                            } else {
-                                tracing::error!(
-                                    target: "freenet_core::transport::keepalive_timeout",
-                                    remote = ?self.remote_conn.remote_addr,
-                                    "Keep-alive task has ALREADY FINISHED before timeout!"
-                                );
-                            }
+                            let task_state = if handle.is_finished() { "finished" } else { "running" };
+                            tracing::debug!(
+                                target: "freenet_core::transport::keepalive_timeout",
+                                remote = ?self.remote_conn.remote_addr,
+                                keepalive_task = task_state,
+                                "Connection timed out, keepalive task was {task_state}"
+                            );
                         }
 
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
