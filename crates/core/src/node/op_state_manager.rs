@@ -238,6 +238,8 @@ pub(crate) struct OpManager {
     pub proximity_cache: Arc<ProximityCacheManager>,
     /// Interest manager for delta-based state synchronization
     pub interest_manager: Arc<crate::ring::interest::InterestManager<InstantTimeSrc>>,
+    /// Dedup cache for skipping redundant broadcast WASM merges
+    pub broadcast_dedup_cache: Arc<crate::operations::update::BroadcastDedupCache>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -289,6 +291,7 @@ impl Clone for OpManager {
             contract_waiters: self.contract_waiters.clone(),
             proximity_cache: self.proximity_cache.clone(),
             interest_manager: self.interest_manager.clone(),
+            broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             streaming_threshold: self.streaming_threshold,
@@ -400,6 +403,7 @@ impl OpManager {
             contract_waiters,
             proximity_cache,
             interest_manager,
+            broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
             request_router,
             orphan_stream_registry,
             streaming_threshold,

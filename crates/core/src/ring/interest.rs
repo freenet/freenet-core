@@ -292,6 +292,12 @@ pub struct InterestManager<T: TimeSource> {
     /// Number of ResyncRequests received (indicates delta application failures at remote peer).
     /// This counter helps detect incorrect summary caching issues (see PR #2763).
     resync_requests_received: AtomicU64,
+
+    /// Throttle timestamps for proactive summary notifications.
+    /// After applying a broadcast update, we notify interested peers of our new summary
+    /// so they can skip sending us data we already have. This DashMap tracks the last
+    /// notification time per contract to avoid flooding (minimum 100ms interval).
+    summary_notify_timestamps: DashMap<ContractKey, Instant>,
 }
 
 impl<T: TimeSource> InterestManager<T> {
@@ -310,6 +316,7 @@ impl<T: TimeSource> InterestManager<T> {
             full_state_sends: AtomicU64::new(0),
             delta_bytes_saved: AtomicU64::new(0),
             resync_requests_received: AtomicU64::new(0),
+            summary_notify_timestamps: DashMap::new(),
         }
     }
 
@@ -339,6 +346,14 @@ impl<T: TimeSource> InterestManager<T> {
     pub fn record_resync_request_received(&self) {
         self.resync_requests_received
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get the current time from the configured `TimeSource`.
+    ///
+    /// Use this to pass DST-compatible timestamps to components that need
+    /// the current time (e.g., `BroadcastDedupCache`).
+    pub fn now(&self) -> Instant {
+        self.time_source.now()
     }
 
     /// Register a peer's interest in a contract.
@@ -471,6 +486,29 @@ impl<T: TimeSource> InterestManager<T> {
         self.interested_peers
             .get(contract)
             .and_then(|entry| entry.get(peer).and_then(|i| i.summary.clone()))
+    }
+
+    /// Check if enough time has elapsed to send a proactive summary notification
+    /// for this contract. Returns `true` if at least 100ms has passed since the last
+    /// notification (or if no notification was ever sent). Updates the timestamp on success.
+    ///
+    /// This prevents flooding peers with summary notifications when multiple broadcasts
+    /// are applied in rapid succession.
+    pub fn should_send_summary_notification(&self, contract: &ContractKey) -> bool {
+        let now = self.time_source.now();
+        let min_interval = Duration::from_millis(100);
+
+        let mut entry = self.summary_notify_timestamps.entry(*contract).or_insert(
+            // Use a timestamp far in the past so the first check always succeeds
+            now - min_interval - Duration::from_millis(1),
+        );
+
+        if now.duration_since(*entry.value()) >= min_interval {
+            *entry.value_mut() = now;
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove all interests for a peer (called on peer disconnect).
@@ -761,6 +799,8 @@ impl<T: TimeSource> InterestManager<T> {
 
         if !has_peer_interest && !has_local_interest {
             self.unindex_contract_hash(contract);
+            // Clean up summary notification timestamp when no interest remains
+            self.summary_notify_timestamps.remove(contract);
         }
     }
 
