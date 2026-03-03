@@ -505,9 +505,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         .any(|f| matches!(f.reason, FailureReason::VersionMismatch { .. }));
     let nat_all_failing = s.nat_stats.attempts > 0 && s.nat_stats.successes == 0;
 
-    let health = if has_version_mismatch {
-        HealthLevel::Trouble
-    } else if open_connections == 0 && elapsed_secs > 60 {
+    let health = if has_version_mismatch || (open_connections == 0 && elapsed_secs > 60) {
         HealthLevel::Trouble
     } else if open_connections == 0 {
         HealthLevel::Connecting
