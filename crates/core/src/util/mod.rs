@@ -300,3 +300,11 @@ pub(crate) mod tests {
         dir
     }
 }
+
+pub fn format_peer_count(n: usize) -> String {
+    if n == 1 {
+        "1 peer".to_string()
+    } else {
+        format!("{n} peers")
+    }
+}
