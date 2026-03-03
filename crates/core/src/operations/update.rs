@@ -1221,6 +1221,31 @@ impl OpManager {
             }
         }
 
+        // Source 3: Ring-routing fallback for locally-initiated updates with no targets.
+        // When a client submits an update to THIS node but we have no proximity/interest
+        // targets (subscriber registered interest at a different node), forward to the
+        // closest ring peer so the normal BroadcastStateChange cascade can reach subscribers.
+        // Only fires for local initiators to avoid amplifying cascaded broadcasts.
+        if targets.is_empty() && is_local_update_initiator {
+            let skip_list: Vec<std::net::SocketAddr> = std::iter::once(*sender)
+                .chain(self_addr)
+                .collect();
+            let ring_target = self.ring.closest_potentially_caching(
+                key,
+                skip_list.as_slice(),
+            );
+            if let Some(pkl) = ring_target {
+                tracing::info!(
+                    contract = %format!("{:.8}", key),
+                    peer_addr = %sender,
+                    ring_target = ?pkl.socket_addr(),
+                    phase = "ring_fallback",
+                    "UPDATE_PROPAGATION: No proximity/interest targets, using ring-routing fallback"
+                );
+                targets.insert(pkl);
+            }
+        }
+
         // Sort targets for deterministic iteration order
         let mut result: Vec<PeerKeyLocation> = targets.into_iter().collect();
         result.sort();
