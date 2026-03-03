@@ -1897,6 +1897,17 @@ impl Operation for ConnectOp {
                         if state.response_forwarded {
                             if let Some(ref fwd) = state.forwarded_to {
                                 if let Some(fwd_addr) = fwd.socket_addr() {
+                                    // Record the failure on this relay before forwarding
+                                    // downstream, so this relay learns to avoid routing
+                                    // to the bad acceptor in future CONNECTs.
+                                    op_manager
+                                        .ring
+                                        .connection_manager
+                                        .record_connect_acceptor_failure(
+                                            *failed_acceptor_addr,
+                                            Instant::now(),
+                                        );
+
                                     let fwd_msg = ConnectMsg::ConnectFailed {
                                         id: self.id,
                                         failed_acceptor_addr: *failed_acceptor_addr,

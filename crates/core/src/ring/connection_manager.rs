@@ -52,10 +52,21 @@ const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 /// use `usize::MAX` since they see far fewer concurrent connects.
 const MAX_CONCURRENT_GATEWAY_CONNECTS: usize = 8;
 
-/// How long a peer address stays in the recently-failed cache after a NAT traversal
-/// failure. During this window the address is added to the CONNECT bloom filter so
-/// routing nodes avoid selecting the peer as an acceptor.
-const FAILED_ADDR_TTL: Duration = Duration::from_secs(300);
+/// Base TTL for a peer address in the recently-failed cache after a NAT traversal
+/// failure. Repeated failures to the same address scale the TTL exponentially:
+/// `min(BASE * 2^count, MAX)` — so 5 min → 10 → 20 → 40 → 60 min (cap).
+const FAILED_ADDR_BASE_TTL: Duration = Duration::from_secs(300);
+
+/// Maximum TTL for a repeatedly-failing address. Permanent NAT incompatibility
+/// (e.g., symmetric NAT on both sides) caps at 1 hour between retries.
+const FAILED_ADDR_MAX_TTL: Duration = Duration::from_secs(3600);
+
+/// Compute the adaptive TTL for an address with `failure_count` repeated failures.
+fn failed_addr_ttl(failure_count: u32) -> Duration {
+    let multiplier = 1u64.checked_shl(failure_count).unwrap_or(u64::MAX);
+    let ttl_secs = FAILED_ADDR_BASE_TTL.as_secs().saturating_mul(multiplier);
+    Duration::from_secs(ttl_secs.min(FAILED_ADDR_MAX_TTL.as_secs()))
+}
 
 /// RAII guard that releases a connect admission slot when dropped.
 ///
@@ -255,7 +266,7 @@ pub(crate) struct ConnectionManager {
     max_concurrent_connects: usize,
     /// Addresses that recently failed NAT traversal. Pre-populated into the
     /// CONNECT `visited` bloom filter so routing nodes skip these peers.
-    recently_failed_addrs: Arc<RwLock<BTreeMap<SocketAddr, Instant>>>,
+    recently_failed_addrs: Arc<RwLock<BTreeMap<SocketAddr, (Instant, u32)>>>,
     /// Peers that have advertised readiness to accept non-CONNECT operations.
     ready_peers: Arc<DashSet<SocketAddr>>,
     /// Minimum connections before this peer advertises readiness.
@@ -1413,10 +1424,12 @@ impl ConnectionManager {
 
     /// Record that a transport-level connection to `addr` failed, so future
     /// CONNECT requests will mark it as visited in the bloom filter.
+    /// Repeated failures increment the count, scaling the TTL exponentially.
     pub fn record_failed_addr(&self, addr: SocketAddr) {
-        self.recently_failed_addrs
-            .write()
-            .insert(addr, Instant::now());
+        let now = Instant::now();
+        let mut map = self.recently_failed_addrs.write();
+        let count = map.get(&addr).map_or(0, |(_, c)| *c);
+        map.insert(addr, (now, count.saturating_add(1)));
     }
 
     /// Remove `addr` from the failed cache (e.g., after a successful connection).
@@ -1435,23 +1448,24 @@ impl ConnectionManager {
         self.location_for_peer.read().keys().copied().collect()
     }
 
-    /// Return addresses that failed NAT traversal within `FAILED_ADDR_TTL`.
+    /// Return addresses that failed NAT traversal within their adaptive TTL.
+    /// Addresses with more repeated failures have longer TTLs (up to 1 hour).
     pub fn recently_failed_addrs(&self) -> Vec<SocketAddr> {
         let now = Instant::now();
         self.recently_failed_addrs
             .read()
             .iter()
-            .filter(|(_, ts)| now.duration_since(**ts) < FAILED_ADDR_TTL)
+            .filter(|(_, (ts, count))| now.duration_since(*ts) < failed_addr_ttl(*count))
             .map(|(addr, _)| *addr)
             .collect()
     }
 
-    /// Remove entries older than `FAILED_ADDR_TTL`.
+    /// Remove entries whose adaptive TTL has expired.
     pub fn cleanup_stale_failed_addrs(&self) -> usize {
         let now = Instant::now();
         let mut map = self.recently_failed_addrs.write();
         let before = map.len();
-        map.retain(|_, ts| now.duration_since(*ts) < FAILED_ADDR_TTL);
+        map.retain(|_, (ts, count)| now.duration_since(*ts) < failed_addr_ttl(*count));
         before - map.len()
     }
 
