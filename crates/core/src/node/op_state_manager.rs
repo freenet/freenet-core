@@ -1312,30 +1312,46 @@ fn remove_get_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring
     }
 }
 
-/// Log when a connect operation in Relaying state with an outstanding uphill forward times out.
-/// This directly counts lost uphill routes and identifies which peers are unresponsive.
-fn log_connect_uphill_timeout(tx: &Transaction, op: &ConnectOp) {
-    if let Some(ConnectState::Relaying(state)) = &op.state {
-        // Don't log timeout for relays that already forwarded a ConnectResponse —
-        // forwarded_to is preserved for ConnectFailed propagation, not because
-        // we're still waiting for a response.
-        if state.response_forwarded {
-            return;
-        }
-        if let Some(ref peer) = state.forwarded_to {
-            let pending_secs = if let Some(ref fwd_at) = state.forwarded_at {
-                fwd_at.elapsed().as_secs()
-            } else {
-                tx.elapsed().as_secs()
-            };
-            tracing::warn!(
-                tx = %tx,
-                forwarded_to = %peer.pub_key(),
-                forwarded_to_addr = ?peer.socket_addr(),
-                pending_secs,
-                "connect: uphill route timed out with no response"
-            );
-        }
+/// Log when a connect operation in Relaying state with an outstanding uphill forward times out,
+/// and record the unresponsive peer as an acceptor failure for routing exclusion.
+fn record_connect_uphill_timeout(
+    tx: &Transaction,
+    op: &ConnectOp,
+    conn_manager: &ConnectionManager,
+) {
+    let Some(ConnectState::Relaying(state)) = &op.state else {
+        return;
+    };
+    // Don't record timeout for relays that already forwarded a ConnectResponse —
+    // forwarded_to is preserved for ConnectFailed propagation, not because
+    // we're still waiting for a response.
+    if state.response_forwarded {
+        return;
+    }
+    let Some(ref peer) = state.forwarded_to else {
+        return;
+    };
+    let pending_secs = if let Some(ref fwd_at) = state.forwarded_at {
+        fwd_at.elapsed().as_secs()
+    } else {
+        tx.elapsed().as_secs()
+    };
+    tracing::warn!(
+        tx = %tx,
+        forwarded_to = %peer.pub_key(),
+        forwarded_to_addr = ?peer.socket_addr(),
+        pending_secs,
+        "connect: uphill route timed out with no response"
+    );
+    if let Some(addr) = peer.socket_addr() {
+        let now = tokio::time::Instant::now();
+        let count = conn_manager.record_connect_acceptor_failure(addr, now);
+        tracing::info!(
+            tx = %tx,
+            addr = %addr,
+            failure_count = count,
+            "recorded GC timeout as acceptor failure"
+        );
     }
 }
 
@@ -1411,12 +1427,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     let still_waiting = match tx.transaction_type() {
                         TransactionType::Connect => {
                             if let Some((_, mut op)) = ops.connect.remove(&tx) {
-                                // Record forward failures before dropping the op so the
-                                // estimator learns about timed-out forwarding targets.
                                 op.expire_forward_attempts(tokio::time::Instant::now());
-                                // Log uphill routes that timed out with no response
-                                log_connect_uphill_timeout(&tx, &op);
-                                // Notify backoff tracker of timeout for joiner operations
+                                record_connect_uphill_timeout(&tx, &op, &ring.connection_manager);
                                 if let Some(target_loc) = op.desired_location {
                                     ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
                                 }
@@ -1511,12 +1523,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     let removed = match tx.transaction_type() {
                         TransactionType::Connect => {
                             if let Some((_, mut op)) = ops.connect.remove(&tx) {
-                                // Record forward failures before dropping the op so the
-                                // estimator learns about timed-out forwarding targets.
                                 op.expire_forward_attempts(tokio::time::Instant::now());
-                                // Log uphill routes that timed out with no response
-                                log_connect_uphill_timeout(&tx, &op);
-                                // Notify backoff tracker of timeout for joiner operations
+                                record_connect_uphill_timeout(&tx, &op, &ring.connection_manager);
                                 if let Some(target_loc) = op.desired_location {
                                     ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
                                 }
@@ -2318,5 +2326,99 @@ mod tests {
             !tracker.sub_operations.contains_key(&parent),
             "sub_operations should be empty after all children removed"
         );
+    }
+
+    mod record_connect_uphill_timeout_tests {
+        use super::super::record_connect_uphill_timeout;
+        use crate::message::Transaction;
+        use crate::operations::connect::{
+            ConnectMsg, ConnectOp, ConnectRequest, ConnectState, RelayState,
+        };
+        use crate::operations::VisitedPeers;
+        use crate::ring::{ConnectionManager, Location, PeerKeyLocation};
+        use crate::transport::TransportKeypair;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        fn make_peer(port: u16) -> PeerKeyLocation {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+            let keypair = TransportKeypair::new();
+            PeerKeyLocation::new(keypair.public().clone(), addr)
+        }
+
+        fn make_relay_state(
+            forwarded_to: Option<PeerKeyLocation>,
+            response_forwarded: bool,
+        ) -> ConnectState {
+            ConnectState::Relaying(Box::new(RelayState {
+                upstream_addr: "10.0.0.1:5000".parse().unwrap(),
+                request: ConnectRequest {
+                    desired_location: Location::new(0.3),
+                    joiner: make_peer(5002),
+                    ttl: 5,
+                    visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
+                },
+                forwarded_to,
+                forwarded_at: Some(tokio::time::Instant::now()),
+                observed_sent: false,
+                accepted_locally: false,
+                response_forwarded,
+            }))
+        }
+
+        /// Regression test for #3392: GC-expired CONNECT forwards to unresponsive
+        /// peers must be recorded as acceptor failures so the peer gets excluded
+        /// from routing after CONNECT_EXCLUDE_THRESHOLD (3) timeouts.
+        #[test]
+        fn records_failure_for_unresponsive_relay() {
+            let peer = make_peer(5001);
+            let peer_addr = peer.socket_addr().unwrap();
+            let op = ConnectOp::with_state(make_relay_state(Some(peer), false));
+            let tx = Transaction::new::<ConnectMsg>();
+            let cm = ConnectionManager::test_default();
+
+            assert!(!cm.is_connect_excluded(peer_addr, tokio::time::Instant::now()));
+
+            // Three GC timeouts should trigger exclusion
+            for _ in 0..3 {
+                record_connect_uphill_timeout(&tx, &op, &cm);
+            }
+
+            assert!(
+                cm.is_connect_excluded(peer_addr, tokio::time::Instant::now()),
+                "peer should be excluded after 3 GC timeouts"
+            );
+        }
+
+        /// response_forwarded=true must NOT record a failure — the forwarded_to
+        /// field is kept for ConnectFailed propagation, not because the peer is
+        /// unresponsive.
+        #[test]
+        fn skips_when_response_already_forwarded() {
+            let peer = make_peer(5001);
+            let peer_addr = peer.socket_addr().unwrap();
+            let op = ConnectOp::with_state(make_relay_state(Some(peer), true));
+            let tx = Transaction::new::<ConnectMsg>();
+            let cm = ConnectionManager::test_default();
+
+            for _ in 0..5 {
+                record_connect_uphill_timeout(&tx, &op, &cm);
+            }
+
+            assert!(
+                !cm.is_connect_excluded(peer_addr, tokio::time::Instant::now()),
+                "peer should NOT be excluded when response was already forwarded"
+            );
+        }
+
+        /// Non-Relaying state (e.g., Completed) must not record any failure.
+        #[test]
+        fn skips_for_non_relay_state() {
+            let op = ConnectOp::with_state(ConnectState::Completed);
+            let tx = Transaction::new::<ConnectMsg>();
+            let cm = ConnectionManager::test_default();
+
+            // Should not panic or record anything
+            record_connect_uphill_timeout(&tx, &op, &cm);
+        }
     }
 }

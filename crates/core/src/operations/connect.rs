@@ -905,6 +905,22 @@ pub(crate) struct ConnectOp {
 }
 
 impl ConnectOp {
+    /// Creates a ConnectOp with just a state, for unit-testing GC timeout logic.
+    #[cfg(test)]
+    pub(crate) fn with_state(state: ConnectState) -> Self {
+        use crate::util::time_source::InstantTimeSrc;
+        Self {
+            id: Transaction::new::<ConnectMsg>(),
+            state: Some(state),
+            first_hop: None,
+            desired_location: None,
+            recency: HashMap::new(),
+            forward_attempts: HashMap::new(),
+            connect_forward_estimator: Arc::new(RwLock::new(ConnectForwardEstimator::new())),
+            time_source: Arc::new(InstantTimeSrc::new()),
+        }
+    }
+
     fn record_forward_outcome(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
         self.forward_attempts.remove(peer);
         if !success {
