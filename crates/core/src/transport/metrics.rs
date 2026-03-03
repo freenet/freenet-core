@@ -199,7 +199,9 @@ impl TransportMetrics {
         }
 
         // Per-peer tracking (skip if at capacity and peer is new)
-        self.record_per_peer_sent(stats.remote_addr, stats.bytes_transferred);
+        self.record_per_peer(stats.remote_addr, stats.bytes_transferred, |s| {
+            &s.bytes_sent
+        });
     }
 
     /// Record a cwnd sample (called periodically or on transfer completion).
@@ -273,17 +275,10 @@ impl TransportMetrics {
 
     /// Record a completed inbound stream transfer.
     pub fn record_inbound_completed(&self, remote_addr: SocketAddr, bytes: u64) {
-        self.bytes_received
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_add(bytes))
-            })
-            .ok();
+        self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
         self.cumulative_bytes_received
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_add(bytes))
-            })
-            .ok();
-        self.record_per_peer_received(remote_addr, bytes);
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.record_per_peer(remote_addr, bytes, |s| &s.bytes_received);
     }
 
     /// Read cumulative bytes downloaded without resetting counters.
@@ -291,23 +286,18 @@ impl TransportMetrics {
         self.cumulative_bytes_received.load(Ordering::Relaxed)
     }
 
-    /// Record per-peer bytes sent (bounded to MAX_TRACKED_PEERS).
-    fn record_per_peer_sent(&self, addr: SocketAddr, bytes: u64) {
+    /// Record per-peer bytes for the given direction (bounded to MAX_TRACKED_PEERS).
+    fn record_per_peer(
+        &self,
+        addr: SocketAddr,
+        bytes: u64,
+        field: impl Fn(&PeerTransferStats) -> &AtomicU64,
+    ) {
         if let Some(entry) = self.per_peer_stats.get(&addr) {
-            entry.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+            field(&entry).fetch_add(bytes, Ordering::Relaxed);
         } else if self.per_peer_stats.len() < MAX_TRACKED_PEERS {
             let entry = self.per_peer_stats.entry(addr).or_default();
-            entry.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-        }
-    }
-
-    /// Record per-peer bytes received (bounded to MAX_TRACKED_PEERS).
-    fn record_per_peer_received(&self, addr: SocketAddr, bytes: u64) {
-        if let Some(entry) = self.per_peer_stats.get(&addr) {
-            entry.bytes_received.fetch_add(bytes, Ordering::Relaxed);
-        } else if self.per_peer_stats.len() < MAX_TRACKED_PEERS {
-            let entry = self.per_peer_stats.entry(addr).or_default();
-            entry.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+            field(&entry).fetch_add(bytes, Ordering::Relaxed);
         }
     }
 

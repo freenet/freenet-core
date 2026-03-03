@@ -291,35 +291,24 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
             String::new()
         };
 
-        // Rolling trend verdict
-        let verdict = if snap.nat_stats.recent_attempts > 0 {
-            let recent_rate =
-                snap.nat_stats.recent_successes as f64 / snap.nat_stats.recent_attempts as f64;
+        // Rolling trend: recent window stats and verdict badge
+        let (recent, verdict) = if snap.nat_stats.recent_attempts > 0 {
+            let rs = snap.nat_stats.recent_successes;
+            let ra = snap.nat_stats.recent_attempts;
+            let recent_rate = rs as f64 / ra as f64;
             let (verdict_text, verdict_class) = if recent_rate > 0.5 {
                 ("Port appears open", "nat-verdict-good")
-            } else if snap.nat_stats.recent_successes == 0 {
+            } else if rs == 0 {
                 ("Port may be blocked", "nat-verdict-bad")
             } else {
                 ("Intermittent", "nat-verdict-warn")
             };
-            format!(
-                r#"<span class="nat-verdict {cls}">{text}</span>"#,
-                cls = verdict_class,
-                text = verdict_text,
+            (
+                format!(r#" <span class="nat-recent">({rs}/{ra} recent)</span>"#),
+                format!(r#"<span class="nat-verdict {verdict_class}">{verdict_text}</span>"#),
             )
         } else {
-            String::new()
-        };
-
-        // Show recent trend alongside cumulative
-        let recent = if snap.nat_stats.recent_attempts > 0 {
-            format!(
-                " <span class=\"nat-recent\">({rs}/{ra} recent)</span>",
-                rs = snap.nat_stats.recent_successes,
-                ra = snap.nat_stats.recent_attempts,
-            )
-        } else {
-            String::new()
+            (String::new(), String::new())
         };
 
         format!(
@@ -481,7 +470,7 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
             "—".to_string()
         };
         rows.push_str(&format!(
-            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'""><td><code>{addr}</code></td><td>{loc}</td><td>{ptype}</td><td>{sent}</td><td>{recv}</td><td>{connected}</td></tr>"#,
+            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'"><td><code>{addr}</code></td><td>{loc}</td><td>{ptype}</td><td>{sent}</td><td>{recv}</td><td>{connected}</td></tr>"#,
             addr_enc = html_escape(&p.address.to_string()),
             addr = p.address,
             loc = loc,

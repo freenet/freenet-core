@@ -82,22 +82,13 @@ pub struct OperationStats {
 const NAT_RECENT_WINDOW: usize = 20;
 
 /// NAT traversal attempt counters with rolling trend.
+#[derive(Default)]
 pub struct NatStats {
     pub attempts: u32,
     pub successes: u32,
     /// Recent NAT attempt results (bounded to last NAT_RECENT_WINDOW).
     /// `true` = success, `false` = failure.
     recent: VecDeque<bool>,
-}
-
-impl Default for NatStats {
-    fn default() -> Self {
-        Self {
-            attempts: 0,
-            successes: 0,
-            recent: VecDeque::new(),
-        }
-    }
 }
 
 impl NatStats {
