@@ -1314,13 +1314,16 @@ fn remove_get_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring
 
 /// Log when a connect operation in Relaying state with an outstanding uphill forward times out.
 /// This directly counts lost uphill routes and identifies which peers are unresponsive.
-fn log_connect_uphill_timeout(tx: &Transaction, op: &ConnectOp) {
+///
+/// Returns the socket address of the unresponsive peer (if any) so the caller can record
+/// it as an acceptor failure for routing exclusion.
+fn log_connect_uphill_timeout(tx: &Transaction, op: &ConnectOp) -> Option<SocketAddr> {
     if let Some(ConnectState::Relaying(state)) = &op.state {
-        // Don't log timeout for relays that already forwarded a ConnectResponse —
+        // Don't record timeout for relays that already forwarded a ConnectResponse —
         // forwarded_to is preserved for ConnectFailed propagation, not because
         // we're still waiting for a response.
         if state.response_forwarded {
-            return;
+            return None;
         }
         if let Some(ref peer) = state.forwarded_to {
             let pending_secs = if let Some(ref fwd_at) = state.forwarded_at {
@@ -1335,8 +1338,10 @@ fn log_connect_uphill_timeout(tx: &Transaction, op: &ConnectOp) {
                 pending_secs,
                 "connect: uphill route timed out with no response"
             );
+            return peer.socket_addr();
         }
     }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1414,8 +1419,19 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 // Record forward failures before dropping the op so the
                                 // estimator learns about timed-out forwarding targets.
                                 op.expire_forward_attempts(tokio::time::Instant::now());
-                                // Log uphill routes that timed out with no response
-                                log_connect_uphill_timeout(&tx, &op);
+                                // Log uphill routes that timed out with no response and
+                                // record the unresponsive peer as an acceptor failure so
+                                // it gets excluded from CONNECT routing after repeated timeouts.
+                                if let Some(timed_out_addr) = log_connect_uphill_timeout(&tx, &op) {
+                                    let now = tokio::time::Instant::now();
+                                    let count = ring.connection_manager.record_connect_acceptor_failure(timed_out_addr, now);
+                                    tracing::info!(
+                                        tx = %tx,
+                                        addr = %timed_out_addr,
+                                        failure_count = count,
+                                        "recorded GC timeout as acceptor failure"
+                                    );
+                                }
                                 // Notify backoff tracker of timeout for joiner operations
                                 if let Some(target_loc) = op.desired_location {
                                     ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
@@ -1514,8 +1530,19 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 // Record forward failures before dropping the op so the
                                 // estimator learns about timed-out forwarding targets.
                                 op.expire_forward_attempts(tokio::time::Instant::now());
-                                // Log uphill routes that timed out with no response
-                                log_connect_uphill_timeout(&tx, &op);
+                                // Log uphill routes that timed out with no response and
+                                // record the unresponsive peer as an acceptor failure so
+                                // it gets excluded from CONNECT routing after repeated timeouts.
+                                if let Some(timed_out_addr) = log_connect_uphill_timeout(&tx, &op) {
+                                    let now = tokio::time::Instant::now();
+                                    let count = ring.connection_manager.record_connect_acceptor_failure(timed_out_addr, now);
+                                    tracing::info!(
+                                        tx = %tx,
+                                        addr = %timed_out_addr,
+                                        failure_count = count,
+                                        "recorded GC timeout as acceptor failure"
+                                    );
+                                }
                                 // Notify backoff tracker of timeout for joiner operations
                                 if let Some(target_loc) = op.desired_location {
                                     ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
