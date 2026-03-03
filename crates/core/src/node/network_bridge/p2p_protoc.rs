@@ -482,6 +482,9 @@ pub(in crate::node) struct P2pConnManager {
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
+    /// Tracks how many consecutive broadcast cycles found zero targets per contract.
+    /// Used to suppress repetitive WARN logs after the first few failures.
+    broadcast_no_target_streak: HashMap<freenet_stdlib::prelude::ContractKey, u32>,
     /// Global broadcast queue that serializes outbound broadcast streams
     /// with bounded concurrency to prevent uplink saturation (issue #3337).
     #[cfg(not(feature = "simulation_tests"))]
@@ -578,6 +581,7 @@ impl P2pConnManager {
             congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
+            broadcast_no_target_streak: HashMap::new(),
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: super::broadcast_queue::BroadcastQueue::new(),
         })
@@ -645,6 +649,7 @@ impl P2pConnManager {
             congestion_config,
             blocked_addresses,
             broadcast_retries,
+            broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue,
         } = self;
@@ -730,6 +735,7 @@ impl P2pConnManager {
             congestion_config, // Already used for connection handler, kept for struct completeness
             blocked_addresses,
             broadcast_retries,
+            broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: broadcast_queue.clone(),
         };
@@ -3932,67 +3938,101 @@ impl P2pConnManager {
         );
 
         if target_result.targets.is_empty() {
-            let retry_count = self.broadcast_retries.entry(key).or_insert(0);
-            if *retry_count < Self::MAX_BROADCAST_RETRIES {
-                *retry_count += 1;
-                let attempt = *retry_count;
-                tracing::info!(
-                    contract = %key,
-                    self_addr = %self_addr,
-                    attempt,
-                    max_retries = Self::MAX_BROADCAST_RETRIES,
-                    "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
-                );
-                // Schedule a delayed re-emission of BroadcastStateChange
-                let op_mgr = op_manager.clone();
-                let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    if let Err(e) = op_mgr
-                        .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                            key,
-                            new_state,
-                        })
-                        .await
-                    {
-                        tracing::warn!(
-                            contract = %key,
-                            error = %e,
-                            "Failed to re-emit BroadcastStateChange for retry"
-                        );
+            // When there are genuinely zero sources (no peers subscribed or in the
+            // proximity cache), retrying is pointless — nothing is "in-flight".
+            // Only retry when we had sources that failed to resolve to addresses,
+            // which suggests a transient lookup failure.
+            let has_potential_sources = target_result.proximity_found > 0
+                || target_result.interest_found > 0
+                || target_result.proximity_resolve_failed > 0
+                || target_result.interest_resolve_failed > 0;
+
+            if has_potential_sources {
+                let retry_count = self.broadcast_retries.entry(key).or_insert(0);
+                if *retry_count < Self::MAX_BROADCAST_RETRIES {
+                    *retry_count += 1;
+                    let attempt = *retry_count;
+                    tracing::info!(
+                        contract = %key,
+                        self_addr = %self_addr,
+                        attempt,
+                        max_retries = Self::MAX_BROADCAST_RETRIES,
+                        "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
+                    );
+                    // Schedule a delayed re-emission of BroadcastStateChange
+                    let op_mgr = op_manager.clone();
+                    let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        if let Err(e) = op_mgr
+                            .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                                key,
+                                new_state,
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                contract = %key,
+                                error = %e,
+                                "Failed to re-emit BroadcastStateChange for retry"
+                            );
+                        }
+                    });
+                } else {
+                    self.broadcast_retries.remove(&key);
+                    tracing::warn!(
+                        contract = %key,
+                        self_addr = %self_addr,
+                        "BROADCAST_NO_TARGETS: no targets found after {} retries, giving up",
+                        Self::MAX_BROADCAST_RETRIES
+                    );
+                    // Emit delivery summary for diagnostics
+                    let update_tx =
+                        crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+                    if let Some(log) = NetEventLog::broadcast_delivery_summary(
+                        &update_tx,
+                        &op_manager.ring,
+                        key,
+                        &target_result,
+                        0,
+                        0,
+                        0,
+                    ) {
+                        self.bridge
+                            .log_register
+                            .register_events(Either::Left(log))
+                            .await;
                     }
-                });
+                }
             } else {
-                self.broadcast_retries.remove(&key);
-                tracing::warn!(
-                    contract = %key,
-                    self_addr = %self_addr,
-                    "BROADCAST_NO_TARGETS: no targets found after {} retries, giving up",
-                    Self::MAX_BROADCAST_RETRIES
-                );
-                // Emit delivery summary for diagnostics
-                let update_tx =
-                    crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
-                if let Some(log) = NetEventLog::broadcast_delivery_summary(
-                    &update_tx,
-                    &op_manager.ring,
-                    key,
-                    &target_result,
-                    0,
-                    0,
-                    0,
-                ) {
-                    self.bridge
-                        .log_register
-                        .register_events(Either::Left(log))
-                        .await;
+                // Genuinely zero sources — no subscribers exist for this contract.
+                // Track consecutive failures to suppress repetitive logging.
+                let streak = self.broadcast_no_target_streak.entry(key).or_insert(0);
+                *streak = streak.saturating_add(1);
+                let current_streak = *streak;
+
+                // Log at WARN for the first occurrence, then DEBUG to reduce noise.
+                if current_streak <= 1 {
+                    tracing::warn!(
+                        contract = %key,
+                        self_addr = %self_addr,
+                        "BROADCAST_NO_TARGETS: no subscribers for this contract"
+                    );
+                } else {
+                    tracing::debug!(
+                        contract = %key,
+                        self_addr = %self_addr,
+                        consecutive_misses = current_streak,
+                        "BROADCAST_NO_TARGETS: still no subscribers (suppressing repeated warns)"
+                    );
                 }
             }
             return;
         }
 
-        // Targets found - clear any pending retry state for this contract
+        // Targets found - clear any pending retry and streak state for this contract
         self.broadcast_retries.remove(&key);
+        self.broadcast_no_target_streak.remove(&key);
 
         // In production, enqueue each target into the broadcast queue.
         // The queue worker handles delta computation and streaming with bounded

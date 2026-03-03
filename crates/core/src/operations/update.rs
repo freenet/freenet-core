@@ -1244,7 +1244,7 @@ impl OpManager {
                 "UPDATE_PROPAGATION"
             );
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
                 self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
