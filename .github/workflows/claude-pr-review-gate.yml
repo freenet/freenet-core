@@ -1,0 +1,89 @@
+name: Rule Review Gate
+
+# Updates the rule-review/findings commit status when:
+# - A maintainer checks/unchecks a finding checkbox in the review comment
+# - A maintainer posts /ack to dismiss all findings
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  update-gate:
+    name: Update acknowledgment status
+    runs-on: ubuntu-latest
+    if: |
+      github.event.issue.pull_request != null &&
+      (contains(github.event.comment.body, '<!-- claude-rule-review -->') ||
+       startsWith(github.event.comment.body, '/ack'))
+    permissions:
+      statuses: write
+      pull-requests: read
+
+    steps:
+      - name: Update commit status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.comment.body;
+            const isAck = body.trim().startsWith('/ack');
+
+            // Get PR head SHA
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            const sha = pr.data.head.sha;
+
+            if (isAck) {
+              // Verify commenter has write/admin access
+              let perm;
+              try {
+                const resp = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: context.payload.comment.user.login,
+                });
+                perm = resp.data.permission;
+              } catch (_) {
+                perm = 'none';
+              }
+              if (!['admin', 'write'].includes(perm)) {
+                console.log(`Ignoring /ack from ${context.payload.comment.user.login} (permission: ${perm})`);
+                return;
+              }
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha,
+                state: 'success',
+                context: 'rule-review/findings',
+                description: `Acknowledged by @${context.payload.comment.user.login}`,
+              });
+              return;
+            }
+
+            // Checkbox edit — recount unchecked Critical/Warning items
+            function countUnchecked(text) {
+              const lines = text.split('\n');
+              let inSection = false, unchecked = 0;
+              for (const line of lines) {
+                if (/^####\s*(Critical|Warning)/i.test(line)) inSection = true;
+                else if (/^####/.test(line)) inSection = false;
+                if (inSection && /^- \[ \]/.test(line)) unchecked++;
+              }
+              return unchecked;
+            }
+
+            const unchecked = countUnchecked(body);
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha,
+              state: unchecked > 0 ? 'failure' : 'success',
+              context: 'rule-review/findings',
+              description: unchecked > 0
+                ? `${unchecked} finding(s) need acknowledgment — check boxes or comment /ack`
+                : 'All findings acknowledged',
+            });

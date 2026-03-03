@@ -46,6 +46,7 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+      statuses: write
 
     steps:
       - name: Checkout repository
@@ -231,6 +232,10 @@ jobs:
             #### Info
             - [ ] `file:line` — description (rule: X)
 
+            > **To acknowledge findings:** Check each box above once addressed (or a tracking issue opened),
+            > or post `/ack` to dismiss all findings for this revision.
+            > Merge is blocked until Critical and Warning findings are acknowledged.
+
             If there are no findings at any severity level, output:
 
             ### ✅ Rule Review: No issues found
@@ -238,7 +243,7 @@ jobs:
             **Rules checked:** [list]
             **Files reviewed:** [count]
 
-            No rule violations detected in this PR.
+            No rule violations detected — merge is not blocked by this check.
 
       - name: Post review comment
         if: steps.rules.outputs.skip != 'true'
@@ -255,7 +260,7 @@ jobs:
                 '### ⚠️ Claude Rule Review: Failed to run\n\n' +
                 'The Claude rule review step failed (likely an authentication or API issue). ' +
                 'Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n' +
-                '---\n*Automated review against `.claude/rules/`. Advisory only — does not block merge.*';
+                '---\n*Automated review against `.claude/rules/`. Critical and Warning findings block merge — check boxes or post `/ack` to acknowledge.*';
 
               const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
@@ -313,7 +318,7 @@ jobs:
               return;
             }
 
-            const body = report + '\n\n---\n*Automated review against `.claude/rules/`. Advisory only — does not block merge.*';
+            const body = report + '\n\n---\n*Automated review against `.claude/rules/`. Critical and Warning findings block merge — check boxes or post `/ack` to acknowledge.*';
 
             // Find and update existing sticky comment, or create new one
             const { data: comments } = await github.rest.issues.listComments({
@@ -343,3 +348,46 @@ jobs:
               });
               console.log('Created new review comment');
             }
+
+      - name: Set acknowledgment status
+        if: steps.rules.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- claude-rule-review -->';
+
+            // Read the already-posted comment body
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+            const body = existing ? existing.body : '';
+
+            function countUnchecked(text) {
+              const lines = text.split('\n');
+              let inSection = false, unchecked = 0;
+              for (const line of lines) {
+                if (/^####\s*(Critical|Warning)/i.test(line)) inSection = true;
+                else if (/^####/.test(line)) inSection = false;
+                if (inSection && /^- \[ \]/.test(line)) unchecked++;
+              }
+              return unchecked;
+            }
+
+            const unchecked = countUnchecked(body);
+            const noFindings = !body.includes('- [ ]') && !body.includes('- [x]');
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ github.event.pull_request.head.sha }}',
+              state: unchecked > 0 ? 'failure' : 'success',
+              context: 'rule-review/findings',
+              description: unchecked > 0
+                ? `${unchecked} finding(s) need acknowledgment — check boxes or comment /ack`
+                : noFindings ? 'No critical/warning findings' : 'All findings acknowledged',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/pull/${context.issue.number}`,
+            });
