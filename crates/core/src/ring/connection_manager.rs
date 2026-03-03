@@ -194,10 +194,12 @@ impl PeerHealthTracker {
 
     /// Identify peers that should be evicted based on health criteria.
     ///
-    /// Never evicts if doing so would drop below `min_connections`.
+    /// Never-succeeded peers (0 successes) are always evictable — a peer that
+    /// never routes successfully is actively harmful (blocks routing and connection
+    /// growth). Other unhealthy peers are protected by `min_connections`.
     pub fn unhealthy_peers(&self, min_connections: usize, current_count: usize) -> Vec<SocketAddr> {
         let now = Instant::now();
-        let mut candidates: Vec<SocketAddr> = self
+        let candidates: Vec<(SocketAddr, bool)> = self
             .stats
             .iter()
             .filter(|(_, stats)| {
@@ -230,17 +232,35 @@ impl PeerHealthTracker {
 
                 false
             })
-            .map(|(addr, _)| *addr)
+            .map(|(addr, stats)| (*addr, stats.successes == 0))
             .collect();
 
-        // Never evict if it would drop below min_connections.
-        // Truncation is by BTreeMap (SocketAddr) order, not severity.
-        if current_count.saturating_sub(candidates.len()) < min_connections {
-            let max_evictable = current_count.saturating_sub(min_connections);
-            candidates.truncate(max_evictable);
+        // Partition: never-succeeded peers are always evictable (they block routing
+        // and connection growth), other unhealthy peers are protected by min_connections.
+        // Note: never-succeeded peers must still pass criterion 2's HEALTH_NO_SUCCESS_TIMEOUT
+        // (600s) + at least 1 failure, so freshly connected peers are not affected.
+        let (never_succeeded, degraded): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|(_, zero_success)| *zero_success);
+        // Safety floor: always retain at least 1 connection to avoid total isolation.
+        // The gateway bootstrap recovery path has a 120s delay; keeping one connection
+        // gives the node a chance to route while waiting for fresh connections.
+        let max_never_succeeded = if current_count > 1 {
+            never_succeeded.len().min(current_count - 1)
+        } else {
+            0
+        };
+        let mut result: Vec<SocketAddr> = never_succeeded
+            .into_iter()
+            .take(max_never_succeeded)
+            .map(|(a, _)| a)
+            .collect();
+        let remaining = current_count.saturating_sub(result.len());
+        if remaining > min_connections {
+            let budget = remaining.saturating_sub(min_connections);
+            result.extend(degraded.into_iter().take(budget).map(|(a, _)| a));
         }
-
-        candidates
+        result
     }
 }
 
@@ -3542,21 +3562,22 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_health_tracker_spares_peer_at_min_connections() {
+    fn test_peer_health_tracker_spares_degraded_peer_at_min_connections() {
         let mut tracker = PeerHealthTracker::new();
         let addr = make_addr(9004);
         tracker.init_peer(addr);
 
-        // 100% failure rate, well above threshold
-        for _ in 0..20 {
+        // 1 success then 19 failures = 95% failure rate, above threshold
+        tracker.record_success(addr);
+        for _ in 0..19 {
             tracker.record_failure(addr);
         }
 
-        // current_count=3, min_connections=3 => can't evict anyone
+        // current_count=3, min_connections=3 => degraded peers (with successes) protected
         let unhealthy = tracker.unhealthy_peers(3, 3);
         assert!(
             unhealthy.is_empty(),
-            "Should not evict when at min_connections"
+            "Degraded peer with successes should not be evicted at min_connections"
         );
     }
 
@@ -3650,6 +3671,74 @@ mod tests {
         assert_eq!(stats_after.successes, 0);
         assert_eq!(stats_after.failures, 0);
         assert!(stats_after.last_success.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_peer_health_tracker_never_succeeded_evicted_below_min() {
+        let mut tracker = PeerHealthTracker::new();
+        let never_ok = make_addr(9010);
+        let has_ok = make_addr(9011);
+
+        tracker.init_peer(never_ok);
+        tracker.init_peer(has_ok);
+
+        // Advance past no-success timeout so the never-succeeded peer qualifies
+        tokio::time::advance(Duration::from_secs(660)).await;
+
+        // never_ok: 0 successes, 5 failures
+        for _ in 0..5 {
+            tracker.record_failure(never_ok);
+        }
+        // has_ok: 1 success then 19 failures = 20 events, 95% failure rate
+        tracker.record_success(has_ok);
+        for _ in 0..19 {
+            tracker.record_failure(has_ok);
+        }
+
+        // current_count=2, min_connections=2 => old logic would evict nobody.
+        // New logic: never-succeeded peers are always evictable, but degraded
+        // peers (has_ok with successes>0) are protected by min.
+        let unhealthy = tracker.unhealthy_peers(2, 2);
+        assert!(
+            unhealthy.contains(&never_ok),
+            "Never-succeeded peer should be evicted even at min_connections"
+        );
+        assert!(
+            !unhealthy.contains(&has_ok),
+            "Degraded peer with successes should be protected by min_connections"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_peer_health_tracker_safety_floor_retains_one_connection() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr_a = make_addr(9012);
+        let addr_b = make_addr(9013);
+        let addr_c = make_addr(9014);
+
+        tracker.init_peer(addr_a);
+        tracker.init_peer(addr_b);
+        tracker.init_peer(addr_c);
+
+        // Advance past no-success timeout
+        tokio::time::advance(Duration::from_secs(660)).await;
+
+        // All 3 peers: 0 successes, failures only
+        for addr in [addr_a, addr_b, addr_c] {
+            for _ in 0..5 {
+                tracker.record_failure(addr);
+            }
+        }
+
+        // current_count=3, min_connections=3, all never-succeeded.
+        // Safety floor: should evict at most 2, retaining 1 connection.
+        let unhealthy = tracker.unhealthy_peers(3, 3);
+        assert_eq!(
+            unhealthy.len(),
+            2,
+            "Should evict at most current_count-1 never-succeeded peers, got {}",
+            unhealthy.len()
+        );
     }
 
     // ============ failed_addr_ttl / adaptive TTL tests ============

@@ -390,7 +390,18 @@ impl Router {
                 .collect();
 
             GlobalRng::shuffle(&mut peer_distances);
-            peer_distances.sort_by_key(|&(_, distance)| distance);
+            // Prefer untried peers over peers with any routing history.
+            // `peer_adjustments` is populated for ALL peers once the global regression
+            // has >= ADJUSTMENT_PRIOR_SIZE (10) events, regardless of success/failure.
+            // In this sub-50-event regime, preferring untried peers is the right
+            // exploration strategy: it breaks death spirals where the closest peer
+            // always times out, and helps the router accumulate diverse data toward
+            // the prediction threshold. Within each group, closest peer wins.
+            peer_distances.sort_by(|(pa, da), (pb, db)| {
+                let fa = self.failure_estimator.peer_adjustments.contains_key(pa);
+                let fb = self.failure_estimator.peer_adjustments.contains_key(pb);
+                fa.cmp(&fb).then_with(|| da.cmp(db))
+            });
             peer_distances.truncate(k);
 
             let candidates: Vec<RoutingCandidate> = peer_distances
@@ -2048,5 +2059,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Distance-based fallback should deprioritize peers that have failure history
+    /// in the estimator, preferring untried peers.
+    #[test]
+    fn test_distance_fallback_deprioritizes_failed_peers() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xDEAD_BEEF);
+
+        // Create a "failed" peer that is very close to the target
+        let failed_peer = PeerKeyLocation::random();
+        // Create an "untried" peer that is farther from the target
+        let untried_peer = PeerKeyLocation::random();
+
+        let target = failed_peer.location().unwrap();
+
+        // Feed failures for the failed peer — but stay below 50 events so the router
+        // uses the distance-based fallback path
+        let events: Vec<RouteEvent> = (0..30)
+            .map(|_| RouteEvent {
+                peer: failed_peer.clone(),
+                contract_location: target,
+                outcome: RouteOutcome::Failure,
+            })
+            .collect();
+
+        let router = Router::new(&events);
+        assert!(
+            !router.has_sufficient_routing_events(),
+            "Should still be in distance-based fallback mode"
+        );
+        assert!(
+            router
+                .failure_estimator
+                .peer_adjustments
+                .contains_key(&failed_peer),
+            "Failed peer should have adjustment data"
+        );
+        assert!(
+            !router
+                .failure_estimator
+                .peer_adjustments
+                .contains_key(&untried_peer),
+            "Untried peer should NOT have adjustment data"
+        );
+
+        // Select 1 peer — the untried peer should be preferred even if farther,
+        // because the failed peer has failure history
+        let peers = vec![failed_peer.clone(), untried_peer.clone()];
+        let (selected, decision) = router.select_k_best_peers_with_telemetry(&peers, target, 1);
+
+        assert_eq!(selected.len(), 1);
+        assert!(
+            matches!(decision.strategy, RoutingStrategy::DistanceBased),
+            "Should use distance-based strategy"
+        );
+        assert_eq!(
+            *selected[0], untried_peer,
+            "Should prefer untried peer over peer with failure history"
+        );
+    }
+
+    /// With k > 1 and a mix of tried/untried peers, untried peers fill first,
+    /// then tried peers fill remaining slots by distance.
+    #[test]
+    fn test_distance_fallback_k_greater_than_untried_count() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xBEEF_CAFE);
+
+        let tried_peer = PeerKeyLocation::random();
+        let untried_a = PeerKeyLocation::random();
+        let untried_b = PeerKeyLocation::random();
+        let target = tried_peer.location().unwrap();
+
+        // 30 failures for the tried peer (above ADJUSTMENT_PRIOR_SIZE=10, below threshold=50)
+        let events: Vec<RouteEvent> = (0..30)
+            .map(|_| RouteEvent {
+                peer: tried_peer.clone(),
+                contract_location: target,
+                outcome: RouteOutcome::Failure,
+            })
+            .collect();
+
+        let router = Router::new(&events);
+        assert!(!router.has_sufficient_routing_events());
+
+        // Select k=3 from 3 peers: 2 untried should come first, tried peer last
+        let peers = vec![tried_peer.clone(), untried_a.clone(), untried_b.clone()];
+        let (selected, _) = router.select_k_best_peers_with_telemetry(&peers, target, 3);
+
+        assert_eq!(selected.len(), 3);
+        // The tried peer should be last (deprioritized)
+        assert_eq!(
+            *selected[2], tried_peer,
+            "Tried peer should be last when untried peers are available"
+        );
+        // First two should be the untried peers (order depends on distance)
+        let untried_set: std::collections::HashSet<PeerKeyLocation> =
+            [untried_a, untried_b].into_iter().collect();
+        assert!(untried_set.contains(selected[0]));
+        assert!(untried_set.contains(selected[1]));
     }
 }
