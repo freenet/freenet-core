@@ -238,10 +238,18 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     first_failure_time_nanos: Option<u64>,
     /// Last packet report time as nanoseconds since time_source epoch
     last_packet_report_time_nanos: u64,
-    keep_alive_handle: Option<JoinHandle<()>>,
-    /// Last rate update time as nanoseconds since time_source epoch
+    /// Last rate update time as nanoseconds since time_source epoch.
     /// Used to implement RTT-adaptive rate updates (update approximately once per RTT)
     last_rate_update_nanos: Option<u64>,
+    /// Timestamp (nanoseconds from time_source epoch) of the last received inbound packet.
+    ///
+    /// Persisted across `recv()` calls to survive cancellation. When the outer
+    /// `peer_connection_listener` select picks the outbound branch, `recv()` is
+    /// cancelled and re-called. Without persisting this across calls, the idle
+    /// timeout window resets on every cancellation, preventing dead-peer detection
+    /// when there is outbound traffic (see #3369).
+    last_received_nanos: u64,
+    keep_alive_handle: Option<JoinHandle<()>>,
     /// Tracks pending ping probes awaiting pong responses.
     /// Maps ping sequence number -> send timestamp (nanoseconds since time_source epoch).
     /// Used for bidirectional liveness detection.
@@ -268,14 +276,6 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// working set size (capped at 1000 entries) and negligible collision
     /// probability.
     dispatched_msg_hashes: HashSet<u64>,
-    /// Timestamp (nanoseconds from time_source epoch) of the last received inbound packet.
-    ///
-    /// Persisted across `recv()` calls to survive cancellation. When the outer
-    /// `peer_connection_listener` select picks the outbound branch, `recv()` is
-    /// cancelled and re-called. Without persisting this across calls, the idle
-    /// timeout window resets on every cancellation, preventing dead-peer detection
-    /// when there is outbound traffic (see #3369).
-    last_received_nanos: u64,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -502,15 +502,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             failure_count: 0,
             first_failure_time_nanos: None,
             last_packet_report_time_nanos: now_nanos,
-            keep_alive_handle: Some(keep_alive_handle),
             last_rate_update_nanos: None,
+            last_received_nanos: now_nanos,
+            keep_alive_handle: Some(keep_alive_handle),
             pending_pings,
             streaming_registry: Arc::new(streaming::StreamRegistry::new()),
             streaming_handles: HashMap::new(),
             time_source,
             orphan_stream_registry: None,
             dispatched_msg_hashes: HashSet::new(),
-            last_received_nanos: now_nanos,
         }
     }
 
