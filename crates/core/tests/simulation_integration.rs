@@ -3427,6 +3427,18 @@ fn test_subscription_relay_propagation() {
         peer_states
     );
 
+    // Run StateVerifier for anomaly detection (per testing.md)
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "Anomaly report: {} anomalies across {} contracts",
+        report.anomalies.len(),
+        report.contracts_analyzed
+    );
+
     tracing::info!(
         "test_subscription_relay_propagation PASSED: {} peers converged via relay",
         peer_states.len()
