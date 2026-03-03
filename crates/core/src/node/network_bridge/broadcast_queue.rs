@@ -22,8 +22,18 @@ use crate::ring::PeerKeyLocation;
 
 use super::p2p_protoc::P2pBridge;
 
-/// Maximum number of concurrent outbound broadcast streams.
-const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 2;
+/// Maximum concurrent outbound broadcast streams for small payloads (< 64KB).
+/// Small payloads (deltas, chat messages) can fan out aggressively without
+/// saturating the uplink since they finish quickly.
+const DEFAULT_SMALL_PAYLOAD_CONCURRENCY: usize = 12;
+
+/// Maximum concurrent outbound broadcast streams for large payloads (>= 64KB).
+/// Large payloads (full state) are rate-limited to avoid uplink saturation.
+const DEFAULT_LARGE_PAYLOAD_CONCURRENCY: usize = 2;
+
+/// Payload size threshold for choosing the small vs large concurrency pool.
+/// Matches the streaming threshold used elsewhere in the broadcast path.
+const PAYLOAD_SIZE_THRESHOLD: usize = 64 * 1024;
 
 /// Maximum entries in the queue before oldest are dropped.
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
@@ -40,6 +50,8 @@ struct BroadcastEntry {
     key: ContractKey,
     target: PeerKeyLocation,
     new_state: WrappedState,
+    /// Payload size in bytes, used to select concurrency pool.
+    payload_size: usize,
 }
 
 /// Internal queue state: FIFO ordering via VecDeque + HashMap for dedup lookup.
@@ -76,11 +88,16 @@ impl QueueState {
 
 /// Global broadcast queue that serializes outbound broadcast streams
 /// with bounded concurrency and deduplication.
+///
+/// Uses dual concurrency pools: small payloads (< 64KB) get high concurrency
+/// (12 slots) for fast fan-out of deltas/chat messages, while large payloads
+/// (>= 64KB) get low concurrency (2 slots) to avoid saturating the uplink.
 #[derive(Clone)]
 pub(crate) struct BroadcastQueue {
     queue: Arc<Mutex<QueueState>>,
     notify: Arc<Notify>,
-    max_concurrent_streams: usize,
+    small_payload_concurrency: usize,
+    large_payload_concurrency: usize,
     max_queue_depth: usize,
 }
 
@@ -89,7 +106,8 @@ impl BroadcastQueue {
         Self {
             queue: Arc::new(Mutex::new(QueueState::new())),
             notify: Arc::new(Notify::new()),
-            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+            small_payload_concurrency: DEFAULT_SMALL_PAYLOAD_CONCURRENCY,
+            large_payload_concurrency: DEFAULT_LARGE_PAYLOAD_CONCURRENCY,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
         }
     }
@@ -130,12 +148,14 @@ impl BroadcastQueue {
                     break;
                 }
             }
+            let payload_size = new_state.size();
             queue.entries.insert(
                 dedup_key.clone(),
                 BroadcastEntry {
                     key,
                     target,
                     new_state,
+                    payload_size,
                 },
             );
             queue.order.push_back(dedup_key);
@@ -155,7 +175,8 @@ impl BroadcastQueue {
     ) -> tokio::task::JoinHandle<()> {
         let queue = self.queue.clone();
         let notify = self.notify.clone();
-        let semaphore = Arc::new(Semaphore::new(self.max_concurrent_streams));
+        let small_semaphore = Arc::new(Semaphore::new(self.small_payload_concurrency));
+        let large_semaphore = Arc::new(Semaphore::new(self.large_payload_concurrency));
 
         tokio::spawn(async move {
             loop {
@@ -177,9 +198,18 @@ impl BroadcastQueue {
                     };
                     drained_any = true;
 
+                    // Select concurrency pool based on payload size.
+                    // Small payloads (deltas, chat messages) get high concurrency for
+                    // fast fan-out. Large payloads get low concurrency to avoid saturation.
+                    let sem = if entry.payload_size < PAYLOAD_SIZE_THRESHOLD {
+                        small_semaphore.clone()
+                    } else {
+                        large_semaphore.clone()
+                    };
+
                     // Acquire semaphore permit to limit concurrent streams.
                     // This blocks until a slot is available.
-                    let permit = semaphore.clone().acquire_owned().await;
+                    let permit = sem.acquire_owned().await;
                     let Ok(permit) = permit else {
                         tracing::error!("Broadcast queue semaphore closed unexpectedly");
                         return;
