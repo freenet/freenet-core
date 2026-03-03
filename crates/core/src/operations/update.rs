@@ -53,11 +53,26 @@ impl BroadcastDedupCache {
     /// Check if this payload was already seen for this contract.
     /// If not, insert it and return `false` (not a duplicate).
     /// If yes, return `true` (duplicate — skip processing).
-    pub fn check_and_insert(&self, key: &ContractKey, payload_bytes: &[u8]) -> bool {
+    ///
+    /// `is_delta` distinguishes delta payloads from full state payloads so they
+    /// don't collide in the hash space (a delta and full state could have the
+    /// same bytes but represent different semantic operations).
+    ///
+    /// Note: Uses non-cryptographic ahash for speed. A hash collision would
+    /// cause a legitimate update to be silently skipped, but the gossip
+    /// protocol will deliver the data via another peer eventually.
+    pub fn check_and_insert(
+        &self,
+        key: &ContractKey,
+        payload_bytes: &[u8],
+        is_delta: bool,
+    ) -> bool {
         use ahash::AHasher;
         use std::hash::Hasher;
 
         let mut hasher = AHasher::default();
+        // Include payload type discriminant to avoid delta/full-state collisions
+        hasher.write_u8(if is_delta { 1 } else { 0 });
         hasher.write(payload_bytes);
         let delta_hash = hasher.finish();
 
@@ -614,10 +629,13 @@ impl Operation for UpdateOp {
                     // Dedup check: skip expensive WASM merge if we've already processed
                     // this exact payload recently (common when multiple peers broadcast
                     // the same delta to us).
-                    if op_manager
-                        .broadcast_dedup_cache
-                        .check_and_insert(key, payload_bytes)
-                    {
+                    let is_delta_payload =
+                        matches!(payload, crate::message::DeltaOrFullState::Delta(_));
+                    if op_manager.broadcast_dedup_cache.check_and_insert(
+                        key,
+                        payload_bytes,
+                        is_delta_payload,
+                    ) {
                         tracing::debug!(
                             tx = %id,
                             %key,
@@ -644,7 +662,7 @@ impl Operation for UpdateOp {
 
                     let UpdateExecution {
                         value: updated_value,
-                        summary: _summary,
+                        summary: update_summary,
                         changed,
                         ..
                     } = match update_result {
@@ -739,7 +757,21 @@ impl Operation for UpdateOp {
                         // changed so they can update their cached summary of us. This
                         // reduces redundant broadcasts — peers who already sent us this
                         // data will see our summary matches and skip re-sending.
-                        send_proactive_summary_notification(op_manager, key, sender_addr).await;
+                        // Spawned as a background task to avoid blocking the operation.
+                        {
+                            let op_mgr = op_manager.clone();
+                            let contract_key = *key;
+                            let summary = update_summary.clone();
+                            tokio::spawn(async move {
+                                send_proactive_summary_notification(
+                                    &op_mgr,
+                                    &contract_key,
+                                    sender_addr,
+                                    summary,
+                                )
+                                .await;
+                            });
+                        }
                     }
                     // Network peer propagation is now automatic via BroadcastStateChange event
                     // emitted by the executor when state changes. No manual try_to_broadcast needed.
@@ -1121,10 +1153,10 @@ impl Operation for UpdateOp {
                         );
                     }
 
-                    // Dedup check for streaming broadcasts
+                    // Dedup check for streaming broadcasts (always full state)
                     if op_manager
                         .broadcast_dedup_cache
-                        .check_and_insert(key, &state_bytes)
+                        .check_and_insert(key, &state_bytes, false)
                     {
                         tracing::debug!(
                             tx = %id,
@@ -1177,7 +1209,7 @@ impl Operation for UpdateOp {
                     {
                         Ok(UpdateExecution {
                             value: updated_value,
-                            summary: _summary,
+                            summary: streaming_update_summary,
                             changed,
                             ..
                         }) => {
@@ -1213,8 +1245,20 @@ impl Operation for UpdateOp {
                                 );
 
                                 // Proactive summary notification (same as BroadcastTo)
-                                send_proactive_summary_notification(op_manager, key, sender_addr)
-                                    .await;
+                                {
+                                    let op_mgr = op_manager.clone();
+                                    let contract_key = *key;
+                                    let summary = streaming_update_summary.clone();
+                                    tokio::spawn(async move {
+                                        send_proactive_summary_notification(
+                                            &op_mgr,
+                                            &contract_key,
+                                            sender_addr,
+                                            summary,
+                                        )
+                                        .await;
+                                    });
+                                }
                             }
                         }
                         Err(err) => {
@@ -1975,10 +2019,14 @@ impl IsOperationCompleted for UpdateOp {
 /// state change. This tells neighbors "my state just updated — here's my new
 /// summary" so they can update their cached view of us and skip sending
 /// redundant broadcasts.
+///
+/// Accepts the already-computed summary from `UpdateExecution` to avoid an
+/// extra WASM `summarize_state` call.
 async fn send_proactive_summary_notification(
     op_manager: &OpManager,
     key: &ContractKey,
     sender_addr: SocketAddr,
+    summary: StateSummary<'static>,
 ) {
     use crate::message::{InterestMessage, SummaryEntry};
     use crate::ring::interest::contract_hash;
@@ -1990,16 +2038,6 @@ async fn send_proactive_summary_notification(
     {
         return;
     }
-
-    // Get our new summary
-    let summary = match op_manager
-        .interest_manager
-        .get_contract_summary(op_manager, key)
-        .await
-    {
-        Some(s) => s,
-        None => return,
-    };
 
     // Build the Summaries message with our updated summary
     let hash = contract_hash(key);
