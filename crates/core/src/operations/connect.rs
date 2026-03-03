@@ -1894,9 +1894,20 @@ impl Operation for ConnectOp {
                         // Relay received ConnectFailed. Strategy: if we have a downstream
                         // peer that already forwarded a response, send ConnectFailed there
                         // first (closer relay has better local knowledge for re-routing).
+                        // Capture timestamp once for consistent use across this handler.
+                        let now = Instant::now();
                         if state.response_forwarded {
                             if let Some(ref fwd) = state.forwarded_to {
                                 if let Some(fwd_addr) = fwd.socket_addr() {
+                                    // Record failure so this relay avoids the bad acceptor in future CONNECTs.
+                                    op_manager
+                                        .ring
+                                        .connection_manager
+                                        .record_connect_acceptor_failure(
+                                            *failed_acceptor_addr,
+                                            now,
+                                        );
+
                                     let fwd_msg = ConnectMsg::ConnectFailed {
                                         id: self.id,
                                         failed_acceptor_addr: *failed_acceptor_addr,
@@ -1924,8 +1935,6 @@ impl Operation for ConnectOp {
                         let upstream_addr = state.upstream_addr;
                         let failed_peer = state.forwarded_to.clone();
                         let desired_location = state.request.desired_location;
-                        // Capture now once to avoid multiple Instant::now() calls in this handler.
-                        let now = Instant::now();
 
                         // Record failure in exclusion tracker
                         op_manager
