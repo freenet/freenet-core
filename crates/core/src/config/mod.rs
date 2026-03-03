@@ -113,6 +113,7 @@ impl Default for ConfigArgs {
                 skip_load_from_network: true,
                 ignore_protocol_checking: false,
                 gateways: None,
+                gateway: None,
                 location: None,
                 bandwidth_limit: Some(3_000_000), // 3 MB/s default for streaming transfers only
                 total_bandwidth_limit: None,
@@ -391,9 +392,21 @@ impl ConfigArgs {
             Gateways::default()
         };
 
+        // Pre-compute whether --gateway entries are available. This is checked in
+        // the file-load error path below to avoid failing with "no gateways" when
+        // CLI entries will be merged after the main gateway resolution block.
+        let has_cli_gateways = self
+            .network_api
+            .gateway
+            .as_ref()
+            .is_some_and(|v| !v.is_empty());
+
         // Decide which gateways to use based on whether we fetched from network
         let gateways = if mode == OperationMode::Local {
-            // In Local mode, use empty gateways - no external connections
+            // In Local mode, start with empty gateways — no external connections.
+            // Note: --gateway entries are intentionally merged after this block
+            // (unlike the hidden --gateways flag which is discarded here) so that
+            // test harnesses can inject specific gateway addresses in Local mode.
             Gateways { gateways: vec![] }
         } else if !self.network_api.skip_load_from_network
             && !remotely_loaded_gateways.gateways.is_empty()
@@ -443,6 +456,7 @@ impl ConfigArgs {
                     if peer_id.is_none()
                         && mode == OperationMode::Network
                         && remotely_loaded_gateways.gateways.is_empty()
+                        && !has_cli_gateways
                     {
                         tracing::error!(
                             file = ?gateways_file,
@@ -470,6 +484,67 @@ impl ConfigArgs {
 
             gateways
         };
+
+        // Merge any --gateway entries into the gateway list (runs in all modes,
+        // including Local, so test harnesses can inject specific gateways).
+        // User-specified gateways take precedence: they are inserted first,
+        // so file-loaded duplicates (by address) are skipped.
+        //
+        // Precedence when both --gateways (hidden JSON) and --gateway are set:
+        // --gateways entries are resolved above and become `gateways`; --gateway
+        // entries are prepended here, so on address collision --gateway wins.
+        let mut gateways = gateways;
+        if let Some(cli_entries) = self.network_api.gateway {
+            let secrets_dir = config_paths.secrets_dir(mode);
+
+            // Clean up stale key files from previous runs
+            if let Ok(entries) = fs::read_dir(&secrets_dir) {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("cli_gw_") && n.ends_with(".pub"))
+                    {
+                        if let Err(e) = fs::remove_file(entry.path()) {
+                            tracing::debug!(
+                                error = %e,
+                                file = ?entry.path(),
+                                "Failed to remove stale CLI gateway key file"
+                            );
+                        }
+                    }
+                }
+            }
+
+            let mut cli_gateways = Gateways { gateways: vec![] };
+            let mut seen_addrs = HashSet::new();
+            for entry in &cli_entries {
+                match parse_gateway(entry, &secrets_dir) {
+                    Ok(gw) => {
+                        if !seen_addrs.insert(gw.address.clone()) {
+                            tracing::warn!(
+                                address = ?gw.address,
+                                "Skipping duplicate --gateway address"
+                            );
+                            continue;
+                        }
+                        tracing::info!(
+                            address = ?gw.address,
+                            "Adding user-specified gateway via --gateway"
+                        );
+                        cli_gateways.gateways.push(gw);
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to parse --gateway \"{entry}\": {e}"
+                        ));
+                    }
+                }
+            }
+            // CLI-specified gateways go first so they win deduplication
+            cli_gateways.merge_and_deduplicate(gateways);
+            gateways = cli_gateways;
+        }
 
         let this = Config {
             mode,
@@ -734,6 +809,13 @@ pub struct NetworkArgs {
     #[arg(long, hide = true)]
     pub gateways: Option<Vec<String>>,
 
+    /// Gateway peers to connect to, specified as "ip:port,hex-pubkey".
+    /// The hex-pubkey is a 64-character hex-encoded X25519 public key (32 bytes).
+    /// Can be repeated: --gateway "1.2.3.4:31337,abcd..." --gateway "5.6.7.8:31337,ef01..."
+    #[arg(long)]
+    #[serde(rename = "gateway", skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<Vec<String>>,
+
     /// Optional location of the node, this is to be able to deterministically set locations for gateways for testing purposes.
     #[arg(long, hide = true, env = "LOCATION")]
     pub location: Option<f64>,
@@ -857,12 +939,70 @@ pub struct InlineGwConfig {
     /// Address of the gateway.
     pub address: SocketAddr,
 
-    /// Path to the public key of the gateway in PEM format.
+    /// Path to the public key of the gateway (hex-encoded X25519 key).
     #[serde(rename = "public_key")]
     pub public_key_path: PathBuf,
 
     /// Optional location of the gateway. Necessary for deterministic testing.
     pub location: Option<f64>,
+}
+
+/// Parse a `--gateway` value in the format "ip:port,hex-pubkey".
+///
+/// Validates the socket address and the 32-byte X25519 public key (64 hex chars),
+/// writes the key to a file in `secrets_dir`, and returns a `GatewayConfig`.
+fn parse_gateway(input: &str, secrets_dir: &Path) -> anyhow::Result<GatewayConfig> {
+    let (addr_str, key_hex) = input.split_once(',').ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid --gateway format: expected \"ip:port,hex-pubkey\", got \"{input}\""
+        )
+    })?;
+
+    let addr: SocketAddr = addr_str
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid socket address \"{addr_str}\" in --gateway: {e}"))?;
+
+    let key_bytes = hex::decode(key_hex.trim())
+        .map_err(|e| anyhow::anyhow!("Invalid hex public key in --gateway: {e}"))?;
+
+    if key_bytes.len() != 32 {
+        anyhow::bail!(
+            "Invalid public key length {} in --gateway (expected 32 bytes / 64 hex chars)",
+            key_bytes.len()
+        );
+    }
+
+    // Write the hex-encoded key to secrets_dir so NodeConfig::new can load it
+    // (NodeConfig reads the file and calls hex::decode on the contents).
+    fs::create_dir_all(secrets_dir)?;
+    // Use hex-encoded address for the filename to avoid IPv6 bracket/colon issues
+    let key_filename = format!("cli_gw_{}.pub", hex::encode(addr.to_string()));
+    let key_path = secrets_dir.join(&key_filename);
+
+    // Write with restricted permissions from the start to avoid a TOCTOU window
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)?;
+        file.write_all(key_hex.trim().as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&key_path, key_hex.trim())?;
+    }
+
+    Ok(GatewayConfig {
+        address: Address::HostAddress(addr),
+        public_key_path: key_path,
+        location: None,
+    })
 }
 
 impl NetworkArgs {
@@ -1567,12 +1707,17 @@ struct Gateways {
 }
 
 impl Gateways {
+    /// Merges `other` into `self`, deduplicating by address. On collision, `self`'s
+    /// entry takes precedence. Preserves insertion order (`self` entries first).
     pub fn merge_and_deduplicate(&mut self, other: Gateways) {
-        let mut existing_gateways: HashSet<_> = self.gateways.drain(..).collect();
-        for gateway in other.gateways {
-            existing_gateways.insert(gateway);
+        let mut seen: HashSet<Address> = HashSet::new();
+        let mut merged = Vec::with_capacity(self.gateways.len() + other.gateways.len());
+        for gw in self.gateways.drain(..).chain(other.gateways) {
+            if seen.insert(gw.address.clone()) {
+                merged.push(gw);
+            }
         }
-        self.gateways = existing_gateways.into_iter().collect();
+        self.gateways = merged;
     }
 
     pub fn save_to_file(&self, path: &Path) -> anyhow::Result<()> {
@@ -1591,7 +1736,7 @@ pub struct GatewayConfig {
     /// Address of the gateway. It can be either a hostname or an IP address and port.
     pub address: Address,
 
-    /// Path to the public key of the gateway in PEM format.
+    /// Path to the public key of the gateway (hex-encoded X25519 key).
     #[serde(rename = "public_key")]
     pub public_key_path: PathBuf,
 
@@ -2558,5 +2703,309 @@ mod tests {
         assert_eq!(val1, val2);
 
         GlobalRng::clear_seed();
+    }
+
+    #[tokio::test]
+    async fn test_config_build_with_gateway_flag() {
+        let keypair = TransportKeypair::new();
+        let key_hex = hex::encode(keypair.public().as_bytes());
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                gateway: Some(vec![format!("192.168.1.1:31337,{key_hex}")]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        // Local mode skips gateway loading, but --gateway should still be added
+        assert_eq!(cfg.gateways.len(), 1);
+        assert_eq!(
+            cfg.gateways[0].address,
+            Address::HostAddress("192.168.1.1:31337".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parse_gateway_valid() {
+        let keypair = TransportKeypair::new();
+        let key_hex = hex::encode(keypair.public().as_bytes());
+        let input = format!("192.168.1.1:31337,{key_hex}");
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let gw = parse_gateway(&input, tmp_dir.path()).unwrap();
+
+        assert_eq!(
+            gw.address,
+            Address::HostAddress("192.168.1.1:31337".parse().unwrap())
+        );
+        assert!(gw.public_key_path.exists());
+        let saved_key = std::fs::read_to_string(&gw.public_key_path).unwrap();
+        assert_eq!(saved_key, key_hex);
+        assert_eq!(gw.location, None);
+    }
+
+    #[test]
+    fn test_parse_gateway_invalid_format() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        // Missing comma
+        assert!(parse_gateway("192.168.1.1:31337", tmp_dir.path()).is_err());
+
+        // Invalid hex
+        assert!(parse_gateway("192.168.1.1:31337,not_hex_at_all!", tmp_dir.path()).is_err());
+
+        // Wrong key length (16 bytes instead of 32)
+        let short_hex = "ab".repeat(16);
+        assert!(parse_gateway(&format!("192.168.1.1:31337,{short_hex}"), tmp_dir.path()).is_err());
+
+        // Invalid socket addr
+        let key_hex = "ab".repeat(32);
+        assert!(parse_gateway(&format!("not_an_addr,{key_hex}"), tmp_dir.path()).is_err());
+    }
+
+    /// Tests `merge_and_deduplicate` using the production call order from `build()`:
+    /// CLI gateways are `self`, file-loaded are `other`. On address collision, CLI wins.
+    #[test]
+    fn test_gateway_deduplication() {
+        let keypair = TransportKeypair::new();
+        let key_hex = hex::encode(keypair.public().as_bytes());
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let addr: SocketAddr = "10.0.0.1:31337".parse().unwrap();
+
+        // File-loaded gateway with same address (stale key)
+        let file_loaded = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(addr),
+                public_key_path: PathBuf::from("old/key/path"),
+                location: None,
+            }],
+        };
+
+        // CLI gateway with same address (fresh key)
+        let gw = parse_gateway(&format!("{addr},{key_hex}"), tmp_dir.path()).unwrap();
+        let cli_key_path = gw.public_key_path.clone();
+        let mut cli = Gateways { gateways: vec![gw] };
+
+        // Production order: cli_gateways.merge_and_deduplicate(file_loaded)
+        cli.merge_and_deduplicate(file_loaded);
+        // Should deduplicate by address — only one entry
+        assert_eq!(cli.gateways.len(), 1);
+        // CLI entry wins (self takes precedence)
+        assert_eq!(cli.gateways[0].public_key_path, cli_key_path);
+    }
+
+    #[tokio::test]
+    async fn test_config_build_network_mode_gateway_only() {
+        // Simulates the censorship/CGNAT scenario: no gateways file, no remote index,
+        // only --gateway. This must not fail with "Cannot initialize node
+        // without gateways".
+        let keypair = TransportKeypair::new();
+        let key_hex = hex::encode(keypair.public().as_bytes());
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                gateway: Some(vec![format!("203.0.113.1:31337,{key_hex}")]),
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.gateways.len(), 1);
+        assert_eq!(
+            cfg.gateways[0].address,
+            Address::HostAddress("203.0.113.1:31337".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_build_multiple_gateways() {
+        let kp1 = TransportKeypair::new();
+        let kp2 = TransportKeypair::new();
+        let kp3 = TransportKeypair::new();
+        let hex1 = hex::encode(kp1.public().as_bytes());
+        let hex2 = hex::encode(kp2.public().as_bytes());
+        let hex3 = hex::encode(kp3.public().as_bytes());
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                gateway: Some(vec![
+                    format!("10.0.0.1:31337,{hex1}"),
+                    format!("10.0.0.2:31337,{hex2}"),
+                    format!("10.0.0.3:31337,{hex3}"),
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.gateways.len(), 3);
+
+        let addrs: Vec<_> = cfg.gateways.iter().map(|g| g.address.clone()).collect();
+        assert!(addrs.contains(&Address::HostAddress("10.0.0.1:31337".parse().unwrap())));
+        assert!(addrs.contains(&Address::HostAddress("10.0.0.2:31337".parse().unwrap())));
+        assert!(addrs.contains(&Address::HostAddress("10.0.0.3:31337".parse().unwrap())));
+    }
+
+    /// Mirrors the production call order in `build()`: CLI gateways are `self`, file-loaded
+    /// gateways are `other`. This ensures CLI-provided keys win over stale file entries.
+    #[tokio::test]
+    async fn test_gateway_overrides_file_loaded() {
+        // When a user explicitly provides --gateway for an address that
+        // also exists in the file-loaded gateways, the CLI entry should win.
+        let keypair = TransportKeypair::new();
+        let key_hex = hex::encode(keypair.public().as_bytes());
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let addr: SocketAddr = "10.0.0.1:31337".parse().unwrap();
+
+        // Simulate: file-loaded gateways have this address with old key
+        let mut file_gateways = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(addr),
+                public_key_path: PathBuf::from("old/stale/key.pub"),
+                location: None,
+            }],
+        };
+
+        // User provides fresh key via CLI
+        let gw = parse_gateway(&format!("{addr},{key_hex}"), tmp_dir.path()).unwrap();
+        let cli_key_path = gw.public_key_path.clone();
+        let mut cli_gateways = Gateways { gateways: vec![gw] };
+
+        // CLI gateways go first so they win deduplication
+        cli_gateways.merge_and_deduplicate(file_gateways);
+        file_gateways = cli_gateways;
+
+        assert_eq!(file_gateways.gateways.len(), 1);
+        // The CLI-provided key path should win, not the stale file one
+        assert_eq!(file_gateways.gateways[0].public_key_path, cli_key_path);
+    }
+
+    #[tokio::test]
+    async fn test_config_build_network_mode_empty_gateway() {
+        // An empty vec in --gateway should NOT bypass the "no gateways" error.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                gateway: Some(vec![]),
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = args.build().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Cannot initialize node without gateways"),
+            "Expected 'Cannot initialize node without gateways', got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_build_invalid_gateway_error() {
+        // An unparseable --gateway value should propagate a clear error.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                gateway: Some(vec!["not-valid".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = args.build().await.unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse --gateway"),
+            "Expected 'Failed to parse --gateway', got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_build_duplicate_gateway_entries() {
+        // Two identical --gateway entries should be deduplicated to one.
+        let keypair = TransportKeypair::new();
+        let key_hex = hex::encode(keypair.public().as_bytes());
+        let entry = format!("10.0.0.1:31337,{key_hex}");
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                gateway: Some(vec![entry.clone(), entry]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.gateways.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_gateway_key_file_permissions() {
+        let keypair = TransportKeypair::new();
+        let key_hex = hex::encode(keypair.public().as_bytes());
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let gw = parse_gateway(&format!("192.168.1.1:31337,{key_hex}"), tmp_dir.path()).unwrap();
+
+        assert!(gw.public_key_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&gw.public_key_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "Key file should have 0600 permissions");
+        }
     }
 }

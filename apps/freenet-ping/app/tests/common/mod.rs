@@ -161,6 +161,7 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             is_gateway,
             skip_load_from_network: true,
             gateways: Some(gateways),
+            gateway: None,
             location: Some(rng.random()),
             ignore_protocol_checking: true,
             address: Some(network_bind_ip.into()),
