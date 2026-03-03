@@ -268,6 +268,14 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// working set size (capped at 1000 entries) and negligible collision
     /// probability.
     dispatched_msg_hashes: HashSet<u64>,
+    /// Timestamp (nanoseconds from time_source epoch) of the last received inbound packet.
+    ///
+    /// Persisted across `recv()` calls to survive cancellation. When the outer
+    /// `peer_connection_listener` select picks the outbound branch, `recv()` is
+    /// cancelled and re-called. Without persisting this across calls, the idle
+    /// timeout window resets on every cancellation, preventing dead-peer detection
+    /// when there is outbound traffic (see #3369).
+    last_received_nanos: u64,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -502,6 +510,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             time_source,
             orphan_stream_registry: None,
             dispatched_msg_hashes: HashSet::new(),
+            last_received_nanos: now_nanos,
         }
     }
 
@@ -586,7 +595,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
         let kill_connection_after = self.time_source.connection_idle_timeout();
         let kill_connection_after_nanos = kill_connection_after.as_nanos() as u64;
-        let mut last_received_nanos = self.time_source.now_nanos();
 
         // Check for timeout periodically
         let mut timeout_check =
@@ -623,7 +631,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             crate::deterministic_select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv_async() => {
                     let packet_data = inbound.map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
-                    last_received_nanos = self.time_source.now_nanos();
+                    self.last_received_nanos = self.time_source.now_nanos();
 
                     // Debug logging for intro packets
                     if packet_data.is_intro_packet() {
@@ -746,7 +754,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     match &payload {
                         SymmetricMessagePayload::NoOp => {
                             if confirm_receipt.is_empty() {
-                                let elapsed_nanos = self.time_source.now_nanos().saturating_sub(last_received_nanos);
+                                let elapsed_nanos = self.time_source.now_nanos().saturating_sub(self.last_received_nanos);
                                 tracing::debug!(
                                     target: "freenet_core::transport::keepalive_received",
                                     remote = ?self.remote_conn.remote_addr,
@@ -966,7 +974,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 },
                 _ = timeout_check.tick() => {
                     let now_nanos = self.time_source.now_nanos();
-                    let elapsed_nanos = now_nanos.saturating_sub(last_received_nanos);
+                    let elapsed_nanos = now_nanos.saturating_sub(self.last_received_nanos);
                     let elapsed = Duration::from_nanos(elapsed_nanos);
 
                     // Check for traditional timeout (no packets received)
