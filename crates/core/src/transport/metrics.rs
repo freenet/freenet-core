@@ -57,6 +57,9 @@ pub struct TransportMetrics {
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
 
+    // Cumulative counter (never reset — used by the local dashboard)
+    cumulative_bytes_sent: AtomicU64,
+
     // Timing accumulators (for computing averages)
     total_transfer_time_ms: AtomicU64,
 
@@ -93,6 +96,7 @@ impl TransportMetrics {
             transfers_failed: AtomicU32::new(0),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
+            cumulative_bytes_sent: AtomicU64::new(0),
             total_transfer_time_ms: AtomicU64::new(0),
             peak_throughput_bps: AtomicU64::new(0),
             peak_cwnd_bytes: AtomicU32::new(0),
@@ -117,6 +121,11 @@ impl TransportMetrics {
             })
             .ok();
         self.bytes_sent
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(stats.bytes_transferred))
+            })
+            .ok();
+        self.cumulative_bytes_sent
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_add(stats.bytes_transferred))
             })
@@ -223,6 +232,14 @@ impl TransportMetrics {
                 }
             })
             .ok();
+    }
+
+    /// Read cumulative bytes uploaded without resetting counters.
+    ///
+    /// Used by the local dashboard to display lifetime transfer stats
+    /// without interfering with the periodic telemetry snapshots.
+    pub fn cumulative_bytes_sent(&self) -> u64 {
+        self.cumulative_bytes_sent.load(Ordering::Relaxed)
     }
 
     /// Take a snapshot and reset all counters.

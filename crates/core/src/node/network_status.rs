@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use crate::ring::PeerKeyLocation;
 use crate::router::Router;
+use crate::transport::metrics::TRANSPORT_METRICS;
 
 static NETWORK_STATUS: OnceLock<Arc<RwLock<NetworkStatus>>> = OnceLock::new();
 static ROUTER: OnceLock<Arc<parking_lot::RwLock<Router>>> = OnceLock::new();
@@ -289,6 +290,23 @@ pub struct NetworkStatusSnapshot {
     pub nat_stats: NatStatsSnapshot,
     /// True if all connections are to gateways (no peer-to-peer connections).
     pub gateway_only: bool,
+    /// Cumulative bytes uploaded (lifetime, never reset).
+    pub bytes_uploaded: u64,
+    /// Overall node health level for the "everything looks good" indicator.
+    pub health: HealthLevel,
+}
+
+/// Overall health verdict for the node, synthesized from multiple signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthLevel {
+    /// Node has peer-to-peer connections and things are working.
+    Healthy,
+    /// Connected but degraded (gateway-only, or all NAT attempts failing).
+    Degraded,
+    /// Still trying to establish connections.
+    Connecting,
+    /// No connections after extended time, or version mismatch.
+    Trouble,
 }
 
 /// A snapshot of a single failure for display.
@@ -431,11 +449,32 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         a_time.cmp(&b_time)
     });
 
+    let elapsed_secs = s.started_at.elapsed().as_secs();
+    let has_version_mismatch = s
+        .gateway_failures
+        .iter()
+        .any(|f| matches!(f.reason, FailureReason::VersionMismatch { .. }));
+    let nat_all_failing = s.nat_stats.attempts > 0 && s.nat_stats.successes == 0;
+
+    let health = if has_version_mismatch {
+        HealthLevel::Trouble
+    } else if open_connections == 0 && elapsed_secs > 60 {
+        HealthLevel::Trouble
+    } else if open_connections == 0 {
+        HealthLevel::Connecting
+    } else if gateway_only || nat_all_failing {
+        HealthLevel::Degraded
+    } else {
+        HealthLevel::Healthy
+    };
+
+    let bytes_uploaded = TRANSPORT_METRICS.cumulative_bytes_sent();
+
     Some(NetworkStatusSnapshot {
         failures,
         connection_attempts: s.connection_attempts,
         open_connections,
-        elapsed_secs: s.started_at.elapsed().as_secs(),
+        elapsed_secs,
         listening_port: s.listening_port,
         version: s.version.clone(),
         own_location: s.own_location,
@@ -453,6 +492,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             successes: s.nat_stats.successes,
         },
         gateway_only,
+        bytes_uploaded,
+        health,
     })
 }
 
