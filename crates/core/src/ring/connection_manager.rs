@@ -237,10 +237,24 @@ impl PeerHealthTracker {
 
         // Partition: never-succeeded peers are always evictable (they block routing
         // and connection growth), other unhealthy peers are protected by min_connections.
+        // Note: never-succeeded peers must still pass criterion 2's HEALTH_NO_SUCCESS_TIMEOUT
+        // (600s) + at least 1 failure, so freshly connected peers are not affected.
         let (never_succeeded, degraded): (Vec<_>, Vec<_>) = candidates
             .into_iter()
             .partition(|(_, zero_success)| *zero_success);
-        let mut result: Vec<SocketAddr> = never_succeeded.into_iter().map(|(a, _)| a).collect();
+        // Safety floor: always retain at least 1 connection to avoid total isolation.
+        // The gateway bootstrap recovery path has a 120s delay; keeping one connection
+        // gives the node a chance to route while waiting for fresh connections.
+        let max_never_succeeded = if current_count > 1 {
+            never_succeeded.len().min(current_count - 1)
+        } else {
+            0
+        };
+        let mut result: Vec<SocketAddr> = never_succeeded
+            .into_iter()
+            .take(max_never_succeeded)
+            .map(|(a, _)| a)
+            .collect();
         let remaining = current_count.saturating_sub(result.len());
         if remaining > min_connections {
             let budget = remaining.saturating_sub(min_connections);
@@ -3692,6 +3706,38 @@ mod tests {
         assert!(
             !unhealthy.contains(&has_ok),
             "Degraded peer with successes should be protected by min_connections"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_peer_health_tracker_safety_floor_retains_one_connection() {
+        let mut tracker = PeerHealthTracker::new();
+        let addr_a = make_addr(9012);
+        let addr_b = make_addr(9013);
+        let addr_c = make_addr(9014);
+
+        tracker.init_peer(addr_a);
+        tracker.init_peer(addr_b);
+        tracker.init_peer(addr_c);
+
+        // Advance past no-success timeout
+        tokio::time::advance(Duration::from_secs(660)).await;
+
+        // All 3 peers: 0 successes, failures only
+        for addr in [addr_a, addr_b, addr_c] {
+            for _ in 0..5 {
+                tracker.record_failure(addr);
+            }
+        }
+
+        // current_count=3, min_connections=3, all never-succeeded.
+        // Safety floor: should evict at most 2, retaining 1 connection.
+        let unhealthy = tracker.unhealthy_peers(3, 3);
+        assert_eq!(
+            unhealthy.len(),
+            2,
+            "Should evict at most current_count-1 never-succeeded peers, got {}",
+            unhealthy.len()
         );
     }
 
