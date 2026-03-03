@@ -300,3 +300,8 @@ pub(crate) mod tests {
         dir
     }
 }
+
+// TEST: intentional .unwrap() to verify rule-review gate — remove before merge
+pub fn parse_test_addr(s: &str) -> std::net::SocketAddr {
+    s.parse().unwrap()
+}
