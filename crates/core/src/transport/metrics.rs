@@ -21,6 +21,7 @@
 //! }
 //! ```
 
+use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -57,8 +58,9 @@ pub struct TransportMetrics {
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
 
-    // Cumulative counter (never reset — used by the local dashboard)
+    // Cumulative counters (never reset — used by the local dashboard)
     cumulative_bytes_sent: AtomicU64,
+    cumulative_bytes_received: AtomicU64,
 
     // Timing accumulators (for computing averages)
     total_transfer_time_ms: AtomicU64,
@@ -75,11 +77,33 @@ pub struct TransportMetrics {
     // Slowdowns during period
     slowdowns_triggered: AtomicU32,
 
+    // Per-peer transfer stats (bounded to MAX_TRACKED_PEERS entries)
+    per_peer_stats: DashMap<SocketAddr, PeerTransferStats>,
+
     // RTT tracking (in microseconds for precision)
     min_rtt_us: AtomicU64,
     max_rtt_us: AtomicU64,
     rtt_sum_us: AtomicU64,
     rtt_samples: AtomicU32,
+}
+
+/// Maximum number of peers tracked for per-peer transfer stats.
+const MAX_TRACKED_PEERS: usize = 256;
+
+/// Per-peer cumulative transfer statistics.
+#[derive(Debug)]
+pub struct PeerTransferStats {
+    pub bytes_sent: AtomicU64,
+    pub bytes_received: AtomicU64,
+}
+
+impl Default for PeerTransferStats {
+    fn default() -> Self {
+        Self {
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Default for TransportMetrics {
@@ -97,6 +121,7 @@ impl TransportMetrics {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             cumulative_bytes_sent: AtomicU64::new(0),
+            cumulative_bytes_received: AtomicU64::new(0),
             total_transfer_time_ms: AtomicU64::new(0),
             peak_throughput_bps: AtomicU64::new(0),
             peak_cwnd_bytes: AtomicU32::new(0),
@@ -108,6 +133,7 @@ impl TransportMetrics {
             max_rtt_us: AtomicU64::new(0),
             rtt_sum_us: AtomicU64::new(0),
             rtt_samples: AtomicU32::new(0),
+            per_peer_stats: DashMap::new(),
         }
     }
 
@@ -171,6 +197,9 @@ impl TransportMetrics {
         if rtt_us > 0 {
             self.record_rtt_sample(rtt_us);
         }
+
+        // Per-peer tracking (skip if at capacity and peer is new)
+        self.record_per_peer_sent(stats.remote_addr, stats.bytes_transferred);
     }
 
     /// Record a cwnd sample (called periodically or on transfer completion).
@@ -240,6 +269,59 @@ impl TransportMetrics {
     /// without interfering with the periodic telemetry snapshots.
     pub fn cumulative_bytes_sent(&self) -> u64 {
         self.cumulative_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Record a completed inbound stream transfer.
+    pub fn record_inbound_completed(&self, remote_addr: SocketAddr, bytes: u64) {
+        self.bytes_received
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(bytes))
+            })
+            .ok();
+        self.cumulative_bytes_received
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(bytes))
+            })
+            .ok();
+        self.record_per_peer_received(remote_addr, bytes);
+    }
+
+    /// Read cumulative bytes downloaded without resetting counters.
+    pub fn cumulative_bytes_received(&self) -> u64 {
+        self.cumulative_bytes_received.load(Ordering::Relaxed)
+    }
+
+    /// Record per-peer bytes sent (bounded to MAX_TRACKED_PEERS).
+    fn record_per_peer_sent(&self, addr: SocketAddr, bytes: u64) {
+        if let Some(entry) = self.per_peer_stats.get(&addr) {
+            entry.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        } else if self.per_peer_stats.len() < MAX_TRACKED_PEERS {
+            let entry = self.per_peer_stats.entry(addr).or_default();
+            entry.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Record per-peer bytes received (bounded to MAX_TRACKED_PEERS).
+    fn record_per_peer_received(&self, addr: SocketAddr, bytes: u64) {
+        if let Some(entry) = self.per_peer_stats.get(&addr) {
+            entry.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+        } else if self.per_peer_stats.len() < MAX_TRACKED_PEERS {
+            let entry = self.per_peer_stats.entry(addr).or_default();
+            entry.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot per-peer transfer stats: `(addr, bytes_sent, bytes_received)`.
+    pub fn per_peer_snapshot(&self) -> Vec<(SocketAddr, u64, u64)> {
+        self.per_peer_stats
+            .iter()
+            .map(|entry| {
+                let addr = *entry.key();
+                let sent = entry.value().bytes_sent.load(Ordering::Relaxed);
+                let recv = entry.value().bytes_received.load(Ordering::Relaxed);
+                (addr, sent, recv)
+            })
+            .collect()
     }
 
     /// Take a snapshot and reset all counters.

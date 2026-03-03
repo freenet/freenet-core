@@ -278,7 +278,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         String::new()
     };
 
-    // NAT stats
+    // NAT stats with rolling trend
     let nat_html = if snap.nat_stats.attempts > 0 {
         let all_failed = snap.nat_stats.successes == 0;
         let class = if all_failed { " nat-fail" } else { "" };
@@ -290,11 +290,45 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         } else {
             String::new()
         };
+
+        // Rolling trend verdict
+        let verdict = if snap.nat_stats.recent_attempts > 0 {
+            let recent_rate =
+                snap.nat_stats.recent_successes as f64 / snap.nat_stats.recent_attempts as f64;
+            let (verdict_text, verdict_class) = if recent_rate > 0.5 {
+                ("Port appears open", "nat-verdict-good")
+            } else if snap.nat_stats.recent_successes == 0 {
+                ("Port may be blocked", "nat-verdict-bad")
+            } else {
+                ("Intermittent", "nat-verdict-warn")
+            };
+            format!(
+                r#"<span class="nat-verdict {cls}">{text}</span>"#,
+                cls = verdict_class,
+                text = verdict_text,
+            )
+        } else {
+            String::new()
+        };
+
+        // Show recent trend alongside cumulative
+        let recent = if snap.nat_stats.recent_attempts > 0 {
+            format!(
+                " <span class=\"nat-recent\">({rs}/{ra} recent)</span>",
+                rs = snap.nat_stats.recent_successes,
+                ra = snap.nat_stats.recent_attempts,
+            )
+        } else {
+            String::new()
+        };
+
         format!(
-            r#"<p class="nat-stat{class}">NAT hole punching: {s}/{a} successful</p>{extra}"#,
+            r#"<p class="nat-stat{class}">NAT hole punching: {s}/{a} successful{recent} {verdict}</p>{extra}"#,
             class = class,
             s = snap.nat_stats.successes,
             a = snap.nat_stats.attempts,
+            recent = recent,
+            verdict = verdict,
             extra = extra,
         )
     } else if snap.open_connections == 0 {
@@ -383,7 +417,7 @@ fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> 
     let Some(snap) = snap else {
         return String::new();
     };
-    if snap.bytes_uploaded == 0 && snap.open_connections == 0 {
+    if snap.bytes_uploaded == 0 && snap.bytes_downloaded == 0 && snap.open_connections == 0 {
         return String::new();
     }
 
@@ -394,8 +428,13 @@ fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> 
                 <span class="transfer-label">Uploaded</span>
                 <span class="transfer-value">{uploaded}</span>
             </div>
+            <div class="transfer-stat">
+                <span class="transfer-label">Downloaded</span>
+                <span class="transfer-value">{downloaded}</span>
+            </div>
         </div>"#,
         uploaded = format_bytes(snap.bytes_uploaded),
+        downloaded = format_bytes(snap.bytes_downloaded),
     )
 }
 
@@ -431,12 +470,24 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
             .location
             .map(|l| format!("{:.4}", l))
             .unwrap_or_else(|| "—".to_string());
+        let sent = if p.bytes_sent > 0 {
+            format_bytes(p.bytes_sent)
+        } else {
+            "—".to_string()
+        };
+        let recv = if p.bytes_received > 0 {
+            format_bytes(p.bytes_received)
+        } else {
+            "—".to_string()
+        };
         rows.push_str(&format!(
-            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'""><td><code>{addr}</code></td><td>{loc}</td><td>{ptype}</td><td>{connected}</td></tr>"#,
+            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'""><td><code>{addr}</code></td><td>{loc}</td><td>{ptype}</td><td>{sent}</td><td>{recv}</td><td>{connected}</td></tr>"#,
             addr_enc = html_escape(&p.address.to_string()),
             addr = p.address,
             loc = loc,
             ptype = peer_type,
+            sent = sent,
+            recv = recv,
             connected = format_duration(p.connected_secs),
         ));
     }
@@ -447,7 +498,7 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
             {ring_svg}
             <div class="table-wrap">
                 <table>
-                    <thead><tr><th>Address</th><th>Location</th><th>Type</th><th>Connected</th></tr></thead>
+                    <thead><tr><th>Address</th><th>Location</th><th>Type</th><th>Sent</th><th>Recv</th><th>Connected</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>
@@ -859,6 +910,22 @@ main {
     color: #f87171;
 }
 [data-theme="light"] .nat-advice { color: #b91c1c; background: rgba(248, 113, 113, 0.08); }
+.nat-recent { color: var(--text-muted); font-size: 0.8rem; }
+.nat-verdict {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    margin-left: 0.3rem;
+    vertical-align: middle;
+}
+.nat-verdict-good { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+.nat-verdict-bad { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+.nat-verdict-warn { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+[data-theme="light"] .nat-verdict-good { color: #059669; background: rgba(5, 150, 105, 0.1); }
+[data-theme="light"] .nat-verdict-bad { color: #dc2626; background: rgba(220, 38, 38, 0.1); }
+[data-theme="light"] .nat-verdict-warn { color: #d97706; background: rgba(217, 119, 6, 0.1); }
 .diagnostics {
     background: rgba(251, 191, 36, 0.1);
     border: 1px solid rgba(251, 191, 36, 0.3);
@@ -1205,12 +1272,16 @@ fn peer_detail_html(address_str: &str) -> String {
                 <div class="info-label">Location</div><div class="info-value">{loc}</div>
                 <div class="info-label">Type</div><div class="info-value">{ptype}</div>
                 <div class="info-label">Connected</div><div class="info-value">{connected}</div>
+                <div class="info-label">Sent</div><div class="info-value">{sent}</div>
+                <div class="info-label">Received</div><div class="info-value">{recv}</div>
             </div>
         </div>"#,
         addr = html_escape(&peer.address.to_string()),
         loc = loc_str,
         ptype = peer_type,
         connected = format_duration(peer.connected_secs),
+        sent = format_bytes(peer.bytes_sent),
+        recv = format_bytes(peer.bytes_received),
     );
 
     // Build routing model status card
@@ -1678,6 +1749,7 @@ mod tests {
             nat_stats: NatStatsSnapshot::default(),
             gateway_only: false,
             bytes_uploaded: 0,
+            bytes_downloaded: 0,
             health: HealthLevel::Connecting,
         }
     }

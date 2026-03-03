@@ -4,7 +4,7 @@
 //! peer connections, subscriptions, operation stats, etc.) so the HTTP homepage
 //! and connecting page can show actionable diagnostics.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
@@ -78,11 +78,50 @@ pub struct OperationStats {
     pub updates_received: u32,
 }
 
-/// NAT traversal attempt counters.
-#[derive(Default)]
+/// Maximum number of recent NAT attempts to track for rolling trend.
+const NAT_RECENT_WINDOW: usize = 20;
+
+/// NAT traversal attempt counters with rolling trend.
 pub struct NatStats {
     pub attempts: u32,
     pub successes: u32,
+    /// Recent NAT attempt results (bounded to last NAT_RECENT_WINDOW).
+    /// `true` = success, `false` = failure.
+    recent: VecDeque<bool>,
+}
+
+impl Default for NatStats {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            successes: 0,
+            recent: VecDeque::new(),
+        }
+    }
+}
+
+impl NatStats {
+    /// Record a NAT attempt and update the rolling window.
+    pub fn record(&mut self, success: bool) {
+        self.attempts = self.attempts.saturating_add(1);
+        if success {
+            self.successes = self.successes.saturating_add(1);
+        }
+        if self.recent.len() >= NAT_RECENT_WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(success);
+    }
+
+    /// Number of recent attempts in the rolling window.
+    pub fn recent_attempts(&self) -> u32 {
+        self.recent.len() as u32
+    }
+
+    /// Number of recent successes in the rolling window.
+    pub fn recent_successes(&self) -> u32 {
+        self.recent.iter().filter(|&&s| s).count() as u32
+    }
 }
 
 /// Operation type for recording results.
@@ -146,7 +185,7 @@ pub fn record_gateway_failure(address: SocketAddr, reason: FailureReason) {
             s.connection_attempts = s.connection_attempts.saturating_add(1);
             // Track NAT failures
             if matches!(reason, FailureReason::NatTraversalFailed) {
-                s.nat_stats.attempts = s.nat_stats.attempts.saturating_add(1);
+                s.nat_stats.record(false);
             }
             s.gateway_failures.push(GatewayFailure { address, reason });
             // Keep only the most recent failures to avoid unbounded growth
@@ -256,10 +295,7 @@ pub fn record_update_received() {
 pub fn record_nat_attempt(success: bool) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
-            s.nat_stats.attempts = s.nat_stats.attempts.saturating_add(1);
-            if success {
-                s.nat_stats.successes = s.nat_stats.successes.saturating_add(1);
-            }
+            s.nat_stats.record(success);
         }
     }
 }
@@ -292,6 +328,8 @@ pub struct NetworkStatusSnapshot {
     pub gateway_only: bool,
     /// Cumulative bytes uploaded (lifetime, never reset).
     pub bytes_uploaded: u64,
+    /// Cumulative bytes downloaded (lifetime, never reset).
+    pub bytes_downloaded: u64,
     /// Overall node health level for the "everything looks good" indicator.
     pub health: HealthLevel,
 }
@@ -322,6 +360,10 @@ pub struct PeerSnapshot {
     pub location: Option<f64>,
     pub connected_secs: u64,
     pub peer_key_location: Option<PeerKeyLocation>,
+    /// Cumulative bytes sent to this peer.
+    pub bytes_sent: u64,
+    /// Cumulative bytes received from this peer.
+    pub bytes_received: u64,
 }
 
 /// Snapshot of a subscribed contract.
@@ -355,11 +397,15 @@ impl OpStatsSnapshot {
     }
 }
 
-/// Snapshot of NAT stats.
+/// Snapshot of NAT stats with rolling trend.
 #[derive(Default)]
 pub struct NatStatsSnapshot {
     pub attempts: u32,
     pub successes: u32,
+    /// Recent attempts in the rolling window.
+    pub recent_attempts: u32,
+    /// Recent successes in the rolling window.
+    pub recent_successes: u32,
 }
 
 /// Get a snapshot of the current network status for the dashboard.
@@ -407,15 +453,27 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         })
         .collect();
 
+    // Get per-peer transfer stats from transport metrics
+    let per_peer_metrics: HashMap<SocketAddr, (u64, u64)> = TRANSPORT_METRICS
+        .per_peer_snapshot()
+        .into_iter()
+        .map(|(addr, sent, recv)| (addr, (sent, recv)))
+        .collect();
+
     let peers: Vec<PeerSnapshot> = s
         .connected_peers
         .iter()
-        .map(|p| PeerSnapshot {
-            address: p.address,
-            is_gateway: p.is_gateway,
-            location: p.location,
-            connected_secs: now.duration_since(p.connected_since).as_secs(),
-            peer_key_location: p.peer_key_location.clone(),
+        .map(|p| {
+            let (sent, recv) = per_peer_metrics.get(&p.address).copied().unwrap_or((0, 0));
+            PeerSnapshot {
+                address: p.address,
+                is_gateway: p.is_gateway,
+                location: p.location,
+                connected_secs: now.duration_since(p.connected_since).as_secs(),
+                peer_key_location: p.peer_key_location.clone(),
+                bytes_sent: sent,
+                bytes_received: recv,
+            }
         })
         .collect();
 
@@ -469,6 +527,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
     };
 
     let bytes_uploaded = TRANSPORT_METRICS.cumulative_bytes_sent();
+    let bytes_downloaded = TRANSPORT_METRICS.cumulative_bytes_received();
 
     Some(NetworkStatusSnapshot {
         failures,
@@ -490,9 +549,12 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         nat_stats: NatStatsSnapshot {
             attempts: s.nat_stats.attempts,
             successes: s.nat_stats.successes,
+            recent_attempts: s.nat_stats.recent_attempts(),
+            recent_successes: s.nat_stats.recent_successes(),
         },
         gateway_only,
         bytes_uploaded,
+        bytes_downloaded,
         health,
     })
 }
