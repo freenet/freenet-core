@@ -3403,13 +3403,14 @@ fn test_subscription_relay_propagation() {
         peer_states.keys().collect::<Vec<_>>()
     );
 
-    // ASSERTION: At least 2 peers must have state (node-1 seeder + node-2 subscriber)
-    // Without the relay fix, only node-1 and gateway would have state; node-2 wouldn't.
+    // ASSERTION: At least 3 peers must have state (node-1 seeder + gateway relay + node-2 subscriber)
+    // Without the relay fix, only node-1 and gateway would have state (2 peers);
+    // node-2 wouldn't receive updates because the gateway didn't register it as downstream.
     assert!(
-        peer_states.len() >= 2,
+        peer_states.len() >= 3,
         "BUG (#3390): Relay subscription failed! Only {} peer(s) have state for contract {}. \
-         Expected at least 2 (seeder + subscriber via relay). \
-         The relay node (gateway) didn't register the subscriber as downstream. \
+         Expected at least 3 (seeder + gateway relay + subscriber). \
+         The relay node (gateway) likely didn't register the subscriber as downstream. \
          Peers with state: {:?}",
         peer_states.len(),
         contract_key_str,
