@@ -613,7 +613,7 @@ async fn websocket_commands(
         }
     };
 
-    ws.max_message_size(50 * 1024 * 1024).on_upgrade(on_upgrade)
+    ws.max_message_size(100 * 1024 * 1024).on_upgrade(on_upgrade)
 }
 
 /// Send a synthetic Disconnect to the node so subscription cleanup always runs.
