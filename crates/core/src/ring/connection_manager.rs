@@ -61,13 +61,24 @@ const FAILED_ADDR_BASE_TTL: Duration = Duration::from_secs(300);
 /// (e.g., symmetric NAT on both sides) caps at 1 hour between retries.
 const FAILED_ADDR_MAX_TTL: Duration = Duration::from_secs(3600);
 
-/// Compute the adaptive TTL for an address with `failure_count` repeated failures.
+/// Compute the base (un-jittered) adaptive TTL for an address with `failure_count` failures.
 /// First failure (count=1) uses the base TTL; each subsequent failure doubles it.
+/// This is a pure function used by tests; callers that need jitter should use
+/// [`failed_addr_ttl_jittered`] instead.
 fn failed_addr_ttl(failure_count: u32) -> Duration {
     let exponent = failure_count.saturating_sub(1);
     let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
     let ttl_secs = FAILED_ADDR_BASE_TTL.as_secs().saturating_mul(multiplier);
     Duration::from_secs(ttl_secs.min(FAILED_ADDR_MAX_TTL.as_secs()))
+}
+
+/// Like [`failed_addr_ttl`] but applies ±20% random jitter to prevent
+/// multiple peers from retrying the same unreachable address in lockstep.
+fn failed_addr_ttl_jittered(failure_count: u32) -> Duration {
+    let base = failed_addr_ttl(failure_count);
+    // ±20% jitter: multiply by a factor in [0.8, 1.2]
+    let jitter_factor = 0.8 + (GlobalRng::random_u64() % 401) as f64 / 1000.0;
+    base.mul_f64(jitter_factor)
 }
 
 /// RAII guard that releases a connect admission slot when dropped.
@@ -1452,22 +1463,24 @@ impl ConnectionManager {
 
     /// Return addresses that failed NAT traversal within their adaptive TTL.
     /// Addresses with more repeated failures have longer TTLs (up to 1 hour).
+    /// Includes ±20% jitter to stagger retries across peers.
     pub fn recently_failed_addrs(&self) -> Vec<SocketAddr> {
         let now = Instant::now();
         self.recently_failed_addrs
             .read()
             .iter()
-            .filter(|(_, (ts, count))| now.duration_since(*ts) < failed_addr_ttl(*count))
+            .filter(|(_, (ts, count))| now.duration_since(*ts) < failed_addr_ttl_jittered(*count))
             .map(|(addr, _)| *addr)
             .collect()
     }
 
     /// Remove entries whose adaptive TTL has expired.
+    /// Uses jittered TTL so cleanup is naturally staggered.
     pub fn cleanup_stale_failed_addrs(&self) -> usize {
         let now = Instant::now();
         let mut map = self.recently_failed_addrs.write();
         let before = map.len();
-        map.retain(|_, (ts, count)| now.duration_since(*ts) < failed_addr_ttl(*count));
+        map.retain(|_, (ts, count)| now.duration_since(*ts) < failed_addr_ttl_jittered(*count));
         before - map.len()
     }
 
