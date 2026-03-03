@@ -348,6 +348,14 @@ impl<T: TimeSource> InterestManager<T> {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Get the current time from the configured `TimeSource`.
+    ///
+    /// Use this to pass DST-compatible timestamps to components that need
+    /// the current time (e.g., `BroadcastDedupCache`).
+    pub fn now(&self) -> Instant {
+        self.time_source.now()
+    }
+
     /// Register a peer's interest in a contract.
     ///
     /// Returns true if this is a new interest (peer wasn't previously tracked).
@@ -791,6 +799,8 @@ impl<T: TimeSource> InterestManager<T> {
 
         if !has_peer_interest && !has_local_interest {
             self.unindex_contract_hash(contract);
+            // Clean up summary notification timestamp when no interest remains
+            self.summary_notify_timestamps.remove(contract);
         }
     }
 

@@ -66,6 +66,7 @@ impl BroadcastDedupCache {
         key: &ContractKey,
         payload_bytes: &[u8],
         is_delta: bool,
+        now: Instant,
     ) -> bool {
         use ahash::AHasher;
         use std::hash::Hasher;
@@ -75,8 +76,6 @@ impl BroadcastDedupCache {
         hasher.write_u8(if is_delta { 1 } else { 0 });
         hasher.write(payload_bytes);
         let delta_hash = hasher.finish();
-
-        let now = Instant::now();
 
         let mut entry = self.entries.entry(*key).or_default();
         let queue = entry.value_mut();
@@ -635,6 +634,7 @@ impl Operation for UpdateOp {
                         key,
                         payload_bytes,
                         is_delta_payload,
+                        op_manager.interest_manager.now(),
                     ) {
                         tracing::debug!(
                             tx = %id,
@@ -1154,10 +1154,12 @@ impl Operation for UpdateOp {
                     }
 
                     // Dedup check for streaming broadcasts (always full state)
-                    if op_manager
-                        .broadcast_dedup_cache
-                        .check_and_insert(key, &state_bytes, false)
-                    {
+                    if op_manager.broadcast_dedup_cache.check_and_insert(
+                        key,
+                        &state_bytes,
+                        false,
+                        op_manager.interest_manager.now(),
+                    ) {
                         tracing::debug!(
                             tx = %id,
                             %key,
