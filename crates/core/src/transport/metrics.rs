@@ -648,4 +648,77 @@ mod tests {
         assert_eq!(snapshot.peak_cwnd_bytes, 44000); // Max of all peaks
         assert_eq!(snapshot.slowdowns_triggered, 5);
     }
+
+    #[test]
+    fn test_inbound_completed_tracking() {
+        let metrics = TransportMetrics::new();
+        let addr: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+
+        metrics.record_inbound_completed(addr, 2048);
+        metrics.record_inbound_completed(addr, 1024);
+
+        // Cumulative counter
+        assert_eq!(metrics.cumulative_bytes_received(), 3072);
+
+        // Per-peer snapshot
+        let peers = metrics.per_peer_snapshot();
+        let peer = peers.iter().find(|(a, _, _)| *a == addr);
+        assert!(peer.is_some(), "peer should be tracked");
+        let (_, sent, recv) = peer.unwrap();
+        assert_eq!(*sent, 0);
+        assert_eq!(*recv, 3072);
+
+        // Periodic snapshot reflects bytes_received
+        // Need a transfer to make take_snapshot return Some
+        let stats = crate::transport::TransferStats {
+            stream_id: 1,
+            remote_addr: addr,
+            bytes_transferred: 100,
+            elapsed: Duration::from_millis(10),
+            peak_cwnd_bytes: 1000,
+            final_cwnd_bytes: 1000,
+            slowdowns_triggered: 0,
+            base_delay: Duration::from_millis(5),
+            final_ssthresh_bytes: 100000,
+            min_ssthresh_floor_bytes: 5696,
+            total_timeouts: 0,
+            final_flightsize: 0,
+            configured_rate: 0,
+        };
+        metrics.record_transfer_completed(&stats);
+        let snapshot = metrics.take_snapshot().unwrap();
+        assert_eq!(snapshot.bytes_received, 3072);
+
+        // Cumulative survives snapshot reset
+        assert_eq!(metrics.cumulative_bytes_received(), 3072);
+    }
+
+    #[test]
+    fn test_per_peer_capacity_bound() {
+        let metrics = TransportMetrics::new();
+
+        // Fill to capacity
+        for i in 0..MAX_TRACKED_PEERS {
+            let addr: std::net::SocketAddr = format!("10.0.{}.{}:{}", i / 256, i % 256, 5000 + i)
+                .parse()
+                .unwrap();
+            metrics.record_inbound_completed(addr, 100);
+        }
+
+        assert_eq!(metrics.per_peer_snapshot().len(), MAX_TRACKED_PEERS);
+
+        // 257th peer should not be tracked in per-peer stats
+        let extra: std::net::SocketAddr = "192.168.1.1:9999".parse().unwrap();
+        metrics.record_inbound_completed(extra, 500);
+
+        // Per-peer map should not grow
+        assert_eq!(metrics.per_peer_snapshot().len(), MAX_TRACKED_PEERS);
+        let snapshot = metrics.per_peer_snapshot();
+        let extra_entry = snapshot.iter().find(|(a, _, _)| *a == extra);
+        assert!(extra_entry.is_none(), "257th peer should not be tracked");
+
+        // But cumulative counter still includes the bytes
+        let total: u64 = (MAX_TRACKED_PEERS as u64 * 100) + 500;
+        assert_eq!(metrics.cumulative_bytes_received(), total);
+    }
 }

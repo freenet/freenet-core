@@ -897,4 +897,35 @@ mod tests {
         // Cleanup
         record_peer_disconnected(gw_addr);
     }
+
+    #[test]
+    fn test_nat_stats_rolling_window() {
+        let mut nat = NatStats::default();
+
+        // Record 10 successes then 15 failures (25 total)
+        for _ in 0..10 {
+            nat.record(true);
+        }
+        for _ in 0..15 {
+            nat.record(false);
+        }
+
+        // Lifetime counters track everything
+        assert_eq!(nat.attempts, 25);
+        assert_eq!(nat.successes, 10);
+
+        // Rolling window only keeps last 20 (5 successes + 15 failures)
+        assert_eq!(nat.recent_attempts(), 20);
+        assert_eq!(nat.recent_successes(), 5);
+    }
+
+    #[test]
+    fn test_nat_stats_rolling_window_all_failures() {
+        let mut nat = NatStats::default();
+        for _ in 0..25 {
+            nat.record(false);
+        }
+        assert_eq!(nat.recent_attempts(), 20);
+        assert_eq!(nat.recent_successes(), 0);
+    }
 }

@@ -903,6 +903,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                         error
                     })? {
+                        // Record inbound bytes for non-streamed (short) messages
+                        super::TRANSPORT_METRICS.record_inbound_completed(
+                            self.remote_conn.remote_addr,
+                            msg.len() as u64,
+                        );
                         tracing::trace!(
                             peer_addr = %self.remote_conn.remote_addr,
                             packet_id,
