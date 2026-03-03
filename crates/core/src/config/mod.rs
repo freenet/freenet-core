@@ -392,9 +392,21 @@ impl ConfigArgs {
             Gateways::default()
         };
 
+        // Pre-compute whether --gateway entries are available. This is checked in
+        // the file-load error path below to avoid failing with "no gateways" when
+        // CLI entries will be merged after the main gateway resolution block.
+        let has_cli_gateways = self
+            .network_api
+            .gateway
+            .as_ref()
+            .is_some_and(|v| !v.is_empty());
+
         // Decide which gateways to use based on whether we fetched from network
         let gateways = if mode == OperationMode::Local {
-            // In Local mode, use empty gateways - no external connections
+            // In Local mode, start with empty gateways — no external connections.
+            // Note: --gateway entries are intentionally merged after this block
+            // (unlike the hidden --gateways flag which is discarded here) so that
+            // test harnesses can inject specific gateway addresses in Local mode.
             Gateways { gateways: vec![] }
         } else if !self.network_api.skip_load_from_network
             && !remotely_loaded_gateways.gateways.is_empty()
@@ -441,11 +453,6 @@ impl ConfigArgs {
                     })?
                 }
                 Err(err) => {
-                    let has_cli_gateways = self
-                        .network_api
-                        .gateway
-                        .as_ref()
-                        .is_some_and(|v| !v.is_empty());
                     if peer_id.is_none()
                         && mode == OperationMode::Network
                         && remotely_loaded_gateways.gateways.is_empty()
@@ -482,6 +489,10 @@ impl ConfigArgs {
         // including Local, so test harnesses can inject specific gateways).
         // User-specified gateways take precedence: they are inserted first,
         // so file-loaded duplicates (by address) are skipped.
+        //
+        // Precedence when both --gateways (hidden JSON) and --gateway are set:
+        // --gateways entries are resolved above and become `gateways`; --gateway
+        // entries are prepended here, so on address collision --gateway wins.
         let mut gateways = gateways;
         if let Some(cli_entries) = self.network_api.gateway {
             let secrets_dir = config_paths.secrets_dir(mode);
