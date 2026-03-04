@@ -143,6 +143,26 @@ CORRECT:
 
 **Audit targets:** `grep -r "biased;" crates/core/src/` — verify each site has per-iteration caps and cancellation-safety documentation.
 
+### WHEN introducing numeric thresholds or limits
+
+```
+Does this threshold relate to a configurable value (min_connections, max_connections, etc.)?
+  → YES: Derive from that config value, NEVER hardcode a number
+  → NO: Define as a named constant with a comment explaining the choice
+
+WRONG:
+  const BOOTSTRAP_THRESHOLD: usize = 4;  // Magic number, breaks when config changes
+
+CORRECT:
+  let threshold = connection_manager.min_connections;  // Tied to config
+
+WHY: Hardcoded thresholds silently break when the related configuration
+changes. A hardcoded 4 caused nodes to plateau far below min_connections=10+
+for 9 months because the threshold didn't scale with the config.
+
+See: issue #3414 — BOOTSTRAP_THRESHOLD=4 vs min_connections
+```
+
 ### WHEN spawning tasks with `GlobalExecutor::spawn`
 
 **No fire-and-forget spawns for critical tasks.**

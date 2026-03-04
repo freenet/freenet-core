@@ -24,16 +24,61 @@ WHEN calculating contract location:
 ### Connection Management
 
 ```
-WHEN accepting a new connection:
+WHEN accepting a new connection (should_accept):
   1. CHECK: Is this a self-connection? → REJECT
-  2. CHECK: Are we below min_connections (25)? → ACCEPT
-  3. CHECK: Are we at max_connections (200)? → REJECT
+  2. CHECK: Are we below min_connections? → ACCEPT
+     → Use ACTUAL open connection count, NOT speculative totals
+     → Pending reservations are speculative (many fail to complete);
+       counting them pushes nodes into the topology evaluator prematurely
+  3. CHECK: Are we at max_connections? → REJECT
+     → Use total_conn (open + pending) here to prevent over-commitment
   4. OTHERWISE: Evaluate via TopologyManager
 
 WHEN closing a connection:
   → MUST remove from connections_by_location
   → MUST remove from location_for_peer
   → MUST update connection count atomically
+```
+
+### Speculative State vs Actual State
+
+```
+Speculative state (pending reservations, in-flight operations) MUST be
+treated differently from actual state (open connections, completed ops):
+
+  - "Do I need more?" checks → use ACTUAL state only
+    (e.g., open < min_connections)
+  - "Am I over-committed?" checks → use speculative state
+    (e.g., total_conn >= max_connections)
+
+WHY: Speculative state inflates counts. A node with 8 open connections
+and 2 pending reservations appears to have 11 connections, but only 8
+are real. Using the inflated count for "need more?" decisions prevents
+the node from reaching min_connections.
+
+See: connection_manager.rs should_accept(), issue #3414
+```
+
+### Backoff Target Must Match Failure Cause
+
+```
+WHEN recording connection backoff:
+  → The backoff target MUST reflect what actually failed
+
+WRONG:
+  // acquire_new returns None because WE have no routing candidates
+  self.record_connection_failure(target_location, RoutingFailed);
+  // This backs off the TARGET, but the target isn't at fault
+
+CORRECT:
+  // Only back off the target when the TARGET caused the failure
+  // (timeout, rejection, NAT punch failed)
+  // If the failure is local (no routing candidates), don't record backoff
+
+WHY: Backing off a target for a local problem prevents connecting to it
+later when local conditions improve (e.g., more connections acquired).
+
+See: ring/mod.rs connection_maintenance, issue #3414
 ```
 
 ### Routing Decisions
@@ -181,12 +226,32 @@ DON'T: Accept connections without checking should_accept()
 WHY: Breaks topology optimization, may cause resource exhaustion
 ```
 
+### Thresholds Must Derive From Configuration
+
+```
+WHEN introducing a connection count threshold or limit:
+  → MUST derive from min_connections / max_connections, NOT hardcode a number
+  → Hardcoded thresholds silently break when configuration changes
+
+WRONG:
+  const BOOTSTRAP_THRESHOLD: usize = 4;  // Assumes min_connections is small
+
+CORRECT:
+  let bootstrap_threshold = connection_manager.min_connections;
+
+WHY: A hardcoded threshold of 4 caused a 9-month latent bug where nodes
+plateaued far below min_connections=10+ because gateway-directed CONNECTs
+stopped too early.
+
+See: operations/connect.rs initial_join_procedure, issue #3414
+```
+
 ## Testing Checklist
 
 ```
 □ Test with 0 connections (cold start)
-□ Test at min_connections boundary (25)
-□ Test at max_connections boundary (200)
+□ Test at min_connections boundary
+□ Test at max_connections boundary
 □ Test self-connection rejection
 □ Test location calculation determinism
 □ Test routing with visited peer filtering
