@@ -320,17 +320,15 @@ impl ConnectionManager {
             Ring::DEFAULT_MIN_CONNECTIONS
         };
 
-        let mut max_connections = if let Some(v) = config.max_number_conn {
+        let max_connections = if let Some(v) = config.max_number_conn {
             v
         } else {
+            // Previously gateways were hardcoded to 20 here, which artificially capped
+            // them at ~19 ring peers and contributed to CONNECT exclusion death spirals.
+            // Gateways now use the same default (200) as regular peers since they need
+            // MORE connections for routing diversity, not fewer.
             Ring::DEFAULT_MAX_CONNECTIONS
         };
-        // Gateways need MORE connections for routing, not fewer. Use the default (200)
-        // when unset. Previously this was hardcoded to 20, which artificially capped
-        // gateways at ~19 ring peers and contributed to CONNECT exclusion death spirals.
-        if config.is_gateway && config.max_number_conn.is_none() {
-            max_connections = Ring::DEFAULT_MAX_CONNECTIONS;
-        }
 
         let max_upstream_bandwidth = if let Some(v) = config.max_upstream_bandwidth {
             v
@@ -1592,12 +1590,27 @@ impl ConnectionManager {
         // Sort by failure count descending (worst offenders first)
         eligible.sort_by(|a, b| b.1.cmp(&a.1));
 
-        // Cap at CONNECT_EXCLUDE_MAX_FRACTION of total ring peers
+        // Cap at CONNECT_EXCLUDE_MAX_FRACTION of total ring peers.
+        // Use floor() so we never exceed the stated 50% cap.
         let ring_peer_count = self.connection_count();
         let max_excluded =
-            ((ring_peer_count as f64) * Self::CONNECT_EXCLUDE_MAX_FRACTION).ceil() as usize;
+            ((ring_peer_count as f64) * Self::CONNECT_EXCLUDE_MAX_FRACTION).floor() as usize;
         // Always allow excluding at least 1 peer (if any are eligible)
         let max_excluded = max_excluded.max(1);
+
+        if eligible.len() > max_excluded {
+            tracing::info!(
+                eligible = eligible.len(),
+                max_excluded,
+                ring_peer_count,
+                "CONNECT exclusion cap activated: {} eligible peers reduced to {} \
+                 (max {}% of {} ring peers)",
+                eligible.len(),
+                max_excluded,
+                (Self::CONNECT_EXCLUDE_MAX_FRACTION * 100.0) as u32,
+                ring_peer_count,
+            );
+        }
 
         eligible.truncate(max_excluded);
         eligible.into_iter().map(|(addr, _)| addr).collect()
@@ -3933,5 +3946,64 @@ mod tests {
             "at least 50% of peers must remain available for routing, got {}",
             available
         );
+    }
+
+    #[test]
+    fn test_connect_exclusion_prioritizes_worst_offenders() {
+        // When the cap kicks in, the peers with the MOST failures should be excluded,
+        // not arbitrary ones.
+        let own_addr: SocketAddr = "10.0.0.100:9000".parse().unwrap();
+        let cm = make_connection_manager(Some(own_addr), 1, 200, true);
+        let now = Instant::now();
+
+        // Create 6 ring peers
+        let addrs: Vec<SocketAddr> = (1..=6)
+            .map(|i| format!("10.0.0.{}:9000", i).parse().unwrap())
+            .collect();
+        for (i, &addr) in addrs.iter().enumerate() {
+            let loc = Location::new(i as f64 / 6.0);
+            let keypair = TransportKeypair::new();
+            cm.add_connection(loc, addr, keypair.public().clone(), false);
+        }
+
+        // Give peers 1-3 many failures (10 each), peers 4-6 few failures (3 each)
+        let high_failure_addrs: Vec<SocketAddr> = addrs[0..3].to_vec();
+        let low_failure_addrs: Vec<SocketAddr> = addrs[3..6].to_vec();
+
+        for &addr in &high_failure_addrs {
+            for _ in 0..10 {
+                cm.record_connect_acceptor_failure(addr, now);
+            }
+        }
+        for &addr in &low_failure_addrs {
+            for _ in 0..3 {
+                cm.record_connect_acceptor_failure(addr, now);
+            }
+        }
+
+        let excluded = cm.compute_connect_excluded_peers(now);
+
+        // floor(6 * 0.5) = 3, so at most 3 excluded
+        assert_eq!(
+            excluded.len(),
+            3,
+            "should exclude exactly 3 (50% of 6 ring peers)"
+        );
+        // The excluded set should be the 3 worst offenders (10 failures each)
+        for &addr in &high_failure_addrs {
+            assert!(
+                excluded.contains(&addr),
+                "high-failure peer {} should be excluded",
+                addr
+            );
+        }
+        // The low-failure peers should NOT be excluded
+        for &addr in &low_failure_addrs {
+            assert!(
+                !excluded.contains(&addr),
+                "low-failure peer {} should NOT be excluded",
+                addr
+            );
+        }
     }
 }
