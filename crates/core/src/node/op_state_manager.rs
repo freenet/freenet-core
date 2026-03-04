@@ -2380,15 +2380,17 @@ mod tests {
             let tx = Transaction::new::<ConnectMsg>();
             let cm = ConnectionManager::test_default();
 
-            assert!(!cm.is_connect_excluded(peer_addr, tokio::time::Instant::now()));
+            let excluded = cm.compute_connect_excluded_peers(tokio::time::Instant::now());
+            assert!(!excluded.contains(&peer_addr));
 
             // Three GC timeouts should trigger exclusion
             for _ in 0..3 {
                 record_connect_uphill_timeout(&tx, &op, &cm);
             }
 
+            let excluded = cm.compute_connect_excluded_peers(tokio::time::Instant::now());
             assert!(
-                cm.is_connect_excluded(peer_addr, tokio::time::Instant::now()),
+                excluded.contains(&peer_addr),
                 "peer should be excluded after 3 GC timeouts"
             );
         }
@@ -2408,8 +2410,9 @@ mod tests {
                 record_connect_uphill_timeout(&tx, &op, &cm);
             }
 
+            let excluded = cm.compute_connect_excluded_peers(tokio::time::Instant::now());
             assert!(
-                !cm.is_connect_excluded(peer_addr, tokio::time::Instant::now()),
+                !excluded.contains(&peer_addr),
                 "peer should NOT be excluded when response was already forwarded"
             );
         }

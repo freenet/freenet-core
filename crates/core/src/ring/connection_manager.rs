@@ -21,7 +21,7 @@
 
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{btree_map::Entry, BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -325,9 +325,11 @@ impl ConnectionManager {
         } else {
             Ring::DEFAULT_MAX_CONNECTIONS
         };
-        // Gateways benefit from a wider neighbor set for forwarding; default to a higher cap when unset.
+        // Gateways need MORE connections for routing, not fewer. Use the default (200)
+        // when unset. Previously this was hardcoded to 20, which artificially capped
+        // gateways at ~19 ring peers and contributed to CONNECT exclusion death spirals.
         if config.is_gateway && config.max_number_conn.is_none() {
-            max_connections = 20;
+            max_connections = Ring::DEFAULT_MAX_CONNECTIONS;
         }
 
         let max_upstream_bandwidth = if let Some(v) = config.max_upstream_bandwidth {
@@ -1544,8 +1546,13 @@ impl ConnectionManager {
     /// How long a peer stays excluded from CONNECT routing after repeated failures.
     const CONNECT_EXCLUDE_TTL: Duration = Duration::from_secs(30 * 60);
 
-    /// Number of ConnectFailed events before a peer is excluded from CONNECT routing.
-    const CONNECT_EXCLUDE_THRESHOLD: u32 = 3;
+    /// Minimum failure count before a peer is eligible for exclusion.
+    const CONNECT_EXCLUDE_MIN_FAILURES: u32 = 3;
+
+    /// Maximum fraction of ring peers that can be excluded from CONNECT routing.
+    /// Never exclude more than this fraction to prevent routing death spiral where
+    /// all peers accumulate failures and get blanket-excluded, leaving zero candidates.
+    const CONNECT_EXCLUDE_MAX_FRACTION: f64 = 0.5;
 
     /// Record a ConnectFailed for a peer acting as acceptor. Returns the new failure count.
     ///
@@ -1559,18 +1566,41 @@ impl ConnectionManager {
         entry.0
     }
 
-    /// Check if a peer is excluded from CONNECT routing.
+    /// Compute the set of peers currently excluded from CONNECT routing.
     ///
-    /// `now` should be the same value passed to `record_connect_acceptor_failure` in the
-    /// same handler, ensuring the check and the record use a consistent timestamp.
-    pub fn is_connect_excluded(&self, addr: SocketAddr, now: Instant) -> bool {
+    /// Returns peers with the most failures, up to `CONNECT_EXCLUDE_MAX_FRACTION`
+    /// of total ring peers. Only peers with >= `CONNECT_EXCLUDE_MIN_FAILURES` within
+    /// `CONNECT_EXCLUDE_TTL` are eligible for exclusion. This prevents a death spiral
+    /// where all ring peers get excluded after accumulating NAT hole-punch failures.
+    pub fn compute_connect_excluded_peers(&self, now: Instant) -> HashSet<SocketAddr> {
         let map = self.connect_excluded_peers.read();
-        if let Some((count, last_failure)) = map.get(&addr) {
-            *count >= Self::CONNECT_EXCLUDE_THRESHOLD
-                && now.duration_since(*last_failure) < Self::CONNECT_EXCLUDE_TTL
-        } else {
-            false
+
+        // Collect eligible peers (within TTL and above min failures)
+        let mut eligible: Vec<(SocketAddr, u32)> = map
+            .iter()
+            .filter(|(_, (count, last_failure))| {
+                *count >= Self::CONNECT_EXCLUDE_MIN_FAILURES
+                    && now.duration_since(*last_failure) < Self::CONNECT_EXCLUDE_TTL
+            })
+            .map(|(addr, (count, _))| (*addr, *count))
+            .collect();
+
+        if eligible.is_empty() {
+            return HashSet::new();
         }
+
+        // Sort by failure count descending (worst offenders first)
+        eligible.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Cap at CONNECT_EXCLUDE_MAX_FRACTION of total ring peers
+        let ring_peer_count = self.connection_count();
+        let max_excluded =
+            ((ring_peer_count as f64) * Self::CONNECT_EXCLUDE_MAX_FRACTION).ceil() as usize;
+        // Always allow excluding at least 1 peer (if any are eligible)
+        let max_excluded = max_excluded.max(1);
+
+        eligible.truncate(max_excluded);
+        eligible.into_iter().map(|(addr, _)| addr).collect()
     }
 
     /// Clear connect exclusion for a peer (on successful hole-punch).
@@ -3853,5 +3883,55 @@ mod tests {
             "recently_failed_addrs must return identical results on consecutive calls"
         );
         assert!(first.contains(&addr));
+    }
+
+    #[test]
+    fn test_connect_exclusion_never_excludes_all_peers() {
+        // With 10 ring peers all having 5+ failures, at most 50% should be excluded.
+        // This prevents the death spiral where all peers get excluded and routing stalls.
+        let own_addr: SocketAddr = "10.0.0.100:9000".parse().unwrap();
+        let cm = make_connection_manager(Some(own_addr), 1, 200, true);
+
+        let now = Instant::now();
+        let ring_addrs: Vec<SocketAddr> = (1..=10)
+            .map(|i| format!("10.0.0.{}:9000", i).parse().unwrap())
+            .collect();
+
+        // Add all 10 as ring connections
+        for (i, &addr) in ring_addrs.iter().enumerate() {
+            let loc = Location::new(i as f64 / 10.0);
+            let keypair = TransportKeypair::new();
+            cm.add_connection(loc, addr, keypair.public().clone(), false);
+        }
+
+        assert_eq!(cm.connection_count(), 10, "should have 10 ring peers");
+
+        // Record 5 failures for ALL 10 peers
+        for &addr in &ring_addrs {
+            for _ in 0..5 {
+                cm.record_connect_acceptor_failure(addr, now);
+            }
+        }
+
+        let excluded = cm.compute_connect_excluded_peers(now);
+
+        // At most 50% of 10 = 5 should be excluded
+        assert!(
+            excluded.len() <= 5,
+            "should exclude at most 50% of ring peers, got {}/10 excluded",
+            excluded.len()
+        );
+        // At least 1 should be excluded (they all have failures above threshold)
+        assert!(
+            !excluded.is_empty(),
+            "should exclude at least 1 peer with 5 failures"
+        );
+        // At least 5 peers remain available for routing
+        let available = ring_addrs.iter().filter(|a| !excluded.contains(a)).count();
+        assert!(
+            available >= 5,
+            "at least 50% of peers must remain available for routing, got {}",
+            available
+        );
     }
 }

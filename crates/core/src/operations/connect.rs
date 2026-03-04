@@ -695,18 +695,22 @@ impl RelayContext for RelayEnv<'_> {
         recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation> {
-        // Capture now once so that the skip-list TTL check (is_connect_excluded) and
+        // Capture now once so that the exclusion set computation and
         // the recency cooldown check both see the same timestamp for this routing decision.
         let now = Instant::now();
 
-        // Use SkipListWithSelf to explicitly exclude ourselves from candidates,
-        // ensuring we never select ourselves as a forwarding target even if
-        // self wasn't added to visited by upstream callers.
+        // Precompute the excluded set once per routing decision. This uses percentage-based
+        // capping (max 50% of ring peers) to prevent death spiral where all peers get excluded.
+        let excluded_peers = self
+            .op_manager
+            .ring
+            .connection_manager
+            .compute_connect_excluded_peers(now);
+
         let skip = SkipListWithSelf {
             visited,
             self_addr: self.self_location.socket_addr(),
-            connection_manager: &self.op_manager.ring.connection_manager,
-            now,
+            excluded_peers,
         };
         let router = self.op_manager.ring.router.read();
 
@@ -801,14 +805,16 @@ impl RelayContext for RelayEnv<'_> {
         // Therefore, ALL remaining candidates are by definition "uphill" (farther from target).
         // We don't need to re-check distances - just find any available peer.
         //
-        // Capture now once so that the skip-list TTL check (is_connect_excluded) and
-        // the recency cooldown check both see the same timestamp for this routing decision.
         let now = Instant::now();
+        let excluded_peers = self
+            .op_manager
+            .ring
+            .connection_manager
+            .compute_connect_excluded_peers(now);
         let skip = SkipListWithSelf {
             visited,
             self_addr: self.self_location.socket_addr(),
-            connection_manager: &self.op_manager.ring.connection_manager,
-            now,
+            excluded_peers,
         };
         let router = self.op_manager.ring.router.read();
 
@@ -2069,32 +2075,27 @@ impl Operation for ConnectOp {
 /// Skip list that combines visited peers, own address, and CONNECT-excluded peers.
 /// This ensures we never select ourselves as a forwarding target and avoids
 /// peers with repeated acceptor failures.
+///
+/// The excluded set is precomputed via `compute_connect_excluded_peers()` to ensure
+/// percentage-based capping: at most 50% of ring peers are excluded, preventing
+/// a death spiral where all peers accumulate failures and routing stalls.
 struct SkipListWithSelf<'a> {
     visited: &'a VisitedPeers,
     self_addr: Option<SocketAddr>,
-    connection_manager: &'a crate::ring::ConnectionManager,
-    /// Current time used for TTL checks (`is_connect_excluded`). Captured once by the caller
-    /// so that the skip-list check and any recency checks in the same routing decision share
-    /// a consistent timestamp.
-    now: Instant,
+    /// Precomputed set of peers excluded from CONNECT routing.
+    excluded_peers: HashSet<SocketAddr>,
 }
 
 impl Contains<SocketAddr> for SkipListWithSelf<'_> {
     fn has_element(&self, target: SocketAddr) -> bool {
-        // Check if target matches our own address
         if let Some(self_addr) = self.self_addr {
             if target == self_addr {
                 return true;
             }
         }
-        // Check if target is excluded from CONNECT routing due to repeated failures
-        if self
-            .connection_manager
-            .is_connect_excluded(target, self.now)
-        {
+        if self.excluded_peers.contains(&target) {
             return true;
         }
-        // Check if target is in the visited list (bloom filter)
         self.visited.probably_visited(target)
     }
 }
@@ -3776,12 +3777,10 @@ mod tests {
 
         visited.mark_visited(visited_addr);
 
-        let cm = crate::ring::ConnectionManager::test_default();
         let skip = SkipListWithSelf {
             visited: &visited,
             self_addr: Some(self_addr),
-            connection_manager: &cm,
-            now: Instant::now(),
+            excluded_peers: HashSet::new(),
         };
 
         // Should skip visited addresses
@@ -4227,20 +4226,24 @@ mod tests {
         let now = Instant::now();
 
         // Not excluded initially
-        assert!(!cm.is_connect_excluded(addr, now));
+        let excluded = cm.compute_connect_excluded_peers(now);
+        assert!(!excluded.contains(&addr));
 
         // Record failures below threshold
         cm.record_connect_acceptor_failure(addr, now);
         cm.record_connect_acceptor_failure(addr, now);
-        assert!(!cm.is_connect_excluded(addr, now), "below threshold");
+        let excluded = cm.compute_connect_excluded_peers(now);
+        assert!(!excluded.contains(&addr), "below threshold");
 
         // Third failure crosses threshold
         cm.record_connect_acceptor_failure(addr, now);
-        assert!(cm.is_connect_excluded(addr, now), "at threshold");
+        let excluded = cm.compute_connect_excluded_peers(now);
+        assert!(excluded.contains(&addr), "at threshold");
 
         // Clear exclusion
         cm.clear_connect_exclusion(addr);
-        assert!(!cm.is_connect_excluded(addr, now), "after clear");
+        let excluded = cm.compute_connect_excluded_peers(now);
+        assert!(!excluded.contains(&addr), "after clear");
     }
 
     #[test]
@@ -4251,19 +4254,13 @@ mod tests {
         let excluded_addr: SocketAddr = "10.0.0.2:5000".parse().unwrap();
         let normal_addr: SocketAddr = "10.0.0.3:5000".parse().unwrap();
 
-        let cm = crate::ring::ConnectionManager::test_default();
-        let now = Instant::now();
-
-        // Exclude a peer by recording 3 failures
-        for _ in 0..3 {
-            cm.record_connect_acceptor_failure(excluded_addr, now);
-        }
+        let mut excluded_peers = HashSet::new();
+        excluded_peers.insert(excluded_addr);
 
         let skip = SkipListWithSelf {
             visited: &visited,
             self_addr: Some(self_addr),
-            connection_manager: &cm,
-            now,
+            excluded_peers,
         };
 
         assert!(skip.has_element(self_addr), "self should be skipped");
