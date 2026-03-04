@@ -2329,6 +2329,11 @@ pub(crate) async fn initial_join_procedure(
         // ring-based acquisition to take over reliably. Previously hardcoded to 4,
         // which caused nodes to plateau far below min_connections when ring-based
         // acquisition was slow or had insufficient routing candidates.
+        //
+        // Gateway load note: higher min_connections increases gateway traffic during
+        // bootstrap. This is throttled by per-gateway exponential backoff, the
+        // parallel connection cap (number_of_parallel_connections), and the
+        // LONG_WAIT_SECS sleep once the threshold is reached.
         let bootstrap_threshold = op_manager.ring.connection_manager.min_connections;
 
         tracing::info!(

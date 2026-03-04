@@ -545,12 +545,20 @@ impl ConnectionManager {
             return true;
         }
 
-        let accepted = if total_conn < self.min_connections {
+        // Use actual open connections (not inflated total_conn) for the
+        // min_connections threshold. Pending reservations are speculative —
+        // many fail to complete — so counting them pushes nodes into the
+        // topology evaluator path prematurely, causing rejections when the
+        // node genuinely needs more connections.
+        // total_conn (which includes pending) is still used for max_connections
+        // to prevent over-commitment.
+        let accepted = if open < self.min_connections {
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
+                open,
                 total_conn,
-                "should_accept: accepted (below min connections)"
+                "should_accept: accepted (open connections below min)"
             );
             true
         } else if total_conn >= self.max_connections {

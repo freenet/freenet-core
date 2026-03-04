@@ -6378,6 +6378,9 @@ fn test_connect_despite_nat_partition() {
 ///   far below `min_connections`. Fixed: use `min_connections` as the threshold.
 /// - `acquire_new` returning None (no routing candidates) incorrectly put the
 ///   target location in backoff. Fixed: no backoff on routing capacity failure.
+/// - `should_accept` used inflated `total_conn` (including pending reservations)
+///   for the min_connections check, pushing nodes into the topology evaluator
+///   prematurely. Fixed: use actual open connection count for min threshold.
 /// - CONNECT exclusion was absolute (3 failures = banned 30min). Fixed: max 50%
 ///   of ring peers excluded at once (#3408).
 /// - Distance-based fallback never evicted never-succeeded peers below
@@ -6387,7 +6390,7 @@ fn test_connect_despite_nat_partition() {
 /// **What this test verifies (post-fix behavior):**
 ///
 /// 1. Median connections reach min_connections after 1 virtual hour.
-/// 2. At least 25% of nodes reach min_connections.
+/// 2. At least 90% of nodes reach min_connections.
 /// 3. Nodes form connections to non-gateway peers (proves multi-hop CONNECT).
 /// 4. Under 20% message loss (simulating NAT hole-punch failures), no death spiral.
 ///
@@ -6479,23 +6482,21 @@ async fn test_connection_growth_stall_regression() {
         NODES
     );
 
-    // ASSERTION 1: Connection growth beyond gateway-only.
-    // Median must exceed 2 (gateway connections alone contribute at most 2).
-    let min_expected_median = (MIN_CONN / 2).max(2);
+    // ASSERTION 1: Median connections must reach min_connections.
     assert!(
-        median_conn >= min_expected_median,
-        "Connection growth stall: median={} must be >= {} after 10 min. \
-         Nodes stuck at gateway-only connections. Counts: {:?}. Seed: 0x{:X}",
+        median_conn >= MIN_CONN,
+        "Connection growth stall: median={} must be >= min_connections={}. \
+         Counts: {:?}. Seed: 0x{:X}",
         median_conn,
-        min_expected_median,
+        MIN_CONN,
         node_counts,
         SEED
     );
 
-    // ASSERTION 2: At least 25% of nodes reached min_connections.
+    // ASSERTION 2: At least 90% of nodes reached min_connections.
     assert!(
-        fraction_above_min >= 0.25,
-        "Too few nodes reached min_connections: {:.0}% ({}/{}) — expected >= 25%. \
+        fraction_above_min >= 0.90,
+        "Too few nodes reached min_connections: {:.0}% ({}/{}) — expected >= 90%. \
          Counts: {:?}. Seed: 0x{:X}",
         fraction_above_min * 100.0,
         nodes_above_min,
