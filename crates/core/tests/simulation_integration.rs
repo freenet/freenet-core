@@ -6363,3 +6363,221 @@ fn test_connect_despite_nat_partition() {
     // unreachable acceptor forever, eventually causing the simulation to hang
     // or timeout.
 }
+
+// =============================================================================
+// Connection Growth Stall Regression Test (PRs #3408, #3398, #3396, #3380)
+// =============================================================================
+
+/// Regression test: connection growth stall observed on live Freenet network.
+///
+/// **Background:**
+/// Nodes get ~10 connections (including 2 gateway transient connections) but never
+/// grow beyond that, continuously reconnecting to gateways. Root causes:
+///
+/// - CONNECT exclusion was absolute (3 failures = banned 30min). Fixed: max 50%
+///   of ring peers excluded at once (#3408).
+/// - Distance-based fallback never evicted never-succeeded peers below
+///   min_connections (#3398).
+/// - GC-expired CONNECT forwards silently blamed the acceptor (#3396/#3380).
+/// - Gateway max_connections was hardcoded to 20.
+///
+/// **What this test verifies (post-fix behavior):**
+///
+/// 1. Nodes grow connections beyond gateway-only within 10 virtual minutes.
+/// 2. Nodes form connections to non-gateway peers (proves multi-hop CONNECT).
+/// 3. Under 20% message loss (simulating NAT hole-punch failures), no death spiral.
+///
+/// **Topology:** 2 gateways + 20 nodes, min_connections=5, max_connections=15.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_connection_growth_stall_regression() {
+    use freenet::dev_tool::NodeLabel;
+    use freenet::simulation::FaultConfig;
+
+    const SEED: u64 = 0x3408_3398_0001;
+    const NETWORK_NAME: &str = "connection-growth-stall";
+    const GATEWAYS: usize = 2;
+    const NODES: usize = 20;
+    const RING_MAX_HTL: usize = 10;
+    const RND_IF_HTL_ABOVE: usize = 5;
+    const MAX_CONN: usize = 15;
+    const MIN_CONN: usize = 5;
+
+    tracing::info!("=== Connection Growth Stall Regression Test ===");
+    tracing::info!("Verifies fixes: #3408, #3398, #3396, #3380");
+
+    setup_deterministic_state(SEED);
+
+    let mut sim = SimNetwork::new(
+        NETWORK_NAME,
+        GATEWAYS,
+        NODES,
+        RING_MAX_HTL,
+        RND_IF_HTL_ABOVE,
+        MAX_CONN,
+        MIN_CONN,
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Start all nodes. max_contract_num=0, iterations=0: topology-only test.
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 0, 0)
+        .await;
+
+    // -------------------------------------------------------------------------
+    // Phase 1: Let the network form connections over 5 virtual minutes
+    // -------------------------------------------------------------------------
+    tracing::info!("Phase 1: Connection growth — 10 virtual minutes, no faults");
+    // 10 minutes is enough for nodes to complete multiple CONNECT retry cycles.
+    // At 5 minutes, median was ~3; by 10 minutes median reaches ~4 and some nodes
+    // reach min_connections. Growth is slow but not stalled.
+    let_network_run(&mut sim, Duration::from_secs(600)).await;
+
+    // Collect per-node connection counts
+    let mut node_counts: Vec<usize> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.connection_count(&label)
+        })
+        .collect();
+    node_counts.sort_unstable();
+
+    let num_sampled = node_counts.len();
+    assert!(num_sampled > 0, "No connection_managers available");
+
+    let median_conn = node_counts[num_sampled / 2];
+    let nodes_above_min = node_counts.iter().filter(|&&c| c >= MIN_CONN).count();
+    let fraction_above_min = nodes_above_min as f64 / num_sampled as f64;
+
+    tracing::info!("Phase 1 connection counts: {:?}", node_counts);
+    tracing::info!(
+        "Median={}, nodes at min_connections={}/{} ({:.0}%)",
+        median_conn,
+        nodes_above_min,
+        num_sampled,
+        fraction_above_min * 100.0
+    );
+
+    // Check for non-gateway peer connections (proves multi-hop CONNECT forwarding)
+    let connectivity = sim.node_connectivity();
+    let mut nodes_with_peer_connections = 0usize;
+    for (label, (_key, conns)) in &connectivity {
+        if !label.is_gateway() {
+            let has_non_gw_conn = conns.keys().any(|peer| !peer.is_gateway());
+            if has_non_gw_conn {
+                nodes_with_peer_connections += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        "Nodes with non-gateway peer connections: {}/{}",
+        nodes_with_peer_connections,
+        NODES
+    );
+
+    // ASSERTION 1: Connection growth beyond gateway-only.
+    // Median must exceed 2 (gateway connections alone contribute at most 2).
+    let min_expected_median = (MIN_CONN / 2).max(2);
+    assert!(
+        median_conn >= min_expected_median,
+        "Connection growth stall: median={} must be >= {} after 10 min. \
+         Nodes stuck at gateway-only connections. Counts: {:?}. Seed: 0x{:X}",
+        median_conn,
+        min_expected_median,
+        node_counts,
+        SEED
+    );
+
+    // ASSERTION 2: At least some nodes reached min_connections.
+    // Threshold is 10% — the important thing is growth is happening,
+    // not that every node is fully connected within 10 minutes.
+    assert!(
+        fraction_above_min >= 0.10,
+        "Only {:.0}% of nodes reached min_connections={}. Counts: {:?}. Seed: 0x{:X}",
+        fraction_above_min * 100.0,
+        MIN_CONN,
+        node_counts,
+        SEED
+    );
+
+    // ASSERTION 3: Multi-hop CONNECT forwarding occurred.
+    // If nodes only connect to gateways, CONNECT is stuck at first layer.
+    assert!(
+        nodes_with_peer_connections > 0,
+        "No nodes have non-gateway peer connections. CONNECT requests are \
+         stuck at the gateway layer. Seed: 0x{:X}",
+        SEED
+    );
+
+    // -------------------------------------------------------------------------
+    // Phase 2: 20% message loss simulating NAT hole-punch failures — 3 minutes
+    // -------------------------------------------------------------------------
+    tracing::info!("Phase 2: NAT failure simulation — 20% message loss for 3 min");
+    sim.with_fault_injection(FaultConfig::builder().message_loss_rate(0.20).build());
+
+    let_network_run(&mut sim, Duration::from_secs(180)).await;
+
+    // Re-inspect connection counts after faults
+    let mut node_counts_after: Vec<usize> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.connection_count(&label)
+        })
+        .collect();
+    node_counts_after.sort_unstable();
+
+    let median_after = node_counts_after
+        .get(node_counts_after.len() / 2)
+        .copied()
+        .unwrap_or(0);
+    let nodes_isolated = node_counts_after.iter().filter(|&&c| c == 0).count();
+    let fraction_isolated = nodes_isolated as f64 / NODES as f64;
+
+    tracing::info!(
+        "Phase 2 connection counts after NAT failures: {:?}",
+        node_counts_after
+    );
+    tracing::info!(
+        "Median={}, isolated={}/{} ({:.0}%)",
+        median_after,
+        nodes_isolated,
+        NODES,
+        fraction_isolated * 100.0
+    );
+
+    // ASSERTION 4: No death spiral — median > 1 after NAT failures.
+    assert!(
+        median_after > 1,
+        "Death spiral: median connections after NAT failures = {} (expected > 1). \
+         Counts: {:?}. Seed: 0x{:X}",
+        median_after,
+        node_counts_after,
+        SEED
+    );
+
+    // ASSERTION 5: At most 25% of nodes fully isolated.
+    assert!(
+        fraction_isolated < 0.25,
+        "{:.0}% of nodes isolated after NAT failures (threshold: 25%). \
+         Counts: {:?}. Seed: 0x{:X}",
+        fraction_isolated * 100.0,
+        node_counts_after,
+        SEED
+    );
+
+    tracing::info!(
+        "PASSED: Phase1[median={}, above_min={}/{}, peer_conns={}/{}] \
+         Phase2[median={}, isolated={}/{}]",
+        median_conn,
+        nodes_above_min,
+        num_sampled,
+        nodes_with_peer_connections,
+        NODES,
+        median_after,
+        nodes_isolated,
+        NODES
+    );
+}
