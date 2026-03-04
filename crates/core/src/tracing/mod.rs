@@ -503,6 +503,7 @@ impl<'a> NetEventLog<'a> {
         target: PeerKeyLocation,
         hop_count: Option<usize>,
         state_hash: Option<String>,
+        state_size: Option<usize>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -518,6 +519,7 @@ impl<'a> NetEventLog<'a> {
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 state_hash,
+                state_size,
             }),
         })
     }
@@ -767,6 +769,7 @@ impl<'a> NetEventLog<'a> {
         target: PeerKeyLocation,
         state_hash_before: Option<String>,
         state_hash_after: Option<String>,
+        state_size: Option<usize>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -781,6 +784,7 @@ impl<'a> NetEventLog<'a> {
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 state_hash_before,
                 state_hash_after,
+                state_size,
             }),
         })
     }
@@ -836,6 +840,7 @@ impl<'a> NetEventLog<'a> {
                 state_hash_before: Some(state_hash_full(state_before)),
                 state_hash_after: Some(state_hash_full(state_after)),
                 changed,
+                state_size: state_after.len(),
             }),
         })
     }
@@ -1238,6 +1243,7 @@ impl<'a> NetEventLog<'a> {
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     state_hash: None, // Hash not available from message
+                    state_size: None, // Size not available from message
                 })
             }
             NetMessageV1::Get(GetMsg::Request {
@@ -2984,6 +2990,8 @@ pub(crate) enum PutEvent {
         timestamp: u64,
         /// Short hash of the stored state (first 4 bytes of Blake3, 8 hex chars).
         state_hash: Option<String>,
+        /// Size of the stored state in bytes.
+        state_size: Option<usize>,
     },
     /// Put operation failed.
     PutFailure {
@@ -3104,6 +3112,8 @@ pub(crate) enum UpdateEvent {
         state_hash_before: Option<String>,
         /// Short hash of state after update (first 4 bytes of Blake3, 8 hex chars).
         state_hash_after: Option<String>,
+        /// Size of the state after update in bytes.
+        state_size: Option<usize>,
     },
     BroadcastEmitted {
         id: Transaction,
@@ -3166,6 +3176,8 @@ pub(crate) enum UpdateEvent {
         state_hash_after: Option<String>,
         /// Whether the local state actually changed after applying the update.
         changed: bool,
+        /// Size of the state after applying the update in bytes.
+        state_size: usize,
     },
     /// Emitted after handle_broadcast_state_change() completes with a full
     /// breakdown of why each potential peer was or was not sent the broadcast.

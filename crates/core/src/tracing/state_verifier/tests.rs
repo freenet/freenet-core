@@ -67,6 +67,7 @@ fn test_clean_convergence() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("aabb0011".to_string()),
+                state_size: None,
             }),
         },
         // Peer 2 receives broadcast and stores same state
@@ -120,6 +121,7 @@ fn test_detects_final_divergence() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("aaaa0000".to_string()),
+                state_size: None,
             }),
         },
         // Peer 2 stores DIFFERENT state "bbbb"
@@ -136,6 +138,7 @@ fn test_detects_final_divergence() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("bbbb0000".to_string()),
+                state_size: None,
             }),
         },
     ];
@@ -176,6 +179,7 @@ fn test_detects_missing_broadcast() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("aaaa0000".to_string()),
+                state_size: None,
             }),
         },
         // Peer 1 emits broadcast to peer 2
@@ -243,6 +247,7 @@ fn test_detects_unapplied_update_broadcast() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("aaaa0000".to_string()),
+                state_size: None,
             }),
         },
         // Peer 1 updates
@@ -258,6 +263,7 @@ fn test_detects_unapplied_update_broadcast() {
                 timestamp: 200,
                 state_hash_before: Some("aaaa0000".to_string()),
                 state_hash_after: Some("cccc0000".to_string()),
+                state_size: None,
             }),
         },
         // Peer 1 emits broadcast to peer 2
@@ -330,6 +336,7 @@ fn test_full_update_cycle_clean() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("aaaa0000".to_string()),
+                state_size: None,
             }),
         },
         NetLogMessage {
@@ -359,6 +366,7 @@ fn test_full_update_cycle_clean() {
                 timestamp: 200,
                 state_hash_before: Some("aaaa0000".to_string()),
                 state_hash_after: Some("cccc0000".to_string()),
+                state_size: None,
             }),
         },
         // Peer 1 broadcasts to peer 2
@@ -406,6 +414,7 @@ fn test_full_update_cycle_clean() {
                 state_hash_before: Some("aaaa0000".to_string()),
                 state_hash_after: Some("cccc0000".to_string()),
                 changed: true,
+                state_size: 1024,
             }),
         },
     ];
@@ -453,6 +462,7 @@ fn test_report_display() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("aaaa0000".to_string()),
+                state_size: None,
             }),
         },
         NetLogMessage {
@@ -468,6 +478,7 @@ fn test_report_display() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("bbbb0000".to_string()),
+                state_size: None,
             }),
         },
     ];
@@ -599,6 +610,7 @@ fn test_stale_peer_detected() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("aaa".into()),
+                state_size: None,
             }),
         },
         NetLogMessage {
@@ -642,6 +654,7 @@ fn test_stale_peer_detected() {
                 timestamp: 200,
                 state_hash_before: Some("aaa".into()),
                 state_hash_after: Some("bbb".into()),
+                state_size: None,
             }),
         },
         NetLogMessage {
@@ -656,6 +669,7 @@ fn test_stale_peer_detected() {
                 state_hash_before: Some("aaa".into()),
                 state_hash_after: Some("bbb".into()),
                 changed: true,
+                state_size: 1024,
             }),
         },
         NetLogMessage {
@@ -670,6 +684,7 @@ fn test_stale_peer_detected() {
                 timestamp: 300,
                 state_hash_before: Some("bbb".into()),
                 state_hash_after: Some("ccc".into()),
+                state_size: None,
             }),
         },
     ];
@@ -702,6 +717,7 @@ fn test_state_oscillation_detected() {
             elapsed_ms: 10,
             timestamp: 100,
             state_hash: Some("aaa".into()),
+            state_size: None,
         }),
     }];
 
@@ -719,6 +735,7 @@ fn test_state_oscillation_detected() {
                 state_hash_before: Some(if i % 2 == 0 { "aaa" } else { "bbb" }.into()),
                 state_hash_after: Some(hash.to_string()),
                 changed: true,
+                state_size: 1024,
             }),
         });
     }
@@ -797,6 +814,7 @@ fn test_zombie_not_flagged_on_completion() {
                 elapsed_ms: 10,
                 timestamp: 110,
                 state_hash: Some("aaaa".into()),
+                state_size: None,
             }),
         },
     ];
@@ -829,6 +847,7 @@ fn test_broadcast_storm_detected() {
             elapsed_ms: 10,
             timestamp: 100,
             state_hash: Some("aaa".into()),
+            state_size: None,
         }),
     }];
 
@@ -949,6 +968,7 @@ fn test_update_ordering_anomaly() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("init".into()),
+                state_size: None,
             }),
         },
         NetLogMessage {
@@ -964,6 +984,7 @@ fn test_update_ordering_anomaly() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("init".into()),
+                state_size: None,
             }),
         },
         // Peer1 applies A then B -> hash "ab_result"
@@ -979,6 +1000,7 @@ fn test_update_ordering_anomaly() {
                 state_hash_before: Some("init".into()),
                 state_hash_after: Some("after_a".into()),
                 changed: true,
+                state_size: 1024,
             }),
         },
         NetLogMessage {
@@ -993,6 +1015,7 @@ fn test_update_ordering_anomaly() {
                 state_hash_before: Some("after_a".into()),
                 state_hash_after: Some("ab_result".into()),
                 changed: true,
+                state_size: 1024,
             }),
         },
         // Peer2 applies B then A -> hash "ba_result" (different!)
@@ -1008,6 +1031,7 @@ fn test_update_ordering_anomaly() {
                 state_hash_before: Some("init".into()),
                 state_hash_after: Some("after_b".into()),
                 changed: true,
+                state_size: 1024,
             }),
         },
         NetLogMessage {
@@ -1022,6 +1046,7 @@ fn test_update_ordering_anomaly() {
                 state_hash_before: Some("after_b".into()),
                 state_hash_after: Some("ba_result".into()),
                 changed: true,
+                state_size: 1024,
             }),
         },
     ];
@@ -1061,6 +1086,7 @@ fn test_no_ordering_anomaly_when_commutative() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("init".into()),
+                state_size: None,
             }),
         },
         NetLogMessage {
@@ -1076,6 +1102,7 @@ fn test_no_ordering_anomaly_when_commutative() {
                 elapsed_ms: 10,
                 timestamp: 100,
                 state_hash: Some("init".into()),
+                state_size: None,
             }),
         },
         // Peer1: A then B -> "same_result"
@@ -1091,6 +1118,7 @@ fn test_no_ordering_anomaly_when_commutative() {
                 state_hash_before: Some("init".into()),
                 state_hash_after: Some("mid".into()),
                 changed: true,
+                state_size: 1024,
             }),
         },
         NetLogMessage {
@@ -1105,6 +1133,7 @@ fn test_no_ordering_anomaly_when_commutative() {
                 state_hash_before: Some("mid".into()),
                 state_hash_after: Some("same_result".into()),
                 changed: true,
+                state_size: 1024,
             }),
         },
         // Peer2: B then A -> "same_result" (commutative, no anomaly)
@@ -1120,6 +1149,7 @@ fn test_no_ordering_anomaly_when_commutative() {
                 state_hash_before: Some("init".into()),
                 state_hash_after: Some("mid2".into()),
                 changed: true,
+                state_size: 1024,
             }),
         },
         NetLogMessage {
@@ -1134,6 +1164,7 @@ fn test_no_ordering_anomaly_when_commutative() {
                 state_hash_before: Some("mid2".into()),
                 state_hash_after: Some("same_result".into()),
                 changed: true,
+                state_size: 1024,
             }),
         },
     ];
