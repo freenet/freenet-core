@@ -8,8 +8,6 @@
 1. Run: cargo fmt
 2. Run: cargo clippy --all-targets
 3. Run: cargo test
-4. Check: Any TODO-MUST-FIX markers in staged files?
-   → If YES: CI will block. Either fix or create tracking issue first.
 ```
 
 ### WHEN creating a commit message
@@ -58,18 +56,34 @@ DO NOT:
   ✗ Comment it out
   ✗ Skip without documentation
 
-DO:
-  ✓ Add #[ignore] attribute
-  ✓ Add marker: // TODO-MUST-FIX: [reason] #[issue]
-  ✓ Create GitHub issue immediately
+Is the test broken or flaky?
+  DO:
+    ✓ Add #[ignore] attribute
+    ✓ Add comment: // Ignored: [reason] #[issue]
+    ✓ Create GitHub issue immediately
+
+Is the test superseded by a semantic change?
+  DO:
+    ✓ Add #[ignore] attribute
+    ✓ Add comment explaining the semantic change and referencing the PR
+    ✓ Keep as historical documentation of the old behavior
 ```
 
-Example:
+Example (broken test):
 ```rust
-// TODO-MUST-FIX: Re-enable after fixing #1234
+// Ignored: Flaky under parallel execution, see #1234
 #[ignore]
 #[test]
 fn flaky_test() { ... }
+```
+
+Example (superseded test):
+```rust
+// Superseded: hosted-only contracts no longer renewed after #3363.
+// Replaced by test_contracts_needing_renewal_excludes_hosted_only.
+#[ignore]
+#[test]
+fn test_old_behavior() { ... }
 ```
 
 ### WHEN reviewing code
@@ -78,8 +92,8 @@ fn flaky_test() { ... }
 Does PR explain WHY changes were made?
   → NO: Request explanation before approving
 
-Are there new TODO-MUST-FIX markers?
-  → YES: Verify tracking issue exists
+Are there new #[ignore] tests?
+  → YES: Verify tracking issue exists (broken) or PR reference (superseded)
 
 Does test coverage match changed code?
   → NO: Request tests for uncovered paths

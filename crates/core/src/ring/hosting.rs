@@ -1429,6 +1429,33 @@ mod tests {
         assert!(manager.is_receiving_updates(&contract));
     }
 
+    // Superseded by test_contracts_needing_renewal_excludes_hosted_only which tests
+    // the new semantics (hosted-only contracts are NOT renewed). Kept as #[ignore]
+    // per project rules — the old behavior was intentionally changed in #3363. See #3386.
+    #[ignore]
+    #[test]
+    fn test_hosted_contract_renewed_despite_no_interest() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(42);
+
+        // Add contract to hosting cache via GET access
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        assert!(manager.is_hosting_contract(&contract));
+
+        // should_unsubscribe_upstream still returns true (no clients, no downstream)
+        assert!(
+            manager.should_unsubscribe_upstream(&contract),
+            "should_unsubscribe_upstream does not check hosting cache"
+        );
+
+        // But contracts_needing_renewal() includes it anyway
+        let renewals = manager.contracts_needing_renewal();
+        assert!(
+            renewals.contains(&contract),
+            "Hosted contract should be included in subscription renewals"
+        );
+    }
+
     #[test]
     fn test_contracts_needing_renewal_excludes_hosted_only() {
         let manager = HostingManager::new();

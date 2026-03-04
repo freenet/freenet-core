@@ -978,20 +978,20 @@ impl Operation for GetOp {
                             phase = "not_found",
                             "GET Request exhausted HTL - sending NotFound response"
                         );
-                        return build_op_result(
+                        return build_op_result(GetOpResult {
                             id,
-                            None,
-                            Some(GetMsg::Response {
+                            state: None,
+                            msg: Some(GetMsg::Response {
                                 id,
                                 instance_id,
                                 result: GetMsgResult::NotFound,
                             }),
-                            None,
+                            result: None,
                             stats,
-                            self.upstream_addr,
-                            None,
-                            None,
-                        );
+                            upstream_addr: self.upstream_addr,
+                            stream_data: None,
+                            local_fallback: None,
+                        });
                     } else {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
                         debug_assert!(matches!(
@@ -2530,16 +2530,16 @@ impl Operation for GetOp {
                 }
             }
 
-            build_op_result(
-                self.id,
-                new_state,
-                return_msg,
+            build_op_result(GetOpResult {
+                id: self.id,
+                state: new_state,
+                msg: return_msg,
                 result,
                 stats,
-                self.upstream_addr,
+                upstream_addr: self.upstream_addr,
                 stream_data,
                 local_fallback,
-            )
+            })
         })
     }
 }
@@ -2565,8 +2565,7 @@ fn build_fallback_found_response(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_op_result(
+struct GetOpResult {
     id: Transaction,
     state: Option<GetState>,
     msg: Option<GetMsg>,
@@ -2575,7 +2574,19 @@ fn build_op_result(
     upstream_addr: Option<std::net::SocketAddr>,
     stream_data: Option<(StreamId, bytes::Bytes)>,
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
-) -> Result<OperationResult, OpError> {
+}
+
+fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
+    let GetOpResult {
+        id,
+        state,
+        msg,
+        result,
+        stats,
+        upstream_addr,
+        stream_data,
+        local_fallback,
+    } = params;
     // Determine the next hop for sending the message:
     // - For Response messages: route back to upstream_addr (who sent us the request)
     // - For Request messages being forwarded: use next_hop from state
@@ -2689,9 +2700,9 @@ async fn try_forward_or_return(
         // Forwarding nodes always use non-blocking subscriptions:
         // blocking_subscribe is a client-side preference that only
         // applies to the originator node.
-        build_op_result(
+        build_op_result(GetOpResult {
             id,
-            Some(GetState::AwaitingResponse(AwaitingResponseData {
+            state: Some(GetState::AwaitingResponse(AwaitingResponseData {
                 instance_id,
                 requester: sender,
                 retries: 0,
@@ -2705,19 +2716,19 @@ async fn try_forward_or_return(
                 attempts_at_hop: 1,
                 visited: new_visited.clone(),
             })),
-            Some(GetMsg::Request {
+            msg: Some(GetMsg::Request {
                 id,
                 instance_id,
                 fetch_contract,
                 htl: new_htl,
                 visited: new_visited,
             }),
-            None,
+            result: None,
             stats,
             upstream_addr,
-            None,
+            stream_data: None,
             local_fallback,
-        )
+        })
     } else if upstream_addr.is_some() {
         // No targets found — check for local fallback before returning NotFound
         if let Some((key, state, contract)) = local_fallback {
@@ -2727,7 +2738,16 @@ async fn try_forward_or_return(
                 "Relay serving local cache as fallback (no forwarding targets)"
             );
             let msg = build_fallback_found_response(id, instance_id, key, state, contract);
-            build_op_result(id, None, Some(msg), None, stats, upstream_addr, None, None)
+            build_op_result(GetOpResult {
+                id,
+                state: None,
+                msg: Some(msg),
+                result: None,
+                stats,
+                upstream_addr,
+                stream_data: None,
+                local_fallback: None,
+            })
         } else {
             tracing::warn!(
                 tx = %id,
@@ -2735,20 +2755,20 @@ async fn try_forward_or_return(
                 phase = "not_found",
                 "No peers to forward get request to, returning NotFound to upstream"
             );
-            build_op_result(
+            build_op_result(GetOpResult {
                 id,
-                None,
-                Some(GetMsg::Response {
+                state: None,
+                msg: Some(GetMsg::Response {
                     id,
                     instance_id,
                     result: GetMsgResult::NotFound,
                 }),
-                None,
+                result: None,
                 stats,
                 upstream_addr,
-                None,
-                None,
-            )
+                stream_data: None,
+                local_fallback: None,
+            })
         }
     } else {
         // Original requester with no forwarding targets - operation fails locally
@@ -2766,7 +2786,16 @@ async fn try_forward_or_return(
         )
         .await;
 
-        build_op_result(id, None, None, None, stats, upstream_addr, None, None)
+        build_op_result(GetOpResult {
+            id,
+            state: None,
+            msg: None,
+            result: None,
+            stats,
+            upstream_addr,
+            stream_data: None,
+            local_fallback: None,
+        })
     }
 }
 

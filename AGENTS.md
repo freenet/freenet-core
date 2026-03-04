@@ -33,8 +33,16 @@
 
 ```
 DO NOT delete or comment out the test.
-→ Add #[ignore] with // TODO-MUST-FIX: [reason] #[issue]
-→ Create GitHub issue
+
+Is the test broken/flaky?
+  → Add #[ignore] with a comment explaining why
+  → Create GitHub issue immediately
+  → Reference the issue in the comment: // Ignored: [reason] #[issue]
+
+Is the test superseded by new semantics?
+  → Add #[ignore] with a comment explaining the semantic change
+  → Reference the PR that changed the behavior
+  → Keep the test as historical documentation
 ```
 
 ### WHEN writing cleanup/GC logic

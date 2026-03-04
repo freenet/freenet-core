@@ -46,11 +46,17 @@ Need fault injection?
 ```
 Test failed?
   → DO NOT delete the test
-  → DO NOT comment it out without marker
-  → Instead:
+  → DO NOT comment it out without explanation
+
+  Is it broken or flaky?
     1. Add #[ignore] attribute
-    2. Add comment: // TODO-MUST-FIX: [reason] #[issue-number]
+    2. Add comment: // Ignored: [reason] #[issue-number]
     3. Create GitHub issue for follow-up
+
+  Is it superseded by new semantics?
+    1. Add #[ignore] attribute
+    2. Add comment explaining the semantic change and referencing the PR
+    3. Keep as historical documentation
 ```
 
 ### When running tests
