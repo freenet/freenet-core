@@ -40,7 +40,7 @@ use crate::{
     },
     ring::{
         ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
-        PeerKey, PeerKeyLocation, Ring,
+        PeerKeyLocation, Ring,
     },
     transport::TransportPublicKey,
     util::time_source::InstantTimeSrc,

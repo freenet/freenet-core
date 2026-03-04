@@ -3551,7 +3551,12 @@ mod tests {
                 assert_eq!(value.state, Some(state));
                 assert!(value.contract.is_none());
             }
-            other => panic!("Expected Found response, got {other:?}"),
+            other @ GetMsg::Response { .. }
+            | other @ GetMsg::Request { .. }
+            | other @ GetMsg::ResponseStreaming { .. }
+            | other @ GetMsg::ResponseStreamingAck { .. } => {
+                panic!("Expected Found response, got {other:?}")
+            }
         }
     }
 }

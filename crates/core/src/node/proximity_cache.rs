@@ -365,6 +365,7 @@ impl ProximityCacheManager {
     }
 
     /// Handle peer disconnection by removing their cache state.
+    #[cfg(test)]
     pub fn on_peer_disconnected(&self, pub_key: &TransportPublicKey) {
         if let Some((_, removed_cache)) = self.neighbor_caches.remove(pub_key) {
             let count = removed_cache.len();
