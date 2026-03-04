@@ -552,7 +552,15 @@ impl ConnectionManager {
         // node genuinely needs more connections.
         // total_conn (which includes pending) is still used for max_connections
         // to prevent over-commitment.
-        let accepted = if open < self.min_connections {
+        let accepted = if total_conn >= self.max_connections {
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                total_conn,
+                "should_accept: rejected (max connections reached)"
+            );
+            false
+        } else if open < self.min_connections {
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
@@ -561,14 +569,6 @@ impl ConnectionManager {
                 "should_accept: accepted (open connections below min)"
             );
             true
-        } else if total_conn >= self.max_connections {
-            tracing::debug!(
-                addr = %addr,
-                peer_location = %location,
-                total_conn,
-                "should_accept: rejected (max connections reached)"
-            );
-            false
         } else {
             let accepted = self
                 .topology_manager
