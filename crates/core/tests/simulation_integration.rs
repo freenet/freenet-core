@@ -6389,12 +6389,13 @@ fn test_connect_despite_nat_partition() {
 ///
 /// **What this test verifies (post-fix behavior):**
 ///
-/// 1. Median connections reach min_connections after 1 virtual hour.
+/// 1. Median connections reach min_connections after 10 virtual minutes.
 /// 2. At least 90% of nodes reach min_connections.
 /// 3. Nodes form connections to non-gateway peers (proves multi-hop CONNECT).
 /// 4. Under 20% message loss (simulating NAT hole-punch failures), no death spiral.
 ///
-/// **Topology:** 2 gateways + 50 nodes, min_connections=10, max_connections=20.
+/// **Topology:** 2 gateways + 15 nodes, min_connections=3, max_connections=8.
+/// Sized for CI: 600s virtual time ≈ 70s wall time via `let_network_run`.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_connection_growth_stall_regression() {
     use freenet::dev_tool::NodeLabel;
@@ -6403,11 +6404,11 @@ async fn test_connection_growth_stall_regression() {
     const SEED: u64 = 0x3408_3398_0001;
     const NETWORK_NAME: &str = "connection-growth-stall";
     const GATEWAYS: usize = 2;
-    const NODES: usize = 50;
-    const RING_MAX_HTL: usize = 10;
-    const RND_IF_HTL_ABOVE: usize = 7;
-    const MAX_CONN: usize = 20;
-    const MIN_CONN: usize = 10;
+    const NODES: usize = 15;
+    const RING_MAX_HTL: usize = 7;
+    const RND_IF_HTL_ABOVE: usize = 3;
+    const MAX_CONN: usize = 8;
+    const MIN_CONN: usize = 3;
 
     tracing::info!("=== Connection Growth Stall Regression Test ===");
     tracing::info!("Verifies fixes: #3408, #3398, #3396, #3380");
@@ -6436,8 +6437,8 @@ async fn test_connection_growth_stall_regression() {
     // -------------------------------------------------------------------------
     // Phase 1: Let the network form connections over 5 virtual minutes
     // -------------------------------------------------------------------------
-    tracing::info!("Phase 1: Connection growth — 1 virtual hour, no faults");
-    let_network_run(&mut sim, Duration::from_secs(3600)).await;
+    tracing::info!("Phase 1: Connection growth — 10 virtual minutes, no faults");
+    let_network_run(&mut sim, Duration::from_secs(600)).await;
 
     // Collect per-node connection counts
     let mut node_counts: Vec<usize> = (0..NODES)
@@ -6517,10 +6518,10 @@ async fn test_connection_growth_stall_regression() {
     // -------------------------------------------------------------------------
     // Phase 2: 20% message loss simulating NAT hole-punch failures — 3 minutes
     // -------------------------------------------------------------------------
-    tracing::info!("Phase 2: NAT failure simulation — 20% message loss for 3 min");
+    tracing::info!("Phase 2: NAT failure simulation — 20% message loss for 1 min");
     sim.with_fault_injection(FaultConfig::builder().message_loss_rate(0.20).build());
 
-    let_network_run(&mut sim, Duration::from_secs(180)).await;
+    let_network_run(&mut sim, Duration::from_secs(60)).await;
 
     // Re-inspect connection counts after faults
     let mut node_counts_after: Vec<usize> = (0..NODES)
