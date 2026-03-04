@@ -2295,7 +2295,7 @@ pub(crate) async fn join_ring_request(
 /// we cap the per-iteration gateway-backoff sleep to this value so the loop
 /// re-checks `open_conns` frequently.  The concurrent `connection_maintenance`
 /// task adds connections via ring-based acquisition every 5s; polling at ~30s
-/// intervals lets `initial_join_procedure` notice when `BOOTSTRAP_THRESHOLD`
+/// intervals lets `initial_join_procedure` notice when `min_connections`
 /// is reached without waiting for the full gateway backoff to expire.
 ///
 /// Also applied in `handle_aborted_op` for the same reason.  ±20% jitter is
@@ -2324,9 +2324,20 @@ pub(crate) async fn initial_join_procedure(
 
         const BASE_WAIT_SECS: u64 = 1;
         const LONG_WAIT_SECS: u64 = 30;
-        const BOOTSTRAP_THRESHOLD: usize = 4;
+        // Use min_connections as the bootstrap threshold so the gateway-directed
+        // join loop keeps driving connections until the node has enough peers for
+        // ring-based acquisition to take over reliably. Previously hardcoded to 4,
+        // which caused nodes to plateau far below min_connections when ring-based
+        // acquisition was slow or had insufficient routing candidates.
+        //
+        // Gateway load note: higher min_connections increases gateway traffic during
+        // bootstrap. This is throttled by per-gateway exponential backoff, the
+        // parallel connection cap (number_of_parallel_connections), and the
+        // LONG_WAIT_SECS sleep once the threshold is reached.
+        let bootstrap_threshold = op_manager.ring.connection_manager.min_connections;
 
         tracing::info!(
+            bootstrap_threshold,
             "Starting initial join procedure with {} gateways",
             gateways.len()
         );
@@ -2366,7 +2377,7 @@ pub(crate) async fn initial_join_procedure(
                 // control retry timing to avoid thundering herd when multiple peers lose
                 // connectivity simultaneously. The 120-second isolation recovery in
                 // connection_maintenance resets both backoff and reservations periodically.
-            } else if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count == 0 {
+            } else if open_conns < bootstrap_threshold && unconnected_count == 0 {
                 tracing::info!(
                     open_conns,
                     total_gateways = gateways.len(),
@@ -2375,7 +2386,7 @@ pub(crate) async fn initial_join_procedure(
                 );
             }
 
-            if open_conns < BOOTSTRAP_THRESHOLD && unconnected_count > 0 {
+            if open_conns < bootstrap_threshold && unconnected_count > 0 {
                 // Filter out gateways that are in backoff due to previous failures.
                 // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
                 //
@@ -2451,7 +2462,7 @@ pub(crate) async fn initial_join_procedure(
                 tracing::info!(
                     "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways (skipped {} in backoff)",
                     open_conns,
-                    BOOTSTRAP_THRESHOLD,
+                    bootstrap_threshold,
                     number_of_parallel_connections.min(eligible_count),
                     unconnected_count - eligible_count
                 );
@@ -2485,11 +2496,11 @@ pub(crate) async fn initial_join_procedure(
                         }
                     })
                     .await;
-            } else if open_conns >= BOOTSTRAP_THRESHOLD {
+            } else if open_conns >= bootstrap_threshold {
                 tracing::trace!(
                     "Have {} connections (>= threshold of {}), not attempting gateway connections",
                     open_conns,
-                    BOOTSTRAP_THRESHOLD
+                    bootstrap_threshold
                 );
             }
 
@@ -2503,12 +2514,12 @@ pub(crate) async fn initial_join_procedure(
                     BASE_WAIT_SECS
                 );
                 BASE_WAIT_SECS * 1000
-            } else if open_conns < BOOTSTRAP_THRESHOLD {
+            } else if open_conns < bootstrap_threshold {
                 let wait = BASE_WAIT_SECS * 3 * 1000;
                 tracing::debug!(
                     "Have {} connections (below threshold of {}), waiting ~{}ms",
                     open_conns,
-                    BOOTSTRAP_THRESHOLD,
+                    bootstrap_threshold,
                     wait + jitter_ms
                 );
                 wait

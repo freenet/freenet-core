@@ -2047,15 +2047,17 @@ impl Ring {
                     })?;
                 if tx.is_none() {
                     let conns = self.connection_manager.connection_count();
-                    tracing::warn!(
+                    tracing::debug!(
                         connections = conns,
                         target_location = %ideal_location,
                         "acquire_new returned None - likely no peers to query through"
                     );
-                    self.record_connection_failure(
-                        ideal_location,
-                        ConnectionFailureReason::RoutingFailed,
-                    );
+                    // Don't record a backoff against the target location here.
+                    // acquire_new returning None means we have insufficient routing
+                    // candidates locally — the target location itself is fine.
+                    // Backing off the target would block future attempts when we
+                    // gain more connections and could actually route to it.
+                    // adjust_topology will re-request this location on the next tick.
                 } else {
                     active_count += 1;
                     tracing::info!(
