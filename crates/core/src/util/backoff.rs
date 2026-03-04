@@ -29,11 +29,12 @@
 //! assert!(tracker.is_in_backoff(&"peer1".to_string()));
 //! ```
 
-use rand::Rng;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::Duration;
 use tokio::time::Instant;
+
+use crate::config::GlobalRng;
 
 /// Stateless exponential backoff delay calculator.
 ///
@@ -223,8 +224,9 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
         };
 
         let backoff = self.config.delay_for_failures(consecutive_failures);
-        // Apply ±20% jitter to prevent thundering herd (per code-style rules)
-        let jitter_factor: f64 = rand::rng().random_range(0.8..=1.2);
+        // Apply ±20% jitter to prevent thundering herd (per code-style rules).
+        // GlobalRng is used so jitter is reproducible in seeded simulation tests.
+        let jitter_factor: f64 = GlobalRng::random_range(0.8_f64..=1.2_f64);
         let jittered_backoff = backoff.mul_f64(jitter_factor);
 
         if let Some(entry) = self.entries.get_mut(&key) {
@@ -259,13 +261,17 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
             .unwrap_or(0)
     }
 
-    /// Clean up expired backoff entries.
+    /// Conservative cleanup: removes entries that are **both** past their retry
+    /// time **and** have been stale for longer than the max backoff duration.
     ///
-    /// Removes entries that are both:
-    /// 1. Past their retry time
-    /// 2. Have been stale for longer than max backoff duration
+    /// This two-condition policy retains recently-unblocked entries for a grace
+    /// period (up to `max` duration after the last failure), which preserves the
+    /// failure counter in case the same key fails again shortly after backoff
+    /// expires. Use this when you want the accumulated failure count to persist
+    /// across consecutive failure→backoff→retry cycles.
     ///
-    /// This prevents unbounded memory growth from old entries.
+    /// See also [`remove_expired_entries`](Self::remove_expired_entries) for a
+    /// more aggressive single-condition cleanup.
     pub fn cleanup_expired(&mut self) {
         let now = Instant::now();
         let max_stale = self.config.max();
@@ -311,9 +317,48 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
         }
     }
 
+    /// Returns all keys currently in backoff (i.e., retry time has not elapsed).
+    pub fn keys_in_backoff(&self) -> Vec<K> {
+        let now = Instant::now();
+        self.entries
+            .iter()
+            .filter(|(_, e)| now < e.retry_after)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Aggressive cleanup: removes any entry whose retry window has passed,
+    /// regardless of how recently the last failure was recorded.
+    ///
+    /// This resets the failure counter for removed keys; the next call to
+    /// [`record_failure`](Self::record_failure) for those keys will restart
+    /// from count=1. Use this when an expired backoff means the address
+    /// should be treated as a fresh candidate (e.g., NAT failed-address cache).
+    ///
+    /// Contrast with [`cleanup_expired`](Self::cleanup_expired), which uses a
+    /// two-condition policy that keeps recently-unblocked entries longer.
+    ///
+    /// Returns the number of entries removed.
+    pub fn remove_expired_entries(&mut self) -> usize {
+        let now = Instant::now();
+        let before = self.entries.len();
+        self.entries.retain(|_, e| now < e.retry_after);
+        before - self.entries.len()
+    }
+
     /// Get a reference to the backoff configuration.
     pub fn config(&self) -> &ExponentialBackoff {
         &self.config
+    }
+
+    /// Override the retry_after instant for a specific key (test-only).
+    ///
+    /// Used in tests to simulate time passage without actually sleeping.
+    #[cfg(test)]
+    pub fn set_retry_after(&mut self, key: &K, retry_after: Instant) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.retry_after = retry_after;
+        }
     }
 }
 
@@ -441,12 +486,64 @@ mod tests {
         // No backoff initially
         assert!(tracker.remaining_backoff(&key).is_none());
 
-        // After failure, should have remaining backoff (with ±20% jitter)
+        // After failure, should have remaining backoff (with ±20% jitter).
+        // Use set_retry_after to inject a deterministic value, avoiding
+        // clock-dependent assertions.
         tracker.record_failure(key.clone());
+        // Inject a known retry_after 10 seconds from now
+        tracker.set_retry_after(&key, Instant::now() + Duration::from_secs(10));
         let remaining = tracker.remaining_backoff(&key);
         assert!(remaining.is_some());
-        // With ±20% jitter, backoff should be in [8s, 12s]
-        assert!(remaining.unwrap() <= Duration::from_secs(12));
-        assert!(remaining.unwrap() >= Duration::from_secs(7));
+        // Should be close to 10s; allow 1s for execution time
+        assert!(remaining.unwrap() <= Duration::from_secs(10));
+        assert!(remaining.unwrap() >= Duration::from_secs(9));
+    }
+
+    #[test]
+    fn test_keys_in_backoff_stable_across_consecutive_calls() {
+        // Core invariant: jitter is applied once at write time, so two consecutive
+        // reads must always agree on which keys are blocked.
+        let config = ExponentialBackoff::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let mut tracker: TrackedBackoff<u32> = TrackedBackoff::new(config, 64);
+
+        tracker.record_failure(1u32);
+        tracker.record_failure(2u32);
+
+        let first = tracker.keys_in_backoff();
+        let second = tracker.keys_in_backoff();
+
+        let mut first_sorted = first.clone();
+        first_sorted.sort();
+        let mut second_sorted = second.clone();
+        second_sorted.sort();
+
+        assert_eq!(
+            first_sorted, second_sorted,
+            "keys_in_backoff must return identical results on consecutive calls"
+        );
+        assert!(first_sorted.contains(&1u32));
+        assert!(first_sorted.contains(&2u32));
+    }
+
+    #[test]
+    fn test_remove_expired_entries_count() {
+        let config = ExponentialBackoff::new(Duration::from_secs(300), Duration::from_secs(3600));
+        let mut tracker: TrackedBackoff<u32> = TrackedBackoff::new(config, 64);
+
+        tracker.record_failure(1u32);
+        tracker.record_failure(2u32);
+        tracker.record_failure(3u32);
+
+        // Force entries 1 and 2 to be expired
+        tracker.set_retry_after(&1u32, Instant::now() - Duration::from_secs(1));
+        tracker.set_retry_after(&2u32, Instant::now() - Duration::from_secs(1));
+        // Entry 3 stays in the future
+
+        let removed = tracker.remove_expired_entries();
+        assert_eq!(removed, 2);
+        assert_eq!(tracker.len(), 1);
+        assert!(!tracker.is_in_backoff(&1u32));
+        assert!(!tracker.is_in_backoff(&2u32));
+        assert!(tracker.is_in_backoff(&3u32));
     }
 }

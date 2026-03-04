@@ -17,6 +17,7 @@
 //!
 //! - `connect_jitter_failures` (`parking_lot::Mutex<(u32, Option<Instant>)>`)
 //! - `connect_excluded_peers` (`parking_lot::RwLock<BTreeMap<SocketAddr, (u32, Instant)>>`)
+//! - `recently_failed_addrs` (`parking_lot::Mutex<TrackedBackoff<SocketAddr>>`)
 
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -28,6 +29,7 @@ use tokio::time::Instant;
 
 use crate::config::GlobalRng;
 use crate::topology::{Limits, TopologyManager};
+use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 
 use super::*;
 
@@ -61,25 +63,9 @@ const FAILED_ADDR_BASE_TTL: Duration = Duration::from_secs(300);
 /// (e.g., symmetric NAT on both sides) caps at 1 hour between retries.
 const FAILED_ADDR_MAX_TTL: Duration = Duration::from_secs(3600);
 
-/// Compute the base (un-jittered) adaptive TTL for an address with `failure_count` failures.
-/// First failure (count=1) uses the base TTL; each subsequent failure doubles it.
-/// This is a pure function used by tests; callers that need jitter should use
-/// [`failed_addr_ttl_jittered`] instead.
-fn failed_addr_ttl(failure_count: u32) -> Duration {
-    let exponent = failure_count.saturating_sub(1);
-    let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
-    let ttl_secs = FAILED_ADDR_BASE_TTL.as_secs().saturating_mul(multiplier);
-    Duration::from_secs(ttl_secs.min(FAILED_ADDR_MAX_TTL.as_secs()))
-}
-
-/// Like [`failed_addr_ttl`] but applies ±20% random jitter to prevent
-/// multiple peers from retrying the same unreachable address in lockstep.
-fn failed_addr_ttl_jittered(failure_count: u32) -> Duration {
-    let base = failed_addr_ttl(failure_count);
-    // ±20% jitter: multiply by a factor in [0.8, 1.2]
-    let jitter_factor = 0.8 + (GlobalRng::random_u64() % 401) as f64 / 1000.0;
-    base.mul_f64(jitter_factor)
-}
+/// Maximum number of failed addresses tracked in the recently-failed cache.
+/// Entries are evicted LRU-style when the limit is reached.
+const FAILED_ADDR_MAX_ENTRIES: usize = 1024;
 
 /// RAII guard that releases a connect admission slot when dropped.
 ///
@@ -299,7 +285,9 @@ pub(crate) struct ConnectionManager {
     max_concurrent_connects: usize,
     /// Addresses that recently failed NAT traversal. Pre-populated into the
     /// CONNECT `visited` bloom filter so routing nodes skip these peers.
-    recently_failed_addrs: Arc<RwLock<BTreeMap<SocketAddr, (Instant, u32)>>>,
+    /// Jitter is applied once at `record_failed_addr` time and stored as a
+    /// `retry_after` instant, so consecutive reads are always consistent.
+    recently_failed_addrs: Arc<parking_lot::Mutex<TrackedBackoff<SocketAddr>>>,
     /// Peers that have advertised readiness to accept non-CONNECT operations.
     ready_peers: Arc<DashSet<SocketAddr>>,
     /// Minimum connections before this peer advertises readiness.
@@ -433,7 +421,10 @@ impl ConnectionManager {
             } else {
                 usize::MAX
             },
-            recently_failed_addrs: Arc::new(RwLock::new(BTreeMap::new())),
+            recently_failed_addrs: Arc::new(parking_lot::Mutex::new(TrackedBackoff::new(
+                ExponentialBackoff::new(FAILED_ADDR_BASE_TTL, FAILED_ADDR_MAX_TTL),
+                FAILED_ADDR_MAX_ENTRIES,
+            ))),
             ready_peers: Arc::new(DashSet::new()),
             min_ready_connections,
             connected_since: Arc::new(RwLock::new(BTreeMap::new())),
@@ -1458,16 +1449,15 @@ impl ConnectionManager {
     /// Record that a transport-level connection to `addr` failed, so future
     /// CONNECT requests will mark it as visited in the bloom filter.
     /// Repeated failures increment the count, scaling the TTL exponentially.
+    /// Jitter is applied once here at write time, so back-to-back reads always
+    /// agree on whether the address is still blocked.
     pub fn record_failed_addr(&self, addr: SocketAddr) {
-        let now = Instant::now();
-        let mut map = self.recently_failed_addrs.write();
-        let count = map.get(&addr).map_or(0, |(_, c)| *c);
-        map.insert(addr, (now, count.saturating_add(1)));
+        self.recently_failed_addrs.lock().record_failure(addr);
     }
 
     /// Remove `addr` from the failed cache (e.g., after a successful connection).
     pub fn clear_failed_addr(&self, addr: SocketAddr) {
-        self.recently_failed_addrs.write().remove(&addr);
+        self.recently_failed_addrs.lock().record_success(&addr);
     }
 
     /// Return addresses of all peers tracked in `location_for_peer` (established and pending).
@@ -1483,31 +1473,21 @@ impl ConnectionManager {
 
     /// Return addresses that failed NAT traversal within their adaptive TTL.
     /// Addresses with more repeated failures have longer TTLs (up to 1 hour).
-    /// Includes ±20% jitter to stagger retries across peers.
+    /// Jitter was applied once at record time, so the result is stable across
+    /// consecutive calls within the same millisecond.
     pub fn recently_failed_addrs(&self) -> Vec<SocketAddr> {
-        let now = Instant::now();
-        self.recently_failed_addrs
-            .read()
-            .iter()
-            .filter(|(_, (ts, count))| now.duration_since(*ts) < failed_addr_ttl_jittered(*count))
-            .map(|(addr, _)| *addr)
-            .collect()
+        self.recently_failed_addrs.lock().keys_in_backoff()
     }
 
-    /// Remove entries whose adaptive TTL has expired.
-    /// Uses jittered TTL so cleanup is naturally staggered.
+    /// Remove entries whose adaptive TTL has expired. Returns the number removed.
     pub fn cleanup_stale_failed_addrs(&self) -> usize {
-        let now = Instant::now();
-        let mut map = self.recently_failed_addrs.write();
-        let before = map.len();
-        map.retain(|_, (ts, count)| now.duration_since(*ts) < failed_addr_ttl_jittered(*count));
-        before - map.len()
+        self.recently_failed_addrs.lock().remove_expired_entries()
     }
 
     /// Clear all recently-failed addresses. Used after suspend/resume when
     /// previously-unreachable peers may be reachable again.
     pub fn cleanup_all_failed_addrs(&self) {
-        self.recently_failed_addrs.write().clear();
+        self.recently_failed_addrs.lock().clear();
     }
 
     // ==================== CONNECT Jitter ====================
@@ -3741,37 +3721,39 @@ mod tests {
         );
     }
 
-    // ============ failed_addr_ttl / adaptive TTL tests ============
+    // ============ failed_addr / adaptive TTL tests ============
 
     #[test]
-    fn test_failed_addr_ttl_base_cases() {
-        // count=0 should never happen in practice, but should not panic
-        assert_eq!(failed_addr_ttl(0), Duration::from_secs(300));
+    fn test_failed_addr_backoff_base_cases() {
+        // Verify the ExponentialBackoff config used for failed addresses
+        let backoff = ExponentialBackoff::new(FAILED_ADDR_BASE_TTL, FAILED_ADDR_MAX_TTL);
         // First failure (count=1): base TTL = 5 min
-        assert_eq!(failed_addr_ttl(1), Duration::from_secs(300));
+        assert_eq!(backoff.delay_for_failures(1), Duration::from_secs(300));
         // Second failure: 10 min
-        assert_eq!(failed_addr_ttl(2), Duration::from_secs(600));
+        assert_eq!(backoff.delay_for_failures(2), Duration::from_secs(600));
         // Third: 20 min
-        assert_eq!(failed_addr_ttl(3), Duration::from_secs(1200));
+        assert_eq!(backoff.delay_for_failures(3), Duration::from_secs(1200));
         // Fourth: 40 min
-        assert_eq!(failed_addr_ttl(4), Duration::from_secs(2400));
+        assert_eq!(backoff.delay_for_failures(4), Duration::from_secs(2400));
         // Fifth: would be 80 min, capped to 60 min
-        assert_eq!(failed_addr_ttl(5), Duration::from_secs(3600));
+        assert_eq!(backoff.delay_for_failures(5), FAILED_ADDR_MAX_TTL);
     }
 
     #[test]
-    fn test_failed_addr_ttl_cap_and_overflow() {
-        // High counts should cap at MAX_TTL, never panic
-        assert_eq!(failed_addr_ttl(100), FAILED_ADDR_MAX_TTL);
-        assert_eq!(failed_addr_ttl(u32::MAX), FAILED_ADDR_MAX_TTL);
+    fn test_failed_addr_backoff_cap_and_overflow() {
+        let backoff = ExponentialBackoff::new(FAILED_ADDR_BASE_TTL, FAILED_ADDR_MAX_TTL);
+        // High counts and extreme values should cap at MAX_TTL, never panic
+        assert_eq!(backoff.delay_for_failures(100), FAILED_ADDR_MAX_TTL);
+        assert_eq!(backoff.delay_for_failures(u32::MAX), FAILED_ADDR_MAX_TTL);
     }
 
     #[test]
-    fn test_failed_addr_ttl_monotonic() {
+    fn test_failed_addr_backoff_monotonic() {
+        let backoff = ExponentialBackoff::new(FAILED_ADDR_BASE_TTL, FAILED_ADDR_MAX_TTL);
         // TTL should never decrease with increasing failure count
-        let mut prev = failed_addr_ttl(0);
-        for count in 1..=20 {
-            let current = failed_addr_ttl(count);
+        let mut prev = backoff.delay_for_failures(1);
+        for count in 2..=20 {
+            let current = backoff.delay_for_failures(count);
             assert!(current >= prev, "TTL decreased at count={count}");
             prev = current;
         }
@@ -3791,8 +3773,7 @@ mod tests {
         assert!(failed.contains(&addr));
 
         // Internal count should be 1 after first failure
-        let map = cm.recently_failed_addrs.read();
-        assert_eq!(map.get(&addr).unwrap().1, 1);
+        assert_eq!(cm.recently_failed_addrs.lock().failure_count(&addr), 1);
     }
 
     #[test]
@@ -3802,8 +3783,10 @@ mod tests {
 
         for expected in 1..=5u32 {
             cm.record_failed_addr(addr);
-            let map = cm.recently_failed_addrs.read();
-            assert_eq!(map.get(&addr).unwrap().1, expected);
+            assert_eq!(
+                cm.recently_failed_addrs.lock().failure_count(&addr),
+                expected
+            );
         }
     }
 
@@ -3814,34 +3797,34 @@ mod tests {
 
         cm.record_failed_addr(addr);
         cm.record_failed_addr(addr);
-        assert_eq!(cm.recently_failed_addrs.read().get(&addr).unwrap().1, 2);
+        assert_eq!(cm.recently_failed_addrs.lock().failure_count(&addr), 2);
 
         // Clear removes the entry entirely
         cm.clear_failed_addr(addr);
-        assert!(cm.recently_failed_addrs.read().get(&addr).is_none());
+        assert_eq!(cm.recently_failed_addrs.lock().failure_count(&addr), 0);
 
         // Re-recording starts from count=1
         cm.record_failed_addr(addr);
-        assert_eq!(cm.recently_failed_addrs.read().get(&addr).unwrap().1, 1);
+        assert_eq!(cm.recently_failed_addrs.lock().failure_count(&addr), 1);
     }
 
     #[test]
     fn test_cleanup_stale_failed_addrs_respects_adaptive_ttl() {
         let cm = make_connection_manager(Some(make_addr(9300)), 1, 10, false);
-        let addr_once = make_addr(9301); // 1 failure → 5 min TTL
-        let addr_many = make_addr(9302); // 4 failures → 40 min TTL
+        let addr_once = make_addr(9301); // 1 failure → expires soon
+        let addr_many = make_addr(9302); // 4 failures → expires much later
 
         cm.record_failed_addr(addr_once);
         for _ in 0..4 {
             cm.record_failed_addr(addr_many);
         }
 
-        // Age both entries past 5 min but under 40 min
+        // Simulate time passage: force addr_once's retry_after into the past
+        // while leaving addr_many's retry_after far in the future.
         {
-            let mut map = cm.recently_failed_addrs.write();
-            for (_, (ts, _)) in map.iter_mut() {
-                *ts = Instant::now() - Duration::from_secs(400); // ~6.7 min
-            }
+            let mut tracker = cm.recently_failed_addrs.lock();
+            tracker.set_retry_after(&addr_once, Instant::now() - Duration::from_secs(1));
+            // addr_many's retry_after remains its original future instant
         }
 
         let removed = cm.cleanup_stale_failed_addrs();
@@ -3850,5 +3833,25 @@ mod tests {
         let remaining = cm.recently_failed_addrs();
         assert!(!remaining.contains(&addr_once));
         assert!(remaining.contains(&addr_many));
+    }
+
+    #[test]
+    fn test_recently_failed_addrs_stable_across_consecutive_calls() {
+        // Core invariant this PR establishes: jitter is applied once at record_failed_addr
+        // time, so two consecutive calls to recently_failed_addrs() within the same
+        // millisecond always agree on which addresses are blocked.
+        let cm = make_connection_manager(Some(make_addr(9400)), 1, 10, false);
+        let addr = make_addr(9401);
+
+        cm.record_failed_addr(addr);
+
+        let first = cm.recently_failed_addrs();
+        let second = cm.recently_failed_addrs();
+
+        assert_eq!(
+            first, second,
+            "recently_failed_addrs must return identical results on consecutive calls"
+        );
+        assert!(first.contains(&addr));
     }
 }
