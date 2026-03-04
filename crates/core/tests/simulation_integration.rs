@@ -6374,20 +6374,24 @@ fn test_connect_despite_nat_partition() {
 /// Nodes get ~10 connections (including 2 gateway transient connections) but never
 /// grow beyond that, continuously reconnecting to gateways. Root causes:
 ///
+/// - `BOOTSTRAP_THRESHOLD` was hardcoded to 4, stopping gateway-directed CONNECTs
+///   far below `min_connections`. Fixed: use `min_connections` as the threshold.
+/// - `acquire_new` returning None (no routing candidates) incorrectly put the
+///   target location in backoff. Fixed: no backoff on routing capacity failure.
 /// - CONNECT exclusion was absolute (3 failures = banned 30min). Fixed: max 50%
 ///   of ring peers excluded at once (#3408).
 /// - Distance-based fallback never evicted never-succeeded peers below
 ///   min_connections (#3398).
 /// - GC-expired CONNECT forwards silently blamed the acceptor (#3396/#3380).
-/// - Gateway max_connections was hardcoded to 20.
 ///
 /// **What this test verifies (post-fix behavior):**
 ///
-/// 1. Nodes grow connections beyond gateway-only within 10 virtual minutes.
-/// 2. Nodes form connections to non-gateway peers (proves multi-hop CONNECT).
-/// 3. Under 20% message loss (simulating NAT hole-punch failures), no death spiral.
+/// 1. Median connections reach min_connections after 1 virtual hour.
+/// 2. At least 25% of nodes reach min_connections.
+/// 3. Nodes form connections to non-gateway peers (proves multi-hop CONNECT).
+/// 4. Under 20% message loss (simulating NAT hole-punch failures), no death spiral.
 ///
-/// **Topology:** 2 gateways + 20 nodes, min_connections=5, max_connections=15.
+/// **Topology:** 2 gateways + 50 nodes, min_connections=10, max_connections=20.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn test_connection_growth_stall_regression() {
     use freenet::dev_tool::NodeLabel;
@@ -6488,12 +6492,16 @@ async fn test_connection_growth_stall_regression() {
         SEED
     );
 
-    // LOG: How many nodes reached min_connections (known to be low — see PR description).
-    tracing::info!(
-        "Nodes at min_connections: {:.0}% ({}/{})",
+    // ASSERTION 2: At least 25% of nodes reached min_connections.
+    assert!(
+        fraction_above_min >= 0.25,
+        "Too few nodes reached min_connections: {:.0}% ({}/{}) — expected >= 25%. \
+         Counts: {:?}. Seed: 0x{:X}",
         fraction_above_min * 100.0,
         nodes_above_min,
-        num_sampled
+        num_sampled,
+        node_counts,
+        SEED
     );
 
     // ASSERTION 3: Multi-hop CONNECT forwarding occurred.
