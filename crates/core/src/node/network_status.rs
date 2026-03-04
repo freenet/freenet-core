@@ -44,6 +44,8 @@ pub struct NetworkStatus {
     pub version: String,
     /// This node's ring location.
     pub own_location: Option<f64>,
+    /// This node's externally observed address (as seen by peers).
+    pub external_address: Option<SocketAddr>,
     /// Operation counters.
     pub op_stats: OperationStats,
     /// NAT traversal counters.
@@ -153,6 +155,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         subscribed_contracts: HashMap::new(),
         version,
         own_location: None,
+        external_address: None,
         op_stats: OperationStats::default(),
         nat_stats: NatStats::default(),
     };
@@ -300,6 +303,15 @@ pub fn set_own_location(location: f64) {
     }
 }
 
+/// Set this node's externally observed address (as reported by peers).
+pub fn set_external_address(addr: SocketAddr) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.external_address = Some(addr);
+        }
+    }
+}
+
 // --- Snapshot types for rendering ---
 
 /// Snapshot of the current network status for rendering.
@@ -311,6 +323,8 @@ pub struct NetworkStatusSnapshot {
     pub listening_port: u16,
     pub version: String,
     pub own_location: Option<f64>,
+    /// This node's externally observed address (as seen by peers).
+    pub external_address: Option<SocketAddr>,
     pub peers: Vec<PeerSnapshot>,
     pub contracts: Vec<ContractSnapshot>,
     pub op_stats: OpStatsSnapshot,
@@ -526,6 +540,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         listening_port: s.listening_port,
         version: s.version.clone(),
         own_location: s.own_location,
+        external_address: s.external_address,
         peers,
         contracts,
         op_stats: OpStatsSnapshot {
