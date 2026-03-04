@@ -2047,7 +2047,7 @@ impl Ring {
                     })?;
                 if tx.is_none() {
                     let conns = self.connection_manager.connection_count();
-                    tracing::warn!(
+                    tracing::debug!(
                         connections = conns,
                         target_location = %ideal_location,
                         "acquire_new returned None - likely no peers to query through"
