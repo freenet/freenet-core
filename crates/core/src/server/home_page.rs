@@ -1442,8 +1442,8 @@ fn build_estimator_chart(
     curve_points: &[(f64, f64)],
     peer_adjustment: Option<f64>,
     peer_location: Option<f64>,
-    _y_min_label: &str,
-    _y_max_label: &str,
+    y_min_hint: &str,
+    y_max_hint: &str,
 ) -> String {
     if curve_points.is_empty() {
         return format!(
@@ -1461,28 +1461,51 @@ fn build_estimator_chart(
     let plot_w = w - pad_l - pad_r;
     let plot_h = h - pad_t - pad_b;
 
-    // Determine Y range from data
-    let y_vals: Vec<f64> = curve_points.iter().map(|(_, y)| *y).collect();
-    let mut y_min = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
-    let mut y_max = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // Determine Y range: use fixed bounds if provided, otherwise auto-scale from data
+    let fixed_y_min = y_min_hint.parse::<f64>().ok();
+    let fixed_y_max = y_max_hint.parse::<f64>().ok();
 
-    // Include peer-adjusted values in range if present
-    if let Some(adj) = peer_adjustment {
-        for (_, y) in curve_points {
-            let adjusted = y + adj;
-            y_min = y_min.min(adjusted);
-            y_max = y_max.max(adjusted);
-        }
-    }
+    let mut y_min;
+    let mut y_max;
 
-    // Add 10% padding and avoid zero-range
-    let range = y_max - y_min;
-    if range < 1e-10 {
-        y_min -= 0.5;
-        y_max += 0.5;
+    if let (Some(lo), Some(hi)) = (fixed_y_min, fixed_y_max) {
+        y_min = lo;
+        y_max = hi;
     } else {
-        y_min -= range * 0.1;
-        y_max += range * 0.1;
+        let y_vals: Vec<f64> = curve_points.iter().map(|(_, y)| *y).collect();
+        y_min = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+        y_max = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        // Include peer-adjusted values in range if present
+        if let Some(adj) = peer_adjustment {
+            for (_, y) in curve_points {
+                let adjusted = y + adj;
+                y_min = y_min.min(adjusted);
+                y_max = y_max.max(adjusted);
+            }
+        }
+
+        // Override individual bounds if a fixed hint was given
+        if let Some(lo) = fixed_y_min {
+            y_min = lo;
+        }
+        if let Some(hi) = fixed_y_max {
+            y_max = hi;
+        }
+
+        // Add 10% padding and avoid zero-range (only for auto-scaled bounds)
+        let range = y_max - y_min;
+        if range < 1e-10 {
+            y_min -= 0.5;
+            y_max += 0.5;
+        } else {
+            if fixed_y_min.is_none() {
+                y_min -= range * 0.1;
+            }
+            if fixed_y_max.is_none() {
+                y_max += range * 0.1;
+            }
+        }
     }
     let y_range = y_max - y_min;
 
@@ -1555,7 +1578,7 @@ fn build_estimator_chart(
         .ok();
     }
 
-    // Global curve (blue stepped line)
+    // Global curve (blue line with linear interpolation)
     if curve_points.len() >= 2 {
         let mut path = String::new();
         for (i, (x, y)) in curve_points.iter().enumerate() {
@@ -1564,9 +1587,7 @@ fn build_estimator_chart(
             if i == 0 {
                 write!(path, "M{sx:.1},{sy:.1}").ok();
             } else {
-                // Stepped: horizontal then vertical
-                let prev_y = to_svg_y(curve_points[i - 1].1);
-                write!(path, " L{sx:.1},{prev_y:.1} L{sx:.1},{sy:.1}").ok();
+                write!(path, " L{sx:.1},{sy:.1}").ok();
             }
         }
         write!(
@@ -1577,7 +1598,7 @@ fn build_estimator_chart(
         .ok();
     }
 
-    // Peer-adjusted curve (green stepped line)
+    // Peer-adjusted curve (green line with linear interpolation)
     if let Some(adj) = peer_adjustment {
         if curve_points.len() >= 2 {
             let mut path = String::new();
@@ -1587,8 +1608,7 @@ fn build_estimator_chart(
                 if i == 0 {
                     write!(path, "M{sx:.1},{sy:.1}").ok();
                 } else {
-                    let prev_y = to_svg_y(curve_points[i - 1].1 + adj);
-                    write!(path, " L{sx:.1},{prev_y:.1} L{sx:.1},{sy:.1}").ok();
+                    write!(path, " L{sx:.1},{sy:.1}").ok();
                 }
             }
             write!(
