@@ -429,6 +429,7 @@ impl Operation for UpdateOp {
                                     requester_pkl,
                                     hash_before,
                                     hash_after.clone(),
+                                    Some(updated_value.len()),
                                 ) {
                                     op_manager.ring.register_events(Either::Left(event)).await;
                                 }
@@ -968,6 +969,7 @@ impl Operation for UpdateOp {
                                 requester_pkl,
                                 None, // No before hash for streaming
                                 hash_after.clone(),
+                                Some(updated_value.len()),
                             ) {
                                 op_manager.ring.register_events(Either::Left(event)).await;
                             }

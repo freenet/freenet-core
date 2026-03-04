@@ -512,6 +512,7 @@ impl Operation for PutOp {
                             // hop_count is 0 since we stored locally
                             let own_location = op_manager.ring.connection_manager.own_location();
                             let hash = Some(state_hash_full(&merged_value));
+                            let size = Some(merged_value.len());
                             if let Some(event) = NetEventLog::put_success(
                                 &id,
                                 &op_manager.ring,
@@ -519,6 +520,7 @@ impl Operation for PutOp {
                                 own_location,
                                 Some(0), // Stored locally, 0 hops
                                 hash,
+                                size,
                             ) {
                                 op_manager.ring.register_events(Either::Left(event)).await;
                             }
@@ -547,6 +549,7 @@ impl Operation for PutOp {
                             // across multiple peers). See issue #2680.
                             let own_location = op_manager.ring.connection_manager.own_location();
                             let hash = Some(state_hash_full(&merged_value));
+                            let size = Some(merged_value.len());
                             if let Some(event) = NetEventLog::put_success(
                                 &id,
                                 &op_manager.ring,
@@ -554,6 +557,7 @@ impl Operation for PutOp {
                                 own_location,
                                 None, // hop_count unknown without initial HTL
                                 hash,
+                                size,
                             ) {
                                 op_manager.ring.register_events(Either::Left(event)).await;
                             }
@@ -609,6 +613,7 @@ impl Operation for PutOp {
                                 sender,
                                 hop_count,
                                 None, // State not available in response
+                                None, // Size not available in response
                             ) {
                                 op_manager.ring.register_events(Either::Left(event)).await;
                             }
@@ -1042,6 +1047,7 @@ impl Operation for PutOp {
                         if is_originator {
                             let own_location = op_manager.ring.connection_manager.own_location();
                             let hash = Some(state_hash_full(&merged_value));
+                            let size = Some(merged_value.len());
                             if let Some(event) = NetEventLog::put_success(
                                 &id,
                                 &op_manager.ring,
@@ -1049,6 +1055,7 @@ impl Operation for PutOp {
                                 own_location,
                                 Some(0),
                                 hash,
+                                size,
                             ) {
                                 op_manager.ring.register_events(Either::Left(event)).await;
                             }
@@ -1073,6 +1080,7 @@ impl Operation for PutOp {
                             // Send ResponseStreaming back to upstream
                             let own_location = op_manager.ring.connection_manager.own_location();
                             let hash = Some(state_hash_full(&merged_value));
+                            let size = Some(merged_value.len());
                             if let Some(event) = NetEventLog::put_success(
                                 &id,
                                 &op_manager.ring,
@@ -1080,6 +1088,7 @@ impl Operation for PutOp {
                                 own_location,
                                 None,
                                 hash,
+                                size,
                             ) {
                                 op_manager.ring.register_events(Either::Left(event)).await;
                             }
@@ -1134,6 +1143,7 @@ impl Operation for PutOp {
                             op_manager.ring.connection_manager.own_location(),
                             hop_count,
                             None, // No hash available in streaming response
+                            None, // No size available in streaming response
                         ) {
                             op_manager.ring.register_events(Either::Left(event)).await;
                         }

@@ -761,6 +761,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     elapsed_ms,
                     timestamp,
                     state_hash,
+                    state_size,
                 } => {
                     let mut json = serde_json::json!({
                         "type": "success",
@@ -774,6 +775,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     });
                     if let Some(hash) = state_hash {
                         json["state_hash"] = serde_json::Value::String(hash.clone());
+                    }
+                    if let Some(size) = state_size {
+                        json["state_size"] = serde_json::json!(size);
                     }
                     json
                 }
@@ -1133,6 +1137,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     timestamp,
                     state_hash_before,
                     state_hash_after,
+                    state_size,
                 } => {
                     let mut json = serde_json::json!({
                         "type": "success",
@@ -1147,6 +1152,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     }
                     if let Some(hash) = state_hash_after {
                         json["state_hash_after"] = serde_json::Value::String(hash.clone());
+                    }
+                    if let Some(size) = state_size {
+                        json["state_size"] = serde_json::json!(size);
                     }
                     json
                 }
@@ -1221,6 +1229,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     state_hash_before,
                     state_hash_after,
                     changed,
+                    state_size,
                 } => {
                     let mut json = serde_json::json!({
                         "type": "broadcast_applied",
@@ -1229,6 +1238,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "timestamp": timestamp,
                         "changed": changed,
+                        "state_size": state_size,
                     });
                     if let Some(hash) = state_hash_before {
                         json["state_hash_before"] = serde_json::Value::String(hash.clone());
