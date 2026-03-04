@@ -226,7 +226,7 @@ impl Adjustment {
     }
 
     fn value(&self) -> f64 {
-        self.sum / self.count as f64
+        self.mean()
     }
 
     /// Mean adjustment value (sum / count).
