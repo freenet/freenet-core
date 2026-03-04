@@ -139,6 +139,33 @@ event signal count and per-peer generation budget).
 See: `crates/core/tests/simulation_integration.rs` — `test_partition_heal_convergence`,
 `test_crash_recover_convergence`, `test_multi_step_churn`
 
+## Simulation Test Realism
+
+```
+WHEN writing a simulation test for connection/topology behavior:
+  → Use realistic parameters, not minimal ones
+
+WRONG:
+  5 nodes, min_connections=3, 5 virtual minutes
+  // Too small to detect growth ceilings or compounding bugs
+
+CORRECT:
+  50 nodes, min_connections=10, 1 virtual hour
+  // Exercises realistic topology formation and exposes plateau behavior
+
+WHEN asserting on connection counts:
+  → Assert against min_connections, not arbitrary low thresholds
+  → Assert a high percentage (>=90%) of nodes reach min_connections
+  → Include a fault injection phase to verify no death spiral
+
+WHY: Small topologies with low thresholds masked a 9-month bug where
+nodes plateaued at 4-9 connections. The stall only manifests clearly
+with min_connections significantly above hardcoded internal thresholds
+and enough nodes + time for the growth ceiling to appear.
+
+See: test_connection_growth_stall_regression in simulation_integration.rs
+```
+
 ## Anomaly Detection
 
 After any simulation test, use `StateVerifier` to check for consistency anomalies:
