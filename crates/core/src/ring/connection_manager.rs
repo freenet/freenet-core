@@ -851,6 +851,7 @@ impl ConnectionManager {
         let mut own_addr = self.own_addr.lock();
         if own_addr.is_none() {
             *own_addr = Some(addr);
+            crate::node::network_status::set_external_address(addr);
             tracing::info!(
                 addr = %addr,
                 "try_set_own_addr: initialized own address"
@@ -872,6 +873,7 @@ impl ConnectionManager {
         let mut own_addr = self.own_addr.lock();
         let old_addr = *own_addr;
         *own_addr = Some(addr);
+        crate::node::network_status::set_external_address(addr);
         tracing::debug!(
             old_addr = ?old_addr,
             new_addr = %addr,

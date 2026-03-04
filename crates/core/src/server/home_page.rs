@@ -256,6 +256,19 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         }
     };
 
+    // External address info (shown once discovered via NAT traversal)
+    let external_addr_html = if let Some(addr) = snap.external_address {
+        format!(
+            r#"<p class="external-addr">External address: <code>{ip}</code> &mdash; UDP port: <code>{port}</code></p>"#,
+            ip = addr.ip(),
+            port = addr.port(),
+        )
+    } else if snap.open_connections > 0 {
+        r#"<p class="external-addr muted">External address: discovering...</p>"#.to_string()
+    } else {
+        String::new()
+    };
+
     let spinner = if snap.open_connections == 0 {
         r#"<div class="spinner"></div>"#
     } else {
@@ -372,12 +385,14 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         r#"<div class="card">
             <h2>Connection Status</h2>
             {health_banner}
+            {external_addr_html}
             {spinner}
             {gateway_warning}
             {nat_html}
             {failures_html}
         </div>"#,
         health_banner = health_banner,
+        external_addr_html = external_addr_html,
         spinner = spinner,
         gateway_warning = gateway_warning,
         nat_html = nat_html,
@@ -882,6 +897,12 @@ main {
     font-size: 0.85rem;
 }
 .warning li { margin-bottom: 0.25rem; }
+.external-addr {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    margin-top: 0.5rem;
+}
+.external-addr.muted { opacity: 0.6; font-style: italic; }
 .nat-stat {
     font-size: 0.85rem;
     color: var(--text-secondary);
@@ -1752,6 +1773,7 @@ mod tests {
             listening_port: 31337,
             version: "0.1.0".to_string(),
             own_location: None,
+            external_address: None,
             peers: Vec::new(),
             contracts: Vec::new(),
             op_stats: OpStatsSnapshot::default(),
