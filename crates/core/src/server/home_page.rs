@@ -1584,7 +1584,7 @@ fn build_estimator_chart(
         let sy = to_svg_y(y_val);
         let label = if y_val.abs() < 1e-3 && y_range < 10.0 {
             format!("{:.3}", y_val)
-        } else if y_range < 1.0 {
+        } else if y_range <= 1.0 {
             format!("{:.2}", y_val)
         } else {
             format!("{:.0}", y_val)
