@@ -892,22 +892,16 @@ async fn send_response_message(
         let chunks = chunk_response(serialized, stream_id);
         match conn_state.encoding_protoc {
             EncodingProtocol::Flatbuffers => {
-                for (i, chunk) in chunks.into_iter().enumerate() {
+                for chunk in chunks {
                     let b = chunk.into_fbs_bytes().map_err(axum::Error::new)?;
                     tx.send(Message::Binary(b.into())).await?;
-                    if (i + 1) % freenet_stdlib::client_api::streaming::MAX_CHUNKS_PER_BATCH == 0 {
-                        tokio::task::yield_now().await;
-                    }
                 }
             }
             EncodingProtocol::Native => {
-                for (i, chunk) in chunks.into_iter().enumerate() {
+                for chunk in chunks {
                     let b = bincode::serialize(&Ok::<_, ClientError>(chunk))
                         .map_err(axum::Error::new)?;
                     tx.send(Message::Binary(b.into())).await?;
-                    if (i + 1) % freenet_stdlib::client_api::streaming::MAX_CHUNKS_PER_BATCH == 0 {
-                        tokio::task::yield_now().await;
-                    }
                 }
             }
         }
