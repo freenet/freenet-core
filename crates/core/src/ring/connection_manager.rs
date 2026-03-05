@@ -3193,16 +3193,19 @@ mod tests {
         let addr2 = make_addr(9002);
         cm.add_connection(Location::new(0.7), addr2, peer2.public().clone(), false);
 
-        // Neither peer is ready — routing_candidates should return empty
+        // Neither peer is ready — fallback returns all not-ready peers rather than
+        // empty (to prevent EmptyRing failures, see #3356).
         let target = Location::new(0.5);
         let skip = HashSet::<SocketAddr>::new();
         let candidates = cm.routing_candidates(target, Some(own_addr), &skip, true);
-        assert!(
-            candidates.is_empty(),
-            "no peers are ready, should get no candidates"
+        assert_eq!(
+            candidates.len(),
+            2,
+            "all-not-ready fallback should return both peers"
         );
 
-        // Mark peer1 ready — only peer1 should appear
+        // Mark peer1 ready — only peer1 should appear (fallback does NOT activate
+        // when at least one peer is ready).
         cm.mark_peer_ready(addr1);
         let candidates = cm.routing_candidates(target, Some(own_addr), &skip, true);
         assert_eq!(candidates.len(), 1);
