@@ -1404,31 +1404,58 @@ impl ConnectionManager {
         // This ensures GlobalRng is called in the same order across runs
         let mut sorted_keys: Vec<_> = connections.keys().collect();
         sorted_keys.sort();
-        let candidates: Vec<PeerKeyLocation> = sorted_keys
-            .into_iter()
-            .filter_map(|loc| connections.get(loc))
-            .filter_map(|conns| {
-                // Sort connections for deterministic selection
-                // (Vec ordering may vary based on async connection establishment order)
-                let mut sorted_conns: Vec<_> = conns.iter().collect();
-                sorted_conns.sort_by_key(|c| c.location.clone());
-                let conn = GlobalRng::choose(&sorted_conns)?;
-                let addr = conn.location.socket_addr()?;
-                if self.is_transient(addr) {
-                    return None;
+        let mut candidates: Vec<PeerKeyLocation> = Vec::new();
+        let mut not_ready_fallback: Vec<PeerKeyLocation> = Vec::new();
+
+        for loc in sorted_keys {
+            let conns = match connections.get(loc) {
+                Some(c) => c,
+                None => continue,
+            };
+            // Sort connections for deterministic selection
+            // (Vec ordering may vary based on async connection establishment order)
+            let mut sorted_conns: Vec<_> = conns.iter().collect();
+            sorted_conns.sort_by_key(|c| c.location.clone());
+            let conn = match GlobalRng::choose(&sorted_conns) {
+                Some(c) => c,
+                None => continue,
+            };
+            let addr = match conn.location.socket_addr() {
+                Some(a) => a,
+                None => continue,
+            };
+            if self.is_transient(addr) {
+                continue;
+            }
+            if let Some(requester) = requesting {
+                if requester == addr {
+                    continue;
                 }
-                // Skip peers that haven't advertised readiness (unless bypassed for CONNECT)
-                if check_readiness && !self.is_peer_ready(addr) {
-                    return None;
-                }
-                if let Some(requester) = requesting {
-                    if requester == addr {
-                        return None;
-                    }
-                }
-                (!skip_list.has_element(addr)).then_some(conn.location.clone())
-            })
-            .collect();
+            }
+            if skip_list.has_element(addr) {
+                continue;
+            }
+            // Skip peers that haven't advertised readiness (unless bypassed for CONNECT),
+            // but collect them as fallback in case all peers fail the readiness check.
+            if check_readiness && !self.is_peer_ready(addr) {
+                not_ready_fallback.push(conn.location.clone());
+                continue;
+            }
+            candidates.push(conn.location.clone());
+        }
+
+        // If all connected peers failed the readiness check, fall back to using them anyway.
+        // Same rationale as k_closest_potentially_caching: routing to not-ready peers is
+        // better than returning empty (which causes EmptyRing / no routing target for
+        // PUT, UPDATE, and other operations that use this path).
+        if check_readiness && candidates.is_empty() && !not_ready_fallback.is_empty() {
+            tracing::warn!(
+                count = not_ready_fallback.len(),
+                target_location = %target,
+                "routing_candidates: no ready peers, falling back to not-yet-ready peers"
+            );
+            candidates = not_ready_fallback;
+        }
 
         tracing::debug!(
             total_locations = connections.len(),
@@ -3166,16 +3193,19 @@ mod tests {
         let addr2 = make_addr(9002);
         cm.add_connection(Location::new(0.7), addr2, peer2.public().clone(), false);
 
-        // Neither peer is ready — routing_candidates should return empty
+        // Neither peer is ready — fallback returns all not-ready peers rather than
+        // empty (to prevent EmptyRing failures, see #3356).
         let target = Location::new(0.5);
         let skip = HashSet::<SocketAddr>::new();
         let candidates = cm.routing_candidates(target, Some(own_addr), &skip, true);
-        assert!(
-            candidates.is_empty(),
-            "no peers are ready, should get no candidates"
+        assert_eq!(
+            candidates.len(),
+            2,
+            "all-not-ready fallback should return both peers"
         );
 
-        // Mark peer1 ready — only peer1 should appear
+        // Mark peer1 ready — only peer1 should appear (fallback does NOT activate
+        // when at least one peer is ready).
         cm.mark_peer_ready(addr1);
         let candidates = cm.routing_candidates(target, Some(own_addr), &skip, true);
         assert_eq!(candidates.len(), 1);
