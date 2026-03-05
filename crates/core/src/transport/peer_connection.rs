@@ -346,6 +346,12 @@ fn keepalive_interval_for_pending(pending_count: usize) -> Duration {
 /// pong responses being delayed under CI load (issue: premature connection closure).
 const MAX_UNANSWERED_PINGS: usize = 5;
 
+/// Maximum number of metadata hashes to track for dedup.
+const DEDUP_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1000) {
+    Some(v) => v,
+    None => panic!("DEDUP_CACHE_CAPACITY must be non-zero"),
+};
+
 #[allow(private_bounds)]
 impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     pub(super) fn new(remote_conn: RemoteConnection<S, T>) -> Self {
@@ -509,7 +515,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             streaming_handles: HashMap::new(),
             time_source,
             orphan_stream_registry: None,
-            dispatched_msg_hashes: lru::LruCache::new(NonZeroUsize::new(1000).expect("non-zero")),
+            dispatched_msg_hashes: lru::LruCache::new(DEDUP_CACHE_CAPACITY),
         }
     }
 
@@ -2523,6 +2529,24 @@ mod tests {
     /// Create a dedup cache with the given capacity.
     fn dedup_cache(cap: usize) -> lru::LruCache<u64, ()> {
         lru::LruCache::new(NonZeroUsize::new(cap).unwrap())
+    }
+
+    // Superseded: dedup store replaced with LRU cache in #3418;
+    // HashSet.insert() return-value semantics no longer apply.
+    // Equivalent behavior now tested by duplicate_embedded_metadata_suppressed.
+    #[ignore]
+    #[test]
+    fn dispatched_short_message_always_recorded() {
+        let mut cache = dedup_cache(1000);
+        let bytes = b"metadata-payload";
+        assert!(
+            cache.put(msg_hash(bytes), ()).is_none(),
+            "first insert should return None (not present)"
+        );
+        assert!(
+            cache.put(msg_hash(bytes), ()).is_some(),
+            "second insert returns Some (was present)"
+        );
     }
 
     #[test]
