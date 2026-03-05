@@ -1,8 +1,8 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -267,7 +267,7 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// Set by the node layer after connection establishment.
     orphan_stream_registry:
         Option<std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>>,
-    /// Hashes of recently dispatched metadata bytes, to dedup
+    /// LRU cache of recently dispatched metadata hashes, to dedup
     /// embedded-metadata-in-fragment-#1 against the separate ShortMessage.
     ///
     /// Uses `DefaultHasher` (not cryptographic). A hash collision would cause
@@ -275,7 +275,12 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// the affected stream. This is an acceptable trade-off given the small
     /// working set size (capped at 1000 entries) and negligible collision
     /// probability.
-    dispatched_msg_hashes: HashSet<u64>,
+    ///
+    /// Previously used `HashSet` with cap-and-clear at 1000 entries, which
+    /// cleared the just-inserted hash — allowing both the ShortMessage and
+    /// embedded-metadata copies through, causing duplicate `RequestStreaming`
+    /// delivery and ~40% PUT failure rate (issue #3317).
+    dispatched_msg_hashes: lru::LruCache<u64, ()>,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -510,7 +515,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             streaming_handles: HashMap::new(),
             time_source,
             orphan_stream_registry: None,
-            dispatched_msg_hashes: HashSet::new(),
+            dispatched_msg_hashes: lru::LruCache::new(NonZeroUsize::new(1000).expect("non-zero")),
         }
     }
 
@@ -526,7 +531,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// Only used on the embedded-metadata-in-fragment-#1 path to suppress
     /// duplicates when the same metadata was already dispatched as a ShortMessage.
     fn is_duplicate_dispatch(&mut self, bytes: &[u8]) -> bool {
-        !self.dispatched_msg_hashes.insert(Self::msg_hash(bytes))
+        self.dispatched_msg_hashes
+            .put(Self::msg_hash(bytes), ())
+            .is_some()
     }
 
     /// Sets the orphan stream registry for handling race conditions between
@@ -1299,10 +1306,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // embedded in a stream fragment, it will be suppressed as a duplicate.
                 // We always dispatch ShortMessages — dedup only suppresses the
                 // redundant embedded-metadata copy, never the ShortMessage itself.
-                self.dispatched_msg_hashes.insert(Self::msg_hash(&bytes));
-                if self.dispatched_msg_hashes.len() > 1000 {
-                    self.dispatched_msg_hashes.clear();
-                }
+                self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
                 Ok(Some(bytes))
             }
             AckConnection { result: Err(cause) } => {
@@ -2517,34 +2521,40 @@ mod tests {
         h.finish()
     }
 
-    /// Helper that mirrors PeerConnection::is_duplicate_dispatch.
-    fn is_duplicate_dispatch(set: &mut HashSet<u64>, bytes: &[u8]) -> bool {
-        !set.insert(msg_hash(bytes))
+    /// Helper that mirrors PeerConnection::is_duplicate_dispatch using LRU.
+    fn is_duplicate_dispatch(cache: &mut lru::LruCache<u64, ()>, bytes: &[u8]) -> bool {
+        cache.put(msg_hash(bytes), ()).is_some()
     }
 
     #[test]
     fn dispatched_short_message_always_recorded() {
         // ShortMessage path inserts hash — the insert itself never indicates "duplicate"
         // because ShortMessages are always dispatched.
-        let mut set = HashSet::new();
+        let mut cache = lru::LruCache::<u64, ()>::new(NonZeroUsize::new(1000).unwrap());
         let bytes = b"metadata-payload";
-        assert!(set.insert(msg_hash(bytes)), "first insert should succeed");
-        // Inserting same hash again returns false (already present), but this path
+        assert!(
+            cache.put(msg_hash(bytes), ()).is_none(),
+            "first insert should return None (not present)"
+        );
+        // Inserting same hash again returns Some (already present), but this path
         // is only used for embedded-metadata dedup, never for ShortMessage dispatch.
-        assert!(!set.insert(msg_hash(bytes)), "second insert returns false");
+        assert!(
+            cache.put(msg_hash(bytes), ()).is_some(),
+            "second insert returns Some (was present)"
+        );
     }
 
     #[test]
     fn duplicate_embedded_metadata_suppressed() {
         // If metadata was already dispatched as a ShortMessage, the same bytes
         // arriving as embedded metadata should be detected as a duplicate.
-        let mut set = HashSet::new();
+        let mut cache = lru::LruCache::<u64, ()>::new(NonZeroUsize::new(1000).unwrap());
         let bytes = b"streaming-metadata";
         // Simulate ShortMessage dispatch (insert hash)
-        set.insert(msg_hash(bytes));
+        cache.put(msg_hash(bytes), ());
         // Now embedded metadata arrives with same bytes
         assert!(
-            is_duplicate_dispatch(&mut set, bytes),
+            is_duplicate_dispatch(&mut cache, bytes),
             "embedded metadata with same bytes should be suppressed"
         );
     }
@@ -2553,15 +2563,48 @@ mod tests {
     fn different_metadata_not_suppressed() {
         // Different metadata bytes must not be suppressed even if a prior
         // ShortMessage was recorded.
-        let mut set = HashSet::new();
+        let mut cache = lru::LruCache::<u64, ()>::new(NonZeroUsize::new(1000).unwrap());
         let short_msg = b"first-metadata";
         let embedded = b"different-metadata";
         // Simulate ShortMessage dispatch
-        set.insert(msg_hash(short_msg));
+        cache.put(msg_hash(short_msg), ());
         // Different embedded metadata should NOT be suppressed
         assert!(
-            !is_duplicate_dispatch(&mut set, embedded),
+            !is_duplicate_dispatch(&mut cache, embedded),
             "different metadata bytes must not be treated as duplicate"
+        );
+    }
+
+    #[test]
+    fn lru_eviction_preserves_recent_entries() {
+        // Regression test for #3317: the old HashSet cap-and-clear at 1000 entries
+        // would clear ALL entries (including the just-inserted one), allowing both
+        // the ShortMessage and embedded-metadata copies through as non-duplicates.
+        // LRU eviction only removes the oldest entry, preserving recent ones.
+        let mut cache = lru::LruCache::<u64, ()>::new(NonZeroUsize::new(3).unwrap());
+
+        // Fill cache to capacity
+        cache.put(msg_hash(b"msg-1"), ());
+        cache.put(msg_hash(b"msg-2"), ());
+        cache.put(msg_hash(b"msg-3"), ());
+
+        // Insert a 4th entry — should evict msg-1 (oldest), NOT clear everything
+        cache.put(msg_hash(b"msg-4"), ());
+
+        // msg-3 and msg-4 should still be recognized as duplicates
+        assert!(
+            is_duplicate_dispatch(&mut cache, b"msg-4"),
+            "recently inserted entry must survive eviction"
+        );
+        assert!(
+            is_duplicate_dispatch(&mut cache, b"msg-3"),
+            "recent entry must survive eviction of older entries"
+        );
+
+        // msg-1 should have been evicted
+        assert!(
+            !is_duplicate_dispatch(&mut cache, b"msg-1"),
+            "oldest entry should have been evicted"
         );
     }
 
