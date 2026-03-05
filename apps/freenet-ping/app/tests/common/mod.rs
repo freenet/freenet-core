@@ -349,6 +349,18 @@ pub async fn connect_ws_client(ws_port: u16) -> Result<WebApi> {
     Ok(WebApi::start(stream))
 }
 
+/// Connect to a WebSocket endpoint with streaming enabled and retry logic.
+pub async fn connect_ws_with_retry_streaming(
+    ip: std::net::Ipv4Addr,
+    ws_port: u16,
+    node_name: &str,
+    timeout_secs: u64,
+) -> Result<WebApi> {
+    let uri =
+        format!("ws://{ip}:{ws_port}/v1/contract/command?encodingProtocol=native&streaming=true");
+    connect_ws_with_retry(&uri, node_name, timeout_secs).await
+}
+
 /// Connect to a WebSocket endpoint with retry logic.
 /// Retries connection attempts until successful or timeout is reached.
 pub async fn connect_ws_with_retry(
