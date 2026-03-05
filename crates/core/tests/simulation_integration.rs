@@ -6599,11 +6599,16 @@ async fn test_connection_growth_stall_regression() {
 /// Regression test for #3356 / #3423: GET fails with EmptyRing when all peers
 /// fail readiness gating.
 ///
-/// Sets `relay_ready_connections` high enough that ReadyState is never sent
-/// (min_ready_connections > network size), which means `is_peer_ready()` returns
-/// false for all peers. Before the fix, `k_closest_potentially_caching` returned
-/// empty → GET failed with EmptyRing. After the fix, it falls back to using
-/// not-yet-ready peers.
+/// Sets `relay_ready_connections` higher than network size so `is_self_ready()`
+/// returns false on every node → no node ever sends `ReadyState` to peers →
+/// `is_peer_ready()` returns false for all peers. The 60-second optimistic
+/// timeout (`OPTIMISTIC_READY_TIMEOUT`) uses real wall-clock `Instant::now()`,
+/// not virtual time, so it cannot fire during this test (~0.5s wall-clock).
+///
+/// Before the fix, `k_closest_potentially_caching` returned empty → GET failed
+/// with EmptyRing. After the fix, it falls back to using not-yet-ready peers.
+/// Verified: this test FAILS without the fallback (confirmed by reverting the
+/// fix and observing the assertion fire).
 ///
 /// Scenario:
 ///   1. Gateway PUTs a contract

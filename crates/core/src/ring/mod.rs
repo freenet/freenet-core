@@ -1443,10 +1443,11 @@ impl Ring {
         }
 
         // If all connected peers failed the readiness check, fall back to using them anyway.
-        // This prevents GET operations from failing with EmptyRing when the node is connected
-        // but peers haven't yet sent ReadyState messages (e.g., early after connecting, or
-        // in network topologies where the min_ready_connections threshold is never satisfied).
-        // A warn-level log is emitted so operators know readiness gating was bypassed.
+        // This prevents GET/SUBSCRIBE operations from failing with EmptyRing when the node
+        // is connected but peers haven't yet sent ReadyState messages (e.g., early after
+        // connecting, or in network topologies where the min_ready_connections threshold is
+        // never satisfied). A warn-level log is emitted so operators know gating was bypassed.
+        // Note: ConnectionManager::routing_candidates has the same fallback for PUT/UPDATE.
         if candidates.is_empty() && !not_ready_fallback.is_empty() {
             tracing::warn!(
                 count = not_ready_fallback.len(),
