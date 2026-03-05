@@ -6591,3 +6591,119 @@ async fn test_connection_growth_stall_regression() {
         NODES
     );
 }
+
+// =============================================================================
+// GET Routing Regression Tests
+// =============================================================================
+
+/// Regression test for #3356 / #3423: GET fails with EmptyRing when all peers
+/// fail readiness gating.
+///
+/// Sets `relay_ready_connections` high enough that ReadyState is never sent
+/// (min_ready_connections > network size), which means `is_peer_ready()` returns
+/// false for all peers. Before the fix, `k_closest_potentially_caching` returned
+/// empty → GET failed with EmptyRing. After the fix, it falls back to using
+/// not-yet-ready peers.
+///
+/// Scenario:
+///   1. Gateway PUTs a contract
+///   2. Node 1 GETs the contract with `return_contract_code=true`
+///   3. Assert node 1's storage contains the contract state
+#[test_log::test]
+fn test_get_succeeds_despite_readiness_gating() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0xAE7F_1A00_0001;
+    const NETWORK_NAME: &str = "get-readiness-fallback";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,  // gateways
+            3,  // nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Set readiness gating higher than network size (4 nodes total).
+    // No node can ever have 10 ready connections, so ReadyState is never sent,
+    // and is_peer_ready() returns false for all peers.
+    sim.with_readiness_gating(10);
+
+    let contract = SimOperation::create_test_contract(0xAE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+
+    let operations = vec![
+        // 1. Gateway PUTs the contract
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: vec![1, 2, 3, 4],
+                subscribe: false,
+            },
+        ),
+        // 2. Node 1 GETs the contract (with contract code)
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "GET readiness fallback simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Verify that node 1 has the contract state despite readiness gating
+    let node1_label = NodeLabel::node(NETWORK_NAME, 1);
+    let node1_storage = result
+        .node_storages
+        .get(&node1_label)
+        .expect("node 1 should have a storage handle");
+    let node1_state = node1_storage.get_stored_state(&contract_key);
+
+    assert!(
+        node1_state.is_some(),
+        "Node 1 should have contract state after GET, but storage is empty. \
+         This indicates k_closest_potentially_caching returned empty due to \
+         readiness gating (the bug from #3356/#3423)."
+    );
+
+    let rt = create_runtime();
+    let event_count = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.len()
+    });
+
+    tracing::info!(
+        "test_get_succeeds_despite_readiness_gating PASSED: \
+         node 1 has contract state, {} events produced",
+        event_count
+    );
+}

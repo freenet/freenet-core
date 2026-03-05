@@ -1407,6 +1407,7 @@ impl Ring {
 
         let mut seen = HashSet::new();
         let mut candidates: Vec<PeerKeyLocation> = Vec::new();
+        let mut not_ready_fallback: Vec<PeerKeyLocation> = Vec::new();
         let mut skipped_not_ready: usize = 0;
 
         let connections = self.connection_manager.get_connections_by_location();
@@ -1424,19 +1425,35 @@ impl Ring {
                     if skip_list.has_element(addr) || !seen.insert(addr) {
                         continue;
                     }
-                    // Skip peers that haven't advertised readiness
+                    // Skip peers that haven't advertised readiness, but collect them
+                    // as fallback candidates in case all peers fail the readiness check.
                     if !self.connection_manager.is_peer_ready(addr) {
                         tracing::debug!(
                             %addr,
                             target_location = %target_location.as_f64(),
                             "k_closest: skipping peer not yet ready"
                         );
+                        not_ready_fallback.push(conn.location.clone());
                         skipped_not_ready += 1;
                         continue;
                     }
                 }
                 candidates.push(conn.location.clone());
             }
+        }
+
+        // If all connected peers failed the readiness check, fall back to using them anyway.
+        // This prevents GET operations from failing with EmptyRing when the node is connected
+        // but peers haven't yet sent ReadyState messages (e.g., early after connecting, or
+        // in network topologies where the min_ready_connections threshold is never satisfied).
+        // A warn-level log is emitted so operators know readiness gating was bypassed.
+        if candidates.is_empty() && !not_ready_fallback.is_empty() {
+            tracing::warn!(
+                count = not_ready_fallback.len(),
+                target_location = %target_location.as_f64(),
+                "k_closest: no ready peers available, falling back to not-yet-ready peers to avoid EmptyRing"
+            );
+            candidates = not_ready_fallback;
         }
 
         // Sort candidates for deterministic input to select_k_best_peers
