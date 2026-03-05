@@ -267,19 +267,13 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// Set by the node layer after connection establishment.
     orphan_stream_registry:
         Option<std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>>,
-    /// LRU cache of recently dispatched metadata hashes, to dedup
+    /// LRU cache of recently dispatched metadata hashes (capacity 1000), used to dedup
     /// embedded-metadata-in-fragment-#1 against the separate ShortMessage.
     ///
     /// Uses `DefaultHasher` (not cryptographic). A hash collision would cause
     /// a silent metadata drop, leading to a 60-second operation timeout for
-    /// the affected stream. This is an acceptable trade-off given the small
-    /// working set size (capped at 1000 entries) and negligible collision
-    /// probability.
-    ///
-    /// Previously used `HashSet` with cap-and-clear at 1000 entries, which
-    /// cleared the just-inserted hash — allowing both the ShortMessage and
-    /// embedded-metadata copies through, causing duplicate `RequestStreaming`
-    /// delivery and ~40% PUT failure rate (issue #3317).
+    /// the affected stream -- acceptable given the small working set and
+    /// negligible collision probability. See issue #3317.
     dispatched_msg_hashes: lru::LruCache<u64, ()>,
 }
 
@@ -2526,85 +2520,51 @@ mod tests {
         cache.put(msg_hash(bytes), ()).is_some()
     }
 
-    #[test]
-    fn dispatched_short_message_always_recorded() {
-        // ShortMessage path inserts hash — the insert itself never indicates "duplicate"
-        // because ShortMessages are always dispatched.
-        let mut cache = lru::LruCache::<u64, ()>::new(NonZeroUsize::new(1000).unwrap());
-        let bytes = b"metadata-payload";
-        assert!(
-            cache.put(msg_hash(bytes), ()).is_none(),
-            "first insert should return None (not present)"
-        );
-        // Inserting same hash again returns Some (already present), but this path
-        // is only used for embedded-metadata dedup, never for ShortMessage dispatch.
-        assert!(
-            cache.put(msg_hash(bytes), ()).is_some(),
-            "second insert returns Some (was present)"
-        );
+    /// Create a dedup cache with the given capacity.
+    fn dedup_cache(cap: usize) -> lru::LruCache<u64, ()> {
+        lru::LruCache::new(NonZeroUsize::new(cap).unwrap())
     }
 
     #[test]
     fn duplicate_embedded_metadata_suppressed() {
-        // If metadata was already dispatched as a ShortMessage, the same bytes
-        // arriving as embedded metadata should be detected as a duplicate.
-        let mut cache = lru::LruCache::<u64, ()>::new(NonZeroUsize::new(1000).unwrap());
-        let bytes = b"streaming-metadata";
-        // Simulate ShortMessage dispatch (insert hash)
-        cache.put(msg_hash(bytes), ());
-        // Now embedded metadata arrives with same bytes
+        // Same bytes: first insert is new, second is a duplicate.
+        let mut cache = dedup_cache(1000);
+        let bytes = b"metadata-payload";
+        assert!(
+            !is_duplicate_dispatch(&mut cache, bytes),
+            "first insert is not a duplicate"
+        );
         assert!(
             is_duplicate_dispatch(&mut cache, bytes),
-            "embedded metadata with same bytes should be suppressed"
+            "second insert is a duplicate"
         );
     }
 
     #[test]
     fn different_metadata_not_suppressed() {
-        // Different metadata bytes must not be suppressed even if a prior
-        // ShortMessage was recorded.
-        let mut cache = lru::LruCache::<u64, ()>::new(NonZeroUsize::new(1000).unwrap());
-        let short_msg = b"first-metadata";
-        let embedded = b"different-metadata";
-        // Simulate ShortMessage dispatch
-        cache.put(msg_hash(short_msg), ());
-        // Different embedded metadata should NOT be suppressed
-        assert!(
-            !is_duplicate_dispatch(&mut cache, embedded),
-            "different metadata bytes must not be treated as duplicate"
-        );
+        // Different metadata bytes must not be treated as duplicates.
+        let mut cache = dedup_cache(1000);
+        assert!(!is_duplicate_dispatch(&mut cache, b"first-metadata"));
+        assert!(!is_duplicate_dispatch(&mut cache, b"different-metadata"));
     }
 
     #[test]
     fn lru_eviction_preserves_recent_entries() {
-        // Regression test for #3317: the old HashSet cap-and-clear at 1000 entries
-        // would clear ALL entries (including the just-inserted one), allowing both
-        // the ShortMessage and embedded-metadata copies through as non-duplicates.
-        // LRU eviction only removes the oldest entry, preserving recent ones.
-        let mut cache = lru::LruCache::<u64, ()>::new(NonZeroUsize::new(3).unwrap());
+        // Regression test for #3317: LRU eviction only removes the oldest entry,
+        // unlike the old HashSet cap-and-clear which cleared everything.
+        let mut cache = dedup_cache(3);
 
-        // Fill cache to capacity
-        cache.put(msg_hash(b"msg-1"), ());
-        cache.put(msg_hash(b"msg-2"), ());
-        cache.put(msg_hash(b"msg-3"), ());
+        // Fill cache to capacity, then insert a 4th to evict the oldest
+        for i in 1..=4 {
+            cache.put(msg_hash(format!("msg-{i}").as_bytes()), ());
+        }
 
-        // Insert a 4th entry — should evict msg-1 (oldest), NOT clear everything
-        cache.put(msg_hash(b"msg-4"), ());
-
-        // msg-3 and msg-4 should still be recognized as duplicates
+        // Recent entries survive; oldest (msg-1) was evicted
+        assert!(cache.contains(&msg_hash(b"msg-4")), "msg-4 should survive");
+        assert!(cache.contains(&msg_hash(b"msg-3")), "msg-3 should survive");
         assert!(
-            is_duplicate_dispatch(&mut cache, b"msg-4"),
-            "recently inserted entry must survive eviction"
-        );
-        assert!(
-            is_duplicate_dispatch(&mut cache, b"msg-3"),
-            "recent entry must survive eviction of older entries"
-        );
-
-        // msg-1 should have been evicted
-        assert!(
-            !is_duplicate_dispatch(&mut cache, b"msg-1"),
-            "oldest entry should have been evicted"
+            !cache.contains(&msg_hash(b"msg-1")),
+            "msg-1 should be evicted"
         );
     }
 
