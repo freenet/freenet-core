@@ -1063,17 +1063,21 @@ impl Operation for GetOp {
                                     }),
                             }) => {
                                 if fetch_contract && contract.is_none() {
+                                    // Serve state even without contract code rather than
+                                    // forwarding. UPDATE broadcasts propagate state but not
+                                    // WASM code, so most peers have state without code.
+                                    // Forwarding causes a death spiral where the GET bounces
+                                    // between peers that all have state but no code, eventually
+                                    // exhausting retries and dying silently (#3356 45% case).
                                     tracing::info!(
                                         tx = %id,
                                         %instance_id,
                                         %this_peer,
                                         fetch_contract,
-                                        "GET: state available locally but contract code missing; forwarding GET"
+                                        "GET: serving state without contract code (code not available locally)"
                                     );
-                                    None
-                                } else {
-                                    Some((key, state, contract))
                                 }
+                                Some((key, state, contract))
                             }
                             _ => None,
                         };

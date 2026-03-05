@@ -6720,3 +6720,138 @@ fn test_get_succeeds_despite_readiness_gating() {
         report.total_events
     );
 }
+
+/// Validates GET with `fetch_contract=true` works in a PUT→UPDATE→GET flow.
+///
+/// Related to #3356 (45% case): peers that receive state via UPDATE but not
+/// WASM code should still serve the state rather than forwarding into a death
+/// spiral. In this small topology the GET may reach the gateway (which has
+/// code), so this test primarily validates the end-to-end flow rather than
+/// specifically proving the forwarding fix. The forwarding fix is a defensive
+/// change for larger topologies where GETs may not reach the PUT originator.
+///
+/// Scenario:
+///   1. Gateway PUTs contract with subscribe=true
+///   2. Nodes 1-2 subscribe (triggering state propagation)
+///   3. Gateway sends UPDATE (propagates state to subscribers)
+///   4. Node 3 (not subscribed) GETs with `return_contract_code=true`
+///   5. Assert node 3's storage has the contract state
+#[test_log::test]
+fn test_get_fetch_contract_serves_state_without_code() {
+    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0xDE7A_5F10_0001;
+    const NETWORK_NAME: &str = "get-fetch-contract-no-code";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,  // gateways
+            3,  // nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xDE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let operations = vec![
+        // 1. Gateway PUTs contract with subscribe
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, 0xDE),
+                subscribe: true,
+            },
+        ),
+        // 2. Nodes 1-2 subscribe (state propagation targets)
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+        // 3. Gateway updates — propagates state (not code) to subscribers
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(10, 0xDE),
+            },
+        ),
+        // 4. Node 3 GETs with fetch_contract=true (not a subscriber, must route)
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "GET fetch_contract simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Verify that node 3 has the contract state despite peers only having
+    // state (not code) from UPDATE broadcasts.
+    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
+    let node3_storage = result
+        .node_storages
+        .get(&node3_label)
+        .expect("node 3 should have a storage handle");
+    let node3_state = node3_storage.get_stored_state(&contract_key);
+
+    assert!(
+        node3_state.is_some(),
+        "Node 3 should have contract state after GET with fetch_contract=true, \
+         but storage is empty. This indicates the GET died in a forwarding \
+         death spiral because relay peers had state but no WASM code (#3356)."
+    );
+
+    // Run StateVerifier for anomaly detection (per testing.md)
+    let rt = create_runtime();
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "Anomaly report: {} anomalies across {} contracts",
+        report.anomalies.len(),
+        report.contracts_analyzed
+    );
+
+    tracing::info!(
+        "test_get_fetch_contract_serves_state_without_code PASSED: \
+         node 3 has contract state, {} events analyzed",
+        report.total_events
+    );
+}
