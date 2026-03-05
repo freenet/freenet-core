@@ -1407,6 +1407,7 @@ impl Ring {
 
         let mut seen = HashSet::new();
         let mut candidates: Vec<PeerKeyLocation> = Vec::new();
+        let mut skipped_not_ready: usize = 0;
 
         let connections = self.connection_manager.get_connections_by_location();
         // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
@@ -1425,6 +1426,12 @@ impl Ring {
                     }
                     // Skip peers that haven't advertised readiness
                     if !self.connection_manager.is_peer_ready(addr) {
+                        tracing::debug!(
+                            %addr,
+                            target_location = %target_location.as_f64(),
+                            "k_closest: skipping peer not yet ready"
+                        );
+                        skipped_not_ready += 1;
                         continue;
                     }
                 }
@@ -1451,6 +1458,13 @@ impl Ring {
             total_routing_events = decision.total_routing_events,
             selected_count = selected.len(),
             "routing_decision"
+        );
+
+        tracing::debug!(
+            target_location = %target_location.as_f64(),
+            candidates_found = selected.len(),
+            skipped_not_ready,
+            "k_closest_potentially_caching result"
         );
 
         selected.into_iter().cloned().collect()
