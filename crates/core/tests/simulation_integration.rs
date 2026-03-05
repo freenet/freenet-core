@@ -6637,10 +6637,11 @@ fn test_get_succeeds_despite_readiness_gating() {
         (sim, logs_handle)
     });
 
-    // Set readiness gating higher than network size (4 nodes total).
-    // No node can ever have 10 ready connections, so ReadyState is never sent,
+    // Set readiness gating higher than network size (1 gateway + 3 nodes = 4 total).
+    // No node can ever have this many ready connections, so ReadyState is never sent,
     // and is_peer_ready() returns false for all peers.
-    sim.with_readiness_gating(10);
+    let total_nodes = 1 + 3; // gateways + nodes
+    sim.with_readiness_gating(total_nodes + 1);
 
     let contract = SimOperation::create_test_contract(0xAE);
     let contract_id = *contract.key().id();
@@ -6695,15 +6696,22 @@ fn test_get_succeeds_despite_readiness_gating() {
          readiness gating (the bug from #3356/#3423)."
     );
 
+    // Run StateVerifier for anomaly detection (per testing.md)
     let rt = create_runtime();
-    let event_count = rt.block_on(async {
+    let report = rt.block_on(async {
         let logs = logs_handle.lock().await;
-        logs.len()
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
     });
+    tracing::info!(
+        "Anomaly report: {} anomalies across {} contracts",
+        report.anomalies.len(),
+        report.contracts_analyzed
+    );
 
     tracing::info!(
         "test_get_succeeds_despite_readiness_gating PASSED: \
-         node 1 has contract state, {} events produced",
-        event_count
+         node 1 has contract state, {} events analyzed",
+        report.total_events
     );
 }
