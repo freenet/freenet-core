@@ -108,7 +108,7 @@ fn homepage_html() -> String {
 /// Freenet rabbit silhouette SVG path, derived from freenet_logo.svg.
 /// Used for the favicon with a solid color fill (no gradient) so the
 /// connection status color is immediately visible at favicon size.
-const RABBIT_SVG_PATH: &str = concat!(
+pub(super) const RABBIT_SVG_PATH: &str = concat!(
     "M358.864 40.470C358.605 40.728 354.143 42.467 348.947 44.334",
     "C284.621 67.446 232.573 113.729 201.443 175.500",
     "C193.895 190.478 184.375 213.708 185.375 214.708",

@@ -325,6 +325,14 @@ fn shell_page(
 
     // auth_token is base58 (alphanumeric only), safe for unescaped interpolation.
     let auth_token = auth_token.as_str();
+    // Use an inline SVG data URI for the default favicon to avoid CORS errors
+    // from cross-origin requests. Contracts can override this via the
+    // __freenet_shell__ postMessage bridge (type: 'favicon').
+    let favicon = format!(
+        "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 640 471'>\
+         <path d='{}' fill='%23007FFF' fill-rule='evenodd'/></svg>",
+        super::home_page::RABBIT_SVG_PATH,
+    );
     let html = format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -332,7 +340,7 @@ fn shell_page(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Freenet</title>
-<link rel="icon" href="https://freenet.org/freenet_logo.svg">
+<link rel="icon" type="image/svg+xml" href="{favicon}">
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none}}</style>
 </head>
 <body>
@@ -854,8 +862,12 @@ mod tests {
             "shell page title mismatch"
         );
         assert!(
-            html.contains(r#"<link rel="icon" href="https://freenet.org/freenet_logo.svg">"#),
-            "favicon link missing"
+            html.contains(r#"<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,"#),
+            "favicon should use inline data URI, not external URL"
+        );
+        assert!(
+            !html.contains("freenet.org"),
+            "shell page must not reference external origins (CORS)"
         );
         // Shell message handler must be present in bridge JS
         assert!(
