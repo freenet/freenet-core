@@ -1,8 +1,8 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -267,15 +267,14 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// Set by the node layer after connection establishment.
     orphan_stream_registry:
         Option<std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>>,
-    /// Hashes of recently dispatched metadata bytes, to dedup
+    /// LRU cache of recently dispatched metadata hashes (capacity 1000), used to dedup
     /// embedded-metadata-in-fragment-#1 against the separate ShortMessage.
     ///
     /// Uses `DefaultHasher` (not cryptographic). A hash collision would cause
     /// a silent metadata drop, leading to a 60-second operation timeout for
-    /// the affected stream. This is an acceptable trade-off given the small
-    /// working set size (capped at 1000 entries) and negligible collision
-    /// probability.
-    dispatched_msg_hashes: HashSet<u64>,
+    /// the affected stream -- acceptable given the small working set and
+    /// negligible collision probability. See issue #3317.
+    dispatched_msg_hashes: lru::LruCache<u64, ()>,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -346,6 +345,12 @@ fn keepalive_interval_for_pending(pending_count: usize) -> Duration {
 /// Note: Was previously 2 (10 seconds) but caused flaky test failures due to
 /// pong responses being delayed under CI load (issue: premature connection closure).
 const MAX_UNANSWERED_PINGS: usize = 5;
+
+/// Maximum number of metadata hashes to track for dedup.
+const DEDUP_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1000) {
+    Some(v) => v,
+    None => panic!("DEDUP_CACHE_CAPACITY must be non-zero"),
+};
 
 #[allow(private_bounds)]
 impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
@@ -510,7 +515,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             streaming_handles: HashMap::new(),
             time_source,
             orphan_stream_registry: None,
-            dispatched_msg_hashes: HashSet::new(),
+            dispatched_msg_hashes: lru::LruCache::new(DEDUP_CACHE_CAPACITY),
         }
     }
 
@@ -526,7 +531,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// Only used on the embedded-metadata-in-fragment-#1 path to suppress
     /// duplicates when the same metadata was already dispatched as a ShortMessage.
     fn is_duplicate_dispatch(&mut self, bytes: &[u8]) -> bool {
-        !self.dispatched_msg_hashes.insert(Self::msg_hash(bytes))
+        self.dispatched_msg_hashes
+            .put(Self::msg_hash(bytes), ())
+            .is_some()
     }
 
     /// Sets the orphan stream registry for handling race conditions between
@@ -1299,10 +1306,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // embedded in a stream fragment, it will be suppressed as a duplicate.
                 // We always dispatch ShortMessages — dedup only suppresses the
                 // redundant embedded-metadata copy, never the ShortMessage itself.
-                self.dispatched_msg_hashes.insert(Self::msg_hash(&bytes));
-                if self.dispatched_msg_hashes.len() > 1000 {
-                    self.dispatched_msg_hashes.clear();
-                }
+                self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
                 Ok(Some(bytes))
             }
             AckConnection { result: Err(cause) } => {
@@ -2517,51 +2521,74 @@ mod tests {
         h.finish()
     }
 
-    /// Helper that mirrors PeerConnection::is_duplicate_dispatch.
-    fn is_duplicate_dispatch(set: &mut HashSet<u64>, bytes: &[u8]) -> bool {
-        !set.insert(msg_hash(bytes))
+    /// Helper that mirrors PeerConnection::is_duplicate_dispatch using LRU.
+    fn is_duplicate_dispatch(cache: &mut lru::LruCache<u64, ()>, bytes: &[u8]) -> bool {
+        cache.put(msg_hash(bytes), ()).is_some()
     }
 
+    /// Create a dedup cache with the given capacity.
+    fn dedup_cache(cap: usize) -> lru::LruCache<u64, ()> {
+        lru::LruCache::new(NonZeroUsize::new(cap).unwrap())
+    }
+
+    // Superseded: dedup store replaced with LRU cache in #3418;
+    // HashSet.insert() return-value semantics no longer apply.
+    // Equivalent behavior now tested by duplicate_embedded_metadata_suppressed.
+    #[ignore]
     #[test]
     fn dispatched_short_message_always_recorded() {
-        // ShortMessage path inserts hash — the insert itself never indicates "duplicate"
-        // because ShortMessages are always dispatched.
-        let mut set = HashSet::new();
+        let mut cache = dedup_cache(1000);
         let bytes = b"metadata-payload";
-        assert!(set.insert(msg_hash(bytes)), "first insert should succeed");
-        // Inserting same hash again returns false (already present), but this path
-        // is only used for embedded-metadata dedup, never for ShortMessage dispatch.
-        assert!(!set.insert(msg_hash(bytes)), "second insert returns false");
+        assert!(
+            cache.put(msg_hash(bytes), ()).is_none(),
+            "first insert should return None (not present)"
+        );
+        assert!(
+            cache.put(msg_hash(bytes), ()).is_some(),
+            "second insert returns Some (was present)"
+        );
     }
 
     #[test]
     fn duplicate_embedded_metadata_suppressed() {
-        // If metadata was already dispatched as a ShortMessage, the same bytes
-        // arriving as embedded metadata should be detected as a duplicate.
-        let mut set = HashSet::new();
-        let bytes = b"streaming-metadata";
-        // Simulate ShortMessage dispatch (insert hash)
-        set.insert(msg_hash(bytes));
-        // Now embedded metadata arrives with same bytes
+        // Same bytes: first insert is new, second is a duplicate.
+        let mut cache = dedup_cache(1000);
+        let bytes = b"metadata-payload";
         assert!(
-            is_duplicate_dispatch(&mut set, bytes),
-            "embedded metadata with same bytes should be suppressed"
+            !is_duplicate_dispatch(&mut cache, bytes),
+            "first insert is not a duplicate"
+        );
+        assert!(
+            is_duplicate_dispatch(&mut cache, bytes),
+            "second insert is a duplicate"
         );
     }
 
     #[test]
     fn different_metadata_not_suppressed() {
-        // Different metadata bytes must not be suppressed even if a prior
-        // ShortMessage was recorded.
-        let mut set = HashSet::new();
-        let short_msg = b"first-metadata";
-        let embedded = b"different-metadata";
-        // Simulate ShortMessage dispatch
-        set.insert(msg_hash(short_msg));
-        // Different embedded metadata should NOT be suppressed
+        // Different metadata bytes must not be treated as duplicates.
+        let mut cache = dedup_cache(1000);
+        assert!(!is_duplicate_dispatch(&mut cache, b"first-metadata"));
+        assert!(!is_duplicate_dispatch(&mut cache, b"different-metadata"));
+    }
+
+    #[test]
+    fn lru_eviction_preserves_recent_entries() {
+        // Regression test for #3317: LRU eviction only removes the oldest entry,
+        // unlike the old HashSet cap-and-clear which cleared everything.
+        let mut cache = dedup_cache(3);
+
+        // Fill cache to capacity, then insert a 4th to evict the oldest
+        for i in 1..=4 {
+            cache.put(msg_hash(format!("msg-{i}").as_bytes()), ());
+        }
+
+        // Recent entries survive; oldest (msg-1) was evicted
+        assert!(cache.contains(&msg_hash(b"msg-4")), "msg-4 should survive");
+        assert!(cache.contains(&msg_hash(b"msg-3")), "msg-3 should survive");
         assert!(
-            !is_duplicate_dispatch(&mut set, embedded),
-            "different metadata bytes must not be treated as duplicate"
+            !cache.contains(&msg_hash(b"msg-1")),
+            "msg-1 should be evicted"
         );
     }
 
