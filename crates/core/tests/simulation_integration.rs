@@ -6720,3 +6720,144 @@ fn test_get_succeeds_despite_readiness_gating() {
         report.total_events
     );
 }
+
+/// Regression test for #3431: GET routing exhaustion when contract is cached at few nodes.
+///
+/// With low HTL, PUT only caches the contract at a handful of nodes along the
+/// route. GET from nodes whose connected peers don't overlap with caching nodes
+/// fails with "No other peers found" → NotFound.
+///
+/// Scenario:
+///   1. Gateway PUTs contract (HTL=3 → only ~4 nodes cache code+state)
+///   2. 12 nodes subscribe, gateway sends UPDATE (state propagation)
+///   3. All 15 nodes GET with `fetch_contract=true`
+///   4. Assert every node gets the contract state
+///
+/// Currently ignored: node-13 consistently fails (routing exhaustion). #3431
+// Ignored: GET routing exhaustion when contract cached at few nodes #3431
+#[ignore]
+#[test_log::test]
+fn test_get_routing_coverage_low_htl() {
+    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0xC0DE_B0CA_0001;
+    const NETWORK_NAME: &str = "get-routing-coverage";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let num_nodes = 15;
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,         // gateways
+            num_nodes, // nodes — large enough that PUT won't reach all
+            3,         // ring_max_htl — LOW to limit PUT propagation depth
+            1,         // rnd_if_htl_above
+            6,         // max_connections
+            3,         // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xC0);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let mut operations = vec![
+        // Gateway PUTs with subscribe (HTL=3 → caches at ~4 nodes)
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, 0xC0),
+                subscribe: true,
+            },
+        ),
+    ];
+
+    // Subscribe nodes 1-12
+    for i in 1..=12 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    // Gateway updates — propagates state to subscribers
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(42, 0xC0),
+        },
+    ));
+
+    // Every node GETs with fetch_contract=true
+    for i in 1..=num_nodes {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Assert every node has the contract state after GET
+    let mut nodes_without_state = Vec::new();
+
+    for i in 1..=num_nodes {
+        let label = NodeLabel::node(NETWORK_NAME, i);
+        let storage = result
+            .node_storages
+            .get(&label)
+            .unwrap_or_else(|| panic!("node {i} should have a storage handle"));
+        if storage.get_stored_state(&contract_key).is_none() {
+            nodes_without_state.push(format!("node-{i}"));
+        }
+    }
+
+    assert!(
+        nodes_without_state.is_empty(),
+        "GET routing exhaustion: {} nodes failed to get contract state \
+         (contract only cached at ~4 nodes due to HTL=3). \
+         Failed nodes: {:?}. See #3431.",
+        nodes_without_state.len(),
+        nodes_without_state
+    );
+
+    // StateVerifier anomaly check
+    let rt = create_runtime();
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "test_get_routing_coverage_low_htl PASSED: {} anomalies, {} events",
+        report.anomalies.len(),
+        report.total_events
+    );
+}
