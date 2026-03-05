@@ -6733,9 +6733,6 @@ fn test_get_succeeds_despite_readiness_gating() {
 ///   3. All 15 nodes GET with `fetch_contract=true`
 ///   4. Assert every node gets the contract state
 ///
-/// Currently ignored: node-13 consistently fails (routing exhaustion). #3431
-// Ignored: GET routing exhaustion when contract cached at few nodes #3431
-#[ignore]
 #[test_log::test]
 fn test_get_routing_coverage_low_htl() {
     use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};

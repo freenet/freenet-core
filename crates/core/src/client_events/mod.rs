@@ -2127,11 +2127,9 @@ pub(crate) mod test {
                 key, ..
             })) = response
             {
-                self.internal_state
-                    .as_mut()
-                    .expect("state should be set")
-                    .owns_contracts
-                    .insert(key);
+                if let Some(state) = self.internal_state.as_mut() {
+                    state.owns_contracts.insert(key);
+                }
             }
             async { Ok(()) }.boxed()
         }
