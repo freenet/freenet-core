@@ -165,16 +165,17 @@ async fn web_home(
         add_sandbox_cors_headers(&mut response);
         // CSP for sandbox content: the iframe has an opaque origin (null) because the
         // sandbox attribute omits allow-same-origin. This means CSP 'self' won't match
-        // the gateway's actual origin, so we must use the explicit gateway origin derived
-        // from the Host header. This allows the iframe to load scripts, styles, images,
-        // and WASM from the gateway while blocking access to other origins.
-        let gateway_origin = req_headers
+        // the local API server's actual origin, so we must use the explicit local API
+        // origin derived from the Host header. This allows the iframe to load scripts,
+        // styles, images, and WASM from the local API server while blocking access
+        // to other origins.
+        let local_api_origin = req_headers
             .get(axum::http::header::HOST)
             .and_then(|h| h.to_str().ok())
             .map(|host| format!("http://{host}"))
             .unwrap_or_else(|| "'self'".to_string());
         let csp = format!(
-            "default-src {gateway_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {gateway_origin} blob: data:"
+            "default-src {local_api_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {local_api_origin} blob: data:"
         );
         if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
             response

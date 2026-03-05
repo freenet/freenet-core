@@ -1,4 +1,4 @@
-//! Clients events related logic and type definitions. For example, receival of client events from applications throught the HTTP gateway.
+//! Clients events related logic and type definitions. For example, receival of client events from applications throught the HTTP API.
 
 use either::Either;
 use freenet_stdlib::{

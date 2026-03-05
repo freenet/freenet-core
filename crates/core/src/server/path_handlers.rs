@@ -1,8 +1,8 @@
 //! Handle the `web` part of the bundles.
 //!
 //! Contract web apps are served inside sandboxed iframes to provide origin isolation.
-//! The gateway returns a "shell" page that holds the auth token and proxies WebSocket
-//! connections via postMessage, while the contract runs in an
+//! The local API server returns a "shell" page that holds the auth token and
+//! proxies WebSocket connections via postMessage, while the contract runs in an
 //! `<iframe sandbox="allow-scripts allow-forms">` with an opaque origin that cannot
 //! access other contracts' data.
 
@@ -423,12 +423,12 @@ async fn sandbox_content_body(
 /// The bridge listens for WebSocket requests from the sandboxed iframe,
 /// creates real WebSocket connections with the auth token injected, and
 /// forwards messages in both directions. Only allows connections to the
-/// gateway itself (same origin) to prevent the contract from using the
+/// local API server itself (same origin) to prevent the contract from using the
 /// bridge as an open proxy to other localhost services.
 const SHELL_BRIDGE_JS: &str = r#"
 function freenetBridge(authToken) {
   'use strict';
-  var GATEWAY_ORIGIN = location.origin;
+  var LOCAL_API_ORIGIN = location.origin;
   var MAX_CONNECTIONS = 32;
   var iframe = document.getElementById('app');
   var connections = new Map();
@@ -468,7 +468,7 @@ function freenetBridge(authToken) {
           sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
           return;
         }
-        // Security: only allow WebSocket connections to the gateway itself.
+        // Security: only allow WebSocket connections to the local API server itself.
         // Validate protocol explicitly and compare origin.
         try {
           var u = new URL(msg.url);
@@ -477,7 +477,7 @@ function freenetBridge(authToken) {
             return;
           }
           var httpProto = u.protocol === 'wss:' ? 'https:' : 'http:';
-          if (httpProto + '//' + u.host !== GATEWAY_ORIGIN) {
+          if (httpProto + '//' + u.host !== LOCAL_API_ORIGIN) {
             sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
             return;
           }
@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn bridge_js_contains_origin_check() {
         assert!(
-            SHELL_BRIDGE_JS.contains("GATEWAY_ORIGIN"),
+            SHELL_BRIDGE_JS.contains("LOCAL_API_ORIGIN"),
             "bridge JS must validate WebSocket origin"
         );
         assert!(
