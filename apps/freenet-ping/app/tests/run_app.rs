@@ -1745,3 +1745,190 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn test_ws_streaming_large_payload() -> anyhow::Result<()> {
+    use common::{connect_ws_with_retry_streaming, deploy_contract, get_contract_state};
+
+    // Allocate unique IPs to avoid conflicts with parallel tests
+    let base_node_idx = allocate_test_node_block(2);
+    let gw_ip = test_ip_for_node(base_node_idx);
+    let node_ip = test_ip_for_node(base_node_idx + 1);
+
+    println!("WS streaming test - Gateway IP: {gw_ip}, Node IP: {node_ip}");
+
+    // Reserve ports using TcpListener on the unique IPs
+    let network_socket_gw = TcpListener::bind(std::net::SocketAddr::new(gw_ip.into(), 0))?;
+    let ws_api_port_socket_gw = TcpListener::bind(std::net::SocketAddr::new(gw_ip.into(), 0))?;
+    let ws_api_port_socket_node = TcpListener::bind(std::net::SocketAddr::new(node_ip.into(), 0))?;
+
+    let network_port_gw = network_socket_gw.local_addr()?.port();
+    let ws_port_gw = ws_api_port_socket_gw.local_addr()?.port();
+    let ws_port_node = ws_api_port_socket_node.local_addr()?.port();
+
+    // Configure nodes with a fixed seed for deterministic testing
+    let mut test_rng = rand::rngs::StdRng::seed_from_u64(0x5453_4554_1234_5678_u64);
+
+    // Configure gateway node
+    let (config_gw, preset_cfg_gw) = base_node_test_config_with_rng(
+        true,
+        vec![],
+        Some(network_port_gw),
+        ws_port_gw,
+        "gw_streaming",
+        None,
+        None,
+        Some(gw_ip),
+        &mut test_rng,
+    )
+    .await?;
+    let public_port = config_gw.network_api.public_port.unwrap();
+    let path = preset_cfg_gw.temp_dir.path().to_path_buf();
+    let config_gw_info = gw_config_from_path_with_rng(public_port, &path, &mut test_rng, gw_ip)?;
+
+    // Configure client node
+    let (config_node, preset_cfg_node) = base_node_test_config_with_rng(
+        false,
+        vec![serde_json::to_string(&config_gw_info)?],
+        None,
+        ws_port_node,
+        "node_streaming",
+        None,
+        None,
+        Some(node_ip),
+        &mut test_rng,
+    )
+    .await?;
+
+    println!("Gateway data dir: {:?}", preset_cfg_gw.temp_dir.path());
+    println!(
+        "Client node data dir: {:?}",
+        preset_cfg_node.temp_dir.path()
+    );
+
+    // Drop TCP listeners before starting nodes so ports are available
+    std::mem::drop(network_socket_gw);
+    std::mem::drop(ws_api_port_socket_gw);
+    std::mem::drop(ws_api_port_socket_node);
+
+    // Start gateway node
+    let gateway_node = async {
+        let config = config_gw.build().await?;
+        let node = test_node_config(config.clone())
+            .await?
+            .build(serve_client_api(config.ws_api).await?)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Start client node
+    let client_node = async move {
+        let config = config_node.build().await?;
+        let node = test_node_config(config.clone())
+            .await?
+            .build(serve_client_api(config.ws_api).await?)
+            .await?;
+        node.run().await
+    }
+    .boxed_local();
+
+    // Main test logic with overall timeout
+    let test = tokio::time::timeout(Duration::from_secs(180), async {
+        // Connect both clients using streaming WebSocket endpoints
+        println!("Connecting to gateway with streaming WebSocket...");
+        let mut client_gw =
+            connect_ws_with_retry_streaming(gw_ip, ws_port_gw, "Gateway", 60).await?;
+        println!("Connecting to client node with streaming WebSocket...");
+        let mut client_node =
+            connect_ws_with_retry_streaming(node_ip, ws_port_node, "ClientNode", 60).await?;
+        println!("Both streaming WebSocket connections established!");
+
+        // Wait for the gateway to have at least one ring connection before deploying
+        println!("Waiting for gateway to have ring connections...");
+        wait_for_node_connected(&mut client_gw, "Gateway", 1, 60).await?;
+        println!("Gateway has ring connections!");
+
+        // Create a large Ping state (> 512 KB) to exercise WebSocket streaming
+        let mut large_ping = Ping::with_padding(600 * 1024);
+        large_ping.insert("streaming-test-node".to_string());
+
+        // Verify the serialized size exceeds 512 KB
+        let serialized_size = serde_json::to_vec(&large_ping)?.len();
+        assert!(
+            serialized_size > 512 * 1024,
+            "Expected serialized Ping to exceed 512 KB for streaming test, got {} bytes",
+            serialized_size
+        );
+        println!(
+            "Large Ping created: {} bytes serialized (> 512 KB)",
+            serialized_size
+        );
+
+        // Configure contract options
+        let options = PingContractOptions {
+            ttl: Duration::from_secs(300),
+            frequency: Duration::from_secs(1),
+            tag: APP_TAG.to_string(),
+            code_key: String::new(),
+        };
+
+        // Deploy the contract with the large initial state via the gateway
+        println!("Deploying contract with large state via gateway...");
+        let contract_key = deploy_contract(&mut client_gw, large_ping.clone(), &options, false)
+            .await?;
+        println!("Contract deployed successfully: {contract_key}");
+
+        // Wait for state to propagate through the network
+        println!("Waiting 10s for state propagation...");
+        sleep(Duration::from_secs(10)).await;
+
+        // Retrieve the state from the client node via streaming
+        println!("Retrieving large contract state from client node via streaming...");
+        let retrieved_state = get_contract_state(&mut client_node, contract_key, false).await?;
+
+        // Validate the retrieved state contains the expected key
+        assert!(
+            retrieved_state.contains_key("streaming-test-node"),
+            "Retrieved state must contain 'streaming-test-node' key"
+        );
+
+        // Validate the padding was preserved
+        let expected_padding_len = 600 * 1024;
+        let retrieved_padding_len = retrieved_state
+            .padding
+            .as_ref()
+            .map(|p| p.len())
+            .unwrap_or(0);
+        assert_eq!(
+            retrieved_padding_len, expected_padding_len,
+            "Retrieved padding length ({retrieved_padding_len}) must match original ({expected_padding_len})"
+        );
+
+        println!("=== WS STREAMING LARGE PAYLOAD TEST PASSED! ===");
+        println!("  - Large state ({serialized_size} bytes) deployed via streaming WebSocket");
+        println!("  - State propagated to client node and retrieved successfully");
+        println!("  - 'streaming-test-node' key present in retrieved state");
+        println!("  - Padding ({retrieved_padding_len} bytes) preserved across network");
+
+        Ok::<_, anyhow::Error>(())
+    })
+    .instrument(span!(Level::INFO, "test_ws_streaming_large_payload"));
+
+    // Wait for test completion or node failures
+    select! {
+        gw = gateway_node => {
+            let Err(gw) = gw;
+            anyhow::bail!("Gateway node failed: {}", gw);
+        }
+        n = client_node => {
+            let Err(n) = n;
+            anyhow::bail!("Client node failed: {}", n);
+        }
+        r = test => {
+            r??;
+        }
+    }
+
+    Ok(())
+}
