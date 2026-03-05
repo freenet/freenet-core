@@ -188,6 +188,18 @@ pub(crate) async fn request_get(
                 phase = "error",
                 "GET: Contract not found locally and no peers available"
             );
+
+            // Emit failure telemetry so this case is visible in production metrics
+            if let Some(event) = NetEventLog::get_failure(
+                id,
+                &op_manager.ring,
+                *instance_id,
+                OperationFailure::NoPeersAvailable,
+                None,
+            ) {
+                op_manager.ring.register_events(Either::Left(event)).await;
+            }
+
             return Err(RingError::EmptyRing.into());
         }
 
@@ -1055,7 +1067,8 @@ impl Operation for GetOp {
                                         tx = %id,
                                         %instance_id,
                                         %this_peer,
-                                        "GET: state available locally but contract code missing; continuing search"
+                                        fetch_contract,
+                                        "GET: state available locally but contract code missing; forwarding GET"
                                     );
                                     None
                                 } else {
