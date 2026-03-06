@@ -50,9 +50,9 @@ const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 
 /// Minimum connections before applying Kleinberg distance filtering on inbound
 /// connections. Below this threshold, all inbound connections are accepted to
-/// avoid blocking initial bootstrap. At 3+ connections the node has enough
-/// context to make distance-aware decisions.
-const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = 3;
+/// avoid blocking initial bootstrap. Set to NUM_BANDS because band-based
+/// scoring requires at least that many connections to be meaningful.
+const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = crate::topology::small_world_rand::NUM_BANDS;
 
 /// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
 /// This prevents thundering-herd scenarios where many joiners hit the same gateway at once.
@@ -558,9 +558,6 @@ impl ConnectionManager {
         // node genuinely needs more connections.
         // total_conn (which includes pending) is still used for max_connections
         // to prevent over-commitment.
-        let my_location = self.get_stored_location();
-        let connections = self.connections_by_location.read();
-
         let accepted = if total_conn >= self.max_connections {
             tracing::debug!(
                 addr = %addr,
@@ -575,14 +572,15 @@ impl ConnectionManager {
             // the distance distribution. This prevents the first N connections
             // from being uniformly distributed, which defeats small-world routing.
             //
-            // With fewer than 3 connections we always accept to avoid blocking
-            // bootstrap. Above that, we apply a soft filter: connections in
-            // over-represented bands are rejected with probability proportional
-            // to the over-representation. The floor acceptance rate of 50%
-            // ensures bootstrapping isn't blocked.
+            // With fewer than KLEINBERG_FILTER_MIN_CONNECTIONS connections we
+            // always accept to avoid blocking bootstrap. Above that, we apply a
+            // soft filter: connections in over-represented bands are rejected with
+            // probability proportional to the over-representation. The floor
+            // acceptance rate of 50% ensures bootstrapping isn't blocked.
             let accepted = if open < KLEINBERG_FILTER_MIN_CONNECTIONS {
                 true
-            } else if let Some(me) = my_location {
+            } else if let Some(me) = self.get_stored_location() {
+                let connections = self.connections_by_location.read();
                 // Iterate all connections (not just unique locations) to correctly
                 // count band occupancy when multiple peers share a location.
                 let band_counts = crate::topology::small_world_rand::count_bands(
@@ -591,6 +589,7 @@ impl ConnectionManager {
                         .iter()
                         .flat_map(|(loc, conns)| std::iter::repeat(*loc).take(conns.len())),
                 );
+                drop(connections);
                 let dist = me.distance(location).as_f64();
                 let score =
                     crate::topology::small_world_rand::kleinberg_band_score(dist, &band_counts);
@@ -617,7 +616,7 @@ impl ConnectionManager {
             let accepted = self
                 .topology_manager
                 .write()
-                .evaluate_new_connection(location, Instant::now(), my_location, &connections)
+                .evaluate_new_connection(location, Instant::now())
                 .unwrap_or(true);
 
             tracing::debug!(
@@ -629,7 +628,6 @@ impl ConnectionManager {
             );
             accepted
         };
-        drop(connections);
         tracing::debug!(
             addr = %addr,
             peer_location = %location,

@@ -23,21 +23,19 @@
 //! - At/above `min_connections`, resource usage > 90% → remove connections
 //! - Above `max_connections` → remove connections
 //!
-//! ## Accepting Incoming Connections (`evaluate_new_connection`)
+//! ## Accepting Incoming Connections
 //!
-//! Used by `should_accept()` in connection_manager when a peer has between min and max connections.
-//! (Below min: Kleinberg-aware soft filter with 50% acceptance floor. At max: always reject.)
+//! Two mechanisms shape inbound connection topology:
 //!
-//! Scoring uses a **composite** of:
-//! - **Distance distribution score** (70%): How much the candidate fills a deficient
-//!   logarithmic distance band relative to the ideal 1/d (Kleinberg) distribution.
-//! - **Density score** (30%): Request density at the candidate's location.
+//! 1. **Below min_connections** (`should_accept` in connection_manager): Kleinberg-aware
+//!    soft filter with 50% acceptance floor. Uses logarithmic distance band scoring to
+//!    probabilistically prefer connections that fill deficient bands. This shapes the
+//!    distance distribution during bootstrap.
 //!
-//! This ensures inbound connections converge toward the optimal small-world topology
-//! even when they are not Kleinberg-targeted outbound connections.
-//!
-//! The evaluator compares the composite score against other candidates seen in a time
-//! window, accepting only if this candidate scores higher than ALL others.
+//! 2. **At/above min_connections** (`evaluate_new_connection`): Request density scoring
+//!    via the ConnectionEvaluator. Accepts only if the candidate's density score beats
+//!    all other candidates in a time window. When no density map exists (early bootstrap),
+//!    returns Err and the caller falls back to accepting all connections.
 //!
 //! ## Removing Connections
 //!
@@ -144,61 +142,25 @@ impl TopologyManager {
         self.outbound_request_counter.record_request(recipient);
     }
 
-    /// Decide whether to accept a connection from a new candidate peer based on its location,
-    /// how well it improves the Kleinberg 1/d distance distribution, and how it compares
-    /// to other recent candidates.
+    /// Decide whether to accept a connection from a new candidate peer based on
+    /// request density at its location, compared against other recent candidates.
     ///
-    /// The score is a weighted combination of:
-    /// - **Distance distribution score** (weight 0.7): How much the candidate fills a
-    ///   deficient logarithmic distance band relative to the ideal 1/d distribution.
-    /// - **Density score** (weight 0.3): Request density at the candidate's location.
-    ///
-    /// This ensures inbound connections converge toward the optimal small-world topology
-    /// regardless of whether they were Kleinberg-targeted outbound connections.
+    /// Used when the node has at/above min_connections. Below min_connections,
+    /// the Kleinberg band filter in `should_accept` handles distance distribution.
     pub(crate) fn evaluate_new_connection(
         &mut self,
         candidate_location: Location,
         current_time: Instant,
-        my_location: Option<Location>,
-        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> Result<bool, DensityMapError> {
-        let (band_score, candidate_distance) = if let Some(me) = my_location {
-            let dist = me.distance(candidate_location).as_f64();
-            // Count all connections per band (not just unique locations).
-            let band_counts = small_world_rand::count_bands(
-                me,
-                neighbor_locations
-                    .iter()
-                    .flat_map(|(loc, conns)| std::iter::repeat(*loc).take(conns.len())),
-            );
-            (
-                small_world_rand::kleinberg_band_score(dist, &band_counts),
-                Some(dist),
-            )
-        } else {
-            (0.5, None) // Neutral when own location unknown
-        };
-
-        // Get density score (request-based), falling back to band-only if unavailable
-        let density_score = self
-            .cached_density_map
-            .get()
-            .and_then(|dm| dm.get_density_at(candidate_location).ok())
-            .unwrap_or(0.0);
-
-        // Composite score: distance distribution is primary, density is secondary.
-        // The 0.7/0.3 weighting ensures topology formation is driven by Kleinberg
-        // distance requirements while still benefiting from request-locality.
-        let score = 0.7 * band_score + 0.3 * density_score;
-
         tracing::debug!(
             candidate_location = %candidate_location,
-            ?candidate_distance,
-            band_score,
-            density_score,
-            composite_score = score,
             "Evaluating new connection"
         );
+        let density_map = self
+            .cached_density_map
+            .get()
+            .ok_or(DensityMapError::EmptyNeighbors)?;
+        let score = density_map.get_density_at(candidate_location)?;
 
         let accept = match self.connection_acquisition_strategy {
             ConnectionAcquisitionStrategy::Slow => {
