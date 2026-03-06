@@ -1303,8 +1303,11 @@ impl Operation for UpdateOp {
     }
 }
 
-/// Cooldown before retrying a self-healing contract fetch (5 minutes).
-const CONTRACT_FETCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+/// Cooldown before retrying a self-healing contract fetch, in milliseconds.
+/// 5 minutes: long enough to avoid hammering peers if the contract genuinely
+/// doesn't exist, short enough to recover within a session if there was a
+/// transient routing failure.
+pub(crate) const CONTRACT_FETCH_COOLDOWN_MS: u64 = 300_000;
 
 impl OpManager {
     /// Trigger a background GET when an UPDATE broadcast fails because the node
@@ -1314,16 +1317,29 @@ impl OpManager {
     ///
     /// Rate-limited: at most one fetch attempt per contract per 5 minutes.
     pub(crate) fn try_auto_fetch_contract(&self, key: &ContractKey, sender_addr: SocketAddr) {
-        let instance_id = *key.id();
+        use crate::config::GlobalSimulationTime;
 
-        // Rate-limit: check if we've recently tried to fetch this contract
-        if let Some(entry) = self.pending_contract_fetches.get(&instance_id) {
-            if entry.elapsed() < CONTRACT_FETCH_COOLDOWN {
-                return;
+        let instance_id = *key.id();
+        let now_ms = GlobalSimulationTime::read_time_ms();
+
+        // Atomic rate-limit: try to insert a new entry. If one exists and hasn't
+        // expired, bail out. Uses entry API to avoid TOCTOU between check and insert.
+        {
+            use dashmap::mapref::entry::Entry;
+            match self.pending_contract_fetches.entry(instance_id) {
+                Entry::Occupied(existing) => {
+                    let elapsed_ms = now_ms.saturating_sub(*existing.get());
+                    if elapsed_ms < CONTRACT_FETCH_COOLDOWN_MS {
+                        return; // Still in cooldown
+                    }
+                    // Cooldown expired — update timestamp atomically
+                    drop(existing);
+                    self.pending_contract_fetches.insert(instance_id, now_ms);
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(now_ms);
+                }
             }
-            // Cooldown expired, remove stale entry and retry
-            drop(entry);
-            self.pending_contract_fetches.remove(&instance_id);
         }
 
         // Look up the sender's PeerKeyLocation so we can target them directly
@@ -1335,13 +1351,10 @@ impl OpManager {
                     sender = %sender_addr,
                     "Cannot auto-fetch: UPDATE sender not found in connection manager"
                 );
+                self.pending_contract_fetches.remove(&instance_id);
                 return;
             }
         };
-
-        // Mark as in-progress
-        self.pending_contract_fetches
-            .insert(instance_id, std::time::Instant::now());
 
         tracing::info!(
             contract = %key,

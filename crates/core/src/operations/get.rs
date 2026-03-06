@@ -59,6 +59,7 @@ pub(crate) fn start_op(
         })),
         upstream_addr: None, // Local operation, no upstream peer
         local_fallback: None,
+        auto_fetch: false,
     }
 }
 
@@ -91,6 +92,7 @@ pub(crate) fn start_op_with_id(
         })),
         upstream_addr: None, // Local operation, no upstream peer
         local_fallback: None,
+        auto_fetch: false,
     }
 }
 
@@ -150,6 +152,7 @@ pub(crate) fn start_targeted_op(
         })),
         upstream_addr: None,
         local_fallback: None,
+        auto_fetch: true, // System-initiated, not a client request
     };
 
     (op, msg)
@@ -236,6 +239,7 @@ pub(crate) async fn request_get(
                     stats: get_op.stats,
                     upstream_addr: get_op.upstream_addr,
                     local_fallback: None,
+                    auto_fetch: false,
                 };
 
                 op_manager.push(*id, OpEnum::Get(completed_op)).await?;
@@ -338,6 +342,7 @@ pub(crate) async fn request_get(
                 }),
                 upstream_addr: get_op.upstream_addr,
                 local_fallback, // Store local cache for fallback if network returns NotFound
+                auto_fetch: get_op.auto_fetch,
             };
 
             // Emit get_request telemetry when initiating a GET operation
@@ -538,6 +543,10 @@ pub(crate) struct GetOp {
     /// This enables "network first, local fallback" behavior to ensure we get fresh data
     /// while still being able to serve cached content when the network is unavailable.
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
+    /// True when this GET was spawned internally by try_auto_fetch_contract,
+    /// not by a client request. Used to avoid sending spurious timeout errors
+    /// to a non-existent client.
+    auto_fetch: bool,
 }
 
 impl GetOp {
@@ -609,13 +618,16 @@ impl GetOp {
         }
     }
 
-    /// Returns true if this GET was initiated by a local client (not forwarded from a peer).
-    /// Only client-initiated GETs have `requester: None` in the AwaitingResponse state.
+    /// Returns true if this GET was initiated by a local client (not forwarded from
+    /// a peer and not a system-initiated auto-fetch).
     pub(crate) fn is_client_initiated(&self) -> bool {
+        if self.auto_fetch {
+            return false;
+        }
         match &self.state {
             Some(GetState::PrepareRequest(_)) => true,
             Some(GetState::AwaitingResponse(data)) => data.requester.is_none(),
-            _ => false,
+            Some(GetState::ReceivedRequest) | Some(GetState::Finished(_)) | None => false,
         }
     }
 
@@ -697,6 +709,7 @@ impl GetOp {
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
                     local_fallback: self.local_fallback,
+                    auto_fetch: self.auto_fetch,
                 };
 
                 op_manager
@@ -763,6 +776,7 @@ impl GetOp {
                         stats: self.stats,
                         upstream_addr: self.upstream_addr,
                         local_fallback: self.local_fallback,
+                        auto_fetch: self.auto_fetch,
                     };
 
                     op_manager
@@ -793,6 +807,7 @@ impl GetOp {
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
                     local_fallback: None,
+                    auto_fetch: false,
                 };
 
                 op_manager.push(self.id, OpEnum::Get(completed_op)).await?;
@@ -817,6 +832,7 @@ impl GetOp {
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
                     local_fallback: None,
+                    auto_fetch: false,
                 };
 
                 op_manager
@@ -858,6 +874,7 @@ impl GetOp {
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
                     local_fallback: None,
+                    auto_fetch: false,
                 };
                 op_manager.push(self.id, OpEnum::Get(failed_op)).await?;
                 return Ok(());
@@ -1038,6 +1055,7 @@ impl Operation for GetOp {
                         stats: None, // don't care about stats in target peers
                         upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                         local_fallback: None,       // Remote requests don't have local fallback
+                        auto_fetch: false,
                     },
                     source_addr,
                 })
@@ -1058,8 +1076,9 @@ impl Operation for GetOp {
         source_addr: Option<std::net::SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
-            // Take local_fallback early since self will be partially moved
+            // Take fields early since self will be partially moved
             let mut local_fallback = self.local_fallback;
+            let auto_fetch = self.auto_fetch;
             #[allow(unused_assignments)]
             let mut return_msg = None;
             #[allow(unused_assignments)]
@@ -1151,6 +1170,7 @@ impl Operation for GetOp {
                             upstream_addr: self.upstream_addr,
                             stream_data: None,
                             local_fallback: None,
+                            auto_fetch: false,
                         });
                     } else {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
@@ -1945,6 +1965,7 @@ impl Operation for GetOp {
                                         stats,
                                         upstream_addr: self.upstream_addr,
                                         local_fallback: None,
+                                        auto_fetch: false,
                                     }),
                                 )
                                 .await?;
@@ -2402,6 +2423,7 @@ impl Operation for GetOp {
                                             stats,
                                             upstream_addr: self.upstream_addr,
                                             local_fallback,
+                                            auto_fetch: false,
                                         }),
                                     )
                                     .await
@@ -2430,6 +2452,7 @@ impl Operation for GetOp {
                                             stats,
                                             upstream_addr: self.upstream_addr,
                                             local_fallback,
+                                            auto_fetch: false,
                                         }),
                                     )
                                     .await
@@ -2698,6 +2721,7 @@ impl Operation for GetOp {
                 result,
                 stats,
                 upstream_addr: self.upstream_addr,
+                auto_fetch,
                 stream_data,
                 local_fallback,
             })
@@ -2733,6 +2757,7 @@ struct GetOpResult {
     result: Option<GetResult>,
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
+    auto_fetch: bool,
     stream_data: Option<(StreamId, bytes::Bytes)>,
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
 }
@@ -2745,6 +2770,7 @@ fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
         result,
         stats,
         upstream_addr,
+        auto_fetch,
         stream_data,
         local_fallback,
     } = params;
@@ -2768,6 +2794,7 @@ fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
         stats,
         upstream_addr,
         local_fallback,
+        auto_fetch,
     });
     let return_msg = msg.map(NetMessage::from);
     let op_state = output_op.map(OpEnum::Get);
@@ -2889,6 +2916,7 @@ async fn try_forward_or_return(
             upstream_addr,
             stream_data: None,
             local_fallback,
+            auto_fetch: false,
         })
     } else if upstream_addr.is_some() {
         // No targets found — check for local fallback before returning NotFound
@@ -2908,6 +2936,7 @@ async fn try_forward_or_return(
                 upstream_addr,
                 stream_data: None,
                 local_fallback: None,
+                auto_fetch: false,
             })
         } else {
             tracing::warn!(
@@ -2929,6 +2958,7 @@ async fn try_forward_or_return(
                 upstream_addr,
                 stream_data: None,
                 local_fallback: None,
+                auto_fetch: false,
             })
         }
     } else {
@@ -2956,6 +2986,7 @@ async fn try_forward_or_return(
             upstream_addr,
             stream_data: None,
             local_fallback: None,
+            auto_fetch: false,
         })
     }
 }
@@ -3149,6 +3180,7 @@ mod tests {
             stats: None,
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         }
     }
 
@@ -3504,6 +3536,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         match op.outcome() {
@@ -3528,6 +3561,7 @@ mod tests {
             stats: None,
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
         assert!(
             matches!(op_no_stats.outcome(), OpOutcome::Incomplete),
@@ -3553,6 +3587,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
         assert!(
             matches!(op_success.outcome(), OpOutcome::ContractOpSuccess { .. }),
@@ -3591,6 +3626,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         match op.outcome() {
@@ -3636,6 +3672,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         match op.outcome() {
@@ -3676,6 +3713,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         assert!(
@@ -3705,6 +3743,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         match op.outcome() {
