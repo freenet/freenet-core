@@ -1089,18 +1089,33 @@ impl Operation for GetOp {
                         };
 
                         // Relay peers in ReceivedRequest: prefer fresh network state,
-                        // local cache is fallback only. Store local value and forward.
+                        // local cache is fallback only. EXCEPTION: if this node is
+                        // hosting the contract, serve immediately — we're an
+                        // authoritative source and deferring wastes the full
+                        // OPERATION_TTL routing toward peers that may not have
+                        // the contract, causing ~94% GET failure rate (#3356).
                         let local_value = if self.upstream_addr.is_some()
                             && matches!(self.state, Some(GetState::ReceivedRequest))
                         {
                             if let Some(lv) = local_value {
-                                tracing::debug!(
-                                    tx = %id,
-                                    "Relay peer deferring local cache, forwarding GET for fresh state"
-                                );
-                                local_fallback = Some(lv);
+                                if op_manager.ring.is_hosting_contract(&lv.0) {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        contract = %lv.0,
+                                        "Relay peer hosting contract, serving immediately"
+                                    );
+                                    Some(lv)
+                                } else {
+                                    tracing::debug!(
+                                        tx = %id,
+                                        "Relay peer deferring local cache, forwarding GET for fresh state"
+                                    );
+                                    local_fallback = Some(lv);
+                                    None
+                                }
+                            } else {
+                                None
                             }
-                            None
                         } else {
                             local_value
                         };
