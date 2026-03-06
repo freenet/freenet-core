@@ -93,6 +93,7 @@ pub(crate) struct DensityMap {
 }
 
 impl DensityMap {
+    #[allow(dead_code)]
     pub fn get_density_at(&self, location: Location) -> Result<f64, DensityMapError> {
         if self.neighbor_request_counts.is_empty() {
             return Err(DensityMapError::EmptyNeighbors);
@@ -316,6 +317,7 @@ impl CachedDensityMap {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get(&self) -> Option<&DensityMap> {
         self.density_map.as_ref()
     }

@@ -26,16 +26,18 @@ WHEN calculating contract location:
 ```
 WHEN accepting a new connection (should_accept):
   1. CHECK: Is this a self-connection? → REJECT
-  2. CHECK: Are we below min_connections?
-     → Use ACTUAL open connection count, NOT speculative totals
-     → Pending reservations are speculative (many fail to complete);
-       counting them pushes nodes into the topology evaluator prematurely
-     → Below KLEINBERG_FILTER_MIN_CONNECTIONS (NUM_BANDS): always ACCEPT
-     → Above that: Kleinberg band scoring with 50% acceptance floor
-       (probabilistically prefer connections that fill deficient distance bands)
-  3. CHECK: Are we at max_connections? → REJECT
-     → Use total_conn (open + pending) here to prevent over-commitment
-  4. OTHERWISE: Evaluate via TopologyManager
+  2. CHECK: Are we at max_connections (open + pending)? → REJECT
+  3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
+     → Map all connection distances to log-space (1/d = uniform in log)
+     → Score = min distance to nearest neighbor in log-space
+     → Candidates filling the largest gap score highest
+     → Candidates outside [D_MIN, D_MAX] score 0 (including Sybil-close peers)
+  4. Below min_connections: probabilistic acceptance (soft filter)
+     → Below KLEINBERG_FILTER_MIN_CONNECTIONS (3): always ACCEPT
+     → Above that: accept_prob = 0.5 + gap_score (50% floor)
+     → Use ACTUAL open count, NOT speculative totals
+  5. At/above min_connections: strict ConnectionEvaluator
+     → Feed gap score into evaluator (accepts best candidate per window)
 
 WHEN closing a connection:
   → MUST remove from connections_by_location
