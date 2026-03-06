@@ -94,6 +94,67 @@ pub(crate) fn start_op_with_id(
     }
 }
 
+/// Create a GET operation pre-targeted at a specific peer, bypassing normal routing.
+/// Returns the operation and the message to send. Used for auto-fetching contracts
+/// from peers known to have them (e.g., UPDATE senders).
+pub(crate) fn start_targeted_op(
+    instance_id: ContractInstanceId,
+    target: PeerKeyLocation,
+    max_hops_to_live: usize,
+) -> (GetOp, GetMsg) {
+    let contract_location = Location::from(&instance_id);
+    let id = Transaction::new::<GetMsg>();
+    tracing::debug!(
+        tx = %id,
+        "Requesting targeted get contract {instance_id} @ loc({contract_location})"
+    );
+
+    let visited = super::VisitedPeers::new(&id);
+    let mut tried_peers = HashSet::new();
+    if let Some(addr) = target.socket_addr() {
+        tried_peers.insert(addr);
+    }
+
+    let state = Some(GetState::AwaitingResponse(AwaitingResponseData {
+        instance_id,
+        retries: 0,
+        fetch_contract: true,
+        requester: None,
+        current_hop: max_hops_to_live,
+        subscribe: false,
+        blocking_subscribe: false,
+        next_hop: target,
+        tried_peers,
+        alternatives: vec![],
+        attempts_at_hop: 1,
+        visited: visited.clone(),
+    }));
+
+    let msg = GetMsg::Request {
+        id,
+        instance_id,
+        fetch_contract: true,
+        htl: max_hops_to_live,
+        visited,
+    };
+
+    let op = GetOp {
+        id,
+        state,
+        result: None,
+        stats: Some(Box::new(GetStats {
+            contract_location,
+            next_peer: None,
+            transfer_time: None,
+            first_response_time: None,
+        })),
+        upstream_addr: None,
+        local_fallback: None,
+    };
+
+    (op, msg)
+}
+
 /// Request to get the current value from a contract.
 pub(crate) async fn request_get(
     op_manager: &OpManager,
@@ -848,6 +909,83 @@ impl GetOp {
         match &self.state {
             Some(GetState::AwaitingResponse(data)) => Some(data.current_hop),
             _ => None,
+        }
+    }
+
+    /// Try to retry this GET operation by sending to the next alternative peer.
+    /// If local alternatives are exhausted, `fallback_peers` provides additional
+    /// candidates (e.g., all connected peers for DBF search).
+    /// Returns `Ok((new_op, msg))` if a peer was available,
+    /// `Err(self)` if no peers remain (caller gets ownership back).
+    pub(crate) fn retry_with_next_alternative(
+        mut self,
+        max_hops_to_live: usize,
+        fallback_peers: &[PeerKeyLocation],
+    ) -> Result<(GetOp, GetMsg), Box<GetOp>> {
+        let state = match self.state.take() {
+            Some(s) => s,
+            None => return Err(Box::new(self)),
+        };
+        match state {
+            GetState::AwaitingResponse(mut data) => {
+                // If local alternatives exhausted, inject fallback peers we haven't tried
+                if data.alternatives.is_empty() && !fallback_peers.is_empty() {
+                    for peer in fallback_peers {
+                        if let Some(addr) = peer.socket_addr() {
+                            if !data.tried_peers.contains(&addr) {
+                                data.alternatives.push(peer.clone());
+                            }
+                        }
+                    }
+                    if !data.alternatives.is_empty() {
+                        tracing::info!(
+                            tx = %self.id,
+                            contract = %data.instance_id,
+                            new_candidates = data.alternatives.len(),
+                            "GET broadening search to all connected peers (DBF fallback)"
+                        );
+                    }
+                }
+
+                if data.alternatives.is_empty() {
+                    self.state = Some(GetState::AwaitingResponse(data));
+                    return Err(Box::new(self));
+                }
+
+                let next_target = data.alternatives.remove(0);
+                let instance_id = data.instance_id;
+                if let Some(addr) = next_target.socket_addr() {
+                    data.tried_peers.insert(addr);
+                }
+                tracing::info!(
+                    tx = %self.id,
+                    contract = %instance_id,
+                    target = %next_target,
+                    remaining_alternatives = data.alternatives.len(),
+                    "GET retrying with alternative peer after timeout"
+                );
+                data.next_hop = next_target;
+                data.attempts_at_hop += 1;
+                let visited = data.visited.clone();
+
+                self.state = Some(GetState::AwaitingResponse(data));
+
+                let msg = GetMsg::Request {
+                    id: self.id,
+                    instance_id,
+                    fetch_contract: true,
+                    htl: max_hops_to_live,
+                    visited,
+                };
+
+                Ok((self, msg))
+            }
+            other @ GetState::ReceivedRequest
+            | other @ GetState::PrepareRequest(_)
+            | other @ GetState::Finished(_) => {
+                self.state = Some(other);
+                Err(Box::new(self))
+            }
         }
     }
 }

@@ -273,6 +273,11 @@ pub(crate) struct OpManager {
     /// Used by connection_maintenance to directly attempt gateway connections
     /// when the node has zero ring connections (#3219).
     pub configured_gateways: Arc<Vec<PeerKeyLocation>>,
+    /// Tracks contracts for which a self-healing GET has been triggered
+    /// (e.g., when an UPDATE broadcast fails due to missing contract parameters).
+    /// Maps contract instance ID to the time the fetch was initiated,
+    /// with a cooldown to avoid repeated fetch attempts.
+    pub(crate) pending_contract_fetches: Arc<DashMap<ContractInstanceId, std::time::Instant>>,
 }
 
 impl Clone for OpManager {
@@ -299,6 +304,7 @@ impl Clone for OpManager {
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
             blocked_addresses: self.blocked_addresses.clone(),
             configured_gateways: self.configured_gateways.clone(),
+            pending_contract_fetches: self.pending_contract_fetches.clone(),
         }
     }
 }
@@ -420,6 +426,7 @@ impl OpManager {
                     .map(|gw| gw.peer_key_location.clone())
                     .collect(),
             ),
+            pending_contract_fetches: Arc::new(DashMap::new()),
         })
     }
 
@@ -1412,6 +1419,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     let mut ttl_set = BTreeSet::new();
 
     let mut delayed = vec![];
+    let mut get_retried: std::collections::HashMap<Transaction, usize> =
+        std::collections::HashMap::new();
     loop {
         crate::deterministic_select! {
             tx = new_transactions.recv() => {
@@ -1441,6 +1450,68 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             removed = before - after,
                             "Cleaned up stale contract_waiters entries"
                         );
+                    }
+                }
+
+                // Retry GET operations that have been waiting too long.
+                // If a GET has been pending for > GET_RETRY_THRESHOLD and has untried
+                // alternative peers, remove it from the map, advance to the next
+                // alternative, and re-submit. This prevents silent timeout when the
+                // selected peer is unreachable or drops the request.
+                const GET_RETRY_THRESHOLD: Duration = Duration::from_secs(20);
+                {
+                    // Clean up entries for completed operations
+                    get_retried.retain(|tx, _| ops.get.contains_key(tx));
+
+                    let mut retry_candidates: Vec<Transaction> = Vec::new();
+                    for entry in ops.get.iter() {
+                        let tx = *entry.key();
+                        let elapsed = tx.elapsed();
+                        // Allow retry every GET_RETRY_THRESHOLD seconds:
+                        // first retry at 20s, second at 40s, etc.
+                        let retry_count = get_retried.get(&tx).copied().unwrap_or(0);
+                        let next_retry_at = GET_RETRY_THRESHOLD * (retry_count as u32 + 1);
+                        if elapsed > next_retry_at {
+                            retry_candidates.push(tx);
+                        }
+                    }
+
+                    // Collect all connected peers once for DBF fallback
+                    let all_connected: Vec<_> = ring
+                        .connection_manager
+                        .get_connections_by_location()
+                        .values()
+                        .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
+                        .collect();
+
+                    for tx in retry_candidates {
+                        if let Some((_, get_op)) = ops.get.remove(&tx) {
+                            let max_htl = ring.max_hops_to_live;
+                            match get_op.retry_with_next_alternative(max_htl, &all_connected) {
+                                Ok((new_op, msg)) => {
+                                    *get_retried.entry(tx).or_insert(0) += 1;
+                                    ops.get.insert(tx, new_op);
+                                    let msg = crate::message::NetMessage::from(msg);
+                                    match event_loop_notifier
+                                        .notifications_sender
+                                        .try_send(Either::Left(msg))
+                                    {
+                                        Ok(()) => {}
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                %tx,
+                                                error = %e,
+                                                "Failed to send GET retry message"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(get_op) => {
+                                    // No alternatives — put it back for normal timeout
+                                    ops.get.insert(tx, *get_op);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1478,6 +1549,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     if still_waiting {
                         delayed.push(tx);
                     } else {
+                        get_retried.remove(&tx);
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
                         tracing::info!(
