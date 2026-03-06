@@ -1327,14 +1327,13 @@ impl OpManager {
         {
             use dashmap::mapref::entry::Entry;
             match self.pending_contract_fetches.entry(instance_id) {
-                Entry::Occupied(existing) => {
+                Entry::Occupied(mut existing) => {
                     let elapsed_ms = now_ms.saturating_sub(*existing.get());
                     if elapsed_ms < CONTRACT_FETCH_COOLDOWN_MS {
                         return; // Still in cooldown
                     }
-                    // Cooldown expired — update timestamp atomically
-                    drop(existing);
-                    self.pending_contract_fetches.insert(instance_id, now_ms);
+                    // Cooldown expired — update timestamp while still holding the lock
+                    *existing.get_mut() = now_ms;
                 }
                 Entry::Vacant(slot) => {
                     slot.insert(now_ms);

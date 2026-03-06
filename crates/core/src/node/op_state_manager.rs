@@ -1503,26 +1503,29 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 {
                                     Ok((new_op, msg)) => {
                                         let msg = crate::message::NetMessage::from(msg);
-                                        match event_loop_notifier
-                                            .notifications_sender
-                                            .try_send(Either::Left(msg))
+                                        // Insert op BEFORE sending message to avoid race
+                                        // where the response arrives before the op is stored.
+                                        ops.get.insert(tx, new_op);
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(1),
+                                            event_loop_notifier
+                                                .notifications_sender
+                                                .send(Either::Left(msg)),
+                                        )
+                                        .await
                                         {
-                                            Ok(()) => {
-                                                // Only count the retry if the message was sent
+                                            Ok(Ok(())) => {
+                                                // Count the retry now that message was sent
                                                 *get_retried.entry(tx).or_insert(0) += 1;
-                                                ops.get.insert(tx, new_op);
                                             }
-                                            Err(e) => {
-                                                // Send failed — put the op back WITHOUT
-                                                // incrementing retry count or marking the
-                                                // peer as tried, so we can retry next tick.
+                                            Ok(Err(_)) | Err(_) => {
+                                                // Channel closed or timeout — op is already
+                                                // stored, will be retried next tick.
                                                 tracing::warn!(
                                                     %tx,
-                                                    error = %e,
                                                     "Failed to send GET retry message, \
                                                      will retry next tick"
                                                 );
-                                                ops.get.insert(tx, new_op);
                                             }
                                         }
                                     }

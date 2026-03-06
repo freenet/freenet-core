@@ -971,6 +971,7 @@ impl GetOp {
 
                 let next_target = data.alternatives.remove(0);
                 let instance_id = data.instance_id;
+                let fetch_contract = data.fetch_contract;
                 if let Some(addr) = next_target.socket_addr() {
                     data.tried_peers.insert(addr);
                 }
@@ -990,7 +991,7 @@ impl GetOp {
                 let msg = GetMsg::Request {
                     id: self.id,
                     instance_id,
-                    fetch_contract: true,
+                    fetch_contract,
                     htl: max_hops_to_live,
                     visited,
                 };
@@ -3841,8 +3842,18 @@ mod tests {
         assert!(result.is_ok(), "Should succeed with local alternatives");
 
         let (new_op, msg) = result.unwrap_or_else(|_| panic!("expected Ok"));
-        // The message should be a Request
-        assert!(matches!(msg, GetMsg::Request { .. }));
+        // The message should be a Request preserving original fetch_contract
+        match &msg {
+            GetMsg::Request { fetch_contract, .. } => {
+                assert!(
+                    *fetch_contract,
+                    "retry must preserve original fetch_contract"
+                );
+            }
+            GetMsg::Response { .. }
+            | GetMsg::ResponseStreaming { .. }
+            | GetMsg::ResponseStreamingAck { .. } => panic!("Expected GetMsg::Request"),
+        }
         // Should have 1 alternative remaining
         if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
             assert_eq!(data.alternatives.len(), 1);
