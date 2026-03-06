@@ -3788,4 +3788,281 @@ mod tests {
             }
         }
     }
+
+    // === Tests for retry_with_next_alternative ===
+
+    use crate::operations::test_utils::make_peer;
+
+    fn make_awaiting_op(alternatives: Vec<PeerKeyLocation>, tried: &[PeerKeyLocation]) -> GetOp {
+        let id = Transaction::new::<GetMsg>();
+        let instance_id = ContractInstanceId::new([42u8; 32]);
+        let visited = VisitedPeers::new(&id);
+        let next_hop = make_peer(9000);
+        let mut tried_peers = HashSet::new();
+        for p in tried {
+            if let Some(addr) = p.socket_addr() {
+                tried_peers.insert(addr);
+            }
+        }
+        if let Some(addr) = next_hop.socket_addr() {
+            tried_peers.insert(addr);
+        }
+        GetOp {
+            id,
+            state: Some(GetState::AwaitingResponse(AwaitingResponseData {
+                instance_id,
+                retries: 0,
+                fetch_contract: true,
+                requester: None,
+                current_hop: 7,
+                subscribe: false,
+                blocking_subscribe: false,
+                next_hop,
+                tried_peers,
+                alternatives,
+                attempts_at_hop: 1,
+                visited,
+            })),
+            result: None,
+            stats: None,
+            upstream_addr: None,
+            local_fallback: None,
+            auto_fetch: false,
+        }
+    }
+
+    #[test]
+    fn retry_with_local_alternative_succeeds() {
+        let alt1 = make_peer(1001);
+        let alt2 = make_peer(1002);
+        let op = make_awaiting_op(vec![alt1.clone(), alt2], &[]);
+
+        let result = op.retry_with_next_alternative(7, &[]);
+        assert!(result.is_ok(), "Should succeed with local alternatives");
+
+        let (new_op, msg) = result.unwrap_or_else(|_| panic!("expected Ok"));
+        // The message should be a Request
+        assert!(matches!(msg, GetMsg::Request { .. }));
+        // Should have 1 alternative remaining
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            assert_eq!(data.alternatives.len(), 1);
+            assert!(data.tried_peers.contains(&alt1.socket_addr().unwrap()));
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    #[test]
+    fn retry_exhausted_returns_err() {
+        let op = make_awaiting_op(vec![], &[]);
+
+        let result = op.retry_with_next_alternative(7, &[]);
+        assert!(result.is_err(), "Should fail with no alternatives");
+
+        // Verify op is returned intact
+        let returned_op = match result {
+            Err(op) => *op,
+            Ok(_) => panic!("expected Err"),
+        };
+        assert!(
+            matches!(&returned_op.state, Some(GetState::AwaitingResponse(_))),
+            "State should be preserved"
+        );
+    }
+
+    #[test]
+    fn retry_dbf_fallback_injects_new_peers() {
+        // No local alternatives, but provide fallback peers
+        let fallback1 = make_peer(2001);
+        let fallback2 = make_peer(2002);
+        let op = make_awaiting_op(vec![], &[]);
+
+        let result = op.retry_with_next_alternative(7, &[fallback1.clone(), fallback2]);
+        assert!(result.is_ok(), "Should succeed with DBF fallback peers");
+
+        let (new_op, _msg) = result.unwrap_or_else(|_| panic!("expected Ok"));
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            // One fallback used as next_hop, one remaining
+            assert_eq!(data.alternatives.len(), 1);
+            assert!(data.tried_peers.contains(&fallback1.socket_addr().unwrap()));
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    #[test]
+    fn retry_dbf_fallback_skips_already_tried() {
+        let already_tried = make_peer(3001);
+        let fresh_peer = make_peer(3002);
+        let op = make_awaiting_op(vec![], std::slice::from_ref(&already_tried));
+
+        let result = op.retry_with_next_alternative(7, &[already_tried, fresh_peer.clone()]);
+        assert!(result.is_ok(), "Should find fresh_peer");
+
+        let (new_op, _msg) = result.unwrap_or_else(|_| panic!("expected Ok"));
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            assert_eq!(data.alternatives.len(), 0, "Only one fresh peer injected");
+            assert!(data
+                .tried_peers
+                .contains(&fresh_peer.socket_addr().unwrap()));
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    #[test]
+    fn retry_dbf_all_tried_returns_err() {
+        let tried1 = make_peer(4001);
+        let tried2 = make_peer(4002);
+        let op = make_awaiting_op(vec![], &[tried1.clone(), tried2.clone()]);
+
+        let result = op.retry_with_next_alternative(7, &[tried1, tried2]);
+        assert!(result.is_err(), "All fallback peers already tried");
+    }
+
+    #[test]
+    fn retry_wrong_state_returns_err() {
+        // PrepareRequest state
+        let op = make_get_op(
+            Some(GetState::PrepareRequest(PrepareRequestData {
+                instance_id: ContractInstanceId::new([1u8; 32]),
+                id: Transaction::new::<GetMsg>(),
+                fetch_contract: true,
+                subscribe: false,
+                blocking_subscribe: false,
+            })),
+            None,
+        );
+        assert!(op.retry_with_next_alternative(7, &[]).is_err());
+
+        // ReceivedRequest state
+        let op = make_get_op(Some(GetState::ReceivedRequest), None);
+        assert!(op.retry_with_next_alternative(7, &[]).is_err());
+
+        // None state
+        let op = make_get_op(None, None);
+        assert!(op.retry_with_next_alternative(7, &[]).is_err());
+    }
+
+    // === Tests for start_targeted_op ===
+
+    #[test]
+    fn start_targeted_op_creates_correct_state() {
+        let target = make_peer(5001);
+        let instance_id = ContractInstanceId::new([99u8; 32]);
+
+        let (op, msg) = start_targeted_op(instance_id, target.clone(), 10);
+
+        // Should be auto_fetch
+        assert!(op.auto_fetch, "Targeted op should be marked as auto_fetch");
+
+        // Should be in AwaitingResponse state targeting the peer
+        if let Some(GetState::AwaitingResponse(data)) = &op.state {
+            assert_eq!(data.instance_id, instance_id);
+            assert!(data.fetch_contract);
+            assert!(data.requester.is_none());
+            assert!(data.tried_peers.contains(&target.socket_addr().unwrap()));
+            assert!(data.alternatives.is_empty());
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+
+        // Message should be a Request with correct fields
+        match msg {
+            GetMsg::Request {
+                instance_id: msg_id,
+                fetch_contract,
+                htl,
+                ..
+            } => {
+                assert_eq!(msg_id, instance_id);
+                assert!(fetch_contract);
+                assert_eq!(htl, 10);
+            }
+            GetMsg::Response { .. }
+            | GetMsg::ResponseStreaming { .. }
+            | GetMsg::ResponseStreamingAck { .. } => {
+                panic!("Expected Request message")
+            }
+        }
+    }
+
+    // === Tests for is_client_initiated ===
+
+    #[test]
+    fn is_client_initiated_true_for_prepare_request() {
+        let op = make_get_op(
+            Some(GetState::PrepareRequest(PrepareRequestData {
+                instance_id: ContractInstanceId::new([1u8; 32]),
+                id: Transaction::new::<GetMsg>(),
+                fetch_contract: true,
+                subscribe: false,
+                blocking_subscribe: false,
+            })),
+            None,
+        );
+        assert!(op.is_client_initiated());
+    }
+
+    #[test]
+    fn is_client_initiated_true_for_awaiting_no_requester() {
+        let op = make_awaiting_op(vec![], &[]);
+        assert!(op.is_client_initiated());
+    }
+
+    #[test]
+    fn is_client_initiated_false_for_awaiting_with_requester() {
+        let id = Transaction::new::<GetMsg>();
+        let instance_id = ContractInstanceId::new([42u8; 32]);
+        let visited = VisitedPeers::new(&id);
+        let requester = make_peer(6001);
+        let op = GetOp {
+            id,
+            state: Some(GetState::AwaitingResponse(AwaitingResponseData {
+                instance_id,
+                retries: 0,
+                fetch_contract: true,
+                requester: Some(requester),
+                current_hop: 7,
+                subscribe: false,
+                blocking_subscribe: false,
+                next_hop: make_peer(6002),
+                tried_peers: HashSet::new(),
+                alternatives: vec![],
+                attempts_at_hop: 1,
+                visited,
+            })),
+            result: None,
+            stats: None,
+            upstream_addr: None,
+            local_fallback: None,
+            auto_fetch: false,
+        };
+        assert!(!op.is_client_initiated());
+    }
+
+    #[test]
+    fn is_client_initiated_false_for_auto_fetch() {
+        let target = make_peer(7001);
+        let instance_id = ContractInstanceId::new([77u8; 32]);
+        let (op, _msg) = start_targeted_op(instance_id, target, 10);
+        // auto_fetch ops should NOT be client-initiated even though requester is None
+        assert!(
+            !op.is_client_initiated(),
+            "Auto-fetch GET should not be client-initiated"
+        );
+    }
+
+    #[test]
+    fn is_client_initiated_false_for_other_states() {
+        let op = make_get_op(Some(GetState::ReceivedRequest), None);
+        assert!(!op.is_client_initiated());
+
+        let key = make_contract_key(1);
+        let op = make_get_op(Some(GetState::Finished(FinishedData { key })), None);
+        assert!(!op.is_client_initiated());
+
+        let op = make_get_op(None, None);
+        assert!(!op.is_client_initiated());
+    }
 }
