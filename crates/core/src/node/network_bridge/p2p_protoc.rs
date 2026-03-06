@@ -2512,6 +2512,17 @@ impl P2pConnManager {
                     "connect_peer: promoted to ring"
                 );
 
+                // Update the dashboard/network_status with the peer's location.
+                // Without this, peers promoted via this path show "—" on the
+                // dashboard because the initial record_peer_connected(addr, None, None)
+                // from handle_successful_connection is never updated.
+                let pkl = crate::ring::PeerKeyLocation::new(peer.pub_key().clone(), peer_addr);
+                crate::node::network_status::record_peer_connected(
+                    peer_addr,
+                    Some(loc.as_f64()),
+                    Some(pkl),
+                );
+
                 // tell the promoted peer about our subscriptions and cache
                 for (target, msg) in self
                     .bridge
@@ -2579,6 +2590,38 @@ impl P2pConnManager {
                 })
                 .ok();
             return Ok(());
+        }
+
+        // Early admission check: avoid expensive NAT hole-punching for connections
+        // that would be rejected by should_accept() after establishment. Only applies
+        // to non-transient (ring-bound) connections — transient gateway connections
+        // don't go through admission.
+        if !transient && !peer_addr.ip().is_unspecified() {
+            let connection_manager = &self.bridge.op_manager.ring.connection_manager;
+            let loc = peer
+                .location()
+                .unwrap_or_else(|| Location::from_address(&peer_addr));
+            if !connection_manager.should_accept(loc, peer_addr) {
+                tracing::info!(
+                    tx = %tx,
+                    remote = %peer_addr,
+                    %loc,
+                    "connect_peer: skipping connection — admission would reject"
+                );
+                callback
+                    .send_result(Err(()))
+                    .await
+                    .inspect_err(|err| {
+                        tracing::debug!(
+                            tx = %tx,
+                            remote = %peer_addr,
+                            ?err,
+                            "connect_peer: failed to notify early-rejection callback"
+                        );
+                    })
+                    .ok();
+                return Ok(());
+            }
         }
 
         // Check if this peer is in backoff due to previous connection failures.
@@ -3270,6 +3313,11 @@ impl P2pConnManager {
                         %loc,
                         "handle_successful_connection: promotion rejected by admission logic"
                     );
+                    // Drop the connection immediately instead of letting it linger
+                    // as a zombie for up to 5 minutes confusing the dashboard.
+                    crate::node::network_status::record_peer_disconnected(peer_addr);
+                    self.drop_connection_by_addr(peer_addr, handshake_commands)
+                        .await;
                     return Ok(());
                 }
                 let current = connection_manager.connection_count();
@@ -3281,6 +3329,11 @@ impl P2pConnManager {
                         %loc,
                         "handle_successful_connection: rejecting new connection to enforce cap"
                     );
+                    // Drop the connection immediately instead of letting it linger
+                    // as a zombie for up to 5 minutes confusing the dashboard.
+                    crate::node::network_status::record_peer_disconnected(peer_addr);
+                    self.drop_connection_by_addr(peer_addr, handshake_commands)
+                        .await;
                     return Ok(());
                 }
                 tracing::info!(%peer_addr, %loc, "handle_successful_connection: promoting connection into ring");
