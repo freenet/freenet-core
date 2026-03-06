@@ -552,6 +552,9 @@ impl ConnectionManager {
         // node genuinely needs more connections.
         // total_conn (which includes pending) is still used for max_connections
         // to prevent over-commitment.
+        let my_location = self.get_stored_location();
+        let connections = self.connections_by_location.read();
+
         let accepted = if total_conn >= self.max_connections {
             tracing::debug!(
                 addr = %addr,
@@ -561,19 +564,51 @@ impl ConnectionManager {
             );
             false
         } else if open < self.min_connections {
+            // Below min_connections: accept most connections, but use Kleinberg
+            // band scoring to probabilistically prefer connections that improve
+            // the distance distribution. This prevents the first N connections
+            // from being uniformly distributed, which defeats small-world routing.
+            //
+            // With fewer than 3 connections we always accept to avoid blocking
+            // bootstrap. Above that, we apply a soft filter: connections in
+            // over-represented bands are rejected with probability proportional
+            // to the over-representation. The floor acceptance rate of 50%
+            // ensures bootstrapping isn't blocked.
+            let accepted = if open < 3 {
+                true
+            } else if let Some(me) = my_location {
+                let band_counts =
+                    crate::topology::small_world_rand::count_bands(me, connections.keys().copied());
+                let total = connections.values().map(|v| v.len()).sum();
+                let dist = me.distance(location).as_f64();
+                let score = crate::topology::small_world_rand::kleinberg_band_score(
+                    dist,
+                    &band_counts,
+                    total,
+                );
+                // Accept with probability based on score, with 50% floor.
+                // score=1.0 (deficient band) → always accept
+                // score=0.0 (over-represented) → accept 50% of the time
+                let threshold = GlobalRng::random_range(0.0..=0.5);
+                score > threshold
+            } else {
+                true
+            };
+
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
                 open,
                 total_conn,
-                "should_accept: accepted (open connections below min)"
+                accepted,
+                "should_accept: below min_connections (Kleinberg-aware)"
             );
-            true
+            accepted
         } else {
             let accepted = self
                 .topology_manager
                 .write()
-                .evaluate_new_connection(location, Instant::now())
+                .evaluate_new_connection(location, Instant::now(), my_location, &connections)
                 .unwrap_or(true);
 
             tracing::debug!(
@@ -585,6 +620,7 @@ impl ConnectionManager {
             );
             accepted
         };
+        drop(connections);
         tracing::debug!(
             addr = %addr,
             peer_location = %location,
