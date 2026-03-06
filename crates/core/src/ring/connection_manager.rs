@@ -566,20 +566,45 @@ impl ConnectionManager {
                 "should_accept: rejected (max connections reached)"
             );
             false
-        } else {
-            // Unified Kleinberg gap scoring: score each candidate by how much
-            // it improves the 1/d distance distribution. The score is the
-            // candidate's min distance to its nearest neighbor in log-space,
-            // so candidates that fill the largest gap score highest.
+        } else if open < self.min_connections {
+            // Below min_connections: use gap score as a soft probabilistic
+            // filter to shape the distribution during bootstrap. We don't use
+            // the strict ConnectionEvaluator here because its "beat all in
+            // window" policy would accept at most one connection per window,
+            // stalling bootstrap when many peers try to connect.
             //
-            // Below KLEINBERG_FILTER_MIN_CONNECTIONS we always accept to avoid
-            // blocking bootstrap. Above that, we feed the gap score into the
-            // ConnectionEvaluator which picks the best candidate from recent
-            // arrivals — the same rate-limiting mechanism used previously, but
-            // now scoring topology quality instead of request density.
+            // Below KLEINBERG_FILTER_MIN_CONNECTIONS we always accept (too few
+            // connections for a meaningful gap score). Above that, higher gap
+            // scores get higher acceptance probability, with a 50% floor so
+            // bootstrap is never blocked.
             let accepted = if open < KLEINBERG_FILTER_MIN_CONNECTIONS {
                 true
             } else if let Some(me) = self.get_stored_location() {
+                let score = self.compute_kleinberg_score(me, location);
+                // score ranges from 0.0 (next to existing connection) to ~0.5
+                // (centered in empty range). Normalize to [0, 1] and apply
+                // a 50% floor: accept_prob = 0.5 + score (clamped to 1.0).
+                let accept_prob = (0.5 + score).min(1.0);
+                GlobalRng::random_range(0.0..1.0) < accept_prob
+            } else {
+                true
+            };
+
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                open,
+                total_conn,
+                accepted,
+                "should_accept: below min_connections (Kleinberg soft filter)"
+            );
+            accepted
+        } else {
+            // At/above min_connections: feed gap score through the
+            // ConnectionEvaluator which picks the best candidate from recent
+            // arrivals. This rate-limits acceptance to maintain topology
+            // quality while the node has enough connections for routing.
+            let accepted = if let Some(me) = self.get_stored_location() {
                 let score = self.compute_kleinberg_score(me, location);
                 self.topology_manager
                     .write()
@@ -591,11 +616,9 @@ impl ConnectionManager {
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
-                open,
                 total_conn,
                 accepted,
-                below_min = open < self.min_connections,
-                "should_accept: Kleinberg gap score"
+                "should_accept: above min_connections (Kleinberg evaluator)"
             );
             accepted
         };

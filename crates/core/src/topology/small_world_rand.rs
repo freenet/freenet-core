@@ -73,7 +73,9 @@ fn to_log_unit(distance: f64) -> f64 {
 /// the largest gap perfectly gets the highest possible score.
 ///
 /// Candidates outside [D_MIN, D_MAX] score 0 — they don't contribute to
-/// small-world routing.
+/// small-world routing. This also serves as Sybil/eclipse defense: co-located
+/// peers (distance < D_MIN) are never preferred by the scoring, preventing an
+/// attacker from filling all connection slots with nearby nodes.
 ///
 /// This is O(N) where N is the number of existing connections.
 pub(crate) fn kleinberg_score(

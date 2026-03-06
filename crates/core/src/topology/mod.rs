@@ -25,16 +25,22 @@
 //!
 //! ## Accepting Incoming Connections
 //!
-//! A single unified mechanism scores all inbound connection candidates by how much they
-//! improve the node's 1/d distance distribution (the **Kleinberg gap score**). The score
-//! is the candidate's minimum distance to its nearest neighbor in log-distance space —
-//! candidates that fill the largest gap in the distribution score highest. This score is
-//! fed into the [`ConnectionEvaluator`] which rate-limits acceptance by picking the best
-//! candidate from recent arrivals.
-//!
-//! Below `KLEINBERG_FILTER_MIN_CONNECTIONS` (bootstrap), all connections are accepted
-//! unconditionally. See `should_accept` in connection_manager and
+//! All inbound connection candidates are scored by the **Kleinberg gap score**: the
+//! candidate's minimum distance to its nearest neighbor in log-distance space. Candidates
+//! that fill the largest gap in the distribution score highest. See
 //! `small_world_rand::kleinberg_score`.
+//!
+//! Two acceptance policies use this score:
+//!
+//! 1. **Below min_connections** (`should_accept` in connection_manager): Probabilistic
+//!    acceptance with a 50% floor. Higher gap scores get higher acceptance probability.
+//!    This shapes the distribution during bootstrap without blocking it.
+//!
+//! 2. **At/above min_connections**: The gap score is fed into the [`ConnectionEvaluator`]
+//!    which rate-limits acceptance by picking the best candidate from recent arrivals.
+//!
+//! Below `KLEINBERG_FILTER_MIN_CONNECTIONS` (3), all connections are accepted
+//! unconditionally to avoid blocking initial bootstrap.
 //!
 //! ## Removing Connections
 //!
