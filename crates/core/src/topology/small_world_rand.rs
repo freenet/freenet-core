@@ -77,8 +77,8 @@ pub(crate) fn gap_target(
 ) -> Location {
     // Collect and sort connection distances in log-space
     let mut points: Vec<f64> = connection_distances
-        .filter(|&d| d >= D_MIN && d <= D_MAX)
-        .map(|d| to_log_unit(d))
+        .filter(|&d| (D_MIN..=D_MAX).contains(&d))
+        .map(to_log_unit)
         .collect();
 
     if points.is_empty() {
