@@ -12,7 +12,7 @@ const D_MIN: f64 = 0.01;
 const D_MAX: f64 = 0.5;
 
 /// Log ratio used for mapping distances to the unit interval in log-space.
-const LOG_RATIO: f64 = 3.912_023_005_428_146_1; // (D_MAX / D_MIN).ln()
+const LOG_RATIO: f64 = 3.912_023_005_428_146; // (D_MAX / D_MIN).ln()
 
 /// Generate a random link distance based on Kleinberg's d^{-1} distribution.
 ///
@@ -80,7 +80,7 @@ pub(crate) fn kleinberg_score(
     candidate_distance: f64,
     connection_distances: impl Iterator<Item = f64>,
 ) -> f64 {
-    if candidate_distance < D_MIN || candidate_distance > D_MAX {
+    if !(D_MIN..=D_MAX).contains(&candidate_distance) {
         return 0.0;
     }
 

@@ -631,14 +631,12 @@ impl ConnectionManager {
     fn compute_kleinberg_score(&self, my_location: Location, candidate: Location) -> f64 {
         let candidate_distance = my_location.distance(candidate).as_f64();
         let connections = self.connections_by_location.read();
-        let score = crate::topology::small_world_rand::kleinberg_score(
+        crate::topology::small_world_rand::kleinberg_score(
             candidate_distance,
             connections.iter().flat_map(|(loc, conns)| {
                 std::iter::repeat(my_location.distance(*loc).as_f64()).take(conns.len())
             }),
-        );
-        drop(connections);
-        score
+        )
     }
 
     /// Record the advertised location for a peer that we have decided to accept.

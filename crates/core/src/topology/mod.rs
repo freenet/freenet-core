@@ -141,45 +141,6 @@ impl TopologyManager {
         self.outbound_request_counter.record_request(recipient);
     }
 
-    /// Decide whether to accept a connection based on request density scoring.
-    ///
-    /// Retained for potential future use (e.g., hybrid scoring). Currently
-    /// `should_accept` uses `evaluate_new_connection_with_score` with the
-    /// Kleinberg gap score instead.
-    #[allow(dead_code)]
-    pub(crate) fn evaluate_new_connection(
-        &mut self,
-        candidate_location: Location,
-        current_time: Instant,
-    ) -> Result<bool, DensityMapError> {
-        tracing::debug!(
-            candidate_location = %candidate_location,
-            "Evaluating new connection"
-        );
-        let density_map = self
-            .cached_density_map
-            .get()
-            .ok_or(DensityMapError::EmptyNeighbors)?;
-        let score = density_map.get_density_at(candidate_location)?;
-
-        let accept = match self.connection_acquisition_strategy {
-            ConnectionAcquisitionStrategy::Slow => {
-                self.fast_connection_evaluator
-                    .record_only_with_current_time(score, current_time);
-                self.slow_connection_evaluator
-                    .record_and_eval_with_current_time(score, current_time)
-            }
-            ConnectionAcquisitionStrategy::Fast => {
-                self.slow_connection_evaluator
-                    .record_only_with_current_time(score, current_time);
-                self.fast_connection_evaluator
-                    .record_and_eval_with_current_time(score, current_time)
-            }
-        };
-
-        Ok(accept)
-    }
-
     /// Evaluate a pre-computed score through the connection evaluator.
     ///
     /// Used by `should_accept` to feed the Kleinberg gap score through the
@@ -683,8 +644,7 @@ mod tests {
         // Should be half way between 0.3 and 0.4 as that is where the most requests were.
         assert_eq!(best_candidate_location, Location::new(0.35));
 
-        // call evaluate_new_connection for locations 0.0 to 1.0 at 0.01 intervals and find the
-        // location with the highest score
+        // Find the location with the highest density score across 0.0 to 1.0
         let mut best_score = 0.0;
         let mut best_location = Location::new(0.0);
         for i in 0..100 {
