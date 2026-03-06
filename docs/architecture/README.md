@@ -14,7 +14,7 @@ Freenet Core is a peer-to-peer runtime that enables decentralized applications. 
 ```mermaid
 flowchart TB
     subgraph Client["Client Applications"]
-        ClientAPI["WebSocket API / HTTP Gateway"]
+        ClientAPI["WebSocket API / HTTP API"]
     end
 
     subgraph NodeLoop["Node Event Loop (Central Coordinator)"]
@@ -137,7 +137,7 @@ See [ring/README.md](ring/README.md) for detailed documentation.
 Client-facing APIs:
 
 - **WebSocket API** – Primary client interface (`/v1/contract/command`)
-- **HTTP Gateway** – REST endpoints for management
+- **HTTP API** – REST endpoints for management
 
 ### Simulation (`crates/core/src/simulation/`)
 
