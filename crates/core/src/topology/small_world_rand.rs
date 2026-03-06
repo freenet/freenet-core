@@ -98,10 +98,7 @@ pub(crate) fn gap_target(
     }
     gaps.push((prev, 1.0 - prev));
 
-    let best_gap_size = gaps
-        .iter()
-        .map(|(_, size)| *size)
-        .fold(0.0_f64, f64::max);
+    let best_gap_size = gaps.iter().map(|(_, size)| *size).fold(0.0_f64, f64::max);
 
     // Collect all gaps within 1% of the best (floating point tolerance)
     let threshold = best_gap_size * 0.99;
