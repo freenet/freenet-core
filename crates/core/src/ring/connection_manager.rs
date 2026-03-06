@@ -48,6 +48,12 @@ pub(crate) struct TransientEntry {
 /// to prevent permanent node isolation when CONNECT operations fail to complete.
 const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 
+/// Minimum connections before applying Kleinberg distance scoring on inbound
+/// connections. Below this threshold, all inbound connections are accepted to
+/// avoid blocking initial bootstrap. With fewer than 3 connections the gap
+/// score is too noisy to be useful.
+const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = 3;
+
 /// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
 /// This prevents thundering-herd scenarios where many joiners hit the same gateway at once.
 /// The value 8 balances throughput (parallel joins) against overload protection. Non-gateways
@@ -561,27 +567,58 @@ impl ConnectionManager {
             );
             false
         } else if open < self.min_connections {
+            // Below min_connections: use gap score as a soft probabilistic
+            // filter to shape the distribution during bootstrap. We don't use
+            // the strict ConnectionEvaluator here because its "beat all in
+            // window" policy would accept at most one connection per window,
+            // stalling bootstrap when many peers try to connect.
+            //
+            // Below KLEINBERG_FILTER_MIN_CONNECTIONS we always accept (too few
+            // connections for a meaningful gap score). Above that, higher gap
+            // scores get higher acceptance probability, with a 50% floor so
+            // bootstrap is never blocked.
+            let accepted = if open < KLEINBERG_FILTER_MIN_CONNECTIONS {
+                true
+            } else if let Some(me) = self.get_stored_location() {
+                let score = self.compute_kleinberg_score(me, location);
+                // score ranges from 0.0 (next to existing connection) to ~0.5
+                // (centered in empty range). Normalize to [0, 1] and apply
+                // a 50% floor: accept_prob = 0.5 + score (clamped to 1.0).
+                let accept_prob = (0.5 + score).min(1.0);
+                GlobalRng::random_range(0.0..1.0) < accept_prob
+            } else {
+                true
+            };
+
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
                 open,
                 total_conn,
-                "should_accept: accepted (open connections below min)"
+                accepted,
+                "should_accept: below min_connections (Kleinberg soft filter)"
             );
-            true
+            accepted
         } else {
-            let accepted = self
-                .topology_manager
-                .write()
-                .evaluate_new_connection(location, Instant::now())
-                .unwrap_or(true);
+            // At/above min_connections: feed gap score through the
+            // ConnectionEvaluator which picks the best candidate from recent
+            // arrivals. This rate-limits acceptance to maintain topology
+            // quality while the node has enough connections for routing.
+            let accepted = if let Some(me) = self.get_stored_location() {
+                let score = self.compute_kleinberg_score(me, location);
+                self.topology_manager
+                    .write()
+                    .evaluate_new_connection_with_score(score, Instant::now())
+            } else {
+                true
+            };
 
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
                 total_conn,
                 accepted,
-                "should_accept: topology manager decision"
+                "should_accept: above min_connections (Kleinberg evaluator)"
             );
             accepted
         };
@@ -608,6 +645,21 @@ impl ConnectionManager {
             self.record_pending_location(addr, location);
         }
         accepted
+    }
+
+    /// Compute the Kleinberg gap score for a candidate connection.
+    ///
+    /// Measures how much the candidate improves the 1/d distance distribution by
+    /// finding the candidate's min distance to its nearest neighbor in log-space.
+    fn compute_kleinberg_score(&self, my_location: Location, candidate: Location) -> f64 {
+        let candidate_distance = my_location.distance(candidate).as_f64();
+        let connections = self.connections_by_location.read();
+        crate::topology::small_world_rand::kleinberg_score(
+            candidate_distance,
+            connections.iter().flat_map(|(loc, conns)| {
+                std::iter::repeat(my_location.distance(*loc).as_f64()).take(conns.len())
+            }),
+        )
     }
 
     /// Record the advertised location for a peer that we have decided to accept.

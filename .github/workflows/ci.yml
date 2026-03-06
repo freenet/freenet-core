@@ -128,13 +128,12 @@ jobs:
 
   test_unit:
     name: Unit & Integration
-    runs-on: ubicloud-standard-16
+    runs-on: "${{ (github.event_name == 'merge_group' && startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
     timeout-minutes: 30
     needs: fmt_check
-    # Skip on:
-    # - push to main: PR already validated code before merge (saves ~$0.08/push)
-    # - release PRs: only bump versions, main already passed CI
-    # Note: merge_group MUST run — required status checks apply to merge queue entries
+    # Skip on push to main (PR already validated) and release PRs (only version bumps).
+    # For release merge_group entries: required checks can't be skipped (would block merge),
+    # so we run on a cheap runner and skip expensive steps via is_release output.
     if: |
       (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       !startsWith(github.head_ref, 'release/v')
@@ -148,27 +147,42 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
+      - name: Detect release merge queue
+        id: release_check
+        run: |
+          if [[ "${{ github.event_name }}" == "merge_group" && "${{ github.event.merge_group.head_commit.message }}" == build:\ release* ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping tests — release PRs only bump versions (main CI already validated)"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v6
+        if: steps.release_check.outputs.is_release != 'true'
 
       - name: Install mold linker
+        if: steps.release_check.outputs.is_release != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y mold
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.release_check.outputs.is_release != 'true'
         with:
           toolchain: 1.93.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: success() || steps.test.conclusion == 'failure'
+        if: (success() || steps.test.conclusion == 'failure') && steps.release_check.outputs.is_release != 'true'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install nextest
+        if: steps.release_check.outputs.is_release != 'true'
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Build
+        if: steps.release_check.outputs.is_release != 'true'
         env:
           # Use mold linker to avoid rust-lld crashes (see issue #2519)
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
@@ -179,12 +193,14 @@ jobs:
           make -C apps/freenet-ping -f run-ping.mk build
 
       - name: Clean test directories
+        if: steps.release_check.outputs.is_release != 'true'
         run: |
           # Remove freenet test directories from /tmp to avoid permission issues
           # when tests create directories with different user ownership
           rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
 
       - name: Test
+        if: steps.release_check.outputs.is_release != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -210,7 +226,7 @@ jobs:
             --profile ci -E 'not test(blocked_peers)'
 
       - name: Test blocked-peers (serial)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.release_check.outputs.is_release != 'true' }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -223,17 +239,17 @@ jobs:
             -E 'test(blocked_peers)' -j 1
 
       - name: Test ping-types
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.release_check.outputs.is_release != 'true' }}
         # freenet-ping-types tests need the std feature (default).
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
 
   test_simulation:
     name: Simulation
-    runs-on: ubicloud-standard-16
+    runs-on: "${{ (github.event_name == 'merge_group' && startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
     timeout-minutes: 30
     needs: fmt_check
-    # Same skip conditions as test_unit
+    # Same skip conditions as test_unit (see test_unit comment for details)
     if: |
       (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       !startsWith(github.head_ref, 'release/v')
@@ -243,23 +259,39 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
+      - name: Detect release merge queue
+        id: release_check
+        run: |
+          if [[ "${{ github.event_name }}" == "merge_group" && "${{ github.event.merge_group.head_commit.message }}" == build:\ release* ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping tests — release PRs only bump versions (main CI already validated)"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v6
+        if: steps.release_check.outputs.is_release != 'true'
 
       - name: Install mold linker
+        if: steps.release_check.outputs.is_release != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y mold
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.release_check.outputs.is_release != 'true'
         with:
           toolchain: 1.93.0
 
       - uses: Swatinem/rust-cache@v2
+        if: steps.release_check.outputs.is_release != 'true'
 
       - name: Install nextest
+        if: steps.release_check.outputs.is_release != 'true'
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run simulation tests
+        if: steps.release_check.outputs.is_release != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -276,13 +308,13 @@ jobs:
   nat_validation:
     name: NAT Validation
     needs: fmt_check
-    runs-on: ubicloud-standard-16
+    runs-on: "${{ (github.event_name == 'merge_group' && startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
     timeout-minutes: 30
     # Skip on:
     # - push to main: PR already validated code before merge
     # - release PRs: only bump versions
     # - dependabot PRs: just version bumps, Test job is sufficient
-    # Note: merge_group MUST run — required status checks apply to merge queue entries
+    # For release merge_group entries: run on cheap runner and skip expensive steps
     if: |
       (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       !startsWith(github.head_ref, 'release/v') &&
@@ -293,27 +325,44 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
+      - name: Detect release merge queue
+        id: release_check
+        run: |
+          if [[ "${{ github.event_name }}" == "merge_group" && "${{ github.event.merge_group.head_commit.message }}" == build:\ release* ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping tests — release PRs only bump versions (main CI already validated)"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v6
+        if: steps.release_check.outputs.is_release != 'true'
 
       - name: Install dependencies
+        if: steps.release_check.outputs.is_release != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y mold liblzma-dev
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.release_check.outputs.is_release != 'true'
         with:
           toolchain: 1.93.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
+        if: steps.release_check.outputs.is_release != 'true'
 
       - name: Pull Docker images for NAT simulation
+        if: steps.release_check.outputs.is_release != 'true'
         run: docker pull alpine:latest
 
       - name: Install nextest
+        if: steps.release_check.outputs.is_release != 'true'
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Build
+        if: steps.release_check.outputs.is_release != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -323,6 +372,7 @@ jobs:
           make -C apps/freenet-ping -f run-ping.mk build
 
       - name: Run Docker NAT test
+        if: steps.release_check.outputs.is_release != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
