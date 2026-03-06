@@ -437,6 +437,11 @@ impl TopologyManager {
     /// Targets the center of the largest gap in the node's current connection
     /// distribution in log-distance space. Falls back to random Kleinberg 1/d
     /// sampling when own location is unknown or there are no existing connections.
+    ///
+    /// Note: when `count > 1`, all targets may cluster in the same gap since
+    /// the distance snapshot is not updated between iterations. This is
+    /// self-correcting: after connections succeed, subsequent calls to
+    /// `adjust_topology` will see filled gaps and target different ranges.
     fn sample_targets(
         my_location: &Option<Location>,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
