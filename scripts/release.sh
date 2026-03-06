@@ -12,6 +12,19 @@ if ! PROJECT_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)
     exit 1
 fi
 
+# Save original branch so we can restore it on exit (avoids leaving user on release branch)
+ORIGINAL_BRANCH="$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null || echo "")"
+restore_branch() {
+    local current
+    current="$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null || echo "")"
+    if [[ -n "$ORIGINAL_BRANCH" && "$current" != "$ORIGINAL_BRANCH" ]]; then
+        echo ""
+        echo "Restoring original branch ($ORIGINAL_BRANCH)..."
+        git -C "$PROJECT_ROOT" checkout "$ORIGINAL_BRANCH" 2>/dev/null || true
+    fi
+}
+trap restore_branch EXIT
+
 # Parse arguments
 VERSION=""
 MIN_COMPATIBLE=""
@@ -488,35 +501,47 @@ check_prerequisites() {
     # Check if main branch CI is green (required before skipping tests on release PR)
     # Note: GitHub Actions uses Check Runs API, not the legacy Status API
     if [[ "$DRY_RUN" == "false" ]]; then
-        echo -n "  Checking main branch CI status... "
-        local check_runs_json
-        check_runs_json=$(gh api repos/freenet/freenet-core/commits/main/check-runs 2>/dev/null || echo "{}")
+        local ci_max_wait=600  # 10 minutes max wait for pending CI
+        local ci_elapsed=0
+        local ci_interval=30
 
-        local total_checks in_progress_count failed_count
-        total_checks=$(echo "$check_runs_json" | jq '.total_count // 0')
-        in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and (.name | startswith("Build for") | not) and .name != "claude")] | length')
-        failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude")] | length')
+        while true; do
+            echo -n "  Checking main branch CI status... "
+            local check_runs_json
+            check_runs_json=$(gh api repos/freenet/freenet-core/commits/main/check-runs 2>/dev/null || echo "{}")
 
-        if [[ "$total_checks" == "0" ]]; then
-            echo "⚠️  (no checks found)"
-            echo "  ⚠️  Could not find any CI checks for main branch"
-            echo "     Proceeding anyway - verify CI manually if needed"
-        elif [[ "$in_progress_count" -gt 0 ]]; then
-            echo "⚠️  (pending: $in_progress_count checks running)"
-            echo "  ⚠️  Main branch CI is still running"
-            echo "     Release PRs skip slow tests, so main must be green first"
-            echo "     Wait for CI to complete or run with tests enabled"
-            exit 1
-        elif [[ "$failed_count" -gt 0 ]]; then
-            echo "✗ ($failed_count checks failed)"
-            local failed_names
-            failed_names=$(echo "$check_runs_json" | jq -r '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped")] | .[].name' | head -5)
-            echo "  ✗ Main branch CI is failing - cannot release"
-            echo "     Failed checks: $failed_names"
-            exit 1
-        else
-            echo "✓ (green - $total_checks checks passed)"
-        fi
+            local total_checks in_progress_count failed_count
+            total_checks=$(echo "$check_runs_json" | jq '.total_count // 0')
+            in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and (.name | startswith("Build for") | not) and .name != "claude")] | length')
+            failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude")] | length')
+
+            if [[ "$total_checks" == "0" ]]; then
+                echo "⚠️  (no checks found)"
+                echo "  ⚠️  Could not find any CI checks for main branch"
+                echo "     Proceeding anyway - verify CI manually if needed"
+                break
+            elif [[ "$in_progress_count" -gt 0 ]]; then
+                if [[ $ci_elapsed -ge $ci_max_wait ]]; then
+                    echo "⚠️  (still pending after ${ci_max_wait}s)"
+                    echo "  ⚠️  Main branch CI is still running after ${ci_max_wait}s"
+                    echo "     Release PRs skip slow tests, so main must be green first"
+                    exit 1
+                fi
+                echo "⏳ ($in_progress_count checks running, waiting... ${ci_elapsed}s/${ci_max_wait}s)"
+                sleep $ci_interval
+                ci_elapsed=$((ci_elapsed + ci_interval))
+            elif [[ "$failed_count" -gt 0 ]]; then
+                echo "✗ ($failed_count checks failed)"
+                local failed_names
+                failed_names=$(echo "$check_runs_json" | jq -r '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped")] | .[].name' | head -5)
+                echo "  ✗ Main branch CI is failing - cannot release"
+                echo "     Failed checks: $failed_names"
+                exit 1
+            else
+                echo "✓ (green - $total_checks checks passed)"
+                break
+            fi
+        done
     fi
 
     # Check required tools
