@@ -313,8 +313,9 @@ impl TopologyManager {
     /// Determine whether to add or remove connections based on current connection
     /// count and resource usage.
     ///
-    /// When adding connections, targets are always sampled from Kleinberg's 1/d
-    /// distribution centered on own location (see `small_world_rand::kleinberg_target`).
+    /// When adding connections, targets are selected using gap-based targeting:
+    /// the center of the largest gap in the node's connection distribution in
+    /// log-distance space (see `small_world_rand::gap_target`).
     /// When own location is unknown, random targets are used as fallback.
     pub(crate) fn adjust_topology(
         &mut self,
@@ -958,7 +959,7 @@ mod tests {
 
     // Test that resource-based addition uses gap-based targets biased toward own location.
     #[test_log::test]
-    fn test_resource_based_add_uses_kleinberg_targets() {
+    fn test_resource_based_add_uses_gap_targets() {
         let _guard = crate::config::GlobalRng::seed_guard(0xBEEF_CAFE);
         let mut resource_manager = setup_topology_manager(1000.0);
         let peers: Vec<PeerKeyLocation> = generate_random_peers(6);

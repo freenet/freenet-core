@@ -422,6 +422,92 @@ mod tests {
     }
 
     #[test]
+    fn gap_target_all_distances_outside_range() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xFEED_FACE);
+        let my_loc = Location::new(0.5);
+        // All distances outside [D_MIN=0.01, D_MAX=0.5] — should fallback
+        let existing = [0.001, 0.002, 0.7];
+        for _ in 0..100 {
+            let target = gap_target(my_loc, existing.iter().copied());
+            let v = target.as_f64();
+            assert!(
+                (0.0..1.0).contains(&v),
+                "Target {v} outside valid range when all distances out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn gap_target_single_connection() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xBAAD_F00D);
+        let my_loc = Location::new(0.5);
+        // Single short-distance connection — largest gap should be at long distance
+        let existing = [0.015];
+        let mut long_count = 0;
+        let trials = 100;
+        for _ in 0..trials {
+            let target = gap_target(my_loc, existing.iter().copied());
+            let dist = my_loc.distance(target).as_f64();
+            if dist > 0.05 {
+                long_count += 1;
+            }
+        }
+        assert!(
+            long_count > trials / 2,
+            "Expected gap targeting to favor long-distance with single short connection, \
+             got {long_count}/{trials}"
+        );
+    }
+
+    #[test]
+    fn gap_target_duplicate_distances() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xDEAD_C0DE);
+        let my_loc = Location::new(0.5);
+        // Multiple connections at the same distance should behave like one
+        let single = [0.1];
+        let dupes = [0.1, 0.1, 0.1];
+        let mut targets_single = Vec::new();
+        let mut targets_dupes = Vec::new();
+        for _ in 0..200 {
+            targets_single.push(gap_target(my_loc, single.iter().copied()));
+        }
+        for _ in 0..200 {
+            targets_dupes.push(gap_target(my_loc, dupes.iter().copied()));
+        }
+        // Both should have similar distance distributions
+        let avg_dist_single: f64 = targets_single
+            .iter()
+            .map(|t| my_loc.distance(*t).as_f64())
+            .sum::<f64>()
+            / 200.0;
+        let avg_dist_dupes: f64 = targets_dupes
+            .iter()
+            .map(|t| my_loc.distance(*t).as_f64())
+            .sum::<f64>()
+            / 200.0;
+        let diff = (avg_dist_single - avg_dist_dupes).abs();
+        assert!(
+            diff < 0.1,
+            "Duplicate distances should behave like single: avg diff {diff:.4}"
+        );
+    }
+
+    #[test]
+    fn gap_target_wraps_near_boundary() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
+        let my_loc = Location::new(0.95);
+        let existing = [0.1, 0.3];
+        for _ in 0..1000 {
+            let target = gap_target(my_loc, existing.iter().copied());
+            let v = target.as_f64();
+            assert!(
+                (0.0..1.0).contains(&v),
+                "Target {v} outside valid range near boundary"
+            );
+        }
+    }
+
+    #[test]
     fn kleinberg_target_produces_valid_locations() {
         let my_loc = Location::new(0.5);
         for _ in 0..1000 {
