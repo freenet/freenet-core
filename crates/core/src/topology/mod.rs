@@ -25,17 +25,16 @@
 //!
 //! ## Accepting Incoming Connections
 //!
-//! Two mechanisms shape inbound connection topology:
+//! A single unified mechanism scores all inbound connection candidates by how much they
+//! improve the node's 1/d distance distribution (the **Kleinberg gap score**). The score
+//! is the candidate's minimum distance to its nearest neighbor in log-distance space —
+//! candidates that fill the largest gap in the distribution score highest. This score is
+//! fed into the [`ConnectionEvaluator`] which rate-limits acceptance by picking the best
+//! candidate from recent arrivals.
 //!
-//! 1. **Below min_connections** (`should_accept` in connection_manager): Kleinberg-aware
-//!    soft filter with 50% acceptance floor. Uses logarithmic distance band scoring to
-//!    probabilistically prefer connections that fill deficient bands. This shapes the
-//!    distance distribution during bootstrap.
-//!
-//! 2. **At/above min_connections** (`evaluate_new_connection`): Request density scoring
-//!    via the ConnectionEvaluator. Accepts only if the candidate's density score beats
-//!    all other candidates in a time window. When no density map exists (early bootstrap),
-//!    returns Err and the caller falls back to accepting all connections.
+//! Below `KLEINBERG_FILTER_MIN_CONNECTIONS` (bootstrap), all connections are accepted
+//! unconditionally. See `should_accept` in connection_manager and
+//! `small_world_rand::kleinberg_score`.
 //!
 //! ## Removing Connections
 //!
@@ -142,11 +141,12 @@ impl TopologyManager {
         self.outbound_request_counter.record_request(recipient);
     }
 
-    /// Decide whether to accept a connection from a new candidate peer based on
-    /// request density at its location, compared against other recent candidates.
+    /// Decide whether to accept a connection based on request density scoring.
     ///
-    /// Used when the node has at/above min_connections. Below min_connections,
-    /// the Kleinberg band filter in `should_accept` handles distance distribution.
+    /// Retained for potential future use (e.g., hybrid scoring). Currently
+    /// `should_accept` uses `evaluate_new_connection_with_score` with the
+    /// Kleinberg gap score instead.
+    #[allow(dead_code)]
     pub(crate) fn evaluate_new_connection(
         &mut self,
         candidate_location: Location,
@@ -178,6 +178,31 @@ impl TopologyManager {
         };
 
         Ok(accept)
+    }
+
+    /// Evaluate a pre-computed score through the connection evaluator.
+    ///
+    /// Used by `should_accept` to feed the Kleinberg gap score through the
+    /// same windowed comparison mechanism that rate-limits connection acceptance.
+    pub(crate) fn evaluate_new_connection_with_score(
+        &mut self,
+        score: f64,
+        current_time: Instant,
+    ) -> bool {
+        match self.connection_acquisition_strategy {
+            ConnectionAcquisitionStrategy::Slow => {
+                self.fast_connection_evaluator
+                    .record_only_with_current_time(score, current_time);
+                self.slow_connection_evaluator
+                    .record_and_eval_with_current_time(score, current_time)
+            }
+            ConnectionAcquisitionStrategy::Fast => {
+                self.slow_connection_evaluator
+                    .record_only_with_current_time(score, current_time);
+                self.fast_connection_evaluator
+                    .record_and_eval_with_current_time(score, current_time)
+            }
+        }
     }
 
     #[cfg(test)]

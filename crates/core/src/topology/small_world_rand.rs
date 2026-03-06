@@ -11,14 +11,8 @@ const D_MIN: f64 = 0.01;
 /// Maximum ring distance (half the ring).
 const D_MAX: f64 = 0.5;
 
-/// Number of logarithmic distance bands for Kleinberg distribution enforcement.
-/// Band boundaries are D_MIN * (D_MAX/D_MIN)^(k/NUM_BANDS) for k in 0..NUM_BANDS.
-/// With D_MIN=0.01 and D_MAX=0.5, 4 bands gives equal probability mass per band:
-///   Band 0: [0.010, 0.027)  — very short
-///   Band 1: [0.027, 0.071)  — short
-///   Band 2: [0.071, 0.188)  — medium
-///   Band 3: [0.188, 0.500]  — long
-pub(crate) const NUM_BANDS: usize = 4;
+/// Log ratio used for mapping distances to the unit interval in log-space.
+const LOG_RATIO: f64 = 3.912_023_005_428_146_1; // (D_MAX / D_MIN).ln()
 
 /// Generate a random link distance based on Kleinberg's d^{-1} distribution.
 ///
@@ -54,85 +48,62 @@ pub(crate) fn kleinberg_target(my_location: Location) -> Location {
     Location::new_rounded(my_location.as_f64() + offset)
 }
 
-/// Compute which logarithmic distance band a given distance falls into.
-/// Returns `None` if the distance is outside [D_MIN, D_MAX].
+/// Map a ring distance to the unit interval in log-space.
 ///
-/// Bands are uniform in log-distance space, matching the 1/d distribution
-/// where each band should contain equal probability mass.
-pub(crate) fn distance_band(distance: f64) -> Option<usize> {
-    if !(D_MIN..=D_MAX).contains(&distance) {
-        return None;
+/// The 1/d distribution is uniform in log-distance, so this transform maps
+/// the ideal connection distribution to Uniform[0, 1]. Distances at or below
+/// `D_MIN` map to 0; distances at or above `D_MAX` map to 1.
+fn to_log_unit(distance: f64) -> f64 {
+    if distance <= D_MIN {
+        return 0.0;
     }
-    let log_ratio = (D_MAX / D_MIN).ln();
-    let band = ((distance / D_MIN).ln() / log_ratio * NUM_BANDS as f64).floor() as usize;
-    Some(band.min(NUM_BANDS - 1))
-}
-
-/// Score how much accepting a candidate at a given distance improves the
-/// node's distance distribution toward the ideal 1/d (Kleinberg) distribution.
-///
-/// Returns a score in [0.0, 1.0] where higher means the candidate fills a
-/// more deficient band. A candidate in the most under-represented band
-/// scores 1.0; one in the most over-represented band scores close to 0.0.
-///
-/// `band_counts` is the number of existing connections in each of the
-/// `NUM_BANDS` logarithmic distance bands.
-pub(crate) fn kleinberg_band_score(
-    candidate_distance: f64,
-    band_counts: &[usize; NUM_BANDS],
-) -> f64 {
-    let band = match distance_band(candidate_distance) {
-        Some(b) => b,
-        None => {
-            if candidate_distance < D_MIN {
-                // Treat very close connections as band 0 (shortest). This ensures
-                // co-located peers are subject to band deficit scoring rather than
-                // always being accepted, preventing Sybil/eclipse concentration.
-                0
-            } else {
-                // Connections farther than D_MAX are useless for routing.
-                return 0.0;
-            }
-        }
-    };
-
-    // Ideal: each band gets equal share of connections in [D_MIN, D_MAX].
-    // Connections outside [D_MIN, D_MAX] don't count against any band.
-    let in_range: usize = band_counts.iter().sum();
-    if in_range == 0 {
+    if distance >= D_MAX {
         return 1.0;
     }
-
-    let ideal_per_band = in_range as f64 / NUM_BANDS as f64;
-    let actual = band_counts[band] as f64;
-
-    // Deficit ratio: how far below ideal this band is.
-    // deficit > 0 means under-represented, deficit < 0 means over-represented.
-    let deficit = (ideal_per_band - actual) / ideal_per_band.max(1.0);
-
-    // Map deficit to [0, 1] score. deficit=1.0 (empty band) → score=1.0,
-    // deficit=0.0 (at ideal) → score=0.5, deficit=-1.0 (2x over) → score=0.0
-    (0.5 + deficit * 0.5).clamp(0.0, 1.0)
+    (distance / D_MIN).ln() / LOG_RATIO
 }
 
-/// Count existing connections per logarithmic distance band relative to
-/// `my_location`.
-pub(crate) fn count_bands(
-    my_location: Location,
-    connection_locations: impl Iterator<Item = Location>,
-) -> [usize; NUM_BANDS] {
-    let mut counts = [0usize; NUM_BANDS];
-    for loc in connection_locations {
-        let dist = my_location.distance(loc).as_f64();
-        match distance_band(dist) {
-            Some(band) => counts[band] += 1,
-            // Connections closer than D_MIN count toward band 0 (shortest).
-            // Connections beyond D_MAX are excluded.
-            None if dist < D_MIN => counts[0] += 1,
-            None => {}
+/// Score how much a candidate connection at `candidate_distance` improves the
+/// node's distance distribution toward the ideal Kleinberg 1/d distribution,
+/// given existing connections at `connection_distances`.
+///
+/// The score equals the distance from the candidate to its nearest neighbor
+/// in log-space (including the boundaries 0 and 1). Higher scores mean the
+/// candidate fills a larger gap in the distribution. A candidate that bisects
+/// the largest gap perfectly gets the highest possible score.
+///
+/// Candidates outside [D_MIN, D_MAX] score 0 — they don't contribute to
+/// small-world routing.
+///
+/// This is O(N) where N is the number of existing connections.
+pub(crate) fn kleinberg_score(
+    candidate_distance: f64,
+    connection_distances: impl Iterator<Item = f64>,
+) -> f64 {
+    if candidate_distance < D_MIN || candidate_distance > D_MAX {
+        return 0.0;
+    }
+
+    let u_c = to_log_unit(candidate_distance);
+
+    // Find the nearest neighbors below and above the candidate in log-space.
+    // Start with boundaries 0 and 1.
+    let mut nearest_below = 0.0_f64;
+    let mut nearest_above = 1.0_f64;
+
+    for d in connection_distances {
+        let u = to_log_unit(d);
+        if u <= u_c && u > nearest_below {
+            nearest_below = u;
+        } else if u > u_c && u < nearest_above {
+            nearest_above = u;
         }
     }
-    counts
+
+    // Score = min distance to nearest neighbor in log-space.
+    // A candidate in the middle of a large gap scores high.
+    // A candidate next to an existing connection scores low.
+    (u_c - nearest_below).min(nearest_above - u_c)
 }
 
 #[cfg(test)]
@@ -150,6 +121,109 @@ mod tests {
 
     use super::*;
     use statrs::distribution::*;
+
+    #[test]
+    fn log_ratio_is_correct() {
+        let computed = (D_MAX / D_MIN).ln();
+        assert!(
+            (LOG_RATIO - computed).abs() < 1e-10,
+            "LOG_RATIO constant {LOG_RATIO} doesn't match computed {computed}"
+        );
+    }
+
+    #[test]
+    fn to_log_unit_boundaries() {
+        assert_eq!(to_log_unit(D_MIN), 0.0);
+        assert_eq!(to_log_unit(D_MAX), 1.0);
+        assert_eq!(to_log_unit(0.001), 0.0); // below D_MIN
+        assert_eq!(to_log_unit(0.6), 1.0); // above D_MAX
+    }
+
+    #[test]
+    fn to_log_unit_midpoint() {
+        // Geometric mean of D_MIN and D_MAX should map to 0.5
+        let geometric_mean = (D_MIN * D_MAX).sqrt();
+        let u = to_log_unit(geometric_mean);
+        assert!(
+            (u - 0.5).abs() < 0.01,
+            "Geometric mean should map to ~0.5, got {u}"
+        );
+    }
+
+    #[test]
+    fn score_no_connections() {
+        // With no existing connections, candidate is bracketed by boundaries 0 and 1.
+        // Geometric mean maps to 0.5, so min(0.5, 0.5) = 0.5.
+        let geometric_mean = (D_MIN * D_MAX).sqrt();
+        let score = kleinberg_score(geometric_mean, std::iter::empty());
+        assert!(
+            (score - 0.5).abs() < 0.01,
+            "Midpoint candidate with no connections should score ~0.5, got {score}"
+        );
+    }
+
+    #[test]
+    fn score_center_of_gap_beats_edge() {
+        // Existing connections near boundaries: leave a big gap in the middle.
+        let existing = [0.015, 0.45]; // near D_MIN and near D_MAX
+
+        // Candidate A: center of gap (geometric mean ≈ 0.07)
+        let center = (0.015_f64 * 0.45).sqrt();
+        let score_center = kleinberg_score(center, existing.iter().copied());
+
+        // Candidate B: right next to an existing connection
+        let score_edge = kleinberg_score(0.016, existing.iter().copied());
+
+        assert!(
+            score_center > score_edge,
+            "Center candidate ({score_center:.4}) should beat edge candidate ({score_edge:.4})"
+        );
+    }
+
+    #[test]
+    fn score_fills_largest_gap() {
+        // Connections clustered at short distances, large gap at long distances.
+        let existing = [0.012, 0.015, 0.02];
+
+        // Long-distance candidate fills the big gap
+        let score_long = kleinberg_score(0.15, existing.iter().copied());
+        // Short-distance candidate lands in a crowded region
+        let score_short = kleinberg_score(0.014, existing.iter().copied());
+
+        assert!(
+            score_long > score_short,
+            "Long-distance ({score_long:.4}) should beat short-distance ({score_short:.4}) \
+             when short range is crowded"
+        );
+    }
+
+    #[test]
+    fn score_outside_range_is_zero() {
+        let existing = [0.1];
+        assert_eq!(kleinberg_score(0.005, existing.iter().copied()), 0.0);
+        assert_eq!(kleinberg_score(0.6, existing.iter().copied()), 0.0);
+    }
+
+    #[test]
+    fn score_perfectly_uniform_scores_equal() {
+        // Place connections at equally-spaced log-distances (quartiles).
+        // Each new candidate in a remaining gap should score roughly equally.
+        let d_at = |u: f64| D_MIN * (D_MAX / D_MIN).powf(u);
+        let existing = [d_at(0.25), d_at(0.5), d_at(0.75)];
+
+        // Candidates at 0.125 and 0.625 are both centered in their respective gaps.
+        let score_a = kleinberg_score(d_at(0.125), existing.iter().copied());
+        let score_b = kleinberg_score(d_at(0.625), existing.iter().copied());
+
+        assert!(
+            (score_a - score_b).abs() < 0.01,
+            "Equally-centered candidates should score equally: {score_a:.4} vs {score_b:.4}"
+        );
+        assert!(
+            (score_a - 0.125).abs() < 0.01,
+            "Expected score ~0.125, got {score_a:.4}"
+        );
+    }
 
     #[test]
     fn chi_squared_test() {
@@ -249,95 +323,5 @@ mod tests {
                 "Target {v} outside valid range for boundary location"
             );
         }
-    }
-
-    #[test]
-    fn distance_band_covers_full_range() {
-        // Band boundaries should tile [D_MIN, D_MAX] without gaps
-        assert_eq!(distance_band(0.01), Some(0));
-        assert_eq!(distance_band(0.02), Some(0));
-        assert_eq!(distance_band(0.05), Some(1));
-        assert_eq!(distance_band(0.1), Some(2));
-        assert_eq!(distance_band(0.3), Some(3));
-        assert_eq!(distance_band(0.5), Some(3));
-        // Outside range
-        assert_eq!(distance_band(0.005), None);
-        assert_eq!(distance_band(0.6), None);
-    }
-
-    #[test]
-    fn band_score_favors_deficient_bands() {
-        // All connections in band 3 (long range), none in band 0 (short)
-        let counts = [0, 0, 0, 10];
-
-        // Short-distance candidate should score high (fills deficit)
-        let short_score = kleinberg_band_score(0.015, &counts);
-        // Long-distance candidate should score low (over-represented)
-        let long_score = kleinberg_band_score(0.4, &counts);
-
-        assert!(
-            short_score > long_score,
-            "Short connection (score={short_score:.2}) should score higher than \
-             long connection (score={long_score:.2}) when short bands are empty"
-        );
-        assert!(
-            short_score > 0.8,
-            "Empty band should score near 1.0, got {short_score:.2}"
-        );
-        assert!(
-            long_score < 0.3,
-            "Over-full band should score near 0.0, got {long_score:.2}"
-        );
-    }
-
-    #[test]
-    fn band_score_balanced_connections() {
-        // Balanced distribution: 5 in each band
-        let counts = [5, 5, 5, 5];
-
-        // All bands at ideal, so all scores should be ~0.5
-        let score = kleinberg_band_score(0.015, &counts);
-        assert!(
-            (0.4..=0.6).contains(&score),
-            "Balanced band should score ~0.5, got {score:.2}"
-        );
-    }
-
-    #[test]
-    fn count_bands_correct() {
-        let my_loc = Location::new(0.5);
-        let peers = vec![
-            Location::new(0.505), // distance 0.005 → sub-D_MIN, counts in band 0
-            Location::new(0.515), // distance 0.015 → band 0
-            Location::new(0.55),  // distance 0.05  → band 1
-            Location::new(0.6),   // distance 0.1   → band 2
-            Location::new(0.8),   // distance 0.3   → band 3
-        ];
-        let counts = count_bands(my_loc, peers.into_iter());
-        assert_eq!(counts[0], 2); // 0.005 (sub-D_MIN) + 0.015
-        assert_eq!(counts[1], 1); // 0.05
-        assert_eq!(counts[2], 1); // 0.1
-        assert_eq!(counts[3], 1); // 0.3
-    }
-
-    #[test]
-    fn very_close_connections_use_band_0_scoring() {
-        // Connections closer than D_MIN are treated as band 0, not auto-accepted.
-        // This prevents co-located Sybil nodes from filling all slots.
-        let balanced = [5, 5, 5, 5];
-        let score = kleinberg_band_score(0.005, &balanced);
-        // Band 0 at ideal → score 0.5, not 1.0
-        assert!(
-            (0.4..=0.6).contains(&score),
-            "Sub-D_MIN should use band 0 scoring, got {score:.2}"
-        );
-
-        // With empty band 0, sub-D_MIN connection should score high
-        let empty_band0 = [0, 10, 5, 5];
-        let score = kleinberg_band_score(0.005, &empty_band0);
-        assert!(
-            score > 0.8,
-            "Sub-D_MIN into empty band 0 should score high, got {score:.2}"
-        );
     }
 }
