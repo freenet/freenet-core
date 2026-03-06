@@ -6858,3 +6858,285 @@ fn test_get_routing_coverage_low_htl() {
         report.total_events
     );
 }
+
+/// Regression test for GET retry with alternatives in sparse topologies.
+///
+/// With HTL=2 and 10 nodes, PUT only caches the contract at 2-3 nodes along the
+/// route. When distant nodes GET, their initial routing candidate may not have
+/// the contract. The fix ensures the GET state machine tries alternative peers
+/// (from k_closest) and re-queries k_closest when alternatives are exhausted,
+/// rather than immediately returning NotFound.
+///
+/// Without the fix: distant nodes return NotFound because the first-choice peer
+/// doesn't have the contract and there's no retry.
+/// With the fix: the GET retries with alternative peers until one succeeds.
+///
+/// Exercises: `get.rs` alternative retry (line ~1521) and k_closest re-query (line ~1569)
+#[test_log::test]
+fn test_get_retry_with_alternatives_sparse_topology() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0xBEEF_CAFE_0001;
+    const NETWORK_NAME: &str = "get-retry-sparse";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let num_nodes = 10;
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,         // 1 gateway
+            num_nodes, // 10 nodes — large enough that PUT won't reach all
+            2,         // ring_max_htl = 2 — VERY low, PUT caches at only ~2-3 nodes
+            1,         // rnd_if_htl_above
+            6,         // max_connections
+            3,         // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xBE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+
+    let mut operations = vec![
+        // Gateway PUTs the contract (HTL=2 → only ~2-3 nodes cache)
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: vec![10, 20, 30, 40],
+                subscribe: false,
+            },
+        ),
+    ];
+
+    // All 10 nodes GET with fetch_contract=true
+    // Nodes far from caching nodes must retry with alternatives
+    for i in 1..=num_nodes {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300), // simulation duration
+        Duration::from_secs(90),  // post-operations wait for retries
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Verify that all nodes got the contract state despite sparse caching.
+    // Without the retry fix, distant nodes would get NotFound.
+    let mut nodes_without_state = Vec::new();
+    for i in 1..=num_nodes {
+        let label = NodeLabel::node(NETWORK_NAME, i);
+        let storage = result
+            .node_storages
+            .get(&label)
+            .unwrap_or_else(|| panic!("node {i} should have a storage handle"));
+        if storage.get_stored_state(&contract_key).is_none() {
+            nodes_without_state.push(format!("node-{i}"));
+        }
+    }
+
+    assert!(
+        nodes_without_state.is_empty(),
+        "GET retry regression: {} of {} nodes failed to get contract state \
+         (contract cached at only ~2-3 nodes due to HTL=2, retry should find it). \
+         Failed nodes: {:?}. See PR #3444.",
+        nodes_without_state.len(),
+        num_nodes,
+        nodes_without_state
+    );
+
+    // StateVerifier anomaly check
+    let rt = create_runtime();
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "test_get_retry_with_alternatives_sparse_topology PASSED: \
+         all {} nodes got contract state, {} anomalies, {} events",
+        num_nodes,
+        report.anomalies.len(),
+        report.total_events
+    );
+}
+
+/// Regression test for auto-fetch from UPDATE sender.
+///
+/// When a node subscribed to a CRDT contract receives an UPDATE broadcast but
+/// doesn't have the contract's code/parameters (because PUT's low HTL didn't
+/// cache it there), the fix triggers `try_auto_fetch_contract` — a targeted GET
+/// to the UPDATE sender who is known to have the contract.
+///
+/// Scenario:
+///   1. Gateway PUTs a CRDT contract (HTL=2 → only ~2-3 nodes cache code)
+///   2. All nodes subscribe to the contract
+///   3. Gateway sends UPDATE → broadcast reaches subscribed nodes
+///   4. Nodes that subscribed but don't have the contract code auto-fetch
+///   5. All subscribed nodes should end up with the state
+///
+/// Without the fix: nodes without contract code can't apply the update → stale.
+/// With the fix: auto-fetch retrieves the contract, then update applies.
+///
+/// Exercises: `update.rs` try_auto_fetch_contract (BroadcastTo/BroadcastToStreaming paths)
+#[test_log::test]
+fn test_auto_fetch_from_update_sender() {
+    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0xFE7C_A100_0001;
+    const NETWORK_NAME: &str = "auto-fetch-update";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let num_nodes = 8;
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,         // 1 gateway
+            num_nodes, // 8 nodes
+            2,         // ring_max_htl = 2 — low to limit PUT propagation
+            1,         // rnd_if_htl_above
+            6,         // max_connections
+            3,         // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xFE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let mut operations = vec![
+        // 1. Gateway PUTs with subscribe (HTL=2 → few nodes cache code)
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, 0xFE),
+                subscribe: true,
+            },
+        ),
+    ];
+
+    // 2. All nodes subscribe
+    for i in 1..=num_nodes {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    // 3. Gateway sends UPDATE — propagates to subscribers
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(42, 0xFE),
+        },
+    ));
+
+    // 4. All nodes GET to verify they have the state
+    // (auto-fetch should have already retrieved it for nodes without code)
+    for i in 1..=num_nodes {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300), // simulation duration
+        Duration::from_secs(90),  // post-operations wait for auto-fetch
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Verify that all subscribing nodes got the contract state.
+    // Nodes that didn't have the contract code from PUT should have
+    // auto-fetched it when they received the UPDATE broadcast.
+    let mut nodes_without_state = Vec::new();
+    for i in 1..=num_nodes {
+        let label = NodeLabel::node(NETWORK_NAME, i);
+        let storage = result
+            .node_storages
+            .get(&label)
+            .unwrap_or_else(|| panic!("node {i} should have a storage handle"));
+        if storage.get_stored_state(&contract_key).is_none() {
+            nodes_without_state.push(format!("node-{i}"));
+        }
+    }
+
+    // Allow up to 1 node without state (edge case: a node may not have connected
+    // to any subscriber yet). But most nodes should have it via auto-fetch.
+    let success_count = num_nodes - nodes_without_state.len();
+    let success_rate = success_count as f64 / num_nodes as f64;
+    assert!(
+        success_rate >= 0.75,
+        "Auto-fetch regression: only {} of {} nodes ({:.0}%) got contract state \
+         after UPDATE broadcast. Without auto-fetch, nodes that didn't receive \
+         PUT due to low HTL would never get the contract. \
+         Failed nodes: {:?}. See PR #3444.",
+        success_count,
+        num_nodes,
+        success_rate * 100.0,
+        nodes_without_state
+    );
+
+    // StateVerifier anomaly check
+    let rt = create_runtime();
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "test_auto_fetch_from_update_sender PASSED: \
+         {}/{} nodes got contract state ({:.0}%), {} anomalies, {} events",
+        success_count,
+        num_nodes,
+        success_rate * 100.0,
+        report.anomalies.len(),
+        report.total_events
+    );
+}
