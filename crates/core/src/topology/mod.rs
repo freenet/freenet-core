@@ -5,15 +5,15 @@
 //!
 //! ## Connection Target Selection
 //!
-//! All new connections target locations sampled from **Kleinberg's 1/d distribution** centered
-//! on the peer's own ring location. This produces ~59% short-distance connections with a long
-//! tail for routing reachability — proven optimal for O(log²N) greedy routing on a ring.
+//! Outbound connection targets are selected using **gap-based targeting**: the center of
+//! the largest gap in the node's current connection distribution in log-distance space.
+//! This makes target selection adaptive — nodes converge to the ideal 1/d distribution
+//! faster by actively seeking the most deficient distance range. See
+//! `small_world_rand::gap_target`.
 //!
-//! The sampling uses inverse CDF: `d = d_min * (d_max/d_min)^U` where U ~ Uniform(0,1),
-//! producing samples uniform in log-distance space. See `small_world_rand::kleinberg_target`.
-//!
-//! When the peer's own location is unknown (during very early bootstrap), random locations
-//! are used as a fallback.
+//! When the node has no existing connections or its own location is unknown (during very
+//! early bootstrap), the fallback is random Kleinberg 1/d sampling via inverse CDF:
+//! `d = d_min * (d_max/d_min)^U` where U ~ Uniform(0,1).
 //!
 //! ## When to Add/Remove
 //!
@@ -313,8 +313,9 @@ impl TopologyManager {
     /// Determine whether to add or remove connections based on current connection
     /// count and resource usage.
     ///
-    /// When adding connections, targets are always sampled from Kleinberg's 1/d
-    /// distribution centered on own location (see `small_world_rand::kleinberg_target`).
+    /// When adding connections, targets are selected using gap-based targeting:
+    /// the center of the largest gap in the node's connection distribution in
+    /// log-distance space (see `small_world_rand::gap_target`).
     /// When own location is unknown, random targets are used as fallback.
     pub(crate) fn adjust_topology(
         &mut self,
@@ -327,9 +328,9 @@ impl TopologyManager {
         if current_connections < self.limits.min_connections {
             let needed = self.limits.min_connections - current_connections;
 
-            // With 5+ connections, use Kleinberg sampling
+            // With 5+ connections, use gap-based targeting
             if current_connections >= DENSITY_SELECTION_THRESHOLD {
-                let locations = Self::sample_targets(my_location, needed);
+                let locations = Self::sample_targets(my_location, neighbor_locations, needed);
                 return TopologyAdjustment::AddConnections(locations);
             }
 
@@ -382,7 +383,7 @@ impl TopologyManager {
                     "Resource usage below threshold, adding connection"
                 );
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Fast);
-                let locations = Self::sample_targets(my_location, 1);
+                let locations = Self::sample_targets(my_location, neighbor_locations, 1);
                 Ok(TopologyAdjustment::AddConnections(locations))
             } else if usage_proportion > decrease_usage_if_above {
                 if current_connections <= self.limits.min_connections {
@@ -431,13 +432,31 @@ impl TopologyManager {
         adjustment.unwrap_or(TopologyAdjustment::NoChange)
     }
 
-    /// Sample `count` target locations using Kleinberg 1/d distribution.
-    /// Falls back to random locations if own location is unknown.
-    fn sample_targets(my_location: &Option<Location>, count: usize) -> Vec<Location> {
+    /// Sample `count` target locations using gap-based targeting.
+    ///
+    /// Targets the center of the largest gap in the node's current connection
+    /// distribution in log-distance space. Falls back to random Kleinberg 1/d
+    /// sampling when own location is unknown or there are no existing connections.
+    ///
+    /// Note: when `count > 1`, all targets may cluster in the same gap since
+    /// the distance snapshot is not updated between iterations. This is
+    /// self-correcting: after connections succeed, subsequent calls to
+    /// `adjust_topology` will see filled gaps and target different ranges.
+    fn sample_targets(
+        my_location: &Option<Location>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+        count: usize,
+    ) -> Vec<Location> {
         match my_location {
-            Some(loc) => (0..count)
-                .map(|_| small_world_rand::kleinberg_target(*loc))
-                .collect(),
+            Some(loc) => {
+                let distances: Vec<f64> = neighbor_locations
+                    .keys()
+                    .map(|nloc| loc.distance(*nloc).as_f64())
+                    .collect();
+                (0..count)
+                    .map(|_| small_world_rand::gap_target(*loc, distances.iter().copied()))
+                    .collect()
+            }
             None => (0..count).map(|_| Location::random()).collect(),
         }
     }
@@ -943,9 +962,9 @@ mod tests {
         }
     }
 
-    // Test that resource-based addition uses Kleinberg targets biased toward own location.
+    // Test that resource-based addition uses gap-based targets biased toward own location.
     #[test_log::test]
-    fn test_resource_based_add_uses_kleinberg_targets() {
+    fn test_resource_based_add_uses_gap_targets() {
         let _guard = crate::config::GlobalRng::seed_guard(0xBEEF_CAFE);
         let mut resource_manager = setup_topology_manager(1000.0);
         let peers: Vec<PeerKeyLocation> = generate_random_peers(6);
