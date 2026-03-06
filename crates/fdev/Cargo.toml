@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.3.145"
+version = "0.3.146"
 edition = "2021"
 rust-version = "1.80"
 publish = true
