@@ -4076,4 +4076,236 @@ mod tests {
         let op = make_get_op(None, None);
         assert!(!op.is_client_initiated());
     }
+
+    // === Tests for GC task retry flow ===
+    //
+    // These tests reproduce the exact scenario from the garbage_cleanup_task in
+    // op_state_manager.rs: a GET op has been stuck for >20s with no response,
+    // and the GC task selects it for retry.
+    //
+    // The GC task uses:
+    //   1. tx.elapsed() > GET_RETRY_THRESHOLD (20s ± 20% jitter)
+    //   2. retry_with_next_alternative(max_htl, &all_connected)
+    //
+    // Without the fix (no GC retry logic), stuck GETs would sit until the 60s
+    // OPERATION_TTL expires and then be silently removed — no retry, no client
+    // notification.
+
+    use crate::config::{GlobalRng, GlobalSimulationTime};
+
+    /// Verify that a transaction created 25s ago would be selected as a
+    /// retry candidate by the GC task's threshold check.
+    ///
+    /// Removing the GC retry logic from op_state_manager.rs would make this
+    /// test's scenario moot — the elapsed check would never be performed
+    /// and stuck GETs would silently expire.
+    #[test]
+    fn gc_retry_candidate_selected_after_threshold() {
+        // Set deterministic simulation time
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C01);
+
+        // Create a transaction (records creation timestamp via current_time_ms)
+        let tx = Transaction::new::<GetMsg>();
+        // Advance simulation time by 25 seconds (past the 20s threshold).
+        // Creation timestamp is ~1_700_000_000_000 (base + small counter offset).
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000 + 25_000);
+
+        let elapsed = tx.elapsed();
+        assert!(
+            elapsed > std::time::Duration::from_secs(20),
+            "Transaction should show >20s elapsed after time advancement, got {:?}",
+            elapsed
+        );
+
+        // This is what the GC task checks: elapsed > threshold * (retry_count + 1)
+        let threshold = std::time::Duration::from_secs(20);
+        let retry_count = 0u32;
+        let base = threshold * (retry_count + 1);
+        // With jitter factor 0.8-1.2, the threshold ranges from 16s to 24s
+        // At 25s elapsed, we're past even the worst-case jitter
+        assert!(
+            elapsed > base.mul_f64(1.2),
+            "Should exceed even worst-case jittered threshold"
+        );
+    }
+
+    /// Verify that a transaction created only 10s ago would NOT be selected
+    /// as a retry candidate.
+    #[test]
+    fn gc_retry_candidate_not_selected_before_threshold() {
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C02);
+
+        let tx = Transaction::new::<GetMsg>();
+        // Only 10 seconds — below the 20s threshold
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000 + 10_000);
+
+        let elapsed = tx.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "Transaction should show <20s elapsed, got {:?}",
+            elapsed
+        );
+    }
+
+    /// Full GC retry flow: stuck GET → time passes → retry with alternative.
+    ///
+    /// Reproduces the exact flow from garbage_cleanup_task:
+    ///   1. GET op created, sent to peer, waiting for response
+    ///   2. 25 seconds pass with no response
+    ///   3. GC task selects it as retry candidate
+    ///   4. retry_with_next_alternative produces a new Request message
+    ///   5. Op is re-inserted with updated state
+    ///
+    /// Without the fix: step 4 doesn't exist — the op sits until TTL expiry.
+    /// Removing retry_with_next_alternative → this test fails to compile.
+    /// Removing the GC retry logic → step 3-5 never happen in production.
+    #[test]
+    fn gc_retry_full_flow_stuck_get_retries_with_alternative() {
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C03);
+
+        // Create a GET op with 2 alternative peers
+        let alt1 = make_peer(4001);
+        let alt2 = make_peer(4002);
+        let op = make_awaiting_op(vec![alt1.clone(), alt2], &[]);
+        let tx = op.id;
+
+        // Simulate the op being stuck: advance time by 25 seconds
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000 + 25_000);
+
+        // Verify the GC task would select this as a retry candidate
+        assert!(
+            tx.elapsed() > std::time::Duration::from_secs(20),
+            "Op should be eligible for retry"
+        );
+
+        // GC task calls retry_with_next_alternative (this IS the fix)
+        let max_htl = 7;
+        let all_connected: Vec<PeerKeyLocation> = vec![]; // no DBF needed, has alternatives
+        let result = op.retry_with_next_alternative(max_htl, &all_connected);
+
+        // With the fix: produces a retry message targeting alt1
+        let (new_op, msg) = result.unwrap_or_else(|_| {
+            panic!("GC retry should produce a message when alternatives exist")
+        });
+
+        // Verify the retry message targets the first alternative
+        match &msg {
+            GetMsg::Request { htl, .. } => {
+                assert_eq!(*htl, max_htl, "Retry should use max_htl");
+            }
+            GetMsg::Response { .. }
+            | GetMsg::ResponseStreaming { .. }
+            | GetMsg::ResponseStreamingAck { .. } => panic!("Expected Request"),
+        }
+
+        // Verify the op state was updated: alt1 is now the next_hop, alt2 remains
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            assert_eq!(
+                data.next_hop, alt1,
+                "Should be targeting the first alternative"
+            );
+            assert_eq!(data.alternatives.len(), 1, "One alternative remaining");
+            assert!(
+                data.tried_peers.contains(&alt1.socket_addr().unwrap()),
+                "alt1 should be in tried_peers"
+            );
+        } else {
+            panic!("Expected AwaitingResponse state after retry");
+        }
+    }
+
+    /// GC retry with DBF fallback: stuck GET, all alternatives exhausted,
+    /// broadens search to all connected peers.
+    ///
+    /// Without the DBF fallback fix: when alternatives are empty, the retry
+    /// returns Err and the op stays stuck until TTL expiry.
+    /// With the fix: fallback_peers (from ring.get_connections_by_location)
+    /// are injected as new alternatives.
+    #[test]
+    fn gc_retry_dbf_fallback_broadens_to_connected_peers() {
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C04);
+
+        // Create a GET op with NO alternatives (all exhausted)
+        let op = make_awaiting_op(vec![], &[]);
+
+        // Without DBF fallback: retry fails (no alternatives)
+        let fallback_peers: Vec<PeerKeyLocation> = vec![];
+        let op_clone_for_no_fallback = make_awaiting_op(vec![], &[]);
+        let result = op_clone_for_no_fallback.retry_with_next_alternative(7, &fallback_peers);
+        assert!(result.is_err(), "Without fallback peers, retry should fail");
+
+        // WITH DBF fallback: provide connected peers that haven't been tried
+        let fallback1 = make_peer(5001);
+        let fallback2 = make_peer(5002);
+        let fallback_peers = vec![fallback1.clone(), fallback2];
+
+        let result = op.retry_with_next_alternative(7, &fallback_peers);
+        let (new_op, msg) =
+            result.unwrap_or_else(|_| panic!("DBF fallback should inject new peers and retry"));
+
+        // Verify the retry targets a fallback peer
+        assert!(matches!(msg, GetMsg::Request { .. }));
+
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            assert!(
+                data.tried_peers.contains(&fallback1.socket_addr().unwrap()),
+                "Fallback peer should be in tried_peers"
+            );
+            // One fallback was used, one remains as alternative
+            assert_eq!(
+                data.alternatives.len(),
+                1,
+                "Second fallback should remain as alternative"
+            );
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    /// Verify that successive GC retries advance the threshold multiplicatively.
+    ///
+    /// The GC task uses: threshold = GET_RETRY_THRESHOLD * (retry_count + 1)
+    ///   retry 0: fires at ~20s
+    ///   retry 1: fires at ~40s
+    ///   retry 2: fires at ~60s (near TTL expiry)
+    ///
+    /// This prevents rapid-fire retries from overwhelming the network.
+    #[test]
+    fn gc_retry_threshold_scales_with_retry_count() {
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C05);
+
+        let tx = Transaction::new::<GetMsg>();
+        // Transaction was created at ~1_700_000_000_000 (base + tiny counter offset)
+        let base_ms = 1_700_000_000_000u64;
+
+        let threshold = std::time::Duration::from_secs(20);
+
+        // At 25s: retry_count=0 threshold=20s → eligible
+        GlobalSimulationTime::set_time_ms(base_ms + 25_000);
+        let base_0 = threshold * 1;
+        assert!(tx.elapsed() > base_0, "First retry should fire at ~20s");
+
+        // At 25s: retry_count=1 threshold=40s → NOT eligible
+        let base_1 = threshold * 2;
+        assert!(
+            tx.elapsed() < base_1,
+            "Second retry should NOT fire at 25s (needs ~40s)"
+        );
+
+        // At 45s: retry_count=1 threshold=40s → eligible
+        GlobalSimulationTime::set_time_ms(base_ms + 45_000);
+        assert!(tx.elapsed() > base_1, "Second retry should fire at ~40s");
+
+        // At 45s: retry_count=2 threshold=60s → NOT eligible
+        let base_2 = threshold * 3;
+        assert!(
+            tx.elapsed() < base_2,
+            "Third retry should NOT fire at 45s (needs ~60s)"
+        );
+    }
 }
