@@ -548,6 +548,16 @@ impl GetOp {
         }
     }
 
+    /// Returns true if this GET was initiated by a local client (not forwarded from a peer).
+    /// Only client-initiated GETs have `requester: None` in the AwaitingResponse state.
+    pub(crate) fn is_client_initiated(&self) -> bool {
+        match &self.state {
+            Some(GetState::PrepareRequest(_)) => true,
+            Some(GetState::AwaitingResponse(data)) => data.requester.is_none(),
+            _ => false,
+        }
+    }
+
     /// Extract routing failure info for timeout reporting.
     /// Returns `(target_peer, contract_location)` if stats are available.
     pub(crate) fn failure_routing_info(&self) -> Option<(PeerKeyLocation, Location)> {
