@@ -1317,8 +1317,10 @@ fn remove_get_and_report_failure(
             "GET operation timed out without receiving a response"
         );
         // Notify client of timeout so they get an immediate error instead of
-        // waiting silently for their own client-side timeout (#3423)
-        if instance_id.is_some() {
+        // waiting silently for their own client-side timeout (#3423).
+        // Only for client-initiated GETs (requester is None); forwarded GETs
+        // have no local client waiting.
+        if get_op.is_client_initiated() {
             let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
                 cause: "GET operation timed out".into(),
             }
@@ -1327,7 +1329,7 @@ fn remove_get_and_report_failure(
             let tx = *tx;
             GlobalExecutor::spawn(async move {
                 if let Err(e) = router_tx.send((tx, error_result)).await {
-                    tracing::debug!(
+                    tracing::warn!(
                         %tx,
                         error = %e,
                         "failed to send GET timeout error to client"
