@@ -26,10 +26,13 @@ WHEN calculating contract location:
 ```
 WHEN accepting a new connection (should_accept):
   1. CHECK: Is this a self-connection? → REJECT
-  2. CHECK: Are we below min_connections? → ACCEPT
+  2. CHECK: Are we below min_connections?
      → Use ACTUAL open connection count, NOT speculative totals
      → Pending reservations are speculative (many fail to complete);
        counting them pushes nodes into the topology evaluator prematurely
+     → Below KLEINBERG_FILTER_MIN_CONNECTIONS (NUM_BANDS): always ACCEPT
+     → Above that: Kleinberg band scoring with 50% acceptance floor
+       (probabilistically prefer connections that fill deficient distance bands)
   3. CHECK: Are we at max_connections? → REJECT
      → Use total_conn (open + pending) here to prevent over-commitment
   4. OTHERWISE: Evaluate via TopologyManager
