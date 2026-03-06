@@ -75,12 +75,10 @@ pub(crate) fn distance_band(distance: f64) -> Option<usize> {
 /// scores 1.0; one in the most over-represented band scores close to 0.0.
 ///
 /// `band_counts` is the number of existing connections in each of the
-/// `NUM_BANDS` logarithmic distance bands. `total_connections` is the
-/// total number of ring connections (including those outside [D_MIN, D_MAX]).
+/// `NUM_BANDS` logarithmic distance bands.
 pub(crate) fn kleinberg_band_score(
     candidate_distance: f64,
     band_counts: &[usize; NUM_BANDS],
-    total_connections: usize,
 ) -> f64 {
     let band = match distance_band(candidate_distance) {
         Some(b) => b,
@@ -92,14 +90,9 @@ pub(crate) fn kleinberg_band_score(
         }
     };
 
-    if total_connections == 0 {
-        return 1.0;
-    }
-
     // Ideal: each band gets equal share of connections in [D_MIN, D_MAX].
     // Connections outside [D_MIN, D_MAX] don't count against any band.
     let in_range: usize = band_counts.iter().sum();
-    // If no connections are in range yet, any in-range connection is great.
     if in_range == 0 {
         return 1.0;
     }
@@ -266,12 +259,11 @@ mod tests {
     fn band_score_favors_deficient_bands() {
         // All connections in band 3 (long range), none in band 0 (short)
         let counts = [0, 0, 0, 10];
-        let total = 10;
 
         // Short-distance candidate should score high (fills deficit)
-        let short_score = kleinberg_band_score(0.015, &counts, total);
+        let short_score = kleinberg_band_score(0.015, &counts);
         // Long-distance candidate should score low (over-represented)
-        let long_score = kleinberg_band_score(0.4, &counts, total);
+        let long_score = kleinberg_band_score(0.4, &counts);
 
         assert!(
             short_score > long_score,
@@ -292,10 +284,9 @@ mod tests {
     fn band_score_balanced_connections() {
         // Balanced distribution: 5 in each band
         let counts = [5, 5, 5, 5];
-        let total = 20;
 
         // All bands at ideal, so all scores should be ~0.5
-        let score = kleinberg_band_score(0.015, &counts, total);
+        let score = kleinberg_band_score(0.015, &counts);
         assert!(
             (0.4..=0.6).contains(&score),
             "Balanced band should score ~0.5, got {score:.2}"
@@ -323,7 +314,7 @@ mod tests {
     fn very_close_connections_always_valuable() {
         // Connections closer than D_MIN always score 1.0
         let counts = [5, 5, 5, 5];
-        let score = kleinberg_band_score(0.005, &counts, 20);
+        let score = kleinberg_band_score(0.005, &counts);
         assert_eq!(score, 1.0, "Very close connections should always score 1.0");
     }
 }

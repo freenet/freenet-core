@@ -162,16 +162,15 @@ impl TopologyManager {
         my_location: Option<Location>,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> Result<bool, DensityMapError> {
-        let candidate_distance = my_location.map(|me| me.distance(candidate_location).as_f64());
-
-        let band_score = match (candidate_distance, my_location) {
-            (Some(dist), Some(me)) => {
-                let band_counts =
-                    small_world_rand::count_bands(me, neighbor_locations.keys().copied());
-                let total = neighbor_locations.values().map(|v| v.len()).sum();
-                small_world_rand::kleinberg_band_score(dist, &band_counts, total)
-            }
-            _ => 0.5, // Neutral when own location unknown
+        let (band_score, candidate_distance) = if let Some(me) = my_location {
+            let dist = me.distance(candidate_location).as_f64();
+            let band_counts = small_world_rand::count_bands(me, neighbor_locations.keys().copied());
+            (
+                small_world_rand::kleinberg_band_score(dist, &band_counts),
+                Some(dist),
+            )
+        } else {
+            (0.5, None) // Neutral when own location unknown
         };
 
         // Get density score (request-based), falling back to band-only if unavailable

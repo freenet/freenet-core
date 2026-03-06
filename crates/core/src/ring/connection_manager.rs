@@ -48,6 +48,12 @@ pub(crate) struct TransientEntry {
 /// to prevent permanent node isolation when CONNECT operations fail to complete.
 const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 
+/// Minimum connections before applying Kleinberg distance filtering on inbound
+/// connections. Below this threshold, all inbound connections are accepted to
+/// avoid blocking initial bootstrap. At 3+ connections the node has enough
+/// context to make distance-aware decisions.
+const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = 3;
+
 /// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
 /// This prevents thundering-herd scenarios where many joiners hit the same gateway at once.
 /// The value 8 balances throughput (parallel joins) against overload protection. Non-gateways
@@ -574,23 +580,20 @@ impl ConnectionManager {
             // over-represented bands are rejected with probability proportional
             // to the over-representation. The floor acceptance rate of 50%
             // ensures bootstrapping isn't blocked.
-            let accepted = if open < 3 {
+            let accepted = if open < KLEINBERG_FILTER_MIN_CONNECTIONS {
                 true
             } else if let Some(me) = my_location {
                 let band_counts =
                     crate::topology::small_world_rand::count_bands(me, connections.keys().copied());
-                let total = connections.values().map(|v| v.len()).sum();
                 let dist = me.distance(location).as_f64();
-                let score = crate::topology::small_world_rand::kleinberg_band_score(
-                    dist,
-                    &band_counts,
-                    total,
-                );
-                // Accept with probability based on score, with 50% floor.
+                let score =
+                    crate::topology::small_world_rand::kleinberg_band_score(dist, &band_counts);
+                // Accept probability = 0.5 + 0.5 * score (50% floor, 100% ceiling).
                 // score=1.0 (deficient band) → always accept
+                // score=0.5 (balanced band)  → accept 75% of the time
                 // score=0.0 (over-represented) → accept 50% of the time
-                let threshold = GlobalRng::random_range(0.0..=0.5);
-                score > threshold
+                let accept_prob = 0.5 + 0.5 * score;
+                GlobalRng::random_range(0.0..1.0) < accept_prob
             } else {
                 true
             };
