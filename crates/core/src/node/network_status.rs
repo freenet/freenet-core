@@ -933,6 +933,28 @@ mod tests {
     }
 
     #[test]
+    fn test_record_peer_connected_updates_location() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9999);
+        init(31339, HashSet::new(), "0.1.148".to_string());
+
+        // First call with no location (as handle_successful_connection does initially)
+        record_peer_connected(peer_addr, None, None);
+        let snap = get_snapshot().unwrap();
+        let peer = snap.peers.iter().find(|p| p.address == peer_addr).unwrap();
+        assert_eq!(peer.location, None);
+
+        // Second call with location (as connect_peer promotion path now does)
+        record_peer_connected(peer_addr, Some(0.42), None);
+        let snap = get_snapshot().unwrap();
+        let peer = snap.peers.iter().find(|p| p.address == peer_addr).unwrap();
+        assert_eq!(peer.location, Some(0.42));
+
+        // Cleanup
+        record_peer_disconnected(peer_addr);
+    }
+
+    #[test]
     fn test_nat_stats_rolling_window_all_failures() {
         let mut nat = NatStats::default();
         for _ in 0..25 {

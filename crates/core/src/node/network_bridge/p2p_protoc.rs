@@ -2592,6 +2592,42 @@ impl P2pConnManager {
             return Ok(());
         }
 
+        // Check if this peer is in backoff due to previous connection failures.
+        // This check is done AFTER the existing connection check above, so that:
+        // 1. If we already have a connection (possibly from inbound), we reuse it
+        // 2. Backoff only blocks NEW outbound connection attempts
+        // NOTE: Backoff must run BEFORE the early admission check because
+        // should_accept() has a side effect (inserts pending_reservation on
+        // acceptance). If backoff rejects after should_accept passes, the
+        // reservation leaks until TTL.
+        if !peer_addr.ip().is_unspecified() && state.peer_backoff.is_in_backoff(peer_addr) {
+            let remaining = state
+                .peer_backoff
+                .remaining_backoff(peer_addr)
+                .unwrap_or(Duration::ZERO);
+            tracing::debug!(
+                tx = %tx,
+                peer = %peer,
+                peer_addr = %peer_addr,
+                remaining_secs = remaining.as_secs(),
+                transient,
+                phase = "connect",
+                "Skipping connection attempt - peer in backoff"
+            );
+            callback
+                .send_result(Err(()))
+                .await
+                .inspect_err(|error| {
+                    tracing::debug!(
+                        remote = %peer_addr,
+                        ?error,
+                        "Failed to notify caller about backoff-delayed connection"
+                    );
+                })
+                .ok();
+            return Ok(());
+        }
+
         // Early admission check: avoid expensive NAT hole-punching for connections
         // that would be rejected by should_accept() after establishment. Only applies
         // to non-transient (ring-bound) connections — transient gateway connections
@@ -2622,38 +2658,6 @@ impl P2pConnManager {
                     .ok();
                 return Ok(());
             }
-        }
-
-        // Check if this peer is in backoff due to previous connection failures.
-        // This check is done AFTER the existing connection check above, so that:
-        // 1. If we already have a connection (possibly from inbound), we reuse it
-        // 2. Backoff only blocks NEW outbound connection attempts
-        if !peer_addr.ip().is_unspecified() && state.peer_backoff.is_in_backoff(peer_addr) {
-            let remaining = state
-                .peer_backoff
-                .remaining_backoff(peer_addr)
-                .unwrap_or(Duration::ZERO);
-            tracing::debug!(
-                tx = %tx,
-                peer = %peer,
-                peer_addr = %peer_addr,
-                remaining_secs = remaining.as_secs(),
-                transient,
-                phase = "connect",
-                "Skipping connection attempt - peer in backoff"
-            );
-            callback
-                .send_result(Err(()))
-                .await
-                .inspect_err(|error| {
-                    tracing::debug!(
-                        remote = %peer_addr,
-                        ?error,
-                        "Failed to notify caller about backoff-delayed connection"
-                    );
-                })
-                .ok();
-            return Ok(());
         }
 
         match state.awaiting_connection.entry(peer_addr) {
