@@ -23,14 +23,19 @@
 //! - At/above `min_connections`, resource usage > 90% → remove connections
 //! - Above `max_connections` → remove connections
 //!
-//! ## Accepting Incoming Connections (`evaluate_new_connection`)
+//! ## Accepting Incoming Connections
 //!
-//! Used by `should_accept()` in connection_manager when a peer has between min and max connections.
-//! (Below min: always accept. At max: always reject.)
+//! Two mechanisms shape inbound connection topology:
 //!
-//! 1. Computes a "density score" for the candidate's location (higher = more requests go there)
-//! 2. Compares against other candidates seen in a time window
-//! 3. Accepts only if this candidate scores higher than ALL others in the window
+//! 1. **Below min_connections** (`should_accept` in connection_manager): Kleinberg-aware
+//!    soft filter with 50% acceptance floor. Uses logarithmic distance band scoring to
+//!    probabilistically prefer connections that fill deficient bands. This shapes the
+//!    distance distribution during bootstrap.
+//!
+//! 2. **At/above min_connections** (`evaluate_new_connection`): Request density scoring
+//!    via the ConnectionEvaluator. Accepts only if the candidate's density score beats
+//!    all other candidates in a time window. When no density map exists (early bootstrap),
+//!    returns Err and the caller falls back to accepting all connections.
 //!
 //! ## Removing Connections
 //!
@@ -56,7 +61,7 @@ pub(crate) mod outbound_request_counter;
 pub(crate) mod rate;
 pub mod request_density_tracker;
 pub(crate) mod running_average;
-mod small_world_rand;
+pub(crate) mod small_world_rand;
 
 use crate::ring::{Connection, PeerKeyLocation};
 use crate::topology::meter::{AttributionSource, ResourceType};
@@ -137,9 +142,11 @@ impl TopologyManager {
         self.outbound_request_counter.record_request(recipient);
     }
 
-    /// Decide whether to accept a connection from a new candidate peer based on its location
-    /// and current neighbors and request density, along with how it compares to other
-    /// recent candidates.
+    /// Decide whether to accept a connection from a new candidate peer based on
+    /// request density at its location, compared against other recent candidates.
+    ///
+    /// Used when the node has at/above min_connections. Below min_connections,
+    /// the Kleinberg band filter in `should_accept` handles distance distribution.
     pub(crate) fn evaluate_new_connection(
         &mut self,
         candidate_location: Location,

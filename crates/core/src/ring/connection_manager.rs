@@ -48,6 +48,12 @@ pub(crate) struct TransientEntry {
 /// to prevent permanent node isolation when CONNECT operations fail to complete.
 const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 
+/// Minimum connections before applying Kleinberg distance filtering on inbound
+/// connections. Below this threshold, all inbound connections are accepted to
+/// avoid blocking initial bootstrap. Set to NUM_BANDS because band-based
+/// scoring requires at least that many connections to be meaningful.
+const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = crate::topology::small_world_rand::NUM_BANDS;
+
 /// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
 /// This prevents thundering-herd scenarios where many joiners hit the same gateway at once.
 /// The value 8 balances throughput (parallel joins) against overload protection. Non-gateways
@@ -561,14 +567,51 @@ impl ConnectionManager {
             );
             false
         } else if open < self.min_connections {
+            // Below min_connections: accept most connections, but use Kleinberg
+            // band scoring to probabilistically prefer connections that improve
+            // the distance distribution. This prevents the first N connections
+            // from being uniformly distributed, which defeats small-world routing.
+            //
+            // With fewer than KLEINBERG_FILTER_MIN_CONNECTIONS connections we
+            // always accept to avoid blocking bootstrap. Above that, we apply a
+            // soft filter: connections in over-represented bands are rejected with
+            // probability proportional to the over-representation. The floor
+            // acceptance rate of 50% ensures bootstrapping isn't blocked.
+            let accepted = if open < KLEINBERG_FILTER_MIN_CONNECTIONS {
+                true
+            } else if let Some(me) = self.get_stored_location() {
+                let connections = self.connections_by_location.read();
+                // Iterate all connections (not just unique locations) to correctly
+                // count band occupancy when multiple peers share a location.
+                let band_counts = crate::topology::small_world_rand::count_bands(
+                    me,
+                    connections
+                        .iter()
+                        .flat_map(|(loc, conns)| std::iter::repeat(*loc).take(conns.len())),
+                );
+                drop(connections);
+                let dist = me.distance(location).as_f64();
+                let score =
+                    crate::topology::small_world_rand::kleinberg_band_score(dist, &band_counts);
+                // Accept probability = 0.5 + 0.5 * score (50% floor, 100% ceiling).
+                // score=1.0 (deficient band) → always accept
+                // score=0.5 (balanced band)  → accept 75% of the time
+                // score=0.0 (over-represented) → accept 50% of the time
+                let accept_prob = 0.5 + 0.5 * score;
+                GlobalRng::random_range(0.0..1.0) < accept_prob
+            } else {
+                true
+            };
+
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
                 open,
                 total_conn,
-                "should_accept: accepted (open connections below min)"
+                accepted,
+                "should_accept: below min_connections (Kleinberg-aware)"
             );
-            true
+            accepted
         } else {
             let accepted = self
                 .topology_manager
