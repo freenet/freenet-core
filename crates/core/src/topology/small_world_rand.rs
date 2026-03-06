@@ -63,6 +63,79 @@ fn to_log_unit(distance: f64) -> f64 {
     (distance / D_MIN).ln() / LOG_RATIO
 }
 
+/// Target the center of the largest gap in the node's current connection
+/// distribution in log-space, mapped back to a ring location.
+///
+/// With existing connections, finds the largest gap between consecutive points
+/// in log-distance space (including boundaries 0 and 1), then targets the
+/// midpoint of that gap with some jitter to avoid deterministic targeting.
+///
+/// Falls back to pure Kleinberg 1/d sampling when `connection_distances` is empty.
+pub(crate) fn gap_target(
+    my_location: Location,
+    connection_distances: impl Iterator<Item = f64>,
+) -> Location {
+    // Collect and sort connection distances in log-space
+    let mut points: Vec<f64> = connection_distances
+        .filter(|&d| d >= D_MIN && d <= D_MAX)
+        .map(|d| to_log_unit(d))
+        .collect();
+
+    if points.is_empty() {
+        return kleinberg_target(my_location);
+    }
+
+    points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    points.dedup();
+
+    // Find all gaps and pick randomly among the largest ones
+    let mut gaps: Vec<(f64, f64)> = Vec::new(); // (start, size)
+
+    let mut prev = 0.0_f64;
+    for &p in &points {
+        gaps.push((prev, p - prev));
+        prev = p;
+    }
+    gaps.push((prev, 1.0 - prev));
+
+    let best_gap_size = gaps
+        .iter()
+        .map(|(_, size)| *size)
+        .fold(0.0_f64, f64::max);
+
+    // Collect all gaps within 1% of the best (floating point tolerance)
+    let threshold = best_gap_size * 0.99;
+    let largest_gaps: Vec<(f64, f64)> = gaps
+        .into_iter()
+        .filter(|(_, size)| *size >= threshold)
+        .collect();
+
+    // Pick one randomly
+    let idx = GlobalRng::with_rng(|rng| {
+        use rand::Rng;
+        rng.random_range(0..largest_gaps.len())
+    });
+    let (best_gap_start, best_gap_size) = largest_gaps[idx];
+
+    // Target the midpoint with ±25% jitter within the gap
+    let midpoint = best_gap_start + best_gap_size / 2.0;
+    let jitter_range = best_gap_size * 0.25;
+    let jitter: f64 = GlobalRng::with_rng(|rng| {
+        use rand::Rng;
+        rng.random_range(-jitter_range..=jitter_range)
+    });
+    let u_target = (midpoint + jitter).clamp(0.0, 1.0);
+
+    // Map back from log-space unit interval to a ring distance:
+    // u = ln(d/D_MIN) / LOG_RATIO  =>  d = D_MIN * exp(u * LOG_RATIO)
+    let distance = D_MIN * (u_target * LOG_RATIO).exp();
+
+    let sign: bool = GlobalRng::random_bool(0.5);
+    let offset = if sign { distance } else { -distance };
+
+    Location::new_rounded(my_location.as_f64() + offset)
+}
+
 /// Score how much a candidate connection at `candidate_distance` improves the
 /// node's distance distribution toward the ideal Kleinberg 1/d distribution,
 /// given existing connections at `connection_distances`.
@@ -262,6 +335,92 @@ mod tests {
         assert!(
             p_value > 0.001,
             "Chi-squared test failed, p_value = {p_value}"
+        );
+    }
+
+    #[test]
+    fn gap_target_fills_largest_gap() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xDEAD_BEEF);
+        let my_loc = Location::new(0.5);
+
+        // Existing connections clustered at short distances
+        let existing = [0.012, 0.015, 0.02];
+
+        let mut long_count = 0;
+        let trials = 100;
+        for _ in 0..trials {
+            let target = gap_target(my_loc, existing.iter().copied());
+            let dist = my_loc.distance(target).as_f64();
+            if dist > 0.05 {
+                long_count += 1;
+            }
+        }
+        // The largest gap is in the long-distance range, so most targets
+        // should be long-distance
+        assert!(
+            long_count > trials * 3 / 4,
+            "Expected gap targeting to favor long-distance, got {long_count}/{trials}"
+        );
+    }
+
+    #[test]
+    fn gap_target_produces_valid_locations() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_1234);
+        let my_loc = Location::new(0.5);
+        let existing = [0.05, 0.2];
+
+        for _ in 0..1000 {
+            let target = gap_target(my_loc, existing.iter().copied());
+            let v = target.as_f64();
+            assert!(
+                (0.0..1.0).contains(&v),
+                "Target location {v} outside valid ring range"
+            );
+        }
+    }
+
+    #[test]
+    fn gap_target_no_connections_falls_back() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xABCD_5678);
+        let my_loc = Location::new(0.5);
+
+        // With no connections, should produce valid targets (falls back to kleinberg_target)
+        for _ in 0..100 {
+            let target = gap_target(my_loc, std::iter::empty());
+            let v = target.as_f64();
+            assert!(
+                (0.0..1.0).contains(&v),
+                "Fallback target {v} outside valid range"
+            );
+        }
+    }
+
+    #[test]
+    fn gap_target_uniform_connections_spreads_evenly() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x1234_5678);
+        let my_loc = Location::new(0.5);
+
+        // Place connections at quartiles in log-space
+        let d_at = |u: f64| D_MIN * (D_MAX / D_MIN).powf(u);
+        let existing = [d_at(0.25), d_at(0.5), d_at(0.75)];
+
+        // With uniform connections, the 4 gaps are equal. Targets should
+        // spread across all gaps, not cluster.
+        let mut short = 0; // distance < geometric_mean
+        let geo_mean = (D_MIN * D_MAX).sqrt();
+        let trials = 200;
+        for _ in 0..trials {
+            let target = gap_target(my_loc, existing.iter().copied());
+            let dist = my_loc.distance(target).as_f64();
+            if dist < geo_mean {
+                short += 1;
+            }
+        }
+        // Should be roughly 50/50 between short and long
+        let ratio = short as f64 / trials as f64;
+        assert!(
+            (0.3..0.7).contains(&ratio),
+            "Expected ~50/50 split, got {ratio:.2} short ratio"
         );
     }
 
