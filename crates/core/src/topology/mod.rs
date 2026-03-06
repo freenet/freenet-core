@@ -164,7 +164,13 @@ impl TopologyManager {
     ) -> Result<bool, DensityMapError> {
         let (band_score, candidate_distance) = if let Some(me) = my_location {
             let dist = me.distance(candidate_location).as_f64();
-            let band_counts = small_world_rand::count_bands(me, neighbor_locations.keys().copied());
+            // Count all connections per band (not just unique locations).
+            let band_counts = small_world_rand::count_bands(
+                me,
+                neighbor_locations
+                    .iter()
+                    .flat_map(|(loc, conns)| std::iter::repeat(*loc).take(conns.len())),
+            );
             (
                 small_world_rand::kleinberg_band_score(dist, &band_counts),
                 Some(dist),

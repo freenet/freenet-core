@@ -583,8 +583,14 @@ impl ConnectionManager {
             let accepted = if open < KLEINBERG_FILTER_MIN_CONNECTIONS {
                 true
             } else if let Some(me) = my_location {
-                let band_counts =
-                    crate::topology::small_world_rand::count_bands(me, connections.keys().copied());
+                // Iterate all connections (not just unique locations) to correctly
+                // count band occupancy when multiple peers share a location.
+                let band_counts = crate::topology::small_world_rand::count_bands(
+                    me,
+                    connections
+                        .iter()
+                        .flat_map(|(loc, conns)| std::iter::repeat(*loc).take(conns.len())),
+                );
                 let dist = me.distance(location).as_f64();
                 let score =
                     crate::topology::small_world_rand::kleinberg_band_score(dist, &band_counts);

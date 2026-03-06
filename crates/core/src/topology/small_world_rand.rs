@@ -12,11 +12,12 @@ const D_MIN: f64 = 0.01;
 const D_MAX: f64 = 0.5;
 
 /// Number of logarithmic distance bands for Kleinberg distribution enforcement.
-/// With D_MIN=0.01 and D_MAX=0.5, 4 bands gives roughly equal probability mass:
-///   Band 0: [0.01, 0.024)  — very short
-///   Band 1: [0.024, 0.056) — short
-///   Band 2: [0.056, 0.13)  — medium
-///   Band 3: [0.13, 0.5]    — long
+/// Band boundaries are D_MIN * (D_MAX/D_MIN)^(k/NUM_BANDS) for k in 0..NUM_BANDS.
+/// With D_MIN=0.01 and D_MAX=0.5, 4 bands gives equal probability mass per band:
+///   Band 0: [0.010, 0.027)  — very short
+///   Band 1: [0.027, 0.071)  — short
+///   Band 2: [0.071, 0.188)  — medium
+///   Band 3: [0.188, 0.500]  — long
 pub(crate) const NUM_BANDS: usize = 4;
 
 /// Generate a random link distance based on Kleinberg's d^{-1} distribution.
@@ -82,11 +83,16 @@ pub(crate) fn kleinberg_band_score(
 ) -> f64 {
     let band = match distance_band(candidate_distance) {
         Some(b) => b,
-        // Connections outside [D_MIN, D_MAX] get a neutral score.
-        // Very close connections (< D_MIN) are always valuable;
-        // very far connections (> D_MAX) are never useful.
         None => {
-            return if candidate_distance < D_MIN { 1.0 } else { 0.0 };
+            if candidate_distance < D_MIN {
+                // Treat very close connections as band 0 (shortest). This ensures
+                // co-located peers are subject to band deficit scoring rather than
+                // always being accepted, preventing Sybil/eclipse concentration.
+                0
+            } else {
+                // Connections farther than D_MAX are useless for routing.
+                return 0.0;
+            }
         }
     };
 
@@ -118,8 +124,12 @@ pub(crate) fn count_bands(
     let mut counts = [0usize; NUM_BANDS];
     for loc in connection_locations {
         let dist = my_location.distance(loc).as_f64();
-        if let Some(band) = distance_band(dist) {
-            counts[band] += 1;
+        match distance_band(dist) {
+            Some(band) => counts[band] += 1,
+            // Connections closer than D_MIN count toward band 0 (shortest).
+            // Connections beyond D_MAX are excluded.
+            None if dist < D_MIN => counts[0] += 1,
+            None => {}
         }
     }
     counts
@@ -297,24 +307,37 @@ mod tests {
     fn count_bands_correct() {
         let my_loc = Location::new(0.5);
         let peers = vec![
-            Location::new(0.505), // distance 0.005 → outside D_MIN
+            Location::new(0.505), // distance 0.005 → sub-D_MIN, counts in band 0
             Location::new(0.515), // distance 0.015 → band 0
             Location::new(0.55),  // distance 0.05  → band 1
             Location::new(0.6),   // distance 0.1   → band 2
             Location::new(0.8),   // distance 0.3   → band 3
         ];
         let counts = count_bands(my_loc, peers.into_iter());
-        assert_eq!(counts[0], 1); // 0.015
+        assert_eq!(counts[0], 2); // 0.005 (sub-D_MIN) + 0.015
         assert_eq!(counts[1], 1); // 0.05
         assert_eq!(counts[2], 1); // 0.1
         assert_eq!(counts[3], 1); // 0.3
     }
 
     #[test]
-    fn very_close_connections_always_valuable() {
-        // Connections closer than D_MIN always score 1.0
-        let counts = [5, 5, 5, 5];
-        let score = kleinberg_band_score(0.005, &counts);
-        assert_eq!(score, 1.0, "Very close connections should always score 1.0");
+    fn very_close_connections_use_band_0_scoring() {
+        // Connections closer than D_MIN are treated as band 0, not auto-accepted.
+        // This prevents co-located Sybil nodes from filling all slots.
+        let balanced = [5, 5, 5, 5];
+        let score = kleinberg_band_score(0.005, &balanced);
+        // Band 0 at ideal → score 0.5, not 1.0
+        assert!(
+            (0.4..=0.6).contains(&score),
+            "Sub-D_MIN should use band 0 scoring, got {score:.2}"
+        );
+
+        // With empty band 0, sub-D_MIN connection should score high
+        let empty_band0 = [0, 10, 5, 5];
+        let score = kleinberg_band_score(0.005, &empty_band0);
+        assert!(
+            score > 0.8,
+            "Sub-D_MIN into empty band 0 should score high, got {score:.2}"
+        );
     }
 }
