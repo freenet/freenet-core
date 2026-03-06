@@ -59,6 +59,7 @@ pub(crate) fn start_op(
         })),
         upstream_addr: None, // Local operation, no upstream peer
         local_fallback: None,
+        auto_fetch: false,
     }
 }
 
@@ -91,7 +92,70 @@ pub(crate) fn start_op_with_id(
         })),
         upstream_addr: None, // Local operation, no upstream peer
         local_fallback: None,
+        auto_fetch: false,
     }
+}
+
+/// Create a GET operation pre-targeted at a specific peer, bypassing normal routing.
+/// Returns the operation and the message to send. Used for auto-fetching contracts
+/// from peers known to have them (e.g., UPDATE senders).
+pub(crate) fn start_targeted_op(
+    instance_id: ContractInstanceId,
+    target: PeerKeyLocation,
+    max_hops_to_live: usize,
+) -> (GetOp, GetMsg) {
+    let contract_location = Location::from(&instance_id);
+    let id = Transaction::new::<GetMsg>();
+    tracing::debug!(
+        tx = %id,
+        "Requesting targeted get contract {instance_id} @ loc({contract_location})"
+    );
+
+    let visited = super::VisitedPeers::new(&id);
+    let mut tried_peers = HashSet::new();
+    if let Some(addr) = target.socket_addr() {
+        tried_peers.insert(addr);
+    }
+
+    let state = Some(GetState::AwaitingResponse(AwaitingResponseData {
+        instance_id,
+        retries: 0,
+        fetch_contract: true,
+        requester: None,
+        current_hop: max_hops_to_live,
+        subscribe: false,
+        blocking_subscribe: false,
+        next_hop: target,
+        tried_peers,
+        alternatives: vec![],
+        attempts_at_hop: 1,
+        visited: visited.clone(),
+    }));
+
+    let msg = GetMsg::Request {
+        id,
+        instance_id,
+        fetch_contract: true,
+        htl: max_hops_to_live,
+        visited,
+    };
+
+    let op = GetOp {
+        id,
+        state,
+        result: None,
+        stats: Some(Box::new(GetStats {
+            contract_location,
+            next_peer: None,
+            transfer_time: None,
+            first_response_time: None,
+        })),
+        upstream_addr: None,
+        local_fallback: None,
+        auto_fetch: true, // System-initiated, not a client request
+    };
+
+    (op, msg)
 }
 
 /// Request to get the current value from a contract.
@@ -175,6 +239,7 @@ pub(crate) async fn request_get(
                     stats: get_op.stats,
                     upstream_addr: get_op.upstream_addr,
                     local_fallback: None,
+                    auto_fetch: false,
                 };
 
                 op_manager.push(*id, OpEnum::Get(completed_op)).await?;
@@ -277,6 +342,7 @@ pub(crate) async fn request_get(
                 }),
                 upstream_addr: get_op.upstream_addr,
                 local_fallback, // Store local cache for fallback if network returns NotFound
+                auto_fetch: get_op.auto_fetch,
             };
 
             // Emit get_request telemetry when initiating a GET operation
@@ -477,6 +543,10 @@ pub(crate) struct GetOp {
     /// This enables "network first, local fallback" behavior to ensure we get fresh data
     /// while still being able to serve cached content when the network is unavailable.
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
+    /// True when this GET was spawned internally by try_auto_fetch_contract,
+    /// not by a client request. Used to avoid sending spurious timeout errors
+    /// to a non-existent client.
+    auto_fetch: bool,
 }
 
 impl GetOp {
@@ -548,13 +618,16 @@ impl GetOp {
         }
     }
 
-    /// Returns true if this GET was initiated by a local client (not forwarded from a peer).
-    /// Only client-initiated GETs have `requester: None` in the AwaitingResponse state.
+    /// Returns true if this GET was initiated by a local client (not forwarded from
+    /// a peer and not a system-initiated auto-fetch).
     pub(crate) fn is_client_initiated(&self) -> bool {
+        if self.auto_fetch {
+            return false;
+        }
         match &self.state {
             Some(GetState::PrepareRequest(_)) => true,
             Some(GetState::AwaitingResponse(data)) => data.requester.is_none(),
-            _ => false,
+            Some(GetState::ReceivedRequest) | Some(GetState::Finished(_)) | None => false,
         }
     }
 
@@ -636,6 +709,7 @@ impl GetOp {
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
                     local_fallback: self.local_fallback,
+                    auto_fetch: self.auto_fetch,
                 };
 
                 op_manager
@@ -702,6 +776,7 @@ impl GetOp {
                         stats: self.stats,
                         upstream_addr: self.upstream_addr,
                         local_fallback: self.local_fallback,
+                        auto_fetch: self.auto_fetch,
                     };
 
                     op_manager
@@ -732,6 +807,7 @@ impl GetOp {
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
                     local_fallback: None,
+                    auto_fetch: false,
                 };
 
                 op_manager.push(self.id, OpEnum::Get(completed_op)).await?;
@@ -756,6 +832,7 @@ impl GetOp {
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
                     local_fallback: None,
+                    auto_fetch: false,
                 };
 
                 op_manager
@@ -797,6 +874,7 @@ impl GetOp {
                     stats: self.stats,
                     upstream_addr: self.upstream_addr,
                     local_fallback: None,
+                    auto_fetch: false,
                 };
                 op_manager.push(self.id, OpEnum::Get(failed_op)).await?;
                 return Ok(());
@@ -850,6 +928,84 @@ impl GetOp {
             _ => None,
         }
     }
+
+    /// Try to retry this GET operation by sending to the next alternative peer.
+    /// If local alternatives are exhausted, `fallback_peers` provides additional
+    /// candidates (e.g., all connected peers for DBF search).
+    /// Returns `Ok((new_op, msg))` if a peer was available,
+    /// `Err(self)` if no peers remain (caller gets ownership back).
+    pub(crate) fn retry_with_next_alternative(
+        mut self,
+        max_hops_to_live: usize,
+        fallback_peers: &[PeerKeyLocation],
+    ) -> Result<(GetOp, GetMsg), Box<GetOp>> {
+        let state = match self.state.take() {
+            Some(s) => s,
+            None => return Err(Box::new(self)),
+        };
+        match state {
+            GetState::AwaitingResponse(mut data) => {
+                // If local alternatives exhausted, inject fallback peers we haven't tried
+                if data.alternatives.is_empty() && !fallback_peers.is_empty() {
+                    for peer in fallback_peers {
+                        if let Some(addr) = peer.socket_addr() {
+                            if !data.tried_peers.contains(&addr) {
+                                data.alternatives.push(peer.clone());
+                            }
+                        }
+                    }
+                    if !data.alternatives.is_empty() {
+                        tracing::info!(
+                            tx = %self.id,
+                            contract = %data.instance_id,
+                            new_candidates = data.alternatives.len(),
+                            "GET broadening search to all connected peers (DBF fallback)"
+                        );
+                    }
+                }
+
+                if data.alternatives.is_empty() {
+                    self.state = Some(GetState::AwaitingResponse(data));
+                    return Err(Box::new(self));
+                }
+
+                let next_target = data.alternatives.remove(0);
+                let instance_id = data.instance_id;
+                let fetch_contract = data.fetch_contract;
+                if let Some(addr) = next_target.socket_addr() {
+                    data.tried_peers.insert(addr);
+                }
+                tracing::info!(
+                    tx = %self.id,
+                    contract = %instance_id,
+                    target = %next_target,
+                    remaining_alternatives = data.alternatives.len(),
+                    "GET retrying with alternative peer after timeout"
+                );
+                data.next_hop = next_target;
+                data.attempts_at_hop += 1;
+                let visited = data.visited.clone();
+
+                self.state = Some(GetState::AwaitingResponse(data));
+
+                let msg = GetMsg::Request {
+                    id: self.id,
+                    instance_id,
+                    fetch_contract,
+                    htl: max_hops_to_live,
+                    visited,
+                };
+
+                Ok((self, msg))
+            }
+            other @ GetState::ReceivedRequest
+            | other @ GetState::PrepareRequest(_)
+            | other @ GetState::Finished(_) => {
+                self.state = Some(other);
+                Err(Box::new(self))
+            }
+        }
+    }
 }
 
 impl Operation for GetOp {
@@ -900,6 +1056,7 @@ impl Operation for GetOp {
                         stats: None, // don't care about stats in target peers
                         upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                         local_fallback: None,       // Remote requests don't have local fallback
+                        auto_fetch: false,
                     },
                     source_addr,
                 })
@@ -920,8 +1077,9 @@ impl Operation for GetOp {
         source_addr: Option<std::net::SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>> {
         Box::pin(async move {
-            // Take local_fallback early since self will be partially moved
+            // Take fields early since self will be partially moved
             let mut local_fallback = self.local_fallback;
+            let auto_fetch = self.auto_fetch;
             #[allow(unused_assignments)]
             let mut return_msg = None;
             #[allow(unused_assignments)]
@@ -1013,6 +1171,7 @@ impl Operation for GetOp {
                             upstream_addr: self.upstream_addr,
                             stream_data: None,
                             local_fallback: None,
+                            auto_fetch: false,
                         });
                     } else {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
@@ -1807,6 +1966,7 @@ impl Operation for GetOp {
                                         stats,
                                         upstream_addr: self.upstream_addr,
                                         local_fallback: None,
+                                        auto_fetch: false,
                                     }),
                                 )
                                 .await?;
@@ -2264,6 +2424,7 @@ impl Operation for GetOp {
                                             stats,
                                             upstream_addr: self.upstream_addr,
                                             local_fallback,
+                                            auto_fetch: false,
                                         }),
                                     )
                                     .await
@@ -2292,6 +2453,7 @@ impl Operation for GetOp {
                                             stats,
                                             upstream_addr: self.upstream_addr,
                                             local_fallback,
+                                            auto_fetch: false,
                                         }),
                                     )
                                     .await
@@ -2560,6 +2722,7 @@ impl Operation for GetOp {
                 result,
                 stats,
                 upstream_addr: self.upstream_addr,
+                auto_fetch,
                 stream_data,
                 local_fallback,
             })
@@ -2595,6 +2758,7 @@ struct GetOpResult {
     result: Option<GetResult>,
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
+    auto_fetch: bool,
     stream_data: Option<(StreamId, bytes::Bytes)>,
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
 }
@@ -2607,6 +2771,7 @@ fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
         result,
         stats,
         upstream_addr,
+        auto_fetch,
         stream_data,
         local_fallback,
     } = params;
@@ -2630,6 +2795,7 @@ fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
         stats,
         upstream_addr,
         local_fallback,
+        auto_fetch,
     });
     let return_msg = msg.map(NetMessage::from);
     let op_state = output_op.map(OpEnum::Get);
@@ -2751,6 +2917,7 @@ async fn try_forward_or_return(
             upstream_addr,
             stream_data: None,
             local_fallback,
+            auto_fetch: false,
         })
     } else if upstream_addr.is_some() {
         // No targets found — check for local fallback before returning NotFound
@@ -2770,6 +2937,7 @@ async fn try_forward_or_return(
                 upstream_addr,
                 stream_data: None,
                 local_fallback: None,
+                auto_fetch: false,
             })
         } else {
             tracing::warn!(
@@ -2791,6 +2959,7 @@ async fn try_forward_or_return(
                 upstream_addr,
                 stream_data: None,
                 local_fallback: None,
+                auto_fetch: false,
             })
         }
     } else {
@@ -2818,6 +2987,7 @@ async fn try_forward_or_return(
             upstream_addr,
             stream_data: None,
             local_fallback: None,
+            auto_fetch: false,
         })
     }
 }
@@ -3011,6 +3181,7 @@ mod tests {
             stats: None,
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         }
     }
 
@@ -3366,6 +3537,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         match op.outcome() {
@@ -3390,6 +3562,7 @@ mod tests {
             stats: None,
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
         assert!(
             matches!(op_no_stats.outcome(), OpOutcome::Incomplete),
@@ -3415,6 +3588,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
         assert!(
             matches!(op_success.outcome(), OpOutcome::ContractOpSuccess { .. }),
@@ -3453,6 +3627,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         match op.outcome() {
@@ -3498,6 +3673,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         match op.outcome() {
@@ -3538,6 +3714,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         assert!(
@@ -3567,6 +3744,7 @@ mod tests {
             })),
             upstream_addr: None,
             local_fallback: None,
+            auto_fetch: false,
         };
 
         match op.outcome() {
@@ -3610,5 +3788,524 @@ mod tests {
                 panic!("Expected Found response, got {other:?}")
             }
         }
+    }
+
+    // === Tests for retry_with_next_alternative ===
+
+    use crate::operations::test_utils::make_peer;
+
+    fn make_awaiting_op(alternatives: Vec<PeerKeyLocation>, tried: &[PeerKeyLocation]) -> GetOp {
+        let id = Transaction::new::<GetMsg>();
+        let instance_id = ContractInstanceId::new([42u8; 32]);
+        let visited = VisitedPeers::new(&id);
+        let next_hop = make_peer(9000);
+        let mut tried_peers = HashSet::new();
+        for p in tried {
+            if let Some(addr) = p.socket_addr() {
+                tried_peers.insert(addr);
+            }
+        }
+        if let Some(addr) = next_hop.socket_addr() {
+            tried_peers.insert(addr);
+        }
+        GetOp {
+            id,
+            state: Some(GetState::AwaitingResponse(AwaitingResponseData {
+                instance_id,
+                retries: 0,
+                fetch_contract: true,
+                requester: None,
+                current_hop: 7,
+                subscribe: false,
+                blocking_subscribe: false,
+                next_hop,
+                tried_peers,
+                alternatives,
+                attempts_at_hop: 1,
+                visited,
+            })),
+            result: None,
+            stats: None,
+            upstream_addr: None,
+            local_fallback: None,
+            auto_fetch: false,
+        }
+    }
+
+    #[test]
+    fn retry_with_local_alternative_succeeds() {
+        let alt1 = make_peer(1001);
+        let alt2 = make_peer(1002);
+        let op = make_awaiting_op(vec![alt1.clone(), alt2], &[]);
+
+        let result = op.retry_with_next_alternative(7, &[]);
+        assert!(result.is_ok(), "Should succeed with local alternatives");
+
+        let (new_op, msg) = result.unwrap_or_else(|_| panic!("expected Ok"));
+        // The message should be a Request preserving original fetch_contract
+        match &msg {
+            GetMsg::Request { fetch_contract, .. } => {
+                assert!(
+                    *fetch_contract,
+                    "retry must preserve original fetch_contract"
+                );
+            }
+            GetMsg::Response { .. }
+            | GetMsg::ResponseStreaming { .. }
+            | GetMsg::ResponseStreamingAck { .. } => panic!("Expected GetMsg::Request"),
+        }
+        // Should have 1 alternative remaining
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            assert_eq!(data.alternatives.len(), 1);
+            assert!(data.tried_peers.contains(&alt1.socket_addr().unwrap()));
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    #[test]
+    fn retry_exhausted_returns_err() {
+        let op = make_awaiting_op(vec![], &[]);
+
+        let result = op.retry_with_next_alternative(7, &[]);
+        assert!(result.is_err(), "Should fail with no alternatives");
+
+        // Verify op is returned intact
+        let returned_op = match result {
+            Err(op) => *op,
+            Ok(_) => panic!("expected Err"),
+        };
+        assert!(
+            matches!(&returned_op.state, Some(GetState::AwaitingResponse(_))),
+            "State should be preserved"
+        );
+    }
+
+    #[test]
+    fn retry_dbf_fallback_injects_new_peers() {
+        // No local alternatives, but provide fallback peers
+        let fallback1 = make_peer(2001);
+        let fallback2 = make_peer(2002);
+        let op = make_awaiting_op(vec![], &[]);
+
+        let result = op.retry_with_next_alternative(7, &[fallback1.clone(), fallback2]);
+        assert!(result.is_ok(), "Should succeed with DBF fallback peers");
+
+        let (new_op, _msg) = result.unwrap_or_else(|_| panic!("expected Ok"));
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            // One fallback used as next_hop, one remaining
+            assert_eq!(data.alternatives.len(), 1);
+            assert!(data.tried_peers.contains(&fallback1.socket_addr().unwrap()));
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    #[test]
+    fn retry_dbf_fallback_skips_already_tried() {
+        let already_tried = make_peer(3001);
+        let fresh_peer = make_peer(3002);
+        let op = make_awaiting_op(vec![], std::slice::from_ref(&already_tried));
+
+        let result = op.retry_with_next_alternative(7, &[already_tried, fresh_peer.clone()]);
+        assert!(result.is_ok(), "Should find fresh_peer");
+
+        let (new_op, _msg) = result.unwrap_or_else(|_| panic!("expected Ok"));
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            assert_eq!(data.alternatives.len(), 0, "Only one fresh peer injected");
+            assert!(data
+                .tried_peers
+                .contains(&fresh_peer.socket_addr().unwrap()));
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    #[test]
+    fn retry_dbf_all_tried_returns_err() {
+        let tried1 = make_peer(4001);
+        let tried2 = make_peer(4002);
+        let op = make_awaiting_op(vec![], &[tried1.clone(), tried2.clone()]);
+
+        let result = op.retry_with_next_alternative(7, &[tried1, tried2]);
+        assert!(result.is_err(), "All fallback peers already tried");
+    }
+
+    #[test]
+    fn retry_wrong_state_returns_err() {
+        // PrepareRequest state
+        let op = make_get_op(
+            Some(GetState::PrepareRequest(PrepareRequestData {
+                instance_id: ContractInstanceId::new([1u8; 32]),
+                id: Transaction::new::<GetMsg>(),
+                fetch_contract: true,
+                subscribe: false,
+                blocking_subscribe: false,
+            })),
+            None,
+        );
+        assert!(op.retry_with_next_alternative(7, &[]).is_err());
+
+        // ReceivedRequest state
+        let op = make_get_op(Some(GetState::ReceivedRequest), None);
+        assert!(op.retry_with_next_alternative(7, &[]).is_err());
+
+        // None state
+        let op = make_get_op(None, None);
+        assert!(op.retry_with_next_alternative(7, &[]).is_err());
+    }
+
+    // === Tests for start_targeted_op ===
+
+    #[test]
+    fn start_targeted_op_creates_correct_state() {
+        let target = make_peer(5001);
+        let instance_id = ContractInstanceId::new([99u8; 32]);
+
+        let (op, msg) = start_targeted_op(instance_id, target.clone(), 10);
+
+        // Should be auto_fetch
+        assert!(op.auto_fetch, "Targeted op should be marked as auto_fetch");
+
+        // Should be in AwaitingResponse state targeting the peer
+        if let Some(GetState::AwaitingResponse(data)) = &op.state {
+            assert_eq!(data.instance_id, instance_id);
+            assert!(data.fetch_contract);
+            assert!(data.requester.is_none());
+            assert!(data.tried_peers.contains(&target.socket_addr().unwrap()));
+            assert!(data.alternatives.is_empty());
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+
+        // Message should be a Request with correct fields
+        match msg {
+            GetMsg::Request {
+                instance_id: msg_id,
+                fetch_contract,
+                htl,
+                ..
+            } => {
+                assert_eq!(msg_id, instance_id);
+                assert!(fetch_contract);
+                assert_eq!(htl, 10);
+            }
+            GetMsg::Response { .. }
+            | GetMsg::ResponseStreaming { .. }
+            | GetMsg::ResponseStreamingAck { .. } => {
+                panic!("Expected Request message")
+            }
+        }
+    }
+
+    // === Tests for is_client_initiated ===
+
+    #[test]
+    fn is_client_initiated_true_for_prepare_request() {
+        let op = make_get_op(
+            Some(GetState::PrepareRequest(PrepareRequestData {
+                instance_id: ContractInstanceId::new([1u8; 32]),
+                id: Transaction::new::<GetMsg>(),
+                fetch_contract: true,
+                subscribe: false,
+                blocking_subscribe: false,
+            })),
+            None,
+        );
+        assert!(op.is_client_initiated());
+    }
+
+    #[test]
+    fn is_client_initiated_true_for_awaiting_no_requester() {
+        let op = make_awaiting_op(vec![], &[]);
+        assert!(op.is_client_initiated());
+    }
+
+    #[test]
+    fn is_client_initiated_false_for_awaiting_with_requester() {
+        let id = Transaction::new::<GetMsg>();
+        let instance_id = ContractInstanceId::new([42u8; 32]);
+        let visited = VisitedPeers::new(&id);
+        let requester = make_peer(6001);
+        let op = GetOp {
+            id,
+            state: Some(GetState::AwaitingResponse(AwaitingResponseData {
+                instance_id,
+                retries: 0,
+                fetch_contract: true,
+                requester: Some(requester),
+                current_hop: 7,
+                subscribe: false,
+                blocking_subscribe: false,
+                next_hop: make_peer(6002),
+                tried_peers: HashSet::new(),
+                alternatives: vec![],
+                attempts_at_hop: 1,
+                visited,
+            })),
+            result: None,
+            stats: None,
+            upstream_addr: None,
+            local_fallback: None,
+            auto_fetch: false,
+        };
+        assert!(!op.is_client_initiated());
+    }
+
+    #[test]
+    fn is_client_initiated_false_for_auto_fetch() {
+        let target = make_peer(7001);
+        let instance_id = ContractInstanceId::new([77u8; 32]);
+        let (op, _msg) = start_targeted_op(instance_id, target, 10);
+        // auto_fetch ops should NOT be client-initiated even though requester is None
+        assert!(
+            !op.is_client_initiated(),
+            "Auto-fetch GET should not be client-initiated"
+        );
+    }
+
+    #[test]
+    fn is_client_initiated_false_for_other_states() {
+        let op = make_get_op(Some(GetState::ReceivedRequest), None);
+        assert!(!op.is_client_initiated());
+
+        let key = make_contract_key(1);
+        let op = make_get_op(Some(GetState::Finished(FinishedData { key })), None);
+        assert!(!op.is_client_initiated());
+
+        let op = make_get_op(None, None);
+        assert!(!op.is_client_initiated());
+    }
+
+    // === Tests for GC task retry flow ===
+    //
+    // These tests reproduce the exact scenario from the garbage_cleanup_task in
+    // op_state_manager.rs: a GET op has been stuck for >20s with no response,
+    // and the GC task selects it for retry.
+    //
+    // The GC task uses:
+    //   1. tx.elapsed() > GET_RETRY_THRESHOLD (20s ± 20% jitter)
+    //   2. retry_with_next_alternative(max_htl, &all_connected)
+    //
+    // Without the fix (no GC retry logic), stuck GETs would sit until the 60s
+    // OPERATION_TTL expires and then be silently removed — no retry, no client
+    // notification.
+
+    use crate::config::{GlobalRng, GlobalSimulationTime};
+
+    /// Verify that a transaction created 25s ago would be selected as a
+    /// retry candidate by the GC task's threshold check.
+    ///
+    /// Removing the GC retry logic from op_state_manager.rs would make this
+    /// test's scenario moot — the elapsed check would never be performed
+    /// and stuck GETs would silently expire.
+    #[test]
+    fn gc_retry_candidate_selected_after_threshold() {
+        // Set deterministic simulation time
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C01);
+
+        // Create a transaction (records creation timestamp via current_time_ms)
+        let tx = Transaction::new::<GetMsg>();
+        // Advance simulation time by 25 seconds (past the 20s threshold).
+        // Creation timestamp is ~1_700_000_000_000 (base + small counter offset).
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000 + 25_000);
+
+        let elapsed = tx.elapsed();
+        assert!(
+            elapsed > std::time::Duration::from_secs(20),
+            "Transaction should show >20s elapsed after time advancement, got {:?}",
+            elapsed
+        );
+
+        // This is what the GC task checks: elapsed > threshold * (retry_count + 1)
+        let threshold = std::time::Duration::from_secs(20);
+        let retry_count = 0u32;
+        let base = threshold * (retry_count + 1);
+        // With jitter factor 0.8-1.2, the threshold ranges from 16s to 24s
+        // At 25s elapsed, we're past even the worst-case jitter
+        assert!(
+            elapsed > base.mul_f64(1.2),
+            "Should exceed even worst-case jittered threshold"
+        );
+    }
+
+    /// Verify that a transaction created only 10s ago would NOT be selected
+    /// as a retry candidate.
+    #[test]
+    fn gc_retry_candidate_not_selected_before_threshold() {
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C02);
+
+        let tx = Transaction::new::<GetMsg>();
+        // Only 10 seconds — below the 20s threshold
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000 + 10_000);
+
+        let elapsed = tx.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "Transaction should show <20s elapsed, got {:?}",
+            elapsed
+        );
+    }
+
+    /// Full GC retry flow: stuck GET → time passes → retry with alternative.
+    ///
+    /// Reproduces the exact flow from garbage_cleanup_task:
+    ///   1. GET op created, sent to peer, waiting for response
+    ///   2. 25 seconds pass with no response
+    ///   3. GC task selects it as retry candidate
+    ///   4. retry_with_next_alternative produces a new Request message
+    ///   5. Op is re-inserted with updated state
+    ///
+    /// Without the fix: step 4 doesn't exist — the op sits until TTL expiry.
+    /// Removing retry_with_next_alternative → this test fails to compile.
+    /// Removing the GC retry logic → step 3-5 never happen in production.
+    #[test]
+    fn gc_retry_full_flow_stuck_get_retries_with_alternative() {
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C03);
+
+        // Create a GET op with 2 alternative peers
+        let alt1 = make_peer(4001);
+        let alt2 = make_peer(4002);
+        let op = make_awaiting_op(vec![alt1.clone(), alt2], &[]);
+        let tx = op.id;
+
+        // Simulate the op being stuck: advance time by 25 seconds
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000 + 25_000);
+
+        // Verify the GC task would select this as a retry candidate
+        assert!(
+            tx.elapsed() > std::time::Duration::from_secs(20),
+            "Op should be eligible for retry"
+        );
+
+        // GC task calls retry_with_next_alternative (this IS the fix)
+        let max_htl = 7;
+        let all_connected: Vec<PeerKeyLocation> = vec![]; // no DBF needed, has alternatives
+        let result = op.retry_with_next_alternative(max_htl, &all_connected);
+
+        // With the fix: produces a retry message targeting alt1
+        let (new_op, msg) = result.unwrap_or_else(|_| {
+            panic!("GC retry should produce a message when alternatives exist")
+        });
+
+        // Verify the retry message targets the first alternative
+        match &msg {
+            GetMsg::Request { htl, .. } => {
+                assert_eq!(*htl, max_htl, "Retry should use max_htl");
+            }
+            GetMsg::Response { .. }
+            | GetMsg::ResponseStreaming { .. }
+            | GetMsg::ResponseStreamingAck { .. } => panic!("Expected Request"),
+        }
+
+        // Verify the op state was updated: alt1 is now the next_hop, alt2 remains
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            assert_eq!(
+                data.next_hop, alt1,
+                "Should be targeting the first alternative"
+            );
+            assert_eq!(data.alternatives.len(), 1, "One alternative remaining");
+            assert!(
+                data.tried_peers.contains(&alt1.socket_addr().unwrap()),
+                "alt1 should be in tried_peers"
+            );
+        } else {
+            panic!("Expected AwaitingResponse state after retry");
+        }
+    }
+
+    /// GC retry with DBF fallback: stuck GET, all alternatives exhausted,
+    /// broadens search to all connected peers.
+    ///
+    /// Without the DBF fallback fix: when alternatives are empty, the retry
+    /// returns Err and the op stays stuck until TTL expiry.
+    /// With the fix: fallback_peers (from ring.get_connections_by_location)
+    /// are injected as new alternatives.
+    #[test]
+    fn gc_retry_dbf_fallback_broadens_to_connected_peers() {
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C04);
+
+        // Create a GET op with NO alternatives (all exhausted)
+        let op = make_awaiting_op(vec![], &[]);
+
+        // Without DBF fallback: retry fails (no alternatives)
+        let fallback_peers: Vec<PeerKeyLocation> = vec![];
+        let op_clone_for_no_fallback = make_awaiting_op(vec![], &[]);
+        let result = op_clone_for_no_fallback.retry_with_next_alternative(7, &fallback_peers);
+        assert!(result.is_err(), "Without fallback peers, retry should fail");
+
+        // WITH DBF fallback: provide connected peers that haven't been tried
+        let fallback1 = make_peer(5001);
+        let fallback2 = make_peer(5002);
+        let fallback_peers = vec![fallback1.clone(), fallback2];
+
+        let result = op.retry_with_next_alternative(7, &fallback_peers);
+        let (new_op, msg) =
+            result.unwrap_or_else(|_| panic!("DBF fallback should inject new peers and retry"));
+
+        // Verify the retry targets a fallback peer
+        assert!(matches!(msg, GetMsg::Request { .. }));
+
+        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
+            assert!(
+                data.tried_peers.contains(&fallback1.socket_addr().unwrap()),
+                "Fallback peer should be in tried_peers"
+            );
+            // One fallback was used, one remains as alternative
+            assert_eq!(
+                data.alternatives.len(),
+                1,
+                "Second fallback should remain as alternative"
+            );
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    /// Verify that successive GC retries advance the threshold multiplicatively.
+    ///
+    /// The GC task uses: threshold = GET_RETRY_THRESHOLD * (retry_count + 1)
+    ///   retry 0: fires at ~20s
+    ///   retry 1: fires at ~40s
+    ///   retry 2: fires at ~60s (near TTL expiry)
+    ///
+    /// This prevents rapid-fire retries from overwhelming the network.
+    #[test]
+    fn gc_retry_threshold_scales_with_retry_count() {
+        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
+        GlobalRng::set_seed(0x6C05);
+
+        let tx = Transaction::new::<GetMsg>();
+        // Transaction was created at ~1_700_000_000_000 (base + tiny counter offset)
+        let base_ms = 1_700_000_000_000u64;
+
+        let threshold = std::time::Duration::from_secs(20);
+
+        // At 25s: retry_count=0 threshold=20s → eligible
+        GlobalSimulationTime::set_time_ms(base_ms + 25_000);
+        let base_0 = threshold * 1;
+        assert!(tx.elapsed() > base_0, "First retry should fire at ~20s");
+
+        // At 25s: retry_count=1 threshold=40s → NOT eligible
+        let base_1 = threshold * 2;
+        assert!(
+            tx.elapsed() < base_1,
+            "Second retry should NOT fire at 25s (needs ~40s)"
+        );
+
+        // At 45s: retry_count=1 threshold=40s → eligible
+        GlobalSimulationTime::set_time_ms(base_ms + 45_000);
+        assert!(tx.elapsed() > base_1, "Second retry should fire at ~40s");
+
+        // At 45s: retry_count=2 threshold=60s → NOT eligible
+        let base_2 = threshold * 3;
+        assert!(
+            tx.elapsed() < base_2,
+            "Third retry should NOT fire at 45s (needs ~60s)"
+        );
     }
 }

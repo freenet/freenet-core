@@ -718,6 +718,10 @@ impl Operation for UpdateOp {
                                 {
                                     tracing::warn!(tx = %id, error = %e, "failed to send ResyncRequest");
                                 }
+                            } else {
+                                // Full state update failed (not delta) — likely missing
+                                // contract parameters. Trigger a self-healing GET.
+                                op_manager.try_auto_fetch_contract(key, sender_addr);
                             }
                             return Err(err);
                         }
@@ -1268,13 +1272,15 @@ impl Operation for UpdateOp {
                         Err(err) => {
                             // Broadcast updates are best-effort: if we can't apply the update
                             // (e.g., missing contract parameters after restart), log and skip.
-                            // The contract will be obtained properly via GET eventually.
-                            tracing::debug!(
+                            tracing::warn!(
                                 tx = %id,
                                 %key,
                                 error = %err,
                                 "BroadcastToStreaming update skipped — contract not ready locally"
                             );
+                            // Self-heal: trigger a background GET to fetch the missing
+                            // contract code and parameters from the network.
+                            op_manager.try_auto_fetch_contract(key, sender_addr);
                         }
                     }
 
@@ -1297,7 +1303,98 @@ impl Operation for UpdateOp {
     }
 }
 
+/// Cooldown before retrying a self-healing contract fetch, in milliseconds.
+/// 5 minutes: long enough to avoid hammering peers if the contract genuinely
+/// doesn't exist, short enough to recover within a session if there was a
+/// transient routing failure.
+pub(crate) const CONTRACT_FETCH_COOLDOWN_MS: u64 = 300_000;
+
 impl OpManager {
+    /// Trigger a background GET when an UPDATE broadcast fails because the node
+    /// doesn't have the contract's parameters (code + params). This self-heals
+    /// the node by fetching the contract directly from the UPDATE sender, who
+    /// is known to have the contract.
+    ///
+    /// Rate-limited: at most one fetch attempt per contract per 5 minutes.
+    pub(crate) fn try_auto_fetch_contract(&self, key: &ContractKey, sender_addr: SocketAddr) {
+        use crate::config::GlobalSimulationTime;
+
+        let instance_id = *key.id();
+        let now_ms = GlobalSimulationTime::read_time_ms();
+
+        // Atomic rate-limit: try to insert a new entry. If one exists and hasn't
+        // expired, bail out. Uses entry API to avoid TOCTOU between check and insert.
+        {
+            use dashmap::mapref::entry::Entry;
+            match self.pending_contract_fetches.entry(instance_id) {
+                Entry::Occupied(mut existing) => {
+                    let elapsed_ms = now_ms.saturating_sub(*existing.get());
+                    if elapsed_ms < CONTRACT_FETCH_COOLDOWN_MS {
+                        return; // Still in cooldown
+                    }
+                    // Cooldown expired — update timestamp while still holding the lock
+                    *existing.get_mut() = now_ms;
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(now_ms);
+                }
+            }
+        }
+
+        // Look up the sender's PeerKeyLocation so we can target them directly
+        let sender_pkl = match self.ring.connection_manager.get_peer_by_addr(sender_addr) {
+            Some(pkl) => pkl,
+            None => {
+                tracing::debug!(
+                    contract = %key,
+                    sender = %sender_addr,
+                    "Cannot auto-fetch: UPDATE sender not found in connection manager"
+                );
+                self.pending_contract_fetches.remove(&instance_id);
+                return;
+            }
+        };
+
+        tracing::info!(
+            contract = %key,
+            sender = %sender_addr,
+            "Auto-fetching contract from UPDATE sender (missing parameters)"
+        );
+
+        // Create a GET operation that targets the sender directly
+        let max_htl = self.ring.max_hops_to_live;
+        let op_manager = self.clone();
+
+        crate::config::GlobalExecutor::spawn(async move {
+            let (targeted_op, msg) =
+                super::get::start_targeted_op(instance_id, sender_pkl, max_htl);
+
+            match op_manager
+                .notify_op_change(
+                    crate::message::NetMessage::from(msg),
+                    super::OpEnum::Get(targeted_op),
+                )
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        contract = %instance_id,
+                        target = %sender_addr,
+                        "Auto-fetch GET sent directly to UPDATE sender"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        contract = %instance_id,
+                        error = %e,
+                        "Auto-fetch GET failed to send to UPDATE sender"
+                    );
+                    op_manager.pending_contract_fetches.remove(&instance_id);
+                }
+            }
+        });
+    }
+
     /// Get the list of network subscribers to broadcast an UPDATE to.
     ///
     /// **Architecture Note (Issue #2075):**

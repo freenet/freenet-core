@@ -273,6 +273,11 @@ pub(crate) struct OpManager {
     /// Used by connection_maintenance to directly attempt gateway connections
     /// when the node has zero ring connections (#3219).
     pub configured_gateways: Arc<Vec<PeerKeyLocation>>,
+    /// Tracks contracts for which a self-healing GET has been triggered
+    /// (e.g., when an UPDATE broadcast fails due to missing contract parameters).
+    /// Maps contract instance ID to the timestamp (ms since epoch via GlobalSimulationTime)
+    /// when the fetch was initiated, with a cooldown to avoid repeated fetch attempts.
+    pub(crate) pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
 }
 
 impl Clone for OpManager {
@@ -299,6 +304,7 @@ impl Clone for OpManager {
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
             blocked_addresses: self.blocked_addresses.clone(),
             configured_gateways: self.configured_gateways.clone(),
+            pending_contract_fetches: self.pending_contract_fetches.clone(),
         }
     }
 }
@@ -337,6 +343,8 @@ impl OpManager {
         let contract_waiters: Arc<
             Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
         > = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>> =
+            Arc::new(DashMap::new());
 
         task_monitor.register(
             "garbage_cleanup",
@@ -353,6 +361,7 @@ impl OpManager {
                     ring.clone(),
                     ch_outbound.clone(),
                     contract_waiters.clone(),
+                    pending_contract_fetches.clone(),
                 )
                 .instrument(garbage_span),
             ),
@@ -420,6 +429,7 @@ impl OpManager {
                     .map(|gw| gw.peer_key_location.clone())
                     .collect(),
             ),
+            pending_contract_fetches,
         })
     }
 
@@ -1401,6 +1411,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     contract_waiters: Arc<
         Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
     >,
+    pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     /// How often to clean up stale contract_waiters entries (every N ticks).
@@ -1412,6 +1423,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     let mut ttl_set = BTreeSet::new();
 
     let mut delayed = vec![];
+    let mut get_retried: std::collections::HashMap<Transaction, usize> =
+        std::collections::HashMap::new();
     loop {
         crate::deterministic_select! {
             tx = new_transactions.recv() => {
@@ -1441,6 +1454,98 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             removed = before - after,
                             "Cleaned up stale contract_waiters entries"
                         );
+                    }
+                }
+
+                // Retry GET operations that have been waiting too long.
+                // If a GET has been pending for > GET_RETRY_THRESHOLD and has untried
+                // alternative peers, remove it from the map, advance to the next
+                // alternative, and re-submit. This prevents silent timeout when the
+                // selected peer is unreachable or drops the request.
+                //
+                // 20s chosen to be long enough for a normal response round-trip
+                // (including streaming) but short enough to retry 2-3 times before
+                // the 60s OPERATION_TTL expires.
+                const GET_RETRY_THRESHOLD: Duration = Duration::from_secs(20);
+                {
+                    // Clean up entries for completed operations
+                    get_retried.retain(|tx, _| ops.get.contains_key(tx));
+
+                    let mut retry_candidates: Vec<Transaction> = Vec::new();
+                    for entry in ops.get.iter() {
+                        let tx = *entry.key();
+                        let elapsed = tx.elapsed();
+                        // Allow retry every GET_RETRY_THRESHOLD seconds with ±20% jitter:
+                        // first retry at ~20s, second at ~40s, etc.
+                        let retry_count = get_retried.get(&tx).copied().unwrap_or(0);
+                        let base = GET_RETRY_THRESHOLD * (retry_count as u32 + 1);
+                        let jitter_factor: f64 =
+                            crate::config::GlobalRng::random_range(0.8..=1.2);
+                        let jitter = base.mul_f64(jitter_factor);
+                        if elapsed > jitter {
+                            retry_candidates.push(tx);
+                        }
+                    }
+
+                    if !retry_candidates.is_empty() {
+                        // Collect all connected peers for DBF fallback (only when needed)
+                        let all_connected: Vec<_> = ring
+                            .connection_manager
+                            .get_connections_by_location()
+                            .values()
+                            .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
+                            .collect();
+
+                        for tx in retry_candidates {
+                            if let Some((_, get_op)) = ops.get.remove(&tx) {
+                                let max_htl = ring.max_hops_to_live;
+                                match get_op.retry_with_next_alternative(max_htl, &all_connected)
+                                {
+                                    Ok((new_op, msg)) => {
+                                        let msg = crate::message::NetMessage::from(msg);
+                                        // Insert op BEFORE sending message to avoid race
+                                        // where the response arrives before the op is stored.
+                                        ops.get.insert(tx, new_op);
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(1),
+                                            event_loop_notifier
+                                                .notifications_sender
+                                                .send(Either::Left(msg)),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {
+                                                // Count the retry now that message was sent
+                                                *get_retried.entry(tx).or_insert(0) += 1;
+                                            }
+                                            Ok(Err(_)) | Err(_) => {
+                                                // Channel closed or timeout — op is already
+                                                // stored, will be retried next tick.
+                                                tracing::warn!(
+                                                    %tx,
+                                                    "Failed to send GET retry message, \
+                                                     will retry next tick"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(get_op) => {
+                                        // No alternatives — put it back for normal timeout
+                                        ops.get.insert(tx, *get_op);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Periodically clean up stale pending_contract_fetches entries.
+                    // Entries older than 2x cooldown are removed to prevent unbounded growth.
+                    if tick_count % 12 == 0 {
+                        let cooldown_ms = crate::operations::update::CONTRACT_FETCH_COOLDOWN_MS;
+                        let now_ms = crate::config::GlobalSimulationTime::read_time_ms();
+                        pending_contract_fetches.retain(|_, ts| {
+                            now_ms.saturating_sub(*ts) < cooldown_ms * 2
+                        });
                     }
                 }
 
@@ -1478,6 +1583,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     if still_waiting {
                         delayed.push(tx);
                     } else {
+                        get_retried.remove(&tx);
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
                         tracing::info!(
