@@ -159,6 +159,11 @@ impl UpdateOp {
         }
     }
 
+    /// Returns true if this UPDATE was initiated by a local client (not forwarded from a peer).
+    pub(crate) fn is_client_initiated(&self) -> bool {
+        self.upstream_addr.is_none()
+    }
+
     /// Extract routing failure info for timeout reporting.
     pub(crate) fn failure_routing_info(&self) -> Option<(PeerKeyLocation, Location)> {
         match &self.stats {
@@ -2414,6 +2419,23 @@ mod tests {
             stats,
             upstream_addr: None,
         }
+    }
+
+    #[test]
+    fn is_client_initiated_true_when_no_upstream() {
+        let op = make_update_op(None, None);
+        assert!(op.is_client_initiated());
+    }
+
+    #[test]
+    fn is_client_initiated_false_when_forwarded() {
+        let op = UpdateOp {
+            id: Transaction::new::<UpdateMsg>(),
+            state: None,
+            stats: None,
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+        };
+        assert!(!op.is_client_initiated());
     }
 
     #[test]

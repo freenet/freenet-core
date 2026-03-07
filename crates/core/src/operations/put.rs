@@ -67,6 +67,11 @@ impl PutOp {
         }
     }
 
+    /// Returns true if this PUT was initiated by a local client (not forwarded from a peer).
+    pub(crate) fn is_client_initiated(&self) -> bool {
+        self.upstream_addr.is_none()
+    }
+
     /// Extract routing failure info for timeout reporting.
     pub(crate) fn failure_routing_info(&self) -> Option<(PeerKeyLocation, Location)> {
         self.stats
@@ -2111,5 +2116,22 @@ mod tests {
         // state=None → finalized, stats=None → Irrelevant
         assert!(op.finalized());
         assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
+    }
+
+    #[test]
+    fn is_client_initiated_true_when_no_upstream() {
+        let op = make_put_op(None);
+        assert!(op.is_client_initiated());
+    }
+
+    #[test]
+    fn is_client_initiated_false_when_forwarded() {
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: None,
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+            stats: None,
+        };
+        assert!(!op.is_client_initiated());
     }
 }

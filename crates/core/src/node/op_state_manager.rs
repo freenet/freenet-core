@@ -1260,12 +1260,43 @@ fn report_timeout_failure(
     );
 }
 
-/// Removes a put operation from the ops map and reports timeout failure if stats are available.
+/// Removes a put operation from the ops map, reports timeout failure if stats are available,
+/// and notifies the client with an error so they don't wait silently until their own timeout.
 /// Returns `true` if the operation was found and removed, `false` otherwise.
-fn remove_put_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring::Ring) -> bool {
+fn remove_put_and_report_failure(
+    ops: &Ops,
+    tx: &Transaction,
+    ring: &crate::ring::Ring,
+    result_router_tx: &mpsc::Sender<(Transaction, HostResult)>,
+) -> bool {
     if let Some((_, put_op)) = ops.put.remove(tx) {
         if let Some((peer, contract_location)) = put_op.failure_routing_info() {
             report_timeout_failure(ring, tx, peer, contract_location);
+        }
+        tracing::warn!(
+            tx = %tx,
+            elapsed_ms = tx.elapsed().as_millis(),
+            phase = "put_timeout",
+            "PUT operation timed out without receiving a response"
+        );
+        // Notify client of timeout so they get an immediate error instead of
+        // waiting silently for their own client-side timeout (#3451).
+        if put_op.is_client_initiated() {
+            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: "PUT operation timed out".into(),
+            }
+            .into());
+            let router_tx = result_router_tx.clone();
+            let tx = *tx;
+            GlobalExecutor::spawn(async move {
+                if let Err(e) = router_tx.send((tx, error_result)).await {
+                    tracing::warn!(
+                        %tx,
+                        error = %e,
+                        "failed to send PUT timeout error to client"
+                    );
+                }
+            });
         }
         true
     } else {
@@ -1273,12 +1304,43 @@ fn remove_put_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring
     }
 }
 
-/// Removes an update operation from the ops map and reports timeout failure if stats are available.
+/// Removes an update operation from the ops map, reports timeout failure if stats are available,
+/// and notifies the client with an error so they don't wait silently until their own timeout.
 /// Returns `true` if the operation was found and removed, `false` otherwise.
-fn remove_update_and_report_failure(ops: &Ops, tx: &Transaction, ring: &crate::ring::Ring) -> bool {
+fn remove_update_and_report_failure(
+    ops: &Ops,
+    tx: &Transaction,
+    ring: &crate::ring::Ring,
+    result_router_tx: &mpsc::Sender<(Transaction, HostResult)>,
+) -> bool {
     if let Some((_, update_op)) = ops.update.remove(tx) {
         if let Some((peer, contract_location)) = update_op.failure_routing_info() {
             report_timeout_failure(ring, tx, peer, contract_location);
+        }
+        tracing::warn!(
+            tx = %tx,
+            elapsed_ms = tx.elapsed().as_millis(),
+            phase = "update_timeout",
+            "UPDATE operation timed out without receiving a response"
+        );
+        // Notify client of timeout so they get an immediate error instead of
+        // waiting silently for their own client-side timeout (#3451).
+        if update_op.is_client_initiated() {
+            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: "UPDATE operation timed out".into(),
+            }
+            .into());
+            let router_tx = result_router_tx.clone();
+            let tx = *tx;
+            GlobalExecutor::spawn(async move {
+                if let Err(e) = router_tx.send((tx, error_result)).await {
+                    tracing::warn!(
+                        %tx,
+                        error = %e,
+                        "failed to send UPDATE timeout error to client"
+                    );
+                }
+            });
         }
         true
     } else {
@@ -1573,12 +1635,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 true
                             }
                         }
-                        TransactionType::Put => !remove_put_and_report_failure(&ops, &tx, &ring),
+                        TransactionType::Put => !remove_put_and_report_failure(&ops, &tx, &ring, &result_router_tx),
                         TransactionType::Get => !remove_get_and_report_failure(&ops, &tx, &ring, &result_router_tx),
                         TransactionType::Subscribe => {
                             remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_none()
                         }
-                        TransactionType::Update => !remove_update_and_report_failure(&ops, &tx, &ring),
+                        TransactionType::Update => !remove_update_and_report_failure(&ops, &tx, &ring, &result_router_tx),
                     };
                     if still_waiting {
                         delayed.push(tx);
@@ -1670,12 +1732,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 false
                             }
                         }
-                        TransactionType::Put => remove_put_and_report_failure(&ops, &tx, &ring),
+                        TransactionType::Put => remove_put_and_report_failure(&ops, &tx, &ring, &result_router_tx),
                         TransactionType::Get => remove_get_and_report_failure(&ops, &tx, &ring, &result_router_tx),
                         TransactionType::Subscribe => {
                             remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_some()
                         }
-                        TransactionType::Update => remove_update_and_report_failure(&ops, &tx, &ring),
+                        TransactionType::Update => remove_update_and_report_failure(&ops, &tx, &ring, &result_router_tx),
                     };
                     if removed {
                         tracing::info!(
