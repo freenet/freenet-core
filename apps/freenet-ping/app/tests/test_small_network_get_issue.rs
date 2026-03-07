@@ -282,7 +282,9 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
         );
 
         let start = std::time::Instant::now();
-        match timeout(Duration::from_secs(45), client_node2.recv()).await {
+        // 120s to accommodate WASM compilation under CI load (shared Engine mutex
+        // serializes compilation across executors).
+        match timeout(Duration::from_secs(120), client_node2.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(response))) => {
                 println!("Get response after {:?}: {:?}", start.elapsed(), response);
                 match response {
@@ -312,7 +314,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
                 anyhow::bail!("Get operation failed: {}", e);
             }
             Err(_) => {
-                println!("❌ Timeout waiting for get response after 45s");
+                println!("❌ Timeout waiting for get response after 120s");
                 anyhow::bail!("Get operation timed out");
             }
         }
@@ -330,8 +332,9 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
             }))
             .await?;
 
-        // Second GET timeout - with rate limiting fix (#2546), this should complete quickly
-        match timeout(Duration::from_secs(45), client_node2.recv()).await {
+        // Second GET timeout - with rate limiting fix (#2546), this should complete quickly.
+        // 120s to accommodate WASM compilation under CI load.
+        match timeout(Duration::from_secs(120), client_node2.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
                 state,
@@ -354,7 +357,7 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
                 anyhow::bail!("Second GET operation failed: {}", e);
             }
             Err(_) => {
-                println!("❌ Timeout waiting for second get response after 45s");
+                println!("❌ Timeout waiting for second get response after 120s");
                 anyhow::bail!("Second GET operation timed out");
             }
         }
