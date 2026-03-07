@@ -24,9 +24,11 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration};
 
 /// Maximum peers to try per hop (breadth search).
+/// Matches GET operation's DEFAULT_MAX_BREADTH; change both together.
 const MAX_BREADTH: usize = 3;
 
 /// Maximum retry rounds (each round queries k_closest for new candidates).
+/// Matches GET operation's MAX_RETRIES; change both together.
 const MAX_RETRIES: usize = 10;
 
 /// Timeout for waiting on contract storage notification.
