@@ -2222,9 +2222,7 @@ impl Ring {
                     add_location,
                 } => {
                     // Drop the least-useful connection, then queue the gap target
-                    // for acquisition. The net effect is replacing a redundant/poor
-                    // connection with one that fills the largest gap in the
-                    // Kleinberg distribution.
+                    // for acquisition.
                     if let Some(addr) = remove.socket_addr() {
                         tracing::info!(
                             remove_peer = %remove,
@@ -2245,6 +2243,11 @@ impl Ring {
                                 error
                             })?;
                         pending_conn_adds.insert(add_location);
+                    } else {
+                        tracing::warn!(
+                            remove_peer = %remove,
+                            "Topology swap skipped: peer has no socket address"
+                        );
                     }
                 }
                 TopologyAdjustment::NoChange => {}

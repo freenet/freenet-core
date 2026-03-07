@@ -19,9 +19,9 @@
 //!
 //! - Below `min_connections` → add connections
 //! - At/above `min_connections`, resource usage < 50% → add connections
-//! - At/above `min_connections`, resource usage 50-90% → consider topology swap
 //! - At/above `min_connections`, resource usage > 90% → remove connections
 //! - Above `max_connections` → remove connections
+//! - Whenever not removing → consider topology swap (probability-gated)
 //!
 //! ## Topology Swaps
 //!
@@ -67,7 +67,7 @@ use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use tokio::time::Instant;
-use tracing::{debug, event, info, span, warn, Level};
+use tracing::{debug, event, info, span, trace, warn, Level};
 
 pub mod connection_evaluator;
 mod constants;
@@ -441,13 +441,11 @@ impl TopologyManager {
 
         let adj = adjustment.unwrap_or(TopologyAdjustment::NoChange);
 
-        // Topology swap: when the node is at steady state (at/above
-        // min_connections, not removing), check whether replacing a
-        // connection would improve the Kleinberg distribution. Independent
-        // of resource usage — the swap probability is driven purely by how
-        // much the largest gap exceeds the expected gap for an ideal
-        // distribution. Swaps don't net-add connections (they replace one),
-        // so they're compatible with AddConnections results too.
+        // Topology swap: when not removing connections, check whether
+        // replacing the least-routed connection would improve the Kleinberg
+        // distribution. Swap probability is proportional to how much the
+        // largest gap exceeds the ideal. Overrides AddConnections when
+        // triggered (probabilistically rare).
         if !matches!(adj, TopologyAdjustment::RemoveConnections(_)) {
             let swap =
                 self.maybe_swap_connection(my_location, neighbor_locations, current_connections);
@@ -599,9 +597,8 @@ impl TopologyManager {
             return TopologyAdjustment::NoChange;
         }
 
-        let my_loc = match my_location {
-            Some(loc) => *loc,
-            None => return TopologyAdjustment::NoChange,
+        let Some(&my_loc) = my_location.as_ref() else {
+            return TopologyAdjustment::NoChange;
         };
 
         let distances: Vec<f64> = neighbor_locations
@@ -627,9 +624,13 @@ impl TopologyManager {
 
         let roll: f64 = crate::config::GlobalRng::random_range(0.0..1.0);
         if roll >= swap_prob {
-            debug!(
+            trace!(
                 largest_gap,
-                expected_gap, excess, swap_prob, roll, "Topology swap check: not triggered"
+                expected_gap,
+                excess,
+                swap_prob,
+                roll,
+                "Topology swap check: not triggered"
             );
             return TopologyAdjustment::NoChange;
         }

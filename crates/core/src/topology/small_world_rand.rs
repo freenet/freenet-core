@@ -98,7 +98,7 @@ fn analyze_gaps(connection_distances: impl Iterator<Item = f64>) -> Option<GapAn
     }
     gaps.push((prev, 1.0 - prev));
 
-    let largest_gap_size = gaps.iter().map(|(_, size)| *size).fold(0.0_f64, f64::max);
+    let largest_gap_size = gaps.iter().map(|(_, size)| *size).reduce(f64::max).unwrap();
 
     Some(GapAnalysis {
         gaps,
