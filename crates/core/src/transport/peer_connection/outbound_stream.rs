@@ -509,17 +509,19 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 if payload.len() <= available {
                     (Some(meta), payload)
                 } else if available > 0 {
-                    leftover = Some(payload.slice(available..));
+                    let leftover_bytes = payload.slice(available..);
+                    let leftover_len = leftover_bytes.len();
                     let reduced = payload.slice(..available);
                     tracing::debug!(
                         stream_id = %outbound_stream_id.0,
-                        original_len = available + leftover.as_ref().unwrap().len(),
+                        original_len = available + leftover_len,
                         reduced_len = reduced.len(),
-                        leftover_len = leftover.as_ref().unwrap().len(),
+                        leftover_len,
                         meta_len = meta.len(),
                         destination = %destination_addr,
                         "Reduced piped fragment #1 payload to fit metadata"
                     );
+                    leftover = Some(leftover_bytes);
                     (Some(meta), reduced)
                 } else {
                     tracing::warn!(
@@ -666,12 +668,55 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     }
 
     // Leftover should always be absorbed by the last fragment since it is
-    // typically smaller than MAX_DATA_SIZE.
-    debug_assert!(
-        leftover.is_none(),
-        "pipe_stream: leftover not absorbed after stream end ({} bytes remaining)",
-        leftover.as_ref().map_or(0, |lo| lo.len())
-    );
+    // typically smaller than MAX_DATA_SIZE. In the degenerate case of a
+    // single-chunk stream where metadata overhead exceeds the available space,
+    // leftover could remain — send it as an additional fragment rather than
+    // silently dropping data.
+    if let Some(lo) = leftover.take() {
+        tracing::warn!(
+            stream_id = %outbound_stream_id.0,
+            leftover_len = lo.len(),
+            destination = %destination_addr,
+            "pipe_stream: sending residual leftover as extra fragment"
+        );
+
+        let packet_size = lo.len();
+        let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let token = congestion_controller.on_send_with_token(packet_size);
+
+        if let Err(e) = super::packet_sending(
+            destination_addr,
+            &socket,
+            packet_id,
+            &outbound_symmetric_key,
+            vec![],
+            symmetric_message::StreamFragment {
+                stream_id: outbound_stream_id,
+                total_length_bytes: total_bytes,
+                fragment_number,
+                payload: lo,
+                metadata_bytes: None,
+            },
+            sent_packet_tracker.as_ref(),
+            token,
+        )
+        .await
+        {
+            let elapsed = time_source.now().saturating_sub(start_time);
+            emit_transfer_failed(
+                outbound_stream_id.0 as u64,
+                destination_addr,
+                sent_so_far,
+                e.to_string(),
+                elapsed.as_millis() as u64,
+                TransferDirection::Send,
+            );
+            return Err(e);
+        }
+
+        sent_so_far += packet_size as u64;
+        fragment_number += 1;
+    }
 
     let generic_stats = congestion_controller.stats();
     let ledbat_stats = congestion_controller.ledbat_stats();
