@@ -2217,6 +2217,36 @@ impl Ring {
                         }
                     }
                 }
+                TopologyAdjustment::SwapConnection {
+                    remove,
+                    add_location,
+                } => {
+                    // Drop the least-useful connection, then queue the gap target
+                    // for acquisition. The net effect is replacing a redundant/poor
+                    // connection with one that fills the largest gap in the
+                    // Kleinberg distribution.
+                    if let Some(addr) = remove.socket_addr() {
+                        tracing::info!(
+                            remove_peer = %remove,
+                            add_target = %add_location,
+                            "Executing topology swap"
+                        );
+                        notifier
+                            .notifications_sender
+                            .send(Either::Right(crate::message::NodeEvent::DropConnection(
+                                addr,
+                            )))
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(
+                                    error = ?error,
+                                    "Shutting down connection maintenance task"
+                                );
+                                error
+                            })?;
+                        pending_conn_adds.insert(add_location);
+                    }
+                }
                 TopologyAdjustment::NoChange => {}
             }
 
