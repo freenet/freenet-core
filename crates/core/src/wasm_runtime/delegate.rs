@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
-    ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
-    DelegateInterfaceResult, DelegateKey, DelegateMessage, GetContractRequest, InboundDelegateMsg,
-    OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId, SubscribeContractRequest,
-    UpdateContractRequest,
+    ApplicationMessage, ClientResponse, ContractInstanceId, DelegateContainer, DelegateContext,
+    DelegateError, DelegateInterfaceResult, DelegateKey, DelegateMessage, GetContractRequest,
+    InboundDelegateMsg, OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId,
+    SubscribeContractRequest, UpdateContractRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +104,21 @@ impl Runtime {
         // SAFETY: `self.secret_store` and `self.contract_store` are valid for the
         // duration of the WASM `process()` call below, and the `DelegateEnvGuard`
         // ensures the env is removed from `DELEGATE_ENV` before this function returns.
+        // Build the attested_contracts list from the attested bytes passed in.
+        // Each attested byte slice is a 32-byte ContractInstanceId.
+        let attested_contracts = attested
+            .filter(|a| a.len() == 32)
+            .map(|a| {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(a);
+                vec![ContractInstanceId::new(id)]
+            })
+            .unwrap_or_default();
+
+        // SAFETY: The `DelegateCallEnv` does not outlive `self`. The raw pointers to
+        // `secret_store`, `contract_store`, and `delegate_store` remain valid for the
+        // duration of the WASM `process()` call, and are cleaned up via DELEGATE_ENV
+        // removal below.
         let env = unsafe {
             DelegateCallEnv::new(
                 context,
@@ -111,6 +126,9 @@ impl Runtime {
                 &self.contract_store,
                 self.state_store_db.clone(),
                 delegate_key.clone(),
+                &mut self.delegate_store,
+                0, // creation_depth: always 0 for top-level calls
+                attested_contracts,
             )
         };
 

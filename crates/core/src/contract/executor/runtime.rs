@@ -2501,8 +2501,18 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
-                // Use the attested_contract directly instead of looking it up in delegate_attested_ids
-                let attested_bytes = attested_contract.map(|c| c.as_bytes());
+                // Use the attested_contract directly, falling back to inherited attestation
+                // from parent delegates that created this delegate via create_delegate host function.
+                let inherited_attested: Option<Vec<u8>> = if attested_contract.is_some() {
+                    None // Direct attestation takes priority
+                } else {
+                    crate::wasm_runtime::DELEGATE_INHERITED_ATTESTATIONS
+                        .get(&key)
+                        .and_then(|ids| ids.first().map(|c| c.as_bytes().to_vec()))
+                };
+                let attested_bytes: Option<&[u8]> = attested_contract
+                    .map(|c| c.as_bytes() as &[u8])
+                    .or(inherited_attested.as_deref());
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,
