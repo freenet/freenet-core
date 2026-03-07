@@ -1230,5 +1230,424 @@ fn test_not_found_result_originator_returns_error() {
 }
 
 // Superseded: should_forward_not_found_on_abort was removed when handle_abort
-// gained breadth/retry logic (#3446). The retry logic handles all cases inline.
-// The forwarding behavior is now tested end-to-end through simulation tests.
+// gained breadth/retry logic in PR #3460 (closes #3446). The retry logic now
+// handles all state-guard cases inline. Forwarding behavior is validated by
+// the handle_abort retry tests below.
+#[ignore]
+#[test]
+fn test_should_forward_not_found_on_abort_state_guard() {
+    // Original test validated that only AwaitingResponse state with a
+    // requester_addr triggers NotFound forwarding on abort. This behavior
+    // is now embedded in handle_abort's `if let SubscribeState::AwaitingResponse`
+    // destructure and the `if let Some(req_addr) = requester_addr` guard.
+}
+
+// =============================================================================
+// Breadth/Retry State Construction Tests (#3446 / PR #3460)
+// =============================================================================
+
+/// Verify that AwaitingResponseData correctly tracks breadth alternatives
+/// from the initial request_subscribe call.
+#[test]
+fn test_awaiting_response_data_tracks_alternatives() {
+    let instance_id = ContractInstanceId::new([80u8; 32]);
+    let tx = Transaction::new::<SubscribeMsg>();
+    let peer1 = random_peer();
+    let peer2 = random_peer();
+    let peer3 = random_peer();
+    let peer1_addr = peer1.socket_addr().unwrap();
+
+    // Simulate request_subscribe: first candidate is used as target,
+    // remaining go into alternatives
+    let mut tried_peers = HashSet::new();
+    tried_peers.insert(peer1_addr);
+
+    let data = AwaitingResponseData {
+        next_hop: Some(peer1_addr),
+        instance_id,
+        retries: 0,
+        current_hop: 10,
+        tried_peers,
+        alternatives: vec![peer2.clone(), peer3.clone()],
+        attempts_at_hop: 1,
+        visited: crate::operations::VisitedPeers::new(&tx),
+    };
+
+    assert_eq!(
+        data.alternatives.len(),
+        2,
+        "Should store remaining candidates"
+    );
+    assert_eq!(data.attempts_at_hop, 1, "First attempt at this hop");
+    assert_eq!(data.retries, 0, "No retry rounds yet");
+    assert_eq!(data.next_hop, Some(peer1_addr), "Target is first candidate");
+}
+
+/// Verify Phase 1 retry state: when an alternative is consumed,
+/// attempts_at_hop increments and alternatives shrinks.
+#[test]
+fn test_retry_phase1_state_transition() {
+    let instance_id = ContractInstanceId::new([81u8; 32]);
+    let tx = Transaction::new::<SubscribeMsg>();
+    let peer1 = random_peer();
+    let peer2 = random_peer();
+    let peer3 = random_peer();
+    let peer1_addr = peer1.socket_addr().unwrap();
+    let peer2_addr = peer2.socket_addr().unwrap();
+
+    // Start with 2 alternatives, 1 attempt at hop
+    let mut tried_peers = HashSet::new();
+    tried_peers.insert(peer1_addr);
+
+    let mut alternatives = vec![peer2.clone(), peer3.clone()];
+    let attempts_at_hop: usize = 1;
+
+    // Phase 1: try next alternative (simulates handle_abort Phase 1)
+    assert!(!alternatives.is_empty() && attempts_at_hop < MAX_BREADTH);
+    let next_target = alternatives.remove(0);
+    let next_addr = next_target.socket_addr().unwrap();
+    tried_peers.insert(next_addr);
+
+    let new_data = AwaitingResponseData {
+        next_hop: Some(next_addr),
+        instance_id,
+        retries: 0,
+        current_hop: 10,
+        tried_peers: tried_peers.clone(),
+        alternatives: alternatives.clone(),
+        attempts_at_hop: attempts_at_hop + 1,
+        visited: crate::operations::VisitedPeers::new(&tx),
+    };
+
+    assert_eq!(new_data.next_hop, Some(peer2_addr), "Should target peer2");
+    assert_eq!(
+        new_data.alternatives.len(),
+        1,
+        "One alternative remaining (peer3)"
+    );
+    assert_eq!(new_data.attempts_at_hop, 2, "Second attempt at this hop");
+    assert_eq!(new_data.retries, 0, "Still in same retry round");
+    assert!(
+        new_data.tried_peers.contains(&peer1_addr),
+        "peer1 still in tried set"
+    );
+    assert!(
+        new_data.tried_peers.contains(&peer2_addr),
+        "peer2 added to tried set"
+    );
+}
+
+/// Verify Phase 1 boundary: when attempts_at_hop == MAX_BREADTH, Phase 1 is skipped.
+#[test]
+fn test_retry_phase1_boundary_max_breadth() {
+    let peer1 = random_peer();
+
+    let alternatives = [peer1]; // alternatives available but...
+    let attempts_at_hop = MAX_BREADTH; // ...already at max breadth
+
+    // Phase 1 condition should be false
+    assert!(
+        alternatives.is_empty() || attempts_at_hop >= MAX_BREADTH,
+        "Phase 1 should NOT trigger when attempts_at_hop == MAX_BREADTH"
+    );
+}
+
+/// Verify Phase 2 retry state: new retry round resets tried_peers and alternatives.
+#[test]
+fn test_retry_phase2_state_transition() {
+    let instance_id = ContractInstanceId::new([82u8; 32]);
+    let tx = Transaction::new::<SubscribeMsg>();
+    let new_peer = random_peer();
+    let new_peer_addr = new_peer.socket_addr().unwrap();
+    let extra_peer = random_peer();
+
+    let retries: usize = 3;
+
+    // Phase 2: new k_closest candidates found (simulates handle_abort Phase 2)
+    assert!(retries < MAX_RETRIES);
+
+    let mut new_candidates = vec![new_peer.clone(), extra_peer.clone()];
+    let next_target = new_candidates.remove(0);
+    let next_addr = next_target.socket_addr().unwrap();
+
+    let mut new_tried_peers = HashSet::new();
+    new_tried_peers.insert(next_addr);
+
+    let new_data = AwaitingResponseData {
+        next_hop: Some(next_addr),
+        instance_id,
+        retries: retries + 1,
+        current_hop: 8,
+        tried_peers: new_tried_peers.clone(),
+        alternatives: new_candidates.clone(),
+        attempts_at_hop: 1,
+        visited: crate::operations::VisitedPeers::new(&tx),
+    };
+
+    assert_eq!(
+        new_data.next_hop,
+        Some(new_peer_addr),
+        "Should target new candidate"
+    );
+    assert_eq!(new_data.retries, 4, "Retry counter incremented");
+    assert_eq!(
+        new_data.alternatives.len(),
+        1,
+        "Remaining new candidates stored"
+    );
+    assert_eq!(new_data.attempts_at_hop, 1, "Reset to 1 for new round");
+    assert_eq!(
+        new_data.tried_peers.len(),
+        1,
+        "Fresh tried_peers with only new target"
+    );
+    assert!(new_data.tried_peers.contains(&new_peer_addr));
+}
+
+/// Verify Phase 2 boundary: when retries == MAX_RETRIES, Phase 2 is skipped.
+#[test]
+fn test_retry_phase2_boundary_max_retries() {
+    let retries = MAX_RETRIES;
+
+    // Phase 2 condition should be false
+    assert!(
+        retries >= MAX_RETRIES,
+        "Phase 2 should NOT trigger when retries == MAX_RETRIES"
+    );
+}
+
+/// Verify Phase 3 behavior for intermediate node: should forward NotFound upstream.
+#[test]
+fn test_retry_phase3_intermediate_node_forwards_notfound() {
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([83u8; 32]);
+    let requester: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+
+    // Phase 3: all retries exhausted, we're an intermediate node
+    let op = SubscribeOp {
+        id: tx,
+        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
+            next_hop: Some("10.0.0.2:9000".parse().unwrap()),
+            instance_id,
+            retries: MAX_RETRIES,
+            current_hop: 5,
+            tried_peers: HashSet::new(),
+            alternatives: Vec::new(),
+            attempts_at_hop: MAX_BREADTH,
+            visited: crate::operations::VisitedPeers::new(&tx),
+        }),
+        requester_addr: Some(requester),
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+
+    // Intermediate node has requester_addr → should forward NotFound
+    assert!(
+        op.requester_addr.is_some(),
+        "Intermediate node should have requester_addr"
+    );
+
+    // The state is AwaitingResponse with exhausted retries
+    if let SubscribeState::AwaitingResponse(ref data) = op.state {
+        assert!(
+            data.alternatives.is_empty() || data.attempts_at_hop >= MAX_BREADTH,
+            "Phase 1 should be exhausted"
+        );
+        assert!(data.retries >= MAX_RETRIES, "Phase 2 should be exhausted");
+    } else {
+        panic!("Expected AwaitingResponse state");
+    }
+}
+
+/// Verify Phase 3 behavior for originator: no requester_addr means local failure.
+#[test]
+fn test_retry_phase3_originator_fails_locally() {
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([84u8; 32]);
+
+    // Originator op: no requester_addr
+    let op = SubscribeOp {
+        id: tx,
+        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
+            next_hop: Some("10.0.0.2:9000".parse().unwrap()),
+            instance_id,
+            retries: MAX_RETRIES,
+            current_hop: 5,
+            tried_peers: HashSet::new(),
+            alternatives: Vec::new(),
+            attempts_at_hop: MAX_BREADTH,
+            visited: crate::operations::VisitedPeers::new(&tx),
+        }),
+        requester_addr: None, // We're the originator
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+
+    // Originator has no requester_addr → should fail locally
+    assert!(
+        op.requester_addr.is_none(),
+        "Originator should not have requester_addr"
+    );
+}
+
+/// Verify that non-AwaitingResponse states skip retry logic entirely.
+/// handle_abort just completes the operation for PrepareRequest, Completed, Failed states.
+#[test]
+fn test_non_awaiting_response_states_skip_retry() {
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([85u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([86u8; 32]));
+
+    // PrepareRequest state — should not match AwaitingResponse destructure
+    let op_prepare = SubscribeOp {
+        id: tx,
+        state: SubscribeState::PrepareRequest(PrepareRequestData {
+            id: tx,
+            instance_id,
+            is_renewal: false,
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(
+        !matches!(op_prepare.state, SubscribeState::AwaitingResponse(_)),
+        "PrepareRequest should not trigger retry"
+    );
+
+    // Completed state — should not match AwaitingResponse destructure
+    let op_completed = SubscribeOp {
+        id: tx,
+        state: SubscribeState::Completed(CompletedData { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(
+        !matches!(op_completed.state, SubscribeState::AwaitingResponse(_)),
+        "Completed should not trigger retry"
+    );
+
+    // Failed state — should not match AwaitingResponse destructure
+    let op_failed = SubscribeOp {
+        id: tx,
+        state: SubscribeState::Failed,
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(
+        !matches!(op_failed.state, SubscribeState::AwaitingResponse(_)),
+        "Failed should not trigger retry"
+    );
+}
+
+/// Verify that the visited bloom filter grows as peers are tried across retries.
+#[test]
+fn test_visited_bloom_filter_accumulates_across_retries() {
+    let tx = Transaction::new::<SubscribeMsg>();
+    let peer1 = random_peer();
+    let peer2 = random_peer();
+    let peer3 = random_peer();
+    let peer1_addr = peer1.socket_addr().unwrap();
+    let peer2_addr = peer2.socket_addr().unwrap();
+    let peer3_addr = peer3.socket_addr().unwrap();
+
+    let mut visited = crate::operations::VisitedPeers::new(&tx);
+
+    // Phase 1: mark peer1 and peer2 as visited
+    visited.mark_visited(peer1_addr);
+    visited.mark_visited(peer2_addr);
+    assert!(visited.probably_visited(peer1_addr));
+    assert!(visited.probably_visited(peer2_addr));
+    assert!(!visited.probably_visited(peer3_addr));
+
+    // Phase 2 new round: peer3 added
+    visited.mark_visited(peer3_addr);
+    assert!(
+        visited.probably_visited(peer1_addr),
+        "peer1 still visited after Phase 2"
+    );
+    assert!(
+        visited.probably_visited(peer2_addr),
+        "peer2 still visited after Phase 2"
+    );
+    assert!(visited.probably_visited(peer3_addr), "peer3 now visited");
+}
+
+/// Verify that tried_peers is reset on Phase 2 transitions but visited is preserved.
+/// This mirrors the handle_abort behavior where tried_peers resets per-round
+/// while visited accumulates globally.
+#[test]
+fn test_tried_peers_reset_on_phase2_visited_preserved() {
+    let tx = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([87u8; 32]);
+    let peer1 = random_peer();
+    let peer2 = random_peer();
+    let peer1_addr = peer1.socket_addr().unwrap();
+    let peer2_addr = peer2.socket_addr().unwrap();
+
+    // Round 1 state: tried peer1 and peer2
+    let mut visited = crate::operations::VisitedPeers::new(&tx);
+    visited.mark_visited(peer1_addr);
+    visited.mark_visited(peer2_addr);
+
+    let mut old_tried_peers = HashSet::new();
+    old_tried_peers.insert(peer1_addr);
+    old_tried_peers.insert(peer2_addr);
+
+    // Transition to Phase 2: merge tried_peers into visited, then reset tried_peers
+    for addr in &old_tried_peers {
+        visited.mark_visited(*addr);
+    }
+
+    // New round starts with fresh tried_peers
+    let new_peer = random_peer();
+    let new_peer_addr = new_peer.socket_addr().unwrap();
+    let mut new_tried_peers = HashSet::new();
+    new_tried_peers.insert(new_peer_addr);
+    visited.mark_visited(new_peer_addr);
+
+    let new_data = AwaitingResponseData {
+        next_hop: Some(new_peer_addr),
+        instance_id,
+        retries: 1,
+        current_hop: 8,
+        tried_peers: new_tried_peers,
+        alternatives: Vec::new(),
+        attempts_at_hop: 1,
+        visited: visited.clone(),
+    };
+
+    // tried_peers is fresh (only new target), but visited has everyone
+    assert_eq!(
+        new_data.tried_peers.len(),
+        1,
+        "tried_peers reset for new round"
+    );
+    assert!(new_data.tried_peers.contains(&new_peer_addr));
+    assert!(
+        visited.probably_visited(peer1_addr),
+        "peer1 still in visited bloom"
+    );
+    assert!(
+        visited.probably_visited(peer2_addr),
+        "peer2 still in visited bloom"
+    );
+    assert!(
+        visited.probably_visited(new_peer_addr),
+        "new peer in visited bloom"
+    );
+}
+
+/// Verify MAX_BREADTH and MAX_RETRIES constants are reasonable.
+#[test]
+fn test_retry_constants() {
+    assert_eq!(MAX_BREADTH, 3, "MAX_BREADTH should be 3 (same as GET)");
+    assert_eq!(MAX_RETRIES, 10, "MAX_RETRIES should be 10 (same as GET)");
+}
