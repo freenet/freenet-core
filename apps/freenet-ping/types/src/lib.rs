@@ -38,6 +38,9 @@ const MAX_HISTORY_PER_PEER: usize = 10;
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize, Clone)]
 pub struct Ping {
     from: HashMap<String, Vec<DateTime<Utc>>>,
+    /// Optional padding to inflate serialized size for streaming tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding: Option<Vec<u8>>,
 }
 
 impl core::ops::Deref for Ping {
@@ -59,6 +62,14 @@ impl Ping {
         Self::default()
     }
 
+    /// Create a Ping with padding of the given size in bytes.
+    pub fn with_padding(size: usize) -> Self {
+        Self {
+            from: HashMap::new(),
+            padding: Some(vec![0xAB; size]),
+        }
+    }
+
     #[cfg(feature = "std")]
     pub fn insert(&mut self, name: String) {
         let now = Utc::now();
@@ -76,6 +87,14 @@ impl Ping {
     }
 
     pub fn merge(&mut self, other: Self, ttl: Duration) -> HashMap<String, Vec<DateTime<Utc>>> {
+        // Preserve the larger padding
+        if let Some(other_padding) = &other.padding {
+            match &self.padding {
+                Some(existing) if existing.len() >= other_padding.len() => {}
+                _ => self.padding = Some(other_padding.clone()),
+            }
+        }
+
         #[cfg(feature = "std")]
         let now = Utc::now();
         #[cfg(not(feature = "std"))]
