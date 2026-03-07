@@ -135,7 +135,8 @@ pub async fn wait_for_get_response(
     client: &mut WebApi,
     expected_key: &ContractKey,
 ) -> Result<Ping, BoxError> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // 120s to match other wait_for_* functions; CI runners can be slow
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut skipped = 0u32;
 
     loop {
