@@ -374,12 +374,18 @@ async fn serve_client_api_in_impl(
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
 
-    // When bound to a non-loopback address, reject connections from non-private IPs
-    // to prevent exposure beyond the local network.
-    let needs_ip_filter = !config.address.is_loopback();
-    let router = if needs_ip_filter {
+    // When bound to a non-loopback address, add two security layers:
+    // 1. Reject connections from non-private source IPs
+    // 2. Reject requests with Host headers that don't match our bind address
+    //    (mitigates DNS rebinding attacks)
+    let needs_lan_filters = !config.address.is_loopback();
+    let router = if needs_lan_filters {
+        let allowed_hosts = build_allowed_hosts(config.address, config.port);
         ws_router
             .layer(axum::middleware::from_fn(private_network_filter))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                host_header_filter(req, next, allowed_hosts.clone())
+            }))
             .layer(TraceLayer::new_for_http())
     } else {
         ws_router.layer(TraceLayer::new_for_http())
@@ -387,6 +393,69 @@ async fn serve_client_api_in_impl(
 
     serve_with_listener(ws_socket, router, pre_bound).await?;
     Ok((gw, ws_proxy))
+}
+
+/// Build the set of Host header values we accept.
+///
+/// When bound to 0.0.0.0 we accept any private IP as host (since the client
+/// may connect via any local interface). When bound to a specific IP we only
+/// accept that IP. Localhost variants are always accepted.
+fn build_allowed_hosts(bind_addr: IpAddr, port: u16) -> Vec<String> {
+    let mut hosts = vec![
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+    ];
+    if bind_addr.is_unspecified() {
+        // Accept any host that resolves to a private IP — the private_network_filter
+        // middleware already ensures the source IP is private, and the Host header
+        // will be the IP the client used to connect. We can't enumerate all local
+        // IPs portably, so we validate the Host is a private IP at request time.
+    } else {
+        hosts.push(format!("{bind_addr}:{port}"));
+    }
+    hosts
+}
+
+/// Middleware that rejects requests whose Host header doesn't match our bind address.
+/// This mitigates DNS rebinding attacks where a malicious page resolves to our LAN IP.
+async fn host_header_filter(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+    static_hosts: Vec<String>,
+) -> axum::response::Response {
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    // Check against static allowed hosts (localhost, specific bind IP)
+    if static_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+        return next.run(req).await;
+    }
+
+    // For 0.0.0.0 bindings: accept if the Host header is a private IP
+    if let Some(colon_pos) = host.rfind(':') {
+        let host_ip = &host[..colon_pos];
+        // Strip brackets for IPv6
+        let host_ip = host_ip.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = host_ip.parse::<IpAddr>() {
+            if is_private_ip(&ip) && !ip.is_unspecified() {
+                return next.run(req).await;
+            }
+        }
+    }
+
+    tracing::warn!(
+        host = host,
+        "Rejected request with non-matching Host header (possible DNS rebinding)"
+    );
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        "Request host does not match server address",
+    )
+        .into_response()
 }
 
 /// Middleware that rejects requests from non-private IP addresses.
