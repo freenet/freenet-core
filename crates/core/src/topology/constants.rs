@@ -19,10 +19,3 @@ pub(super) const DENSITY_SELECTION_THRESHOLD: usize = 5;
 /// even when topology deviation is very high. During normal operation the actual
 /// probability is proportional to the gap deviation and will be much lower.
 pub(super) const MAX_SWAP_PROB_PER_TICK: f64 = 0.1;
-
-/// Minimum connections before topology swaps are considered.
-///
-/// Below this threshold the node is still bootstrapping and shouldn't be replacing
-/// connections — it should be adding them. Must be >= DENSITY_SELECTION_THRESHOLD
-/// so gap analysis is meaningful.
-pub(super) const MIN_CONNECTIONS_FOR_SWAP: usize = DENSITY_SELECTION_THRESHOLD;

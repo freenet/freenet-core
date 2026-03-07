@@ -21,7 +21,7 @@
 //! - At/above `min_connections`, resource usage < 50% → add connections
 //! - At/above `min_connections`, resource usage > 90% → remove connections
 //! - Above `max_connections` → remove connections
-//! - Whenever not removing → consider topology swap (probability-gated)
+//! - At steady state (no add/remove) → consider topology swap (probability-gated)
 //!
 //! ## Topology Swaps
 //!
@@ -441,12 +441,12 @@ impl TopologyManager {
 
         let adj = adjustment.unwrap_or(TopologyAdjustment::NoChange);
 
-        // Topology swap: when not removing connections, check whether
+        // Topology swap: at steady state (no add/remove needed), check whether
         // replacing the least-routed connection would improve the Kleinberg
         // distribution. Swap probability is proportional to how much the
-        // largest gap exceeds the ideal. Overrides AddConnections when
-        // triggered (probabilistically rare).
-        if !matches!(adj, TopologyAdjustment::RemoveConnections(_)) {
+        // largest gap exceeds the ideal. Only fires when the main logic
+        // produces NoChange — never preempts AddConnections or RemoveConnections.
+        if matches!(adj, TopologyAdjustment::NoChange) {
             let swap =
                 self.maybe_swap_connection(my_location, neighbor_locations, current_connections);
             if !matches!(swap, TopologyAdjustment::NoChange) {
@@ -593,7 +593,7 @@ impl TopologyManager {
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
         current_connections: usize,
     ) -> TopologyAdjustment {
-        if current_connections < MIN_CONNECTIONS_FOR_SWAP {
+        if current_connections < self.limits.min_connections {
             return TopologyAdjustment::NoChange;
         }
 
@@ -609,7 +609,9 @@ impl TopologyManager {
         let largest_gap = small_world_rand::largest_gap_size(distances.iter().copied());
 
         // Expected largest gap for k uniform points on [0,1]: ~ln(k)/k.
-        let k = current_connections as f64;
+        // Use the actual number of distinct distances in the gap analysis,
+        // not the total connection count, since BTreeMap keys are deduplicated.
+        let k = distances.len() as f64;
         let expected_gap = k.ln() / k;
 
         // Swap probability proportional to how much the gap exceeds expected.
@@ -1572,13 +1574,11 @@ mod tests {
                 .push(Connection::new(peer));
         }
 
-        // Run adjust_topology many times — with a large gap and 10% max
-        // probability per tick, we should see at least one SwapConnection.
+        // Test maybe_swap_connection directly (bypasses resource meter).
         let mut swap_count = 0;
         let trials = 100;
         for _ in 0..trials {
-            let adjustment =
-                tm.adjust_topology(&neighbor_locations, &Some(my_location), Instant::now(), 10);
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 10);
             if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
                 swap_count += 1;
             }
@@ -1622,13 +1622,12 @@ mod tests {
                 .push(Connection::new(peer));
         }
 
-        // With well-distributed connections, largest gap ≈ expected gap,
-        // so swap probability should be near zero.
+        // Test maybe_swap_connection directly — with well-distributed connections,
+        // largest gap ≈ expected gap, so swap probability should be near zero.
         let mut swap_count = 0;
         let trials = 100;
         for _ in 0..trials {
-            let adjustment =
-                tm.adjust_topology(&neighbor_locations, &Some(my_location), Instant::now(), 10);
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 10);
             if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
                 swap_count += 1;
             }
@@ -1675,12 +1674,11 @@ mod tests {
                 .push(Connection::new(peer));
         }
 
-        // Run many trials until we get a swap
+        // Test maybe_swap_connection directly.
         let expected_drop = least_routed_peer.unwrap();
         let mut found_swap = false;
         for _ in 0..200 {
-            let adjustment =
-                tm.adjust_topology(&neighbor_locations, &Some(my_location), Instant::now(), 6);
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 6);
             if let TopologyAdjustment::SwapConnection { remove, .. } = adjustment {
                 assert_eq!(remove, expected_drop, "Should drop the least-routed peer");
                 found_swap = true;
