@@ -168,20 +168,32 @@ async fn serve_with_listener(
     Ok(())
 }
 
-/// Returns `true` if the IP is a private/local address (loopback, LAN, link-local, or unspecified).
+/// Returns `true` if the IP is a private/local address suitable for LAN access.
+///
+/// Accepted ranges:
+/// - **IPv4**: loopback (127/8), RFC 1918 (10/8, 172.16/12, 192.168/16),
+///   link-local (169.254/16), unspecified (0.0.0.0)
+/// - **IPv6**: loopback (::1), link-local (fe80::/10), ULA (fc00::/7),
+///   unspecified (::)
 pub fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()        // 127.0.0.0/8
-            || v4.is_private()      // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            || v4.is_link_local()   // 169.254.0.0/16
-            || v4.is_unspecified() // 0.0.0.0 (bind address)
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
         }
         IpAddr::V6(v6) => {
-            v6.is_loopback()        // ::1
-            || v6.is_unspecified() // :: (bind address)
+            v6.is_loopback() || v6.is_unspecified() || is_ipv6_link_local(v6) || is_ipv6_ula(v6)
         }
     }
+}
+
+/// fe80::/10 — IPv6 link-local
+fn is_ipv6_link_local(addr: &std::net::Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// fc00::/7 — IPv6 Unique Local Address (ULA)
+fn is_ipv6_ula(addr: &std::net::Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xfe00) == 0xfc00
 }
 
 pub mod local_node {
@@ -534,4 +546,140 @@ fn spawn_token_cleanup_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_is_private_ip_v4() {
+        // Loopback
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))));
+
+        // RFC 1918
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2))));
+
+        // Link-local
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+
+        // Unspecified (bind address)
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+
+        // Public IPs — must be rejected
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 32, 0, 1))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(192, 169, 0, 1))));
+    }
+
+    #[test]
+    fn test_is_private_ip_v6() {
+        // Loopback
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        // Unspecified
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+
+        // Link-local (fe80::/10)
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfebf, 0xffff, 0, 0, 0, 0, 0, 1
+        ))));
+        // fe40:: is NOT link-local
+        assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfe40, 0, 0, 0, 0, 0, 0, 1
+        ))));
+
+        // ULA (fc00::/7 — includes fd00::/8)
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfdff, 0xffff, 0, 0, 0, 0, 0, 1
+        ))));
+
+        // Public IPv6 — must be rejected
+        assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2607, 0xf8b0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_specific_ip() {
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 7509);
+        assert!(hosts.contains(&"localhost:7509".to_string()));
+        assert!(hosts.contains(&"127.0.0.1:7509".to_string()));
+        assert!(hosts.contains(&"[::1]:7509".to_string()));
+        assert!(hosts.contains(&"192.168.1.2:7509".to_string()));
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_unspecified() {
+        // When bound to 0.0.0.0, we don't add a specific IP — the host_header_filter
+        // dynamically validates that the Host is a private IP.
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509);
+        assert!(hosts.contains(&"localhost:7509".to_string()));
+        assert_eq!(hosts.len(), 3); // localhost, 127.0.0.1, [::1]
+    }
+
+    #[test]
+    fn test_host_header_filter_logic() {
+        // Test the Host header parsing logic used by host_header_filter.
+        // We test the parsing inline since the middleware requires an async runtime.
+
+        let check_host = |host: &str| -> bool {
+            let static_hosts = [
+                "localhost:7509".to_string(),
+                "127.0.0.1:7509".to_string(),
+                "[::1]:7509".to_string(),
+            ];
+
+            // Static match
+            if static_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                return true;
+            }
+
+            // Dynamic private-IP match
+            if let Some(colon_pos) = host.rfind(':') {
+                let host_ip = &host[..colon_pos];
+                let host_ip = host_ip.trim_start_matches('[').trim_end_matches(']');
+                if let Ok(ip) = host_ip.parse::<IpAddr>() {
+                    if is_private_ip(&ip) && !ip.is_unspecified() {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        };
+
+        // Allowed
+        assert!(check_host("localhost:7509"));
+        assert!(check_host("127.0.0.1:7509"));
+        assert!(check_host("[::1]:7509"));
+        assert!(check_host("192.168.1.2:7509"));
+        assert!(check_host("10.0.0.5:7509"));
+        assert!(check_host("[fd00::1]:7509"));
+        assert!(check_host("[fe80::1]:7509"));
+
+        // Rejected (DNS rebinding, public IPs)
+        assert!(!check_host("evil.com:7509"));
+        assert!(!check_host("8.8.8.8:7509"));
+        assert!(!check_host("[2001:db8::1]:7509"));
+        assert!(!check_host("localhost.evil.com:7509"));
+    }
 }
