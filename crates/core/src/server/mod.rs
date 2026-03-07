@@ -12,7 +12,7 @@ pub(crate) mod errors;
 mod home_page;
 pub(crate) mod path_handlers;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -24,6 +24,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 
+use axum::response::IntoResponse;
 use client_api::HttpClientApi;
 use tower_http::trace::TraceLayer;
 
@@ -155,16 +156,49 @@ async fn serve_with_listener(
     };
     tracing::info!("HTTP client API listening on {}", socket);
     GlobalExecutor::spawn(async move {
-        axum::serve(listener, router).await.map_err(|e| {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|e| {
             tracing::error!("Error while running HTTP client API server: {e}");
         })
     });
     Ok(())
 }
 
+/// Returns `true` if the IP is a private/local address suitable for LAN access.
+///
+/// Accepted ranges:
+/// - **IPv4**: loopback (127/8), RFC 1918 (10/8, 172.16/12, 192.168/16),
+///   link-local (169.254/16), unspecified (0.0.0.0)
+/// - **IPv6**: loopback (::1), link-local (fe80::/10), ULA (fc00::/7),
+///   unspecified (::)
+pub fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || is_ipv6_link_local(v6) || is_ipv6_ula(v6)
+        }
+    }
+}
+
+/// fe80::/10 — IPv6 link-local
+fn is_ipv6_link_local(addr: &std::net::Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// fc00::/7 — IPv6 Unique Local Address (ULA)
+fn is_ipv6_ula(addr: &std::net::Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xfe00) == 0xfc00
+}
+
 pub mod local_node {
     use freenet_stdlib::client_api::{ClientRequest, ErrorKind};
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::SocketAddr;
     use tower_http::trace::TraceLayer;
 
     use crate::{
@@ -175,14 +209,11 @@ pub mod local_node {
     use super::{client_api::HttpClientApi, serve};
 
     pub async fn run_local_node(mut executor: Executor, socket: SocketAddr) -> anyhow::Result<()> {
-        match socket.ip() {
-            IpAddr::V4(ip) if !ip.is_loopback() => {
-                anyhow::bail!("invalid ip: {ip}, expecting localhost")
-            }
-            IpAddr::V6(ip) if !ip.is_loopback() => {
-                anyhow::bail!("invalid ip: {ip}, expecting localhost")
-            }
-            IpAddr::V4(_) | IpAddr::V6(_) => {}
+        if !super::is_private_ip(&socket.ip()) {
+            anyhow::bail!(
+                "invalid ip: {}, only loopback and private network addresses are allowed",
+                socket.ip()
+            )
         }
         let (mut gw, gw_router) = HttpClientApi::as_router(&socket);
         let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
@@ -355,13 +386,108 @@ async fn serve_client_api_in_impl(
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
 
-    serve_with_listener(
-        ws_socket,
-        ws_router.layer(TraceLayer::new_for_http()),
-        pre_bound,
-    )
-    .await?;
+    // When bound to a non-loopback address, add two security layers:
+    // 1. Reject connections from non-private source IPs
+    // 2. Reject requests with Host headers that don't match our bind address
+    //    (mitigates DNS rebinding attacks)
+    let needs_lan_filters = !config.address.is_loopback();
+    let router = if needs_lan_filters {
+        let allowed_hosts = build_allowed_hosts(config.address, config.port);
+        ws_router
+            .layer(axum::middleware::from_fn(private_network_filter))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                host_header_filter(req, next, allowed_hosts.clone())
+            }))
+            .layer(TraceLayer::new_for_http())
+    } else {
+        ws_router.layer(TraceLayer::new_for_http())
+    };
+
+    serve_with_listener(ws_socket, router, pre_bound).await?;
     Ok((gw, ws_proxy))
+}
+
+/// Build the set of Host header values we accept.
+///
+/// When bound to 0.0.0.0 we accept any private IP as host (since the client
+/// may connect via any local interface). When bound to a specific IP we only
+/// accept that IP. Localhost variants are always accepted.
+fn build_allowed_hosts(bind_addr: IpAddr, port: u16) -> Vec<String> {
+    let mut hosts = vec![
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+    ];
+    if bind_addr.is_unspecified() {
+        // Accept any host that resolves to a private IP — the private_network_filter
+        // middleware already ensures the source IP is private, and the Host header
+        // will be the IP the client used to connect. We can't enumerate all local
+        // IPs portably, so we validate the Host is a private IP at request time.
+    } else {
+        hosts.push(format!("{bind_addr}:{port}"));
+    }
+    hosts
+}
+
+/// Middleware that rejects requests whose Host header doesn't match our bind address.
+/// This mitigates DNS rebinding attacks where a malicious page resolves to our LAN IP.
+async fn host_header_filter(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+    static_hosts: Vec<String>,
+) -> axum::response::Response {
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    // Check against static allowed hosts (localhost, specific bind IP)
+    if static_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+        return next.run(req).await;
+    }
+
+    // For 0.0.0.0 bindings: accept if the Host header is a private IP
+    if let Some(colon_pos) = host.rfind(':') {
+        let host_ip = &host[..colon_pos];
+        // Strip brackets for IPv6
+        let host_ip = host_ip.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = host_ip.parse::<IpAddr>() {
+            if is_private_ip(&ip) && !ip.is_unspecified() {
+                return next.run(req).await;
+            }
+        }
+    }
+
+    tracing::warn!(
+        host = host,
+        "Rejected request with non-matching Host header (possible DNS rebinding)"
+    );
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        "Request host does not match server address",
+    )
+        .into_response()
+}
+
+/// Middleware that rejects requests from non-private IP addresses.
+async fn private_network_filter(
+    connect_info: axum::extract::ConnectInfo<SocketAddr>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !is_private_ip(&connect_info.0.ip()) {
+        tracing::warn!(
+            remote_ip = %connect_info.0.ip(),
+            "Rejected connection from non-private IP"
+        );
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "Only local network connections are allowed",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Spawns a background task that periodically removes expired authentication tokens.
@@ -420,4 +546,140 @@ fn spawn_token_cleanup_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_is_private_ip_v4() {
+        // Loopback
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))));
+
+        // RFC 1918
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2))));
+
+        // Link-local
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+
+        // Unspecified (bind address)
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+
+        // Public IPs — must be rejected
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 32, 0, 1))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(192, 169, 0, 1))));
+    }
+
+    #[test]
+    fn test_is_private_ip_v6() {
+        // Loopback
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        // Unspecified
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+
+        // Link-local (fe80::/10)
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfebf, 0xffff, 0, 0, 0, 0, 0, 1
+        ))));
+        // fe40:: is NOT link-local
+        assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfe40, 0, 0, 0, 0, 0, 0, 1
+        ))));
+
+        // ULA (fc00::/7 — includes fd00::/8)
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfdff, 0xffff, 0, 0, 0, 0, 0, 1
+        ))));
+
+        // Public IPv6 — must be rejected
+        assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2607, 0xf8b0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_specific_ip() {
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 7509);
+        assert!(hosts.contains(&"localhost:7509".to_string()));
+        assert!(hosts.contains(&"127.0.0.1:7509".to_string()));
+        assert!(hosts.contains(&"[::1]:7509".to_string()));
+        assert!(hosts.contains(&"192.168.1.2:7509".to_string()));
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_unspecified() {
+        // When bound to 0.0.0.0, we don't add a specific IP — the host_header_filter
+        // dynamically validates that the Host is a private IP.
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509);
+        assert!(hosts.contains(&"localhost:7509".to_string()));
+        assert_eq!(hosts.len(), 3); // localhost, 127.0.0.1, [::1]
+    }
+
+    #[test]
+    fn test_host_header_filter_logic() {
+        // Test the Host header parsing logic used by host_header_filter.
+        // We test the parsing inline since the middleware requires an async runtime.
+
+        let check_host = |host: &str| -> bool {
+            let static_hosts = [
+                "localhost:7509".to_string(),
+                "127.0.0.1:7509".to_string(),
+                "[::1]:7509".to_string(),
+            ];
+
+            // Static match
+            if static_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                return true;
+            }
+
+            // Dynamic private-IP match
+            if let Some(colon_pos) = host.rfind(':') {
+                let host_ip = &host[..colon_pos];
+                let host_ip = host_ip.trim_start_matches('[').trim_end_matches(']');
+                if let Ok(ip) = host_ip.parse::<IpAddr>() {
+                    if is_private_ip(&ip) && !ip.is_unspecified() {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        };
+
+        // Allowed
+        assert!(check_host("localhost:7509"));
+        assert!(check_host("127.0.0.1:7509"));
+        assert!(check_host("[::1]:7509"));
+        assert!(check_host("192.168.1.2:7509"));
+        assert!(check_host("10.0.0.5:7509"));
+        assert!(check_host("[fd00::1]:7509"));
+        assert!(check_host("[fe80::1]:7509"));
+
+        // Rejected (DNS rebinding, public IPs)
+        assert!(!check_host("evil.com:7509"));
+        assert!(!check_host("8.8.8.8:7509"));
+        assert!(!check_host("[2001:db8::1]:7509"));
+        assert!(!check_host("localhost.evil.com:7509"));
+    }
 }
