@@ -304,21 +304,19 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
             String::new()
         };
 
-        // Rolling trend: recent window stats and verdict badge
+        // Rolling trend: recent window stats; only show verdict when truly blocked
         let (recent, verdict) = if snap.nat_stats.recent_attempts > 0 {
             let rs = snap.nat_stats.recent_successes;
             let ra = snap.nat_stats.recent_attempts;
-            let recent_rate = rs as f64 / ra as f64;
-            let (verdict_text, verdict_class) = if recent_rate > 0.5 {
-                ("Port appears open", "nat-verdict-good")
-            } else if rs == 0 {
-                ("Port may be blocked", "nat-verdict-bad")
+            let verdict = if rs == 0 && snap.nat_stats.successes == 0 {
+                r#" <span class="nat-verdict nat-verdict-bad">Port may be blocked</span>"#
+                    .to_string()
             } else {
-                ("Intermittent", "nat-verdict-warn")
+                String::new()
             };
             (
                 format!(r#" <span class="nat-recent">({rs}/{ra} recent)</span>"#),
-                format!(r#"<span class="nat-verdict {verdict_class}">{verdict_text}</span>"#),
+                verdict,
             )
         } else {
             (String::new(), String::new())
