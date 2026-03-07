@@ -618,7 +618,7 @@ impl TopologyManager {
         // Swap probability proportional to how much the gap exceeds expected.
         // When gap == expected: excess = 0, no swap.
         // When gap == 2x expected: excess = 1.0, swap at MAX_SWAP_PROB_PER_TICK.
-        let excess = ((largest_gap / expected_gap) - 1.0).max(0.0).min(1.0);
+        let excess = ((largest_gap / expected_gap) - 1.0).clamp(0.0, 1.0);
         let swap_prob = excess * MAX_SWAP_PROB_PER_TICK;
 
         if swap_prob <= 0.0 {
