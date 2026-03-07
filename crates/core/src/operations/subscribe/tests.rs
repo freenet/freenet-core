@@ -464,6 +464,12 @@ async fn test_subscription_validates_k_closest_usage() {
             state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
                 next_hop: None,
                 instance_id: *contract_key.id(),
+                retries: 0,
+                current_hop: 0,
+                tried_peers: std::collections::HashSet::new(),
+                alternatives: Vec::new(),
+                attempts_at_hop: 0,
+                visited: crate::operations::VisitedPeers::new(&transaction_id),
             }),
             requester_addr: None,
             requester_pub_key: None,
@@ -583,6 +589,12 @@ fn test_subscribe_op_state_lifecycle() {
         state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
             next_hop: Some(peer_addr),
             instance_id,
+            retries: 0,
+            current_hop: 0,
+            tried_peers: std::collections::HashSet::new(),
+            alternatives: Vec::new(),
+            attempts_at_hop: 0,
+            visited: crate::operations::VisitedPeers::new(&tx_id),
         }),
         requester_addr: None,
         requester_pub_key: None,
@@ -992,6 +1004,12 @@ fn test_subscribe_stats_lifecycle() {
         state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
             next_hop: None,
             instance_id,
+            retries: 0,
+            current_hop: 0,
+            tried_peers: std::collections::HashSet::new(),
+            alternatives: Vec::new(),
+            attempts_at_hop: 0,
+            visited: crate::operations::VisitedPeers::new(&tx),
         }),
         requester_addr: None,
         requester_pub_key: None,
@@ -1211,98 +1229,6 @@ fn test_not_found_result_originator_returns_error() {
     }
 }
 
-/// Verify should_forward_not_found_on_abort state guard: only AwaitingResponse
-/// with a requester_addr triggers the forwarding path. Other states (PrepareRequest,
-/// Failed) and originator ops (no requester_addr) must return None.
-#[test]
-fn test_should_forward_not_found_on_abort_state_guard() {
-    let tx = Transaction::new::<SubscribeMsg>();
-    let instance_id = ContractInstanceId::new([42u8; 32]);
-    let requester: SocketAddr = "10.0.0.1:9000".parse().unwrap();
-
-    // Case 1: PrepareRequest state with requester → should NOT forward
-    let op_prepare = SubscribeOp {
-        id: tx,
-        state: SubscribeState::PrepareRequest(super::PrepareRequestData {
-            id: tx,
-            instance_id,
-            is_renewal: false,
-        }),
-        requester_addr: Some(requester),
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-    };
-    assert!(
-        op_prepare.should_forward_not_found_on_abort().is_none(),
-        "PrepareRequest state must not trigger forwarding"
-    );
-
-    // Case 2: Failed state with requester → should NOT forward
-    let op_failed = SubscribeOp {
-        id: tx,
-        state: SubscribeState::Failed,
-        requester_addr: Some(requester),
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-    };
-    assert!(
-        op_failed.should_forward_not_found_on_abort().is_none(),
-        "Failed state must not trigger forwarding"
-    );
-
-    // Case 3: Completed state with requester → should NOT forward
-    let op_completed = SubscribeOp {
-        id: tx,
-        state: SubscribeState::Completed(super::CompletedData {
-            key: ContractKey::from_id_and_code(instance_id, CodeHash::new([99u8; 32])),
-        }),
-        requester_addr: Some(requester),
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-    };
-    assert!(
-        op_completed.should_forward_not_found_on_abort().is_none(),
-        "Completed state must not trigger forwarding"
-    );
-
-    // Case 4: AwaitingResponse with NO requester (originator) → should NOT forward
-    let op_originator = SubscribeOp {
-        id: tx,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            instance_id,
-            next_hop: None,
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-    };
-    assert!(
-        op_originator.should_forward_not_found_on_abort().is_none(),
-        "Originator (no requester_addr) must not trigger forwarding"
-    );
-
-    // Case 5: AwaitingResponse WITH requester → SHOULD forward
-    let op_intermediate = SubscribeOp {
-        id: tx,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            instance_id,
-            next_hop: None,
-        }),
-        requester_addr: Some(requester),
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-    };
-    let result = op_intermediate.should_forward_not_found_on_abort();
-    assert!(
-        result.is_some(),
-        "Intermediate node in AwaitingResponse must trigger forwarding"
-    );
-    let (fwd_instance_id, fwd_addr) = result.unwrap();
-    assert_eq!(fwd_instance_id, instance_id);
-    assert_eq!(fwd_addr, requester);
-}
+// Superseded: should_forward_not_found_on_abort was removed when handle_abort
+// gained breadth/retry logic (#3446). The retry logic handles all cases inline.
+// The forwarding behavior is now tested end-to-end through simulation tests.

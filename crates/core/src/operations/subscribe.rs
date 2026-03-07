@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -7,6 +8,7 @@ pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
 use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::node::IsOperationCompleted;
+use crate::ring::PeerKeyLocation;
 use crate::tracing::NetEventLog;
 use crate::{
     client_events::HostResult,
@@ -20,6 +22,12 @@ use freenet_stdlib::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration};
+
+/// Maximum peers to try per hop (breadth search).
+const MAX_BREADTH: usize = 3;
+
+/// Maximum retry rounds (each round queries k_closest for new candidates).
+const MAX_RETRIES: usize = 10;
 
 /// Timeout for waiting on contract storage notification.
 /// Used when a subscription arrives before the contract has been propagated via PUT.
@@ -112,6 +120,12 @@ impl PrepareRequestData {
         AwaitingResponseData {
             next_hop,
             instance_id: self.instance_id,
+            retries: 0,
+            current_hop: 0,
+            tried_peers: HashSet::new(),
+            alternatives: Vec::new(),
+            attempts_at_hop: 0,
+            visited: super::VisitedPeers::new(&self.id),
         }
     }
 
@@ -132,6 +146,18 @@ struct AwaitingResponseData {
     next_hop: Option<std::net::SocketAddr>,
     /// The contract being subscribed to (needed for error notification on abort)
     instance_id: ContractInstanceId,
+    /// Retry round counter (each round queries k_closest for new candidates)
+    retries: usize,
+    /// Current HTL value for the request
+    current_hop: usize,
+    /// Peers already tried at this hop level
+    tried_peers: HashSet<std::net::SocketAddr>,
+    /// Alternative peers from the same k_closest call, not yet tried
+    alternatives: Vec<PeerKeyLocation>,
+    /// How many of the breadth candidates have been tried at this hop
+    attempts_at_hop: usize,
+    /// Bloom filter tracking visited peers across all hops
+    visited: super::VisitedPeers,
 }
 
 impl AwaitingResponseData {
@@ -233,6 +259,12 @@ pub(crate) fn create_unsubscribe_op(
         state: SubscribeState::AwaitingResponse(AwaitingResponseData {
             next_hop: Some(target_addr),
             instance_id,
+            retries: 0,
+            current_hop: 0,
+            tried_peers: HashSet::new(),
+            alternatives: Vec::new(),
+            attempts_at_hop: 0,
+            visited: super::VisitedPeers::new(&tx),
         }),
         requester_addr: None,
         requester_pub_key: None,
@@ -300,16 +332,17 @@ pub(crate) async fn request_subscribe(
     let mut visited = super::VisitedPeers::new(id);
     visited.mark_visited(own_addr);
 
-    let candidates = op_manager
-        .ring
-        .k_closest_potentially_caching(instance_id, &visited, 3);
+    let mut candidates =
+        op_manager
+            .ring
+            .k_closest_potentially_caching(instance_id, &visited, MAX_BREADTH);
 
     // First try the best candidates from k_closest_potentially_caching.
     // If that returns empty, fall back to any available connection.
     // This ensures we join the subscription tree even when the routing algorithm
     // can't find ideal candidates (e.g., due to timing or location filtering).
-    let target = if let Some(t) = candidates.first() {
-        t.clone()
+    let target = if !candidates.is_empty() {
+        candidates.remove(0)
     } else {
         // k_closest_potentially_caching returned empty - try any connected peer as fallback.
         // The subscription will be forwarded toward the contract location.
@@ -377,7 +410,7 @@ pub(crate) async fn request_subscribe(
         id: *id,
         instance_id: *instance_id,
         htl: op_manager.ring.max_hops_to_live,
-        visited,
+        visited: visited.clone(),
         is_renewal,
     };
 
@@ -392,11 +425,21 @@ pub(crate) async fn request_subscribe(
         op_manager.ring.register_events(Either::Left(event)).await;
     }
 
+    let htl = op_manager.ring.max_hops_to_live;
+    let mut tried_peers = HashSet::new();
+    tried_peers.insert(target_addr);
+
     let op = SubscribeOp {
         id: *id,
         state: SubscribeState::AwaitingResponse(AwaitingResponseData {
             next_hop: Some(target_addr),
             instance_id: *instance_id,
+            retries: 0,
+            current_hop: htl,
+            tried_peers,
+            alternatives: candidates, // remaining candidates after remove(0)
+            attempts_at_hop: 1,
+            visited,
         }),
         requester_addr: None, // We're the originator
         requester_pub_key: None,
@@ -620,119 +663,247 @@ impl SubscribeOp {
         }
     }
 
-    /// Check whether this operation should forward a NotFound upstream on abort.
-    fn should_forward_not_found_on_abort(
-        &self,
-    ) -> Option<(ContractInstanceId, std::net::SocketAddr)> {
-        let requester_addr = self.requester_addr?;
-        if let SubscribeState::AwaitingResponse(data) = &self.state {
-            Some((data.instance_id, requester_addr))
-        } else {
-            None
-        }
-    }
-
-    /// Handle aborted connections by failing the operation immediately.
+    /// Handle aborted connections by retrying with alternative peers before failing.
     ///
-    /// Unlike Get operations, Subscribe doesn't have alternative routes to try.
-    /// The subscription follows the contract's location in the ring, so when
-    /// the connection drops, we notify the client of the failure so they can retry.
+    /// Follows the same breadth/retry pattern as GET: try alternatives at the same
+    /// hop level first, then seek new candidates via k_closest.
     pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
+        // Extract fields from self BEFORE destructuring self.state (which moves it).
+        let tx_id = self.id;
+        let requester_addr = self.requester_addr;
+        let requester_pub_key = self.requester_pub_key;
+        let is_renewal = self.is_renewal;
+        let stats = self.stats;
+        let is_sub_op = op_manager.is_sub_operation(tx_id);
+
         tracing::debug!(
-            tx = %self.id,
-            requester_addr = ?self.requester_addr,
+            tx = %tx_id,
+            ?requester_addr,
             "Subscribe operation aborted due to connection failure"
         );
 
-        // Forward NotFound upstream so the originator gets a fast failure instead of
-        // a 60s timeout. Uses notify_op_change because handle_abort lacks NetworkBridge
-        // access; the round-trip through process_message is functionally equivalent.
-        if let Some((instance_id, requester_addr)) = self.should_forward_not_found_on_abort() {
-            tracing::warn!(
-                tx = %self.id,
-                %instance_id,
-                requester = %requester_addr,
-                phase = "not_found",
-                "Subscribe aborted at intermediate node - sending NotFound to upstream"
-            );
+        if let SubscribeState::AwaitingResponse(AwaitingResponseData {
+            next_hop: failed_hop,
+            instance_id,
+            retries,
+            current_hop,
+            mut tried_peers,
+            mut alternatives,
+            attempts_at_hop,
+            mut visited,
+        }) = self.state
+        {
+            // Mark the failed peer as tried
+            if let Some(addr) = failed_hop {
+                tried_peers.insert(addr);
+                visited.mark_visited(addr);
+            }
 
-            let response_op = SubscribeOp {
-                id: self.id,
-                state: SubscribeState::Failed,
-                requester_addr: self.requester_addr,
-                requester_pub_key: self.requester_pub_key,
-                is_renewal: self.is_renewal,
-                stats: self.stats,
-            };
+            // Phase 1: Try the next alternative at same hop
+            if !alternatives.is_empty() && attempts_at_hop < MAX_BREADTH {
+                let next_target = alternatives.remove(0);
+                if let Some(next_addr) = next_target.socket_addr() {
+                    tried_peers.insert(next_addr);
+                    visited.mark_visited(next_addr);
 
-            op_manager
-                .notify_op_change(
-                    NetMessage::from(SubscribeMsg::Response {
-                        id: self.id,
-                        instance_id,
-                        result: SubscribeMsgResult::NotFound,
-                    }),
-                    OpEnum::Subscribe(response_op),
-                )
-                .await?;
-            return Err(OpError::StatePushed);
-        }
-
-        if op_manager.is_sub_operation(self.id) {
-            // Async sub-operation: no client is waiting on this transaction.
-            // Notify via the subscription notification channel instead.
-            if let SubscribeState::AwaitingResponse(data) = &self.state {
-                let instance_id = &data.instance_id;
-                let reason = format!(
-                    "Subscription failed for contract {}: peer connection dropped",
-                    instance_id
-                );
-                if let Err(e) = op_manager
-                    .notify_contract_handler(
-                        crate::contract::ContractHandlerEvent::NotifySubscriptionError {
-                            key: *instance_id,
-                            reason,
-                        },
-                    )
-                    .await
-                {
                     tracing::debug!(
-                        tx = %self.id,
-                        contract = %instance_id,
-                        error = %e,
-                        "Failed to send subscription abort error to notification channels"
+                        tx = %tx_id,
+                        %instance_id,
+                        next_target = %next_addr,
+                        "Subscribe: connection aborted, trying alternative peer"
                     );
+
+                    let msg = SubscribeMsg::Request {
+                        id: tx_id,
+                        instance_id,
+                        htl: current_hop,
+                        visited: visited.clone(),
+                        is_renewal,
+                    };
+
+                    let op = SubscribeOp {
+                        id: tx_id,
+                        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
+                            next_hop: Some(next_addr),
+                            instance_id,
+                            retries,
+                            current_hop,
+                            tried_peers,
+                            alternatives,
+                            attempts_at_hop: attempts_at_hop + 1,
+                            visited,
+                        }),
+                        requester_addr,
+                        requester_pub_key,
+                        is_renewal,
+                        stats,
+                    };
+
+                    op_manager
+                        .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
+                        .await?;
+                    return Err(OpError::StatePushed);
                 }
             }
-        } else if self.is_renewal {
-            // Subscription renewal abort: no client waiting, just log. See #2891.
-            tracing::debug!(
-                tx = %self.id,
-                "Subscription renewal aborted, no client to notify"
-            );
-        } else {
-            // Standalone subscribe: client is waiting on this transaction directly.
-            let error_result: crate::client_events::HostResult =
-                Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                    cause: "Subscribe operation failed: peer connection dropped".into(),
+
+            // Phase 2: Seek new candidates via k_closest
+            if retries < MAX_RETRIES {
+                for addr in &tried_peers {
+                    visited.mark_visited(*addr);
                 }
-                .into());
-            if let Err(err) = op_manager
-                .result_router_tx
-                .send((self.id, error_result))
-                .await
-            {
-                tracing::error!(
-                    tx = %self.id,
-                    error = %err,
-                    "Failed to send abort notification to client"
+
+                let mut new_candidates = op_manager.ring.k_closest_potentially_caching(
+                    &instance_id,
+                    &visited,
+                    MAX_BREADTH,
                 );
+
+                if !new_candidates.is_empty() {
+                    let next_target = new_candidates.remove(0);
+                    if let Some(next_addr) = next_target.socket_addr() {
+                        let mut new_tried_peers = HashSet::new();
+                        new_tried_peers.insert(next_addr);
+                        visited.mark_visited(next_addr);
+
+                        tracing::debug!(
+                            tx = %tx_id,
+                            %instance_id,
+                            next_target = %next_addr,
+                            retries = retries + 1,
+                            "Subscribe: connection aborted, found new candidate"
+                        );
+
+                        let msg = SubscribeMsg::Request {
+                            id: tx_id,
+                            instance_id,
+                            htl: current_hop,
+                            visited: visited.clone(),
+                            is_renewal,
+                        };
+
+                        let op = SubscribeOp {
+                            id: tx_id,
+                            state: SubscribeState::AwaitingResponse(AwaitingResponseData {
+                                next_hop: Some(next_addr),
+                                instance_id,
+                                retries: retries + 1,
+                                current_hop,
+                                tried_peers: new_tried_peers,
+                                alternatives: new_candidates,
+                                attempts_at_hop: 1,
+                                visited,
+                            }),
+                            requester_addr,
+                            requester_pub_key,
+                            is_renewal,
+                            stats,
+                        };
+
+                        op_manager
+                            .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
+                            .await?;
+                        return Err(OpError::StatePushed);
+                    }
+                }
             }
+
+            // Phase 3: All retries exhausted
+
+            // Forward NotFound upstream if we're an intermediate node
+            if let Some(req_addr) = requester_addr {
+                tracing::warn!(
+                    tx = %tx_id,
+                    %instance_id,
+                    requester = %req_addr,
+                    phase = "not_found",
+                    "Subscribe aborted (retries exhausted) - sending NotFound upstream"
+                );
+
+                let response_op = SubscribeOp {
+                    id: tx_id,
+                    state: SubscribeState::Failed,
+                    requester_addr,
+                    requester_pub_key,
+                    is_renewal,
+                    stats,
+                };
+
+                op_manager
+                    .notify_op_change(
+                        NetMessage::from(SubscribeMsg::Response {
+                            id: tx_id,
+                            instance_id,
+                            result: SubscribeMsgResult::NotFound,
+                        }),
+                        OpEnum::Subscribe(response_op),
+                    )
+                    .await?;
+                return Err(OpError::StatePushed);
+            }
+
+            // We're the originator — notify client of failure
+            notify_abort_failure(op_manager, tx_id, is_sub_op, is_renewal, &instance_id).await;
+            op_manager.completed(tx_id);
+            return Ok(());
         }
 
-        // Mark the operation as completed so it's removed from tracking
-        op_manager.completed(self.id);
+        // Not in AwaitingResponse state — just complete
+        op_manager.completed(tx_id);
         Ok(())
+    }
+}
+
+/// Notify the appropriate listener about an abort failure at the originator.
+async fn notify_abort_failure(
+    op_manager: &OpManager,
+    tx_id: Transaction,
+    is_sub_op: bool,
+    is_renewal: bool,
+    instance_id: &ContractInstanceId,
+) {
+    if is_sub_op {
+        let reason = format!(
+            "Subscription failed for contract {}: peer connection dropped",
+            instance_id
+        );
+        if let Err(e) = op_manager
+            .notify_contract_handler(
+                crate::contract::ContractHandlerEvent::NotifySubscriptionError {
+                    key: *instance_id,
+                    reason,
+                },
+            )
+            .await
+        {
+            tracing::debug!(
+                tx = %tx_id,
+                contract = %instance_id,
+                error = %e,
+                "Failed to send subscription abort error to notification channels"
+            );
+        }
+    } else if is_renewal {
+        tracing::debug!(
+            tx = %tx_id,
+            "Subscription renewal aborted, no client to notify"
+        );
+    } else {
+        let error_result: crate::client_events::HostResult =
+            Err(freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: "Subscribe operation failed: peer connection dropped".into(),
+            }
+            .into());
+        if let Err(err) = op_manager
+            .result_router_tx
+            .send((tx_id, error_result))
+            .await
+        {
+            tracing::error!(
+                tx = %tx_id,
+                error = %err,
+                "Failed to send abort notification to client"
+            );
+        }
     }
 }
 
@@ -872,6 +1043,12 @@ impl Operation for SubscribeOp {
                         state: SubscribeState::AwaitingResponse(AwaitingResponseData {
                             next_hop: None, // Will be determined during processing
                             instance_id: msg_instance_id,
+                            retries: 0,
+                            current_hop: 0,
+                            tried_peers: HashSet::new(),
+                            alternatives: Vec::new(),
+                            attempts_at_hop: 0,
+                            visited: super::VisitedPeers::new(&id),
                         }),
                         requester_addr: source_addr, // Store who sent us this message
                         requester_pub_key,
@@ -1028,12 +1205,13 @@ impl Operation for SubscribeOp {
                         new_visited.mark_visited(requester);
                     }
 
-                    let candidates =
-                        op_manager
-                            .ring
-                            .k_closest_potentially_caching(instance_id, &new_visited, 3);
+                    let mut candidates = op_manager.ring.k_closest_potentially_caching(
+                        instance_id,
+                        &new_visited,
+                        MAX_BREADTH,
+                    );
 
-                    let Some(next_hop) = candidates.first() else {
+                    if candidates.is_empty() {
                         tracing::warn!(tx = %id, contract = %instance_id, phase = "not_found", "No closer peers to forward subscribe request");
                         return Self::not_found_result(
                             *id,
@@ -1041,10 +1219,12 @@ impl Operation for SubscribeOp {
                             self.requester_addr,
                             "no closer peers available",
                         );
-                    };
+                    }
+
+                    let next_hop = candidates.remove(0);
 
                     // Convert to KnownPeerKeyLocation for compile-time address guarantee
-                    let next_hop_known = match KnownPeerKeyLocation::try_from(next_hop) {
+                    let next_hop_known = match KnownPeerKeyLocation::try_from(&next_hop) {
                         Ok(known) => known,
                         Err(e) => {
                             tracing::error!(
@@ -1063,22 +1243,32 @@ impl Operation for SubscribeOp {
                     let next_addr = next_hop_known.socket_addr();
                     new_visited.mark_visited(next_addr);
 
-                    tracing::debug!(tx = %id, %instance_id, next = %next_addr, is_renewal, "Forwarding subscribe request");
+                    let new_htl = htl.saturating_sub(1);
+                    let mut tried_peers = HashSet::new();
+                    tried_peers.insert(next_addr);
+
+                    tracing::debug!(tx = %id, %instance_id, next = %next_addr, alternatives = candidates.len(), is_renewal, "Forwarding subscribe request");
 
                     Ok(OperationResult::SendAndContinue {
                         msg: NetMessage::from(SubscribeMsg::Request {
                             id: *id,
                             instance_id: *instance_id,
-                            htl: htl.saturating_sub(1),
-                            visited: new_visited,
+                            htl: new_htl,
+                            visited: new_visited.clone(),
                             is_renewal: *is_renewal,
                         }),
                         next_hop: Some(next_addr),
                         state: OpEnum::Subscribe(SubscribeOp {
                             id: *id,
                             state: SubscribeState::AwaitingResponse(AwaitingResponseData {
-                                next_hop: None, // Already routing via next_hop in OperationResult
+                                next_hop: None,
                                 instance_id: *instance_id,
+                                retries: 0,
+                                current_hop: new_htl,
+                                tried_peers,
+                                alternatives: candidates,
+                                attempts_at_hop: 1,
+                                visited: new_visited,
                             }),
                             requester_addr: self.requester_addr,
                             requester_pub_key: self.requester_pub_key,
@@ -1251,10 +1441,159 @@ impl Operation for SubscribeOp {
                                 "subscribe: processing NotFound response"
                             );
 
-                            // Forward NotFound response to requester or complete with failure
+                            // Extract retry state from current AwaitingResponse
+                            let (
+                                retries,
+                                current_hop,
+                                mut tried_peers,
+                                mut alternatives,
+                                attempts_at_hop,
+                                mut visited,
+                            ) = if let SubscribeState::AwaitingResponse(ref data) = self.state {
+                                (
+                                    data.retries,
+                                    data.current_hop,
+                                    data.tried_peers.clone(),
+                                    data.alternatives.clone(),
+                                    data.attempts_at_hop,
+                                    data.visited.clone(),
+                                )
+                            } else {
+                                (
+                                    0,
+                                    0,
+                                    HashSet::new(),
+                                    Vec::new(),
+                                    0,
+                                    super::VisitedPeers::new(msg_id),
+                                )
+                            };
+
+                            // Mark the source that returned NotFound as tried
+                            if let Some(addr) = source_addr {
+                                tried_peers.insert(addr);
+                                visited.mark_visited(addr);
+                            }
+
+                            // --- Breadth retry: try alternative peers at same hop ---
+                            if !alternatives.is_empty() && attempts_at_hop < MAX_BREADTH {
+                                let next_target = alternatives.remove(0);
+                                if let Some(next_addr) = next_target.socket_addr() {
+                                    tried_peers.insert(next_addr);
+                                    visited.mark_visited(next_addr);
+
+                                    tracing::info!(
+                                        tx = %msg_id,
+                                        %instance_id,
+                                        peer_addr = %next_addr,
+                                        attempts_at_hop = attempts_at_hop + 1,
+                                        max_attempts = MAX_BREADTH,
+                                        phase = "retry",
+                                        "Subscribe: trying alternative peer at same hop"
+                                    );
+
+                                    return Ok(OperationResult::SendAndContinue {
+                                        msg: NetMessage::from(SubscribeMsg::Request {
+                                            id: *msg_id,
+                                            instance_id: *instance_id,
+                                            htl: current_hop,
+                                            visited: visited.clone(),
+                                            is_renewal: self.is_renewal,
+                                        }),
+                                        next_hop: Some(next_addr),
+                                        state: OpEnum::Subscribe(SubscribeOp {
+                                            id,
+                                            state: SubscribeState::AwaitingResponse(
+                                                AwaitingResponseData {
+                                                    next_hop: Some(next_addr),
+                                                    instance_id: *instance_id,
+                                                    retries,
+                                                    current_hop,
+                                                    tried_peers,
+                                                    alternatives,
+                                                    attempts_at_hop: attempts_at_hop + 1,
+                                                    visited,
+                                                },
+                                            ),
+                                            requester_addr: self.requester_addr,
+                                            requester_pub_key: self.requester_pub_key,
+                                            is_renewal: self.is_renewal,
+                                            stats: self.stats,
+                                        }),
+                                        stream_data: None,
+                                    });
+                                }
+                            }
+
+                            // --- Retry round: seek new candidates via k_closest ---
+                            if retries < MAX_RETRIES {
+                                for addr in &tried_peers {
+                                    visited.mark_visited(*addr);
+                                }
+
+                                let mut new_candidates =
+                                    op_manager.ring.k_closest_potentially_caching(
+                                        instance_id,
+                                        &visited,
+                                        MAX_BREADTH,
+                                    );
+
+                                if !new_candidates.is_empty() {
+                                    let next_target = new_candidates.remove(0);
+                                    if let Some(next_addr) = next_target.socket_addr() {
+                                        let mut new_tried_peers = HashSet::new();
+                                        new_tried_peers.insert(next_addr);
+                                        visited.mark_visited(next_addr);
+
+                                        tracing::info!(
+                                            tx = %msg_id,
+                                            %instance_id,
+                                            peer_addr = %next_addr,
+                                            retries = retries + 1,
+                                            max_retries = MAX_RETRIES,
+                                            new_candidates = new_candidates.len(),
+                                            phase = "retry",
+                                            "Subscribe: seeking new candidates after exhausted alternatives"
+                                        );
+
+                                        return Ok(OperationResult::SendAndContinue {
+                                            msg: NetMessage::from(SubscribeMsg::Request {
+                                                id: *msg_id,
+                                                instance_id: *instance_id,
+                                                htl: current_hop,
+                                                visited: visited.clone(),
+                                                is_renewal: self.is_renewal,
+                                            }),
+                                            next_hop: Some(next_addr),
+                                            state: OpEnum::Subscribe(SubscribeOp {
+                                                id,
+                                                state: SubscribeState::AwaitingResponse(
+                                                    AwaitingResponseData {
+                                                        next_hop: Some(next_addr),
+                                                        instance_id: *instance_id,
+                                                        retries: retries + 1,
+                                                        current_hop,
+                                                        tried_peers: new_tried_peers,
+                                                        alternatives: new_candidates,
+                                                        attempts_at_hop: 1,
+                                                        visited,
+                                                    },
+                                                ),
+                                                requester_addr: self.requester_addr,
+                                                requester_pub_key: self.requester_pub_key,
+                                                is_renewal: self.is_renewal,
+                                                stats: self.stats,
+                                            }),
+                                            stream_data: None,
+                                        });
+                                    }
+                                }
+                            }
+
+                            // --- All retries exhausted ---
                             if let Some(requester_addr) = self.requester_addr {
                                 // We're an intermediate node - forward NotFound to requester
-                                tracing::debug!(tx = %msg_id, %instance_id, requester = %requester_addr, "Forwarding NotFound response to requester");
+                                tracing::debug!(tx = %msg_id, %instance_id, requester = %requester_addr, "Forwarding NotFound response to requester (retries exhausted)");
                                 Ok(OperationResult::SendAndComplete {
                                     msg: NetMessage::from(SubscribeMsg::Response {
                                         id: *msg_id,
