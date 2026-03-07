@@ -283,9 +283,10 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn module_has_async_imports(&self, module: &Module) -> bool {
-        module
-            .imports()
-            .any(|import| import.module() == "freenet_delegate_contracts")
+        module.imports().any(|import| {
+            import.module() == "freenet_delegate_contracts"
+                || import.module() == "freenet_delegate_management"
+        })
     }
 
     fn create_instance(
@@ -1031,6 +1032,42 @@ impl WasmtimeEngine {
                     refresh_mem_addr_from_caller(&mut caller, id);
                     Box::new(async move {
                         native_api::delegate_contracts::subscribe_contract_impl(id_ptr, id_len)
+                    })
+                },
+            )
+            .map_err(WasmError::Other)?;
+
+        // ============================================================
+        // freenet_delegate_management namespace — delegate creation
+        // ============================================================
+        linker
+            .func_wrap_async(
+                "freenet_delegate_management",
+                "__frnt__delegate__create_delegate",
+                |mut caller: Caller<'_, HostState>,
+                 (
+                    wasm_ptr,
+                    wasm_len,
+                    params_ptr,
+                    params_len,
+                    cipher_ptr,
+                    nonce_ptr,
+                    out_key_ptr,
+                    out_hash_ptr,
+                ): (i64, i64, i64, i32, i64, i64, i64, i64)| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    Box::new(async move {
+                        native_api::delegate_management::create_delegate_impl(
+                            wasm_ptr,
+                            wasm_len,
+                            params_ptr,
+                            params_len,
+                            cipher_ptr,
+                            nonce_ptr,
+                            out_key_ptr,
+                            out_hash_ptr,
+                        )
                     })
                 },
             )

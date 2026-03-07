@@ -454,7 +454,7 @@ fn compile_contract(name: &str) -> anyhow::Result<Vec<u8>> {
     Ok(std::fs::read(output_file)?)
 }
 
-fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
+pub fn compile_delegate(name: &str) -> anyhow::Result<Vec<u8>> {
     let delegate_path = {
         const CRATE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/");
         let delegates = PathBuf::from(CRATE_DIR);

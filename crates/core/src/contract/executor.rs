@@ -84,6 +84,16 @@ pub(crate) const MAX_DELTA_COMPUTATIONS_PER_FANOUT: usize = 32;
 /// contracts with high fan-out before they hit the hard cap.
 pub(crate) const FANOUT_WARNING_THRESHOLD: usize = 50;
 
+/// Maximum delegate creation chain depth (A creates B creates C...).
+/// Prevents recursive fork-bomb attacks via delegate spawning.
+pub(crate) const MAX_DELEGATE_CREATION_DEPTH: u32 = 4;
+
+/// Maximum delegates a single delegate can create within one process() call.
+pub(crate) const MAX_DELEGATE_CREATIONS_PER_CALL: u32 = 8;
+
+// TODO(#2833): Investigate RSS/memory exhaustion from delegate proliferation.
+// Currently no per-node cap — revisit if delegate creation causes
+// unbounded memory growth.
 pub(crate) type DelegateNotificationSender = mpsc::Sender<DelegateNotification>;
 pub(crate) type DelegateNotificationReceiver = mpsc::Receiver<DelegateNotification>;
 

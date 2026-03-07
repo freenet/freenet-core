@@ -168,6 +168,30 @@ pub mod contract_error_codes {
     pub const ERR_CONTRACT_CODE_NOT_REGISTERED: i32 = -10;
 }
 
+/// Error codes for delegate management host functions (create_delegate, etc.).
+///
+/// Uses the -20..-29 range to avoid collisions with existing error codes.
+#[allow(dead_code)] // Public API — error codes for host function implementations
+pub mod delegate_mgmt_error_codes {
+    /// Delegate creation succeeded.
+    pub const SUCCESS: i32 = 0;
+    /// Called outside of a `process()` context.
+    pub const ERR_NOT_IN_PROCESS: i32 = -1;
+    /// Invalid parameter (e.g., negative length).
+    pub const ERR_INVALID_PARAM: i32 = -4;
+    /// Memory bounds violation (pointer out of range).
+    pub const ERR_MEMORY_BOUNDS: i32 = -9;
+    /// Delegate creation depth limit exceeded.
+    pub const ERR_DEPTH_EXCEEDED: i32 = -20;
+    /// Per-call delegate creation limit exceeded.
+    pub const ERR_CREATIONS_EXCEEDED: i32 = -21;
+    // -22 reserved for future per-node limit
+    /// Invalid WASM bytes (failed to construct DelegateContainer).
+    pub const ERR_INVALID_WASM: i32 = -23;
+    /// Delegate store or secret store operation failed.
+    pub const ERR_STORE_FAILED: i32 = -24;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +317,7 @@ mod tests {
     struct TestEnv {
         _temp_dir: tempfile::TempDir,
         contract_store: ContractStore,
+        delegate_store: super::super::delegate_store::DelegateStore,
         secret_store: SecretsStore,
         db: Storage,
     }
@@ -310,14 +335,13 @@ mod tests {
             let delegate_store =
                 super::super::delegate_store::DelegateStore::new(delegates_dir, 10_000, db.clone())
                     .unwrap();
-            // DelegateStore not stored since we only need contract_store + secret_store
-            drop(delegate_store);
             let secret_store =
                 SecretsStore::new(secrets_dir, Default::default(), db.clone()).unwrap();
 
             Self {
                 _temp_dir: temp_dir,
                 contract_store,
+                delegate_store,
                 secret_store,
                 db,
             }
@@ -357,6 +381,9 @@ mod tests {
                     &self.contract_store,
                     Some(self.db.clone()),
                     delegate_key,
+                    &mut self.delegate_store,
+                    0,
+                    vec![],
                 )
             }
         }
@@ -446,6 +473,9 @@ mod tests {
                 &env_holder.contract_store,
                 None, // No state store
                 delegate_key,
+                &mut env_holder.delegate_store,
+                0,
+                vec![],
             )
         };
 
@@ -523,6 +553,9 @@ mod tests {
                 &env_holder.contract_store,
                 None,
                 delegate_key,
+                &mut env_holder.delegate_store,
+                0,
+                vec![],
             )
         };
 
@@ -546,6 +579,9 @@ mod tests {
                 &env_holder.contract_store,
                 None,
                 delegate_key,
+                &mut env_holder.delegate_store,
+                0,
+                vec![],
             )
         };
 

@@ -136,6 +136,9 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # Freenet
 freenet-stdlib = "0.1.40"
 
+[patch.crates-io]
+freenet-stdlib = { path = "libs/freenet-stdlib" }
+
 [profile.dev.package."*"]
 opt-level = 3
 

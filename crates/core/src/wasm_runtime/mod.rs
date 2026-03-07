@@ -22,7 +22,7 @@ pub use delegate_store::DelegateStore;
 pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
-pub(crate) use native_api::DELEGATE_SUBSCRIPTIONS;
+pub(crate) use native_api::{DELEGATE_INHERITED_ATTESTATIONS, DELEGATE_SUBSCRIPTIONS};
 pub use runtime::{ContractExecError, Runtime, DEFAULT_MODULE_CACHE_CAPACITY};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
 pub(crate) use secrets_store::SecretStoreError;
