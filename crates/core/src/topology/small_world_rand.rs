@@ -63,6 +63,71 @@ fn to_log_unit(distance: f64) -> f64 {
     (distance / D_MIN).ln() / LOG_RATIO
 }
 
+/// Result of analyzing the gap distribution in log-distance space.
+///
+/// Contains the sorted gaps between consecutive connection points
+/// (including boundaries 0 and 1) and the size of the largest gap.
+struct GapAnalysis {
+    /// All gaps as (start, size) pairs, sorted by position.
+    gaps: Vec<(f64, f64)>,
+    /// Size of the largest gap (in [0, 1] log-space units).
+    largest_gap_size: f64,
+    /// Number of distinct in-range points used for the analysis.
+    point_count: usize,
+}
+
+/// Analyze the gap distribution of connection distances in log-space.
+///
+/// Returns `None` if there are no valid distances in [D_MIN, D_MAX].
+fn analyze_gaps(connection_distances: impl Iterator<Item = f64>) -> Option<GapAnalysis> {
+    let mut points: Vec<f64> = connection_distances
+        .filter(|&d| (D_MIN..=D_MAX).contains(&d))
+        .map(to_log_unit)
+        .collect();
+
+    if points.is_empty() {
+        return None;
+    }
+
+    points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    points.dedup();
+
+    let mut gaps: Vec<(f64, f64)> = Vec::new();
+    let mut prev = 0.0_f64;
+    for &p in &points {
+        gaps.push((prev, p - prev));
+        prev = p;
+    }
+    gaps.push((prev, 1.0 - prev));
+
+    let largest_gap_size = gaps.iter().map(|(_, size)| *size).fold(0.0_f64, f64::max);
+    let point_count = points.len();
+
+    Some(GapAnalysis {
+        gaps,
+        largest_gap_size,
+        point_count,
+    })
+}
+
+/// Compute the size of the largest gap in the connection distribution
+/// in log-distance space, normalized to [0, 1]. Also returns the number
+/// of distinct in-range points used for the analysis (for the expected
+/// gap formula `ln(k)/k`).
+///
+/// With k connections ideally distributed (uniform in log-space), the expected
+/// largest gap is approximately ln(k)/k. A return value significantly larger
+/// than that indicates the topology has room for improvement.
+///
+/// Returns `(gap_size, point_count)` where `point_count` is the number of
+/// distinct in-range distances used. Returns `(1.0, 0)` when there are no
+/// connections in the valid range.
+pub(crate) fn largest_gap_size(connection_distances: impl Iterator<Item = f64>) -> (f64, usize) {
+    analyze_gaps(connection_distances)
+        .map(|a| (a.largest_gap_size, a.point_count))
+        .unwrap_or((1.0, 0))
+}
+
 /// Target the center of the largest gap in the node's current connection
 /// distribution in log-space, mapped back to a ring location.
 ///
@@ -75,34 +140,15 @@ pub(crate) fn gap_target(
     my_location: Location,
     connection_distances: impl Iterator<Item = f64>,
 ) -> Location {
-    // Collect and sort connection distances in log-space
-    let mut points: Vec<f64> = connection_distances
-        .filter(|&d| (D_MIN..=D_MAX).contains(&d))
-        .map(to_log_unit)
-        .collect();
-
-    if points.is_empty() {
-        return kleinberg_target(my_location);
-    }
-
-    points.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    points.dedup();
-
-    // Find all gaps and pick randomly among the largest ones
-    let mut gaps: Vec<(f64, f64)> = Vec::new(); // (start, size)
-
-    let mut prev = 0.0_f64;
-    for &p in &points {
-        gaps.push((prev, p - prev));
-        prev = p;
-    }
-    gaps.push((prev, 1.0 - prev));
-
-    let best_gap_size = gaps.iter().map(|(_, size)| *size).fold(0.0_f64, f64::max);
+    let analysis = match analyze_gaps(connection_distances) {
+        Some(a) => a,
+        None => return kleinberg_target(my_location),
+    };
 
     // Collect all gaps within 1% of the best (floating point tolerance)
-    let threshold = best_gap_size * 0.99;
-    let largest_gaps: Vec<(f64, f64)> = gaps
+    let threshold = analysis.largest_gap_size * 0.99;
+    let largest_gaps: Vec<(f64, f64)> = analysis
+        .gaps
         .into_iter()
         .filter(|(_, size)| *size >= threshold)
         .collect();
@@ -567,5 +613,47 @@ mod tests {
                 "Target {v} outside valid range for boundary location"
             );
         }
+    }
+
+    #[test]
+    fn largest_gap_no_connections() {
+        assert_eq!(largest_gap_size(std::iter::empty()), (1.0, 0));
+    }
+
+    #[test]
+    fn largest_gap_uniform_connections() {
+        // Place connections at quartiles in log-space
+        let d_at = |u: f64| D_MIN * (D_MAX / D_MIN).powf(u);
+        let existing = [d_at(0.25), d_at(0.5), d_at(0.75)];
+        let (gap, count) = largest_gap_size(existing.iter().copied());
+        // 4 equal gaps of size 0.25
+        assert!((gap - 0.25).abs() < 0.01, "Expected gap ~0.25, got {gap}");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn largest_gap_clustered_connections() {
+        // All connections near D_MIN — large gap at long distances
+        let existing = [0.012, 0.015, 0.02];
+        let (gap, count) = largest_gap_size(existing.iter().copied());
+        // Most of log-space is empty, gap should be large
+        assert!(
+            gap > 0.5,
+            "Clustered connections should have large gap, got {gap}"
+        );
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn largest_gap_single_connection_at_midpoint() {
+        // Single connection at geometric mean (log-space midpoint)
+        let geo_mean = (D_MIN * D_MAX).sqrt();
+        let (gap, count) = largest_gap_size(std::iter::once(geo_mean));
+        // Splits [0,1] into two ~equal halves
+        assert!(
+            (gap - 0.5).abs() < 0.01,
+            "Midpoint connection should yield gap ~0.5, got {gap}"
+        );
+        assert_eq!(count, 1);
     }
 }

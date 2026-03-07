@@ -2217,6 +2217,42 @@ impl Ring {
                         }
                     }
                 }
+                TopologyAdjustment::SwapConnection {
+                    remove,
+                    add_location,
+                } => {
+                    // Drop the least-useful connection, then queue the gap target
+                    // for acquisition. Note: this is not atomic — the drop happens
+                    // immediately but the new connection may fail to establish.
+                    // This is acceptable: the node temporarily has one fewer
+                    // connection, which the normal topology maintenance will fill.
+                    if let Some(addr) = remove.socket_addr() {
+                        tracing::info!(
+                            remove_peer = %remove,
+                            add_target = %add_location,
+                            "Executing topology swap"
+                        );
+                        notifier
+                            .notifications_sender
+                            .send(Either::Right(crate::message::NodeEvent::DropConnection(
+                                addr,
+                            )))
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(
+                                    error = ?error,
+                                    "Shutting down connection maintenance task"
+                                );
+                                error
+                            })?;
+                        pending_conn_adds.insert(add_location);
+                    } else {
+                        tracing::warn!(
+                            remove_peer = %remove,
+                            "Topology swap skipped: peer has no socket address"
+                        );
+                    }
+                }
                 TopologyAdjustment::NoChange => {}
             }
 

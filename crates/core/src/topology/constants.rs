@@ -12,3 +12,10 @@ pub(super) const MAXIMUM_DESIRED_RESOURCE_USAGE_PROPORTION: f64 = 0.9;
 /// Below this threshold, peers target their own location to build local neighborhoods.
 /// At or above this threshold, peers use Kleinberg 1/d sampling for optimal ring coverage.
 pub(super) const DENSITY_SELECTION_THRESHOLD: usize = 5;
+
+/// Maximum probability of attempting a topology swap on any single maintenance tick.
+///
+/// At 60s ticks with max probability, this means at most ~one swap every 10 minutes
+/// even when topology deviation is very high. During normal operation the actual
+/// probability is proportional to the gap deviation and will be much lower.
+pub(super) const MAX_SWAP_PROB_PER_TICK: f64 = 0.1;

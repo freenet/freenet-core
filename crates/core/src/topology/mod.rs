@@ -15,13 +15,23 @@
 //! early bootstrap), the fallback is random Kleinberg 1/d sampling via inverse CDF:
 //! `d = d_min * (d_max/d_min)^U` where U ~ Uniform(0,1).
 //!
-//! ## When to Add/Remove
+//! ## When to Add/Remove/Swap
 //!
 //! - Below `min_connections` → add connections
 //! - At/above `min_connections`, resource usage < 50% → add connections
-//! - At/above `min_connections`, resource usage 50-90% → no change
 //! - At/above `min_connections`, resource usage > 90% → remove connections
 //! - Above `max_connections` → remove connections
+//! - Whenever not removing and not resource-constrained → consider topology swap
+//!
+//! ## Topology Swaps
+//!
+//! When at steady state (resource usage 50-90%), the manager checks whether
+//! replacing a connection would improve the Kleinberg distribution. The swap
+//! probability is proportional to how much the largest gap in log-distance space
+//! exceeds the expected gap for an ideal distribution (`ln(k)/k` for k connections).
+//! This makes swaps self-limiting: frequent when topology is poor, rare when it's
+//! good. The connection to drop is the one with the fewest routed requests
+//! (least useful to the routing algorithm).
 //!
 //! ## Accepting Incoming Connections
 //!
@@ -57,7 +67,7 @@ use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use tokio::time::Instant;
-use tracing::{debug, event, info, span, warn, Level};
+use tracing::{debug, event, info, span, trace, warn, Level};
 
 pub mod connection_evaluator;
 mod constants;
@@ -367,6 +377,11 @@ impl TopologyManager {
 
         let (resource_type, usage_proportion) = self.calculate_usage_proportion(at_time);
 
+        // Track whether we should suppress topology swaps. Swaps should NOT
+        // fire when resource usage is high and we're pinned at min_connections
+        // (Codex review catch: don't churn connections under load).
+        let mut suppress_swap = false;
+
         let adjustment: anyhow::Result<TopologyAdjustment> =
             if current_connections > self.limits.max_connections {
                 debug!(
@@ -392,6 +407,7 @@ impl TopologyManager {
                         min_connections = self.limits.min_connections,
                         "Resource usage high but at min_connections — not removing"
                     );
+                    suppress_swap = true;
                     Ok(TopologyAdjustment::NoChange)
                 } else {
                     debug!(
@@ -429,7 +445,24 @@ impl TopologyManager {
             return adj;
         }
 
-        adjustment.unwrap_or(TopologyAdjustment::NoChange)
+        let adj = adjustment.unwrap_or(TopologyAdjustment::NoChange);
+
+        // Topology swap: when not removing connections and not under resource
+        // pressure at min_connections, check whether replacing the least-routed
+        // connection would improve the Kleinberg distribution. The swap's own
+        // min_connections guard (in maybe_swap_connection) prevents swaps during
+        // bootstrap. When the main logic returns AddConnections, the swap can
+        // override it — the node already has min_connections so the swap's
+        // topology improvement is more valuable than growing beyond min.
+        if !suppress_swap && !matches!(adj, TopologyAdjustment::RemoveConnections(_)) {
+            let swap =
+                self.maybe_swap_connection(my_location, neighbor_locations, current_connections);
+            if !matches!(swap, TopologyAdjustment::NoChange) {
+                return swap;
+            }
+        }
+
+        adj
     }
 
     /// Sample `count` target locations using gap-based targeting.
@@ -552,6 +585,104 @@ impl TopologyManager {
         } else {
             event!(Level::WARN, "Couldn't find a suitable peer to remove");
             TopologyAdjustment::NoChange
+        }
+    }
+
+    /// Probabilistically decide whether to swap a connection to improve topology.
+    ///
+    /// Computes the largest gap in the current connection distribution in
+    /// log-distance space, compares it to the expected gap for an ideal
+    /// Kleinberg distribution, and triggers a swap with probability
+    /// proportional to the excess. The connection to drop is the one with
+    /// the fewest routed requests (least useful to the routing algorithm).
+    fn maybe_swap_connection(
+        &self,
+        my_location: &Option<Location>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+        current_connections: usize,
+    ) -> TopologyAdjustment {
+        if current_connections < self.limits.min_connections {
+            return TopologyAdjustment::NoChange;
+        }
+
+        let Some(&my_loc) = my_location.as_ref() else {
+            return TopologyAdjustment::NoChange;
+        };
+
+        let distances: Vec<f64> = neighbor_locations
+            .keys()
+            .map(|nloc| my_loc.distance(*nloc).as_f64())
+            .collect();
+
+        let (largest_gap, point_count) =
+            small_world_rand::largest_gap_size(distances.iter().copied());
+
+        if point_count == 0 {
+            return TopologyAdjustment::NoChange;
+        }
+
+        // Expected largest gap for k uniform points on [0,1]: ~ln(k)/k.
+        // point_count is the number of distinct in-range distances from the
+        // gap analysis, which filters to [D_MIN, D_MAX] and deduplicates.
+        // Note: when k=1, ln(1)/1 = 0, so excess → inf → clamp(1.0), meaning
+        // a single in-range connection always triggers a swap at max probability.
+        // This is intentional: with one connection the gap is ~0.5 (genuinely large).
+        let k = point_count as f64;
+        let expected_gap = k.ln() / k;
+
+        // Swap probability proportional to how much the gap exceeds expected.
+        // When gap == expected: excess = 0, no swap.
+        // When gap == 2x expected: excess = 1.0, swap at MAX_SWAP_PROB_PER_TICK.
+        let excess = ((largest_gap / expected_gap) - 1.0).clamp(0.0, 1.0);
+        let swap_prob = excess * MAX_SWAP_PROB_PER_TICK;
+
+        if swap_prob <= 0.0 {
+            return TopologyAdjustment::NoChange;
+        }
+
+        let roll: f64 = crate::config::GlobalRng::random_range(0.0..1.0);
+        if roll >= swap_prob {
+            trace!(
+                largest_gap,
+                expected_gap,
+                excess,
+                swap_prob,
+                roll,
+                "Topology swap check: not triggered"
+            );
+            return TopologyAdjustment::NoChange;
+        }
+
+        // Find the least-routed peer to drop.
+        let least_routed = neighbor_locations
+            .values()
+            .flatten()
+            .min_by_key(|conn| {
+                self.outbound_request_counter
+                    .get_request_count(&conn.location)
+            })
+            .map(|conn| conn.location.clone());
+
+        let Some(remove) = least_routed else {
+            return TopologyAdjustment::NoChange;
+        };
+
+        // Target the largest gap for the replacement connection.
+        let add_location = small_world_rand::gap_target(my_loc, distances.iter().copied());
+
+        info!(
+            largest_gap,
+            expected_gap,
+            excess,
+            swap_prob,
+            remove_peer = %remove,
+            add_target = %add_location,
+            "Topology swap triggered: replacing least-routed peer with gap-targeted connection"
+        );
+
+        TopologyAdjustment::SwapConnection {
+            remove,
+            add_location,
         }
     }
 }
@@ -777,7 +908,9 @@ mod tests {
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0], *worst_peer);
             }
-            TopologyAdjustment::AddConnections(_) | TopologyAdjustment::NoChange => {
+            TopologyAdjustment::AddConnections(_)
+            | TopologyAdjustment::NoChange
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected to remove a peer, adjustment was {adjustment:?}")
             }
         }
@@ -819,7 +952,9 @@ mod tests {
             TopologyAdjustment::AddConnections(locations) => {
                 assert_eq!(locations.len(), 1);
             }
-            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+            TopologyAdjustment::RemoveConnections(_)
+            | TopologyAdjustment::NoChange
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected to add a connection, adjustment was {adjustment:?}")
             }
         }
@@ -853,7 +988,9 @@ mod tests {
 
         match adjustment {
             TopologyAdjustment::NoChange => {}
-            TopologyAdjustment::AddConnections(_) | TopologyAdjustment::RemoveConnections(_) => {
+            TopologyAdjustment::AddConnections(_)
+            | TopologyAdjustment::RemoveConnections(_)
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected no adjustment, adjustment was {adjustment:?}")
             }
         }
@@ -914,7 +1051,9 @@ mod tests {
         );
         match adjustment {
             TopologyAdjustment::AddConnections(_) => {}
-            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+            TopologyAdjustment::RemoveConnections(_)
+            | TopologyAdjustment::NoChange
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected AddConnections when below min, got {adjustment:?}")
             }
         }
@@ -956,7 +1095,9 @@ mod tests {
                     "First bootstrap target should be own location"
                 );
             }
-            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+            TopologyAdjustment::RemoveConnections(_)
+            | TopologyAdjustment::NoChange
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected AddConnections, but was: {adjustment:?}")
             }
         }
@@ -1001,7 +1142,9 @@ mod tests {
                         close_count += 1;
                     }
                 }
-                TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+                TopologyAdjustment::RemoveConnections(_)
+                | TopologyAdjustment::NoChange
+                | TopologyAdjustment::SwapConnection { .. } => {
                     panic!("Expected AddConnections, got {adjustment:?}")
                 }
             }
@@ -1170,7 +1313,9 @@ mod tests {
                     "All bootstrap targets must be distinct"
                 );
             }
-            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+            TopologyAdjustment::RemoveConnections(_)
+            | TopologyAdjustment::NoChange
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected AddConnections, got {adjustment:?}")
             }
         }
@@ -1218,7 +1363,9 @@ mod tests {
                     locations.len()
                 );
             }
-            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+            TopologyAdjustment::RemoveConnections(_)
+            | TopologyAdjustment::NoChange
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected AddConnections, got {adjustment:?}")
             }
         }
@@ -1255,7 +1402,9 @@ mod tests {
                 assert_eq!(locations.len(), 1);
                 assert_eq!(locations[0], my_location);
             }
-            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+            TopologyAdjustment::RemoveConnections(_)
+            | TopologyAdjustment::NoChange
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected AddConnections, got {adjustment:?}")
             }
         }
@@ -1302,7 +1451,9 @@ mod tests {
                     "All bootstrap targets must be distinct even when wrapping"
                 );
             }
-            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+            TopologyAdjustment::RemoveConnections(_)
+            | TopologyAdjustment::NoChange
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected AddConnections, got {adjustment:?}")
             }
         }
@@ -1339,7 +1490,9 @@ mod tests {
                     locations.len()
                 );
             }
-            TopologyAdjustment::RemoveConnections(_) | TopologyAdjustment::NoChange => {
+            TopologyAdjustment::RemoveConnections(_)
+            | TopologyAdjustment::NoChange
+            | TopologyAdjustment::SwapConnection { .. } => {
                 panic!("Expected AddConnections, got {adjustment:?}")
             }
         }
@@ -1406,12 +1559,163 @@ mod tests {
             "Random locations should generally be distinct"
         );
     }
+
+    /// Test that topology swaps trigger when connections are clustered
+    /// (large gap deviation) and don't trigger when well-distributed.
+    #[test_log::test]
+    fn test_topology_swap_triggers_on_clustered_connections() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xABCD_1234);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(100000.0),
+            max_connections: 200,
+            min_connections: 10,
+        };
+        let mut tm = TopologyManager::new(limits);
+
+        // Create 10 peers all clustered at very similar short distances from us.
+        // This creates a huge gap in the long-distance part of log-space,
+        // which should trigger swaps.
+        let my_location = Location::new(0.5);
+        let mut neighbor_locations = BTreeMap::new();
+        for i in 0..10 {
+            // All within distance 0.02 of us — heavily clustered
+            let offset = 0.01 + (i as f64 * 0.001);
+            let loc = Location::new(my_location.as_f64() + offset);
+            let peer = PeerKeyLocation::random();
+            tm.outbound_request_counter.record_request(peer.clone());
+            neighbor_locations
+                .entry(loc)
+                .or_insert_with(Vec::new)
+                .push(Connection::new(peer));
+        }
+
+        // Test maybe_swap_connection directly (bypasses resource meter).
+        let mut swap_count = 0;
+        let trials = 100;
+        for _ in 0..trials {
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 10);
+            if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
+                swap_count += 1;
+            }
+        }
+        assert!(
+            swap_count > 0,
+            "Expected at least one swap with clustered connections, got 0/{trials}"
+        );
+        // With max 10% probability per tick and a large gap, expect roughly 5-15 swaps
+        assert!(
+            swap_count < trials / 2,
+            "Too many swaps ({swap_count}/{trials}) — probability should be capped"
+        );
+    }
+
+    /// Test that topology swaps don't trigger when connections are well-distributed.
+    #[test_log::test]
+    fn test_topology_swap_no_trigger_when_well_distributed() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x600D_7090);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(100000.0),
+            max_connections: 200,
+            min_connections: 10,
+        };
+        let mut tm = TopologyManager::new(limits);
+
+        // Create 10 peers evenly distributed in log-distance space.
+        let my_location = Location::new(0.5);
+        let d_at = |u: f64| 0.01_f64 * (0.5_f64 / 0.01).powf(u); // D_MIN * (D_MAX/D_MIN)^u
+        let mut neighbor_locations = BTreeMap::new();
+        for i in 0..10 {
+            let u = (i as f64 + 0.5) / 10.0; // evenly spaced in [0, 1]
+            let dist = d_at(u);
+            let loc = Location::new_rounded(my_location.as_f64() + dist);
+            let peer = PeerKeyLocation::random();
+            tm.outbound_request_counter.record_request(peer.clone());
+            neighbor_locations
+                .entry(loc)
+                .or_insert_with(Vec::new)
+                .push(Connection::new(peer));
+        }
+
+        // Test maybe_swap_connection directly — with well-distributed connections,
+        // largest gap ≈ expected gap, so swap probability should be near zero.
+        let mut swap_count = 0;
+        let trials = 100;
+        for _ in 0..trials {
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 10);
+            if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
+                swap_count += 1;
+            }
+        }
+        assert!(
+            swap_count <= 3,
+            "Well-distributed topology should rarely trigger swaps, got {swap_count}/{trials}"
+        );
+    }
+
+    /// Test that the swap selects the least-routed peer for removal.
+    #[test_log::test]
+    fn test_topology_swap_removes_least_routed() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x1EA5_70FE);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(100000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut tm = TopologyManager::new(limits);
+
+        let my_location = Location::new(0.5);
+        let mut neighbor_locations = BTreeMap::new();
+
+        // Create 6 clustered peers. Give most of them high request counts
+        // but one peer gets zero requests.
+        let mut least_routed_peer = None;
+        for i in 0..6 {
+            let loc = Location::new(my_location.as_f64() + 0.01 + (i as f64 * 0.001));
+            let peer = PeerKeyLocation::random();
+            if i == 3 {
+                // This peer gets no requests — should be the drop candidate
+                least_routed_peer = Some(peer.clone());
+            } else {
+                // Give other peers many requests
+                for _ in 0..50 {
+                    tm.outbound_request_counter.record_request(peer.clone());
+                }
+            }
+            neighbor_locations
+                .entry(loc)
+                .or_insert_with(Vec::new)
+                .push(Connection::new(peer));
+        }
+
+        // Test maybe_swap_connection directly.
+        let expected_drop = least_routed_peer.unwrap();
+        let mut found_swap = false;
+        for _ in 0..200 {
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 6);
+            if let TopologyAdjustment::SwapConnection { remove, .. } = adjustment {
+                assert_eq!(remove, expected_drop, "Should drop the least-routed peer");
+                found_swap = true;
+                break;
+            }
+        }
+        assert!(found_swap, "Should have triggered a swap within 200 trials");
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum TopologyAdjustment {
     AddConnections(Vec<Location>),
     RemoveConnections(Vec<PeerKeyLocation>),
+    /// Replace the least-routed connection with a new one targeting the largest gap.
+    /// This allows the topology to converge toward the ideal Kleinberg distribution
+    /// even after reaching the target connection count.
+    SwapConnection {
+        remove: PeerKeyLocation,
+        add_location: Location,
+    },
     NoChange,
 }
 

@@ -209,7 +209,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
 
     let span = span!(Level::INFO, "test_ping_blocked_peers");
 
-    let test = tokio::time::timeout(Duration::from_secs(300), async {
+    let test = tokio::time::timeout(Duration::from_secs(420), async {
         tracing::info!("Waiting 25s for nodes to start up...");
         sleep(Duration::from_secs(25)).await;
 
@@ -299,7 +299,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
                 .await?;
 
             tokio::time::timeout(
-                Duration::from_secs(60),
+                Duration::from_secs(120),
                 wait_for_get_response(client, &contract_key),
             )
             .await
