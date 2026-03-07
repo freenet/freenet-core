@@ -613,6 +613,9 @@ async fn websocket_commands(
         }
     };
 
+    // 100MB limit: WASM contract uploads can be very large and the default
+    // ~64KB would reject them. Streaming chunks individual responses but the
+    // initial PUT still arrives as a single WebSocket message.
     ws.max_message_size(100 * 1024 * 1024)
         .on_upgrade(on_upgrade)
 }
@@ -654,6 +657,10 @@ async fn websocket_interface(
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::Receiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
 
+    // NOTE: ReassemblyBuffer has no built-in TTL for incomplete streams.
+    // If a client stalls mid-stream, partial entries persist for the connection
+    // lifetime. A server-side eviction guard should be added in freenet-stdlib
+    // to bound memory usage from incomplete streams.
     let mut conn_state = ConnectionState {
         encoding_protoc,
         streaming,
@@ -817,7 +824,19 @@ async fn websocket_interface(
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
-                let serialized_res = match encoding_protoc {
+                // Extract StreamContent for streaming-capable clients (same as process_host_response)
+                let stream_content = match &response {
+                    Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                        key,
+                        contract,
+                        ..
+                    })) => Some(freenet_stdlib::client_api::StreamContent::GetResponse {
+                        key: *key,
+                        includes_contract: contract.is_some(),
+                    }),
+                    _ => None,
+                };
+                let serialized_res = match conn_state.encoding_protoc {
                     EncodingProtocol::Flatbuffers => match response {
                         Ok(res) => match res.into_fbs_bytes() {
                             Ok(b) => b,
@@ -842,7 +861,7 @@ async fn websocket_interface(
                         }
                     },
                 };
-                if let Err(err) = send_response_message(&mut server_sink, serialized_res, &mut conn_state, None).await {
+                if let Err(err) = send_response_message(&mut server_sink, serialized_res, &mut conn_state, stream_content).await {
                     tracing::debug!(err = %err, "error sending notification to client");
                     notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
                     return Err(err.into());
@@ -861,17 +880,18 @@ async fn websocket_interface(
     }
 }
 
-async fn send_response_message(
-    tx: &mut futures::stream::SplitSink<WebSocket, Message>,
-    serialized: Vec<u8>,
+fn prepare_response_messages(
+    payload: Vec<u8>,
     conn_state: &mut ConnectionState,
     stream_content: Option<freenet_stdlib::client_api::StreamContent>,
-) -> Result<(), axum::Error> {
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
     use freenet_stdlib::client_api::streaming::{chunk_response, CHUNK_THRESHOLD};
 
-    if conn_state.streaming && serialized.len() > CHUNK_THRESHOLD {
+    if conn_state.streaming && payload.len() > CHUNK_THRESHOLD {
         let stream_id = conn_state.next_stream_id;
         conn_state.next_stream_id = conn_state.next_stream_id.wrapping_add(1);
+
+        let mut messages = Vec::new();
 
         // Send StreamHeader before chunks if content type is known.
         // StreamHeader is only supported over Native encoding (bincode), since
@@ -880,35 +900,44 @@ async fn send_response_message(
             if conn_state.encoding_protoc == EncodingProtocol::Native {
                 let header: HostResponse = HostResponse::StreamHeader {
                     stream_id,
-                    total_bytes: serialized.len() as u64,
+                    total_bytes: payload.len() as u64,
                     content,
                 };
-                let header_bytes =
-                    bincode::serialize(&Ok::<_, ClientError>(header)).map_err(axum::Error::new)?;
-                tx.send(Message::Binary(header_bytes.into())).await?;
+                messages.push(bincode::serialize(&Ok::<_, ClientError>(header))?);
             }
         }
 
-        let chunks = chunk_response(serialized, stream_id);
+        let chunks = chunk_response(payload, stream_id);
         match conn_state.encoding_protoc {
             EncodingProtocol::Flatbuffers => {
                 for chunk in chunks {
-                    let b = chunk.into_fbs_bytes().map_err(axum::Error::new)?;
-                    tx.send(Message::Binary(b.into())).await?;
+                    messages.push(chunk.into_fbs_bytes()?);
                 }
             }
             EncodingProtocol::Native => {
                 for chunk in chunks {
-                    let b = bincode::serialize(&Ok::<_, ClientError>(chunk))
-                        .map_err(axum::Error::new)?;
-                    tx.send(Message::Binary(b.into())).await?;
+                    messages.push(bincode::serialize(&Ok::<_, ClientError>(chunk))?);
                 }
             }
         }
-        Ok(())
+        Ok(messages)
     } else {
-        tx.send(Message::Binary(serialized.into())).await
+        Ok(vec![payload])
     }
+}
+
+async fn send_response_message(
+    tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    serialized: Vec<u8>,
+    conn_state: &mut ConnectionState,
+    stream_content: Option<freenet_stdlib::client_api::StreamContent>,
+) -> Result<(), axum::Error> {
+    let messages = prepare_response_messages(serialized, conn_state, stream_content)
+        .map_err(axum::Error::new)?;
+    for msg in messages {
+        tx.send(Message::Binary(msg.into())).await?;
+    }
+    Ok(())
 }
 
 async fn new_client_connection(
@@ -1000,29 +1029,35 @@ async fn process_client_request(
         Err(msg) => return Ok(msg),
     };
 
-    // Handle StreamChunk: reassemble chunked requests from streaming clients
-    let req = if let ClientRequest::StreamChunk {
-        stream_id,
-        index,
-        total,
-        data,
-    } = req
-    {
-        match conn_state
-            .reassembly
-            .receive_chunk(stream_id, index, total, data)
+    // Handle StreamChunk: reassemble chunked requests from streaming clients.
+    // Only process StreamChunk when the connection was opened with streaming=true;
+    // non-streaming clients should never send StreamChunk messages.
+    let req = if conn_state.streaming {
+        if let ClientRequest::StreamChunk {
+            stream_id,
+            index,
+            total,
+            data,
+        } = req
         {
-            Ok(Some(complete)) => {
-                match decode_client_request(&complete, conn_state.encoding_protoc) {
-                    Ok(req) => req,
-                    Err(msg) => return Ok(msg),
+            match conn_state
+                .reassembly
+                .receive_chunk(stream_id, index, total, data)
+            {
+                Ok(Some(complete)) => {
+                    match decode_client_request(&complete, conn_state.encoding_protoc) {
+                        Ok(req) => req,
+                        Err(msg) => return Ok(msg),
+                    }
+                }
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    tracing::warn!(%client_id, error = %e, "streaming reassembly error");
+                    return Err(Some(e.into()));
                 }
             }
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                tracing::warn!(%client_id, error = %e, "streaming reassembly error");
-                return Err(Some(e.into()));
-            }
+        } else {
+            req
         }
     } else {
         req
@@ -1519,6 +1554,18 @@ impl ClientEventsProxy for WebSocketProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freenet_stdlib::client_api::streaming::{
+        chunk_request, ReassemblyBuffer, CHUNK_SIZE, CHUNK_THRESHOLD,
+    };
+
+    fn test_conn_state(streaming: bool, encoding: EncodingProtocol) -> ConnectionState {
+        ConnectionState {
+            encoding_protoc: encoding,
+            streaming,
+            reassembly: ReassemblyBuffer::new(),
+            next_stream_id: 0,
+        }
+    }
 
     #[test]
     fn test_is_client_disconnect_error() {
@@ -1755,5 +1802,327 @@ mod tests {
         // ExecutionError does NOT carry a key
         let err = DelegateError::ExecutionError("test error".into());
         assert!(delegate_error_key(&err).is_none());
+    }
+
+    // =========================================================================
+    // WebSocket streaming unit tests
+    // =========================================================================
+
+    #[test]
+    fn no_streaming_sends_single_message() {
+        let payload = vec![0xAB; CHUNK_THRESHOLD + 100];
+        let mut conn = test_conn_state(false, EncodingProtocol::Native);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "non-streaming must send exactly one message"
+        );
+        assert_eq!(messages[0], payload, "payload must be sent as-is");
+        assert_eq!(conn.next_stream_id, 0, "stream_id must not advance");
+    }
+
+    #[test]
+    fn payload_at_threshold_not_chunked() {
+        let payload = vec![0xCC; CHUNK_THRESHOLD];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "payload exactly at CHUNK_THRESHOLD must not be chunked"
+        );
+        assert_eq!(conn.next_stream_id, 0);
+    }
+
+    #[test]
+    fn payload_below_threshold_not_chunked() {
+        let payload = vec![0xCC; CHUNK_THRESHOLD - 1];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+
+        let messages = prepare_response_messages(payload, &mut conn, None).unwrap();
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn payload_above_threshold_is_chunked_and_reassembles() {
+        let payload = vec![0xCC; CHUNK_THRESHOLD + 1];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+        assert!(messages.len() > 1, "must produce multiple chunks");
+        assert_eq!(conn.next_stream_id, 1);
+
+        // Reassemble and verify round-trip
+        let mut buf = ReassemblyBuffer::new();
+        let mut result = None;
+        for msg_bytes in &messages {
+            let resp: Result<HostResponse, ClientError> = bincode::deserialize(msg_bytes).unwrap();
+            if let Ok(HostResponse::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            }) = resp
+            {
+                if let Some(r) = buf.receive_chunk(stream_id, index, total, data).unwrap() {
+                    result = Some(r);
+                }
+            }
+        }
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    // --- Test 3: Flatbuffers encoding ---
+
+    #[test]
+    fn flatbuffers_chunked_serialization_succeeds() {
+        let payload = vec![0xDD; CHUNK_THRESHOLD + 100];
+        let mut conn = test_conn_state(true, EncodingProtocol::Flatbuffers);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+        assert!(
+            messages.len() > 1,
+            "must produce multiple FBS-encoded chunks"
+        );
+        assert_eq!(conn.next_stream_id, 1);
+
+        // Each message is the output of HostResponse::StreamChunk::into_fbs_bytes()
+        // which succeeded (no panic). Verify the total data across all chunks
+        // accounts for the original payload.
+        let total_fbs_bytes: usize = messages.iter().map(|m| m.len()).sum();
+        assert!(
+            total_fbs_bytes > payload.len(),
+            "FBS-encoded chunks must contain at least as much data as the payload \
+                 (plus FBS overhead)"
+        );
+    }
+
+    #[test]
+    fn flatbuffers_no_stream_header_even_with_content() {
+        // When stream_content is Some, Flatbuffers path should still NOT
+        // produce a StreamHeader (it's Native-only).
+        let payload = vec![0xDD; CHUNK_THRESHOLD + 100];
+        let mut conn = test_conn_state(true, EncodingProtocol::Flatbuffers);
+        let content = freenet_stdlib::client_api::StreamContent::Raw;
+
+        let messages_with_content =
+            prepare_response_messages(payload.clone(), &mut conn, Some(content)).unwrap();
+
+        let mut conn2 = test_conn_state(true, EncodingProtocol::Flatbuffers);
+        let messages_without_content =
+            prepare_response_messages(payload, &mut conn2, None).unwrap();
+
+        // Same number of messages: no extra StreamHeader was added
+        assert_eq!(
+            messages_with_content.len(),
+            messages_without_content.len(),
+            "Flatbuffers must not add StreamHeader regardless of stream_content"
+        );
+    }
+
+    #[test]
+    fn server_reassembles_chunked_request() {
+        let payload = vec![0xFF; CHUNK_SIZE * 3];
+        let chunks = chunk_request(payload.clone(), 42);
+        assert_eq!(chunks.len(), 3);
+
+        let mut buf = ReassemblyBuffer::new();
+        let mut result = None;
+        for chunk in &chunks {
+            if let ClientRequest::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            } = chunk
+            {
+                if let Some(r) = buf
+                    .receive_chunk(*stream_id, *index, *total, data.clone())
+                    .unwrap()
+                {
+                    result = Some(r);
+                }
+            }
+        }
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    #[test]
+    fn server_reassembly_out_of_order() {
+        let payload: Vec<u8> = (0..CHUNK_SIZE * 3).map(|i| (i % 256) as u8).collect();
+        let chunks = chunk_request(payload.clone(), 7);
+
+        let mut buf = ReassemblyBuffer::new();
+        let order = [2, 0, 1];
+        let mut result = None;
+        for &i in &order {
+            if let ClientRequest::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            } = &chunks[i]
+            {
+                if let Some(r) = buf
+                    .receive_chunk(*stream_id, *index, *total, data.clone())
+                    .unwrap()
+                {
+                    result = Some(r);
+                }
+            }
+        }
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    #[test]
+    fn server_reassembly_interleaved_streams() {
+        let payload_a = vec![0xAA; CHUNK_SIZE * 2];
+        let payload_b = vec![0xBB; CHUNK_SIZE * 3];
+        let chunks_a = chunk_request(payload_a.clone(), 1);
+        let chunks_b = chunk_request(payload_b.clone(), 2);
+
+        let mut buf = ReassemblyBuffer::new();
+        let mut result_a = None;
+        let mut result_b = None;
+
+        // Interleave: A[0], B[0], B[1], A[1], B[2]
+        let interleaved = [
+            &chunks_a[0],
+            &chunks_b[0],
+            &chunks_b[1],
+            &chunks_a[1],
+            &chunks_b[2],
+        ];
+        for chunk in interleaved {
+            if let ClientRequest::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            } = chunk
+            {
+                if let Some(r) = buf
+                    .receive_chunk(*stream_id, *index, *total, data.clone())
+                    .unwrap()
+                {
+                    match *stream_id {
+                        1 => result_a = Some(r),
+                        _ => result_b = Some(r),
+                    }
+                }
+            }
+        }
+        assert_eq!(result_a.unwrap(), payload_a);
+        assert_eq!(result_b.unwrap(), payload_b);
+    }
+
+    // --- Test 5: ReassemblyBuffer bounds ---
+
+    #[test]
+    fn reassembly_rejects_too_many_concurrent_streams() {
+        use freenet_stdlib::client_api::streaming::{StreamError, MAX_CONCURRENT_STREAMS};
+
+        let mut buf = ReassemblyBuffer::new();
+        for i in 0..MAX_CONCURRENT_STREAMS as u32 {
+            buf.receive_chunk(i, 0, 2, bytes::Bytes::from_static(&[0xAA]))
+                .expect("within limit");
+        }
+        let err = buf
+            .receive_chunk(
+                MAX_CONCURRENT_STREAMS as u32,
+                0,
+                2,
+                bytes::Bytes::from_static(&[0xBB]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StreamError::TooManyConcurrentStreams { .. }));
+    }
+
+    #[test]
+    fn reassembly_rejects_oversized_total_chunks() {
+        use freenet_stdlib::client_api::streaming::{StreamError, MAX_TOTAL_CHUNKS};
+
+        let mut buf = ReassemblyBuffer::new();
+        let err = buf
+            .receive_chunk(
+                1,
+                0,
+                MAX_TOTAL_CHUNKS + 1,
+                bytes::Bytes::from_static(&[0xCC]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StreamError::TotalChunksTooLarge { .. }));
+    }
+
+    #[test]
+    fn reassembly_rejects_duplicate_chunk() {
+        use freenet_stdlib::client_api::streaming::StreamError;
+
+        let mut buf = ReassemblyBuffer::new();
+        buf.receive_chunk(1, 0, 3, bytes::Bytes::from_static(&[0xDD]))
+            .unwrap();
+        let err = buf
+            .receive_chunk(1, 0, 3, bytes::Bytes::from_static(&[0xEE]))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StreamError::DuplicateChunk {
+                stream_id: 1,
+                index: 0
+            }
+        ));
+    }
+
+    // --- Bonus: StreamHeader and stream_id behavior ---
+
+    #[test]
+    fn native_sends_stream_header_before_chunks() {
+        let payload = vec![0xEE; CHUNK_THRESHOLD + 100];
+        let payload_len = payload.len();
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        let content = freenet_stdlib::client_api::StreamContent::Raw;
+
+        let messages = prepare_response_messages(payload, &mut conn, Some(content)).unwrap();
+        assert!(messages.len() >= 2);
+
+        let first: Result<HostResponse, ClientError> = bincode::deserialize(&messages[0]).unwrap();
+        match first {
+            Ok(HostResponse::StreamHeader {
+                stream_id,
+                total_bytes,
+                ..
+            }) => {
+                assert_eq!(stream_id, 0);
+                assert_eq!(total_bytes, payload_len as u64);
+            }
+            other => panic!("expected StreamHeader, got: {other:?}"),
+        }
+
+        for msg in &messages[1..] {
+            let resp: Result<HostResponse, ClientError> = bincode::deserialize(msg).unwrap();
+            assert!(matches!(resp, Ok(HostResponse::StreamChunk { .. })));
+        }
+    }
+
+    #[test]
+    fn stream_id_advances_only_for_chunked_sends() {
+        let large = vec![0xFF; CHUNK_THRESHOLD + 1];
+        let small = vec![0x00; 100];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+
+        assert_eq!(conn.next_stream_id, 0);
+        prepare_response_messages(large.clone(), &mut conn, None).unwrap();
+        assert_eq!(conn.next_stream_id, 1);
+        prepare_response_messages(large, &mut conn, None).unwrap();
+        assert_eq!(conn.next_stream_id, 2);
+        prepare_response_messages(small, &mut conn, None).unwrap();
+        assert_eq!(
+            conn.next_stream_id, 2,
+            "non-chunked must not advance stream_id"
+        );
     }
 }

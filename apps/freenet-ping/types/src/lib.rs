@@ -86,13 +86,15 @@ impl Ping {
         }
     }
 
-    pub fn merge(&mut self, other: Self, ttl: Duration) -> HashMap<String, Vec<DateTime<Utc>>> {
+    pub fn merge(&mut self, mut other: Self, ttl: Duration) -> HashMap<String, Vec<DateTime<Utc>>> {
         // Preserve the larger padding
-        if let Some(other_padding) = &other.padding {
-            match &self.padding {
-                Some(existing) if existing.len() >= other_padding.len() => {}
-                _ => self.padding = Some(other_padding.clone()),
-            }
+        let replace_padding = match (&self.padding, &other.padding) {
+            (Some(existing), Some(other_p)) => existing.len() < other_p.len(),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if replace_padding {
+            self.padding = other.padding.take();
         }
 
         #[cfg(feature = "std")]
