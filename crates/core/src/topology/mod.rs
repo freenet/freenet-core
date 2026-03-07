@@ -21,7 +21,7 @@
 //! - At/above `min_connections`, resource usage < 50% → add connections
 //! - At/above `min_connections`, resource usage > 90% → remove connections
 //! - Above `max_connections` → remove connections
-//! - At steady state (no add/remove) → consider topology swap (probability-gated)
+//! - Whenever not removing and not resource-constrained → consider topology swap
 //!
 //! ## Topology Swaps
 //!
@@ -377,9 +377,10 @@ impl TopologyManager {
 
         let (resource_type, usage_proportion) = self.calculate_usage_proportion(at_time);
 
-        // Track whether we're in the steady-state band (50-90% resource usage)
-        // where topology swaps are appropriate.
-        let mut in_steady_state = false;
+        // Track whether we should suppress topology swaps. Swaps should NOT
+        // fire when resource usage is high and we're pinned at min_connections
+        // (Codex review catch: don't churn connections under load).
+        let mut suppress_swap = false;
 
         let adjustment: anyhow::Result<TopologyAdjustment> =
             if current_connections > self.limits.max_connections {
@@ -406,6 +407,7 @@ impl TopologyManager {
                         min_connections = self.limits.min_connections,
                         "Resource usage high but at min_connections — not removing"
                     );
+                    suppress_swap = true;
                     Ok(TopologyAdjustment::NoChange)
                 } else {
                     debug!(
@@ -416,7 +418,6 @@ impl TopologyManager {
                     Ok(self.select_connections_to_remove(&resource_type, at_time))
                 }
             } else {
-                in_steady_state = true;
                 Ok(TopologyAdjustment::NoChange)
             };
 
@@ -446,11 +447,14 @@ impl TopologyManager {
 
         let adj = adjustment.unwrap_or(TopologyAdjustment::NoChange);
 
-        // Topology swap: at steady state (resource usage 50-90%, no add/remove needed),
-        // check whether replacing the least-routed connection would improve the
-        // Kleinberg distribution. Only fires in the steady-state band — not when
-        // resource usage is high but we're pinned at min_connections.
-        if in_steady_state && matches!(adj, TopologyAdjustment::NoChange) {
+        // Topology swap: when not removing connections and not under resource
+        // pressure at min_connections, check whether replacing the least-routed
+        // connection would improve the Kleinberg distribution. The swap's own
+        // min_connections guard (in maybe_swap_connection) prevents swaps during
+        // bootstrap. When the main logic returns AddConnections, the swap can
+        // override it — the node already has min_connections so the swap's
+        // topology improvement is more valuable than growing beyond min.
+        if !suppress_swap && !matches!(adj, TopologyAdjustment::RemoveConnections(_)) {
             let swap =
                 self.maybe_swap_connection(my_location, neighbor_locations, current_connections);
             if !matches!(swap, TopologyAdjustment::NoChange) {
