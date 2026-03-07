@@ -2066,14 +2066,11 @@ pub async fn run_local_node(
     mut executor: Executor,
     socket: WebsocketApiConfig,
 ) -> anyhow::Result<()> {
-    match socket.address {
-        IpAddr::V4(ip) if !ip.is_loopback() => {
-            anyhow::bail!("invalid ip: {ip}, expecting localhost")
-        }
-        IpAddr::V6(ip) if !ip.is_loopback() => {
-            anyhow::bail!("invalid ip: {ip}, expecting localhost")
-        }
-        IpAddr::V4(_) | IpAddr::V6(_) => {}
+    if !crate::server::is_private_ip(&socket.address) {
+        anyhow::bail!(
+            "invalid ip: {}, only loopback and private network addresses are allowed",
+            socket.address
+        )
     }
 
     let (mut gw, mut ws_proxy) = crate::server::serve_client_api_in(socket).await?;

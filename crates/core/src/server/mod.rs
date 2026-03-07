@@ -12,7 +12,7 @@ pub(crate) mod errors;
 mod home_page;
 pub(crate) mod path_handlers;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -24,6 +24,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 
+use axum::response::IntoResponse;
 use client_api::HttpClientApi;
 use tower_http::trace::TraceLayer;
 
@@ -155,16 +156,37 @@ async fn serve_with_listener(
     };
     tracing::info!("HTTP client API listening on {}", socket);
     GlobalExecutor::spawn(async move {
-        axum::serve(listener, router).await.map_err(|e| {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|e| {
             tracing::error!("Error while running HTTP client API server: {e}");
         })
     });
     Ok(())
 }
 
+/// Returns `true` if the IP is a private/local address (loopback, LAN, link-local, or unspecified).
+pub fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()        // 127.0.0.0/8
+            || v4.is_private()      // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_link_local()   // 169.254.0.0/16
+            || v4.is_unspecified() // 0.0.0.0 (bind address)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()        // ::1
+            || v6.is_unspecified() // :: (bind address)
+        }
+    }
+}
+
 pub mod local_node {
     use freenet_stdlib::client_api::{ClientRequest, ErrorKind};
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::SocketAddr;
     use tower_http::trace::TraceLayer;
 
     use crate::{
@@ -175,14 +197,11 @@ pub mod local_node {
     use super::{client_api::HttpClientApi, serve};
 
     pub async fn run_local_node(mut executor: Executor, socket: SocketAddr) -> anyhow::Result<()> {
-        match socket.ip() {
-            IpAddr::V4(ip) if !ip.is_loopback() => {
-                anyhow::bail!("invalid ip: {ip}, expecting localhost")
-            }
-            IpAddr::V6(ip) if !ip.is_loopback() => {
-                anyhow::bail!("invalid ip: {ip}, expecting localhost")
-            }
-            IpAddr::V4(_) | IpAddr::V6(_) => {}
+        if !super::is_private_ip(&socket.ip()) {
+            anyhow::bail!(
+                "invalid ip: {}, only loopback and private network addresses are allowed",
+                socket.ip()
+            )
         }
         let (mut gw, gw_router) = HttpClientApi::as_router(&socket);
         let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
@@ -355,13 +374,39 @@ async fn serve_client_api_in_impl(
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
 
-    serve_with_listener(
-        ws_socket,
-        ws_router.layer(TraceLayer::new_for_http()),
-        pre_bound,
-    )
-    .await?;
+    // When bound to a non-loopback address, reject connections from non-private IPs
+    // to prevent exposure beyond the local network.
+    let needs_ip_filter = !config.address.is_loopback();
+    let router = if needs_ip_filter {
+        ws_router
+            .layer(axum::middleware::from_fn(private_network_filter))
+            .layer(TraceLayer::new_for_http())
+    } else {
+        ws_router.layer(TraceLayer::new_for_http())
+    };
+
+    serve_with_listener(ws_socket, router, pre_bound).await?;
     Ok((gw, ws_proxy))
+}
+
+/// Middleware that rejects requests from non-private IP addresses.
+async fn private_network_filter(
+    connect_info: axum::extract::ConnectInfo<SocketAddr>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !is_private_ip(&connect_info.0.ip()) {
+        tracing::warn!(
+            remote_ip = %connect_info.0.ip(),
+            "Rejected connection from non-private IP"
+        );
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "Only local network connections are allowed",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Spawns a background task that periodically removes expired authentication tokens.

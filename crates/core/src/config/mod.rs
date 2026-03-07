@@ -602,20 +602,10 @@ impl ConfigArgs {
             },
             ws_api: WebsocketApiConfig {
                 address: {
-                    let addr = self.ws_api.address.unwrap_or_else(|| match mode {
+                    self.ws_api.address.unwrap_or_else(|| match mode {
                         OperationMode::Local => default_local_address(),
                         OperationMode::Network => default_listening_address(),
-                    });
-                    // In local mode, 0.0.0.0 is normalized to localhost
-                    match (mode, addr) {
-                        (OperationMode::Local, IpAddr::V4(ip)) if ip == Ipv4Addr::UNSPECIFIED => {
-                            default_local_address()
-                        }
-                        (OperationMode::Local, IpAddr::V6(ip)) if ip.is_unspecified() => {
-                            default_local_address()
-                        }
-                        _ => addr,
-                    }
+                    })
                 },
                 port: self.ws_api.ws_api_port.unwrap_or(default_ws_api_port()),
                 token_ttl_seconds: self
