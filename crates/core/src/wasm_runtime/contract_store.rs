@@ -2,7 +2,7 @@ use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
-use stretto::Cache;
+use moka::sync::Cache as MokaCache;
 
 use crate::contract::storages::Storage;
 
@@ -11,7 +11,7 @@ use super::RuntimeResult;
 /// Handle contract blob storage on the file system.
 pub struct ContractStore {
     contracts_dir: PathBuf,
-    contract_cache: Cache<CodeHash, Arc<ContractCode<'static>>>,
+    contract_cache: MokaCache<CodeHash, Arc<ContractCode<'static>>>,
     /// In-memory index: ContractInstanceId -> CodeHash
     /// This is populated from ReDb on startup and kept in sync
     key_to_code_part: Arc<DashMap<ContractInstanceId, CodeHash>>,
@@ -27,8 +27,6 @@ impl ContractStore {
     /// - max_size: max size in bytes of the contracts being cached
     /// - db: ReDb storage for persistent index
     pub fn new(contracts_dir: PathBuf, max_size: i64, db: Storage) -> RuntimeResult<Self> {
-        const ERR: &str = "failed to build mem cache";
-
         std::fs::create_dir_all(&contracts_dir).map_err(|err| {
             tracing::error!("error creating contract dir: {err}");
             err
@@ -52,7 +50,14 @@ impl ContractStore {
         }
 
         Ok(Self {
-            contract_cache: Cache::new(100, max_size).expect(ERR),
+            contract_cache: MokaCache::builder()
+                .max_capacity(max_size as u64)
+                .weigher(
+                    |_key: &CodeHash, value: &Arc<ContractCode<'static>>| -> u32 {
+                        value.data().len() as u32
+                    },
+                )
+                .build(),
             contracts_dir,
             key_to_code_part,
             db,
@@ -69,7 +74,7 @@ impl ContractStore {
         let code_hash = key.code_hash();
         if let Some(data) = self.contract_cache.get(code_hash) {
             return Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-                WrappedContract::new(data.value().clone(), params.clone().into_owned()),
+                WrappedContract::new(data, params.clone().into_owned()),
             )));
         }
 
@@ -88,9 +93,8 @@ impl ContractStore {
                 .ok()?;
             let params = params.clone().into_owned();
             // add back the contract part to the mem store
-            let size = code.data().len() as i64;
             self.contract_cache
-                .insert(code_hash, Arc::new(code.clone()), size);
+                .insert(code_hash, Arc::new(code.clone()));
             Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
                 WrappedContract::new(Arc::new(code), params),
             )))
@@ -119,15 +123,12 @@ impl ContractStore {
             // WASM file exists on disk. Add to cache AND ensure the index is updated.
             // See issue #2344 for why this is critical after crash recovery.
             self.ensure_key_indexed(&key)?;
-            let size = code.data().len() as i64;
-            self.contract_cache.insert(*code_hash, Arc::new(code), size);
+            self.contract_cache.insert(*code_hash, Arc::new(code));
             return Ok(());
         }
 
         // CRITICAL ORDER: Write disk first, then index, then cache.
-        // This ensures fetch_contract() can always fall back to disk lookup
-        // even if the cache insert is rejected by TinyLFU admission policy.
-        // See issue #2306 - stretto's cache.wait() doesn't guarantee visibility.
+        // This ensures fetch_contract() can always fall back to disk lookup.
 
         // Step 1: Save to disk first (ensures data is persisted)
         let version = APIVersion::from(contract);
@@ -146,14 +147,10 @@ impl ContractStore {
         // Step 3: Update in-memory index
         self.key_to_code_part.insert(*key.id(), *code_hash);
 
-        // Step 4: Insert into memory cache (best-effort, may be rejected by TinyLFU)
-        let size = code.data().len() as i64;
+        // Step 4: Insert into memory cache
         let data = code.data().to_vec();
         self.contract_cache
-            .insert(*code_hash, Arc::new(ContractCode::from(data)), size);
-        // Wait for cache to process the insert. Even if TinyLFU rejects it,
-        // the disk fallback above ensures the contract can still be fetched.
-        let _cache_result = self.contract_cache.wait();
+            .insert(*code_hash, Arc::new(ContractCode::from(data)));
 
         Ok(())
     }

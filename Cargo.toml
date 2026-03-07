@@ -57,7 +57,7 @@ dashmap = "6.1"
 lru = "0.16.3"
 redb = "3"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
-stretto = { version = "0.8", features = ["async", "sync"] }
+moka = { version = "0.12", features = ["sync", "future"] }
 
 # File I/O
 directories = "6"
