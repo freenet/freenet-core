@@ -1748,7 +1748,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ws_streaming_large_payload() -> anyhow::Result<()> {
-    use common::{connect_ws_with_retry_streaming, deploy_contract, get_contract_state};
+    use common::{connect_ws_with_retry_streaming, get_contract_state, load_contract};
 
     // Allocate unique IPs to avoid conflicts with parallel tests
     let base_node_idx = allocate_test_node_block(2);
@@ -1865,18 +1865,46 @@ async fn test_ws_streaming_large_payload() -> anyhow::Result<()> {
             serialized_size
         );
 
-        // Configure contract options
-        let options = PingContractOptions {
+        // Load and compile the contract (same pattern as other working tests)
+        let path_to_code = PathBuf::from(PACKAGE_DIR).join(PATH_TO_CONTRACT);
+        println!("Loading contract code: {}", path_to_code.display());
+
+        let temp_options = PingContractOptions {
             ttl: Duration::from_secs(300),
             frequency: Duration::from_secs(1),
             tag: APP_TAG.to_string(),
             code_key: String::new(),
         };
+        let temp_params = Parameters::from(serde_json::to_vec(&temp_options).unwrap());
+        let container = load_contract(&path_to_code, temp_params)?;
+
+        // Get the actual code hash and create proper options
+        let code_hash = CodeHash::from_code(container.data());
+        let options = PingContractOptions {
+            ttl: Duration::from_secs(300),
+            frequency: Duration::from_secs(1),
+            tag: APP_TAG.to_string(),
+            code_key: code_hash.to_string(),
+        };
+        let params = Parameters::from(serde_json::to_vec(&options).unwrap());
+        let container = load_contract(&path_to_code, params)?;
+        let contract_key = container.key();
 
         // Deploy the contract with the large initial state via the gateway
         println!("Deploying contract with large state via gateway...");
-        let contract_key = deploy_contract(&mut client_gw, large_ping.clone(), &options, false)
+        let wrapped_state = WrappedState::new(serde_json::to_vec(&large_ping)?);
+        client_gw
+            .send(ClientRequest::ContractOp(ContractRequest::Put {
+                contract: container,
+                state: wrapped_state,
+                related_contracts: RelatedContracts::new(),
+                subscribe: false,
+                blocking_subscribe: false,
+            }))
             .await?;
+        let contract_key = wait_for_put_response(&mut client_gw, &contract_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to deploy contract: {}", e))?;
         println!("Contract deployed successfully: {contract_key}");
 
         // Wait for state to propagate through the network
