@@ -2422,6 +2422,23 @@ mod tests {
     }
 
     #[test]
+    fn is_client_initiated_true_when_no_upstream() {
+        let op = make_update_op(None, None);
+        assert!(op.is_client_initiated());
+    }
+
+    #[test]
+    fn is_client_initiated_false_when_forwarded() {
+        let op = UpdateOp {
+            id: Transaction::new::<UpdateMsg>(),
+            state: None,
+            stats: None,
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+        };
+        assert!(!op.is_client_initiated());
+    }
+
+    #[test]
     fn update_op_outcome_success_untimed_when_finalized_with_full_stats() {
         let target = PeerKeyLocation::random();
         let loc = Location::random();
