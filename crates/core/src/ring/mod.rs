@@ -2222,7 +2222,10 @@ impl Ring {
                     add_location,
                 } => {
                     // Drop the least-useful connection, then queue the gap target
-                    // for acquisition.
+                    // for acquisition. Note: this is not atomic — the drop happens
+                    // immediately but the new connection may fail to establish.
+                    // This is acceptable: the node temporarily has one fewer
+                    // connection, which the normal topology maintenance will fill.
                     if let Some(addr) = remove.socket_addr() {
                         tracing::info!(
                             remove_peer = %remove,

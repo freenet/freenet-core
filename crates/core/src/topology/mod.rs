@@ -614,12 +614,20 @@ impl TopologyManager {
             .map(|nloc| my_loc.distance(*nloc).as_f64())
             .collect();
 
-        let largest_gap = small_world_rand::largest_gap_size(distances.iter().copied());
+        let (largest_gap, point_count) =
+            small_world_rand::largest_gap_size(distances.iter().copied());
+
+        if point_count == 0 {
+            return TopologyAdjustment::NoChange;
+        }
 
         // Expected largest gap for k uniform points on [0,1]: ~ln(k)/k.
-        // Use the actual number of distinct distances in the gap analysis,
-        // not the total connection count, since BTreeMap keys are deduplicated.
-        let k = distances.len() as f64;
+        // point_count is the number of distinct in-range distances from the
+        // gap analysis, which filters to [D_MIN, D_MAX] and deduplicates.
+        // Note: when k=1, ln(1)/1 = 0, so excess → inf → clamp(1.0), meaning
+        // a single in-range connection always triggers a swap at max probability.
+        // This is intentional: with one connection the gap is ~0.5 (genuinely large).
+        let k = point_count as f64;
         let expected_gap = k.ln() / k;
 
         // Swap probability proportional to how much the gap exceeds expected.
