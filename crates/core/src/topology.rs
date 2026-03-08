@@ -753,7 +753,9 @@ impl TopologyManager {
         }
 
         // Collect raw routing values for normalization.
-        // Includes peer count at each location for collocated-peer handling.
+        // Note: uses raw request count (not requests/bandwidth like the removal path)
+        // because swap decisions care about routing utility, not bandwidth cost.
+        // Both paths normalize to [0,1] so the ranking within each is correct.
         let peers_with_routing: Vec<_> = neighbor_locations
             .iter()
             .flat_map(|(loc, conns)| {
@@ -1966,9 +1968,8 @@ mod tests {
                     "Should not prune topology-critical peer (isolated at long distance)"
                 );
             }
-            _ => {
-                // NoChange or AddConnections are also acceptable —
-                // the key assertion is that the isolated peer is NOT removed
+            other => {
+                panic!("Expected RemoveConnections under resource pressure, got {other:?}");
             }
         }
     }
