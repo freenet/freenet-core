@@ -290,9 +290,26 @@ async fn client_fn(
                         }
                         break;
                     }
-                    Err(err) => {
-                        tracing::error!("Unhandled client error: {err}");
+                    Err(err) if matches!(
+                        err.kind(),
+                        ErrorKind::Shutdown | ErrorKind::TransportProtocolDisconnect
+                    ) => {
+                        // Fatal errors: the node is shutting down or the transport is dead.
+                        tracing::warn!("Fatal client error, shutting down client slot: {err}");
+                        if let Err(e) = tx_host.send(Err(err)).await {
+                            tracing::debug!(error = %e, "failed to notify host of fatal error");
+                        }
                         break;
+                    }
+                    Err(err) => {
+                        // Transient per-connection errors (NodeUnavailable, UnknownClient,
+                        // DeserializationError, etc.) should NOT kill the entire client slot.
+                        // Forward to host for logging and continue accepting connections.
+                        tracing::warn!("Transient client error (continuing): {err}");
+                        if tx_host.send(Err(err)).await.is_err() {
+                            // Host channel closed — we should exit
+                            break;
+                        }
                     }
                 }
             }
@@ -584,5 +601,102 @@ mod test {
             let result = combinator.send(*cli_id, Ok(HostResponse::Ok)).await;
             assert!(result.is_ok(), "send should not fail for client {cli_id}");
         }
+    }
+
+    /// A proxy that returns a configurable error on first recv(), then works normally.
+    struct ErrorThenOkProxy {
+        error_sent: bool,
+        error_kind: ErrorKind,
+        rx: Receiver<usize>,
+        tx: Sender<usize>,
+        id: usize,
+    }
+
+    impl ErrorThenOkProxy {
+        fn new(id: usize, error_kind: ErrorKind, rx: Receiver<usize>, tx: Sender<usize>) -> Self {
+            Self {
+                error_sent: false,
+                error_kind,
+                rx,
+                tx,
+                id,
+            }
+        }
+    }
+
+    impl ClientEventsProxy for ErrorThenOkProxy {
+        fn recv(&mut self) -> BoxFuture<'_, crate::client_events::HostIncomingMsg> {
+            Box::pin(async {
+                if !self.error_sent {
+                    self.error_sent = true;
+                    return Err(self.error_kind.clone().into());
+                }
+                let id = self
+                    .rx
+                    .recv()
+                    .await
+                    .ok_or_else::<ClientError, _>(|| ErrorKind::ChannelClosed.into())?;
+                assert_eq!(id, self.id);
+                Ok(OpenRequest::new(
+                    ClientId::next(),
+                    Box::new(ClientRequest::Disconnect { cause: None }),
+                ))
+            })
+        }
+
+        fn send(
+            &mut self,
+            _id: ClientId,
+            _response: Result<HostResponse, ClientError>,
+        ) -> BoxFuture<'_, Result<(), ClientError>> {
+            async {
+                self.tx
+                    .send(self.id)
+                    .await
+                    .map_err(|_| ErrorKind::ChannelClosed.into())
+            }
+            .boxed()
+        }
+    }
+
+    /// Regression test for #3479: a transient error (NodeUnavailable) from client.recv()
+    /// should NOT permanently kill the client slot. The error should be forwarded to the
+    /// host and the proxy should continue accepting connections.
+    #[tokio::test]
+    async fn test_transient_error_does_not_kill_client_slot() {
+        let (tx_trigger, rx_trigger) = channel(1);
+        let (tx_response, _rx_response) = channel(1);
+
+        let proxy = Box::new(ErrorThenOkProxy::new(
+            0,
+            ErrorKind::NodeUnavailable,
+            rx_trigger,
+            tx_response,
+        )) as BoxedClient;
+
+        // Use a 1-element combinator for simplicity
+        let mut combinator = ClientEventsCombinator::new([proxy]);
+
+        // First recv should get the forwarded NodeUnavailable error (not hang forever)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv())
+            .await
+            .expect("recv timed out — client_fn died on transient error");
+        match result {
+            Err(e) => assert!(
+                matches!(e.kind(), ErrorKind::NodeUnavailable),
+                "error should be NodeUnavailable, got: {e}"
+            ),
+            Ok(_) => panic!("should receive the transient error, got Ok"),
+        }
+
+        // Now send a valid request through the proxy — it should still work
+        tx_trigger.send(0).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv())
+            .await
+            .expect("recv timed out — client slot is dead after transient error");
+        assert!(
+            result.is_ok(),
+            "proxy should still be alive after transient error"
+        );
     }
 }
