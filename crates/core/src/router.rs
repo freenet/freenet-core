@@ -1292,7 +1292,7 @@ mod tests {
         let target_peer = PeerKeyLocation::random();
         let contract_location = Location::random();
 
-        // Simulate what node/mod.rs:580-587 does when OpOutcome::ContractOpSuccessUntimed
+        // Simulate what node.rs:580-587 does when OpOutcome::ContractOpSuccessUntimed
         // is returned from subscribe's outcome() (post-fix: stats are preserved)
         let route_event = RouteEvent {
             peer: target_peer.clone(),

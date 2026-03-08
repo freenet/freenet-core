@@ -796,7 +796,7 @@ mod ordering_invariant_tests {
     /// the invariant, this test name will remind them of its importance.
     #[test]
     fn push_before_send_invariant_is_documented() {
-        // The invariant is documented at operations/mod.rs lines 178-182:
+        // The invariant is documented at operations.rs lines 178-182:
         //
         // ```rust
         // // IMPORTANT: Push state BEFORE sending message to avoid race condition.

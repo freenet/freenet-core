@@ -73,7 +73,7 @@ pub trait Operation: Sized {
 }
 ```
 
-**Code reference:** `crates/core/src/operations/mod.rs:32-56`
+**Code reference:** `crates/core/src/operations.rs:32-56`
 
 ## Operation Types
 
@@ -440,7 +440,7 @@ sequenceDiagram
 
 | File | Purpose |
 |------|---------|
-| `operations/mod.rs` | Core traits and orchestration |
+| `operations.rs` | Core traits and orchestration |
 | `operations/connect.rs` | CONNECT state machine |
 | `operations/get.rs` | GET state machine |
 | `operations/put.rs` | PUT state machine |

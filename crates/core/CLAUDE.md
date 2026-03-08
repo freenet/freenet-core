@@ -11,7 +11,7 @@ Does this code need current time?
 
 Does this code need randomness?
   → DO NOT use: rand::random(), rand::thread_rng()
-  → USE: GlobalRng from src/config/mod.rs
+  → USE: GlobalRng from src/config.rs
 
 Is this network code for tests?
   → DO NOT use: tokio::net::UdpSocket
@@ -28,7 +28,7 @@ Is it a unit test?
   → Use mocks: MockNetworkBridge, MockRing
 
 Need deterministic results?
-  → Use GlobalRng seeding (see src/config/mod.rs)
+  → Use GlobalRng seeding (see src/config.rs)
 ```
 
 ### WHEN modifying transport/
@@ -57,11 +57,11 @@ Each file is a state machine:
 | Module | Entry Point | What It Does |
 |--------|-------------|--------------|
 | `node/` | `node.rs` | Event loop (start here for data flow) |
-| `operations/` | `mod.rs` | Transaction state machines |
+| `operations/` | `operations.rs` | Transaction state machines |
 | `contract/` | `handler.rs` | WASM execution |
 | `transport/` | `connection_handler.rs` | Networking layer |
-| `ring/` | `mod.rs` | DHT routing |
-| `server/` | `mod.rs` | Client API |
+| `ring/` | `ring.rs` | DHT routing |
+| `server/` | `server.rs` | Client API |
 | `simulation/` | `time.rs`, `rng.rs` | DST abstractions |
 
 ## Commands

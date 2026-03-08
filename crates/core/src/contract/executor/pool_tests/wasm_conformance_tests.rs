@@ -25,7 +25,7 @@
 //!
 //! Requires `wasmtime-backend` feature and `wasm32-unknown-unknown` target to
 //! compile the test contract. The feature gate is on the `mod` declaration in
-//! `pool_tests/mod.rs`.
+//! `pool_tests.rs`.
 
 use freenet_stdlib::prelude::*;
 

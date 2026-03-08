@@ -83,7 +83,7 @@ CORRECT:
 WHY: Backing off a target for a local problem prevents connecting to it
 later when local conditions improve (e.g., more connections acquired).
 
-See: ring/mod.rs connection_maintenance, issue #3414
+See: ring.rs connection_maintenance, issue #3414
 ```
 
 ### Routing Decisions
@@ -267,4 +267,4 @@ See: operations/connect.rs initial_join_procedure, issue #3414
 - Architecture: `docs/architecture/ring/README.md`
 - Location: `crates/core/src/ring/location.rs`
 - ConnectionManager: `crates/core/src/ring/connection_manager.rs`
-- Router: `crates/core/src/router/mod.rs`
+- Router: `crates/core/src/router.rs`

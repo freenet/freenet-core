@@ -90,7 +90,7 @@ pub fn prepared_send(self) -> Box<[u8]> {
 
 | File | Change |
 |------|--------|
-| `mod.rs` | `MessagePayload = bytes::Bytes` (was `Vec<u8>`) |
+| `transport.rs` | `MessagePayload = bytes::Bytes` (was `Vec<u8>`) |
 | `outbound_stream.rs` | `SerializedStream = Bytes`, zero-copy fragmentation |
 | `inbound_stream.rs` | Updated to handle `Bytes` fragments |
 | `symmetric_message.rs` | Updated payload types and tests |

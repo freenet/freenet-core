@@ -118,7 +118,7 @@ When LEDBAT++ detects congestion or timeout, it reduces cwnd (congestion window)
 
 **Reference:**
 - Issue #2578 - Timeout storms on high-latency paths
-- Code: `crates/core/src/config/mod.rs:805-824`
+- Code: `crates/core/src/config.rs:805-824`
 - Related: `crates/core/src/transport/ledbat/controller.rs` (ssthresh calculation)
 
 ---
@@ -155,7 +155,7 @@ bbr-startup-rate = 10000000  # 10 MB/s for moderate startup
 **Note:** This parameter only affects connections using BBR algorithm, not LEDBAT++ (the default).
 
 **Reference:**
-- Code: `crates/core/src/config/mod.rs:838-846`
+- Code: `crates/core/src/config.rs:838-846`
 - Related: `crates/core/src/transport/bbr/` (BBR implementation)
 
 ---
@@ -382,7 +382,7 @@ This happens when `min × connections > total`. Either:
 - **GlobalBandwidthManager**: `crates/core/src/transport/global_bandwidth.rs`
 - **TokenBucket**: `crates/core/src/transport/token_bucket.rs`
 - **LEDBAT**: `crates/core/src/transport/ledbat.rs`
-- **Configuration**: `crates/core/src/config/mod.rs`
+- **Configuration**: `crates/core/src/config.rs`
 
 ## References
 

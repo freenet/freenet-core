@@ -553,7 +553,7 @@ async fn report_result(
                     );
                 } else if op_res.is_subscription_renewal() {
                     // Subscription renewals are node-internal operations spawned by the
-                    // renewal manager (ring/mod.rs). No client registered a transaction
+                    // renewal manager (ring.rs). No client registered a transaction
                     // for these, so sending to the session actor would just produce
                     // "registered transactions: 0" noise. See #2891.
                     tracing::debug!(

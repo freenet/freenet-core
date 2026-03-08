@@ -551,7 +551,7 @@ In production (not tests), JSON logging works properly:
     "test_node": "gateway",
     "peer": "PeerId(abc123...)"
   },
-  "file": "src/node/mod.rs",
+  "file": "src/node.rs",
   "line": 123
 }
 ```

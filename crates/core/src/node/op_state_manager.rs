@@ -2348,7 +2348,7 @@ mod tests {
     /// (Ring construction is complex; individual components are unit-tested separately:
     ///  - PutOp::failure_routing_info() tested in operations/put.rs
     ///  - report_timeout_failure() calls ring.routing_finished() which calls Router::add_event()
-    ///  - Router::add_event() tested in router/mod.rs)
+    ///  - Router::add_event() tested in router.rs)
     #[test]
     fn remove_put_returns_false_for_missing_tx() {
         let ops = Ops::default();

@@ -876,7 +876,7 @@ pub mod test {
     /// break the channel.
     ///
     /// This tests that the channel infrastructure supports the fix in
-    /// contract/mod.rs where we changed `send_to_sender()?` to non-propagating
+    /// contract.rs where we changed `send_to_sender()?` to non-propagating
     /// error handling, so the handler loop can continue even when a response
     /// can't be delivered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
