@@ -943,17 +943,18 @@ async fn register_downstream_subscriber(
             .ring
             .add_downstream_subscriber(key, peer_key.clone())
         {
-            op_manager
+            let is_new_peer = op_manager
                 .interest_manager
                 .register_peer_interest(key, peer_key, None, false);
-            // Track downstream subscriber count in local_interests so
-            // has_local_interest() returns true on relay nodes. Without this,
-            // relay nodes reject ChangeInterests messages from peers
-            // (gate at node/mod.rs), breaking interest-based broadcast targeting.
-            let became_interested = op_manager.interest_manager.add_downstream_subscriber(key);
-            if became_interested {
-                // Broadcast that we're now interested in this contract
-                super::broadcast_change_interests(op_manager, vec![*key], vec![]).await;
+            // Only increment downstream count for genuinely new peers, not
+            // renewals. add_downstream_subscriber (hosting) returns true for
+            // both new and renewed peers, so use register_peer_interest's
+            // is_new return to avoid over-counting on renewal cycles.
+            if is_new_peer {
+                let became_interested = op_manager.interest_manager.add_downstream_subscriber(key);
+                if became_interested {
+                    super::broadcast_change_interests(op_manager, vec![*key], vec![]).await;
+                }
             }
         } else {
             tracing::warn!(
@@ -1776,17 +1777,25 @@ impl Operation for SubscribeOp {
                     // Look up the full ContractKey from storage
                     if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
                         if let Some(peer) = &sender_peer {
-                            op_manager.ring.remove_downstream_subscriber(&key, peer);
-                            op_manager.interest_manager.remove_peer_interest(&key, peer);
-                            // Mirror the add_downstream_subscriber call in
-                            // register_downstream_subscriber — decrement the
-                            // downstream count so has_local_interest() reflects reality.
-                            let lost_interest = op_manager
-                                .interest_manager
-                                .remove_downstream_subscriber(&key);
-                            if lost_interest {
-                                super::broadcast_change_interests(op_manager, vec![], vec![key])
+                            let was_downstream =
+                                op_manager.ring.remove_downstream_subscriber(&key, peer);
+                            let was_interested =
+                                op_manager.interest_manager.remove_peer_interest(&key, peer);
+                            // Only decrement downstream count if the peer was
+                            // actually tracked, to stay in sync with the
+                            // increment in register_downstream_subscriber.
+                            if was_downstream || was_interested {
+                                let lost_interest = op_manager
+                                    .interest_manager
+                                    .remove_downstream_subscriber(&key);
+                                if lost_interest {
+                                    super::broadcast_change_interests(
+                                        op_manager,
+                                        vec![],
+                                        vec![key],
+                                    )
                                     .await;
+                                }
                             }
                         } else {
                             tracing::warn!(
