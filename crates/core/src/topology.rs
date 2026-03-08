@@ -700,7 +700,7 @@ impl TopologyManager {
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
         current_connections: usize,
     ) -> TopologyAdjustment {
-        if current_connections < self.limits.min_connections {
+        if current_connections <= self.limits.min_connections {
             return TopologyAdjustment::NoChange;
         }
 
@@ -723,9 +723,6 @@ impl TopologyManager {
         // Expected largest gap for k uniform points on [0,1]: ~ln(k)/k.
         // point_count is the number of distinct in-range distances from the
         // gap analysis, which filters to [D_MIN, D_MAX] and deduplicates.
-        // Note: when k=1, ln(1)/1 = 0, so excess → inf → clamp(1.0), meaning
-        // a single in-range connection always triggers a swap at max probability.
-        // This is intentional: with one connection the gap is ~0.5 (genuinely large).
         let k = point_count as f64;
         let expected_gap = k.ln() / k;
 
@@ -1787,10 +1784,12 @@ mod tests {
         }
 
         // Test maybe_swap_connection directly (bypasses resource meter).
+        // Pass current_connections > min_connections (11 > 10) because swaps are
+        // disabled at exactly min_connections to avoid dropping below the minimum.
         let mut swap_count = 0;
         let trials = 100;
         for _ in 0..trials {
-            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 10);
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 11);
             if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
                 swap_count += 1;
             }
@@ -1836,10 +1835,11 @@ mod tests {
 
         // Test maybe_swap_connection directly — with well-distributed connections,
         // largest gap ≈ expected gap, so swap probability should be near zero.
+        // Pass current_connections > min_connections (11 > 10).
         let mut swap_count = 0;
         let trials = 100;
         for _ in 0..trials {
-            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 10);
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 11);
             if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
                 swap_count += 1;
             }
