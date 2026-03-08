@@ -441,7 +441,7 @@ impl TopologyManager {
             };
 
         // Enforce max-connections cap: if we're still over after the main logic,
-        // use fallback removal (drop the most distant peer).
+        // use fallback removal (drop the least topologically important peer).
         if current_connections > self.limits.max_connections {
             let mut adj = adjustment.unwrap_or(TopologyAdjustment::NoChange);
             if matches!(adj, TopologyAdjustment::NoChange) {
@@ -903,7 +903,7 @@ fn composite_score(
 ///
 /// Computes the removal gap for each peer and picks the one whose removal
 /// creates the smallest gap (least important topologically). Falls back to
-/// most distant if own location is unknown.
+/// an arbitrary peer if own location is unknown.
 fn select_fallback_peer_to_drop(
     neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     my_location: &Option<Location>,
