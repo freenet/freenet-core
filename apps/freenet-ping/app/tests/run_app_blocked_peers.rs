@@ -344,7 +344,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         // fails (subscribe.rs:705-716 - peer_key lookup can return None if the
         // peer isn't fully registered yet).
         let poll_interval = Duration::from_secs(5);
-        let max_polls: u32 = 24; // 120s total
+        let max_polls: u32 = 48; // 240s total (accommodates OPERATION_TTL=120s)
 
         for poll in 1..=max_polls {
             // Send an update from each node
