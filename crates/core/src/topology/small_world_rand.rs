@@ -241,6 +241,8 @@ pub(crate) fn kleinberg_score(
 /// in the Kleinberg distribution.
 ///
 /// Returns 0.0 if the peer distance is outside the valid range or not found.
+///
+/// This is O(N) where N is the number of distances.
 pub(crate) fn removal_gap(peer_distance: f64, all_distances: impl Iterator<Item = f64>) -> f64 {
     if peer_distance <= 0.0 || peer_distance > D_MAX {
         return 0.0;
@@ -248,28 +250,23 @@ pub(crate) fn removal_gap(peer_distance: f64, all_distances: impl Iterator<Item 
 
     let u_peer = to_log_unit(peer_distance);
 
-    // Collect all valid points in log-space, excluding the peer itself
-    let mut points: Vec<f64> = all_distances
-        .filter(|&d| d > D_MIN_TARGET && d <= D_MAX)
-        .map(to_log_unit)
-        .collect();
-    points.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    points.dedup();
-
-    // Find the neighbors of u_peer in the sorted list (including boundaries 0 and 1)
+    // Find the nearest neighbors below and above the peer in log-space,
+    // skipping the peer itself. Same approach as kleinberg_score but
+    // excludes the target point rather than including it.
     let mut below = 0.0_f64;
     let mut above = 1.0_f64;
 
-    for &p in &points {
+    for d in all_distances {
+        let u = to_log_unit(d);
         // Skip the peer itself (within floating point tolerance)
-        if (p - u_peer).abs() < 1e-12 {
+        if (u - u_peer).abs() < 1e-12 {
             continue;
         }
-        if p < u_peer && p > below {
-            below = p;
+        if u < u_peer && u > below {
+            below = u;
         }
-        if p > u_peer && p < above {
-            above = p;
+        if u > u_peer && u < above {
+            above = u;
         }
     }
 

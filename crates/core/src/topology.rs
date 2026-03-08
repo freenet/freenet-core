@@ -554,7 +554,6 @@ impl TopologyManager {
                 .collect(),
             None => Vec::new(),
         };
-        let num_connections = all_distances.len();
 
         let mut worst: Option<(PeerKeyLocation, f64)> = None;
 
@@ -587,59 +586,34 @@ impl TopologyManager {
 
                     let routing_value = request_count / source_usage.per_second();
 
-                    // Compute topology protection: how big a gap would removing
-                    // this peer create? Normalized so 1.0 = expected gap size.
                     // Look up the peer's ring location from neighbor_locations
                     // (authoritative) rather than from peer.location() (which
                     // may differ if the address-to-location mapping changed).
-                    let topology_value = if let Some(my_loc) = my_location {
-                        let peer_ring_loc = neighbor_locations
+                    let peer_distance = my_location.and_then(|my_loc| {
+                        neighbor_locations
                             .iter()
                             .find(|(_, conns)| conns.iter().any(|c| c.location == peer))
-                            .map(|(loc, _)| *loc);
-                        if let Some(peer_loc) = peer_ring_loc {
-                            let peer_dist = my_loc.distance(peer_loc).as_f64();
-                            if num_connections >= 3 {
-                                let gap = small_world_rand::removal_gap(
-                                    peer_dist,
-                                    all_distances.iter().copied(),
-                                );
-                                // Expected removal gap for k uniform points on a
-                                // circle is 2/k. Normalize so topology_value ≈ 1.0
-                                // for an averagely-positioned connection.
-                                let expected_gap = 2.0 / num_connections as f64;
-                                gap / expected_gap
-                            } else {
-                                1.0 // Too few connections to score topology
+                            .map(|(loc, _)| my_loc.distance(*loc).as_f64())
+                    });
+
+                    let effective_value = match peer_distance {
+                        Some(dist) => match composite_score(routing_value, dist, &all_distances) {
+                            Some(score) => score,
+                            None => {
+                                event!(Level::DEBUG, "Peer is topology-critical, skipping");
+                                continue;
                             }
-                        } else {
-                            1.0 // Peer not found in neighbors — can't score
-                        }
-                    } else {
-                        1.0 // No own location — can't compute topology
+                        },
+                        // No own location or peer not found — use routing value
+                        // with default topology (1.0)
+                        None => routing_value + TOPOLOGY_WEIGHT,
                     };
-
-                    // Guard: never prune a connection whose removal would create
-                    // a gap more than 2x the expected size.
-                    if topology_value > TOPOLOGY_PROTECTION_THRESHOLD {
-                        event!(
-                            Level::DEBUG,
-                            topology_value,
-                            "Peer is topology-critical, skipping"
-                        );
-                        continue;
-                    }
-
-                    // Composite score: higher = more valuable = less likely to prune.
-                    // We prune the peer with the LOWEST effective value.
-                    let effective_value = routing_value + TOPOLOGY_WEIGHT * topology_value;
 
                     event!(
                         Level::DEBUG,
                         request_count,
                         usage = source_usage.per_second(),
                         routing_value,
-                        topology_value,
                         effective_value,
                     );
 
@@ -740,21 +714,11 @@ impl TopologyManager {
             .flat_map(|(loc, conns)| conns.iter().map(move |conn| (loc, conn)))
             .filter_map(|(loc, conn)| {
                 let peer_dist = my_loc.distance(*loc).as_f64();
-                let gap = small_world_rand::removal_gap(peer_dist, distances.iter().copied());
-                let k = distances.len() as f64;
-                let expected_gap = if k >= 3.0 { 2.0 / k } else { 1.0 };
-                let topology_value = gap / expected_gap;
-
-                // Guard: don't swap out topology-critical connections
-                if topology_value > TOPOLOGY_PROTECTION_THRESHOLD {
-                    return None;
-                }
-
                 let routing_value = self
                     .outbound_request_counter
                     .get_request_count(&conn.location) as f64;
-                let effective_value = routing_value + TOPOLOGY_WEIGHT * topology_value;
-                Some((conn.location.clone(), effective_value))
+                let score = composite_score(routing_value, peer_dist, &distances)?;
+                Some((conn.location.clone(), score))
             })
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
             .map(|(peer, _)| peer);
@@ -816,6 +780,37 @@ fn bootstrap_target_locations(
         }
         None => (0..needed).map(|_| Location::random()).collect(),
     }
+}
+
+/// Compute the topology value for a peer at `peer_distance` given the full
+/// set of connection distances. Returns `None` if the peer is topology-critical
+/// (removal would create a gap > `TOPOLOGY_PROTECTION_THRESHOLD` times expected).
+///
+/// The topology value is the removal gap normalized by the expected gap (2/k),
+/// so a value of 1.0 means the peer is averagely positioned.
+fn topology_value(peer_distance: f64, all_distances: &[f64]) -> Option<f64> {
+    let k = all_distances.len();
+    if k < 3 {
+        // Too few connections to meaningfully score topology.
+        // Return 1.0 (average) and don't trigger the guard.
+        return Some(1.0);
+    }
+    let gap = small_world_rand::removal_gap(peer_distance, all_distances.iter().copied());
+    let expected_gap = 2.0 / k as f64;
+    let value = gap / expected_gap;
+    if value > TOPOLOGY_PROTECTION_THRESHOLD {
+        None // topology-critical
+    } else {
+        Some(value)
+    }
+}
+
+/// Compute the composite pruning score for a peer: lower = more likely to prune.
+///
+/// Returns `None` if the peer is topology-critical and should not be pruned.
+fn composite_score(routing_value: f64, peer_distance: f64, all_distances: &[f64]) -> Option<f64> {
+    let topo = topology_value(peer_distance, all_distances)?;
+    Some(routing_value + TOPOLOGY_WEIGHT * topo)
 }
 
 /// Select the least topologically important peer to drop as a fallback.
@@ -1690,7 +1685,7 @@ mod tests {
         // This creates a huge gap in the long-distance part of log-space,
         // which should trigger swaps.
         let my_location = Location::new(0.5);
-        let mut neighbor_locations = BTreeMap::new();
+        let mut neighbor_locations: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
         for i in 0..10 {
             // All within distance 0.02 of us — heavily clustered
             let offset = 0.01 + (i as f64 * 0.001);
@@ -1699,7 +1694,7 @@ mod tests {
             tm.outbound_request_counter.record_request(peer.clone());
             neighbor_locations
                 .entry(loc)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(Connection::new(peer));
         }
 
@@ -1738,7 +1733,7 @@ mod tests {
         // Create 10 peers evenly distributed in log-distance space.
         let my_location = Location::new(0.5);
         let d_at = |u: f64| 0.001_f64 * (0.5_f64 / 0.001).powf(u); // D_MIN_TARGET * (D_MAX/D_MIN_TARGET)^u
-        let mut neighbor_locations = BTreeMap::new();
+        let mut neighbor_locations: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
         for i in 0..10 {
             let u = (i as f64 + 0.5) / 10.0; // evenly spaced in [0, 1]
             let dist = d_at(u);
@@ -1747,7 +1742,7 @@ mod tests {
             tm.outbound_request_counter.record_request(peer.clone());
             neighbor_locations
                 .entry(loc)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(Connection::new(peer));
         }
 
@@ -1782,7 +1777,7 @@ mod tests {
         let mut tm = TopologyManager::new(limits);
 
         let my_location = Location::new(0.5);
-        let mut neighbor_locations = BTreeMap::new();
+        let mut neighbor_locations: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
 
         // Create 6 clustered peers. Give most of them high request counts
         // but one peer gets zero requests.
@@ -1803,7 +1798,7 @@ mod tests {
             }
             neighbor_locations
                 .entry(loc)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(Connection::new(peer));
         }
 
@@ -1838,13 +1833,13 @@ mod tests {
 
         // 5 clustered peers at short distances (0.01 apart)
         let mut peers = Vec::new();
-        let mut neighbor_locations = BTreeMap::new();
+        let mut neighbor_locations: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
         for i in 0..5 {
             let loc = Location::new(my_location.as_f64() + 0.01 + (i as f64 * 0.002));
             let peer = PeerKeyLocation::random();
             neighbor_locations
                 .entry(loc)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(Connection::new(peer.clone()));
             peers.push(peer);
         }
@@ -1854,7 +1849,7 @@ mod tests {
         let isolated_peer = PeerKeyLocation::random();
         neighbor_locations
             .entry(isolated_loc)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(Connection::new(isolated_peer.clone()));
         peers.push(isolated_peer.clone());
 
