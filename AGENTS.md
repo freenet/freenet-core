@@ -119,7 +119,7 @@ docs/architecture/  # Design docs
 | Need | Use | Location |
 |------|-----|----------|
 | Time | `TimeSource` | `crates/core/src/simulation/` |
-| RNG | `GlobalRng` | `crates/core/src/config/mod.rs` |
+| RNG | `GlobalRng` | `crates/core/src/config.rs` |
 | Sockets | `Socket` trait | `crates/core/src/transport/` |
 
 ## Documentation

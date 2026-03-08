@@ -92,6 +92,22 @@ jobs:
       - name: Check code formatting
         run: cargo fmt -- --check
 
+      - name: Check for old-style mod.rs files
+        run: |
+          # New modules must use foo.rs + foo/ style, not foo/mod.rs
+          # Exceptions: tests/common/mod.rs (Rust convention), src/bin/*/mod.rs (Cargo binary),
+          #             benches/*/mod.rs (Cargo bench binary)
+          bad_files=$(find crates apps -name "mod.rs" -not -path "*/target/*" \
+            -not -path "*/tests/common/mod.rs" \
+            -not -path "*/src/bin/*/mod.rs" \
+            -not -path "*/benches/*/mod.rs" \
+            2>/dev/null || true)
+          if [ -n "$bad_files" ]; then
+            echo "::error::Found old-style mod.rs files. Use foo.rs + foo/ style instead:"
+            echo "$bad_files"
+            exit 1
+          fi
+
   # Clippy runs in parallel with fmt_check for faster fail-fast
   # Using Ubicloud for faster builds with more cores
   clippy_check:

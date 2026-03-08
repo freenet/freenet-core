@@ -10,13 +10,19 @@ paths:
 ### WHEN writing a new module
 
 ```
-1. Order contents as:
+1. Use the new-style module layout: foo.rs + foo/ directory
+   → NEVER create foo/mod.rs — use foo.rs as the module root instead
+   → Exception: tests/common/mod.rs (Rust test helper convention)
+   → Exception: src/bin/*/mod.rs (Cargo treats src/bin/*.rs as binaries)
+   → Exception: benches/*/mod.rs (Cargo treats benches/*.rs as bench binaries)
+
+2. Order contents as:
    mod declarations → imports → types → trait impls → functions
 
-2. Group imports:
+3. Group imports:
    std:: → external crates → crate::
 
-3. Check: Is this in crates/core/?
+4. Check: Is this in crates/core/?
    → YES: See .claude/rules/testing.md for DST requirements
 ```
 
@@ -263,7 +269,7 @@ Need current time?
 
 Need randomness?
   → DO NOT use: rand::random(), rand::thread_rng()
-  → USE: GlobalRng (crates/core/src/config/mod.rs)
+  → USE: GlobalRng (crates/core/src/config.rs)
 
 Need network socket in tests?
   → DO NOT use: tokio::net::UdpSocket
