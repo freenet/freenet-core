@@ -190,7 +190,7 @@ from being seen as ready. ReadyState bug required re-broadcast every 30s + 60s f
 
 ```
 NEVER use: tokio::net::UdpSocket directly in crates/core
-ALWAYS use: Socket trait (crates/core/src/transport/mod.rs)
+ALWAYS use: Socket trait (crates/core/src/transport.rs)
 
 Why: Enables SimulationSocket for deterministic testing
 ```

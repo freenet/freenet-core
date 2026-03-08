@@ -30,7 +30,7 @@ The Freenet transport layer has **sophisticated, production-ready implementation
 **Current State:**
 - ❌ Not mentioned in `bandwidth-configuration.md`
 - ❌ Not in README.md
-- ✅ Exists in code: `crates/core/src/config/mod.rs:805-824`
+- ✅ Exists in code: `crates/core/src/config.rs:805-824`
 
 **Why Critical:**
 - Solves major production issue (#2578: timeout storms on high-latency paths)
@@ -304,12 +304,12 @@ Max plaintext: 1463 bytes
 
 | Feature | Documentation Status | Code Location |
 |---------|---------------------|---------------|
-| ledbat_min_ssthresh | 🔴 Missing | `config/mod.rs:805-824` |
+| ledbat_min_ssthresh | 🔴 Missing | `config.rs:805-824` |
 | X25519 encryption | 🔴 Outdated (says RSA) | `crypto.rs:131-165` |
 | Connection lifecycle | 🔴 Missing | `connection_handler.rs:1473-1900` |
 | Wire protocol | 🔴 Missing | `packet_data.rs`, `symmetric_message.rs` |
 | Metrics API | 🟡 Undiscoverable | `metrics.rs:228` |
-| BBR startup rate | 🟡 Not in docs | `config/mod.rs:838-846` |
+| BBR startup rate | 🟡 Not in docs | `config.rs:838-846` |
 | Reliability (TLP/RTO) | 🟡 Not explained | `sent_packet_tracker.rs:368-468` |
 | Keep-alive | 🟢 Minor | `peer_connection.rs:243-384` |
 | Fast channel | 🟢 Minor | `fast_channel.rs:1-314` |

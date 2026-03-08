@@ -224,4 +224,4 @@ if let Some(return_msg) = result.return_msg {
 
 - Architecture: `docs/architecture/operations/README.md`
 - OpManager: `crates/core/src/node/op_state_manager.rs`
-- Operation trait: `crates/core/src/operations/mod.rs:32-56`
+- Operation trait: `crates/core/src/operations.rs:32-56`

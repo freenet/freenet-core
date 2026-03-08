@@ -132,7 +132,7 @@ freenet --congestion-control bbr
 congestion-control = "ledbat"  # or "bbr" or "fixedrate"
 ```
 
-**Code reference:** `crates/core/src/config/mod.rs:1075-1077` (default), `crates/core/src/config/mod.rs:1013-1017` (selection logic)
+**Code reference:** `crates/core/src/config.rs:1075-1077` (default), `crates/core/src/config.rs:1013-1017` (selection logic)
 
 ## Quick Reference
 

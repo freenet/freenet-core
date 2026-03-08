@@ -11,9 +11,9 @@ paths:
 ### Engine Abstraction (`wasm_runtime/engine/`)
 
 ```
-WasmEngine trait     → mod.rs             (backend-agnostic interface)
+WasmEngine trait     → engine.rs          (backend-agnostic interface)
 WasmtimeEngine impl  → wasmtime_engine.rs (ONLY file that imports wasmtime::)
-Engine type alias    → mod.rs             (selected by feature flag)
+Engine type alias    → engine.rs          (selected by feature flag)
 ```
 
 **Backend Selection:** The `wasmtime-backend` feature must be enabled (it is on by default).
@@ -312,5 +312,5 @@ LIMIT: Maximum depth and total contracts fetched
 
 - Handler: `crates/core/src/contract/handler.rs`
 - Executor: `crates/core/src/contract/executor.rs`
-- Runtime: `crates/core/src/wasm_runtime/mod.rs`
+- Runtime: `crates/core/src/wasm_runtime.rs`
 - Storage: `crates/core/src/contract/storages.rs`

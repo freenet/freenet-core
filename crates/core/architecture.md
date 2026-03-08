@@ -133,11 +133,11 @@ graph LR
 
 **Key Components & Communication:**
 
-- **[Server](src/server/mod.rs):** Handles HTTP and WebSocket endpoints for client connections. The `ClientConnection` enum in [client_api.rs](src/server/client_api.rs) defines the interface between the server and client events system. The server manages the WebSocket API and passes client requests to the ClientEvents subsystem.
+- **[Server](src/server.rs):** Handles HTTP and WebSocket endpoints for client connections. The `ClientConnection` enum in [client_api.rs](src/server/client_api.rs) defines the interface between the server and client events system. The server manages the WebSocket API and passes client requests to the ClientEvents subsystem.
 
 - **[Node](src/node.rs):** Central coordinator with the main event loop implemented in `run_event_loop()`. This function contains the core `tokio::select!` loop that dispatches events to appropriate handlers like `handle_network_message()`, `handle_node_event()`, and `handle_client_request()`. 
 
-- **[ClientEvents](src/client_events/mod.rs):** Bridges client connections to the Node system through the `ClientEventsProxy` trait in [mod.rs](src/client_events/mod.rs). The WebSocket implementation in [websocket.rs](src/client_events/websocket.rs) provides key methods like `websocket_interface()` and `process_client_request()` that handle client connections.
+- **[ClientEvents](src/client_events.rs):** Bridges client connections to the Node system through the `ClientEventsProxy` trait in [client_events.rs](src/client_events.rs). The WebSocket implementation in [websocket.rs](src/client_events/websocket.rs) provides key methods like `websocket_interface()` and `process_client_request()` that handle client connections.
 
 - **[OpManager](src/operations/op_manager.rs):** Tracks operation state using internal hash maps for each operation type. The `push()` and `pop()` methods manage operation lifecycle, while `garbage_cleanup_task()` runs as a background task to remove stale transactions. Other important methods include `notify_op_change()` and `notify_node_event()` for event notification.
 
@@ -145,19 +145,19 @@ graph LR
 
 - **[ContractExecutor](src/contract/executor.rs):** Executes WASM contract code with network capabilities defined by the `ContractExecutor` trait. The `Executor<R>` implementation connects contracts to the network using `ComposeNetworkMessage<Op>` implementations like `GetContract`, `PutContract`, and `UpdateContract`.
 
-- **[WasmRuntime](src/wasm_runtime/mod.rs):** Provides the sandboxed execution environment through the `ContractRuntimeInterface` and `DelegateRuntimeInterface` traits defined in [mod.rs](src/wasm_runtime/mod.rs). These traits include methods for contract instantiation and function invocation.
+- **[WasmRuntime](src/wasm_runtime.rs):** Provides the sandboxed execution environment through the `ContractRuntimeInterface` and `DelegateRuntimeInterface` traits defined in [wasm_runtime.rs](src/wasm_runtime.rs). These traits include methods for contract instantiation and function invocation.
 
 - **[StateStore](src/contract/storages.rs):** Handles persistent contract state through the `StateStore<S>` implementation, which provides methods like `get_state()` and `put_state()`. The backing store is abstracted through the `Storage` trait.
 
-- **[NetworkBridge](src/node/network_bridge/mod.rs):** Abstracts network communication via the `NetworkBridge` trait in [network_bridge.rs](src/node/network_bridge.rs). The primary implementation is `P2pConnManager` in [p2p_protoc.rs](src/node/network_bridge/p2p_protoc.rs), which provides the `run_event_listener()` method containing the network event loop.
+- **[NetworkBridge](src/node/network_bridge.rs):** Abstracts network communication via the `NetworkBridge` trait in [network_bridge.rs](src/node/network_bridge.rs). The primary implementation is `P2pConnManager` in [p2p_protoc.rs](src/node/network_bridge/p2p_protoc.rs), which provides the `run_event_listener()` method containing the network event loop.
 
-- **[Ring](src/ring/mod.rs):** Manages network topology through the `Ring` struct and `ConnectionManager` in [mod.rs](src/ring/mod.rs). Key methods include `add_connection()` for peer registration and `route()` for determining message paths.
+- **[Ring](src/ring.rs):** Manages network topology through the `Ring` struct and `ConnectionManager` in [ring.rs](src/ring.rs). Key methods include `add_connection()` for peer registration and `route()` for determining message paths.
 
-- **[Transport](src/transport/mod.rs):** Implements low-level communication through the `Socket` trait in [mod.rs](src/transport/mod.rs). The `UdpSocket` implementation provides the actual network I/O operations with support for encryption and rate limiting.
+- **[Transport](src/transport.rs):** Implements low-level communication through the `Socket` trait in [transport.rs](src/transport.rs). The `UdpSocket` implementation provides the actual network I/O operations with support for encryption and rate limiting.
 
 - **[NetMessage](src/message.rs):** Defines the message format used for P2P communication through the `NetMessage` enum hierarchy. Each message includes a `Transaction` ID for tracking and contains operation-specific data in variants like `ConnectMsg`, `PutMsg`, and `GetMsg`.
 
-- **[Operation State Machines](src/operations/mod.rs):** Each operation type is implemented in a dedicated module (e.g., [get.rs](src/operations/get.rs), [put.rs](src/operations/put.rs)) with functions like `start_op()` to create initial state and `request_get()` to initiate network operations.
+- **[Operation State Machines](src/operations.rs):** Each operation type is implemented in a dedicated module (e.g., [get.rs](src/operations/get.rs), [put.rs](src/operations/put.rs)) with functions like `start_op()` to create initial state and `request_get()` to initiate network operations.
 
 **Event Loops and Channels:**
 

@@ -46,7 +46,7 @@ Comparison of transport layer performance before and after LEDBAT congestion con
 **After:** Configurable via `NetworkApiConfig::bandwidth_limit`
 - Default: 10 MB/s per connection
 - User-adjustable for high-bandwidth connections
-- Location: `crates/core/src/config/mod.rs:697`
+- Location: `crates/core/src/config.rs:697`
 
 ---
 

@@ -153,7 +153,7 @@ flowchart LR
 score = (1 - failure_probability) × (1 / latency) × transfer_rate
 ```
 
-**Code reference:** `crates/core/src/router/mod.rs:15-200`
+**Code reference:** `crates/core/src/router.rs:15-200`
 
 ## Small-World Properties
 
@@ -328,14 +328,14 @@ flowchart LR
 
 | File | Purpose |
 |------|---------|
-| `ring/mod.rs` | Main Ring orchestrator |
+| `ring.rs` | Main Ring orchestrator |
 | `ring/connection_manager.rs` | Peer connection management |
 | `ring/location.rs` | Location abstraction |
 | `ring/peer_key_location.rs` | Peer identity + location |
 | `ring/hosting.rs` | Contract hosting cache |
 | `ring/interest.rs` | Interest-based sync |
 | `ring/connection_backoff.rs` | Exponential backoff |
-| `router/mod.rs` | Performance-aware routing |
+| `router.rs` | Performance-aware routing |
 
 ## References
 
