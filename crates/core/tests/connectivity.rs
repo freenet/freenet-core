@@ -306,7 +306,7 @@ async fn test_basic_gateway_connectivity(ctx: &mut TestContext) -> TestResult {
 ///
 /// For peers to participate in P2P mesh connectivity, they must have BOTH
 /// `public_address` AND `public_port` configured. This ensures the peer's
-/// PeerId is set from config (see config/mod.rs:242-251).
+/// PeerId is set from config (see config.rs:242-251).
 ///
 /// ## Port Types
 ///

@@ -18,7 +18,7 @@
 //! - The total queue across all contracts has reached `MAX_TOTAL_FAIR_QUEUE`
 //!
 //! The caller is responsible for sending an appropriate error response for
-//! rejected events (see `send_queue_full_response` in `mod.rs`).
+//! rejected events (see `send_queue_full_response` in `contract.rs`).
 
 use std::collections::{HashMap, VecDeque};
 

@@ -3432,7 +3432,7 @@ mod test {
         };
         assert_eq!(subscribe_req.contract_id, contract_instance_id);
 
-        // Simulate the V1 subscribe handler path (contract/mod.rs:387-405):
+        // Simulate the V1 subscribe handler path (contract.rs:387-405):
         // validate contract existence via lookup, then register if found.
         let subscribe_result = if runtime
             .contract_store
