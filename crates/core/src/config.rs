@@ -41,9 +41,7 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
 /// How long an operation (GET, PUT, SUBSCRIBE, etc.) can run before timing out.
-/// 120s accommodates slow CI runners where WASM compilation serializes on a
-/// shared engine mutex and can consume most of the operation budget. See #3456.
-pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(120);
+pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
 /// Current version of the crate.
 pub(crate) const PCK_VERSION: &str = env!("CARGO_PKG_VERSION");
