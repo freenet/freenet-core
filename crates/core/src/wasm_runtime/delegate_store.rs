@@ -3,8 +3,8 @@ use freenet_stdlib::prelude::{
     APIVersion, CodeHash, Delegate, DelegateCode, DelegateContainer, DelegateKey,
     DelegateWasmAPIVersion, Parameters,
 };
+use moka::sync::Cache as MokaCache;
 use std::{fs::File, fs::OpenOptions, io::Write, path::PathBuf, sync::Arc};
-use stretto::Cache;
 
 use crate::contract::storages::Storage;
 
@@ -15,7 +15,7 @@ const REG_FILE_VERSION: u8 = 1;
 
 pub struct DelegateStore {
     delegates_dir: PathBuf,
-    delegate_cache: Cache<CodeHash, DelegateCode<'static>>,
+    delegate_cache: MokaCache<CodeHash, DelegateCode<'static>>,
     /// In-memory index: DelegateKey -> CodeHash
     /// Populated from .reg files + ReDb on startup and kept in sync.
     key_to_code_part: Arc<DashMap<DelegateKey, CodeHash>>,
@@ -29,8 +29,6 @@ impl DelegateStore {
     /// - max_size: max size in bytes of the delegates being cached
     /// - db: ReDb storage for persistent index
     pub fn new(delegates_dir: PathBuf, max_size: i64, db: Storage) -> RuntimeResult<Self> {
-        const ERR: &str = "failed to build mem cache";
-
         std::fs::create_dir_all(&delegates_dir).map_err(|err| {
             tracing::error!("error creating delegate dir: {err}");
             err
@@ -118,7 +116,12 @@ impl DelegateStore {
         tracing::debug!("Total delegate index entries: {}", key_to_code_part.len());
 
         Ok(Self {
-            delegate_cache: Cache::new(100, max_size).expect(ERR),
+            delegate_cache: MokaCache::builder()
+                .max_capacity(max_size as u64)
+                .weigher(|_key: &CodeHash, value: &DelegateCode<'static>| -> u32 {
+                    value.as_ref().len() as u32
+                })
+                .build(),
             delegates_dir,
             key_to_code_part,
             db,
@@ -132,7 +135,7 @@ impl DelegateStore {
         params: &Parameters<'_>,
     ) -> Option<Delegate<'static>> {
         if let Some(delegate_code) = self.delegate_cache.get(key.code_hash()) {
-            return Some(Delegate::from((delegate_code.value(), params)).into_owned());
+            return Some(Delegate::from((&delegate_code, params)).into_owned());
         }
         self.key_to_code_part.get(key).and_then(|code_hash_entry| {
             let code_hash = *code_hash_entry.value();
@@ -154,10 +157,8 @@ impl DelegateStore {
                 return None;
             };
             tracing::debug!("loaded `{key}` from path");
-            let size = delegate_code.as_ref().len() as i64;
             let delegate = Delegate::from((&delegate_code, &params.clone().into_owned()));
-            self.delegate_cache
-                .insert(*key.code_hash(), delegate_code, size);
+            self.delegate_cache.insert(*key.code_hash(), delegate_code);
             Some(delegate)
         })
     }
@@ -213,8 +214,7 @@ impl DelegateStore {
         // Early return if file exists on disk - but ensure index and .reg are updated
         if let Ok((code, _ver)) = DelegateCode::load_versioned_from_path(delegate_path.as_path()) {
             self.ensure_index_entry(key, code_hash, &params)?;
-            let size = delegate.code().size() as i64;
-            self.delegate_cache.insert(*code_hash, code, size);
+            self.delegate_cache.insert(*code_hash, code);
             return Ok(());
         }
 
@@ -238,17 +238,15 @@ impl DelegateStore {
 
         self.key_to_code_part.insert(key.clone(), *code_hash);
 
-        let code_size = delegate.code().as_ref().len() as i64;
         self.delegate_cache
-            .insert(*code_hash, delegate.code().clone().into_owned(), code_size);
-        let _cache_result = self.delegate_cache.wait();
+            .insert(*code_hash, delegate.code().clone().into_owned());
 
         Ok(())
     }
 
     pub fn remove_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
         let code_hash = *key.code_hash();
-        self.delegate_cache.remove(&code_hash);
+        self.delegate_cache.invalidate(&code_hash);
 
         // Remove .reg file FIRST to prevent resurrection on crash.
         // If we crash after ReDb removal but before .reg removal, startup

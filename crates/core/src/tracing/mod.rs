@@ -3809,7 +3809,7 @@ pub mod tracer {
             tracing_subscriber::EnvFilter::builder()
                 .with_default_directive(default_filter.into())
                 .from_env_lossy()
-                .add_directive("stretto=off".parse().expect("infallible"))
+                .add_directive("moka=off".parse().expect("infallible"))
                 .add_directive("sqlx=error".parse().expect("infallible"))
         }
 

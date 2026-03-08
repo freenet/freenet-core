@@ -1,8 +1,6 @@
 use core::future::Future;
 use freenet_stdlib::prelude::*;
-use stretto::AsyncCache;
-
-use crate::config::GlobalExecutor;
+use moka::sync::Cache as MokaCache;
 
 /// Maximum size of a single contract state blob (50 MiB).
 ///
@@ -75,11 +73,11 @@ pub trait StateStorage {
 /// StateStore wraps a persistent storage backend with an optional in-memory cache.
 /// It is Clone when the underlying storage S is Clone (e.g., ReDb with Arc<Database>).
 ///
-/// For deterministic simulation testing, use `new_uncached()` to bypass the stretto
-/// cache which has non-deterministic TinyLFU admission policy and background workers.
+/// For deterministic simulation testing, use `new_uncached()` to bypass the moka
+/// cache which uses TinyLFU admission and may introduce non-determinism.
 #[derive(Clone)]
 pub struct StateStore<S: StateStorage> {
-    state_mem_cache: Option<AsyncCache<ContractKey, WrappedState>>,
+    state_mem_cache: Option<MokaCache<ContractKey, WrappedState>>,
     store: S,
 }
 
@@ -88,28 +86,25 @@ where
     S: StateStorage + Send + 'static,
     <S as StateStorage>::Error: Into<anyhow::Error>,
 {
-    const AVG_STATE_SIZE: usize = 1_000;
-
-    /// Create a StateStore with stretto caching enabled.
+    /// Create a StateStore with moka caching enabled.
     ///
     /// # Arguments
     /// - max_size: max number of bytes for the mem cache
     pub fn new(store: S, max_size: u32) -> Result<Self, StateStoreError> {
-        let counters = max_size as usize / Self::AVG_STATE_SIZE * 10;
+        let cache = MokaCache::builder()
+            .max_capacity(max_size as u64)
+            .weigher(|_key: &ContractKey, value: &WrappedState| -> u32 { value.size() as u32 })
+            .build();
         Ok(Self {
-            state_mem_cache: Some(
-                AsyncCache::new(counters, max_size as i64, GlobalExecutor::spawn)
-                    .map_err(|err| StateStoreError::Any(anyhow::anyhow!(err)))?,
-            ),
+            state_mem_cache: Some(cache),
             store,
         })
     }
 
     /// Create a StateStore without caching for deterministic simulation.
     ///
-    /// This bypasses the stretto AsyncCache which has non-deterministic behavior:
-    /// - TinyLFU admission policy can reject inserts non-deterministically
-    /// - Background workers for cache eviction and write batching
+    /// This bypasses the moka cache which uses TinyLFU admission and may
+    /// introduce non-determinism in tests.
     ///
     /// Use this constructor for deterministic simulation testing under turmoil.
     pub fn new_uncached(store: S) -> Self {
@@ -140,7 +135,7 @@ where
 
         // only allow updates for existing contracts
         let cache_miss = if let Some(cache) = &self.state_mem_cache {
-            cache.get(key).await.is_none()
+            cache.get(key).is_none()
         } else {
             true
         };
@@ -155,8 +150,7 @@ where
 
         // Update memory cache first (if enabled) to prevent race condition
         if let Some(cache) = &self.state_mem_cache {
-            let cost = state.size() as i64;
-            cache.insert(*key, state.clone(), cost).await;
+            cache.insert(*key, state.clone());
         }
 
         // Then update persistent store
@@ -186,8 +180,7 @@ where
 
         // Update memory cache first (if enabled) to prevent race condition
         if let Some(cache) = &self.state_mem_cache {
-            let cost = state.size() as i64;
-            cache.insert(key, state.clone(), cost).await;
+            cache.insert(key, state.clone());
         }
 
         // Then update persistent stores
@@ -202,8 +195,8 @@ where
     pub async fn get(&self, key: &ContractKey) -> Result<WrappedState, StateStoreError> {
         // Check cache first (if enabled)
         if let Some(cache) = &self.state_mem_cache {
-            if let Some(v) = cache.get(key).await {
-                return Ok(v.value().clone());
+            if let Some(v) = cache.get(key) {
+                return Ok(v);
             }
         }
         let r = self.store.get(key).await.map_err(Into::into)?;
@@ -446,9 +439,7 @@ mod tests {
     /// Test that memory cache is populated during store.
     ///
     /// Verifies that after storing a contract, the state can be retrieved.
-    /// Note: Due to stretto's async write batching, we can't reliably test
-    /// whether a specific get hits cache vs storage without timing delays.
-    /// This test verifies the functional correctness instead.
+    /// This test verifies the functional correctness of cache + storage.
     #[tokio::test]
     async fn test_state_store_cache_populated_on_store() {
         let mock_storage = MockStateStorage::new();
@@ -587,8 +578,8 @@ mod tests {
 
     /// Verify that store() rejects state exceeding MAX_STATE_SIZE.
     ///
-    /// Uses new_uncached() for determinism — stretto's TinyLFU admission policy
-    /// is non-deterministic and irrelevant to the size-limit check.
+    /// Uses new_uncached() for determinism — cache admission policy
+    /// is irrelevant to the size-limit check.
     #[tokio::test]
     async fn test_store_rejects_oversized_state() {
         let mock_storage = MockStateStorage::new();
@@ -673,8 +664,7 @@ mod tests {
     /// This verifies clean failure semantics: when persistent store fails,
     /// no partial state should be visible to subsequent operations.
     ///
-    /// Note: In cached mode, behavior is non-deterministic due to stretto's
-    /// TinyLFU admission policy. Use uncached mode for deterministic testing.
+    /// Note: Use uncached mode for deterministic testing.
     #[tokio::test]
     async fn test_uncached_store_failure_leaves_no_state() {
         let mock_storage = MockStateStorage::new();
