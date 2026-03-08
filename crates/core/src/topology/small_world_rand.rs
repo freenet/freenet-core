@@ -1,19 +1,27 @@
 use crate::config::GlobalRng;
 use crate::ring::{Distance, Location};
 
-/// Minimum distance for Kleinberg sampling. On a ring with N peers uniformly
-/// distributed, the expected distance to the nearest peer is ~1/(2N). We use
-/// 0.001 which corresponds to a ~500 peer network. The previous value of 0.01
-/// created a dead zone that prevented close-neighbor connections: with 500
-/// peers, ~12 exist within distance 0.01 but the topology never targeted them,
-/// causing premature terminus in greedy routing and frequent uphill hops.
-const D_MIN: f64 = 0.001;
+/// Practical minimum distance for Kleinberg targeting and log-space gap analysis.
+/// Set to 0.001 (one thousandth of the ring).
+///
+/// This value balances two concerns:
+/// - Small enough that close-neighbor connections (even at distance 0.001) are
+///   supported. Real peers are never excluded from scoring.
+/// - Large enough that the log-space range (~6.2 decades) provides good gap
+///   discrimination. Too small a value (e.g. 1e-6) creates a 13-decade range
+///   where all real-network connections cluster in the top 30%, making gap
+///   analysis unable to distinguish close vs long-range candidates.
+///
+/// NOTE: This is NOT a scoring floor. `kleinberg_score` scores all positive
+/// distances — there is no dead zone that prevents close-neighbor connections.
+/// Distances below D_MIN_TARGET are simply clamped to 0.0 in log-space.
+const D_MIN_TARGET: f64 = 0.001;
 
 /// Maximum ring distance (half the ring).
 const D_MAX: f64 = 0.5;
 
-/// Log ratio used for mapping distances to the unit interval in log-space.
-const LOG_RATIO: f64 = 6.214_608_098_422_191; // (D_MAX / D_MIN).ln()
+/// Log ratio for targeting: ln(D_MAX / D_MIN_TARGET).
+const LOG_RATIO: f64 = 6.214_608_098_422_191; // (D_MAX / D_MIN_TARGET).ln()
 
 /// Generate a random link distance based on Kleinberg's d^{-1} distribution.
 ///
@@ -37,7 +45,7 @@ pub(crate) fn random_link_distance(d_min: Distance) -> Distance {
 /// `my_location`. Returns a location on the ring biased toward short distances
 /// but with a long tail for routing reachability.
 pub(crate) fn kleinberg_target(my_location: Location) -> Location {
-    let distance = random_link_distance(Distance::new(D_MIN));
+    let distance = random_link_distance(Distance::new(D_MIN_TARGET));
 
     let sign: bool = GlobalRng::random_bool(0.5);
     let offset = if sign {
@@ -49,19 +57,19 @@ pub(crate) fn kleinberg_target(my_location: Location) -> Location {
     Location::new_rounded(my_location.as_f64() + offset)
 }
 
-/// Map a ring distance to the unit interval in log-space.
+/// Map a ring distance to the unit interval in log-space for gap analysis.
 ///
-/// The 1/d distribution is uniform in log-distance, so this transform maps
-/// the ideal connection distribution to Uniform[0, 1]. Distances at or below
-/// `D_MIN` map to 0; distances at or above `D_MAX` map to 1.
+/// Uses D_MIN_TARGET as the lower bound for the log-space mapping.
+/// Distances at or below D_MIN_TARGET map to 0; distances at or above D_MAX
+/// map to 1.
 fn to_log_unit(distance: f64) -> f64 {
-    if distance <= D_MIN {
+    if distance <= D_MIN_TARGET {
         return 0.0;
     }
     if distance >= D_MAX {
         return 1.0;
     }
-    (distance / D_MIN).ln() / LOG_RATIO
+    (distance / D_MIN_TARGET).ln() / LOG_RATIO
 }
 
 /// Result of analyzing the gap distribution in log-distance space.
@@ -79,10 +87,10 @@ struct GapAnalysis {
 
 /// Analyze the gap distribution of connection distances in log-space.
 ///
-/// Returns `None` if there are no valid distances in [D_MIN, D_MAX].
+/// Returns `None` if there are no valid distances in (D_MIN_TARGET, D_MAX].
 fn analyze_gaps(connection_distances: impl Iterator<Item = f64>) -> Option<GapAnalysis> {
     let mut points: Vec<f64> = connection_distances
-        .filter(|&d| (D_MIN..=D_MAX).contains(&d))
+        .filter(|&d| d > D_MIN_TARGET && d <= D_MAX)
         .map(to_log_unit)
         .collect();
 
@@ -171,8 +179,8 @@ pub(crate) fn gap_target(
     let u_target = (midpoint + jitter).clamp(0.0, 1.0);
 
     // Map back from log-space unit interval to a ring distance:
-    // u = ln(d/D_MIN) / LOG_RATIO  =>  d = D_MIN * exp(u * LOG_RATIO)
-    let distance = D_MIN * (u_target * LOG_RATIO).exp();
+    // u = ln(d/D_MIN_TARGET) / LOG_RATIO  =>  d = D_MIN_TARGET * exp(u * LOG_RATIO)
+    let distance = D_MIN_TARGET * (u_target * LOG_RATIO).exp();
 
     let sign: bool = GlobalRng::random_bool(0.5);
     let offset = if sign { distance } else { -distance };
@@ -189,18 +197,16 @@ pub(crate) fn gap_target(
 /// candidate fills a larger gap in the distribution. A candidate that bisects
 /// the largest gap perfectly gets the highest possible score.
 ///
-/// Candidates outside [D_MIN, D_MAX] score 0 — they don't contribute to
-/// small-world routing. Note: D_MIN also provides a weak Sybil/eclipse
-/// defense floor (co-located peers below D_MIN score 0), but the primary
-/// defense is IP-based location hashing which prevents attackers from
-/// choosing arbitrary ring positions.
+/// All positive distances up to D_MAX are scored — there is no minimum
+/// distance floor. This ensures close neighbors are never excluded from
+/// connection acceptance decisions.
 ///
 /// This is O(N) where N is the number of existing connections.
 pub(crate) fn kleinberg_score(
     candidate_distance: f64,
     connection_distances: impl Iterator<Item = f64>,
 ) -> f64 {
-    if !(D_MIN..=D_MAX).contains(&candidate_distance) {
+    if candidate_distance <= 0.0 || candidate_distance > D_MAX {
         return 0.0;
     }
 
@@ -244,7 +250,7 @@ mod tests {
 
     #[test]
     fn log_ratio_is_correct() {
-        let computed = (D_MAX / D_MIN).ln();
+        let computed = (D_MAX / D_MIN_TARGET).ln();
         assert!(
             (LOG_RATIO - computed).abs() < 1e-10,
             "LOG_RATIO constant {LOG_RATIO} doesn't match computed {computed}"
@@ -253,16 +259,16 @@ mod tests {
 
     #[test]
     fn to_log_unit_boundaries() {
-        assert_eq!(to_log_unit(D_MIN), 0.0);
+        assert_eq!(to_log_unit(D_MIN_TARGET), 0.0);
         assert_eq!(to_log_unit(D_MAX), 1.0);
-        assert_eq!(to_log_unit(0.0001), 0.0); // below D_MIN
+        assert_eq!(to_log_unit(1e-4), 0.0); // below D_MIN_TARGET
         assert_eq!(to_log_unit(0.6), 1.0); // above D_MAX
     }
 
     #[test]
     fn to_log_unit_midpoint() {
-        // Geometric mean of D_MIN and D_MAX should map to 0.5
-        let geometric_mean = (D_MIN * D_MAX).sqrt();
+        // Geometric mean of D_MIN_TARGET and D_MAX should map to 0.5
+        let geometric_mean = (D_MIN_TARGET * D_MAX).sqrt();
         let u = to_log_unit(geometric_mean);
         assert!(
             (u - 0.5).abs() < 0.01,
@@ -274,7 +280,7 @@ mod tests {
     fn score_no_connections() {
         // With no existing connections, candidate is bracketed by boundaries 0 and 1.
         // Geometric mean maps to 0.5, so min(0.5, 0.5) = 0.5.
-        let geometric_mean = (D_MIN * D_MAX).sqrt();
+        let geometric_mean = (D_MIN_TARGET * D_MAX).sqrt();
         let score = kleinberg_score(geometric_mean, std::iter::empty());
         assert!(
             (score - 0.5).abs() < 0.01,
@@ -285,7 +291,7 @@ mod tests {
     #[test]
     fn score_center_of_gap_beats_edge() {
         // Existing connections near boundaries: leave a big gap in the middle.
-        let existing = [0.015, 0.45]; // near D_MIN and near D_MAX
+        let existing = [0.015, 0.45]; // near short and near D_MAX
 
         // Candidate A: center of gap (geometric mean ≈ 0.07)
         let center = (0.015_f64 * 0.45).sqrt();
@@ -320,15 +326,35 @@ mod tests {
     #[test]
     fn score_outside_range_is_zero() {
         let existing = [0.1];
-        assert_eq!(kleinberg_score(0.0005, existing.iter().copied()), 0.0);
+        // Zero and negative distances score 0
+        assert_eq!(kleinberg_score(0.0, existing.iter().copied()), 0.0);
+        assert_eq!(kleinberg_score(-0.1, existing.iter().copied()), 0.0);
+        // Above D_MAX scores 0
         assert_eq!(kleinberg_score(0.6, existing.iter().copied()), 0.0);
+    }
+
+    #[test]
+    fn score_very_small_distance_is_nonzero() {
+        // With no D_MIN floor, small distances should score > 0
+        // (D_MIN_TARGET=0.001, so distances above that map to positive log-space)
+        let existing = [0.1];
+        let score = kleinberg_score(0.002, existing.iter().copied());
+        assert!(
+            score > 0.0,
+            "Small distance (0.002) should score > 0, got {score}"
+        );
+        let score_small = kleinberg_score(0.005, existing.iter().copied());
+        assert!(
+            score_small > 0.0,
+            "Small distance (0.005) should score > 0, got {score_small}"
+        );
     }
 
     #[test]
     fn score_perfectly_uniform_scores_equal() {
         // Place connections at equally-spaced log-distances (quartiles).
         // Each new candidate in a remaining gap should score roughly equally.
-        let d_at = |u: f64| D_MIN * (D_MAX / D_MIN).powf(u);
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
         let existing = [d_at(0.25), d_at(0.5), d_at(0.75)];
 
         // Candidates at 0.125 and 0.625 are both centered in their respective gaps.
@@ -347,7 +373,7 @@ mod tests {
 
     #[test]
     fn chi_squared_test() {
-        let d_min = D_MIN;
+        let d_min = D_MIN_TARGET;
         let n = 10000;
         let num_bins = 20;
         let log_ratio = (D_MAX / d_min).ln();
@@ -388,23 +414,26 @@ mod tests {
         let _guard = crate::config::GlobalRng::seed_guard(0xDEAD_BEEF);
         let my_loc = Location::new(0.5);
 
-        // Existing connections clustered at short distances
-        let existing = [0.012, 0.015, 0.02];
+        // Place connections clustered in the upper quarter of log-space
+        // (near D_MAX). This leaves a large gap in the lower 3/4 of log-space.
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+        let existing = [d_at(0.80), d_at(0.85), d_at(0.90)];
 
-        let mut long_count = 0;
+        // The largest gap is below the cluster, so most targets should be
+        // at shorter distances than the cluster.
+        let cluster_lower = d_at(0.80);
+        let mut below_cluster = 0;
         let trials = 100;
         for _ in 0..trials {
             let target = gap_target(my_loc, existing.iter().copied());
             let dist = my_loc.distance(target).as_f64();
-            if dist > 0.05 {
-                long_count += 1;
+            if dist < cluster_lower {
+                below_cluster += 1;
             }
         }
-        // The largest gap is in the long-distance range, so most targets
-        // should be long-distance
         assert!(
-            long_count > trials * 3 / 4,
-            "Expected gap targeting to favor long-distance, got {long_count}/{trials}"
+            below_cluster > trials * 3 / 4,
+            "Expected gap targeting to favor the large gap below the cluster, got {below_cluster}/{trials}"
         );
     }
 
@@ -446,13 +475,13 @@ mod tests {
         let my_loc = Location::new(0.5);
 
         // Place connections at quartiles in log-space
-        let d_at = |u: f64| D_MIN * (D_MAX / D_MIN).powf(u);
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
         let existing = [d_at(0.25), d_at(0.5), d_at(0.75)];
 
         // With uniform connections, the 4 gaps are equal. Targets should
         // spread across all gaps, not cluster.
         let mut short = 0; // distance < geometric_mean
-        let geo_mean = (D_MIN * D_MAX).sqrt();
+        let geo_mean = (D_MIN_TARGET * D_MAX).sqrt();
         let trials = 200;
         for _ in 0..trials {
             let target = gap_target(my_loc, existing.iter().copied());
@@ -473,8 +502,8 @@ mod tests {
     fn gap_target_all_distances_outside_range() {
         let _guard = crate::config::GlobalRng::seed_guard(0xFEED_FACE);
         let my_loc = Location::new(0.5);
-        // All distances outside [D_MIN=0.001, D_MAX=0.5] — should fallback
-        let existing = [0.0001, 0.0005, 0.7];
+        // All distances outside (D_MIN_TARGET, D_MAX] — should fallback
+        let existing = [0.0, 1e-4, 0.7];
         for _ in 0..100 {
             let target = gap_target(my_loc, existing.iter().copied());
             let v = target.as_f64();
@@ -489,21 +518,23 @@ mod tests {
     fn gap_target_single_connection() {
         let _guard = crate::config::GlobalRng::seed_guard(0xBAAD_F00D);
         let my_loc = Location::new(0.5);
-        // Single short-distance connection — largest gap should be at long distance
-        let existing = [0.015];
-        let mut long_count = 0;
-        let trials = 100;
+        // Single connection at log-space midpoint — two equal gaps on either side.
+        // Targets should spread across both gaps (roughly 50/50).
+        let geo_mean = (D_MIN_TARGET * D_MAX).sqrt();
+        let existing = [geo_mean];
+        let mut above_count = 0;
+        let trials = 200;
         for _ in 0..trials {
             let target = gap_target(my_loc, existing.iter().copied());
             let dist = my_loc.distance(target).as_f64();
-            if dist > 0.05 {
-                long_count += 1;
+            if dist > geo_mean {
+                above_count += 1;
             }
         }
+        let ratio = above_count as f64 / trials as f64;
         assert!(
-            long_count > trials / 2,
-            "Expected gap targeting to favor long-distance with single short connection, \
-             got {long_count}/{trials}"
+            (0.3..0.7).contains(&ratio),
+            "Expected ~50/50 split around midpoint connection, got {ratio:.2}"
         );
     }
 
@@ -580,12 +611,12 @@ mod tests {
                 short_count += 1;
             }
         }
-        // With 1/d distribution and d_min=0.001, d_max=0.5, the fraction
-        // below 0.1 should be ln(0.1/0.001)/ln(0.5/0.001) ≈ 74%.
+        // With 1/d distribution and d_min_target=0.001, d_max=0.5, the fraction
+        // below 0.1 should be ln(0.1/0.001)/ln(0.5/0.001) ≈ 74.1%.
         // Use a conservative threshold.
         let ratio = short_count as f64 / n as f64;
         assert!(
-            ratio > 0.5,
+            ratio > 0.7,
             "Expected majority of targets to be short-distance, got {ratio:.2}"
         );
     }
@@ -625,7 +656,7 @@ mod tests {
     #[test]
     fn largest_gap_uniform_connections() {
         // Place connections at quartiles in log-space
-        let d_at = |u: f64| D_MIN * (D_MAX / D_MIN).powf(u);
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
         let existing = [d_at(0.25), d_at(0.5), d_at(0.75)];
         let (gap, count) = largest_gap_size(existing.iter().copied());
         // 4 equal gaps of size 0.25
@@ -635,7 +666,7 @@ mod tests {
 
     #[test]
     fn largest_gap_clustered_connections() {
-        // All connections near D_MIN — large gap at long distances
+        // All connections near short distances — large gap at long distances
         let existing = [0.012, 0.015, 0.02];
         let (gap, count) = largest_gap_size(existing.iter().copied());
         // Most of log-space is empty, gap should be large
@@ -649,7 +680,7 @@ mod tests {
     #[test]
     fn largest_gap_single_connection_at_midpoint() {
         // Single connection at geometric mean (log-space midpoint)
-        let geo_mean = (D_MIN * D_MAX).sqrt();
+        let geo_mean = (D_MIN_TARGET * D_MAX).sqrt();
         let (gap, count) = largest_gap_size(std::iter::once(geo_mean));
         // Splits [0,1] into two ~equal halves
         assert!(

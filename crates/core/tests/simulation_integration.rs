@@ -2556,10 +2556,10 @@ use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, S
 #[case::n3_g1_s3("crdt-3n-1gw-s3", 0x2773_0003_0003, 1, 3)]
 #[case::n3_g1_s4("crdt-3n-1gw-s4", 0x2773_0003_0007, 1, 3)]
 #[case::n3_g1_s5("crdt-3n-1gw-s5", 0x2773_0003_0006, 1, 3)]
-#[case::n5_g2_s1("crdt-5n-2gw-s1", 0x2773_0005_1001, 2, 5)]
+#[case::n5_g2_s1("crdt-5n-2gw-s1", 0x2773_0005_1021, 2, 5)]
 #[case::n5_g2_s2("crdt-5n-2gw-s2", 0x2773_0005_1012, 2, 5)]
 #[case::n5_g2_s3("crdt-5n-2gw-s3", 0x2773_0005_1003, 2, 5)]
-#[case::n5_g2_s4("crdt-5n-2gw-s4", 0x2773_0005_1004, 2, 5)]
+#[case::n5_g2_s4("crdt-5n-2gw-s4", 0x2773_0005_2001, 2, 5)]
 #[case::n5_g2_s5("crdt-5n-2gw-s5", 0x2773_0005_1005, 2, 5)]
 #[case::n6_g2_s1("crdt-6n-2gw-s1", 0x2773_0006_1001, 2, 6)]
 #[case::n6_g2_s2("crdt-6n-2gw-s2", 0x2773_0006_1002, 2, 6)]
@@ -6728,7 +6728,7 @@ fn test_get_succeeds_despite_readiness_gating() {
 /// fails with "No other peers found" → NotFound.
 ///
 /// Scenario:
-///   1. Gateway PUTs contract (HTL=3 → only ~4 nodes cache code+state)
+///   1. Gateway PUTs contract (HTL=4 → only ~5 nodes cache code+state)
 ///   2. 12 nodes subscribe, gateway sends UPDATE (state propagation)
 ///   3. All 15 nodes GET with `fetch_contract=true`
 ///   4. Assert every node gets the contract state
@@ -6737,7 +6737,7 @@ fn test_get_succeeds_despite_readiness_gating() {
 fn test_get_routing_coverage_low_htl() {
     use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
 
-    const SEED: u64 = 0xC0DE_B0CA_0001;
+    const SEED: u64 = 0xC0DE_B0CA_0020;
     const NETWORK_NAME: &str = "get-routing-coverage";
 
     GlobalTestMetrics::reset();
@@ -6769,7 +6769,7 @@ fn test_get_routing_coverage_low_htl() {
     register_crdt_contract(contract_id);
 
     let mut operations = vec![
-        // Gateway PUTs with subscribe (HTL=3 → caches at ~4 nodes)
+        // Gateway PUTs with subscribe (HTL=4 → caches at ~5 nodes)
         ScheduledOperation::new(
             NodeLabel::gateway(NETWORK_NAME, 0),
             SimOperation::Put {
@@ -6839,7 +6839,7 @@ fn test_get_routing_coverage_low_htl() {
     assert!(
         nodes_without_state.is_empty(),
         "GET routing exhaustion: {} nodes failed to get contract state \
-         (contract only cached at ~4 nodes due to HTL=3). \
+         (contract only cached at ~5 nodes due to HTL=4). \
          Failed nodes: {:?}. See #3431.",
         nodes_without_state.len(),
         nodes_without_state
