@@ -232,6 +232,50 @@ pub(crate) fn kleinberg_score(
     (u_c - nearest_below).min(nearest_above - u_c)
 }
 
+/// Compute the gap that would exist in log-space if a peer at `peer_distance`
+/// were removed from the set of `all_distances`.
+///
+/// Returns the size of the merged gap (in [0, 1] log-space units) that would
+/// result from removing this peer. This measures how topologically important
+/// the peer is: a large removal gap means the peer fills a critical position
+/// in the Kleinberg distribution.
+///
+/// Returns 0.0 if the peer distance is outside the valid range or not found.
+pub(crate) fn removal_gap(peer_distance: f64, all_distances: impl Iterator<Item = f64>) -> f64 {
+    if peer_distance <= 0.0 || peer_distance > D_MAX {
+        return 0.0;
+    }
+
+    let u_peer = to_log_unit(peer_distance);
+
+    // Collect all valid points in log-space, excluding the peer itself
+    let mut points: Vec<f64> = all_distances
+        .filter(|&d| d > D_MIN_TARGET && d <= D_MAX)
+        .map(to_log_unit)
+        .collect();
+    points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    points.dedup();
+
+    // Find the neighbors of u_peer in the sorted list (including boundaries 0 and 1)
+    let mut below = 0.0_f64;
+    let mut above = 1.0_f64;
+
+    for &p in &points {
+        // Skip the peer itself (within floating point tolerance)
+        if (p - u_peer).abs() < 1e-12 {
+            continue;
+        }
+        if p < u_peer && p > below {
+            below = p;
+        }
+        if p > u_peer && p < above {
+            above = p;
+        }
+    }
+
+    above - below
+}
+
 #[cfg(test)]
 pub(super) mod test_utils {
     pub(in crate::topology) fn random_link_distance(
@@ -688,5 +732,86 @@ mod tests {
             "Midpoint connection should yield gap ~0.5, got {gap}"
         );
         assert_eq!(count, 1);
+    }
+
+    // --- removal_gap tests ---
+
+    #[test]
+    fn removal_gap_uniform_connections() {
+        // Place 4 connections at quartiles in log-space.
+        // Removing any one should create a gap of 0.5 (two adjacent 0.25 gaps merge).
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+        let all = [d_at(0.25), d_at(0.5), d_at(0.75)];
+
+        for &d in &all {
+            let gap = removal_gap(d, all.iter().copied());
+            // Removing middle point (0.5) merges gaps [0.25..0.5] and [0.5..0.75] → 0.5
+            // Removing edge point (0.25) merges gaps [0..0.25] and [0.25..0.5] → 0.5
+            // All should give 0.5 for uniform spacing
+            assert!(
+                (gap - 0.5).abs() < 0.02,
+                "Expected removal gap ~0.5 for uniformly-spaced peer at {d:.6}, got {gap}"
+            );
+        }
+    }
+
+    #[test]
+    fn removal_gap_critical_vs_redundant() {
+        // One connection is the sole bridge across a large gap;
+        // another is clustered with nearby connections.
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+
+        // Isolated peer at 0.5 (large gap on both sides),
+        // clustered peers at 0.1, 0.12, 0.14
+        let all = [d_at(0.1), d_at(0.12), d_at(0.14), d_at(0.5)];
+
+        let gap_isolated = removal_gap(d_at(0.5), all.iter().copied());
+        let gap_clustered = removal_gap(d_at(0.12), all.iter().copied());
+
+        assert!(
+            gap_isolated > gap_clustered * 2.0,
+            "Isolated peer removal gap ({gap_isolated:.4}) should be much larger \
+             than clustered peer ({gap_clustered:.4})"
+        );
+    }
+
+    #[test]
+    fn removal_gap_outside_range_is_zero() {
+        let all = [0.1, 0.2];
+        assert_eq!(removal_gap(0.0, all.iter().copied()), 0.0);
+        assert_eq!(removal_gap(-0.1, all.iter().copied()), 0.0);
+        assert_eq!(removal_gap(0.6, all.iter().copied()), 0.0);
+    }
+
+    #[test]
+    fn removal_gap_single_connection() {
+        // Single connection: removing it leaves the entire [0, 1] range empty → gap = 1.0
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+        let all = [d_at(0.5)];
+        let gap = removal_gap(d_at(0.5), all.iter().copied());
+        assert!(
+            (gap - 1.0).abs() < 0.01,
+            "Removing sole connection should give gap ~1.0, got {gap}"
+        );
+    }
+
+    #[test]
+    fn removal_gap_expected_value_for_uniform() {
+        // With k connections uniformly distributed, removing one should create
+        // a gap of approximately 2/k (two adjacent 1/k spacings merge).
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+
+        for k in [4, 8, 16] {
+            let all: Vec<f64> = (1..=k).map(|i| d_at(i as f64 / (k + 1) as f64)).collect();
+
+            let expected_removal_gap = 2.0 / (k + 1) as f64;
+            for &d in &all {
+                let gap = removal_gap(d, all.iter().copied());
+                assert!(
+                    (gap - expected_removal_gap).abs() < 0.02,
+                    "k={k}: expected removal gap ~{expected_removal_gap:.4}, got {gap:.4}"
+                );
+            }
+        }
     }
 }

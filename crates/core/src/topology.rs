@@ -54,10 +54,19 @@
 //!
 //! ## Removing Connections
 //!
-//! When resource usage is high or over max_connections:
-//! 1. Calculate value-per-usage ratio for each peer: `request_count / bandwidth_used`
-//! 2. Remove the peer with the worst ratio (least useful for bandwidth consumed)
-//! 3. Fallback: if no peer qualifies, remove the most distant peer on the ring
+//! When resource usage is high or over max_connections, peers are scored by a
+//! composite metric that balances routing usefulness and topological importance:
+//!
+//! 1. **Routing value**: `request_count / bandwidth_used` (how useful the peer
+//!    is for routing relative to its cost)
+//! 2. **Topology value**: `removal_gap / expected_gap` (how big a gap would
+//!    removing this peer create, normalized so 1.0 = average)
+//! 3. **Composite**: `routing_value + β * topology_value` — the peer with the
+//!    lowest composite score is pruned first
+//! 4. **Guard**: peers whose removal would create a gap > 2× expected are
+//!    never pruned (topology-critical protection)
+//! 5. **Fallback**: if no peer qualifies via the composite score, the peer
+//!    with the lowest topology value is removed
 
 use crate::{message::TransactionType, ring::Location};
 use connection_evaluator::ConnectionEvaluator;
@@ -390,7 +399,12 @@ impl TopologyManager {
                     "Above max connections, removing"
                 );
                 self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Slow);
-                Ok(self.select_connections_to_remove(&resource_type, at_time))
+                Ok(self.select_connections_to_remove(
+                    &resource_type,
+                    at_time,
+                    my_location,
+                    neighbor_locations,
+                ))
             } else if usage_proportion < increase_usage_if_below {
                 debug!(
                     resource_type = ?resource_type,
@@ -415,7 +429,12 @@ impl TopologyManager {
                         usage_proportion = ?usage_proportion,
                         "Resource usage above threshold, removing connection"
                     );
-                    Ok(self.select_connections_to_remove(&resource_type, at_time))
+                    Ok(self.select_connections_to_remove(
+                        &resource_type,
+                        at_time,
+                        my_location,
+                        neighbor_locations,
+                    ))
                 }
             } else {
                 Ok(TopologyAdjustment::NoChange)
@@ -521,9 +540,21 @@ impl TopologyManager {
         &mut self,
         exceeded_usage_for_resource_type: &ResourceType,
         at_time: Instant,
+        my_location: &Option<Location>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     ) -> TopologyAdjustment {
         let function_span = span!(Level::INFO, "remove_connections");
         let _enter = function_span.enter();
+
+        // Collect all connection distances for topology scoring.
+        let all_distances: Vec<f64> = match my_location {
+            Some(my_loc) => neighbor_locations
+                .keys()
+                .map(|nloc| my_loc.distance(*nloc).as_f64())
+                .collect(),
+            None => Vec::new(),
+        };
+        let num_connections = all_distances.len();
 
         let mut worst: Option<(PeerKeyLocation, f64)> = None;
 
@@ -554,22 +585,71 @@ impl TopologyManager {
                     let request_count =
                         self.outbound_request_counter.get_request_count(&peer) as f64;
 
-                    let value_per_usage = request_count / source_usage.per_second();
+                    let routing_value = request_count / source_usage.per_second();
+
+                    // Compute topology protection: how big a gap would removing
+                    // this peer create? Normalized so 1.0 = expected gap size.
+                    // Look up the peer's ring location from neighbor_locations
+                    // (authoritative) rather than from peer.location() (which
+                    // may differ if the address-to-location mapping changed).
+                    let topology_value = if let Some(my_loc) = my_location {
+                        let peer_ring_loc = neighbor_locations
+                            .iter()
+                            .find(|(_, conns)| conns.iter().any(|c| c.location == peer))
+                            .map(|(loc, _)| *loc);
+                        if let Some(peer_loc) = peer_ring_loc {
+                            let peer_dist = my_loc.distance(peer_loc).as_f64();
+                            if num_connections >= 3 {
+                                let gap = small_world_rand::removal_gap(
+                                    peer_dist,
+                                    all_distances.iter().copied(),
+                                );
+                                // Expected removal gap for k uniform points on a
+                                // circle is 2/k. Normalize so topology_value ≈ 1.0
+                                // for an averagely-positioned connection.
+                                let expected_gap = 2.0 / num_connections as f64;
+                                gap / expected_gap
+                            } else {
+                                1.0 // Too few connections to score topology
+                            }
+                        } else {
+                            1.0 // Peer not found in neighbors — can't score
+                        }
+                    } else {
+                        1.0 // No own location — can't compute topology
+                    };
+
+                    // Guard: never prune a connection whose removal would create
+                    // a gap more than 2x the expected size.
+                    if topology_value > TOPOLOGY_PROTECTION_THRESHOLD {
+                        event!(
+                            Level::DEBUG,
+                            topology_value,
+                            "Peer is topology-critical, skipping"
+                        );
+                        continue;
+                    }
+
+                    // Composite score: higher = more valuable = less likely to prune.
+                    // We prune the peer with the LOWEST effective value.
+                    let effective_value = routing_value + TOPOLOGY_WEIGHT * topology_value;
 
                     event!(
                         Level::DEBUG,
-                        request_count = request_count,
+                        request_count,
                         usage = source_usage.per_second(),
-                        value_per_usage = value_per_usage
+                        routing_value,
+                        topology_value,
+                        effective_value,
                     );
 
-                    if let Some((_, worst_value_per_usage)) = worst {
-                        if value_per_usage < worst_value_per_usage {
-                            worst = Some((peer, value_per_usage));
+                    if let Some((_, worst_effective_value)) = worst {
+                        if effective_value < worst_effective_value {
+                            worst = Some((peer, effective_value));
                             event!(Level::DEBUG, "Found a worse peer");
                         }
                     } else {
-                        worst = Some((peer, value_per_usage));
+                        worst = Some((peer, effective_value));
                         event!(Level::DEBUG, "Setting initial worst peer");
                     }
                 }
@@ -653,17 +733,33 @@ impl TopologyManager {
             return TopologyAdjustment::NoChange;
         }
 
-        // Find the least-routed peer to drop.
-        let least_routed = neighbor_locations
-            .values()
-            .flatten()
-            .min_by_key(|conn| {
-                self.outbound_request_counter
-                    .get_request_count(&conn.location)
-            })
-            .map(|conn| conn.location.clone());
+        // Find the best peer to drop: lowest composite score of routing
+        // value and topology importance, respecting the topology guard.
+        let remove = neighbor_locations
+            .iter()
+            .flat_map(|(loc, conns)| conns.iter().map(move |conn| (loc, conn)))
+            .filter_map(|(loc, conn)| {
+                let peer_dist = my_loc.distance(*loc).as_f64();
+                let gap = small_world_rand::removal_gap(peer_dist, distances.iter().copied());
+                let k = distances.len() as f64;
+                let expected_gap = if k >= 3.0 { 2.0 / k } else { 1.0 };
+                let topology_value = gap / expected_gap;
 
-        let Some(remove) = least_routed else {
+                // Guard: don't swap out topology-critical connections
+                if topology_value > TOPOLOGY_PROTECTION_THRESHOLD {
+                    return None;
+                }
+
+                let routing_value = self
+                    .outbound_request_counter
+                    .get_request_count(&conn.location) as f64;
+                let effective_value = routing_value + TOPOLOGY_WEIGHT * topology_value;
+                Some((conn.location.clone(), effective_value))
+            })
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+            .map(|(peer, _)| peer);
+
+        let Some(remove) = remove else {
             return TopologyAdjustment::NoChange;
         };
 
@@ -722,28 +818,45 @@ fn bootstrap_target_locations(
     }
 }
 
+/// Select the least topologically important peer to drop as a fallback.
+///
+/// Computes the removal gap for each peer and picks the one whose removal
+/// creates the smallest gap (least important topologically). Falls back to
+/// most distant if own location is unknown.
 fn select_fallback_peer_to_drop(
     neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     my_location: &Option<Location>,
 ) -> Option<PeerKeyLocation> {
-    let mut candidate: Option<(PeerKeyLocation, f64)> = None;
-    for (loc, conns) in neighbor_locations.iter() {
-        for conn in conns {
-            let score = match my_location {
-                Some(me) => me.distance(*loc).as_f64(),
-                None => 0.0,
-            };
-            if let Some((_, best_score)) = &mut candidate {
-                if score > *best_score {
-                    *best_score = score;
-                    candidate = Some((conn.location.clone(), score));
-                }
-            } else {
-                candidate = Some((conn.location.clone(), score));
-            }
-        }
-    }
-    candidate.map(|(peer, _)| peer)
+    let Some(my_loc) = my_location else {
+        // No own location — fall back to arbitrary peer
+        return neighbor_locations
+            .values()
+            .flatten()
+            .next()
+            .map(|conn| conn.location.clone());
+    };
+
+    let all_distances: Vec<f64> = neighbor_locations
+        .keys()
+        .map(|nloc| my_loc.distance(*nloc).as_f64())
+        .collect();
+
+    // Pick the peer whose removal creates the smallest gap (least important)
+    neighbor_locations
+        .iter()
+        .flat_map(|(loc, conns)| conns.iter().map(move |conn| (loc, conn)))
+        .min_by(|(loc_a, _), (loc_b, _)| {
+            let gap_a = small_world_rand::removal_gap(
+                my_loc.distance(**loc_a).as_f64(),
+                all_distances.iter().copied(),
+            );
+            let gap_b = small_world_rand::removal_gap(
+                my_loc.distance(**loc_b).as_f64(),
+                all_distances.iter().copied(),
+            );
+            gap_a.partial_cmp(&gap_b).unwrap_or(Ordering::Equal)
+        })
+        .map(|(_, conn)| conn.location.clone())
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -1654,9 +1767,11 @@ mod tests {
         );
     }
 
-    /// Test that the swap selects the least-routed peer for removal.
+    /// Test that the swap selects the lowest-composite-score peer for removal.
+    /// A peer with zero routing and low topology value should be dropped,
+    /// NOT a topology-critical peer even if it also has low routing.
     #[test_log::test]
-    fn test_topology_swap_removes_least_routed() {
+    fn test_topology_swap_removes_least_valuable_composite() {
         let _guard = crate::config::GlobalRng::seed_guard(0x1EA5_70FE);
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(100000.0),
@@ -1677,6 +1792,8 @@ mod tests {
             let peer = PeerKeyLocation::random();
             if i == 3 {
                 // This peer gets no requests — should be the drop candidate
+                // (clustered peers all have similar topology value, so routing
+                // value breaks the tie)
                 least_routed_peer = Some(peer.clone());
             } else {
                 // Give other peers many requests
@@ -1696,12 +1813,119 @@ mod tests {
         for _ in 0..200 {
             let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 6);
             if let TopologyAdjustment::SwapConnection { remove, .. } = adjustment {
-                assert_eq!(remove, expected_drop, "Should drop the least-routed peer");
+                assert_eq!(
+                    remove, expected_drop,
+                    "Should drop the peer with lowest composite score"
+                );
                 found_swap = true;
                 break;
             }
         }
         assert!(found_swap, "Should have triggered a swap within 200 trials");
+    }
+
+    /// Test that topology-critical connections are protected from pruning.
+    ///
+    /// Scenario: 6 peers, 5 clustered at similar short distances and 1 isolated
+    /// at a unique long distance. The isolated peer has zero routing value but
+    /// high topology value (its removal would create a huge gap). The pruning
+    /// logic should NOT select it for removal.
+    #[test_log::test]
+    fn test_topology_protection_prevents_pruning_critical_connection() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x7090_CAFE);
+        let mut resource_manager = setup_topology_manager(1000.0);
+        let my_location = Location::new(0.5);
+
+        // 5 clustered peers at short distances (0.01 apart)
+        let mut peers = Vec::new();
+        let mut neighbor_locations = BTreeMap::new();
+        for i in 0..5 {
+            let loc = Location::new(my_location.as_f64() + 0.01 + (i as f64 * 0.002));
+            let peer = PeerKeyLocation::random();
+            neighbor_locations
+                .entry(loc)
+                .or_insert_with(Vec::new)
+                .push(Connection::new(peer.clone()));
+            peers.push(peer);
+        }
+
+        // 1 isolated peer at a long distance — this fills a critical gap
+        let isolated_loc = Location::new(my_location.as_f64() + 0.4);
+        let isolated_peer = PeerKeyLocation::random();
+        neighbor_locations
+            .entry(isolated_loc)
+            .or_insert_with(Vec::new)
+            .push(Connection::new(isolated_peer.clone()));
+        peers.push(isolated_peer.clone());
+
+        // Give all peers high bandwidth usage
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        let bw_usage = vec![2000, 2000, 2000, 2000, 2000, 2000];
+        report_resource_usage(&mut resource_manager, &peers, &bw_usage, report_time);
+
+        // Give the clustered peers moderate routing; give isolated peer ZERO routing.
+        // Without topology protection, the isolated peer would be pruned (worst
+        // value-per-bandwidth). With protection, it should be kept.
+        let requests = vec![10, 10, 10, 10, 10, 0];
+        report_outbound_requests(&mut resource_manager, &peers, &requests);
+
+        let adjustment = resource_manager.adjust_topology(
+            &neighbor_locations,
+            &Some(my_location),
+            Instant::now(),
+            peers.len(),
+        );
+
+        match &adjustment {
+            TopologyAdjustment::RemoveConnections(removed) => {
+                assert_eq!(removed.len(), 1);
+                // The removed peer should NOT be the isolated one
+                assert_ne!(
+                    removed[0], isolated_peer,
+                    "Should not prune topology-critical peer (isolated at long distance)"
+                );
+            }
+            _ => {
+                // NoChange or AddConnections are also acceptable —
+                // the key assertion is that the isolated peer is NOT removed
+            }
+        }
+    }
+
+    /// Test that the fallback removal picks the least topologically important
+    /// peer rather than the most distant.
+    #[test]
+    fn test_fallback_peer_to_drop_uses_topology() {
+        let my_loc = Location::new(0.5);
+
+        // Create three peers:
+        // - A distant peer that is the ONLY long-range connection (topology-critical)
+        // - Two close peers that are redundant with each other
+        let mut neighbor_locations = BTreeMap::new();
+
+        // Two very close peers (redundant with each other)
+        let close_loc_1 = Location::new(0.51);
+        let close_loc_2 = Location::new(0.512);
+        let close_peer_1 = PeerKeyLocation::random();
+        let close_peer_2 = PeerKeyLocation::random();
+
+        // One distant peer (unique long-range link)
+        let far_loc = Location::new(0.9);
+        let far_peer = PeerKeyLocation::random();
+
+        neighbor_locations.insert(close_loc_1, vec![Connection::new(close_peer_1.clone())]);
+        neighbor_locations.insert(close_loc_2, vec![Connection::new(close_peer_2.clone())]);
+        neighbor_locations.insert(far_loc, vec![Connection::new(far_peer.clone())]);
+
+        let dropped = select_fallback_peer_to_drop(&neighbor_locations, &Some(my_loc));
+        let dropped = dropped.expect("Should select a peer to drop");
+
+        // The old logic would drop the most distant (far_peer).
+        // The new logic should drop one of the close, redundant peers.
+        assert_ne!(
+            dropped, far_peer,
+            "Should NOT drop the distant peer (topology-critical unique long-range link)"
+        );
     }
 }
 
