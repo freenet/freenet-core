@@ -190,7 +190,10 @@ pub(crate) fn gap_target(
 /// the largest gap perfectly gets the highest possible score.
 ///
 /// Candidates outside [D_MIN, D_MAX] score 0 — they don't contribute to
-/// small-world routing.
+/// small-world routing. Note: D_MIN also provides a weak Sybil/eclipse
+/// defense floor (co-located peers below D_MIN score 0), but the primary
+/// defense is IP-based location hashing which prevents attackers from
+/// choosing arbitrary ring positions.
 ///
 /// This is O(N) where N is the number of existing connections.
 pub(crate) fn kleinberg_score(
