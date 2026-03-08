@@ -1973,6 +1973,82 @@ mod tests {
         }
     }
 
+    // --- Direct unit tests for topology_value and composite_score ---
+
+    #[test]
+    fn test_topology_value_few_connections_returns_default() {
+        // With fewer than 3 connections, topology_value returns 1.0 (average)
+        assert_eq!(topology_value(0.1, &[0.1, 0.2], 1), Some(1.0));
+        assert_eq!(topology_value(0.1, &[0.1], 1), Some(1.0));
+        assert_eq!(topology_value(0.1, &[], 1), Some(1.0));
+    }
+
+    #[test]
+    fn test_topology_value_collocated_peers_returns_zero() {
+        // When multiple peers share a location, removing one doesn't change
+        // topology — topology_value should be 0.0.
+        let distances = [0.01, 0.05, 0.1, 0.2];
+        assert_eq!(topology_value(0.01, &distances, 2), Some(0.0));
+        assert_eq!(topology_value(0.1, &distances, 3), Some(0.0));
+    }
+
+    #[test]
+    fn test_topology_value_critical_peer_returns_none() {
+        // An isolated peer at a unique position with large gaps on both sides.
+        // With 4 uniform points, expected_gap = 2/5 = 0.4.
+        // If removal creates gap > 2 * 0.4 = 0.8, it's critical.
+        let d_at = |u: f64| 0.001_f64 * 500.0_f64.powf(u);
+
+        // 4 points: at 0.1, 0.3, 0.5, 0.9 in log-space
+        // Removing 0.5 creates gap from 0.3 to 0.9 = 0.6
+        // expected_gap = 2/5 = 0.4, value = 0.6/0.4 = 1.5 — not critical
+        let distances = [d_at(0.1), d_at(0.3), d_at(0.5), d_at(0.9)];
+        assert!(topology_value(d_at(0.5), &distances, 1).is_some());
+
+        // Now: 3 clustered + 1 isolated.
+        // Points at 0.01, 0.02, 0.03, 0.95 in log-space.
+        // Removing 0.95 creates gap from 0.03 to 1.0 = 0.97
+        // expected_gap = 2/5 = 0.4, value = 0.97/0.4 = 2.425 > 2.0 — critical!
+        let distances2 = [d_at(0.01), d_at(0.02), d_at(0.03), d_at(0.95)];
+        assert!(topology_value(d_at(0.95), &distances2, 1).is_none());
+    }
+
+    #[test]
+    fn test_composite_score_returns_none_for_critical() {
+        let d_at = |u: f64| 0.001_f64 * 500.0_f64.powf(u);
+        let distances = [d_at(0.01), d_at(0.02), d_at(0.03), d_at(0.95)];
+
+        // Critical peer → None regardless of routing value
+        assert!(composite_score(1.0, d_at(0.95), &distances, 1).is_none());
+        assert!(composite_score(0.0, d_at(0.95), &distances, 1).is_none());
+    }
+
+    #[test]
+    fn test_composite_score_balances_routing_and_topology() {
+        let d_at = |u: f64| 0.001_f64 * 500.0_f64.powf(u);
+
+        // 4 evenly-spaced points in log-space
+        let distances = [d_at(0.2), d_at(0.4), d_at(0.6), d_at(0.8)];
+
+        // High routing, average topology
+        let score_high_routing = composite_score(1.0, d_at(0.4), &distances, 1).unwrap();
+        // Low routing, average topology
+        let score_low_routing = composite_score(0.0, d_at(0.4), &distances, 1).unwrap();
+
+        // Higher routing value → higher composite score (less likely to prune)
+        assert!(
+            score_high_routing > score_low_routing,
+            "High routing ({score_high_routing}) should score higher than low ({score_low_routing})"
+        );
+
+        // Both components should contribute meaningfully (not just routing-dominated)
+        let diff = score_high_routing - score_low_routing;
+        assert!(
+            diff <= 1.0 + f64::EPSILON,
+            "Routing component should be at most 1.0, got diff={diff}"
+        );
+    }
+
     /// Test that the fallback removal picks the least topologically important
     /// peer rather than the most distant.
     #[test]
