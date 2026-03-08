@@ -30,8 +30,8 @@
 //! probability is proportional to how much the largest gap in log-distance space
 //! exceeds the expected gap for an ideal distribution (`ln(k)/k` for k connections).
 //! This makes swaps self-limiting: frequent when topology is poor, rare when it's
-//! good. The connection to drop is the one with the fewest routed requests
-//! (least useful to the routing algorithm).
+//! good. The connection to drop is the one with the lowest composite score
+//! of normalized routing value and topology importance.
 //!
 //! ## Accepting Incoming Connections
 //!
@@ -555,81 +555,96 @@ impl TopologyManager {
             None => Vec::new(),
         };
 
-        let mut worst: Option<(PeerKeyLocation, f64)> = None;
+        // Build a peer-location index for O(1) lookup (avoids O(N²) scan).
+        let peer_to_distance: std::collections::HashMap<PeerKeyLocation, f64> = match my_location {
+            Some(my_loc) => neighbor_locations
+                .iter()
+                .flat_map(|(loc, conns)| {
+                    let dist = my_loc.distance(*loc).as_f64();
+                    conns.iter().map(move |c| (c.location.clone(), dist))
+                })
+                .collect(),
+            None => std::collections::HashMap::new(),
+        };
+
+        // Pass 1: collect candidates with raw routing values and distances.
+        struct Candidate {
+            peer: PeerKeyLocation,
+            routing_value: f64,
+            peer_distance: Option<f64>,
+        }
+        let mut candidates = Vec::new();
 
         for (source, source_usage) in self
             .meter
             .get_usage_rates(exceeded_usage_for_resource_type, at_time)
         {
-            let loop_span = span!(Level::DEBUG, "source_loop", ?source);
-            let _loop_enter = loop_span.enter();
-
-            event!(Level::DEBUG, "Checking source");
-
             if let Some(creation_time) = self.source_creation_times.get(&source) {
                 if Instant::now().duration_since(*creation_time) <= SOURCE_RAMP_UP_DURATION {
-                    event!(Level::DEBUG, "Source is in ramp-up time, skipping");
                     continue;
                 }
             } else {
-                event!(Level::DEBUG, "No creation time for source, skipping");
                 continue;
             }
 
-            match source {
-                AttributionSource::Peer(peer) => {
-                    let peer_span = span!(Level::DEBUG, "peer_processing", ?peer);
-                    let _peer_enter = peer_span.enter();
+            if let AttributionSource::Peer(peer) = source {
+                let request_count = self.outbound_request_counter.get_request_count(&peer) as f64;
+                let routing_value = request_count / source_usage.per_second();
+                let peer_distance = peer_to_distance.get(&peer).copied();
 
-                    let request_count =
-                        self.outbound_request_counter.get_request_count(&peer) as f64;
+                candidates.push(Candidate {
+                    peer,
+                    routing_value,
+                    peer_distance,
+                });
+            }
+        }
 
-                    let routing_value = request_count / source_usage.per_second();
+        // Normalize routing values to [0, 1] so they're comparable with topology_value.
+        let max_routing = candidates
+            .iter()
+            .map(|c| c.routing_value)
+            .fold(0.0_f64, f64::max);
 
-                    // Look up the peer's ring location from neighbor_locations
-                    // (authoritative) rather than from peer.location() (which
-                    // may differ if the address-to-location mapping changed).
-                    let peer_distance = my_location.and_then(|my_loc| {
-                        neighbor_locations
-                            .iter()
-                            .find(|(_, conns)| conns.iter().any(|c| c.location == peer))
-                            .map(|(loc, _)| my_loc.distance(*loc).as_f64())
-                    });
+        // Pass 2: compute composite scores with normalized routing values.
+        let mut worst: Option<(PeerKeyLocation, f64)> = None;
 
-                    let effective_value = match peer_distance {
-                        Some(dist) => match composite_score(routing_value, dist, &all_distances) {
-                            Some(score) => score,
-                            None => {
-                                event!(Level::DEBUG, "Peer is topology-critical, skipping");
-                                continue;
-                            }
-                        },
-                        // No own location or peer not found — use routing value
-                        // with default topology (1.0)
-                        None => routing_value + TOPOLOGY_WEIGHT,
-                    };
+        for c in &candidates {
+            let normalized_routing = if max_routing > 0.0 {
+                c.routing_value / max_routing
+            } else {
+                0.0
+            };
 
-                    event!(
-                        Level::DEBUG,
-                        request_count,
-                        usage = source_usage.per_second(),
-                        routing_value,
-                        effective_value,
-                    );
-
-                    if let Some((_, worst_effective_value)) = worst {
-                        if effective_value < worst_effective_value {
-                            worst = Some((peer, effective_value));
-                            event!(Level::DEBUG, "Found a worse peer");
+            let effective_value = match c.peer_distance {
+                Some(dist) => {
+                    match composite_score(normalized_routing, dist, &all_distances) {
+                        Some(score) => score,
+                        None => {
+                            // Topology-critical — skip
+                            continue;
                         }
-                    } else {
-                        worst = Some((peer, effective_value));
-                        event!(Level::DEBUG, "Setting initial worst peer");
                     }
                 }
-                _ => {
-                    event!(Level::DEBUG, "Non-peer source, skipping");
+                // No own location or peer not found — use normalized routing
+                // with default topology (1.0)
+                None => normalized_routing + TOPOLOGY_WEIGHT,
+            };
+
+            event!(
+                Level::DEBUG,
+                routing_value = c.routing_value,
+                normalized_routing,
+                effective_value,
+                peer = ?c.peer,
+            );
+
+            if let Some((_, worst_effective_value)) = worst {
+                if effective_value < worst_effective_value {
+                    worst = Some((c.peer.clone(), effective_value));
                 }
+            } else {
+                worst = Some((c.peer.clone(), effective_value));
             }
         }
 
@@ -648,7 +663,8 @@ impl TopologyManager {
     /// log-distance space, compares it to the expected gap for an ideal
     /// Kleinberg distribution, and triggers a swap with probability
     /// proportional to the excess. The connection to drop is the one with
-    /// the fewest routed requests (least useful to the routing algorithm).
+    /// the lowest composite score of normalized routing value and topology
+    /// importance, respecting the topology guard for critical connections.
     fn maybe_swap_connection(
         &self,
         my_location: &Option<Location>,
@@ -707,18 +723,36 @@ impl TopologyManager {
             return TopologyAdjustment::NoChange;
         }
 
-        // Find the best peer to drop: lowest composite score of routing
-        // value and topology importance, respecting the topology guard.
-        let remove = neighbor_locations
+        // Collect raw routing values for normalization.
+        let peers_with_routing: Vec<_> = neighbor_locations
             .iter()
             .flat_map(|(loc, conns)| conns.iter().map(move |conn| (loc, conn)))
-            .filter_map(|(loc, conn)| {
+            .map(|(loc, conn)| {
                 let peer_dist = my_loc.distance(*loc).as_f64();
                 let routing_value = self
                     .outbound_request_counter
                     .get_request_count(&conn.location) as f64;
-                let score = composite_score(routing_value, peer_dist, &distances)?;
-                Some((conn.location.clone(), score))
+                (conn.location.clone(), peer_dist, routing_value)
+            })
+            .collect();
+
+        let max_routing = peers_with_routing
+            .iter()
+            .map(|(_, _, rv)| *rv)
+            .fold(0.0_f64, f64::max);
+
+        // Find the best peer to drop: lowest composite score of normalized
+        // routing value and topology importance, respecting the topology guard.
+        let remove = peers_with_routing
+            .into_iter()
+            .filter_map(|(peer, peer_dist, routing_value)| {
+                let normalized = if max_routing > 0.0 {
+                    routing_value / max_routing
+                } else {
+                    0.0
+                };
+                let score = composite_score(normalized, peer_dist, &distances)?;
+                Some((peer, score))
             })
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
             .map(|(peer, _)| peer);
@@ -807,10 +841,15 @@ fn topology_value(peer_distance: f64, all_distances: &[f64]) -> Option<f64> {
 
 /// Compute the composite pruning score for a peer: lower = more likely to prune.
 ///
+/// `normalized_routing` should be in [0, 1] (divided by max routing value among peers).
 /// Returns `None` if the peer is topology-critical and should not be pruned.
-fn composite_score(routing_value: f64, peer_distance: f64, all_distances: &[f64]) -> Option<f64> {
+fn composite_score(
+    normalized_routing: f64,
+    peer_distance: f64,
+    all_distances: &[f64],
+) -> Option<f64> {
     let topo = topology_value(peer_distance, all_distances)?;
-    Some(routing_value + TOPOLOGY_WEIGHT * topo)
+    Some(normalized_routing + TOPOLOGY_WEIGHT * topo)
 }
 
 /// Select the least topologically important peer to drop as a fallback.
