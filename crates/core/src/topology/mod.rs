@@ -827,7 +827,7 @@ mod tests {
     fn random_location(this_peer_location: &Location) -> Location {
         use crate::config::GlobalRng;
         tracing::debug!("Generating random location");
-        let distance = small_world_rand::test_utils::random_link_distance(Distance::new(0.01));
+        let distance = small_world_rand::test_utils::random_link_distance(Distance::new(0.001));
         let location_f64 = if GlobalRng::random_bool(0.5) {
             this_peer_location.as_f64() - distance.as_f64()
         } else {
@@ -1624,7 +1624,7 @@ mod tests {
 
         // Create 10 peers evenly distributed in log-distance space.
         let my_location = Location::new(0.5);
-        let d_at = |u: f64| 0.01_f64 * (0.5_f64 / 0.01).powf(u); // D_MIN * (D_MAX/D_MIN)^u
+        let d_at = |u: f64| 0.001_f64 * (0.5_f64 / 0.001).powf(u); // D_MIN_TARGET * (D_MAX/D_MIN_TARGET)^u
         let mut neighbor_locations = BTreeMap::new();
         for i in 0..10 {
             let u = (i as f64 + 0.5) / 10.0; // evenly spaced in [0, 1]
