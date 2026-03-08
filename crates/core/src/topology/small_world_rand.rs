@@ -470,8 +470,8 @@ mod tests {
     fn gap_target_all_distances_outside_range() {
         let _guard = crate::config::GlobalRng::seed_guard(0xFEED_FACE);
         let my_loc = Location::new(0.5);
-        // All distances outside [D_MIN=0.01, D_MAX=0.5] — should fallback
-        let existing = [0.001, 0.002, 0.7];
+        // All distances outside [D_MIN=0.001, D_MAX=0.5] — should fallback
+        let existing = [0.0001, 0.0005, 0.7];
         for _ in 0..100 {
             let target = gap_target(my_loc, existing.iter().copied());
             let v = target.as_f64();
