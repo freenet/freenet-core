@@ -157,9 +157,8 @@ use super::{DEFAULT_MAX_MEMORY_PAGES, WASM_PAGE_SIZE};
 /// compilation. Others block on the per-hash mutex, then their `Module::new()`
 /// call hits the wasmtime disk cache (near-instant deserialization).
 ///
-/// Keyed by blake3 hash of the raw WASM bytes. Entries are never cleaned up
-/// but bounded by the number of unique contracts (~100 in production, <10 KB
-/// total memory).
+/// Keyed by blake3 hash of the raw WASM bytes. Entries are removed after
+/// compilation when no other thread is waiting, preventing unbounded growth.
 fn compile_coalesce_map() -> &'static DashMap<[u8; 32], Arc<Mutex<()>>> {
     static MAP: OnceLock<DashMap<[u8; 32], Arc<Mutex<()>>>> = OnceLock::new();
     MAP.get_or_init(DashMap::new)
@@ -301,10 +300,20 @@ impl WasmEngine for WasmtimeEngine {
         // to the disk cache; others block here and then get a near-instant
         // disk cache hit from Module::new().
         let hash = *blake3::hash(code).as_bytes();
-        let mutex = compile_coalesce_map().entry(hash).or_default().clone();
+        let map = compile_coalesce_map();
+        let mutex = map.entry(hash).or_default().clone();
         let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
 
-        Module::new(&self.engine, code).map_err(|e| WasmError::Compile(e.to_string()))
+        let result = Module::new(&self.engine, code).map_err(|e| WasmError::Compile(e.to_string()));
+
+        // Clean up when no other thread holds or is waiting on this entry.
+        // If another thread grabbed a clone between our entry() and lock(),
+        // strong_count > 1 and we leave the entry for them to clean up.
+        if Arc::strong_count(&mutex) == 1 {
+            map.remove(&hash);
+        }
+
+        result
     }
 
     fn module_has_async_imports(&self, module: &Module) -> bool {
