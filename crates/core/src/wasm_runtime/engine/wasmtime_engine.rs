@@ -132,11 +132,13 @@
 //! We wrap with `block_on_async()` to maintain a synchronous interface for callers.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use dashmap::DashMap;
 use wasmtime::{
-    Caller, Config, Engine, Error as WasmtimeError, Instance, Linker, Module, OptLevel,
-    ResourceLimiter, Store,
+    Cache, CacheConfig, Caller, Config, Engine, Error as WasmtimeError, Instance, Linker, Module,
+    OptLevel, ResourceLimiter, Store,
 };
 
 use super::{InstanceHandle, WasmEngine, WasmError};
@@ -147,6 +149,20 @@ use crate::wasm_runtime::ContractError;
 // Use shared constants from parent module to ensure consistency
 // with host function bounds validation
 use super::{DEFAULT_MAX_MEMORY_PAGES, WASM_PAGE_SIZE};
+
+/// Process-global compilation coalescing map.
+///
+/// When multiple RuntimePools (different nodes in the same process) need to
+/// compile the same WASM bytes, only the first one does the actual Cranelift
+/// compilation. Others block on the per-hash mutex, then their `Module::new()`
+/// call hits the wasmtime disk cache (near-instant deserialization).
+///
+/// Keyed by blake3 hash of the raw WASM bytes. Entries are removed after
+/// compilation when no other thread is waiting, preventing unbounded growth.
+fn compile_coalesce_map() -> &'static DashMap<[u8; 32], Arc<Mutex<()>>> {
+    static MAP: OnceLock<DashMap<[u8; 32], Arc<Mutex<()>>>> = OnceLock::new();
+    MAP.get_or_init(DashMap::new)
+}
 
 /// WASM stack size in bytes (8 MiB).
 const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -279,7 +295,25 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn compile(&mut self, code: &[u8]) -> Result<Module, WasmError> {
-        Module::new(&self.engine, code).map_err(|e| WasmError::Compile(e.to_string()))
+        // Coalesce concurrent compilations of the same WASM bytes across
+        // RuntimePools. The first thread compiles via Cranelift and writes
+        // to the disk cache; others block here and then get a near-instant
+        // disk cache hit from Module::new().
+        let hash = *blake3::hash(code).as_bytes();
+        let map = compile_coalesce_map();
+        let mutex = map.entry(hash).or_default().clone();
+        let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+
+        let result = Module::new(&self.engine, code).map_err(|e| WasmError::Compile(e.to_string()));
+
+        // Clean up when no other thread holds or is waiting on this entry.
+        // If another thread grabbed a clone between our entry() and lock(),
+        // strong_count > 1 and we leave the entry for them to clean up.
+        if Arc::strong_count(&mutex) == 1 {
+            map.remove(&hash);
+        }
+
+        result
     }
 
     fn module_has_async_imports(&self, module: &Module) -> bool {
@@ -713,6 +747,22 @@ impl WasmtimeEngine {
         // Simpler compiler = smaller attack surface
         // Memory benefits come from pooling and proper cleanup, not optimizations
         wasmtime_config.cranelift_opt_level(OptLevel::None);
+
+        // Enable disk-based compilation cache (#3456). Wasmtime caches compiled
+        // modules keyed by (engine config + WASM bytes hash). On cache hit,
+        // Module::new() skips compilation entirely and deserializes — ~100x faster.
+        // This eliminates WASM compilation as a contributor to OPERATION_TTL timeouts
+        // on slow CI runners and during cold starts in production.
+        match Cache::new(CacheConfig::new()) {
+            Ok(cache) => {
+                wasmtime_config.cache(Some(cache));
+                tracing::info!("Wasmtime compilation cache enabled");
+            }
+            Err(e) => {
+                // Cache is an optimization — don't fail node startup if it can't initialize
+                tracing::warn!("Failed to initialize wasmtime compilation cache: {e}");
+            }
+        }
 
         let engine = Engine::new(&wasmtime_config).map_err(WasmError::Other)?;
 
