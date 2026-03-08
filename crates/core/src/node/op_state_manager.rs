@@ -1526,8 +1526,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // selected peer is unreachable or drops the request.
                 //
                 // 20s chosen to be long enough for a normal response round-trip
-                // (including streaming) but short enough to retry 2-3 times before
-                // the 60s OPERATION_TTL expires.
+                // (including streaming) but short enough to retry multiple times
+                // before OPERATION_TTL expires.
                 const GET_RETRY_THRESHOLD: Duration = Duration::from_secs(20);
                 {
                     // Clean up entries for completed operations
