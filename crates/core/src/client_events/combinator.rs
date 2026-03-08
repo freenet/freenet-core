@@ -318,7 +318,9 @@ async fn client_fn(
                                 consecutive_errors,
                                 "Too many consecutive transient errors, shutting down client slot: {err}"
                             );
-                            let _ = tx_host.send(Err(err)).await;
+                            if let Err(e) = tx_host.send(Err(err)).await {
+                                tracing::debug!(error = %e, "failed to notify host of error limit");
+                            }
                             break;
                         }
                         tracing::warn!("Transient client error (continuing): {err}");
@@ -627,19 +629,7 @@ mod test {
     }
 
     impl ErrorThenOkProxy {
-        fn new(id: usize, error_kind: ErrorKind, rx: Receiver<usize>, tx: Sender<usize>) -> Self {
-            Self {
-                errors: VecDeque::from([error_kind]),
-                inner: SampleProxy::new(id, rx, tx),
-            }
-        }
-
-        fn with_errors(
-            id: usize,
-            errors: Vec<ErrorKind>,
-            rx: Receiver<usize>,
-            tx: Sender<usize>,
-        ) -> Self {
+        fn new(id: usize, errors: Vec<ErrorKind>, rx: Receiver<usize>, tx: Sender<usize>) -> Self {
             Self {
                 errors: VecDeque::from(errors),
                 inner: SampleProxy::new(id, rx, tx),
@@ -676,12 +666,11 @@ mod test {
 
         let proxy = Box::new(ErrorThenOkProxy::new(
             0,
-            ErrorKind::NodeUnavailable,
+            vec![ErrorKind::NodeUnavailable],
             rx_trigger,
             tx_response,
         )) as BoxedClient;
 
-        // Use a 1-element combinator for simplicity
         let mut combinator = ClientEventsCombinator::new([proxy]);
 
         // First recv should get the forwarded NodeUnavailable error (not hang forever)
@@ -710,12 +699,12 @@ mod test {
     /// Test that fatal errors (Shutdown) still kill the client slot as expected.
     #[tokio::test]
     async fn test_fatal_error_kills_client_slot() {
-        let (tx_trigger, rx_trigger) = channel(1);
+        let (_tx_trigger, rx_trigger) = channel(1);
         let (tx_response, _rx_response) = channel(1);
 
         let proxy = Box::new(ErrorThenOkProxy::new(
             0,
-            ErrorKind::Shutdown,
+            vec![ErrorKind::Shutdown],
             rx_trigger,
             tx_response,
         )) as BoxedClient;
@@ -751,10 +740,9 @@ mod test {
         let (tx_trigger, rx_trigger) = channel(1);
         let (tx_response, _rx_response) = channel(1);
 
-        let errors = vec![ErrorKind::NodeUnavailable; 5];
-        let proxy = Box::new(ErrorThenOkProxy::with_errors(
+        let proxy = Box::new(ErrorThenOkProxy::new(
             0,
-            errors,
+            vec![ErrorKind::NodeUnavailable; 5],
             rx_trigger,
             tx_response,
         )) as BoxedClient;
