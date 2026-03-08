@@ -283,18 +283,13 @@ async fn client_fn(
                             break;
                         }
                     }
-                    Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) => {
-                        tracing::debug!("disconnected client");
-                        if let Err(e) = tx_host.send(Err(err)).await {
-                            tracing::debug!(error = %e, "failed to notify host of client disconnect");
-                        }
-                        break;
-                    }
                     Err(err) if matches!(
                         err.kind(),
-                        ErrorKind::Shutdown | ErrorKind::TransportProtocolDisconnect
+                        ErrorKind::ChannelClosed
+                            | ErrorKind::Shutdown
+                            | ErrorKind::TransportProtocolDisconnect
                     ) => {
-                        // Fatal errors: the node is shutting down or the transport is dead.
+                        // Fatal: client disconnected, node shutting down, or transport dead.
                         tracing::warn!("Fatal client error, shutting down client slot: {err}");
                         if let Err(e) = tx_host.send(Err(err)).await {
                             tracing::debug!(error = %e, "failed to notify host of fatal error");
@@ -304,10 +299,9 @@ async fn client_fn(
                     Err(err) => {
                         // Transient per-connection errors (NodeUnavailable, UnknownClient,
                         // DeserializationError, etc.) should NOT kill the entire client slot.
-                        // Forward to host for logging and continue accepting connections.
+                        // Forward to host and continue accepting connections.
                         tracing::warn!("Transient client error (continuing): {err}");
                         if tx_host.send(Err(err)).await.is_err() {
-                            // Host channel closed — we should exit
                             break;
                         }
                     }
@@ -603,23 +597,17 @@ mod test {
         }
     }
 
-    /// A proxy that returns a configurable error on first recv(), then works normally.
+    /// A proxy that returns a configurable error on first recv(), then delegates to SampleProxy.
     struct ErrorThenOkProxy {
-        error_sent: bool,
-        error_kind: ErrorKind,
-        rx: Receiver<usize>,
-        tx: Sender<usize>,
-        id: usize,
+        error_kind: Option<ErrorKind>,
+        inner: SampleProxy,
     }
 
     impl ErrorThenOkProxy {
         fn new(id: usize, error_kind: ErrorKind, rx: Receiver<usize>, tx: Sender<usize>) -> Self {
             Self {
-                error_sent: false,
-                error_kind,
-                rx,
-                tx,
-                id,
+                error_kind: Some(error_kind),
+                inner: SampleProxy::new(id, rx, tx),
             }
         }
     }
@@ -627,35 +615,19 @@ mod test {
     impl ClientEventsProxy for ErrorThenOkProxy {
         fn recv(&mut self) -> BoxFuture<'_, crate::client_events::HostIncomingMsg> {
             Box::pin(async {
-                if !self.error_sent {
-                    self.error_sent = true;
-                    return Err(self.error_kind.clone().into());
+                if let Some(kind) = self.error_kind.take() {
+                    return Err(kind.into());
                 }
-                let id = self
-                    .rx
-                    .recv()
-                    .await
-                    .ok_or_else::<ClientError, _>(|| ErrorKind::ChannelClosed.into())?;
-                assert_eq!(id, self.id);
-                Ok(OpenRequest::new(
-                    ClientId::next(),
-                    Box::new(ClientRequest::Disconnect { cause: None }),
-                ))
+                self.inner.recv().await
             })
         }
 
         fn send(
             &mut self,
-            _id: ClientId,
-            _response: Result<HostResponse, ClientError>,
+            id: ClientId,
+            response: Result<HostResponse, ClientError>,
         ) -> BoxFuture<'_, Result<(), ClientError>> {
-            async {
-                self.tx
-                    .send(self.id)
-                    .await
-                    .map_err(|_| ErrorKind::ChannelClosed.into())
-            }
-            .boxed()
+            self.inner.send(id, response)
         }
     }
 
