@@ -586,7 +586,7 @@ impl TopologyManager {
             .get_usage_rates(exceeded_usage_for_resource_type, at_time)
         {
             if let Some(creation_time) = self.source_creation_times.get(&source) {
-                if Instant::now().duration_since(*creation_time) <= SOURCE_RAMP_UP_DURATION {
+                if at_time.duration_since(*creation_time) <= SOURCE_RAMP_UP_DURATION {
                     continue;
                 }
             } else {
