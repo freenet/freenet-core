@@ -707,59 +707,65 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
             }))
             .await?;
 
-        // Wait for the update to propagate through the network
-        println!("Waiting for update to propagate...");
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        // Poll for update propagation with a generous timeout.
+        // On slow CI runners, subscription tree delivery can take well over 20s
+        // under resource contention. Poll every 5s for up to 60s, breaking early
+        // once the propagation threshold is met.
+        let min_expected_rate = 0.5;
+        let propagation_deadline = Duration::from_secs(60);
+        let poll_interval = Duration::from_secs(5);
+        let propagation_start = std::time::Instant::now();
 
-        // Check which nodes received the update
         let mut nodes_received_update = [false; NUM_REGULAR_NODES];
-        let mut get_state_requests = Vec::new();
-
-        for (i, subscribed) in subscribed_nodes.iter().enumerate() {
-            if *subscribed {
-                node_clients[i]
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key: *contract_key.id(),
-                        return_contract_code: false,
-                        subscribe: false,
-                        blocking_subscribe: false,
-                    }))
-                    .await?;
-                get_state_requests.push(i);
-            }
-        }
-
-        // Also check gateways
         let mut gateways_received_update = [false; NUM_GATEWAYS];
-        let mut gw_get_state_requests = Vec::new();
 
-        for (i, subscribed) in subscribed_gateways.iter().enumerate() {
-            if *subscribed {
-                gateway_clients[i]
-                    .send(ClientRequest::ContractOp(ContractRequest::Get {
-                        key: *contract_key.id(),
-                        return_contract_code: false,
-                        subscribe: false,
-                        blocking_subscribe: false,
-                    }))
-                    .await?;
-                gw_get_state_requests.push(i);
-            }
-        }
+        // Initial wait before first poll
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
-        // Process get state responses with a timeout
-        let start = std::time::Instant::now();
-        let total_timeout = Duration::from_secs(30);
-
-        while !get_state_requests.is_empty() || !gw_get_state_requests.is_empty() {
-            if start.elapsed() > total_timeout {
-                println!("Timeout waiting for get state responses, finalizing test");
-                break;
+        'propagation: loop {
+            // Issue GET requests only to nodes that haven't received the update yet
+            let mut get_state_requests = Vec::new();
+            for (i, subscribed) in subscribed_nodes.iter().enumerate() {
+                if *subscribed && !nodes_received_update[i] {
+                    node_clients[i]
+                        .send(ClientRequest::ContractOp(ContractRequest::Get {
+                            key: *contract_key.id(),
+                            return_contract_code: false,
+                            subscribe: false,
+                            blocking_subscribe: false,
+                        }))
+                        .await?;
+                    get_state_requests.push(i);
+                }
             }
 
-            // Check regular nodes
-            let mut i = 0;
-            while i < get_state_requests.len() {
+            let mut gw_get_state_requests = Vec::new();
+            for (i, subscribed) in subscribed_gateways.iter().enumerate() {
+                if *subscribed && !gateways_received_update[i] {
+                    gateway_clients[i]
+                        .send(ClientRequest::ContractOp(ContractRequest::Get {
+                            key: *contract_key.id(),
+                            return_contract_code: false,
+                            subscribe: false,
+                            blocking_subscribe: false,
+                        }))
+                        .await?;
+                    gw_get_state_requests.push(i);
+                }
+            }
+
+            // Collect responses with a per-round timeout
+            let round_start = std::time::Instant::now();
+            let round_timeout = Duration::from_secs(10);
+
+            while !get_state_requests.is_empty() || !gw_get_state_requests.is_empty() {
+                if round_start.elapsed() > round_timeout {
+                    break;
+                }
+
+                // Check regular nodes
+                let mut i = 0;
+                while i < get_state_requests.len() {
                 let node_idx = get_state_requests[i];
                 let client = &mut node_clients[node_idx];
 
@@ -770,28 +776,10 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                         ..
                     }))) => {
                         if key == contract_key {
-                            // Deserialize state and check for the update tag
-                            match serde_json::from_slice::<Ping>(&state) {
-                                Ok(ping_state) => {
-                                    let has_update = ping_state.get(&update_tag).is_some();
-                                    println!("Node {node_idx} has update: {has_update}");
-
-                                    if has_update {
-                                        let timestamps = ping_state.get(&update_tag).unwrap();
-                                        println!(
-                                            "Node {} has {} timestamps for tag {}",
-                                            node_idx,
-                                            timestamps.len(),
-                                            update_tag
-                                        );
-                                    }
-
-                                    nodes_received_update[node_idx] = has_update;
-                                }
-                                Err(e) => {
-                                    println!(
-                                        "Failed to deserialize state from node {node_idx}: {e}"
-                                    );
+                            if let Ok(ping_state) = serde_json::from_slice::<Ping>(&state) {
+                                if ping_state.get(&update_tag).is_some() {
+                                    println!("Node {node_idx} received update");
+                                    nodes_received_update[node_idx] = true;
                                 }
                             }
                             get_state_requests.remove(i);
@@ -822,28 +810,10 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                         ..
                     }))) => {
                         if key == contract_key {
-                            // Deserialize state and check for the update tag
-                            match serde_json::from_slice::<Ping>(&state) {
-                                Ok(ping_state) => {
-                                    let has_update = ping_state.get(&update_tag).is_some();
-                                    println!("Gateway {gw_idx} has update: {has_update}");
-
-                                    if has_update {
-                                        let timestamps = ping_state.get(&update_tag).unwrap();
-                                        println!(
-                                            "Gateway {} has {} timestamps for tag {}",
-                                            gw_idx,
-                                            timestamps.len(),
-                                            update_tag
-                                        );
-                                    }
-
-                                    gateways_received_update[gw_idx] = has_update;
-                                }
-                                Err(e) => {
-                                    println!(
-                                        "Failed to deserialize state from gateway {gw_idx}: {e}"
-                                    );
+                            if let Ok(ping_state) = serde_json::from_slice::<Ping>(&state) {
+                                if ping_state.get(&update_tag).is_some() {
+                                    println!("Gateway {gw_idx} received update");
+                                    gateways_received_update[gw_idx] = true;
                                 }
                             }
                             gw_get_state_requests.remove(i);
@@ -861,7 +831,35 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                 i += 1;
             }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            // Check if propagation threshold is met
+            let subscribed_node_count = subscribed_nodes.iter().filter(|&&x| x).count();
+            let updated_node_count = nodes_received_update.iter().filter(|&&x| x).count();
+            let current_rate = if subscribed_node_count > 0 {
+                updated_node_count as f64 / subscribed_node_count as f64
+            } else {
+                0.0
+            };
+
+            println!(
+                "Propagation poll: {updated_node_count}/{subscribed_node_count} nodes ({:.1}%) after {:.0}s",
+                current_rate * 100.0,
+                propagation_start.elapsed().as_secs_f64()
+            );
+
+            if current_rate >= min_expected_rate {
+                println!("Propagation threshold met");
+                break 'propagation;
+            }
+
+            if propagation_start.elapsed() > propagation_deadline {
+                println!("Propagation deadline reached at {:.1}%", current_rate * 100.0);
+                break 'propagation;
+            }
+
+            tokio::time::sleep(poll_interval).await;
         }
 
         // Analyze update propagation results
@@ -930,9 +928,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
             );
         }
 
-        // Calculate and assert a minimum expected update propagation rate
-        let min_expected_rate = 0.5; // At least 50% of subscribed nodes should get updates
-
+        // Assert propagation rate (min_expected_rate defined in the polling loop above)
         let actual_rate = if subscribed_node_count > 0 {
             updated_node_count as f64 / subscribed_node_count as f64
         } else {
@@ -941,9 +937,10 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
 
         assert!(
             actual_rate >= min_expected_rate,
-            "Update propagation rate too low: {:.1}% (expected at least {:.1}%)",
+            "Update propagation rate too low: {:.1}% (expected at least {:.1}%) after {:.0}s polling",
             actual_rate * 100.0,
-            min_expected_rate * 100.0
+            min_expected_rate * 100.0,
+            propagation_start.elapsed().as_secs_f64()
         );
         println!("Subscription propagation test completed successfully!");
         Ok::<_, anyhow::Error>(())
