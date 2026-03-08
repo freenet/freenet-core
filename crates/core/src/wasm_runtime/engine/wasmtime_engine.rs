@@ -132,8 +132,10 @@
 //! We wrap with `block_on_async()` to maintain a synchronous interface for callers.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use dashmap::DashMap;
 use wasmtime::{
     Cache, CacheConfig, Caller, Config, Engine, Error as WasmtimeError, Instance, Linker, Module,
     OptLevel, ResourceLimiter, Store,
@@ -147,6 +149,21 @@ use crate::wasm_runtime::ContractError;
 // Use shared constants from parent module to ensure consistency
 // with host function bounds validation
 use super::{DEFAULT_MAX_MEMORY_PAGES, WASM_PAGE_SIZE};
+
+/// Process-global compilation coalescing map.
+///
+/// When multiple RuntimePools (different nodes in the same process) need to
+/// compile the same WASM bytes, only the first one does the actual Cranelift
+/// compilation. Others block on the per-hash mutex, then their `Module::new()`
+/// call hits the wasmtime disk cache (near-instant deserialization).
+///
+/// Keyed by blake3 hash of the raw WASM bytes. Entries are never cleaned up
+/// but bounded by the number of unique contracts (~100 in production, <10 KB
+/// total memory).
+fn compile_coalesce_map() -> &'static DashMap<[u8; 32], Arc<Mutex<()>>> {
+    static MAP: OnceLock<DashMap<[u8; 32], Arc<Mutex<()>>>> = OnceLock::new();
+    MAP.get_or_init(DashMap::new)
+}
 
 /// WASM stack size in bytes (8 MiB).
 const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -279,6 +296,14 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn compile(&mut self, code: &[u8]) -> Result<Module, WasmError> {
+        // Coalesce concurrent compilations of the same WASM bytes across
+        // RuntimePools. The first thread compiles via Cranelift and writes
+        // to the disk cache; others block here and then get a near-instant
+        // disk cache hit from Module::new().
+        let hash = *blake3::hash(code).as_bytes();
+        let mutex = compile_coalesce_map().entry(hash).or_default().clone();
+        let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+
         Module::new(&self.engine, code).map_err(|e| WasmError::Compile(e.to_string()))
     }
 
