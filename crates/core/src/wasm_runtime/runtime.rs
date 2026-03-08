@@ -357,7 +357,7 @@ impl Runtime {
             };
             let module = self.engine.compile(&code)?;
             // Re-check cache: another executor may have compiled this contract
-            // while we were blocked on the shared Engine Mutex during compilation.
+            // concurrently (wasmtime compilation is thread-safe).
             let mut cache = self.contract_modules.lock().unwrap();
             if let Some(existing) = cache.get(key).cloned() {
                 existing
@@ -405,7 +405,7 @@ impl Runtime {
             let code = delegate.code().as_ref().to_vec();
             let module = self.engine.compile(&code)?;
             // Re-check cache: another executor may have compiled this delegate
-            // while we were blocked on the shared Engine Mutex during compilation.
+            // concurrently (wasmtime compilation is thread-safe).
             let mut cache = self.delegate_modules.lock().unwrap();
             if let Some(existing) = cache.get(key).cloned() {
                 existing

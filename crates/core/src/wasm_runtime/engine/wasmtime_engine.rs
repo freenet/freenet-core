@@ -135,8 +135,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use wasmtime::{
-    Caller, Config, Engine, Error as WasmtimeError, Instance, Linker, Module, OptLevel,
-    ResourceLimiter, Store,
+    Cache, CacheConfig, Caller, Config, Engine, Error as WasmtimeError, Instance, Linker, Module,
+    OptLevel, ResourceLimiter, Store,
 };
 
 use super::{InstanceHandle, WasmEngine, WasmError};
@@ -713,6 +713,22 @@ impl WasmtimeEngine {
         // Simpler compiler = smaller attack surface
         // Memory benefits come from pooling and proper cleanup, not optimizations
         wasmtime_config.cranelift_opt_level(OptLevel::None);
+
+        // Enable disk-based compilation cache (#3456). Wasmtime caches compiled
+        // modules keyed by (engine config + WASM bytes hash). On cache hit,
+        // Module::new() skips compilation entirely and deserializes — ~100x faster.
+        // This eliminates WASM compilation as a contributor to OPERATION_TTL timeouts
+        // on slow CI runners and during cold starts in production.
+        match Cache::new(CacheConfig::new()) {
+            Ok(cache) => {
+                wasmtime_config.cache(Some(cache));
+                tracing::info!("Wasmtime compilation cache enabled");
+            }
+            Err(e) => {
+                // Cache is an optimization — don't fail node startup if it can't initialize
+                tracing::warn!("Failed to initialize wasmtime compilation cache: {e}");
+            }
+        }
 
         let engine = Engine::new(&wasmtime_config).map_err(WasmError::Other)?;
 
