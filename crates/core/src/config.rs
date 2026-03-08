@@ -40,6 +40,7 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 /// (if it applies, e.g. connect requests).
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
+/// How long an operation (GET, PUT, SUBSCRIBE, etc.) can run before timing out.
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
 /// Current version of the crate.

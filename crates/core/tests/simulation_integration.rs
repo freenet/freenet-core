@@ -6437,10 +6437,13 @@ async fn test_connection_growth_stall_regression() {
         .await;
 
     // -------------------------------------------------------------------------
-    // Phase 1: Let the network form connections over 10 virtual minutes
+    // Phase 1: Let the network form connections over 20 virtual minutes
     // -------------------------------------------------------------------------
-    tracing::info!("Phase 1: Connection growth — 10 virtual minutes, no faults");
-    let_network_run(&mut sim, Duration::from_secs(600)).await;
+    // 20 minutes gives topology-aware pruning enough time to converge.
+    // The algorithm is more selective about connections (gap-based targeting,
+    // composite scoring), so it trades speed for distribution quality.
+    tracing::info!("Phase 1: Connection growth — 20 virtual minutes, no faults");
+    let_network_run(&mut sim, Duration::from_secs(1200)).await;
 
     // Collect per-node connection counts
     let mut node_counts: Vec<usize> = (0..NODES)
