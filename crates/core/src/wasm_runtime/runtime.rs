@@ -356,8 +356,8 @@ impl Runtime {
                 ContractContainer::Wasm(_) | _ => unimplemented!(),
             };
             let module = self.engine.compile(&code)?;
-            // Re-check cache: another executor may have compiled this contract
-            // concurrently (wasmtime compilation is thread-safe).
+            // Re-check cache: the LRU lock was released before compilation,
+            // so another executor may have compiled and cached this contract.
             let mut cache = self.contract_modules.lock().unwrap();
             if let Some(existing) = cache.get(key).cloned() {
                 existing
@@ -404,8 +404,8 @@ impl Runtime {
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
             let code = delegate.code().as_ref().to_vec();
             let module = self.engine.compile(&code)?;
-            // Re-check cache: another executor may have compiled this delegate
-            // concurrently (wasmtime compilation is thread-safe).
+            // Re-check cache: the LRU lock was released before compilation,
+            // so another executor may have compiled and cached this delegate.
             let mut cache = self.delegate_modules.lock().unwrap();
             if let Some(existing) = cache.get(key).cloned() {
                 existing
