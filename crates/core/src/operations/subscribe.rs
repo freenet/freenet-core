@@ -915,7 +915,7 @@ async fn notify_abort_failure(
 /// avoids NAT timing window failures) or falls back to an address lookup. If a key
 /// is found, records the peer in both the downstream subscriber list and the interest
 /// manager so UPDATE broadcasts reach them immediately.
-fn register_downstream_subscriber(
+async fn register_downstream_subscriber(
     op_manager: &OpManager,
     key: &ContractKey,
     requester_addr: std::net::SocketAddr,
@@ -946,6 +946,15 @@ fn register_downstream_subscriber(
             op_manager
                 .interest_manager
                 .register_peer_interest(key, peer_key, None, false);
+            // Track downstream subscriber count in local_interests so
+            // has_local_interest() returns true on relay nodes. Without this,
+            // relay nodes reject ChangeInterests messages from peers
+            // (gate at node/mod.rs), breaking interest-based broadcast targeting.
+            let became_interested = op_manager.interest_manager.add_downstream_subscriber(key);
+            if became_interested {
+                // Broadcast that we're now interested in this contract
+                super::broadcast_change_interests(op_manager, vec![*key], vec![]).await;
+            }
         } else {
             tracing::warn!(
                 tx = %tx,
@@ -1113,7 +1122,8 @@ impl Operation for SubscribeOp {
                                 source_addr,
                                 id,
                                 "",
-                            );
+                            )
+                            .await;
                             tracing::info!(tx = %id, contract = %key, is_renewal, phase = "response", "Subscription fulfilled, sending Response");
                             return Ok(OperationResult::SendAndComplete {
                                 msg: NetMessage::from(SubscribeMsg::Response {
@@ -1162,7 +1172,8 @@ impl Operation for SubscribeOp {
                                 source_addr,
                                 id,
                                 " (after contract wait)",
-                            );
+                            )
+                            .await;
                             return Ok(OperationResult::SendAndComplete {
                                 msg: NetMessage::from(SubscribeMsg::Response {
                                     id: *id,
@@ -1374,7 +1385,8 @@ impl Operation for SubscribeOp {
                                     None,
                                     msg_id,
                                     " (relay registration on Response)",
-                                );
+                                )
+                                .await;
 
                                 tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
                                 Ok(OperationResult::SendAndComplete {
@@ -1766,6 +1778,16 @@ impl Operation for SubscribeOp {
                         if let Some(peer) = &sender_peer {
                             op_manager.ring.remove_downstream_subscriber(&key, peer);
                             op_manager.interest_manager.remove_peer_interest(&key, peer);
+                            // Mirror the add_downstream_subscriber call in
+                            // register_downstream_subscriber — decrement the
+                            // downstream count so has_local_interest() reflects reality.
+                            let lost_interest = op_manager
+                                .interest_manager
+                                .remove_downstream_subscriber(&key);
+                            if lost_interest {
+                                super::broadcast_change_interests(op_manager, vec![], vec![key])
+                                    .await;
+                            }
                         } else {
                             tracing::warn!(
                                 tx = %id,
