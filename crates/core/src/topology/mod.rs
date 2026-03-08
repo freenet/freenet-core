@@ -1624,7 +1624,7 @@ mod tests {
 
         // Create 10 peers evenly distributed in log-distance space.
         let my_location = Location::new(0.5);
-        let d_at = |u: f64| 0.01_f64 * (0.5_f64 / 0.01).powf(u); // D_MIN * (D_MAX/D_MIN)^u
+        let d_at = |u: f64| 0.001_f64 * (0.5_f64 / 0.001).powf(u); // D_MIN * (D_MAX/D_MIN)^u
         let mut neighbor_locations = BTreeMap::new();
         for i in 0..10 {
             let u = (i as f64 + 0.5) / 10.0; // evenly spaced in [0, 1]

@@ -3,16 +3,17 @@ use crate::ring::{Distance, Location};
 
 /// Minimum distance for Kleinberg sampling. On a ring with N peers uniformly
 /// distributed, the expected distance to the nearest peer is ~1/(2N). We use
-/// 0.01 which corresponds to a ~50 peer network. This produces ~59% of
-/// connections within distance 0.1 (good locality) while ensuring enough
-/// long-range connections for ring coverage in small networks.
-const D_MIN: f64 = 0.01;
+/// 0.001 which corresponds to a ~500 peer network. The previous value of 0.01
+/// created a dead zone that prevented close-neighbor connections: with 500
+/// peers, ~12 exist within distance 0.01 but the topology never targeted them,
+/// causing premature terminus in greedy routing and frequent uphill hops.
+const D_MIN: f64 = 0.001;
 
 /// Maximum ring distance (half the ring).
 const D_MAX: f64 = 0.5;
 
 /// Log ratio used for mapping distances to the unit interval in log-space.
-const LOG_RATIO: f64 = 3.912_023_005_428_146; // (D_MAX / D_MIN).ln()
+const LOG_RATIO: f64 = 6.214_608_098_422_191; // (D_MAX / D_MIN).ln()
 
 /// Generate a random link distance based on Kleinberg's d^{-1} distribution.
 ///
@@ -189,9 +190,7 @@ pub(crate) fn gap_target(
 /// the largest gap perfectly gets the highest possible score.
 ///
 /// Candidates outside [D_MIN, D_MAX] score 0 — they don't contribute to
-/// small-world routing. This also serves as Sybil/eclipse defense: co-located
-/// peers (distance < D_MIN) are never preferred by the scoring, preventing an
-/// attacker from filling all connection slots with nearby nodes.
+/// small-world routing.
 ///
 /// This is O(N) where N is the number of existing connections.
 pub(crate) fn kleinberg_score(
@@ -253,7 +252,7 @@ mod tests {
     fn to_log_unit_boundaries() {
         assert_eq!(to_log_unit(D_MIN), 0.0);
         assert_eq!(to_log_unit(D_MAX), 1.0);
-        assert_eq!(to_log_unit(0.001), 0.0); // below D_MIN
+        assert_eq!(to_log_unit(0.0001), 0.0); // below D_MIN
         assert_eq!(to_log_unit(0.6), 1.0); // above D_MAX
     }
 
@@ -318,7 +317,7 @@ mod tests {
     #[test]
     fn score_outside_range_is_zero() {
         let existing = [0.1];
-        assert_eq!(kleinberg_score(0.005, existing.iter().copied()), 0.0);
+        assert_eq!(kleinberg_score(0.0005, existing.iter().copied()), 0.0);
         assert_eq!(kleinberg_score(0.6, existing.iter().copied()), 0.0);
     }
 
@@ -345,7 +344,7 @@ mod tests {
 
     #[test]
     fn chi_squared_test() {
-        let d_min = 0.01;
+        let d_min = D_MIN;
         let n = 10000;
         let num_bins = 20;
         let log_ratio = (D_MAX / d_min).ln();
@@ -578,8 +577,8 @@ mod tests {
                 short_count += 1;
             }
         }
-        // With 1/d distribution and d_min=0.01, d_max=0.5, the fraction
-        // below 0.1 should be ln(0.1/0.01)/ln(0.5/0.01) ≈ 59%.
+        // With 1/d distribution and d_min=0.001, d_max=0.5, the fraction
+        // below 0.1 should be ln(0.1/0.001)/ln(0.5/0.001) ≈ 74%.
         // Use a conservative threshold.
         let ratio = short_count as f64 / n as f64;
         assert!(
