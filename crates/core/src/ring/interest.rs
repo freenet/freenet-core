@@ -1945,4 +1945,45 @@ mod tests {
         assert!(!became_interested_again);
         assert!(manager.has_local_interest(&contract));
     }
+
+    /// Regression test for #3467: relay nodes must have has_local_interest() = true
+    /// when they have downstream subscribers, otherwise ChangeInterests processing
+    /// is blocked and interest-based broadcast targeting breaks.
+    #[test]
+    fn test_downstream_subscriber_creates_local_interest() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(50);
+
+        // Before adding downstream: no local interest
+        assert!(!manager.has_local_interest(&contract));
+
+        // Add downstream subscriber — should create local interest
+        let became_interested = manager.add_downstream_subscriber(&contract);
+        assert!(
+            became_interested,
+            "First downstream subscriber should create interest"
+        );
+        assert!(
+            manager.has_local_interest(&contract),
+            "Relay node with downstream subscriber must have local interest"
+        );
+
+        // Second downstream subscriber should not re-report "became interested"
+        let became_interested_again = manager.add_downstream_subscriber(&contract);
+        assert!(!became_interested_again);
+        assert!(manager.has_local_interest(&contract));
+
+        // Remove one downstream — still have one left
+        let lost_interest = manager.remove_downstream_subscriber(&contract);
+        assert!(!lost_interest, "Still have one downstream subscriber");
+        assert!(manager.has_local_interest(&contract));
+
+        // Remove last downstream — should lose interest
+        let lost_interest = manager.remove_downstream_subscriber(&contract);
+        assert!(lost_interest, "Last downstream subscriber removed");
+        assert!(
+            !manager.has_local_interest(&contract),
+            "No downstream subscribers left — should lose interest"
+        );
+    }
 }
