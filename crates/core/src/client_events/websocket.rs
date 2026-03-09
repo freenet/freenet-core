@@ -280,17 +280,59 @@ impl WebSocketProxy {
         )
     }
 
+    /// Sets up a subscription notification channel and builds the `OpenRequest`.
+    ///
+    /// Returns `None` if the client has already disconnected (response channel
+    /// closed or missing). Returning `None` instead of an error prevents
+    /// transient disconnects from killing `client_fn` (#3479).
+    fn setup_subscription(
+        &self,
+        client_id: ClientId,
+        key: ContractInstanceId,
+        req: Box<ClientRequest<'static>>,
+        auth_token: Option<AuthToken>,
+        attested_contract: Option<ContractInstanceId>,
+    ) -> Option<OpenRequest<'static>> {
+        let (tx, rx) =
+            tokio::sync::mpsc::channel(crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+        let ch = self.response_channels.get(&client_id)?;
+        if ch
+            .send(HostCallbackResult::SubscriptionChannel {
+                key,
+                id: client_id,
+                callback: rx,
+            })
+            .is_err()
+        {
+            tracing::debug!(%client_id, "Client channel closed during subscription setup");
+            return None;
+        }
+        Some(
+            OpenRequest::new(client_id, req)
+                .with_notification(tx)
+                .with_token(auth_token)
+                .with_attested_contract(attested_contract),
+        )
+    }
+
     async fn internal_proxy_recv(
         &mut self,
         msg: ClientConnection,
     ) -> Result<Option<OpenRequest<'_>>, ClientError> {
         match msg {
             ClientConnection::NewConnection { callbacks, .. } => {
-                // is a new client, assign an id and open a channel to communicate responses from the node
                 let cli_id = ClientId::next();
-                callbacks
+                if callbacks
                     .send(HostCallbackResult::NewId { id: cli_id })
-                    .map_err(|_e| ErrorKind::NodeUnavailable)?;
+                    .is_err()
+                {
+                    // Client disconnected before ID assignment -- normal under load (#3479).
+                    tracing::debug!(
+                        %cli_id,
+                        "NewConnection callback closed -- client disconnected before ID assignment"
+                    );
+                    return Ok(None);
+                }
                 self.response_channels.insert(cli_id, callbacks);
                 Ok(None)
             }
@@ -301,102 +343,44 @@ impl WebSocketProxy {
                 attested_contract,
                 ..
             } => {
-                let open_req = match &*req {
-                    ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
-                        tracing::debug!(%client_id, contract = %key, "subscribing to contract");
-                        // intercept subscription messages because they require a callback subscription channel
-                        let (tx, rx) = tokio::sync::mpsc::channel(
-                            crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
-                        );
-                        if let Some(ch) = self.response_channels.get(&client_id) {
-                            ch.send(HostCallbackResult::SubscriptionChannel {
-                                key: *key,
-                                id: client_id,
-                                callback: rx,
-                            })
-                            .map_err(|_| ErrorKind::ChannelClosed)?;
-                            OpenRequest::new(client_id, req)
-                                .with_notification(tx)
-                                .with_token(auth_token)
-                                .with_attested_contract(attested_contract)
-                        } else {
-                            tracing::warn!(
-                                client_id = %client_id,
-                                "Client not found for request"
-                            );
-                            return Err(ErrorKind::UnknownClient(client_id.into()).into());
-                        }
-                    }
+                // Extract the subscription key if this request needs a notification channel.
+                let sub_key = match &*req {
+                    ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => Some(*key),
                     ClientRequest::ContractOp(ContractRequest::Get {
                         key,
                         subscribe: true,
                         ..
-                    }) => {
-                        tracing::debug!(%client_id, contract = %key, "get with auto-subscribe");
-                        // intercept GET with subscribe=true because they also require a callback subscription channel
-                        let (tx, rx) = tokio::sync::mpsc::channel(
-                            crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
-                        );
-                        if let Some(ch) = self.response_channels.get(&client_id) {
-                            ch.send(HostCallbackResult::SubscriptionChannel {
-                                key: *key,
-                                id: client_id,
-                                callback: rx,
-                            })
-                            .map_err(|_| ErrorKind::ChannelClosed)?;
-                            OpenRequest::new(client_id, req)
-                                .with_notification(tx)
-                                .with_token(auth_token)
-                                .with_attested_contract(attested_contract)
-                        } else {
-                            tracing::warn!(
-                                client_id = %client_id,
-                                "Client not found for request"
-                            );
-                            return Err(ErrorKind::UnknownClient(client_id.into()).into());
-                        }
-                    }
+                    }) => Some(*key),
                     ClientRequest::ContractOp(ContractRequest::Put {
                         contract,
                         subscribe: true,
                         ..
-                    }) => {
-                        tracing::debug!(%client_id, contract = %contract.key(), "put with auto-subscribe");
-                        // intercept PUT with subscribe=true because they also require a callback subscription channel
-                        let (tx, rx) = tokio::sync::mpsc::channel(
-                            crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
-                        );
-                        if let Some(ch) = self.response_channels.get(&client_id) {
-                            ch.send(HostCallbackResult::SubscriptionChannel {
-                                key: *contract.key().id(),
-                                id: client_id,
-                                callback: rx,
-                            })
-                            .map_err(|_| ErrorKind::ChannelClosed)?;
-                            OpenRequest::new(client_id, req)
-                                .with_notification(tx)
-                                .with_token(auth_token)
-                                .with_attested_contract(attested_contract)
-                        } else {
-                            tracing::warn!(
-                                client_id = %client_id,
-                                "Client not found for request"
-                            );
-                            return Err(ErrorKind::UnknownClient(client_id.into()).into());
-                        }
-                    }
+                    }) => Some(*contract.key().id()),
                     ClientRequest::DelegateOp(_)
                     | ClientRequest::ContractOp(_)
                     | ClientRequest::Disconnect { .. }
                     | ClientRequest::Authenticate { .. }
                     | ClientRequest::NodeQueries(_)
                     | ClientRequest::Close
-                    | _ => {
-                        // just forward the request to the node
-                        OpenRequest::new(client_id, req)
-                            .with_token(auth_token)
-                            .with_attested_contract(attested_contract)
+                    | _ => None,
+                };
+
+                let open_req = if let Some(key) = sub_key {
+                    tracing::debug!(%client_id, contract = %key, "setting up subscription channel");
+                    match self.setup_subscription(
+                        client_id,
+                        key,
+                        req,
+                        auth_token,
+                        attested_contract,
+                    ) {
+                        Some(r) => r,
+                        None => return Ok(None),
                     }
+                } else {
+                    OpenRequest::new(client_id, req)
+                        .with_token(auth_token)
+                        .with_attested_contract(attested_contract)
                 };
                 Ok(Some(open_req))
             }

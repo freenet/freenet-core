@@ -20,6 +20,11 @@ use crate::config::GlobalExecutor;
 /// This avoids both the original `channel(1)` deadlock from #2915 and unbounded growth.
 const CHANNEL_CAPACITY: usize = 2048;
 
+/// Maximum consecutive transient errors before `client_fn` gives up on a proxy.
+/// Prevents CPU spin if a proxy's `recv()` returns errors without blocking.
+/// The counter resets on every successful request, so intermittent errors are fine.
+const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 50;
+
 type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
 type ClientEventsFut =
@@ -234,6 +239,7 @@ async fn client_fn(
     mut rx: Receiver<(ClientId, HostResult)>,
     tx_host: Sender<Result<OpenRequest<'static>, ClientError>>,
 ) {
+    let mut consecutive_errors: usize = 0;
     loop {
         tokio::select! {
             biased;
@@ -282,17 +288,45 @@ async fn client_fn(
                         {
                             break;
                         }
+                        consecutive_errors = 0;
                     }
-                    Err(err) if matches!(err.kind(), ErrorKind::ChannelClosed) => {
-                        tracing::debug!("disconnected client");
+                    Err(err) if matches!(
+                        err.kind(),
+                        ErrorKind::ChannelClosed
+                            | ErrorKind::Shutdown
+                            | ErrorKind::TransportProtocolDisconnect
+                    ) => {
+                        // Fatal: client disconnected, node shutting down, or transport dead.
+                        tracing::warn!("Fatal client error, shutting down client slot: {err}");
                         if let Err(e) = tx_host.send(Err(err)).await {
-                            tracing::debug!(error = %e, "failed to notify host of client disconnect");
+                            tracing::debug!(error = %e, "failed to notify host of fatal error");
                         }
                         break;
                     }
                     Err(err) => {
-                        tracing::error!("Unhandled client error: {err}");
-                        break;
+                        // Transient per-connection errors (NodeUnavailable, UnknownClient,
+                        // DeserializationError, etc.) should NOT kill the entire client slot.
+                        // Forward to host and continue accepting connections.
+                        //
+                        // Note: ErrorKind is #[non_exhaustive], so new variants added to
+                        // freenet-stdlib will land here. This is intentional — new errors
+                        // should be treated as transient by default and only promoted to
+                        // fatal after explicit review.
+                        consecutive_errors += 1;
+                        if consecutive_errors >= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
+                            tracing::error!(
+                                consecutive_errors,
+                                "Too many consecutive transient errors, shutting down client slot: {err}"
+                            );
+                            if let Err(e) = tx_host.send(Err(err)).await {
+                                tracing::debug!(error = %e, "failed to notify host of error limit");
+                            }
+                            break;
+                        }
+                        tracing::warn!("Transient client error (continuing): {err}");
+                        if tx_host.send(Err(err)).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -303,6 +337,8 @@ async fn client_fn(
 
 #[cfg(test)]
 mod test {
+    use std::collections::VecDeque;
+
     use freenet_stdlib::client_api::ClientRequest;
     use futures::try_join;
     use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -584,5 +620,190 @@ mod test {
             let result = combinator.send(*cli_id, Ok(HostResponse::Ok)).await;
             assert!(result.is_ok(), "send should not fail for client {cli_id}");
         }
+    }
+
+    /// A proxy that returns N configurable errors before delegating to SampleProxy.
+    struct ErrorThenOkProxy {
+        errors: VecDeque<ErrorKind>,
+        inner: SampleProxy,
+    }
+
+    impl ErrorThenOkProxy {
+        fn new(id: usize, errors: Vec<ErrorKind>, rx: Receiver<usize>, tx: Sender<usize>) -> Self {
+            Self {
+                errors: VecDeque::from(errors),
+                inner: SampleProxy::new(id, rx, tx),
+            }
+        }
+    }
+
+    impl ClientEventsProxy for ErrorThenOkProxy {
+        fn recv(&mut self) -> BoxFuture<'_, crate::client_events::HostIncomingMsg> {
+            Box::pin(async {
+                if let Some(kind) = self.errors.pop_front() {
+                    return Err(kind.into());
+                }
+                self.inner.recv().await
+            })
+        }
+
+        fn send(
+            &mut self,
+            id: ClientId,
+            response: Result<HostResponse, ClientError>,
+        ) -> BoxFuture<'_, Result<(), ClientError>> {
+            self.inner.send(id, response)
+        }
+    }
+
+    /// Regression test for #3479: a transient error (NodeUnavailable) from client.recv()
+    /// should NOT permanently kill the client slot. The error should be forwarded to the
+    /// host and the proxy should continue accepting connections.
+    #[tokio::test]
+    async fn test_transient_error_does_not_kill_client_slot() {
+        let (tx_trigger, rx_trigger) = channel(1);
+        let (tx_response, _rx_response) = channel(1);
+
+        let proxy = Box::new(ErrorThenOkProxy::new(
+            0,
+            vec![ErrorKind::NodeUnavailable],
+            rx_trigger,
+            tx_response,
+        )) as BoxedClient;
+
+        let mut combinator = ClientEventsCombinator::new([proxy]);
+
+        // First recv should get the forwarded NodeUnavailable error (not hang forever)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv())
+            .await
+            .expect("recv timed out — client_fn died on transient error");
+        match result {
+            Err(e) => assert!(
+                matches!(e.kind(), ErrorKind::NodeUnavailable),
+                "error should be NodeUnavailable, got: {e}"
+            ),
+            Ok(_) => panic!("should receive the transient error, got Ok"),
+        }
+
+        // Now send a valid request through the proxy — it should still work
+        tx_trigger.send(0).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv())
+            .await
+            .expect("recv timed out — client slot is dead after transient error");
+        assert!(
+            result.is_ok(),
+            "proxy should still be alive after transient error"
+        );
+    }
+
+    /// Test that fatal errors (Shutdown) still kill the client slot as expected.
+    #[tokio::test]
+    async fn test_fatal_error_kills_client_slot() {
+        let (_tx_trigger, rx_trigger) = channel(1);
+        let (tx_response, _rx_response) = channel(1);
+
+        let proxy = Box::new(ErrorThenOkProxy::new(
+            0,
+            vec![ErrorKind::Shutdown],
+            rx_trigger,
+            tx_response,
+        )) as BoxedClient;
+
+        let mut combinator = ClientEventsCombinator::new([proxy]);
+
+        // First recv should get the forwarded Shutdown error
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv())
+            .await
+            .expect("recv timed out");
+        match result {
+            Err(e) => assert!(
+                matches!(e.kind(), ErrorKind::Shutdown),
+                "error should be Shutdown, got: {e}"
+            ),
+            Ok(_) => panic!("should receive the Shutdown error, got Ok"),
+        }
+
+        // The client slot is dead — the combinator should report shutdown (all slots dead).
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), combinator.recv())
+            .await
+            .expect("recv timed out");
+        assert!(
+            matches!(result, Err(ref e) if matches!(e.kind(), ErrorKind::Shutdown)),
+            "combinator should report shutdown after fatal error killed the slot"
+        );
+    }
+
+    /// Test that exceeding MAX_CONSECUTIVE_TRANSIENT_ERRORS kills the slot.
+    #[tokio::test]
+    async fn test_consecutive_error_limit_kills_slot() {
+        let (_tx_trigger, rx_trigger) = channel(1);
+        let (tx_response, _rx_response) = channel(1);
+
+        let proxy = Box::new(ErrorThenOkProxy::new(
+            0,
+            vec![ErrorKind::NodeUnavailable; MAX_CONSECUTIVE_TRANSIENT_ERRORS],
+            rx_trigger,
+            tx_response,
+        )) as BoxedClient;
+
+        let mut combinator = ClientEventsCombinator::new([proxy]);
+
+        // Drain all transient errors
+        for i in 0..MAX_CONSECUTIVE_TRANSIENT_ERRORS {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv())
+                .await
+                .unwrap_or_else(|_| panic!("recv timed out on error {i}"));
+            assert!(result.is_err(), "iteration {i} should be an error");
+        }
+
+        // Slot should now be dead — combinator reports shutdown
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), combinator.recv())
+            .await
+            .expect("recv timed out — combinator should report shutdown");
+        assert!(
+            matches!(result, Err(ref e) if matches!(e.kind(), ErrorKind::Shutdown)),
+            "combinator should report shutdown after consecutive error limit"
+        );
+    }
+
+    /// Test that multiple consecutive transient errors don't kill the slot
+    /// (as long as they stay under MAX_CONSECUTIVE_TRANSIENT_ERRORS).
+    #[tokio::test]
+    async fn test_multiple_transient_errors_survive() {
+        let (tx_trigger, rx_trigger) = channel(1);
+        let (tx_response, _rx_response) = channel(1);
+
+        let proxy = Box::new(ErrorThenOkProxy::new(
+            0,
+            vec![ErrorKind::NodeUnavailable; 5],
+            rx_trigger,
+            tx_response,
+        )) as BoxedClient;
+
+        let mut combinator = ClientEventsCombinator::new([proxy]);
+
+        // Drain all 5 transient errors
+        for i in 0..5 {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv())
+                .await
+                .unwrap_or_else(|_| panic!("recv timed out on error {i}"));
+            match result {
+                Err(e) => assert!(
+                    matches!(e.kind(), ErrorKind::NodeUnavailable),
+                    "error {i} should be NodeUnavailable, got: {e}"
+                ),
+                Ok(_) => panic!("error {i} should be an error, got Ok"),
+            }
+        }
+
+        // Now send a valid request — slot should still be alive
+        tx_trigger.send(0).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv())
+            .await
+            .expect("recv timed out — client slot died after transient errors");
+        assert!(
+            result.is_ok(),
+            "proxy should still be alive after multiple transient errors"
+        );
     }
 }
