@@ -6,10 +6,10 @@ use std::{
     time::Duration,
 };
 
-use freenet::{server::serve_client_api, test_utils::test_ip_for_node};
+use freenet::server::serve_client_api;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use futures::FutureExt;
@@ -17,8 +17,9 @@ use tokio::{select, time::timeout};
 use tracing::{span, Instrument, Level};
 
 use common::{
-    base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    test_node_config, wait_for_node_connected, ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    allocate_test_node_block, base_node_test_config_with_ip, connect_ws_with_retry,
+    gw_config_from_path_with_ip, test_ip_for_node, test_node_config, wait_for_node_connected,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -32,10 +33,11 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
         NUM_GATEWAYS + NUM_NODES
     );
 
-    // Use unique IPs for each node
-    let gw_ip = test_ip_for_node(0);
-    let node1_ip = test_ip_for_node(1);
-    let node2_ip = test_ip_for_node(2);
+    // Use globally unique IPs to avoid collisions with parallel tests
+    let base_node_idx = allocate_test_node_block(3);
+    let gw_ip = test_ip_for_node(base_node_idx);
+    let node1_ip = test_ip_for_node(base_node_idx + 1);
+    let node2_ip = test_ip_for_node(base_node_idx + 2);
 
     let network_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
     let ws_api_port_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
@@ -136,27 +138,19 @@ async fn test_small_network_get_failure() -> anyhow::Result<()> {
     .boxed_local();
 
     let test = timeout(Duration::from_secs(300), async {
-        // Wait for nodes to start their WebSocket servers
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
+        // Connect to nodes with retry (replaces blind sleep + raw connect)
         let uri_gw =
             format!("ws://{gw_ip}:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
-        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
-        let mut client_gw = WebApi::start(stream_gw);
-
         let uri_node1 = format!(
             "ws://{node1_ip}:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
         );
-        let (stream_node1, _) =
-            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
-        let mut client_node1 = WebApi::start(stream_node1);
-
         let uri_node2 = format!(
             "ws://{node2_ip}:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
-        let (stream_node2, _) =
-            connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
-        let mut client_node2 = WebApi::start(stream_node2);
+
+        let mut client_gw = connect_ws_with_retry(&uri_gw, "Gateway", 60).await?;
+        let mut client_node1 = connect_ws_with_retry(&uri_node1, "Node1", 60).await?;
+        let mut client_node2 = connect_ws_with_retry(&uri_node2, "Node2", 60).await?;
 
         // Verify nodes have joined the ring before starting operations
         println!("Waiting for nodes to join the ring...");

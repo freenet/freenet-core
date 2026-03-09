@@ -21,7 +21,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use freenet::{server::serve_client_api, test_utils::test_ip_for_node};
+use freenet::server::serve_client_api;
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
@@ -33,8 +33,9 @@ use tokio::{select, time::timeout};
 use tracing::{span, Instrument, Level};
 
 use common::{
-    base_node_test_config_with_ip, connect_ws_with_retry, gw_config_from_path_with_ip,
-    test_node_config, wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    allocate_test_node_block, base_node_test_config_with_ip, connect_ws_with_retry,
+    gw_config_from_path_with_ip, test_ip_for_node, test_node_config, wait_for_node_connected,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
 /// Test for subscription propagation in a partially connected network.
@@ -67,12 +68,13 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         NUM_GATEWAYS, NUM_REGULAR_NODES, CONNECTIVITY_RATIO
     );
 
-    // Use varied loopback IPs for unique ring locations
-    // This is essential because ring locations are derived from IP addresses.
-    // Gateways use indices 0..NUM_GATEWAYS, nodes use NUM_GATEWAYS..NUM_GATEWAYS+NUM_REGULAR_NODES
-    let gateway_ips: Vec<_> = (0..NUM_GATEWAYS).map(test_ip_for_node).collect();
+    // Use globally unique loopback IPs to avoid collisions with parallel tests
+    let base_idx = allocate_test_node_block(NUM_GATEWAYS + NUM_REGULAR_NODES);
+    let gateway_ips: Vec<_> = (0..NUM_GATEWAYS)
+        .map(|i| test_ip_for_node(base_idx + i))
+        .collect();
     let node_ips: Vec<_> = (0..NUM_REGULAR_NODES)
-        .map(|i| test_ip_for_node(NUM_GATEWAYS + i))
+        .map(|i| test_ip_for_node(base_idx + NUM_GATEWAYS + i))
         .collect();
 
     // Reserve network ports for gateways on their varied IPs
@@ -85,8 +87,8 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         let port = network_socket.local_addr()?.port();
         gateway_network_ports.push(port);
         gateway_network_sockets.push(network_socket);
-        // WebSocket always uses localhost
-        ws_api_gateway_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+        // Bind WS on node IP to avoid port collisions with parallel tests
+        ws_api_gateway_sockets.push(TcpListener::bind(SocketAddr::new(ip.into(), 0))?);
         println!("Gateway {} will use {}:{}", i, ip, port);
     }
 
@@ -104,8 +106,8 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         node_network_ports.push(port);
         node_network_addrs.push(addr);
         node_network_sockets.push(network_socket);
-        // WebSocket always uses localhost
-        ws_api_node_sockets.push(TcpListener::bind("127.0.0.1:0")?);
+        // Bind WS on node IP to avoid port collisions with parallel tests
+        ws_api_node_sockets.push(TcpListener::bind(SocketAddr::new(ip.into(), 0))?);
         println!("Node {} will use {} ({})", i, addr, ip);
     }
 
@@ -261,12 +263,9 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         regular_node_futures.push(regular_node_future);
     }
 
-    // 420s: 20s gateway startup + 5s port binding + 180s node connection + operations + buffer
+    // 420s: 20s gateway startup + 180s node connection + operations + buffer
     let test = tokio::time::timeout(Duration::from_secs(420), async {
-        // Small initial wait for nodes to start binding ports
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        // Connect to all nodes with retry logic
+        // Connect to all nodes with retry logic (handles waiting for WS servers)
         // Use the correct IPs for each node (WebSocket servers bind to node IPs, not 127.0.0.1)
         let mut gateway_clients = Vec::with_capacity(NUM_GATEWAYS);
         for (i, port) in ws_api_ports_gw.iter().enumerate() {
