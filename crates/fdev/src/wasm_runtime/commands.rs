@@ -24,7 +24,7 @@ pub(super) async fn wasm_runtime(
 }
 
 async fn execute_command(req: ClientRequest<'static>, app: &mut AppState) -> anyhow::Result<bool> {
-    let node = &mut *app.local_node.write().await;
+    let node = &mut *app.local_node.lock().await;
     match req {
         ClientRequest::ContractOp(_) => {
             node.send(req).await?;

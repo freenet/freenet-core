@@ -13,7 +13,7 @@ impl AppState {
         })?;
 
         Ok(AppState {
-            local_node: Arc::new(RwLock::new(WebApi::start(stream))),
+            local_node: Arc::new(Mutex::new(WebApi::start(stream))),
             config: config.clone(),
         })
     }
