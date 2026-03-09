@@ -356,7 +356,13 @@ impl WebSocketProxy {
                         subscribe: true,
                         ..
                     }) => Some(*contract.key().id()),
-                    _ => None,
+                    ClientRequest::DelegateOp(_)
+                    | ClientRequest::ContractOp(_)
+                    | ClientRequest::Disconnect { .. }
+                    | ClientRequest::Authenticate { .. }
+                    | ClientRequest::NodeQueries(_)
+                    | ClientRequest::Close
+                    | _ => None,
                 };
 
                 let open_req = if let Some(key) = sub_key {
