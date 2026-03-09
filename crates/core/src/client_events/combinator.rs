@@ -733,6 +733,39 @@ mod test {
         );
     }
 
+    /// Test that exceeding MAX_CONSECUTIVE_TRANSIENT_ERRORS kills the slot.
+    #[tokio::test]
+    async fn test_consecutive_error_limit_kills_slot() {
+        let (_tx_trigger, rx_trigger) = channel(1);
+        let (tx_response, _rx_response) = channel(1);
+
+        let proxy = Box::new(ErrorThenOkProxy::new(
+            0,
+            vec![ErrorKind::NodeUnavailable; MAX_CONSECUTIVE_TRANSIENT_ERRORS],
+            rx_trigger,
+            tx_response,
+        )) as BoxedClient;
+
+        let mut combinator = ClientEventsCombinator::new([proxy]);
+
+        // Drain all transient errors
+        for i in 0..MAX_CONSECUTIVE_TRANSIENT_ERRORS {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), combinator.recv())
+                .await
+                .unwrap_or_else(|_| panic!("recv timed out on error {i}"));
+            assert!(result.is_err(), "iteration {i} should be an error");
+        }
+
+        // Slot should now be dead — combinator reports shutdown
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), combinator.recv())
+            .await
+            .expect("recv timed out — combinator should report shutdown");
+        assert!(
+            matches!(result, Err(ref e) if matches!(e.kind(), ErrorKind::Shutdown)),
+            "combinator should report shutdown after consecutive error limit"
+        );
+    }
+
     /// Test that multiple consecutive transient errors don't kill the slot
     /// (as long as they stay under MAX_CONSECUTIVE_TRANSIENT_ERRORS).
     #[tokio::test]
