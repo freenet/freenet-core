@@ -1906,11 +1906,9 @@ mod tests {
         assert!(found_swap, "Should have triggered a swap within 200 trials");
     }
 
-    /// Swaps must fire at exactly min_connections. The caller (connection_maintenance)
-    /// defers the drop until the replacement connects, so the node never actually
-    /// falls below min_connections. Previously a `<=` guard blocked swaps at
-    /// exactly min_connections, preventing topology improvement for the common
-    /// steady-state case where peers sit at their minimum.
+    /// Verify swaps fire at exactly min_connections (boundary condition).
+    /// The `<=` guard was changed to `<` because the caller defers the drop
+    /// until the replacement connects, so the node never undershoots.
     #[test_log::test]
     fn test_topology_swap_works_at_exactly_min_connections() {
         let _guard = crate::config::GlobalRng::seed_guard(0xDEAD_BEEF);
