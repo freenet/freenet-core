@@ -1807,7 +1807,9 @@ impl Ring {
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
         /// Max time to hold a deferred swap drop before abandoning it.
         const DEFERRED_SWAP_DROP_TTL: Duration = Duration::from_secs(120);
-        let mut deferred_swap_drops: Vec<(SocketAddr, Instant)> = Vec::new();
+        /// Deferred swap drops: (addr, queued_at) using time_source for
+        /// deterministic simulation support.
+        let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
         let mut zero_connections_since: Option<Instant> = None;
 
         // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
@@ -2238,7 +2240,7 @@ impl Ring {
                         // Deduplicate: don't queue the same peer twice if
                         // consecutive swaps select it before the first executes.
                         if !deferred_swap_drops.iter().any(|(a, _)| *a == addr) {
-                            deferred_swap_drops.push((addr, Instant::now()));
+                            deferred_swap_drops.push((addr, tick_now));
                         }
                     } else {
                         tracing::warn!(
@@ -2253,28 +2255,44 @@ impl Ring {
             // Execute deferred swap drops: only drop as many peers as we
             // have headroom above min_connections to avoid undershooting.
             // Expire stale entries whose replacement never connected.
-            deferred_swap_drops
-                .retain(|(_, queued_at)| queued_at.elapsed() < DEFERRED_SWAP_DROP_TTL);
-            if !deferred_swap_drops.is_empty() {
-                let fresh_count = self.connection_manager.connection_count();
-                let headroom = fresh_count.saturating_sub(self.connection_manager.min_connections);
-                let to_drop = headroom.min(deferred_swap_drops.len());
-                for (addr, _) in deferred_swap_drops.drain(..to_drop) {
-                    tracing::info!(
-                        peer = %addr,
-                        connections = fresh_count,
-                        "Executing deferred swap drop (replacement connected)"
+            {
+                let before_len = deferred_swap_drops.len();
+                deferred_swap_drops.retain(|(_, queued_at)| {
+                    tick_now.saturating_duration_since(*queued_at) < DEFERRED_SWAP_DROP_TTL
+                });
+                let expired = before_len - deferred_swap_drops.len();
+                if expired > 0 {
+                    tracing::debug!(
+                        expired,
+                        "Deferred swap drops expired (replacement never connected)"
                     );
-                    notifier
-                        .notifications_sender
-                        .send(Either::Right(crate::message::NodeEvent::DropConnection(
-                            addr,
-                        )))
-                        .await
-                        .map_err(|error| {
-                            tracing::debug!(?error, "Shutting down connection maintenance task");
-                            error
-                        })?;
+                }
+
+                if !deferred_swap_drops.is_empty() {
+                    let fresh_count = self.connection_manager.connection_count();
+                    let headroom =
+                        fresh_count.saturating_sub(self.connection_manager.min_connections);
+                    let to_drop = headroom.min(deferred_swap_drops.len());
+                    for (addr, _) in deferred_swap_drops.drain(..to_drop) {
+                        tracing::info!(
+                            peer = %addr,
+                            connections = fresh_count,
+                            "Executing deferred swap drop (replacement connected)"
+                        );
+                        notifier
+                            .notifications_sender
+                            .send(Either::Right(crate::message::NodeEvent::DropConnection(
+                                addr,
+                            )))
+                            .await
+                            .map_err(|error| {
+                                tracing::debug!(
+                                    ?error,
+                                    "Shutting down connection maintenance task"
+                                );
+                                error
+                            })?;
+                    }
                 }
             }
 
