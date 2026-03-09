@@ -91,9 +91,10 @@ pub(crate) const MAX_DELEGATE_CREATION_DEPTH: u32 = 4;
 /// Maximum delegates a single delegate can create within one process() call.
 pub(crate) const MAX_DELEGATE_CREATIONS_PER_CALL: u32 = 8;
 
-// TODO(#2833): Investigate RSS/memory exhaustion from delegate proliferation.
-// Currently no per-node cap — revisit if delegate creation causes
-// unbounded memory growth.
+/// Maximum total delegates that can be created via the create_delegate host function
+/// across the lifetime of this node. Prevents unbounded memory growth from
+/// DELEGATE_INHERITED_ATTESTATIONS and the delegate store itself.
+pub(crate) const MAX_CREATED_DELEGATES_PER_NODE: usize = 1024;
 pub(crate) type DelegateNotificationSender = mpsc::Sender<DelegateNotification>;
 pub(crate) type DelegateNotificationReceiver = mpsc::Receiver<DelegateNotification>;
 

@@ -169,6 +169,8 @@ pub(super) enum DelegateCreateError {
     DepthExceeded,
     /// Per-call delegate creation limit exceeded.
     CreationsExceeded,
+    /// Per-node delegate creation limit exceeded.
+    NodeLimitExceeded,
     /// Invalid WASM bytes (failed to construct DelegateContainer).
     InvalidWasm(String),
     /// Delegate store or secret store operation failed.
@@ -234,13 +236,6 @@ impl DelegateCallEnv {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model
         unsafe { &*self.contract_store }
     }
-    /// Access the delegate store immutably. Only safe during the synchronous process() call.
-    #[allow(dead_code)]
-    fn delegate_store(&self) -> &DelegateStore {
-        // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model
-        unsafe { &**self.delegate_store.get() }
-    }
-
     /// Access the delegate store mutably. Only safe during the synchronous process() call.
     #[allow(clippy::mut_from_ref)]
     fn delegate_store_mut(&self) -> &mut DelegateStore {
@@ -269,7 +264,10 @@ impl DelegateCallEnv {
         cipher_bytes: [u8; 32],
         nonce_bytes: [u8; 24],
     ) -> Result<DelegateKey, DelegateCreateError> {
-        use crate::contract::{MAX_DELEGATE_CREATIONS_PER_CALL, MAX_DELEGATE_CREATION_DEPTH};
+        use crate::contract::{
+            MAX_CREATED_DELEGATES_PER_NODE, MAX_DELEGATE_CREATIONS_PER_CALL,
+            MAX_DELEGATE_CREATION_DEPTH,
+        };
         use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
         use freenet_stdlib::prelude::{DelegateContainer, Parameters};
 
@@ -282,6 +280,11 @@ impl DelegateCallEnv {
         // Check creation depth
         if self.creation_depth >= MAX_DELEGATE_CREATION_DEPTH {
             return Err(DelegateCreateError::DepthExceeded);
+        }
+
+        // Check per-node creation limit (bounds DELEGATE_INHERITED_ATTESTATIONS growth)
+        if DELEGATE_INHERITED_ATTESTATIONS.len() >= MAX_CREATED_DELEGATES_PER_NODE {
+            return Err(DelegateCreateError::NodeLimitExceeded);
         }
 
         // Construct DelegateContainer from WASM bytes and params
@@ -1602,10 +1605,10 @@ pub(super) mod delegate_management {
             tracing::error!("Memory bounds violation reading cipher in create_delegate");
             return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
         };
-        // SAFETY: validated by validate_and_compute_ptr
+        // SAFETY: validated by validate_and_compute_ptr (exactly 32 bytes)
         let cipher_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(cipher_src, 32) }
             .try_into()
-            .unwrap();
+            .expect("BUG: slice length guaranteed to be 32 by validate_and_compute_ptr");
 
         // Read 24-byte nonce
         let Some(nonce_src) = validate_and_compute_ptr::<u8>(nonce_ptr, start_ptr, 24, mem_size)
@@ -1613,10 +1616,10 @@ pub(super) mod delegate_management {
             tracing::error!("Memory bounds violation reading nonce in create_delegate");
             return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
         };
-        // SAFETY: validated by validate_and_compute_ptr
+        // SAFETY: validated by validate_and_compute_ptr (exactly 24 bytes)
         let nonce_bytes: [u8; 24] = unsafe { std::slice::from_raw_parts(nonce_src, 24) }
             .try_into()
-            .unwrap();
+            .expect("BUG: slice length guaranteed to be 24 by validate_and_compute_ptr");
 
         // Validate output buffers
         let Some(out_key_dst) =
@@ -1660,6 +1663,10 @@ pub(super) mod delegate_management {
             }
             Err(DelegateCreateError::CreationsExceeded) => {
                 tracing::warn!("delegate create_delegate: per-call creation limit exceeded");
+                delegate_mgmt_error_codes::ERR_CREATIONS_EXCEEDED
+            }
+            Err(DelegateCreateError::NodeLimitExceeded) => {
+                tracing::warn!("delegate create_delegate: per-node creation limit exceeded");
                 delegate_mgmt_error_codes::ERR_CREATIONS_EXCEEDED
             }
             Err(DelegateCreateError::InvalidWasm(msg)) => {

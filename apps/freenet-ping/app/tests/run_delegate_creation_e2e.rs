@@ -326,24 +326,13 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
             }
         }
 
-        // Step 4: Verify per-call creation limit enforcement
-        // MAX_DELEGATE_CREATIONS_PER_CALL = 8, so create 8 more (we already created 1)
-        // The 8th creation (9th total, but limit is per-call so each call resets)
-        // should succeed. We test a batch of 9 in one call to hit the limit.
+        // Step 4: Verify multiple independent creations work (limit resets per call)
+        // Each process() invocation handles one message, creating one delegate.
+        // The per-call limit (8) resets between invocations, so sequential
+        // creations should always succeed. Per-call limit enforcement is
+        // covered by unit test `test_create_delegate_per_call_limit_exceeded`.
         {
-            tracing::info!("Testing per-call creation limit...");
-
-            // Create 9 delegates in a single process() call by sending 9 messages
-            // Actually, each ApplicationMessages call invokes process() once per message,
-            // and the limit is per process() call. So we need to verify in a single call.
-            // Since we can only send one CreateChildDelegate per process() invocation
-            // (each process() call handles one InboundDelegateMsg), the per-call limit
-            // means per single process() invocation. This is inherently satisfied since
-            // each message triggers one create_delegate call.
-            //
-            // To properly test the limit, we'd need a delegate that creates multiple
-            // children in a single process() call. For now, verify that individual
-            // creations continue to work (the limit resets per call).
+            tracing::info!("Testing sequential delegate creation...");
             let app_id = ContractInstanceId::new([0; 32]);
             let payload = bincode::serialize(&InboundAppMessage::CreateChildDelegate {
                 child_wasm: child_wasm_bytes.clone(),
