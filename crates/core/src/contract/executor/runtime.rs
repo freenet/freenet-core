@@ -2486,6 +2486,18 @@ impl Executor<Runtime> {
                 // Clean up delegate creation tracking to prevent unbounded growth
                 crate::wasm_runtime::DELEGATE_INHERITED_ATTESTATIONS.remove(&key);
 
+                // Decrement the global created-delegates counter so the slot can be reused.
+                // Only decrement if count > 0 to avoid underflow for delegates not created
+                // via the host function (e.g., registered directly by apps).
+                {
+                    use std::sync::atomic::Ordering;
+                    let count = &crate::wasm_runtime::CREATED_DELEGATES_COUNT;
+                    let prev = count.load(Ordering::Relaxed);
+                    if prev > 0 {
+                        count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {

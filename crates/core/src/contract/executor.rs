@@ -92,9 +92,10 @@ pub(crate) const MAX_DELEGATE_CREATION_DEPTH: u32 = 4;
 pub(crate) const MAX_DELEGATE_CREATIONS_PER_CALL: u32 = 8;
 
 /// Maximum total delegates that can be created via the create_delegate host function
-/// across the lifetime of this node. Prevents unbounded memory growth from
-/// DELEGATE_INHERITED_ATTESTATIONS and the delegate store itself.
+/// across the lifetime of this node. Prevents unbounded memory growth in the
+/// delegate store and secret store. Enforced via `CREATED_DELEGATES_COUNT` atomic counter.
 pub(crate) const MAX_CREATED_DELEGATES_PER_NODE: usize = 1024;
+
 pub(crate) type DelegateNotificationSender = mpsc::Sender<DelegateNotification>;
 pub(crate) type DelegateNotificationReceiver = mpsc::Receiver<DelegateNotification>;
 

@@ -79,9 +79,9 @@ enum ChildOutboundAppMessage {
 /// can respond to messages.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
-    std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
-    std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
-    std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+    // Note: CARGO_PROFILE_RELEASE_* env vars are set at compile time via Cargo.toml,
+    // not at runtime. Setting them here has no effect and is unsound in multi-threaded
+    // contexts (Rust 1.66+). Removed per std::env::set_var safety requirements.
 
     // Load the parent delegate (test-delegate-creation)
     let parent_params = Parameters::from(vec![]);

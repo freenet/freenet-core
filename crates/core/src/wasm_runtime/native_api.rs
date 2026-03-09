@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
 use super::contract_store::ContractStore;
@@ -44,6 +45,11 @@ pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
 pub(crate) static DELEGATE_INHERITED_ATTESTATIONS: LazyLock<
     DashMap<DelegateKey, Vec<ContractInstanceId>>,
 > = LazyLock::new(DashMap::default);
+
+/// Global counter of all delegates created via the `create_delegate` host function.
+/// Used to enforce `MAX_CREATED_DELEGATES_PER_NODE` regardless of attestation status.
+/// Decremented on `UnregisterDelegate` to allow reuse of slots.
+pub(crate) static CREATED_DELEGATES_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // Thread-local tracking of the currently-executing delegate instance ID.
 // Set before a WASM process() call, cleared after. This allows the new
@@ -171,8 +177,7 @@ pub(super) enum DelegateCreateError {
     CreationsExceeded,
     /// Per-node delegate creation limit exceeded.
     NodeLimitExceeded,
-    /// Invalid WASM bytes (reserved for future validation).
-    #[allow(dead_code)]
+    /// Invalid WASM bytes (e.g., exceeds size limit).
     InvalidWasm(String),
     /// Delegate store or secret store operation failed.
     StoreFailed(String),
@@ -245,13 +250,21 @@ impl DelegateCallEnv {
         unsafe { &mut **self.delegate_store.get() }
     }
 
+    /// Maximum WASM code size (10 MiB) accepted by `create_delegate`.
+    /// Prevents a single process() call from allocating excessive host-side memory.
+    pub(crate) const MAX_WASM_CODE_SIZE: usize = 10 * 1024 * 1024;
+
     /// Create a new delegate synchronously during process() execution.
     ///
-    /// Validates resource limits, constructs a DelegateContainer from the WASM bytes,
+    /// Validates resource limits, constructs a DelegateContainer from the raw WASM bytes,
     /// registers it in the delegate store and secret store, and records creator attestation.
     ///
+    /// Note: WASM bytes are stored as-is. Validation is deferred to execution time
+    /// (when the delegate is actually invoked). Depth tracking is per-call only — child
+    /// delegates invoked later via ApplicationMessages start at depth 0.
+    ///
     /// # Arguments
-    /// * `wasm_bytes` - Versioned delegate WASM code bytes
+    /// * `wasm_bytes` - Raw WASM code bytes (wrapped into versioned DelegateContainer internally)
     /// * `params` - Parameter bytes for the new delegate
     /// * `cipher_bytes` - 32-byte XChaCha20Poly1305 cipher key
     /// * `nonce_bytes` - 24-byte XNonce
@@ -280,14 +293,24 @@ impl DelegateCallEnv {
             return Err(DelegateCreateError::CreationsExceeded);
         }
 
-        // Check creation depth
+        // Check creation depth (per-call only; child delegates start at depth 0 when
+        // invoked via ApplicationMessages in a separate process() call)
         if self.creation_depth >= MAX_DELEGATE_CREATION_DEPTH {
             return Err(DelegateCreateError::DepthExceeded);
         }
 
-        // Check per-node creation limit (bounds DELEGATE_INHERITED_ATTESTATIONS growth)
-        if DELEGATE_INHERITED_ATTESTATIONS.len() >= MAX_CREATED_DELEGATES_PER_NODE {
+        // Check per-node creation limit (counts ALL created delegates, not just attested)
+        if CREATED_DELEGATES_COUNT.load(Ordering::Relaxed) >= MAX_CREATED_DELEGATES_PER_NODE {
             return Err(DelegateCreateError::NodeLimitExceeded);
+        }
+
+        // Reject oversized WASM to prevent excessive host-side allocations
+        if wasm_bytes.len() > Self::MAX_WASM_CODE_SIZE {
+            return Err(DelegateCreateError::InvalidWasm(format!(
+                "WASM code size {} exceeds maximum {} bytes",
+                wasm_bytes.len(),
+                Self::MAX_WASM_CODE_SIZE
+            )));
         }
 
         // Construct DelegateContainer from raw WASM bytes and params.
@@ -308,16 +331,16 @@ impl DelegateCallEnv {
             .register_delegate(child_key.clone(), cipher, nonce)
             .map_err(|e| DelegateCreateError::StoreFailed(e.to_string()))?;
 
-        // Store in delegate store
-        // TODO(#2833): Investigate RSS/memory exhaustion from delegate proliferation.
-        // Currently no per-node cap — revisit if delegate creation causes
-        // unbounded memory growth.
-        self.delegate_store_mut()
-            .store_delegate(container)
-            .map_err(|e| DelegateCreateError::StoreFailed(e.to_string()))?;
+        // Store in delegate store; rollback secret store on failure
+        if let Err(e) = self.delegate_store_mut().store_delegate(container) {
+            // Rollback: remove the secret store cipher we just registered
+            self.secret_store_mut().remove_delegate_cipher(&child_key);
+            return Err(DelegateCreateError::StoreFailed(e.to_string()));
+        }
 
-        // Increment per-call counter
+        // Increment per-call counter and global node counter
         self.creations_this_call.set(current + 1);
+        CREATED_DELEGATES_COUNT.fetch_add(1, Ordering::Relaxed);
 
         // Propagate app attestation to child
         if !self.attested_contracts.is_empty() {
@@ -1671,7 +1694,7 @@ pub(super) mod delegate_management {
             }
             Err(DelegateCreateError::NodeLimitExceeded) => {
                 tracing::warn!("delegate create_delegate: per-node creation limit exceeded");
-                delegate_mgmt_error_codes::ERR_CREATIONS_EXCEEDED
+                delegate_mgmt_error_codes::ERR_NODE_LIMIT_EXCEEDED
             }
             Err(DelegateCreateError::InvalidWasm(msg)) => {
                 tracing::error!("delegate create_delegate: invalid WASM: {msg}");

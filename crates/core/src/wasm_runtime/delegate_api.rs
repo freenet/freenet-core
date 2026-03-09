@@ -185,8 +185,9 @@ pub mod delegate_mgmt_error_codes {
     pub const ERR_DEPTH_EXCEEDED: i32 = -20;
     /// Per-call delegate creation limit exceeded.
     pub const ERR_CREATIONS_EXCEEDED: i32 = -21;
-    // -22 reserved for future per-node limit
-    /// Invalid WASM bytes (failed to construct DelegateContainer).
+    /// Per-node delegate creation limit exceeded (lifetime cap).
+    pub const ERR_NODE_LIMIT_EXCEEDED: i32 = -22;
+    /// Invalid WASM bytes (e.g., exceeds size limit).
     pub const ERR_INVALID_WASM: i32 = -23;
     /// Delegate store or secret store operation failed.
     pub const ERR_STORE_FAILED: i32 = -24;
@@ -393,6 +394,31 @@ mod tests {
                     &mut self.delegate_store,
                     depth,
                     vec![],
+                )
+            }
+        }
+
+        /// Create a DelegateCallEnv with attested contracts for testing attestation inheritance.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env_with_attestations(
+            &mut self,
+            attestations: Vec<ContractInstanceId>,
+        ) -> DelegateCallEnv {
+            let delegate_key = DelegateKey::new([1u8; 32], CodeHash::new([1u8; 32]));
+            // SAFETY: The caller guarantees the returned env does not outlive `self`,
+            // which keeps the borrowed `secret_store` and `contract_store` alive.
+            unsafe {
+                DelegateCallEnv::new(
+                    vec![],
+                    &mut self.secret_store,
+                    &self.contract_store,
+                    Some(self.db.clone()),
+                    delegate_key,
+                    &mut self.delegate_store,
+                    0,
+                    attestations,
                 )
             }
         }
@@ -921,6 +947,25 @@ mod tests {
         );
     }
 
+    /// create_delegate_sync rejects WASM bytes exceeding the size limit.
+    #[tokio::test]
+    async fn test_create_delegate_rejects_oversized_wasm() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        let oversized = vec![0u8; DelegateCallEnv::MAX_WASM_CODE_SIZE + 1];
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let result = env.create_delegate_sync(&oversized, &[], cipher, nonce);
+        assert!(
+            matches!(result, Err(DelegateCreateError::InvalidWasm(_))),
+            "should reject oversized WASM: {:?}",
+            result
+        );
+    }
+
     /// create_delegate_sync tracks per-call count correctly via Cell.
     #[tokio::test]
     async fn test_create_delegate_counter_tracks_correctly() {
@@ -941,5 +986,73 @@ mod tests {
         env.create_delegate_sync(&wasm, &[2], cipher, nonce)
             .unwrap();
         assert_eq!(env.creations_this_call.get(), 2);
+    }
+
+    /// Child delegate inherits parent's attested contracts in DELEGATE_INHERITED_ATTESTATIONS.
+    #[tokio::test]
+    async fn test_create_delegate_inherits_attestations() {
+        use super::super::native_api::DELEGATE_INHERITED_ATTESTATIONS;
+
+        let mut env_holder = TestEnv::new().await;
+
+        let contract_id = ContractInstanceId::new([42u8; 32]);
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env_with_attestations(vec![contract_id]) };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let child_key = env
+            .create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+
+        // Verify the child inherited the parent's attestation
+        let inherited = DELEGATE_INHERITED_ATTESTATIONS.get(&child_key);
+        assert!(
+            inherited.is_some(),
+            "child should have inherited attestations"
+        );
+        assert_eq!(inherited.unwrap().value(), &vec![contract_id]);
+
+        // Cleanup
+        DELEGATE_INHERITED_ATTESTATIONS.remove(&child_key);
+    }
+
+    /// Child created by non-attested parent does NOT appear in DELEGATE_INHERITED_ATTESTATIONS
+    /// but still counts toward the per-node limit via CREATED_DELEGATES_COUNT.
+    #[tokio::test]
+    async fn test_create_delegate_non_attested_still_counts_toward_node_limit() {
+        use super::super::native_api::{CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ATTESTATIONS};
+        use std::sync::atomic::Ordering;
+
+        let mut env_holder = TestEnv::new().await;
+
+        let before = CREATED_DELEGATES_COUNT.load(Ordering::Relaxed);
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() }; // no attestations
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let child_key = env
+            .create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+
+        // Should NOT be in inherited attestations (parent had none)
+        assert!(
+            DELEGATE_INHERITED_ATTESTATIONS.get(&child_key).is_none(),
+            "non-attested parent should not create attestation entry"
+        );
+
+        // But SHOULD have incremented the global counter
+        let after = CREATED_DELEGATES_COUNT.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "global counter should increment for all creations (before={before}, after={after})"
+        );
+
+        // Cleanup
+        CREATED_DELEGATES_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 }

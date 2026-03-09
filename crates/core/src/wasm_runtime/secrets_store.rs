@@ -99,6 +99,12 @@ impl SecretsStore {
         Ok(())
     }
 
+    /// Remove a delegate's cipher entry. Used to rollback `register_delegate`
+    /// when a subsequent operation (e.g., storing the delegate) fails.
+    pub fn remove_delegate_cipher(&mut self, delegate: &DelegateKey) {
+        self.ciphers.remove(delegate);
+    }
+
     pub fn store_secret(
         &mut self,
         delegate: &DelegateKey,
