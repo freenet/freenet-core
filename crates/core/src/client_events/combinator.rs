@@ -43,7 +43,7 @@ pub struct ClientEventsCombinator<const N: usize> {
     /// tracks which client slots have disconnected so we don't re-poll dead channels
     dead_clients: [bool; N],
     /// human-readable names for each slot (e.g., "http", "websocket") for diagnostics
-    slot_names: Vec<&'static str>,
+    slot_names: [&'static str; N],
 }
 
 impl<const N: usize> ClientEventsCombinator<N> {
@@ -82,14 +82,18 @@ impl<const N: usize> ClientEventsCombinator<N> {
             internal_clients: HashMap::new(),
             pending_futs,
             dead_clients: [false; N],
-            slot_names: vec!["unknown"; N],
+            slot_names: ["unknown"; N],
         }
     }
 
     /// Set human-readable names for each slot for diagnostic logging.
+    ///
+    /// Panics if `names.len() != N` (programmer error).
     pub fn with_slot_names(mut self, names: &[&'static str]) -> Self {
         assert_eq!(names.len(), N, "slot names length must match client count");
-        self.slot_names = names.to_vec();
+        for (i, name) in names.iter().enumerate() {
+            self.slot_names[i] = name;
+        }
         self
     }
 }
