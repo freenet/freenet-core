@@ -398,7 +398,8 @@ impl NodeP2P {
             Err(e) => anyhow::anyhow!(e),
         })
         .boxed();
-        let clients = ClientEventsCombinator::new(clients);
+        // Slot 0 = HTTP client API, Slot 1 = WebSocket proxy (from serve_client_api).
+        let clients = ClientEventsCombinator::new(clients).with_slot_names(&["http", "websocket"]);
         // Create node controller channel with capacity for shutdown signal
         // We clone the sender to return it for external shutdown triggering
         let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
