@@ -134,7 +134,7 @@ winapi = "0.3"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-freenet-stdlib = "0.1.40"
+freenet-stdlib = "0.2.1"
 
 [profile.dev.package."*"]
 opt-level = 3

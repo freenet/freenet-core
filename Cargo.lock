@@ -1586,7 +1586,7 @@ dependencies = [
  "dashmap",
  "either",
  "freenet",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.1",
  "futures 0.3.31",
  "glob",
  "http 1.4.0",
@@ -1748,7 +1748,7 @@ dependencies = [
  "flatbuffers 25.12.19",
  "flate2",
  "freenet-macros 0.1.0",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.1",
  "freenet-test-network",
  "futures 0.3.31",
  "gag",
@@ -1842,7 +1842,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.1",
  "freenet-test-network",
  "futures 0.3.31",
  "humantime",
@@ -1864,7 +1864,7 @@ name = "freenet-ping-contract"
 version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.1",
  "serde_json",
 ]
 
@@ -1874,7 +1874,7 @@ version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.1",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1886,11 +1886,41 @@ version = "0.1.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c76c2f57fed646bf8b70f34bf9390060227069cb8f3646533a273a634c5c5b69"
 dependencies = [
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "chrono",
+ "flatbuffers 24.12.23",
+ "freenet-macros 0.1.3",
+ "futures 0.3.31",
+ "js-sys",
+ "semver",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "serde_with",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.27.0",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a721909b82942b9d61c1635f71cfaac572b9b15183fbf569b7719533de12346"
+dependencies = [
  "arbitrary",
  "bincode",
  "blake3",
  "bs58",
  "byteorder",
+ "bytes 1.11.1",
  "chrono",
  "flatbuffers 24.12.23",
  "freenet-macros 0.1.3",
@@ -1919,7 +1949,7 @@ dependencies = [
  "anyhow",
  "bollard",
  "chrono",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.40",
  "futures 0.3.31",
  "hex",
  "ipnetwork",
@@ -5382,7 +5412,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82a72c767771b47409d2345987fda8628641887d5466101319899796367354a0"
 dependencies = [
  "fastrand 2.3.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.52.0",
@@ -5412,7 +5442,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.11"
 dependencies = [
- "freenet-stdlib",
+ "freenet-stdlib 0.2.1",
  "serde",
  "serde_json",
 ]
@@ -5422,14 +5452,14 @@ name = "test-contract-mock-aligned"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.1",
 ]
 
 [[package]]
 name = "test-contract-update-nochange"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib",
+ "freenet-stdlib 0.2.1",
  "serde",
  "serde_json",
 ]
