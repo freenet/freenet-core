@@ -2022,7 +2022,9 @@ mod tests {
                     "Should not prune topology-critical peer (isolated at long distance)"
                 );
             }
-            other => {
+            other @ TopologyAdjustment::AddConnections(_)
+            | other @ TopologyAdjustment::SwapConnection { .. }
+            | other @ TopologyAdjustment::NoChange => {
                 panic!("Expected RemoveConnections under resource pressure, got {other:?}");
             }
         }
