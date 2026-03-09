@@ -371,6 +371,15 @@ mod tests {
         /// # Safety
         /// Caller must ensure the returned env does not outlive `self`.
         unsafe fn make_env(&mut self) -> DelegateCallEnv {
+            // SAFETY: forwarded to make_env_with_depth
+            unsafe { self.make_env_with_depth(0) }
+        }
+
+        /// Create a DelegateCallEnv with a specific creation depth.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env_with_depth(&mut self, depth: u32) -> DelegateCallEnv {
             let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
             // SAFETY: The caller guarantees the returned env does not outlive `self`,
             // which keeps the borrowed `secret_store` and `contract_store` alive.
@@ -382,7 +391,7 @@ mod tests {
                     Some(self.db.clone()),
                     delegate_key,
                     &mut self.delegate_store,
-                    0,
+                    depth,
                     vec![],
                 )
             }
@@ -811,5 +820,130 @@ mod tests {
 
         let result3 = call_inc.call(&mut store, 30).unwrap();
         assert_eq!(result3, 31);
+    }
+
+    // ============ Delegate creation resource limit tests ============
+
+    use super::super::native_api::DelegateCreateError;
+    use crate::contract::{MAX_DELEGATE_CREATIONS_PER_CALL, MAX_DELEGATE_CREATION_DEPTH};
+
+    /// Minimal valid delegate versioned code bytes for DelegateContainer construction.
+    fn minimal_delegate_wasm() -> Vec<u8> {
+        // Versioned format: [8 bytes: version u64 BE][32 bytes: code hash][WASM bytes]
+        // Version 0 = APIVersion::Version0_0_1
+        let minimal_wasm: &[u8] = b"\0asm\x01\x00\x00\x00"; // valid empty WASM module
+        let mut versioned = Vec::new();
+        versioned.extend_from_slice(&0u64.to_be_bytes()); // APIVersion::Version0_0_1
+        versioned.extend_from_slice(&[0u8; 32]); // code hash (arbitrary)
+        versioned.extend_from_slice(minimal_wasm);
+        versioned
+    }
+
+    /// create_delegate_sync rejects creation when depth limit is exceeded.
+    #[tokio::test]
+    async fn test_create_delegate_depth_exceeded() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env_with_depth(MAX_DELEGATE_CREATION_DEPTH) };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let result = env.create_delegate_sync(&wasm, &[], cipher, nonce);
+        assert!(
+            matches!(result, Err(DelegateCreateError::DepthExceeded)),
+            "should reject at depth {}: {:?}",
+            MAX_DELEGATE_CREATION_DEPTH,
+            result
+        );
+    }
+
+    /// create_delegate_sync allows creation at depth just below the limit.
+    #[tokio::test]
+    async fn test_create_delegate_depth_just_under_limit() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env_with_depth(MAX_DELEGATE_CREATION_DEPTH - 1) };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let result = env.create_delegate_sync(&wasm, &[], cipher, nonce);
+        assert!(
+            result.is_ok(),
+            "should allow at depth {}: {:?}",
+            MAX_DELEGATE_CREATION_DEPTH - 1,
+            result
+        );
+    }
+
+    /// create_delegate_sync rejects creation when per-call limit is exceeded.
+    #[tokio::test]
+    async fn test_create_delegate_per_call_limit_exceeded() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        // Create up to the limit
+        for i in 0..MAX_DELEGATE_CREATIONS_PER_CALL {
+            let result = env.create_delegate_sync(&wasm, &[i as u8], cipher, nonce);
+            assert!(result.is_ok(), "creation {i} should succeed: {:?}", result);
+        }
+
+        // One more should fail
+        let result = env.create_delegate_sync(&wasm, &[255], cipher, nonce);
+        assert!(
+            matches!(result, Err(DelegateCreateError::CreationsExceeded)),
+            "should reject at creation count {}: {:?}",
+            MAX_DELEGATE_CREATIONS_PER_CALL,
+            result
+        );
+    }
+
+    /// create_delegate_sync rejects invalid WASM bytes.
+    #[tokio::test]
+    async fn test_create_delegate_invalid_wasm() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        let invalid_wasm = vec![0xFF, 0xFF, 0xFF]; // not valid WASM
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let result = env.create_delegate_sync(&invalid_wasm, &[], cipher, nonce);
+        assert!(
+            matches!(result, Err(DelegateCreateError::InvalidWasm(_))),
+            "should reject invalid WASM: {:?}",
+            result
+        );
+    }
+
+    /// create_delegate_sync tracks per-call count correctly via Cell.
+    #[tokio::test]
+    async fn test_create_delegate_counter_tracks_correctly() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        assert_eq!(env.creations_this_call.get(), 0);
+
+        env.create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+        assert_eq!(env.creations_this_call.get(), 1);
+
+        env.create_delegate_sync(&wasm, &[2], cipher, nonce)
+            .unwrap();
+        assert_eq!(env.creations_this_call.get(), 2);
     }
 }

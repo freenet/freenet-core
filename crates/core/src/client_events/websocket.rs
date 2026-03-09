@@ -1047,6 +1047,8 @@ async fn process_host_response(
                         HostResponse::DelegateResponse { .. } => "DelegateResponse",
                         HostResponse::QueryResponse(_) => "QueryResponse",
                         HostResponse::Ok => "HostResponse::Ok",
+                        HostResponse::StreamHeader { .. } => "StreamHeader",
+                        HostResponse::StreamChunk { .. } => "StreamChunk",
                         _ => "Unknown",
                     };
 

@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 /// Default cipher key (same as DelegateRequest::DEFAULT_CIPHER)
 const DEFAULT_CIPHER: [u8; 32] = [
-    0, 24, 22, 150, 112, 207, 24, 65, 182, 161, 169, 227, 66, 182, 237, 215, 206, 164, 58, 161,
-    64, 108, 157, 195, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 24, 22, 150, 112, 207, 24, 65, 182, 161, 169, 227, 66, 182, 237, 215, 206, 164, 58, 161, 64,
+    108, 157, 195, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
 /// Default nonce (same as DelegateRequest::DEFAULT_NONCE)
@@ -26,7 +26,7 @@ extern "C" {
         wasm_ptr: i64,
         wasm_len: i64,
         params_ptr: i64,
-        params_len: i32,
+        params_len: i64,
         cipher_ptr: i64,
         nonce_ptr: i64,
         out_key_ptr: i64,
@@ -52,7 +52,7 @@ fn create_delegate(
             wasm_code.as_ptr() as i64,
             wasm_code.len() as i64,
             params.as_ptr() as i64,
-            params.len() as i32,
+            params.len() as i64,
             cipher.as_ptr() as i64,
             nonce.as_ptr() as i64,
             key_buf.as_mut_ptr() as i64,
@@ -144,18 +144,16 @@ impl DelegateInterface for Delegate {
                         }
                         .map_err(|err| DelegateError::Other(format!("{err}")))?;
 
-                        let response =
-                            ApplicationMessage::new(incoming_app.app, response_payload)
-                                .processed(true);
+                        let response = ApplicationMessage::new(incoming_app.app, response_payload)
+                            .processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
                     InboundAppMessage::Ping { data } => {
                         let response_payload =
                             bincode::serialize(&OutboundAppMessage::PingResponse { data })
                                 .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response =
-                            ApplicationMessage::new(incoming_app.app, response_payload)
-                                .processed(true);
+                        let response = ApplicationMessage::new(incoming_app.app, response_payload)
+                            .processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
                 }

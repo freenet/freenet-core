@@ -1104,7 +1104,7 @@ impl WasmtimeEngine {
                     nonce_ptr,
                     out_key_ptr,
                     out_hash_ptr,
-                ): (i64, i64, i64, i32, i64, i64, i64, i64)| {
+                ): (i64, i64, i64, i64, i64, i64, i64, i64)| {
                     let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
                     refresh_mem_addr_from_caller(&mut caller, id);
                     Box::new(async move {

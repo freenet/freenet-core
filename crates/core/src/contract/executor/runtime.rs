@@ -2483,6 +2483,9 @@ impl Executor<Runtime> {
                     !subscribers.is_empty()
                 });
 
+                // Clean up delegate creation tracking to prevent unbounded growth
+                crate::wasm_runtime::DELEGATE_INHERITED_ATTESTATIONS.remove(&key);
+
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {

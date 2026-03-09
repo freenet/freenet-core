@@ -37,11 +37,6 @@ pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
     DashMap<ContractInstanceId, HashSet<DelegateKey>>,
 > = LazyLock::new(DashMap::default);
 
-/// Tracks the creator of each delegate created via the create_delegate host function.
-/// DelegateKey (child) → DelegateKey (creator)
-pub(crate) static DELEGATE_CREATORS: LazyLock<DashMap<DelegateKey, DelegateKey>> =
-    LazyLock::new(DashMap::default);
-
 /// Tracks app attestation inherited by child delegates from their parent.
 /// When a delegate with attested_contract creates a child, the child inherits
 /// the same attestation so it can interact with the same app context.
@@ -116,11 +111,10 @@ pub mod error_codes {
 pub(super) struct DelegateCallEnv {
     /// Mutable context bytes. The delegate reads/writes this via host functions.
     pub context: Vec<u8>,
-    /// Raw mutable pointer to the runtime's SecretsStore. Valid only during the
-    /// synchronous `process()` call. The WASM Singlepass compiler executes
-    /// on the calling thread, so the pointer cannot outlive the borrow.
-    /// Stored as *mut because set_secret and remove_secret need mutation.
-    secret_store: *mut SecretsStore,
+    /// Interior-mutable pointer to the runtime's SecretsStore. Valid only during
+    /// the synchronous `process()` call. Uses `UnsafeCell` to make the interior
+    /// mutability explicit rather than hiding it behind `#[allow(clippy::mut_from_ref)]`.
+    secret_store: std::cell::UnsafeCell<*mut SecretsStore>,
     /// The delegate key, needed to scope secret access.
     pub delegate_key: DelegateKey,
     /// Read-only pointer to the ContractStore for index lookups
@@ -130,13 +124,13 @@ pub(super) struct DelegateCallEnv {
     /// contract state synchronously via host functions. ReDb is Arc<Database>
     /// internally, so cloning is cheap.
     state_store_db: Option<Storage>,
-    /// Raw mutable pointer to the runtime's DelegateStore. Valid only during
+    /// Interior-mutable pointer to the runtime's DelegateStore. Valid only during
     /// synchronous `process()` call. Used for creating child delegates.
-    delegate_store: *mut DelegateStore,
+    delegate_store: std::cell::UnsafeCell<*mut DelegateStore>,
     /// Current delegate creation chain depth (0 for top-level calls).
-    creation_depth: u32,
+    pub(super) creation_depth: u32,
     /// Number of delegates created so far in this process() call.
-    creations_this_call: std::cell::Cell<u32>,
+    pub(super) creations_this_call: std::cell::Cell<u32>,
     /// Attested contract IDs for this delegate (from parent or direct registration).
     attested_contracts: Vec<ContractInstanceId>,
 }
@@ -202,11 +196,11 @@ impl DelegateCallEnv {
     ) -> Self {
         Self {
             context,
-            secret_store: secret_store as *mut SecretsStore,
+            secret_store: std::cell::UnsafeCell::new(secret_store as *mut SecretsStore),
             delegate_key,
             contract_store: contract_store as *const ContractStore,
             state_store_db,
-            delegate_store: delegate_store as *mut DelegateStore,
+            delegate_store: std::cell::UnsafeCell::new(delegate_store as *mut DelegateStore),
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
             attested_contracts,
@@ -216,13 +210,13 @@ impl DelegateCallEnv {
     /// Access the secrets store immutably. Only safe during the synchronous process() call.
     fn secret_store(&self) -> &SecretsStore {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model
-        unsafe { &*self.secret_store }
+        unsafe { &**self.secret_store.get() }
     }
 
     /// Access the secrets store mutably. Only safe during the synchronous process() call.
     ///
-    /// # Safety invariants (why this lint is suppressed)
-    /// This uses interior mutability through a raw pointer, which is safe because:
+    /// # Safety invariants
+    /// Interior mutability via `UnsafeCell` is safe because:
     /// 1. The Runtime holds `&mut self` when calling `process()`, ensuring exclusive access
     /// 2. WASM execution is synchronous on the calling thread (Singlepass compiler)
     /// 3. The `DelegateCallEnv` is created immediately before and destroyed immediately after
@@ -231,7 +225,7 @@ impl DelegateCallEnv {
     fn secret_store_mut(&self) -> &mut SecretsStore {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model.
         // The Runtime holds &mut self when calling process(), ensuring exclusive access.
-        unsafe { &mut *self.secret_store }
+        unsafe { &mut **self.secret_store.get() }
     }
 
     /// Access the contract store for index lookups.
@@ -244,7 +238,7 @@ impl DelegateCallEnv {
     #[allow(dead_code)]
     fn delegate_store(&self) -> &DelegateStore {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model
-        unsafe { &*self.delegate_store }
+        unsafe { &**self.delegate_store.get() }
     }
 
     /// Access the delegate store mutably. Only safe during the synchronous process() call.
@@ -252,7 +246,7 @@ impl DelegateCallEnv {
     fn delegate_store_mut(&self) -> &mut DelegateStore {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model.
         // The Runtime holds &mut self when calling process(), ensuring exclusive access.
-        unsafe { &mut *self.delegate_store }
+        unsafe { &mut **self.delegate_store.get() }
     }
 
     /// Create a new delegate synchronously during process() execution.
@@ -317,9 +311,6 @@ impl DelegateCallEnv {
 
         // Increment per-call counter
         self.creations_this_call.set(current + 1);
-
-        // Record creator attestation
-        DELEGATE_CREATORS.insert(child_key.clone(), self.delegate_key.clone());
 
         // Propagate app attestation to child
         if !self.attested_contracts.is_empty() {
@@ -1553,7 +1544,7 @@ pub(super) mod delegate_management {
         wasm_ptr: i64,
         wasm_len: i64,
         params_ptr: i64,
-        params_len: i32,
+        params_len: i64,
         cipher_ptr: i64,
         nonce_ptr: i64,
         out_key_ptr: i64,
