@@ -827,16 +827,10 @@ mod tests {
     use super::super::native_api::DelegateCreateError;
     use crate::contract::{MAX_DELEGATE_CREATIONS_PER_CALL, MAX_DELEGATE_CREATION_DEPTH};
 
-    /// Minimal valid delegate versioned code bytes for DelegateContainer construction.
+    /// Minimal raw WASM bytes for delegate creation tests.
+    /// The host function wraps raw WASM into a versioned DelegateContainer internally.
     fn minimal_delegate_wasm() -> Vec<u8> {
-        // Versioned format: [8 bytes: version u64 BE][32 bytes: code hash][WASM bytes]
-        // Version 0 = APIVersion::Version0_0_1
-        let minimal_wasm: &[u8] = b"\0asm\x01\x00\x00\x00"; // valid empty WASM module
-        let mut versioned = Vec::new();
-        versioned.extend_from_slice(&0u64.to_be_bytes()); // APIVersion::Version0_0_1
-        versioned.extend_from_slice(&[0u8; 32]); // code hash (arbitrary)
-        versioned.extend_from_slice(minimal_wasm);
-        versioned
+        b"\0asm\x01\x00\x00\x00".to_vec() // valid empty WASM module
     }
 
     /// create_delegate_sync rejects creation when depth limit is exceeded.
@@ -906,21 +900,23 @@ mod tests {
         );
     }
 
-    /// create_delegate_sync rejects invalid WASM bytes.
+    /// create_delegate_sync accepts arbitrary bytes at creation time.
+    /// Superseded: WASM validation moved from creation to execution time.
+    /// Replaced test_create_delegate_invalid_wasm which expected InvalidWasm error.
     #[tokio::test]
-    async fn test_create_delegate_invalid_wasm() {
+    async fn test_create_delegate_accepts_any_bytes_at_creation() {
         let mut env_holder = TestEnv::new().await;
 
         // SAFETY: env_holder is alive for the duration of this test
         let env = unsafe { env_holder.make_env() };
-        let invalid_wasm = vec![0xFF, 0xFF, 0xFF]; // not valid WASM
+        let arbitrary_bytes = vec![0xFF, 0xFF, 0xFF]; // not valid WASM
         let cipher = [0u8; 32];
         let nonce = [0u8; 24];
 
-        let result = env.create_delegate_sync(&invalid_wasm, &[], cipher, nonce);
+        let result = env.create_delegate_sync(&arbitrary_bytes, &[], cipher, nonce);
         assert!(
-            matches!(result, Err(DelegateCreateError::InvalidWasm(_))),
-            "should reject invalid WASM: {:?}",
+            result.is_ok(),
+            "creation should accept any bytes (validation deferred to execution): {:?}",
             result
         );
     }

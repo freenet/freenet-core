@@ -171,7 +171,8 @@ pub(super) enum DelegateCreateError {
     CreationsExceeded,
     /// Per-node delegate creation limit exceeded.
     NodeLimitExceeded,
-    /// Invalid WASM bytes (failed to construct DelegateContainer).
+    /// Invalid WASM bytes (reserved for future validation).
+    #[allow(dead_code)]
     InvalidWasm(String),
     /// Delegate store or secret store operation failed.
     StoreFailed(String),
@@ -269,7 +270,9 @@ impl DelegateCallEnv {
             MAX_DELEGATE_CREATION_DEPTH,
         };
         use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
-        use freenet_stdlib::prelude::{DelegateContainer, Parameters};
+        use freenet_stdlib::prelude::{
+            Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters,
+        };
 
         // Check per-call creation limit
         let current = self.creations_this_call.get();
@@ -287,11 +290,12 @@ impl DelegateCallEnv {
             return Err(DelegateCreateError::NodeLimitExceeded);
         }
 
-        // Construct DelegateContainer from WASM bytes and params
+        // Construct DelegateContainer from raw WASM bytes and params.
+        // The caller provides raw WASM; we wrap it into the versioned DelegateContainer.
         let params_owned = Parameters::from(params.to_vec());
-        let container: DelegateContainer = (wasm_bytes.to_vec(), &params_owned)
-            .try_into()
-            .map_err(|e: std::io::Error| DelegateCreateError::InvalidWasm(e.to_string()))?;
+        let delegate_code = DelegateCode::from(wasm_bytes.to_vec());
+        let delegate = Delegate::from((&delegate_code, &params_owned));
+        let container = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
 
         let child_key = container.key().clone();
 
