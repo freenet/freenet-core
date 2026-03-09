@@ -345,3 +345,11 @@ jobs:
           gh release upload "$TAG_NAME" $ASSETS \
             --repo ${{ github.repository }} \
             --clobber
+
+          # Publish the release now that binaries are attached.
+          # The release is created as a draft by release.sh/release.yml to
+          # prevent the installer from seeing a version before binaries exist.
+          gh release edit "$TAG_NAME" \
+            --repo ${{ github.repository }} \
+            --draft=false
+          echo "✅ Release $TAG_NAME published with all binaries attached"

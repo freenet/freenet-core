@@ -304,8 +304,9 @@ jobs:
           VERSION="${{ needs.validate.outputs.version }}"
           gh release create "v$VERSION" \
             --title "v$VERSION" \
-            --notes-file "${{ steps.release_notes.outputs.notes_file }}"
-          echo "✅ Created GitHub release v$VERSION"
+            --notes-file "${{ steps.release_notes.outputs.notes_file }}" \
+            --draft
+          echo "✅ Created draft GitHub release v$VERSION (will be published after binaries are attached)"
 
       - name: Dry run summary
         if: ${{ inputs.dry_run }}
