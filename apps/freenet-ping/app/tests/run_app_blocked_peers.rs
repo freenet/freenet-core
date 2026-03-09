@@ -17,13 +17,11 @@ use std::{
 
 use anyhow::anyhow;
 use common::{
-    base_node_test_config_with_ip, get_all_ping_states, gw_config_from_path_with_ip,
-    test_node_config, wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    allocate_test_node_block, base_node_test_config_with_ip, connect_ws_with_retry,
+    get_all_ping_states, gw_config_from_path_with_ip, test_ip_for_node, test_node_config,
+    wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
-use freenet::{
-    server::serve_client_api,
-    test_utils::{allocate_test_node_block, test_ip_for_node},
-};
+use freenet::server::serve_client_api;
 use freenet_ping_app::ping_client::{
     wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
 };
@@ -35,8 +33,6 @@ use freenet_stdlib::{
 use futures::FutureExt;
 use tokio::{select, time::sleep};
 use tracing::{span, Instrument, Level};
-
-use common::{connect_async_with_config, ws_config};
 
 /// Maximum number of retries when port allocation fails
 const MAX_PORT_RETRY_ATTEMPTS: usize = 5;
@@ -94,9 +90,11 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
     let network_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
     let gw_network_port = network_socket_gw.local_addr()?.port();
 
-    let ws_api_port_socket_gw = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node1 = TcpListener::bind("127.0.0.1:0")?;
-    let ws_api_port_socket_node2 = TcpListener::bind("127.0.0.1:0")?;
+    // Bind WS ports on unique node IPs (not 127.0.0.1) to avoid port collisions
+    // with parallel tests and match the IP that serve_client_api will bind to
+    let ws_api_port_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
+    let ws_api_port_socket_node1 = TcpListener::bind(SocketAddr::new(node1_ip.into(), 0))?;
+    let ws_api_port_socket_node2 = TcpListener::bind(SocketAddr::new(node2_ip.into(), 0))?;
 
     let network_socket_node1 = TcpListener::bind(SocketAddr::new(node1_ip.into(), 0))?;
     let node1_network_port = network_socket_node1.local_addr()?.port();
@@ -210,10 +208,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
     let span = span!(Level::INFO, "test_ping_blocked_peers");
 
     let test = tokio::time::timeout(Duration::from_secs(420), async {
-        tracing::info!("Waiting 25s for nodes to start up...");
-        sleep(Duration::from_secs(25)).await;
-
-        // Connect WebSocket clients
+        // Connect to nodes with retry (replaces blind 25s sleep + raw connect)
         let uri_gw =
             format!("ws://{gw_ip}:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
         let uri_node1 = format!(
@@ -223,19 +218,9 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
             "ws://{node2_ip}:{ws_api_port_node2}/v1/contract/command?encodingProtocol=native"
         );
 
-        tracing::info!("Connecting to Gateway at {}", uri_gw);
-        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
-        let mut client_gw = WebApi::start(stream_gw);
-
-        tracing::info!("Connecting to Node1 at {}", uri_node1);
-        let (stream_node1, _) =
-            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
-        let mut client_node1 = WebApi::start(stream_node1);
-
-        tracing::info!("Connecting to Node2 at {}", uri_node2);
-        let (stream_node2, _) =
-            connect_async_with_config(&uri_node2, Some(ws_config()), false).await?;
-        let mut client_node2 = WebApi::start(stream_node2);
+        let mut client_gw = connect_ws_with_retry(&uri_gw, "Gateway", 60).await?;
+        let mut client_node1 = connect_ws_with_retry(&uri_node1, "Node1", 60).await?;
+        let mut client_node2 = connect_ws_with_retry(&uri_node2, "Node2", 60).await?;
 
         // Wait for ring connections (180s for slow CI runners)
         tracing::info!("Waiting for nodes to join the ring...");
@@ -344,7 +329,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         // fails (subscribe.rs:705-716 - peer_key lookup can return None if the
         // peer isn't fully registered yet).
         let poll_interval = Duration::from_secs(5);
-        let max_polls: u32 = 48; // 240s total (accommodates OPERATION_TTL=120s)
+        let max_polls: u32 = 48; // 240s total (accommodates OPERATION_TTL=60s with retries)
 
         for poll in 1..=max_polls {
             // Send an update from each node
