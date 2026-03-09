@@ -1807,8 +1807,8 @@ impl Ring {
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
         /// Max time to hold a deferred swap drop before abandoning it.
         const DEFERRED_SWAP_DROP_TTL: Duration = Duration::from_secs(120);
-        /// Deferred swap drops: (addr, queued_at) using time_source for
-        /// deterministic simulation support.
+        // Deferred swap drops: (addr, queued_at) using time_source for
+        // deterministic simulation support.
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
         let mut zero_connections_since: Option<Instant> = None;
 
