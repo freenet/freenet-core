@@ -2257,8 +2257,7 @@ impl Ring {
                 .retain(|(_, queued_at)| queued_at.elapsed() < DEFERRED_SWAP_DROP_TTL);
             if !deferred_swap_drops.is_empty() {
                 let fresh_count = self.connection_manager.connection_count();
-                let headroom =
-                    fresh_count.saturating_sub(self.connection_manager.min_connections);
+                let headroom = fresh_count.saturating_sub(self.connection_manager.min_connections);
                 let to_drop = headroom.min(deferred_swap_drops.len());
                 for (addr, _) in deferred_swap_drops.drain(..to_drop) {
                     tracing::info!(
@@ -2273,10 +2272,7 @@ impl Ring {
                         )))
                         .await
                         .map_err(|error| {
-                            tracing::debug!(
-                                ?error,
-                                "Shutting down connection maintenance task"
-                            );
+                            tracing::debug!(?error, "Shutting down connection maintenance task");
                             error
                         })?;
                 }
