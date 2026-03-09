@@ -1805,6 +1805,11 @@ impl Ring {
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
+        /// Max time to hold a deferred swap drop before abandoning it.
+        const DEFERRED_SWAP_DROP_TTL: Duration = Duration::from_secs(120);
+        // Deferred swap drops: (addr, queued_at) using time_source for
+        // deterministic simulation support.
+        let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
         let mut zero_connections_since: Option<Instant> = None;
 
         // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
@@ -2221,16 +2226,58 @@ impl Ring {
                     remove,
                     add_location,
                 } => {
-                    // Drop the least-useful connection, then queue the gap target
-                    // for acquisition. Note: this is not atomic — the drop happens
-                    // immediately but the new connection may fail to establish.
-                    // This is acceptable: the node temporarily has one fewer
-                    // connection, which the normal topology maintenance will fill.
+                    // Connect-first swap: defer the drop until the replacement
+                    // connects (connection_count > min_connections), preventing
+                    // undershoot that would block future swaps. Deferred drops
+                    // expire after DEFERRED_SWAP_DROP_TTL if replacement fails.
                     if let Some(addr) = remove.socket_addr() {
                         tracing::info!(
                             remove_peer = %remove,
                             add_target = %add_location,
-                            "Executing topology swap"
+                            "Topology swap: queuing replacement connection (drop deferred)"
+                        );
+                        pending_conn_adds.insert(add_location);
+                        // Deduplicate: don't queue the same peer twice if
+                        // consecutive swaps select it before the first executes.
+                        if !deferred_swap_drops.iter().any(|(a, _)| *a == addr) {
+                            deferred_swap_drops.push((addr, tick_now));
+                        }
+                    } else {
+                        tracing::warn!(
+                            remove_peer = %remove,
+                            "Topology swap skipped: peer has no socket address"
+                        );
+                    }
+                }
+                TopologyAdjustment::NoChange => {}
+            }
+
+            // Execute deferred swap drops: only drop as many peers as we
+            // have headroom above min_connections to avoid undershooting.
+            // Expire stale entries whose replacement never connected.
+            {
+                let before_len = deferred_swap_drops.len();
+                deferred_swap_drops.retain(|(_, queued_at)| {
+                    tick_now.saturating_duration_since(*queued_at) < DEFERRED_SWAP_DROP_TTL
+                });
+                let expired = before_len - deferred_swap_drops.len();
+                if expired > 0 {
+                    tracing::debug!(
+                        expired,
+                        "Deferred swap drops expired (replacement never connected)"
+                    );
+                }
+
+                if !deferred_swap_drops.is_empty() {
+                    let fresh_count = self.connection_manager.connection_count();
+                    let headroom =
+                        fresh_count.saturating_sub(self.connection_manager.min_connections);
+                    let to_drop = headroom.min(deferred_swap_drops.len());
+                    for (addr, _) in deferred_swap_drops.drain(..to_drop) {
+                        tracing::info!(
+                            peer = %addr,
+                            connections = fresh_count,
+                            "Executing deferred swap drop (replacement connected)"
                         );
                         notifier
                             .notifications_sender
@@ -2240,20 +2287,13 @@ impl Ring {
                             .await
                             .map_err(|error| {
                                 tracing::debug!(
-                                    error = ?error,
+                                    ?error,
                                     "Shutting down connection maintenance task"
                                 );
                                 error
                             })?;
-                        pending_conn_adds.insert(add_location);
-                    } else {
-                        tracing::warn!(
-                            remove_peer = %remove,
-                            "Topology swap skipped: peer has no socket address"
-                        );
                     }
                 }
-                TopologyAdjustment::NoChange => {}
             }
 
             let needs_fast_tick = current_connections < self.connection_manager.min_connections;

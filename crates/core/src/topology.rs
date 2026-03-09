@@ -700,7 +700,7 @@ impl TopologyManager {
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
         current_connections: usize,
     ) -> TopologyAdjustment {
-        if current_connections <= self.limits.min_connections {
+        if current_connections < self.limits.min_connections {
             return TopologyAdjustment::NoChange;
         }
 
@@ -1784,12 +1784,12 @@ mod tests {
         }
 
         // Test maybe_swap_connection directly (bypasses resource meter).
-        // Pass current_connections > min_connections (11 > 10) because swaps are
-        // disabled at exactly min_connections to avoid dropping below the minimum.
+        // Swaps are allowed at min_connections because the caller (connection_maintenance)
+        // defers the drop until the replacement connects, preventing undershoot.
         let mut swap_count = 0;
         let trials = 100;
         for _ in 0..trials {
-            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 11);
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 10);
             if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
                 swap_count += 1;
             }
@@ -1835,11 +1835,10 @@ mod tests {
 
         // Test maybe_swap_connection directly — with well-distributed connections,
         // largest gap ≈ expected gap, so swap probability should be near zero.
-        // Pass current_connections > min_connections (11 > 10).
         let mut swap_count = 0;
         let trials = 100;
         for _ in 0..trials {
-            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 11);
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 10);
             if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
                 swap_count += 1;
             }
@@ -1905,6 +1904,61 @@ mod tests {
             }
         }
         assert!(found_swap, "Should have triggered a swap within 200 trials");
+    }
+
+    /// Verify swaps fire at exactly min_connections (boundary condition).
+    /// The `<=` guard was changed to `<` because the caller defers the drop
+    /// until the replacement connects, so the node never undershoots.
+    #[test_log::test]
+    fn test_topology_swap_works_at_exactly_min_connections() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xDEAD_BEEF);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(100000.0),
+            max_connections: 200,
+            min_connections: 10,
+        };
+        let mut tm = TopologyManager::new(limits);
+
+        let my_location = Location::new(0.5);
+        let mut neighbor_locations: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
+        for i in 0..10 {
+            let offset = 0.01 + (i as f64 * 0.001);
+            let loc = Location::new(my_location.as_f64() + offset);
+            let peer = PeerKeyLocation::random();
+            tm.outbound_request_counter.record_request(peer.clone());
+            neighbor_locations
+                .entry(loc)
+                .or_default()
+                .push(Connection::new(peer));
+        }
+
+        // At exactly min_connections (10 == 10), swaps should still fire.
+        let mut swap_count = 0;
+        let trials = 100;
+        for _ in 0..trials {
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 10);
+            if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
+                swap_count += 1;
+            }
+        }
+        assert!(
+            swap_count > 0,
+            "Swaps must work at exactly min_connections (got 0/{trials})"
+        );
+
+        // Below min_connections, swaps should NOT fire.
+        let mut swap_below = 0;
+        for _ in 0..trials {
+            let adjustment = tm.maybe_swap_connection(&Some(my_location), &neighbor_locations, 9);
+            if matches!(adjustment, TopologyAdjustment::SwapConnection { .. }) {
+                swap_below += 1;
+            }
+        }
+        assert_eq!(
+            swap_below, 0,
+            "Swaps must not fire below min_connections (got {swap_below}/{trials})"
+        );
     }
 
     /// Test that topology-critical connections are protected from pruning.
