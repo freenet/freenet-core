@@ -42,6 +42,8 @@ pub struct ClientEventsCombinator<const N: usize> {
     internal_clients: HashMap<ClientId, (usize, ClientId)>,
     /// tracks which client slots have disconnected so we don't re-poll dead channels
     dead_clients: [bool; N],
+    /// human-readable names for each slot (e.g., "http", "websocket") for diagnostics
+    slot_names: Vec<&'static str>,
 }
 
 impl<const N: usize> ClientEventsCombinator<N> {
@@ -80,7 +82,15 @@ impl<const N: usize> ClientEventsCombinator<N> {
             internal_clients: HashMap::new(),
             pending_futs,
             dead_clients: [false; N],
+            slot_names: vec!["unknown"; N],
         }
+    }
+
+    /// Set human-readable names for each slot for diagnostic logging.
+    pub fn with_slot_names(mut self, names: &[&'static str]) -> Self {
+        assert_eq!(names.len(), N, "slot names length must match client count");
+        self.slot_names = names.to_vec();
+        self
     }
 }
 
@@ -146,10 +156,7 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                     None => {
                         // Channel closed — client_fn exited. Mark slot as dead and clean up
                         // mappings. Do NOT re-push into pending_futs (avoids infinite spin).
-                        tracing::warn!(
-                            proxy_idx = idx,
-                            "Client transport disconnected, cleaning up client slot"
-                        );
+                        let slot_name = self.slot_names[idx];
                         self.dead_clients[idx] = true;
 
                         // Remove internal→external mappings for this slot
@@ -163,6 +170,16 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                             self.internal_clients.remove(id);
                         }
                         self.external_clients[idx].clear();
+
+                        // Log at error level so operators notice degraded state.
+                        // If this is the WebSocket slot, the node can't accept new
+                        // client connections — a restart is recommended (#3479).
+                        tracing::error!(
+                            slot_name,
+                            proxy_idx = idx,
+                            "Client API '{slot_name}' died — node is in degraded state, \
+                             restart recommended"
+                        );
 
                         // Loop back to poll remaining live clients
                         continue;
@@ -805,5 +822,41 @@ mod test {
             result.is_ok(),
             "proxy should still be alive after multiple transient errors"
         );
+    }
+
+    /// Test that with_slot_names works and dead slots still allow live ones to continue.
+    #[tokio::test]
+    async fn test_slot_names_and_dead_slot_continues() {
+        let (proxies, mut senders, _receivers) = setup_proxies();
+        let mut combinator =
+            ClientEventsCombinator::new(proxies).with_slot_names(&["http", "websocket", "extra"]);
+
+        for (idx, sender) in senders.iter_mut().enumerate() {
+            sender.send(idx).await.unwrap();
+            combinator.recv().await.unwrap();
+        }
+
+        // Kill slot 1 ("websocket")
+        drop(senders.remove(1));
+
+        // Send data from a live proxy
+        senders[0].send(0).await.unwrap();
+
+        // Should eventually get a successful request from a live proxy
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match combinator.recv().await {
+                    Ok(req) => return Ok(req),
+                    Err(e) if matches!(e.kind(), ErrorKind::ChannelClosed) => continue,
+                    Err(e) if matches!(e.kind(), ErrorKind::TransportProtocolDisconnect) => {
+                        continue
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .expect("recv timed out — combinator should continue with live slots");
+        assert!(result.is_ok(), "dead slot should not kill combinator");
     }
 }
