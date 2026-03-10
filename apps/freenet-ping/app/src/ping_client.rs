@@ -172,8 +172,11 @@ pub async fn wait_for_get_response(
                 skipped += 1;
             }
             RecvOutcome::HostError(err) => {
-                tracing::error!(err=%err);
-                return Err(err.into());
+                // Host errors from other operations (e.g. subscription timeouts)
+                // can arrive on the WebSocket while we're waiting for a GET response.
+                // Skip them rather than failing, since they're not GET errors.
+                tracing::warn!(err=%err, "Skipping host error while waiting for GET response");
+                skipped += 1;
             }
             RecvOutcome::PerRecvTimeout => continue,
             RecvOutcome::DeadlineElapsed { skipped } => {

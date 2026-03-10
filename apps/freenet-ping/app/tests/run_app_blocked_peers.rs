@@ -57,7 +57,14 @@ async fn test_ping_blocked_peers() -> anyhow::Result<()> {
                         error_str
                     );
                     last_error = Some(e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Jitter ±20% to avoid thundering herd with parallel tests
+                    let jitter = 80
+                        + (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos()
+                            % 41) as u64; // 80..=120
+                    tokio::time::sleep(Duration::from_millis(jitter)).await;
                     continue;
                 }
                 return Err(e);
@@ -339,14 +346,28 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
 
             sleep(poll_interval).await;
 
-            // Check current state on all nodes
-            let (state_gw, state_node1, state_node2) = get_all_ping_states(
+            // Check current state on all nodes — transient errors (e.g. stale
+            // subscription timeouts arriving on the WebSocket) shouldn't abort
+            // the entire polling loop.
+            let (state_gw, state_node1, state_node2) = match get_all_ping_states(
                 &mut client_gw,
                 &mut client_node1,
                 &mut client_node2,
                 contract_key,
             )
-            .await?;
+            .await
+            {
+                Ok(states) => states,
+                Err(e) => {
+                    tracing::warn!(
+                        "Poll {}/{}: get_all_ping_states failed: {}, retrying...",
+                        poll,
+                        max_polls,
+                        e
+                    );
+                    continue;
+                }
+            };
 
             let gw_has_n1 = state_gw.contains_key(node1_tag);
             let gw_has_n2 = state_gw.contains_key(node2_tag);
