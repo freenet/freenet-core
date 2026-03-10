@@ -2179,49 +2179,93 @@ pub(crate) async fn join_ring_request(
     }
 
     let own = op_manager.ring.connection_manager.own_location();
-    // Use the joiner's own location as the desired_location for the connect request.
-    //
-    // History: PR #2907 fixed a critical issue where using `gateway.location()` caused
-    // 99.7% of join requests to converge on a single acceptor. That PR intended to use
-    // the joiner's own location but implemented `Location::random()` instead, which
-    // broke simulation determinism for certain seeds (issues #3028, #3030).
-    //
-    // Using `own.location()` is correct because:
-    // - Each joiner has a unique location → requests spread across gateway neighbors
-    // - The gateway routes toward the joiner's ring neighborhood → better initial placement
-    // - Deterministic in simulation tests (same seed → same location → same topology)
-    // - Falls back to random only if own address is unknown (NAT before ObservedAddress)
     let base_location = own.location().unwrap_or_else(Location::random);
 
     // Capture now once so the jitter failure counter and any other time-sensitive
     // calls in this function share a consistent timestamp.
     let now = Instant::now();
 
-    // Apply location jitter on retry to explore different ring regions.
+    let current_connections = op_manager.ring.connection_manager.connection_count();
+
+    // Helper: apply jitter to base_location for NAT-compatible acceptor exploration.
     // After consecutive hole-punch failures, the same location routes to the same
-    // acceptors. Jittering the target location causes routing to converge on
-    // different ring peers, increasing the chance of finding a NAT-compatible acceptor.
-    let failures = op_manager
-        .ring
-        .connection_manager
-        .increment_connect_jitter_failures(now);
-    let desired_location = if failures > 1 {
-        // Jitter magnitude: 0.05 * 2^(failures-2), capped at 0.25
-        let magnitude = (0.05 * (1u32 << (failures - 2).min(3)) as f64).min(0.25);
-        // Generate uniform random offset in [-magnitude, +magnitude]
-        let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
-        let offset = magnitude * (2.0 * uniform_01 - 1.0);
-        let jittered = (base_location.as_f64() + offset).rem_euclid(1.0);
-        tracing::info!(
-            failures,
-            magnitude,
-            base = %base_location,
-            jittered,
-            "connect: applying location jitter after consecutive failures"
-        );
-        Location::new(jittered)
+    // acceptors. Jittering explores different ring regions.
+    let apply_bootstrap_jitter = |base: Location| -> Location {
+        let failures = op_manager
+            .ring
+            .connection_manager
+            .increment_connect_jitter_failures(now);
+        if failures > 1 {
+            // Jitter magnitude: 0.05 * 2^(failures-2), capped at 0.25
+            let magnitude = (0.05 * (1u32 << (failures - 2).min(3)) as f64).min(0.25);
+            let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
+            let offset = magnitude * (2.0 * uniform_01 - 1.0);
+            let jittered = (base.as_f64() + offset).rem_euclid(1.0);
+            tracing::info!(
+                failures,
+                magnitude,
+                base = %base,
+                jittered,
+                "connect: applying location jitter after consecutive failures"
+            );
+            Location::new(jittered)
+        } else {
+            base
+        }
+    };
+
+    // Choose desired_location based on whether we have enough connections for
+    // gap-based targeting (Kleinberg-optimal) or need bootstrap targeting.
+    //
+    // With connections: use gap_target to find the largest gap in our connection
+    // distribution in log-distance space and target its midpoint. This produces
+    // Kleinberg-optimal 1/d-distributed connections.
+    //
+    // Without connections (true bootstrap): target own location with jitter.
+    // Own-location targeting spreads requests across gateway neighbors (each
+    // joiner has a unique location). Jitter after failures explores different
+    // ring regions to find NAT-compatible acceptors.
+    // Minimum connections needed for meaningful gap analysis. Independent of
+    // min_connections because this is about statistical sample size for the 1/d
+    // distribution, not connection targets. 3 points are sufficient to identify
+    // the largest gap in log-distance space.
+    const GAP_TARGET_THRESHOLD: usize = 3;
+    let desired_location = if current_connections >= GAP_TARGET_THRESHOLD {
+        // Use gap_target: find the largest gap in our current connections
+        // and target its midpoint for Kleinberg-optimal placement.
+        if let Some(my_loc) = own.location() {
+            let neighbor_distances: Vec<f64> = op_manager
+                .ring
+                .connection_manager
+                .location_for_all_peers()
+                .into_iter()
+                .map(|peer_loc| my_loc.distance(peer_loc).as_f64())
+                .collect();
+            if neighbor_distances.len() >= GAP_TARGET_THRESHOLD {
+                let target = crate::topology::small_world_rand::gap_target(
+                    my_loc,
+                    neighbor_distances.into_iter(),
+                );
+                tracing::info!(
+                    current_connections,
+                    own_location = %my_loc,
+                    target = %target,
+                    distance = my_loc.distance(target).as_f64(),
+                    "connect: using gap_target for Kleinberg-optimal placement"
+                );
+                target
+            } else {
+                // Fewer unique neighbor locations than connections (e.g. sybil
+                // masking collapses peers to same ring location). Fall back to
+                // jitter-based exploration to avoid retrying the same acceptors.
+                apply_bootstrap_jitter(base_location)
+            }
+        } else {
+            apply_bootstrap_jitter(base_location)
+        }
     } else {
-        base_location
+        // Bootstrap mode: target own location with jitter after failures.
+        apply_bootstrap_jitter(base_location)
     };
     let ttl = op_manager
         .ring
@@ -4387,6 +4431,71 @@ mod tests {
         assert!(
             !visited.probably_visited(unconnected_peer),
             "unconnected peer should not be in the visited filter"
+        );
+    }
+
+    /// Verify that gap_target produces shorter connections than own-location+jitter.
+    ///
+    /// This is a regression test for the bootstrap topology bug: before the fix,
+    /// join_ring_request always targeted the joiner's own location with up to ±0.25
+    /// jitter, producing median connection distance ~0.12 instead of the Kleinberg-
+    /// optimal ~0.02. Now, with ≥3 existing connections, gap_target is used instead.
+    #[test]
+    fn test_gap_target_produces_shorter_connections_than_jitter() {
+        use crate::topology::small_world_rand::gap_target;
+
+        let _guard = GlobalRng::seed_guard(42);
+
+        let my_location = Location::new(0.5);
+
+        // Simulate a peer with 5 existing connections at various distances
+        let existing_connections = vec![
+            Location::new(0.501), // very close
+            Location::new(0.51),  // close
+            Location::new(0.55),  // nearby
+            Location::new(0.7),   // medium
+            Location::new(0.9),   // far
+        ];
+
+        let distances: Vec<f64> = existing_connections
+            .iter()
+            .map(|loc| my_location.distance(*loc).as_f64())
+            .collect();
+
+        // Generate 100 gap_target samples and 100 jitter samples
+        let mut gap_target_distances = Vec::new();
+        let mut jitter_distances = Vec::new();
+
+        for _ in 0..100 {
+            let target = gap_target(my_location, distances.iter().copied());
+            gap_target_distances.push(my_location.distance(target).as_f64());
+
+            // Simulate jitter with failures=3 (magnitude=0.10)
+            let magnitude = 0.10;
+            let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
+            let offset = magnitude * (2.0 * uniform_01 - 1.0);
+            let jittered = (my_location.as_f64() + offset).rem_euclid(1.0);
+            jitter_distances.push(my_location.distance(Location::new(jittered)).as_f64());
+        }
+
+        gap_target_distances.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        jitter_distances.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let gap_median = gap_target_distances[50];
+        let jitter_median = jitter_distances[50];
+
+        // gap_target should produce significantly shorter median distances
+        // because it targets gaps in the 1/d distribution (Kleinberg-optimal),
+        // while jitter produces roughly uniform distances around the peer.
+        assert!(
+            gap_median < jitter_median,
+            "gap_target median ({gap_median:.4}) should be shorter than jitter median ({jitter_median:.4})"
+        );
+
+        // gap_target median should be well under 0.05 (typically ~0.001-0.01)
+        assert!(
+            gap_median < 0.05,
+            "gap_target median ({gap_median:.4}) should be < 0.05 (Kleinberg-optimal produces short connections)"
         );
     }
 }

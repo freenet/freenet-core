@@ -731,6 +731,15 @@ impl ConnectionManager {
         }
     }
 
+    /// Returns all ring-connected peer locations.
+    pub fn location_for_all_peers(&self) -> Vec<Location> {
+        self.connections_by_location
+            .read()
+            .keys()
+            .copied()
+            .collect()
+    }
+
     /// Returns our own socket address if set.
     pub fn get_own_addr(&self) -> Option<SocketAddr> {
         *self.own_addr.lock()
