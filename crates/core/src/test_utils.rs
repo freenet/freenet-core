@@ -407,11 +407,8 @@ pub async fn make_node_diagnostics(
 /// Cache for compiled contract WASM bytes, keyed by contract name.
 /// Prevents redundant `cargo build` invocations when multiple tests in the
 /// same binary use the same contract. The first call compiles; subsequent
-/// calls reuse the cached bytes.
-///
-/// The mutex intentionally serializes compilation — running parallel
-/// `cargo build` processes causes filesystem races on the output WASM.
-/// Cache hits release the lock immediately.
+/// calls reuse the cached bytes. Concurrent first-callers may both compile
+/// (cargo handles its own locking), but only one result is stored.
 static COMPILED_CONTRACT_CACHE: LazyLock<Mutex<std::collections::HashMap<String, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -426,8 +423,9 @@ pub fn ensure_contract_compiled(name: &str) -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    // Compile outside the lock-held-for-reads path, but still serialized
-    // to prevent parallel `cargo build` filesystem races
+    // Compile with lock released — concurrent first-callers may both invoke
+    // cargo build, but that's safe (cargo serializes via its own file lock).
+    // The cache deduplicates via or_insert so only one copy is stored.
     let bytes = compile_contract(name)?;
     let mut cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
     cache.entry(name.to_string()).or_insert(bytes);

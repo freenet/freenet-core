@@ -62,7 +62,14 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
                         error_str
                     );
                     last_error = Some(e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Jitter ±20% to avoid thundering herd on port retry
+                    let jitter = 80
+                        + (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos()
+                            % 41) as u64; // 80..=120
+                    tokio::time::sleep(Duration::from_millis(jitter)).await;
                     continue;
                 }
                 return Err(e);
