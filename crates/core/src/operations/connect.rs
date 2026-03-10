@@ -2389,7 +2389,16 @@ pub(crate) async fn initial_join_procedure(
         loop {
             let open_conns = op_manager.ring.open_connections();
 
-            tracing::debug!("Connection status: open_connections = {}", open_conns,);
+            let unconnected_gateways: Vec<_> =
+                op_manager.ring.is_not_connected(gateways.iter()).collect();
+
+            tracing::debug!(
+                "Connection status: open_connections = {}, unconnected_gateways = {}",
+                open_conns,
+                unconnected_gateways.len()
+            );
+
+            let unconnected_count = unconnected_gateways.len();
 
             // When fully isolated (0 connections) but all gateways appear "connected/pending",
             // force-clear stale pending reservations so gateways become retryable immediately.
@@ -2397,17 +2406,7 @@ pub(crate) async fn initial_join_procedure(
             // failed attempt, compounding with gateway backoff to cause 20+ minute recovery
             // delays (#3319). The reservations were created by previous failed join_ring_request()
             // calls and no longer represent real in-progress connections.
-            //
-            // Note: unconnected_gateways is only computed here (not every iteration) because
-            // the main bootstrap path below uses all gateways (including connected ones) to
-            // route CONNECTs through them toward gap locations.
-            if open_conns == 0
-                && op_manager
-                    .ring
-                    .is_not_connected(gateways.iter())
-                    .next()
-                    .is_none()
-            {
+            if open_conns == 0 && unconnected_count == 0 {
                 let gateway_addrs: Vec<_> =
                     gateways.iter().filter_map(|gw| gw.socket_addr()).collect();
                 op_manager
@@ -2422,24 +2421,31 @@ pub(crate) async fn initial_join_procedure(
                 // control retry timing to avoid thundering herd when multiple peers lose
                 // connectivity simultaneously. The 120-second isolation recovery in
                 // connection_maintenance resets both backoff and reservations periodically.
+            } else if open_conns < bootstrap_threshold && unconnected_count == 0 {
+                tracing::info!(
+                    open_conns,
+                    total_gateways = gateways.len(),
+                    "Below bootstrap threshold but all gateways appear connected/pending — \
+                     waiting for handshakes to complete or pending reservations to expire"
+                );
             }
 
-            if open_conns < bootstrap_threshold {
+            let use_connected_as_routers = open_conns < bootstrap_threshold
+                && unconnected_count == 0
+                && bootstrap_threshold.saturating_sub(open_conns) > gateways.len();
+
+            if open_conns < bootstrap_threshold && unconnected_count > 0 {
                 // Filter out gateways that are in backoff due to previous failures.
                 // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
                 //
-                // Design note: We use all gateways (not just unconnected) because
-                // already-connected gateways can route CONNECTs to gap locations via
-                // join_ring_request's gap_target() logic. Without this, once all gateways
-                // are connected the loop goes dormant even though we need 15+ more peers.
-                //
-                // Per-gateway backoff still applies, and should_accept() in
-                // connection_manager.rs returns true for already-connected peers.
+                // Design note: We track backoff per-gateway because join_ring_request uses
+                // the joiner's own desired_location each time. Backing off the gateway gives the
+                // network time to stabilize before we retry through that gateway again.
                 let (eligible_gateways, min_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
                     let mut min_remaining: Option<Duration> = None;
-                    let eligible: Vec<_> = gateways
-                        .iter()
+                    let eligible: Vec<_> = unconnected_gateways
+                        .into_iter()
                         .filter(|gw| {
                             if let Some(addr) = gw.socket_addr() {
                                 if backoff.is_in_backoff(addr) {
@@ -2487,7 +2493,7 @@ pub(crate) async fn initial_join_procedure(
                         tracing::info!(
                             wait_secs = effective_wait.as_secs(),
                             gateway_backoff_secs = min_wait.as_secs(),
-                            total_gateways = gateways.len(),
+                            total_gateways = unconnected_count,
                             open_connections = open_conns,
                             "All gateways in backoff, waiting before retry"
                         );
@@ -2502,11 +2508,11 @@ pub(crate) async fn initial_join_procedure(
                 }
 
                 tracing::info!(
-                    "Below bootstrap threshold ({} < {}), attempting to connect via {} gateways (skipped {} in backoff)",
+                    "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways (skipped {} in backoff)",
                     open_conns,
                     bootstrap_threshold,
                     number_of_parallel_connections.min(eligible_count),
-                    gateways.len() - eligible_count
+                    unconnected_count - eligible_count
                 );
                 let select_all = FuturesUnordered::new();
                 for gateway in eligible_gateways
@@ -2515,10 +2521,9 @@ pub(crate) async fn initial_join_procedure(
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
-                    let gateway = gateway.clone();
                     let op_manager = op_manager.clone();
                     select_all.push(async move {
-                        (join_ring_request(&gateway, &op_manager).await, gateway)
+                        (join_ring_request(gateway, &op_manager).await, gateway)
                     });
                 }
                 select_all
@@ -2539,6 +2544,58 @@ pub(crate) async fn initial_join_procedure(
                         }
                     })
                     .await;
+            } else if use_connected_as_routers {
+                // All gateways connected but still need many more peers.
+                // Route CONNECTs through connected gateways toward gap locations.
+                let eligible: Vec<_> = {
+                    let backoff = op_manager.gateway_backoff.lock();
+                    gateways
+                        .iter()
+                        .filter(|gw| {
+                            gw.socket_addr()
+                                .map(|addr| !backoff.is_in_backoff(addr))
+                                .unwrap_or(false)
+                        })
+                        .collect()
+                };
+
+                if !eligible.is_empty() {
+                    tracing::info!(
+                        eligible = eligible.len(),
+                        total_gateways = gateways.len(),
+                        "Routing CONNECTs through connected gateways"
+                    );
+                    let select_all = FuturesUnordered::new();
+                    for gateway in eligible
+                        .into_iter()
+                        .shuffle()
+                        .take(number_of_parallel_connections)
+                    {
+                        let gateway = gateway.clone();
+                        let op_manager = op_manager.clone();
+                        select_all.push(async move {
+                            (join_ring_request(&gateway, &op_manager).await, gateway)
+                        });
+                    }
+                    select_all
+                        .for_each(|(res, gateway)| async move {
+                            if let Err(error) = res {
+                                if !matches!(
+                                    error,
+                                    OpError::ConnError(
+                                        crate::node::ConnectionError::UnwantedConnection
+                                    )
+                                ) {
+                                    tracing::error!(
+                                        %gateway,
+                                        %error,
+                                        "Failed while routing CONNECT through gateway"
+                                    );
+                                }
+                            }
+                        })
+                        .await;
+                }
             } else if open_conns >= bootstrap_threshold {
                 tracing::trace!(
                     "Have {} connections (>= threshold of {}), not attempting gateway connections",

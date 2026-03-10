@@ -4813,7 +4813,7 @@ fn test_neighbor_cache_bounded() {
 #[test]
 #[cfg(feature = "simulation_tests")]
 fn test_anti_starvation_exercised() {
-    let result = TestConfig::medium("anti-starvation", 0x3094_0001)
+    let result = TestConfig::medium("anti-starvation", 0x3094_0002)
         .with_iterations(150)
         .with_max_contracts(10)
         .run();
