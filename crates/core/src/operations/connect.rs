@@ -2421,27 +2421,24 @@ pub(crate) async fn initial_join_procedure(
                 // control retry timing to avoid thundering herd when multiple peers lose
                 // connectivity simultaneously. The 120-second isolation recovery in
                 // connection_maintenance resets both backoff and reservations periodically.
-            } else if open_conns < bootstrap_threshold && unconnected_count == 0 {
-                tracing::info!(
-                    open_conns,
-                    total_gateways = gateways.len(),
-                    "Below bootstrap threshold but all gateways appear connected/pending — \
-                     waiting for handshakes to complete or pending reservations to expire"
-                );
             }
 
-            if open_conns < bootstrap_threshold && unconnected_count > 0 {
+            if open_conns < bootstrap_threshold {
                 // Filter out gateways that are in backoff due to previous failures.
                 // This prevents hammering acceptors that consistently fail (e.g., NAT issues).
                 //
-                // Design note: We track backoff per-gateway because join_ring_request uses
-                // the joiner's own desired_location each time. Backing off the gateway gives the
-                // network time to stabilize before we retry through that gateway again.
+                // Design note: We use all gateways (not just unconnected) because
+                // already-connected gateways can route CONNECTs to gap locations via
+                // join_ring_request's gap_target() logic. Without this, once all gateways
+                // are connected the loop goes dormant even though we need 15+ more peers.
+                //
+                // Per-gateway backoff still applies, and should_accept() in
+                // connection_manager.rs returns true for already-connected peers.
                 let (eligible_gateways, min_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
                     let mut min_remaining: Option<Duration> = None;
-                    let eligible: Vec<_> = unconnected_gateways
-                        .into_iter()
+                    let eligible: Vec<_> = gateways
+                        .iter()
                         .filter(|gw| {
                             if let Some(addr) = gw.socket_addr() {
                                 if backoff.is_in_backoff(addr) {
@@ -2489,7 +2486,7 @@ pub(crate) async fn initial_join_procedure(
                         tracing::info!(
                             wait_secs = effective_wait.as_secs(),
                             gateway_backoff_secs = min_wait.as_secs(),
-                            total_gateways = unconnected_count,
+                            total_gateways = gateways.len(),
                             open_connections = open_conns,
                             "All gateways in backoff, waiting before retry"
                         );
@@ -2504,11 +2501,11 @@ pub(crate) async fn initial_join_procedure(
                 }
 
                 tracing::info!(
-                    "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways (skipped {} in backoff)",
+                    "Below bootstrap threshold ({} < {}), attempting to connect via {} gateways (skipped {} in backoff)",
                     open_conns,
                     bootstrap_threshold,
                     number_of_parallel_connections.min(eligible_count),
-                    unconnected_count - eligible_count
+                    gateways.len() - eligible_count
                 );
                 let select_all = FuturesUnordered::new();
                 for gateway in eligible_gateways
@@ -2517,9 +2514,10 @@ pub(crate) async fn initial_join_procedure(
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
+                    let gateway = gateway.clone();
                     let op_manager = op_manager.clone();
                     select_all.push(async move {
-                        (join_ring_request(gateway, &op_manager).await, gateway)
+                        (join_ring_request(&gateway, &op_manager).await, gateway)
                     });
                 }
                 select_all

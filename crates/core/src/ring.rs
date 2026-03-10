@@ -1784,10 +1784,12 @@ impl Ring {
 
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
-        /// Maximum number of concurrent connection acquisition attempts.
+        /// Base number of concurrent connection acquisition attempts.
         /// Allows parallel connection attempts to speed up network formation
         /// instead of serial blocking on a single connection at a time.
-        const MAX_CONCURRENT_CONNECTIONS: usize = 3;
+        const BASE_CONCURRENT_CONNECTIONS: usize = 3;
+        /// Upper bound on concurrent connections during bootstrap (below min_connections).
+        const BOOTSTRAP_CONCURRENT_CONNECTIONS_CAP: usize = 10;
 
         let mut check_interval = tokio::time::interval(CHECK_TICK_DURATION);
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2020,13 +2022,13 @@ impl Ring {
                         "Zero connections — all gateways connected/pending or in backoff"
                     );
                 } else {
-                    let attempt_count = eligible.len().min(MAX_CONCURRENT_CONNECTIONS);
+                    let attempt_count = eligible.len().min(BASE_CONCURRENT_CONNECTIONS);
                     tracing::info!(
                         eligible = eligible.len(),
                         attempting = attempt_count,
                         "Zero connections — attempting gateway bootstrap"
                     );
-                    for gw in eligible.iter().take(MAX_CONCURRENT_CONNECTIONS) {
+                    for gw in eligible.iter().take(BASE_CONCURRENT_CONNECTIONS) {
                         match crate::operations::connect::join_ring_request(gw, &op_manager).await {
                             Ok(()) => tracing::debug!(gateway = %gw, "Gateway bootstrap initiated"),
                             Err(e) => {
@@ -2037,8 +2039,19 @@ impl Ring {
                 }
             }
 
+            // Scale concurrent connection limit based on deficit to min_connections.
+            // During bootstrap (far below min_connections), allow more parallel attempts
+            // to avoid stalling when slots fill with slow/timing-out transactions.
+            let max_concurrent = if current_conn_count < self.connection_manager.min_connections {
+                let deficit = self.connection_manager.min_connections - current_conn_count;
+                (BASE_CONCURRENT_CONNECTIONS + deficit / 3)
+                    .min(BOOTSTRAP_CONCURRENT_CONNECTIONS_CAP)
+            } else {
+                BASE_CONCURRENT_CONNECTIONS
+            };
+
             // Drain pending connections, initiating multiple attempts per tick
-            // (up to MAX_CONCURRENT_CONNECTIONS) for faster mesh formation.
+            // (up to max_concurrent) for faster mesh formation.
             let mut active_count = live_tx_tracker.active_connect_transaction_count();
             while let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if self.is_in_connection_backoff(ideal_location) {
@@ -2050,10 +2063,10 @@ impl Ring {
                     // this location on the next cycle if still below min_connections.
                     continue;
                 }
-                if active_count >= MAX_CONCURRENT_CONNECTIONS {
+                if active_count >= max_concurrent {
                     tracing::debug!(
                         active_connections = active_count,
-                        max_concurrent = MAX_CONCURRENT_CONNECTIONS,
+                        max_concurrent,
                         target_location = %ideal_location,
                         "At max concurrent connections, re-queuing location"
                     );
@@ -2062,7 +2075,7 @@ impl Ring {
                 }
                 tracing::debug!(
                     active_connections = active_count,
-                    max_concurrent = MAX_CONCURRENT_CONNECTIONS,
+                    max_concurrent,
                     target_location = %ideal_location,
                     "Attempting to acquire new connection"
                 );
