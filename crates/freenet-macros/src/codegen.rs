@@ -141,8 +141,11 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             // 0. Pre-compile test contract WASM before any timeout starts.
             // On CI, `cargo build --target wasm32-unknown-unknown` can take 30-60s
             // on cold cache; doing it inside the test timeout causes false failures.
+            // Note: "test-contract-integration" is the standard contract used by all
+            // #[freenet_test] tests. Tests using different contracts would need to
+            // call ensure_contract_compiled() themselves before the timed section.
             if let Err(e) = freenet::test_utils::ensure_contract_compiled("test-contract-integration") {
-                tracing::warn!("Failed to pre-compile test contract: {}", e);
+                tracing::warn!("Failed to pre-compile test contract (will retry inside test): {}", e);
             }
 
             // 1. Setup TestLogger

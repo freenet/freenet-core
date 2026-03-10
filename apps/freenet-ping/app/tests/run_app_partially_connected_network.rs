@@ -257,6 +257,8 @@ async fn run_partially_connected_test(attempt: usize) -> anyhow::Result<()> {
         // Prevent the topology manager from aggressively pruning connections
         // in this partially connected network. With only 30% connectivity,
         // nodes need to retain the few connections they have.
+        // The +1 accounts for the gateway connection (not counted in
+        // effective_connections which only counts regular peer links).
         cfg.network_api.min_connections = Some(effective_connections + 1);
 
         println!(

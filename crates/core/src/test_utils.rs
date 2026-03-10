@@ -408,6 +408,10 @@ pub async fn make_node_diagnostics(
 /// Prevents redundant `cargo build` invocations when multiple tests in the
 /// same binary use the same contract. The first call compiles; subsequent
 /// calls reuse the cached bytes.
+///
+/// The mutex intentionally serializes compilation — running parallel
+/// `cargo build` processes causes filesystem races on the output WASM.
+/// Cache hits release the lock immediately.
 static COMPILED_CONTRACT_CACHE: LazyLock<Mutex<std::collections::HashMap<String, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -415,22 +419,33 @@ static COMPILED_CONTRACT_CACHE: LazyLock<Mutex<std::collections::HashMap<String,
 /// Call this BEFORE any test timeout to ensure `cargo build` time
 /// doesn't count against the test's deadline. Thread-safe and idempotent.
 pub fn ensure_contract_compiled(name: &str) -> anyhow::Result<()> {
-    let mut cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
-    if !cache.contains_key(name) {
-        let bytes = compile_contract(name)?;
-        cache.insert(name.to_string(), bytes);
+    // Check cache first (fast path — lock released immediately)
+    {
+        let cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
+        if cache.contains_key(name) {
+            return Ok(());
+        }
     }
+    // Compile outside the lock-held-for-reads path, but still serialized
+    // to prevent parallel `cargo build` filesystem races
+    let bytes = compile_contract(name)?;
+    let mut cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
+    cache.entry(name.to_string()).or_insert(bytes);
     Ok(())
 }
 
 pub fn load_contract(name: &str, params: Parameters<'static>) -> anyhow::Result<ContractContainer> {
+    // Fast path: check cache without compiling
     let wasm_bytes = {
-        let mut cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
-        if let Some(bytes) = cache.get(name) {
-            bytes.clone()
-        } else {
+        let cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
+        cache.get(name).cloned()
+    };
+    let wasm_bytes = match wasm_bytes {
+        Some(bytes) => bytes,
+        None => {
             let bytes = compile_contract(name)?;
-            cache.insert(name.to_string(), bytes.clone());
+            let mut cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
+            cache.entry(name.to_string()).or_insert(bytes.clone());
             bytes
         }
     };
