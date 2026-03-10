@@ -608,16 +608,22 @@ impl<T: TimeSource> InterestManager<T> {
             .map(|entry| entry.key().clone())
             .collect();
 
+        let mut executed = 0;
         for peer in &expired_peers {
-            self.pending_removals.remove(peer);
-            let removed = self.remove_all_peer_interests(peer);
-            tracing::info!(
-                peer = %peer.0,
-                removed_interests = removed,
-                "Executed deferred interest removal — peer did not reconnect"
-            );
+            // Atomically remove from pending_removals. If `cancel_deferred_removal`
+            // already removed it (peer reconnected between collect and here), skip
+            // the interest removal to avoid a TOCTOU race.
+            if self.pending_removals.remove(peer).is_some() {
+                let removed = self.remove_all_peer_interests(peer);
+                tracing::info!(
+                    peer = %peer.0,
+                    removed_interests = removed,
+                    "Executed deferred interest removal — peer did not reconnect"
+                );
+                executed += 1;
+            }
         }
-        expired_peers.len()
+        executed
     }
 
     /// Register local interest in a contract (for tracking our reasons).
@@ -2148,5 +2154,33 @@ mod tests {
 
         // No pending removal — cancel should return false
         assert!(!manager.cancel_deferred_removal(&peer));
+    }
+
+    /// Regression test: if cancel_deferred_removal runs between the collect phase
+    /// and the removal phase of execute_pending_removals, the removal must be
+    /// skipped (the peer reconnected). Without the guard on pending_removals.remove(),
+    /// interests would be wiped even though the peer is back.
+    #[test]
+    fn test_execute_skips_removal_if_cancelled_between_collect_and_remove() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        manager.schedule_deferred_removal(&peer);
+
+        // Advance past grace period
+        time.advance_time(INTEREST_DISCONNECT_GRACE_PERIOD + Duration::from_secs(1));
+
+        // Simulate reconnect cancelling the pending removal before sweep executes
+        manager.cancel_deferred_removal(&peer);
+
+        // execute_pending_removals should return 0 — the entry was already cancelled
+        let removed = manager.execute_pending_removals();
+        assert_eq!(removed, 0);
+        assert!(
+            manager.get_peer_interest(&contract, &peer).is_some(),
+            "Interests must be preserved when peer reconnected before sweep executed"
+        );
     }
 }
