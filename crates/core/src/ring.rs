@@ -1784,13 +1784,8 @@ impl Ring {
 
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
 
-        /// Base number of concurrent connection acquisition attempts.
-        /// Allows parallel connection attempts to speed up network formation
-        /// instead of serial blocking on a single connection at a time.
+        /// Base number of concurrent connection acquisition attempts (steady-state).
         const BASE_CONCURRENT_CONNECTIONS: usize = 3;
-        /// How many missing connections map to one additional concurrent slot.
-        /// E.g., with deficit=15, grants 15/3 = 5 extra slots on top of the base.
-        const CONNECTIONS_PER_EXTRA_SLOT: usize = 3;
 
         let mut check_interval = tokio::time::interval(CHECK_TICK_DURATION);
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2043,16 +2038,10 @@ impl Ring {
             // Scale concurrent connection limit based on deficit to min_connections.
             // During bootstrap (far below min_connections), allow more parallel attempts
             // to avoid stalling when slots fill with slow/timing-out transactions.
-            // Cap derived from min_connections to scale with configuration.
-            let min_conns = self.connection_manager.min_connections;
-            let max_concurrent = if current_conn_count < min_conns {
-                let deficit = min_conns - current_conn_count;
-                let bootstrap_cap = min_conns / 2;
-                (BASE_CONCURRENT_CONNECTIONS + deficit / CONNECTIONS_PER_EXTRA_SLOT)
-                    .min(bootstrap_cap.max(BASE_CONCURRENT_CONNECTIONS))
-            } else {
-                BASE_CONCURRENT_CONNECTIONS
-            };
+            let max_concurrent = calculate_max_concurrent_connections(
+                current_conn_count,
+                self.connection_manager.min_connections,
+            );
 
             // Drain pending connections, initiating multiple attempts per tick
             // (up to max_concurrent) for faster mesh formation.
@@ -2505,6 +2494,29 @@ impl Ring {
     }
 }
 
+/// Calculate the maximum number of concurrent connection acquisition attempts.
+///
+/// During bootstrap (below `min_connections`), scales up from the base to allow
+/// more parallel attempts, preventing stalls when slots fill with slow transactions.
+/// Once at or above `min_connections`, returns the base value.
+fn calculate_max_concurrent_connections(
+    current_connections: usize,
+    min_connections: usize,
+) -> usize {
+    /// Base concurrent connection slots (steady-state).
+    const BASE: usize = 3;
+    /// How many missing connections map to one additional concurrent slot.
+    const CONNECTIONS_PER_EXTRA_SLOT: usize = 3;
+
+    if current_connections >= min_connections {
+        return BASE;
+    }
+    let deficit = min_connections - current_connections;
+    // Cap at half of min_connections, floored at BASE.
+    let bootstrap_cap = (min_connections / 2).max(BASE);
+    (BASE + deficit / CONNECTIONS_PER_EXTRA_SLOT).min(bootstrap_cap)
+}
+
 fn calculate_allowed_connection_additions(
     current_connections: usize,
     pending_connections: usize,
@@ -2529,6 +2541,53 @@ fn calculate_allowed_connection_additions(
     }
 
     available_capacity.min(requested)
+}
+
+#[cfg(test)]
+mod max_concurrent_connections_tests {
+    use super::calculate_max_concurrent_connections;
+
+    #[test]
+    fn at_min_connections_returns_base() {
+        assert_eq!(calculate_max_concurrent_connections(25, 25), 3);
+    }
+
+    #[test]
+    fn above_min_connections_returns_base() {
+        assert_eq!(calculate_max_concurrent_connections(30, 25), 3);
+    }
+
+    #[test]
+    fn large_deficit_scales_up() {
+        // deficit=15, 3 + 15/3 = 8, cap = 25/2 = 12 → 8
+        assert_eq!(calculate_max_concurrent_connections(10, 25), 8);
+    }
+
+    #[test]
+    fn full_deficit_capped_at_half_min() {
+        // deficit=25, 3 + 25/3 = 11, cap = 25/2 = 12 → 11
+        assert_eq!(calculate_max_concurrent_connections(0, 25), 11);
+    }
+
+    #[test]
+    fn small_deficit_adds_nothing() {
+        // deficit=2, 3 + 2/3 = 3, cap = 25/2 = 12 → 3
+        assert_eq!(calculate_max_concurrent_connections(23, 25), 3);
+    }
+
+    #[test]
+    fn very_small_min_connections() {
+        // min_conns=1, deficit=1, 3 + 0 = 3, cap = max(0, 3) = 3 → 3
+        assert_eq!(calculate_max_concurrent_connections(0, 1), 3);
+        // min_conns=2, deficit=2, 3 + 0 = 3, cap = max(1, 3) = 3 → 3
+        assert_eq!(calculate_max_concurrent_connections(0, 2), 3);
+    }
+
+    #[test]
+    fn high_min_connections_scales_cap() {
+        // deficit=50, 3 + 50/3 = 19, cap = 50/2 = 25 → 19
+        assert_eq!(calculate_max_concurrent_connections(0, 50), 19);
+    }
 }
 
 #[cfg(test)]

@@ -2389,16 +2389,7 @@ pub(crate) async fn initial_join_procedure(
         loop {
             let open_conns = op_manager.ring.open_connections();
 
-            let unconnected_gateways: Vec<_> =
-                op_manager.ring.is_not_connected(gateways.iter()).collect();
-
-            tracing::debug!(
-                "Connection status: open_connections = {}, unconnected_gateways = {}",
-                open_conns,
-                unconnected_gateways.len()
-            );
-
-            let unconnected_count = unconnected_gateways.len();
+            tracing::debug!("Connection status: open_connections = {}", open_conns,);
 
             // When fully isolated (0 connections) but all gateways appear "connected/pending",
             // force-clear stale pending reservations so gateways become retryable immediately.
@@ -2406,7 +2397,17 @@ pub(crate) async fn initial_join_procedure(
             // failed attempt, compounding with gateway backoff to cause 20+ minute recovery
             // delays (#3319). The reservations were created by previous failed join_ring_request()
             // calls and no longer represent real in-progress connections.
-            if open_conns == 0 && unconnected_count == 0 {
+            //
+            // Note: unconnected_gateways is only computed here (not every iteration) because
+            // the main bootstrap path below uses all gateways (including connected ones) to
+            // route CONNECTs through them toward gap locations.
+            if open_conns == 0
+                && op_manager
+                    .ring
+                    .is_not_connected(gateways.iter())
+                    .next()
+                    .is_none()
+            {
                 let gateway_addrs: Vec<_> =
                     gateways.iter().filter_map(|gw| gw.socket_addr()).collect();
                 op_manager
