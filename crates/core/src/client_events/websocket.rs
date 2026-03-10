@@ -683,6 +683,12 @@ async fn websocket_interface(
     // Per-connection rate limiter for delegate operations (#3305, #3332)
     let mut delegate_rate_limiter = DelegateRateLimiter::new();
 
+    // Per-connection reassembly buffer for chunked client requests.
+    // freenet-stdlib 0.2.2+ automatically chunks ClientRequest messages that exceed
+    // 512 KiB into multiple StreamChunk messages. We reassemble them here before
+    // forwarding the complete request to the node.
+    let mut reassembly_buffer = freenet_stdlib::client_api::streaming::ReassemblyBuffer::new();
+
     // Create ping interval to keep connection alive and prevent idle timeout
     let mut ping_interval = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
     // Don't send ping immediately on connection, wait for first interval
@@ -748,6 +754,7 @@ async fn websocket_interface(
                     encoding_protoc,
                     api_version,
                     &mut delegate_rate_limiter,
+                    &mut reassembly_buffer,
                 )
                 .await
                 {
@@ -881,6 +888,7 @@ async fn process_client_request(
     encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
     rate_limiter: &mut DelegateRateLimiter,
+    reassembly_buffer: &mut freenet_stdlib::client_api::streaming::ReassemblyBuffer,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
     let msg = match msg {
         Ok(Message::Binary(data)) => data.to_vec(),
@@ -915,6 +923,62 @@ async fn process_client_request(
                 }
             },
         }
+    };
+
+    // Reassemble chunked client requests. freenet-stdlib 0.2.2+ splits large
+    // ClientRequest messages (>512 KiB) into StreamChunk variants. We collect
+    // chunks here and reconstruct the original request when all arrive.
+    let req = if let ClientRequest::StreamChunk {
+        stream_id,
+        index,
+        total,
+        data,
+    } = req
+    {
+        match reassembly_buffer.receive_chunk(stream_id, index, total, data) {
+            Ok(Some(complete_bytes)) => {
+                // All chunks received — deserialize the reassembled request
+                match bincode::deserialize::<ClientRequest>(&complete_bytes) {
+                    Ok(decoded) => decoded.into_owned(),
+                    Err(err) => {
+                        tracing::warn!(
+                            %client_id,
+                            stream_id,
+                            "Failed to deserialize reassembled chunked request: {err}"
+                        );
+                        let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
+                            ErrorKind::DeserializationError {
+                                cause: format!("{err}").into(),
+                            }
+                            .into(),
+                        ))
+                        .map_err(|err| Some(err.into()))?;
+                        return Ok(Some(Message::Binary(result_error.into())));
+                    }
+                }
+            }
+            Ok(None) => {
+                // Chunk buffered, waiting for more
+                return Ok(None);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %client_id,
+                    stream_id,
+                    "Stream reassembly error: {err}"
+                );
+                let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
+                    ErrorKind::Unhandled {
+                        cause: format!("stream reassembly error: {err}").into(),
+                    }
+                    .into(),
+                ))
+                .map_err(|err| Some(err.into()))?;
+                return Ok(Some(Message::Binary(result_error.into())));
+            }
+        }
+    } else {
+        req
     };
 
     // Rate-limit delegate requests that have been failing repeatedly (#3305).

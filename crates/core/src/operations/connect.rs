@@ -4449,7 +4449,7 @@ mod tests {
         let my_location = Location::new(0.5);
 
         // Simulate a peer with 5 existing connections at various distances
-        let existing_connections = vec![
+        let existing_connections = [
             Location::new(0.501), // very close
             Location::new(0.51),  // close
             Location::new(0.55),  // nearby
