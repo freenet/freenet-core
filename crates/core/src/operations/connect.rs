@@ -2234,18 +2234,16 @@ pub(crate) async fn join_ring_request(
         // Use gap_target: find the largest gap in our current connections
         // and target its midpoint for Kleinberg-optimal placement.
         if let Some(my_loc) = own.location() {
-            let signed_distances: Vec<f64> = op_manager
+            let distances: Vec<f64> = op_manager
                 .ring
                 .connection_manager
                 .location_for_all_peers()
                 .into_iter()
-                .map(|peer_loc| my_loc.signed_distance(peer_loc))
+                .map(|peer_loc| my_loc.distance(peer_loc).as_f64())
                 .collect();
-            if signed_distances.len() >= GAP_TARGET_THRESHOLD {
-                let target = crate::topology::small_world_rand::gap_target_directional(
-                    my_loc,
-                    &signed_distances,
-                );
+            if distances.len() >= GAP_TARGET_THRESHOLD {
+                let target =
+                    crate::topology::small_world_rand::gap_target(my_loc, distances.into_iter());
                 tracing::info!(
                     current_connections,
                     own_location = %my_loc,
@@ -4490,15 +4488,15 @@ mod tests {
         );
     }
 
-    /// Verify that gap_target_directional produces shorter connections than own-location+jitter.
+    /// Verify that gap_target produces shorter connections than own-location+jitter.
     ///
     /// This is a regression test for the bootstrap topology bug: before the fix,
     /// join_ring_request always targeted the joiner's own location with up to ±0.25
     /// jitter, producing median connection distance ~0.12 instead of the Kleinberg-
-    /// optimal ~0.02. Now, with ≥3 existing connections, gap_target_directional is used.
+    /// optimal ~0.02. Now, with ≥3 existing connections, gap_target is used.
     #[test]
     fn test_gap_target_produces_shorter_connections_than_jitter() {
-        use crate::topology::small_world_rand::gap_target_directional;
+        use crate::topology::small_world_rand::gap_target;
 
         let _guard = GlobalRng::seed_guard(42);
 
@@ -4513,9 +4511,9 @@ mod tests {
             Location::new(0.9),   // far CW
         ];
 
-        let signed_distances: Vec<f64> = existing_connections
+        let distances: Vec<f64> = existing_connections
             .iter()
-            .map(|loc| my_location.signed_distance(*loc))
+            .map(|loc| my_location.distance(*loc).as_f64())
             .collect();
 
         // Generate 100 gap_target samples and 100 jitter samples
@@ -4523,7 +4521,7 @@ mod tests {
         let mut jitter_distances = Vec::new();
 
         for _ in 0..100 {
-            let target = gap_target_directional(my_location, &signed_distances);
+            let target = gap_target(my_location, distances.iter().copied());
             gap_target_distances.push(my_location.distance(target).as_f64());
 
             // Simulate jitter with failures=3 (magnitude=0.10)

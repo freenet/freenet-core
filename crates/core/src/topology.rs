@@ -722,10 +722,10 @@ impl TopologyManager {
         // When a side is empty (count=0, gap=1.0), we use a very small expected gap
         // to ensure a swap is triggered.
         let expected_gap = if side_count == 0 {
-            0.01 // Empty side → always trigger swap
+            EXPECTED_GAP_FLOOR
         } else {
             let k = side_count as f64;
-            k.ln().max(0.01) / k
+            k.ln().max(EXPECTED_GAP_FLOOR) / k
         };
 
         // Swap probability proportional to how much the gap exceeds expected.

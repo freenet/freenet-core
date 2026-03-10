@@ -179,8 +179,15 @@ fn distance_from_gap_analysis(analysis: GapAnalysis) -> f64 {
 /// midpoint of that gap with some jitter to avoid deterministic targeting.
 ///
 /// Falls back to pure Kleinberg 1/d sampling when `connection_distances` is empty.
-#[cfg(test)]
-fn gap_target(my_location: Location, connection_distances: impl Iterator<Item = f64>) -> Location {
+///
+/// This non-directional variant is used during connection establishment (bootstrap
+/// and join_ring_request) where the ring is still forming and directional analysis
+/// has too few data points per side. Directional targeting is applied during
+/// steady-state topology management in `topology.rs`.
+pub(crate) fn gap_target(
+    my_location: Location,
+    connection_distances: impl Iterator<Item = f64>,
+) -> Location {
     let analysis = match analyze_gaps(connection_distances) {
         Some(a) => a,
         None => return kleinberg_target(my_location),
@@ -317,33 +324,28 @@ pub(crate) fn gap_target_directional(my_location: Location, signed_distances: &[
         return kleinberg_target(my_location);
     }
 
-    let cw_gap = cw_analysis
-        .as_ref()
-        .map(|a| a.largest_gap_size)
-        .unwrap_or(1.0);
-    let ccw_gap = ccw_analysis
-        .as_ref()
-        .map(|a| a.largest_gap_size)
-        .unwrap_or(1.0);
+    // If only one side has connections, directional analysis doesn't add value —
+    // the empty side would get a random Kleinberg target that doesn't account for
+    // the existing distribution. Use non-directional gap analysis instead.
+    if cw_analysis.is_none() || ccw_analysis.is_none() {
+        let all_abs = signed_distances.iter().map(|sd| sd.abs());
+        return gap_target(my_location, all_abs);
+    }
+
+    let cw_gap = cw_analysis.as_ref().unwrap().largest_gap_size;
+    let ccw_gap = ccw_analysis.as_ref().unwrap().largest_gap_size;
 
     // Soft weighting: probability of choosing a side proportional to its gap size.
     let pick_cw_prob = cw_gap / (cw_gap + ccw_gap);
     let pick_cw = GlobalRng::random_bool(pick_cw_prob);
 
     let (analysis, sign) = if pick_cw {
-        (cw_analysis, 1.0)
+        (cw_analysis.unwrap(), 1.0)
     } else {
-        (ccw_analysis, -1.0)
+        (ccw_analysis.unwrap(), -1.0)
     };
 
-    let distance = match analysis {
-        Some(a) => distance_from_gap_analysis(a),
-        None => {
-            // This side has no connections — sample from full Kleinberg range
-            random_link_distance(Distance::new(D_MIN_TARGET)).as_f64()
-        }
-    };
-
+    let distance = distance_from_gap_analysis(analysis);
     Location::new_rounded(my_location.as_f64() + sign * distance)
 }
 
@@ -971,15 +973,16 @@ mod tests {
     }
 
     #[test]
-    fn gap_target_directional_prefers_empty_side() {
+    fn gap_target_directional_falls_back_when_one_side_empty() {
         let _guard = crate::config::GlobalRng::seed_guard(0xD121_0001);
         let my_loc = Location::new(0.5);
 
-        // All connections CW (positive signed distance), none CCW
+        // All connections CW (positive signed distance), none CCW.
+        // When one side is empty, directional analysis falls back to
+        // non-directional gap_target which splits ~50/50 CW/CCW.
         let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
         let signed: Vec<f64> = [d_at(0.25), d_at(0.5), d_at(0.75)].to_vec();
 
-        // Most targets should go CCW (negative offset from my_location)
         let mut ccw_count = 0;
         let trials = 200;
         for _ in 0..trials {
@@ -989,11 +992,11 @@ mod tests {
                 ccw_count += 1;
             }
         }
-        // CCW side is completely empty (gap=1.0) vs CW side has connections (gap≈0.25)
-        // Probability of picking CCW ≈ 1.0/(1.0+0.25) ≈ 0.8
+        // Non-directional fallback uses random sign, so ~50% should be CCW
+        let ccw_frac = ccw_count as f64 / trials as f64;
         assert!(
-            ccw_count > trials * 60 / 100,
-            "Expected most targets CCW (empty side), got {ccw_count}/{trials}"
+            (0.3..=0.7).contains(&ccw_frac),
+            "Expected ~50% CCW (non-directional fallback), got {ccw_count}/{trials} ({ccw_frac:.2})"
         );
     }
 
