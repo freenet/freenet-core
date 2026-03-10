@@ -409,41 +409,34 @@ pub async fn make_node_diagnostics(
 /// same binary use the same contract. The first call compiles; subsequent
 /// calls reuse the cached bytes. Concurrent first-callers may both compile
 /// (cargo handles its own locking), but only one result is stored.
-static COMPILED_CONTRACT_CACHE: LazyLock<Mutex<std::collections::HashMap<String, Vec<u8>>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static COMPILED_CONTRACT_CACHE: LazyLock<dashmap::DashMap<String, Vec<u8>>> =
+    LazyLock::new(dashmap::DashMap::new);
 
 /// Pre-compile a test contract WASM binary without loading it.
 /// Call this BEFORE any test timeout to ensure `cargo build` time
 /// doesn't count against the test's deadline. Thread-safe and idempotent.
 pub fn ensure_contract_compiled(name: &str) -> anyhow::Result<()> {
-    // Check cache first (fast path — lock released immediately)
-    {
-        let cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
-        if cache.contains_key(name) {
-            return Ok(());
-        }
+    if COMPILED_CONTRACT_CACHE.contains_key(name) {
+        return Ok(());
     }
-    // Compile with lock released — concurrent first-callers may both invoke
-    // cargo build, but that's safe (cargo serializes via its own file lock).
-    // The cache deduplicates via or_insert so only one copy is stored.
+    // Concurrent first-callers may both invoke cargo build, but that's safe
+    // (cargo serializes via its own file lock). The cache deduplicates via
+    // or_insert so only one copy is stored.
     let bytes = compile_contract(name)?;
-    let mut cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
-    cache.entry(name.to_string()).or_insert(bytes);
+    COMPILED_CONTRACT_CACHE
+        .entry(name.to_string())
+        .or_insert(bytes);
     Ok(())
 }
 
 pub fn load_contract(name: &str, params: Parameters<'static>) -> anyhow::Result<ContractContainer> {
-    // Fast path: check cache without compiling
-    let wasm_bytes = {
-        let cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
-        cache.get(name).cloned()
-    };
-    let wasm_bytes = match wasm_bytes {
-        Some(bytes) => bytes,
+    let wasm_bytes = match COMPILED_CONTRACT_CACHE.get(name) {
+        Some(entry) => entry.value().clone(),
         None => {
             let bytes = compile_contract(name)?;
-            let mut cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
-            cache.entry(name.to_string()).or_insert(bytes.clone());
+            COMPILED_CONTRACT_CACHE
+                .entry(name.to_string())
+                .or_insert(bytes.clone());
             bytes
         }
     };
