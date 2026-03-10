@@ -140,7 +140,7 @@ pub(crate) fn largest_gap_size(connection_distances: impl Iterator<Item = f64>) 
 /// Pick a distance by targeting the largest gap's midpoint (with jitter) in
 /// a `GapAnalysis`, mapping back from log-space to a ring distance.
 ///
-/// Returns `None` if the analysis has no gaps (shouldn't happen with valid input).
+/// Panics if the analysis has no gaps (shouldn't happen with valid input).
 fn distance_from_gap_analysis(analysis: GapAnalysis) -> f64 {
     // Collect all gaps within 1% of the best (floating point tolerance)
     let threshold = analysis.largest_gap_size * 0.99;
