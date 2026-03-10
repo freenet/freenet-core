@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.1.175"
+version = "0.1.178"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1287,7 +1287,7 @@ dependencies = [
  "event-listener",
  "flatbuffers 25.12.19",
  "flate2",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.2",
  "futures",
  "gag",
  "headers",
@@ -1354,7 +1354,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.2",
  "freenet-test-network",
  "futures",
  "humantime",
@@ -1376,7 +1376,7 @@ name = "freenet-ping-contract"
 version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.2",
  "serde_json",
 ]
 
@@ -1386,7 +1386,7 @@ version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib",
+ "freenet-stdlib 0.2.2",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1398,11 +1398,41 @@ version = "0.1.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c76c2f57fed646bf8b70f34bf9390060227069cb8f3646533a273a634c5c5b69"
 dependencies = [
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "chrono",
+ "flatbuffers 24.12.23",
+ "freenet-macros",
+ "futures",
+ "js-sys",
+ "semver",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "serde_with",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.27.0",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5a2e0c177d3ffc2b94dca7692fada450191f38d93d16b01dba3616fb616853f"
+dependencies = [
  "arbitrary",
  "bincode",
  "blake3",
  "bs58",
  "byteorder",
+ "bytes",
  "chrono",
  "flatbuffers 24.12.23",
  "freenet-macros",
@@ -1431,7 +1461,7 @@ dependencies = [
  "anyhow",
  "bollard",
  "chrono",
- "freenet-stdlib",
+ "freenet-stdlib 0.1.40",
  "futures",
  "hex",
  "ipnetwork",

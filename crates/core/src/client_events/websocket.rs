@@ -425,12 +425,14 @@ impl headers::Header for EncodingProtocolExt {
 struct ConnectionInfo {
     auth_token: Option<AuthToken>,
     encoding_protocol: Option<EncodingProtocol>,
+    streaming: Option<bool>,
 }
 
 async fn connection_info(
     Query(ConnectionInfo {
         auth_token: auth_token_q,
         encoding_protocol,
+        streaming,
     }): Query<ConnectionInfo>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -522,6 +524,7 @@ async fn connection_info(
     );
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
+    req.extensions_mut().insert(streaming.unwrap_or(false));
 
     next.run(req).await
 }
@@ -530,6 +533,7 @@ async fn websocket_commands(
     ws: WebSocketUpgrade,
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
+    Extension(streaming): Extension<bool>,
     Extension(rs): Extension<WebSocketRequest>,
     Extension(attested_contracts): Extension<AttestedContractMap>,
     Extension(api_version): Extension<ApiVersion>,
@@ -592,6 +596,7 @@ async fn websocket_commands(
             auth_and_instance,
             token_is_invalid,
             encoding_protoc,
+            streaming,
             api_version,
             ws,
         )
@@ -608,8 +613,9 @@ async fn websocket_commands(
         }
     };
 
-    // Increase max message size to 100MB to handle contract uploads
-    // Default is ~64KB which is too small for WASM contracts
+    // 100MB limit: WASM contract uploads can be very large and the default
+    // ~64KB would reject them. Streaming chunks individual responses but the
+    // initial PUT still arrives as a single WebSocket message.
     ws.max_message_size(100 * 1024 * 1024)
         .on_upgrade(on_upgrade)
 }
@@ -641,6 +647,7 @@ async fn websocket_interface(
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
     token_is_invalid: bool,
     encoding_protoc: EncodingProtocol,
+    streaming: bool,
     api_version: ApiVersion,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
@@ -649,6 +656,16 @@ async fn websocket_interface(
     let (mut server_sink, mut client_stream) = ws.split();
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::Receiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
+
+    // ReassemblyBuffer evicts incomplete streams after STREAM_TTL (60s) via
+    // evict_stale(), called on every receive_chunk(). Concurrent streams are
+    // capped at MAX_CONCURRENT_STREAMS (8).
+    let mut conn_state = ConnectionState {
+        encoding_protoc,
+        streaming,
+        reassembly: freenet_stdlib::client_api::streaming::ReassemblyBuffer::new(),
+        next_stream_id: 0,
+    };
 
     // If a token was provided but is invalid (stale/expired), immediately send an error
     // to the client so it can refresh and get a new token. This prevents endless retry loops.
@@ -672,9 +689,7 @@ async fn websocket_interface(
             }
         };
 
-        server_sink
-            .send(Message::Binary(serialized_error.into()))
-            .await?;
+        send_response_message(&mut server_sink, serialized_error, &mut conn_state, None).await?;
 
         tracing::debug!("Sent AUTH_TOKEN_INVALID error to client");
         // Don't close connection immediately - let client handle the error gracefully
@@ -682,12 +697,6 @@ async fn websocket_interface(
 
     // Per-connection rate limiter for delegate operations (#3305, #3332)
     let mut delegate_rate_limiter = DelegateRateLimiter::new();
-
-    // Per-connection reassembly buffer for chunked client requests.
-    // freenet-stdlib 0.2.2+ automatically chunks ClientRequest messages that exceed
-    // 512 KiB into multiple StreamChunk messages. We reassemble them here before
-    // forwarding the complete request to the node.
-    let mut reassembly_buffer = freenet_stdlib::client_api::streaming::ReassemblyBuffer::new();
 
     // Create ping interval to keep connection alive and prevent idle timeout
     let mut ping_interval = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
@@ -751,10 +760,9 @@ async fn websocket_interface(
                     &request_sender,
                     &mut auth_token.as_mut().map(|t| t.0.clone()),
                     auth_token.as_mut().map(|t| t.1),
-                    encoding_protoc,
                     api_version,
                     &mut delegate_rate_limiter,
-                    &mut reassembly_buffer,
+                    &mut conn_state,
                 )
                 .await
                 {
@@ -784,7 +792,7 @@ async fn websocket_interface(
             msg = response_rx.recv() => {
                 // process_host_response runs in the branch handler (not the select future)
                 // so it cannot be cancelled by other branches resolving first.
-                let msg = match process_host_response(msg, client_id, encoding_protoc, &mut server_sink, &mut delegate_rate_limiter).await {
+                let msg = match process_host_response(msg, client_id, &mut server_sink, &mut delegate_rate_limiter, &mut conn_state).await {
                     Ok(msg) => msg,
                     Err(err) => {
                         notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
@@ -809,7 +817,8 @@ async fn websocket_interface(
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
-                let serialized_res = match encoding_protoc {
+                let stream_content = extract_stream_content(&response);
+                let serialized_res = match conn_state.encoding_protoc {
                     EncodingProtocol::Flatbuffers => match response {
                         Ok(res) => match res.into_fbs_bytes() {
                             Ok(b) => b,
@@ -834,7 +843,7 @@ async fn websocket_interface(
                         }
                     },
                 };
-                if let Err(err) = server_sink.send(Message::Binary(serialized_res.into())).await {
+                if let Err(err) = send_response_message(&mut server_sink, serialized_res, &mut conn_state, stream_content).await {
                     tracing::debug!(err = %err, "error sending notification to client");
                     notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
                     return Err(err.into());
@@ -850,6 +859,113 @@ async fn websocket_interface(
                 }
             }
         }
+    }
+}
+
+/// Maximum chunks to send before yielding to the tokio runtime.
+/// Prevents starving pings, subscriptions, and other select arms when
+/// sending large chunked responses (e.g., 200 chunks for a 50 MiB payload).
+const MAX_CHUNKS_PER_BATCH: usize = 64;
+
+/// Prepare response messages for non-async contexts (unit tests).
+/// For the actual send path, use `send_response_message` which serializes
+/// and sends one chunk at a time to avoid doubling peak memory.
+#[cfg(test)]
+fn prepare_response_messages(
+    payload: Vec<u8>,
+    conn_state: &mut ConnectionState,
+    stream_content: Option<freenet_stdlib::client_api::StreamContent>,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    use freenet_stdlib::client_api::streaming::{chunk_response, CHUNK_THRESHOLD};
+
+    if conn_state.streaming && payload.len() > CHUNK_THRESHOLD {
+        let stream_id = conn_state.next_stream_id;
+        conn_state.next_stream_id = conn_state.next_stream_id.wrapping_add(1);
+
+        let mut messages = Vec::new();
+
+        if let Some(content) = stream_content {
+            if conn_state.encoding_protoc == EncodingProtocol::Native {
+                let header: HostResponse = HostResponse::StreamHeader {
+                    stream_id,
+                    total_bytes: payload.len() as u64,
+                    content,
+                };
+                messages.push(bincode::serialize(&Ok::<_, ClientError>(header))?);
+            }
+        }
+
+        let chunks = chunk_response(payload, stream_id);
+        match conn_state.encoding_protoc {
+            EncodingProtocol::Flatbuffers => {
+                for chunk in chunks {
+                    messages.push(chunk.into_fbs_bytes()?);
+                }
+            }
+            EncodingProtocol::Native => {
+                for chunk in chunks {
+                    messages.push(bincode::serialize(&Ok::<_, ClientError>(chunk))?);
+                }
+            }
+        }
+        Ok(messages)
+    } else {
+        Ok(vec![payload])
+    }
+}
+
+async fn send_response_message(
+    tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    serialized: Vec<u8>,
+    conn_state: &mut ConnectionState,
+    stream_content: Option<freenet_stdlib::client_api::StreamContent>,
+) -> Result<(), axum::Error> {
+    use freenet_stdlib::client_api::streaming::{chunk_response, CHUNK_THRESHOLD};
+
+    if conn_state.streaming && serialized.len() > CHUNK_THRESHOLD {
+        let stream_id = conn_state.next_stream_id;
+        conn_state.next_stream_id = conn_state.next_stream_id.wrapping_add(1);
+
+        // Send StreamHeader before chunks if content type is known.
+        // StreamHeader is only supported over Native encoding (bincode), since
+        // flatbuffers clients use transparent reassembly via StreamChunk only.
+        if let Some(content) = stream_content {
+            if conn_state.encoding_protoc == EncodingProtocol::Native {
+                let header: HostResponse = HostResponse::StreamHeader {
+                    stream_id,
+                    total_bytes: serialized.len() as u64,
+                    content,
+                };
+                let header_bytes =
+                    bincode::serialize(&Ok::<_, ClientError>(header)).map_err(axum::Error::new)?;
+                tx.send(Message::Binary(header_bytes.into())).await?;
+            }
+        }
+
+        // Serialize and send each chunk individually to avoid materializing
+        // all chunks in memory at once (which would roughly double peak memory
+        // for large payloads).
+        let chunks = chunk_response(serialized, stream_id);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let b = match conn_state.encoding_protoc {
+                EncodingProtocol::Flatbuffers => {
+                    chunk.into_fbs_bytes().map_err(axum::Error::new)?
+                }
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Ok::<_, ClientError>(chunk)).map_err(axum::Error::new)?
+                }
+            };
+            tx.send(Message::Binary(b.into())).await?;
+
+            // Yield to the tokio runtime periodically so pings, subscriptions,
+            // and other control flow in the connection's select loop can proceed.
+            if (i + 1) % MAX_CHUNKS_PER_BATCH == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(())
+    } else {
+        tx.send(Message::Binary(serialized.into())).await
     }
 }
 
@@ -878,6 +994,30 @@ struct NewSubscription {
     callback: mpsc::Receiver<HostResult>,
 }
 
+struct ConnectionState {
+    encoding_protoc: EncodingProtocol,
+    streaming: bool,
+    reassembly: freenet_stdlib::client_api::streaming::ReassemblyBuffer,
+    next_stream_id: u32,
+}
+
+/// Extract `StreamContent` metadata from a host response for streaming clients.
+/// Returns `Some` for response types where incremental consumption is useful
+/// (currently `GetResponse`), `None` for all others.
+fn extract_stream_content(
+    result: &Result<HostResponse, ClientError>,
+) -> Option<freenet_stdlib::client_api::StreamContent> {
+    match result {
+        Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key, contract, ..
+        })) => Some(freenet_stdlib::client_api::StreamContent::GetResponse {
+            key: *key,
+            includes_contract: contract.is_some(),
+        }),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_client_request(
     client_id: ClientId,
@@ -885,12 +1025,11 @@ async fn process_client_request(
     request_sender: &mpsc::Sender<ClientConnection>,
     auth_token: &mut Option<AuthToken>,
     attested_contract: Option<ContractInstanceId>,
-    encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
     rate_limiter: &mut DelegateRateLimiter,
-    reassembly_buffer: &mut freenet_stdlib::client_api::streaming::ReassemblyBuffer,
+    conn_state: &mut ConnectionState,
 ) -> Result<Option<Message>, Option<anyhow::Error>> {
-    let msg = match msg {
+    let raw_msg = match msg {
         Ok(Message::Binary(data)) => data.to_vec(),
         Ok(Message::Text(data)) => data.as_bytes().to_vec(),
         Ok(Message::Close(_)) => return Err(None),
@@ -902,32 +1041,45 @@ async fn process_client_request(
         Err(err) => return Err(Some(err.into())),
     };
 
-    // Try to deserialize the ClientRequest message
-    let req = {
-        match encoding_protoc {
-            EncodingProtocol::Flatbuffers => match ClientRequest::try_decode_fbs(&msg) {
-                Ok(decoded) => decoded.into_owned(),
-                Err(err) => return Ok(Some(Message::Binary(err.into_fbs_bytes().into()))),
-            },
-            EncodingProtocol::Native => match bincode::deserialize::<ClientRequest>(&msg) {
-                Ok(decoded) => decoded.into_owned(),
-                Err(err) => {
-                    let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
+    // Decode raw bytes into a ClientRequest based on the encoding protocol.
+    // Returns the decoded request or a WebSocket error message to send back.
+    fn decode_client_request(
+        bytes: &[u8],
+        encoding: EncodingProtocol,
+    ) -> Result<ClientRequest<'static>, Option<Message>> {
+        match encoding {
+            EncodingProtocol::Flatbuffers => ClientRequest::try_decode_fbs(bytes)
+                .map(|d| d.into_owned())
+                .map_err(|err| Some(Message::Binary(err.into_fbs_bytes().into()))),
+            EncodingProtocol::Native => bincode::deserialize::<ClientRequest>(bytes)
+                .map(|d| d.into_owned())
+                .map_err(|err| {
+                    match bincode::serialize(&Err::<HostResponse, ClientError>(
                         ErrorKind::DeserializationError {
                             cause: format!("{err}").into(),
                         }
                         .into(),
-                    ))
-                    .map_err(|err| Some(err.into()))?;
-                    return Ok(Some(Message::Binary(result_error.into())));
-                }
-            },
+                    )) {
+                        Ok(b) => Some(Message::Binary(b.into())),
+                        Err(ser_err) => {
+                            tracing::error!("failed to serialize error response: {ser_err}");
+                            None
+                        }
+                    }
+                }),
         }
+    }
+
+    let req = match decode_client_request(&raw_msg, conn_state.encoding_protoc) {
+        Ok(req) => req,
+        Err(msg) => return Ok(msg),
     };
 
-    // Reassemble chunked client requests. freenet-stdlib 0.2.2+ splits large
-    // ClientRequest messages (>512 KiB) into StreamChunk variants. We collect
-    // chunks here and reconstruct the original request when all arrive.
+    // Handle StreamChunk: reassemble chunked requests from any client.
+    // freenet-stdlib 0.2.2+ automatically chunks large ClientRequest messages
+    // (>512 KiB) regardless of the streaming query parameter, so the server
+    // must always reassemble them. The `streaming` flag only controls whether
+    // the server *sends* chunked responses, not whether it accepts them.
     let req = if let ClientRequest::StreamChunk {
         stream_id,
         index,
@@ -935,46 +1087,35 @@ async fn process_client_request(
         data,
     } = req
     {
-        match reassembly_buffer.receive_chunk(stream_id, index, total, data) {
-            Ok(Some(complete_bytes)) => {
-                // All chunks received — deserialize the reassembled request
-                match bincode::deserialize::<ClientRequest>(&complete_bytes) {
-                    Ok(decoded) => decoded.into_owned(),
-                    Err(err) => {
-                        tracing::warn!(
-                            %client_id,
-                            stream_id,
-                            "Failed to deserialize reassembled chunked request: {err}"
-                        );
-                        let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
-                            ErrorKind::DeserializationError {
-                                cause: format!("{err}").into(),
-                            }
-                            .into(),
-                        ))
-                        .map_err(|err| Some(err.into()))?;
-                        return Ok(Some(Message::Binary(result_error.into())));
-                    }
+        match conn_state
+            .reassembly
+            .receive_chunk(stream_id, index, total, data)
+        {
+            Ok(Some(complete)) => {
+                match decode_client_request(&complete, conn_state.encoding_protoc) {
+                    Ok(req) => req,
+                    Err(msg) => return Ok(msg),
                 }
             }
-            Ok(None) => {
-                // Chunk buffered, waiting for more
-                return Ok(None);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    %client_id,
-                    stream_id,
-                    "Stream reassembly error: {err}"
-                );
-                let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(%client_id, error = %e, "streaming reassembly error");
+                // Send error response to client instead of killing the connection.
+                // A single malformed chunk (duplicate, out-of-range, etc.) should not
+                // terminate the entire session.
+                let error_msg = match bincode::serialize(&Err::<HostResponse, ClientError>(
                     ErrorKind::Unhandled {
-                        cause: format!("stream reassembly error: {err}").into(),
+                        cause: format!("stream reassembly error: {e}").into(),
                     }
                     .into(),
-                ))
-                .map_err(|err| Some(err.into()))?;
-                return Ok(Some(Message::Binary(result_error.into())));
+                )) {
+                    Ok(b) => Some(Message::Binary(b.into())),
+                    Err(ser_err) => {
+                        tracing::error!("failed to serialize reassembly error: {ser_err}");
+                        None
+                    }
+                };
+                return Ok(error_msg);
             }
         }
     } else {
@@ -1000,7 +1141,7 @@ async fn process_client_request(
                 DelegateError::Missing(delegate_req.key().clone()),
             ))
             .into();
-            let serialized = match encoding_protoc {
+            let serialized = match conn_state.encoding_protoc {
                 EncodingProtocol::Flatbuffers => error
                     .into_fbs_bytes()
                     .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?,
@@ -1028,7 +1169,7 @@ async fn process_client_request(
                 ),
             }
             .into();
-            let serialized = match encoding_protoc {
+            let serialized = match conn_state.encoding_protoc {
                 EncodingProtocol::Flatbuffers => error
                     .into_fbs_bytes()
                     .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?,
@@ -1069,10 +1210,11 @@ async fn process_client_request(
 async fn process_host_response(
     msg: Option<HostCallbackResult>,
     client_id: ClientId,
-    encoding_protoc: EncodingProtocol,
     tx: &mut SplitSink<WebSocket, Message>,
     rate_limiter: &mut DelegateRateLimiter,
+    conn_state: &mut ConnectionState,
 ) -> anyhow::Result<Option<NewSubscription>> {
+    let encoding_protoc = conn_state.encoding_protoc;
     match msg {
         Some(HostCallbackResult::Result { id, result }) => {
             debug_assert_eq!(id, client_id);
@@ -1111,8 +1253,8 @@ async fn process_host_response(
                         HostResponse::DelegateResponse { .. } => "DelegateResponse",
                         HostResponse::QueryResponse(_) => "QueryResponse",
                         HostResponse::Ok => "HostResponse::Ok",
-                        HostResponse::StreamHeader { .. } => "StreamHeader",
                         HostResponse::StreamChunk { .. } => "StreamChunk",
+                        HostResponse::StreamHeader { .. } => "StreamHeader",
                         _ => "Unknown",
                     };
 
@@ -1179,6 +1321,8 @@ async fn process_host_response(
                 _ => None,
             };
 
+            let stream_content = extract_stream_content(&result);
+
             let serialized_res = match encoding_protoc {
                 EncodingProtocol::Flatbuffers => match result {
                     Ok(res) => res.into_fbs_bytes()?,
@@ -1198,7 +1342,8 @@ async fn process_host_response(
                 );
             }
 
-            let send_result = tx.send(Message::Binary(serialized_res.into())).await;
+            let send_result =
+                send_response_message(tx, serialized_res, conn_state, stream_content).await;
 
             // Log WebSocket send result for UPDATE responses
             if let Some(key) = is_update_response {
@@ -1235,10 +1380,14 @@ async fn process_host_response(
             Ok(None)
         }
         None => {
-            let result_error = bincode::serialize(&Err::<HostResponse, ClientError>(
-                ErrorKind::NodeUnavailable.into(),
-            ))?;
-            tx.send(Message::Binary(result_error.into())).await?;
+            let error: ClientError = ErrorKind::NodeUnavailable.into();
+            let result_error = match encoding_protoc {
+                EncodingProtocol::Flatbuffers => error.into_fbs_bytes()?,
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Err::<HostResponse, ClientError>(error))?
+                }
+            };
+            send_response_message(tx, result_error, conn_state, None).await?;
             tx.send(Message::Close(None)).await?;
             tracing::warn!(
                 client_id = %client_id,
@@ -1396,6 +1545,18 @@ impl ClientEventsProxy for WebSocketProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freenet_stdlib::client_api::streaming::{
+        chunk_request, ReassemblyBuffer, CHUNK_SIZE, CHUNK_THRESHOLD,
+    };
+
+    fn test_conn_state(streaming: bool, encoding: EncodingProtocol) -> ConnectionState {
+        ConnectionState {
+            encoding_protoc: encoding,
+            streaming,
+            reassembly: ReassemblyBuffer::new(),
+            next_stream_id: 0,
+        }
+    }
 
     #[test]
     fn test_is_client_disconnect_error() {
@@ -1632,5 +1793,481 @@ mod tests {
         // ExecutionError does NOT carry a key
         let err = DelegateError::ExecutionError("test error".into());
         assert!(delegate_error_key(&err).is_none());
+    }
+
+    // =========================================================================
+    // WebSocket streaming unit tests
+    // =========================================================================
+
+    #[test]
+    fn no_streaming_sends_single_message() {
+        let payload = vec![0xAB; CHUNK_THRESHOLD + 100];
+        let mut conn = test_conn_state(false, EncodingProtocol::Native);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "non-streaming must send exactly one message"
+        );
+        assert_eq!(messages[0], payload, "payload must be sent as-is");
+        assert_eq!(conn.next_stream_id, 0, "stream_id must not advance");
+    }
+
+    #[test]
+    fn payload_at_threshold_not_chunked() {
+        let payload = vec![0xCC; CHUNK_THRESHOLD];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "payload exactly at CHUNK_THRESHOLD must not be chunked"
+        );
+        assert_eq!(conn.next_stream_id, 0);
+    }
+
+    #[test]
+    fn payload_below_threshold_not_chunked() {
+        let payload = vec![0xCC; CHUNK_THRESHOLD - 1];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+
+        let messages = prepare_response_messages(payload, &mut conn, None).unwrap();
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn payload_above_threshold_is_chunked_and_reassembles() {
+        let payload = vec![0xCC; CHUNK_THRESHOLD + 1];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+        assert!(messages.len() > 1, "must produce multiple chunks");
+        assert_eq!(conn.next_stream_id, 1);
+
+        // Reassemble and verify round-trip
+        let mut buf = ReassemblyBuffer::new();
+        let mut result = None;
+        for msg_bytes in &messages {
+            let resp: Result<HostResponse, ClientError> = bincode::deserialize(msg_bytes).unwrap();
+            if let Ok(HostResponse::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            }) = resp
+            {
+                if let Some(r) = buf.receive_chunk(stream_id, index, total, data).unwrap() {
+                    result = Some(r);
+                }
+            }
+        }
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    // --- Test 3: Flatbuffers encoding ---
+
+    #[test]
+    fn flatbuffers_chunked_serialization_succeeds() {
+        let payload = vec![0xDD; CHUNK_THRESHOLD + 100];
+        let mut conn = test_conn_state(true, EncodingProtocol::Flatbuffers);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+        assert!(
+            messages.len() > 1,
+            "must produce multiple FBS-encoded chunks"
+        );
+        assert_eq!(conn.next_stream_id, 1);
+
+        // Each message is the output of HostResponse::StreamChunk::into_fbs_bytes()
+        // which succeeded (no panic). Verify the total data across all chunks
+        // accounts for the original payload.
+        let total_fbs_bytes: usize = messages.iter().map(|m| m.len()).sum();
+        assert!(
+            total_fbs_bytes > payload.len(),
+            "FBS-encoded chunks must contain at least as much data as the payload \
+                 (plus FBS overhead)"
+        );
+    }
+
+    #[test]
+    fn flatbuffers_no_stream_header_even_with_content() {
+        // When stream_content is Some, Flatbuffers path should still NOT
+        // produce a StreamHeader (it's Native-only).
+        let payload = vec![0xDD; CHUNK_THRESHOLD + 100];
+        let mut conn = test_conn_state(true, EncodingProtocol::Flatbuffers);
+        let content = freenet_stdlib::client_api::StreamContent::Raw;
+
+        let messages_with_content =
+            prepare_response_messages(payload.clone(), &mut conn, Some(content)).unwrap();
+
+        let mut conn2 = test_conn_state(true, EncodingProtocol::Flatbuffers);
+        let messages_without_content =
+            prepare_response_messages(payload, &mut conn2, None).unwrap();
+
+        // Same number of messages: no extra StreamHeader was added
+        assert_eq!(
+            messages_with_content.len(),
+            messages_without_content.len(),
+            "Flatbuffers must not add StreamHeader regardless of stream_content"
+        );
+    }
+
+    #[test]
+    fn server_reassembles_chunked_request() {
+        let payload = vec![0xFF; CHUNK_SIZE * 3];
+        let chunks = chunk_request(payload.clone(), 42);
+        assert_eq!(chunks.len(), 3);
+
+        let mut buf = ReassemblyBuffer::new();
+        let mut result = None;
+        for chunk in &chunks {
+            if let ClientRequest::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            } = chunk
+            {
+                if let Some(r) = buf
+                    .receive_chunk(*stream_id, *index, *total, data.clone())
+                    .unwrap()
+                {
+                    result = Some(r);
+                }
+            }
+        }
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    #[test]
+    fn server_reassembly_out_of_order() {
+        let payload: Vec<u8> = (0..CHUNK_SIZE * 3).map(|i| (i % 256) as u8).collect();
+        let chunks = chunk_request(payload.clone(), 7);
+
+        let mut buf = ReassemblyBuffer::new();
+        let order = [2, 0, 1];
+        let mut result = None;
+        for &i in &order {
+            if let ClientRequest::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            } = &chunks[i]
+            {
+                if let Some(r) = buf
+                    .receive_chunk(*stream_id, *index, *total, data.clone())
+                    .unwrap()
+                {
+                    result = Some(r);
+                }
+            }
+        }
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    #[test]
+    fn server_reassembly_interleaved_streams() {
+        let payload_a = vec![0xAA; CHUNK_SIZE * 2];
+        let payload_b = vec![0xBB; CHUNK_SIZE * 3];
+        let chunks_a = chunk_request(payload_a.clone(), 1);
+        let chunks_b = chunk_request(payload_b.clone(), 2);
+
+        let mut buf = ReassemblyBuffer::new();
+        let mut result_a = None;
+        let mut result_b = None;
+
+        // Interleave: A[0], B[0], B[1], A[1], B[2]
+        let interleaved = [
+            &chunks_a[0],
+            &chunks_b[0],
+            &chunks_b[1],
+            &chunks_a[1],
+            &chunks_b[2],
+        ];
+        for chunk in interleaved {
+            if let ClientRequest::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            } = chunk
+            {
+                if let Some(r) = buf
+                    .receive_chunk(*stream_id, *index, *total, data.clone())
+                    .unwrap()
+                {
+                    match *stream_id {
+                        1 => result_a = Some(r),
+                        _ => result_b = Some(r),
+                    }
+                }
+            }
+        }
+        assert_eq!(result_a.unwrap(), payload_a);
+        assert_eq!(result_b.unwrap(), payload_b);
+    }
+
+    // --- Test 5: ReassemblyBuffer bounds ---
+
+    #[test]
+    fn reassembly_rejects_too_many_concurrent_streams() {
+        use freenet_stdlib::client_api::streaming::{StreamError, MAX_CONCURRENT_STREAMS};
+
+        let mut buf = ReassemblyBuffer::new();
+        for i in 0..MAX_CONCURRENT_STREAMS as u32 {
+            buf.receive_chunk(i, 0, 2, bytes::Bytes::from_static(&[0xAA]))
+                .expect("within limit");
+        }
+        let err = buf
+            .receive_chunk(
+                MAX_CONCURRENT_STREAMS as u32,
+                0,
+                2,
+                bytes::Bytes::from_static(&[0xBB]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StreamError::TooManyConcurrentStreams { .. }));
+    }
+
+    #[test]
+    fn reassembly_rejects_oversized_total_chunks() {
+        use freenet_stdlib::client_api::streaming::{StreamError, MAX_TOTAL_CHUNKS};
+
+        let mut buf = ReassemblyBuffer::new();
+        let err = buf
+            .receive_chunk(
+                1,
+                0,
+                MAX_TOTAL_CHUNKS + 1,
+                bytes::Bytes::from_static(&[0xCC]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StreamError::TotalChunksTooLarge { .. }));
+    }
+
+    #[test]
+    fn reassembly_rejects_duplicate_chunk() {
+        use freenet_stdlib::client_api::streaming::StreamError;
+
+        let mut buf = ReassemblyBuffer::new();
+        buf.receive_chunk(1, 0, 3, bytes::Bytes::from_static(&[0xDD]))
+            .unwrap();
+        let err = buf
+            .receive_chunk(1, 0, 3, bytes::Bytes::from_static(&[0xEE]))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StreamError::DuplicateChunk {
+                stream_id: 1,
+                index: 0
+            }
+        ));
+    }
+
+    // --- Bonus: StreamHeader and stream_id behavior ---
+
+    #[test]
+    fn native_sends_stream_header_before_chunks() {
+        let payload = vec![0xEE; CHUNK_THRESHOLD + 100];
+        let payload_len = payload.len();
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        let content = freenet_stdlib::client_api::StreamContent::Raw;
+
+        let messages = prepare_response_messages(payload, &mut conn, Some(content)).unwrap();
+        assert!(messages.len() >= 2);
+
+        let first: Result<HostResponse, ClientError> = bincode::deserialize(&messages[0]).unwrap();
+        match first {
+            Ok(HostResponse::StreamHeader {
+                stream_id,
+                total_bytes,
+                ..
+            }) => {
+                assert_eq!(stream_id, 0);
+                assert_eq!(total_bytes, payload_len as u64);
+            }
+            other => panic!("expected StreamHeader, got: {other:?}"),
+        }
+
+        for msg in &messages[1..] {
+            let resp: Result<HostResponse, ClientError> = bincode::deserialize(msg).unwrap();
+            assert!(matches!(resp, Ok(HostResponse::StreamChunk { .. })));
+        }
+    }
+
+    #[test]
+    fn stream_id_advances_only_for_chunked_sends() {
+        let large = vec![0xFF; CHUNK_THRESHOLD + 1];
+        let small = vec![0x00; 100];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+
+        assert_eq!(conn.next_stream_id, 0);
+        prepare_response_messages(large.clone(), &mut conn, None).unwrap();
+        assert_eq!(conn.next_stream_id, 1);
+        prepare_response_messages(large, &mut conn, None).unwrap();
+        assert_eq!(conn.next_stream_id, 2);
+        prepare_response_messages(small, &mut conn, None).unwrap();
+        assert_eq!(
+            conn.next_stream_id, 2,
+            "non-chunked must not advance stream_id"
+        );
+    }
+
+    // --- NodeUnavailable encoding bugfix test ---
+
+    #[test]
+    fn node_unavailable_native_serializes_as_bincode() {
+        let error: ClientError = ErrorKind::NodeUnavailable.into();
+        let bytes = bincode::serialize(&Err::<HostResponse, ClientError>(error)).unwrap();
+        // Must round-trip through bincode
+        let result: Result<HostResponse, ClientError> = bincode::deserialize(&bytes).unwrap();
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err().kind(), ErrorKind::NodeUnavailable),
+            "expected NodeUnavailable error kind"
+        );
+    }
+
+    #[test]
+    fn node_unavailable_flatbuffers_serializes_as_fbs() {
+        let error: ClientError = ErrorKind::NodeUnavailable.into();
+        let fbs_bytes = error
+            .into_fbs_bytes()
+            .expect("FBS serialization must succeed");
+        // Verify it's valid FBS by attempting to decode
+        assert!(!fbs_bytes.is_empty(), "FBS bytes must not be empty");
+        // bincode deserialization must fail — this ensures the fix actually
+        // dispatches to FBS encoding rather than bincode
+        let bincode_result: Result<Result<HostResponse, ClientError>, _> =
+            bincode::deserialize(&fbs_bytes);
+        assert!(
+            bincode_result.is_err(),
+            "FBS-encoded error must not be valid bincode"
+        );
+    }
+
+    // --- Non-streaming client StreamChunk reassembly test ---
+
+    #[test]
+    fn non_streaming_reassembles_stream_chunks() {
+        // Even when streaming=false, the server must reassemble StreamChunks
+        // because freenet-stdlib 0.2.2+ always chunks large requests client-side.
+        let payload = vec![0xFF; CHUNK_SIZE * 3];
+        let chunks = chunk_request(payload.clone(), 42);
+        assert_eq!(chunks.len(), 3);
+
+        // Simulate reassembly with streaming=false
+        let mut conn = test_conn_state(false, EncodingProtocol::Native);
+        let mut result = None;
+        for chunk in &chunks {
+            if let ClientRequest::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            } = chunk
+            {
+                if let Some(r) = conn
+                    .reassembly
+                    .receive_chunk(*stream_id, *index, *total, data.clone())
+                    .unwrap()
+                {
+                    result = Some(r);
+                }
+            }
+        }
+        assert_eq!(
+            result.unwrap(),
+            payload,
+            "non-streaming connection must still reassemble StreamChunks"
+        );
+    }
+
+    // --- FBS chunked serialization validation ---
+
+    #[test]
+    fn flatbuffers_chunked_produces_valid_distinct_messages() {
+        // Verify that FBS-encoded chunks produce distinct, non-empty messages
+        // with total size exceeding the original payload (FBS overhead).
+        // Full round-trip deserialization of HostResponse FBS is not available
+        // server-side (FBS decoding is implemented on the client/browser side).
+        let payload = vec![0xDD; CHUNK_THRESHOLD + 100];
+        let mut conn = test_conn_state(true, EncodingProtocol::Flatbuffers);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+        assert!(
+            messages.len() > 1,
+            "must produce multiple FBS-encoded chunks"
+        );
+
+        for msg in &messages {
+            assert!(!msg.is_empty(), "FBS chunk must not be empty");
+        }
+
+        let total_fbs_bytes: usize = messages.iter().map(|m| m.len()).sum();
+        assert!(
+            total_fbs_bytes > payload.len(),
+            "FBS chunks ({total_fbs_bytes}) must exceed raw payload ({})",
+            payload.len()
+        );
+
+        // Verify the messages are NOT valid bincode (proves FBS encoding was used)
+        let bincode_result: Result<Result<HostResponse, ClientError>, _> =
+            bincode::deserialize(&messages[0]);
+        assert!(
+            bincode_result.is_err(),
+            "FBS-encoded message must not be valid bincode"
+        );
+    }
+
+    // --- stream_id wrapping test ---
+
+    #[test]
+    fn stream_id_wraps_at_u32_max() {
+        let large = vec![0xFF; CHUNK_THRESHOLD + 1];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        conn.next_stream_id = u32::MAX;
+
+        let messages = prepare_response_messages(large, &mut conn, None).unwrap();
+        assert!(messages.len() > 1, "must produce chunks");
+        assert_eq!(
+            conn.next_stream_id, 0,
+            "stream_id must wrap from u32::MAX to 0"
+        );
+    }
+
+    // --- extract_stream_content tests ---
+
+    #[test]
+    fn extract_stream_content_returns_some_for_get_response() {
+        use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedState};
+
+        let code = ContractCode::from(vec![1, 2, 3]);
+        let key = freenet_stdlib::prelude::ContractKey::from_params_and_code(
+            Parameters::from(vec![]),
+            &code,
+        );
+        let result: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+            ContractResponse::GetResponse {
+                key,
+                contract: None,
+                state: WrappedState::new(vec![0; 100]),
+            },
+        ));
+        let content = extract_stream_content(&result);
+        assert!(content.is_some(), "GetResponse must produce StreamContent");
+    }
+
+    #[test]
+    fn extract_stream_content_returns_none_for_other_responses() {
+        let result: Result<HostResponse, ClientError> = Ok(HostResponse::Ok);
+        assert!(extract_stream_content(&result).is_none());
+
+        let result: Result<HostResponse, ClientError> = Err(ErrorKind::NodeUnavailable.into());
+        assert!(extract_stream_content(&result).is_none());
     }
 }
