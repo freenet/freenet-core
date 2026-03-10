@@ -1788,8 +1788,9 @@ impl Ring {
         /// Allows parallel connection attempts to speed up network formation
         /// instead of serial blocking on a single connection at a time.
         const BASE_CONCURRENT_CONNECTIONS: usize = 3;
-        /// Upper bound on concurrent connections during bootstrap (below min_connections).
-        const BOOTSTRAP_CONCURRENT_CONNECTIONS_CAP: usize = 10;
+        /// How many missing connections map to one additional concurrent slot.
+        /// E.g., with deficit=15, grants 15/3 = 5 extra slots on top of the base.
+        const CONNECTIONS_PER_EXTRA_SLOT: usize = 3;
 
         let mut check_interval = tokio::time::interval(CHECK_TICK_DURATION);
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2042,10 +2043,13 @@ impl Ring {
             // Scale concurrent connection limit based on deficit to min_connections.
             // During bootstrap (far below min_connections), allow more parallel attempts
             // to avoid stalling when slots fill with slow/timing-out transactions.
-            let max_concurrent = if current_conn_count < self.connection_manager.min_connections {
-                let deficit = self.connection_manager.min_connections - current_conn_count;
-                (BASE_CONCURRENT_CONNECTIONS + deficit / 3)
-                    .min(BOOTSTRAP_CONCURRENT_CONNECTIONS_CAP)
+            // Cap derived from min_connections to scale with configuration.
+            let min_conns = self.connection_manager.min_connections;
+            let max_concurrent = if current_conn_count < min_conns {
+                let deficit = min_conns - current_conn_count;
+                let bootstrap_cap = min_conns / 2;
+                (BASE_CONCURRENT_CONNECTIONS + deficit / CONNECTIONS_PER_EXTRA_SLOT)
+                    .min(bootstrap_cap.max(BASE_CONCURRENT_CONNECTIONS))
             } else {
                 BASE_CONCURRENT_CONNECTIONS
             };
