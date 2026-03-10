@@ -657,10 +657,9 @@ async fn websocket_interface(
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::Receiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
 
-    // NOTE: ReassemblyBuffer has no built-in TTL for incomplete streams.
-    // If a client stalls mid-stream, partial entries persist for the connection
-    // lifetime. A server-side eviction guard should be added in freenet-stdlib
-    // to bound memory usage from incomplete streams.
+    // ReassemblyBuffer evicts incomplete streams after STREAM_TTL (60s) via
+    // evict_stale(), called on every receive_chunk(). Concurrent streams are
+    // capped at MAX_CONCURRENT_STREAMS (8).
     let mut conn_state = ConnectionState {
         encoding_protoc,
         streaming,
