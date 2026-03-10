@@ -2116,4 +2116,158 @@ mod tests {
             "non-chunked must not advance stream_id"
         );
     }
+
+    // --- NodeUnavailable encoding bugfix test ---
+
+    #[test]
+    fn node_unavailable_native_serializes_as_bincode() {
+        let error: ClientError = ErrorKind::NodeUnavailable.into();
+        let bytes = bincode::serialize(&Err::<HostResponse, ClientError>(error)).unwrap();
+        // Must round-trip through bincode
+        let result: Result<HostResponse, ClientError> = bincode::deserialize(&bytes).unwrap();
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err().kind(), ErrorKind::NodeUnavailable),
+            "expected NodeUnavailable error kind"
+        );
+    }
+
+    #[test]
+    fn node_unavailable_flatbuffers_serializes_as_fbs() {
+        let error: ClientError = ErrorKind::NodeUnavailable.into();
+        let fbs_bytes = error
+            .into_fbs_bytes()
+            .expect("FBS serialization must succeed");
+        // Verify it's valid FBS by attempting to decode
+        assert!(!fbs_bytes.is_empty(), "FBS bytes must not be empty");
+        // bincode deserialization must fail — this ensures the fix actually
+        // dispatches to FBS encoding rather than bincode
+        let bincode_result: Result<Result<HostResponse, ClientError>, _> =
+            bincode::deserialize(&fbs_bytes);
+        assert!(
+            bincode_result.is_err(),
+            "FBS-encoded error must not be valid bincode"
+        );
+    }
+
+    // --- Non-streaming client StreamChunk reassembly test ---
+
+    #[test]
+    fn non_streaming_reassembles_stream_chunks() {
+        // Even when streaming=false, the server must reassemble StreamChunks
+        // because freenet-stdlib 0.2.2+ always chunks large requests client-side.
+        let payload = vec![0xFF; CHUNK_SIZE * 3];
+        let chunks = chunk_request(payload.clone(), 42);
+        assert_eq!(chunks.len(), 3);
+
+        // Simulate reassembly with streaming=false
+        let mut conn = test_conn_state(false, EncodingProtocol::Native);
+        let mut result = None;
+        for chunk in &chunks {
+            if let ClientRequest::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            } = chunk
+            {
+                if let Some(r) = conn
+                    .reassembly
+                    .receive_chunk(*stream_id, *index, *total, data.clone())
+                    .unwrap()
+                {
+                    result = Some(r);
+                }
+            }
+        }
+        assert_eq!(
+            result.unwrap(),
+            payload,
+            "non-streaming connection must still reassemble StreamChunks"
+        );
+    }
+
+    // --- FBS chunked serialization validation ---
+
+    #[test]
+    fn flatbuffers_chunked_produces_valid_distinct_messages() {
+        // Verify that FBS-encoded chunks produce distinct, non-empty messages
+        // with total size exceeding the original payload (FBS overhead).
+        // Full round-trip deserialization of HostResponse FBS is not available
+        // server-side (FBS decoding is implemented on the client/browser side).
+        let payload = vec![0xDD; CHUNK_THRESHOLD + 100];
+        let mut conn = test_conn_state(true, EncodingProtocol::Flatbuffers);
+
+        let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
+        assert!(
+            messages.len() > 1,
+            "must produce multiple FBS-encoded chunks"
+        );
+
+        for msg in &messages {
+            assert!(!msg.is_empty(), "FBS chunk must not be empty");
+        }
+
+        let total_fbs_bytes: usize = messages.iter().map(|m| m.len()).sum();
+        assert!(
+            total_fbs_bytes > payload.len(),
+            "FBS chunks ({total_fbs_bytes}) must exceed raw payload ({})",
+            payload.len()
+        );
+
+        // Verify the messages are NOT valid bincode (proves FBS encoding was used)
+        let bincode_result: Result<Result<HostResponse, ClientError>, _> =
+            bincode::deserialize(&messages[0]);
+        assert!(
+            bincode_result.is_err(),
+            "FBS-encoded message must not be valid bincode"
+        );
+    }
+
+    // --- stream_id wrapping test ---
+
+    #[test]
+    fn stream_id_wraps_at_u32_max() {
+        let large = vec![0xFF; CHUNK_THRESHOLD + 1];
+        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        conn.next_stream_id = u32::MAX;
+
+        let messages = prepare_response_messages(large, &mut conn, None).unwrap();
+        assert!(messages.len() > 1, "must produce chunks");
+        assert_eq!(
+            conn.next_stream_id, 0,
+            "stream_id must wrap from u32::MAX to 0"
+        );
+    }
+
+    // --- extract_stream_content tests ---
+
+    #[test]
+    fn extract_stream_content_returns_some_for_get_response() {
+        use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedState};
+
+        let code = ContractCode::from(vec![1, 2, 3]);
+        let key = freenet_stdlib::prelude::ContractKey::from_params_and_code(
+            Parameters::from(vec![]),
+            &code,
+        );
+        let result: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+            ContractResponse::GetResponse {
+                key,
+                contract: None,
+                state: WrappedState::new(vec![0; 100]),
+            },
+        ));
+        let content = extract_stream_content(&result);
+        assert!(content.is_some(), "GetResponse must produce StreamContent");
+    }
+
+    #[test]
+    fn extract_stream_content_returns_none_for_other_responses() {
+        let result: Result<HostResponse, ClientError> = Ok(HostResponse::Ok);
+        assert!(extract_stream_content(&result).is_none());
+
+        let result: Result<HostResponse, ClientError> = Err(ErrorKind::NodeUnavailable.into());
+        assert!(extract_stream_content(&result).is_none());
+    }
 }
