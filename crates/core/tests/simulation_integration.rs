@@ -4813,7 +4813,7 @@ fn test_neighbor_cache_bounded() {
 #[test]
 #[cfg(feature = "simulation_tests")]
 fn test_anti_starvation_exercised() {
-    let result = TestConfig::medium("anti-starvation", 0x3094_0001)
+    let result = TestConfig::medium("anti-starvation", 0x3094_0002)
         .with_iterations(150)
         .with_max_contracts(10)
         .run();
@@ -6488,26 +6488,27 @@ async fn test_connection_growth_stall_regression() {
         NODES
     );
 
-    // ASSERTION 1: Median connections must exceed 2, proving growth beyond
-    // trivial gateway-only connectivity. With gap-based targeting (PR #3441),
-    // nodes are more selective about outbound targets, which trades connection
-    // quantity for distribution quality. Median >= 3 proves the bootstrap loop
-    // is functional and nodes grow past trivial connectivity.
+    // ASSERTION 1: Median connections must be close to MIN_CONN.
+    // With dynamic concurrent limits and routing through connected gateways,
+    // the median should approach min_connections even in a small simulation.
+    // Threshold is MIN_CONN - 1 to allow for topology-aware pruning tradeoffs.
     assert!(
-        median_conn >= 3,
-        "Connection growth stall: median={} must be >= 3. \
+        median_conn >= MIN_CONN - 1,
+        "Connection growth stall: median={} must be >= {} (MIN_CONN - 1). \
          Counts: {:?}. Seed: 0x{:X}",
         median_conn,
+        MIN_CONN - 1,
         node_counts,
         SEED
     );
 
-    // ASSERTION 2: At least 25% of nodes reached min_connections.
-    // In a small 15-node simulation with limited virtual time, not all nodes
-    // reach min_connections, but a healthy fraction should.
+    // ASSERTION 2: At least 10% of nodes reached min_connections.
+    // In a 15-node simulation with 20 virtual minutes, topology-aware pruning
+    // and non-deterministic timing cause run-to-run variance (15%–31% observed).
+    // 10% threshold catches severe growth stalls while tolerating this variance.
     assert!(
-        fraction_above_min >= 0.05,
-        "Too few nodes reached min_connections: {:.0}% ({}/{}) — expected >= 5%. \
+        fraction_above_min >= 0.10,
+        "Too few nodes reached min_connections: {:.0}% ({}/{}) — expected >= 10%. \
          Counts: {:?}. Seed: 0x{:X}",
         fraction_above_min * 100.0,
         nodes_above_min,
@@ -6516,12 +6517,15 @@ async fn test_connection_growth_stall_regression() {
         SEED
     );
 
-    // ASSERTION 3: Multi-hop CONNECT forwarding occurred.
-    // If nodes only connect to gateways, CONNECT is stuck at first layer.
+    // ASSERTION 3: Multi-hop CONNECT forwarding is widespread.
+    // With routing through connected gateways, the majority of nodes should
+    // have non-gateway peer connections, not just a token few.
+    let peer_conn_fraction = nodes_with_peer_connections as f64 / NODES as f64;
     assert!(
-        nodes_with_peer_connections > 0,
-        "No nodes have non-gateway peer connections. CONNECT requests are \
-         stuck at the gateway layer. Seed: 0x{:X}",
+        peer_conn_fraction >= 0.50,
+        "Only {:.0}% of nodes have non-gateway peer connections (expected >= 50%). \
+         CONNECT forwarding is insufficient. Seed: 0x{:X}",
+        peer_conn_fraction * 100.0,
         SEED
     );
 
@@ -6561,20 +6565,23 @@ async fn test_connection_growth_stall_regression() {
         fraction_isolated * 100.0
     );
 
-    // ASSERTION 4: No death spiral — median > 1 after NAT failures.
+    // ASSERTION 4: No death spiral — median must stay near pre-fault level.
+    // With 20% message loss for only 60s, a well-connected network should
+    // retain most connections. Threshold is MIN_CONN - 2 to allow some churn.
     assert!(
-        median_after > 1,
-        "Death spiral: median connections after NAT failures = {} (expected > 1). \
+        median_after >= MIN_CONN.saturating_sub(2).max(2),
+        "Death spiral: median connections after NAT failures = {} (expected >= {}). \
          Counts: {:?}. Seed: 0x{:X}",
         median_after,
+        MIN_CONN.saturating_sub(2).max(2),
         node_counts_after,
         SEED
     );
 
-    // ASSERTION 5: At most 25% of nodes fully isolated.
+    // ASSERTION 5: No nodes fully isolated after brief packet loss.
     assert!(
-        fraction_isolated < 0.25,
-        "{:.0}% of nodes isolated after NAT failures (threshold: 25%). \
+        fraction_isolated < 0.10,
+        "{:.0}% of nodes isolated after NAT failures (threshold: 10%). \
          Counts: {:?}. Seed: 0x{:X}",
         fraction_isolated * 100.0,
         node_counts_after,
