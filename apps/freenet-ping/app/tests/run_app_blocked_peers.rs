@@ -337,6 +337,8 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         // peer isn't fully registered yet).
         let poll_interval = Duration::from_secs(5);
         let max_polls: u32 = 48; // 240s total (accommodates OPERATION_TTL=60s with retries)
+        let max_consecutive_errors: u32 = 5;
+        let mut consecutive_errors: u32 = 0;
 
         for poll in 1..=max_polls {
             // Send an update from each node
@@ -348,7 +350,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
 
             // Check current state on all nodes — transient errors (e.g. stale
             // subscription timeouts arriving on the WebSocket) shouldn't abort
-            // the entire polling loop.
+            // the entire polling loop, but persistent failures should.
             let (state_gw, state_node1, state_node2) = match get_all_ping_states(
                 &mut client_gw,
                 &mut client_node1,
@@ -357,12 +359,25 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
             )
             .await
             {
-                Ok(states) => states,
+                Ok(states) => {
+                    consecutive_errors = 0;
+                    states
+                }
                 Err(e) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= max_consecutive_errors {
+                        return Err(anyhow!(
+                            "get_all_ping_states failed {} consecutive times, last error: {}",
+                            consecutive_errors,
+                            e
+                        ));
+                    }
                     tracing::warn!(
-                        "Poll {}/{}: get_all_ping_states failed: {}, retrying...",
+                        "Poll {}/{}: get_all_ping_states failed ({}/{}): {}, retrying...",
                         poll,
                         max_polls,
+                        consecutive_errors,
+                        max_consecutive_errors,
                         e
                     );
                     continue;
