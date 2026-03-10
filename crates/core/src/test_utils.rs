@@ -404,11 +404,37 @@ pub async fn make_node_diagnostics(
     Ok(())
 }
 
+/// Cache for compiled contract WASM bytes, keyed by contract name.
+/// Prevents redundant `cargo build` invocations when multiple tests in the
+/// same binary use the same contract. The first call compiles; subsequent
+/// calls reuse the cached bytes.
+static COMPILED_CONTRACT_CACHE: LazyLock<Mutex<std::collections::HashMap<String, Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Pre-compile a test contract WASM binary without loading it.
+/// Call this BEFORE any test timeout to ensure `cargo build` time
+/// doesn't count against the test's deadline. Thread-safe and idempotent.
+pub fn ensure_contract_compiled(name: &str) -> anyhow::Result<()> {
+    let mut cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
+    if !cache.contains_key(name) {
+        let bytes = compile_contract(name)?;
+        cache.insert(name.to_string(), bytes);
+    }
+    Ok(())
+}
+
 pub fn load_contract(name: &str, params: Parameters<'static>) -> anyhow::Result<ContractContainer> {
-    let contract_bytes = WrappedContract::new(
-        Arc::new(ContractCode::from(compile_contract(name)?)),
-        params,
-    );
+    let wasm_bytes = {
+        let mut cache = COMPILED_CONTRACT_CACHE.lock().unwrap();
+        if let Some(bytes) = cache.get(name) {
+            bytes.clone()
+        } else {
+            let bytes = compile_contract(name)?;
+            cache.insert(name.to_string(), bytes.clone());
+            bytes
+        }
+    };
+    let contract_bytes = WrappedContract::new(Arc::new(ContractCode::from(wasm_bytes)), params);
     let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_bytes));
     Ok(contract)
 }

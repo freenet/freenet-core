@@ -138,6 +138,13 @@ pub fn generate_test_code(args: FreenetTestArgs, input_fn: ItemFn) -> Result<Tok
             use tokio::select;
             use anyhow::anyhow;
 
+            // 0. Pre-compile test contract WASM before any timeout starts.
+            // On CI, `cargo build --target wasm32-unknown-unknown` can take 30-60s
+            // on cold cache; doing it inside the test timeout causes false failures.
+            if let Err(e) = freenet::test_utils::ensure_contract_compiled("test-contract-integration") {
+                tracing::warn!("Failed to pre-compile test contract: {}", e);
+            }
+
             // 1. Setup TestLogger
             let mut __test_logger = TestLogger::new().with_json().with_level(#log_level);
             if std::env::var_os("FREENET_TEST_LOG_DISABLE_JSON").is_some() {
