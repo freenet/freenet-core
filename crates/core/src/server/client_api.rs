@@ -216,7 +216,7 @@ async fn web_home(
     response.headers_mut().insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
         axum::http::HeaderValue::from_static(
-            "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; connect-src ws: wss:",
+            "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src ws: wss:",
         ),
     );
     // Shell page must not be framed itself
