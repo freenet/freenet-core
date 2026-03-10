@@ -817,18 +817,7 @@ async fn websocket_interface(
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
                 }
-                // Extract StreamContent for streaming-capable clients (same as process_host_response)
-                let stream_content = match &response {
-                    Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                        key,
-                        contract,
-                        ..
-                    })) => Some(freenet_stdlib::client_api::StreamContent::GetResponse {
-                        key: *key,
-                        includes_contract: contract.is_some(),
-                    }),
-                    _ => None,
-                };
+                let stream_content = extract_stream_content(&response);
                 let serialized_res = match conn_state.encoding_protoc {
                     EncodingProtocol::Flatbuffers => match response {
                         Ok(res) => match res.into_fbs_bytes() {
@@ -873,6 +862,15 @@ async fn websocket_interface(
     }
 }
 
+/// Maximum chunks to send before yielding to the tokio runtime.
+/// Prevents starving pings, subscriptions, and other select arms when
+/// sending large chunked responses (e.g., 200 chunks for a 50 MiB payload).
+const MAX_CHUNKS_PER_BATCH: usize = 64;
+
+/// Prepare response messages for non-async contexts (unit tests).
+/// For the actual send path, use `send_response_message` which serializes
+/// and sends one chunk at a time to avoid doubling peak memory.
+#[cfg(test)]
 fn prepare_response_messages(
     payload: Vec<u8>,
     conn_state: &mut ConnectionState,
@@ -886,9 +884,6 @@ fn prepare_response_messages(
 
         let mut messages = Vec::new();
 
-        // Send StreamHeader before chunks if content type is known.
-        // StreamHeader is only supported over Native encoding (bincode), since
-        // flatbuffers clients use transparent reassembly via StreamChunk only.
         if let Some(content) = stream_content {
             if conn_state.encoding_protoc == EncodingProtocol::Native {
                 let header: HostResponse = HostResponse::StreamHeader {
@@ -925,12 +920,53 @@ async fn send_response_message(
     conn_state: &mut ConnectionState,
     stream_content: Option<freenet_stdlib::client_api::StreamContent>,
 ) -> Result<(), axum::Error> {
-    let messages = prepare_response_messages(serialized, conn_state, stream_content)
-        .map_err(axum::Error::new)?;
-    for msg in messages {
-        tx.send(Message::Binary(msg.into())).await?;
+    use freenet_stdlib::client_api::streaming::{chunk_response, CHUNK_THRESHOLD};
+
+    if conn_state.streaming && serialized.len() > CHUNK_THRESHOLD {
+        let stream_id = conn_state.next_stream_id;
+        conn_state.next_stream_id = conn_state.next_stream_id.wrapping_add(1);
+
+        // Send StreamHeader before chunks if content type is known.
+        // StreamHeader is only supported over Native encoding (bincode), since
+        // flatbuffers clients use transparent reassembly via StreamChunk only.
+        if let Some(content) = stream_content {
+            if conn_state.encoding_protoc == EncodingProtocol::Native {
+                let header: HostResponse = HostResponse::StreamHeader {
+                    stream_id,
+                    total_bytes: serialized.len() as u64,
+                    content,
+                };
+                let header_bytes =
+                    bincode::serialize(&Ok::<_, ClientError>(header)).map_err(axum::Error::new)?;
+                tx.send(Message::Binary(header_bytes.into())).await?;
+            }
+        }
+
+        // Serialize and send each chunk individually to avoid materializing
+        // all chunks in memory at once (which would roughly double peak memory
+        // for large payloads).
+        let chunks = chunk_response(serialized, stream_id);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let b = match conn_state.encoding_protoc {
+                EncodingProtocol::Flatbuffers => {
+                    chunk.into_fbs_bytes().map_err(axum::Error::new)?
+                }
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Ok::<_, ClientError>(chunk)).map_err(axum::Error::new)?
+                }
+            };
+            tx.send(Message::Binary(b.into())).await?;
+
+            // Yield to the tokio runtime periodically so pings, subscriptions,
+            // and other control flow in the connection's select loop can proceed.
+            if (i + 1) % MAX_CHUNKS_PER_BATCH == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(())
+    } else {
+        tx.send(Message::Binary(serialized.into())).await
     }
-    Ok(())
 }
 
 async fn new_client_connection(
@@ -963,6 +999,23 @@ struct ConnectionState {
     streaming: bool,
     reassembly: freenet_stdlib::client_api::streaming::ReassemblyBuffer,
     next_stream_id: u32,
+}
+
+/// Extract `StreamContent` metadata from a host response for streaming clients.
+/// Returns `Some` for response types where incremental consumption is useful
+/// (currently `GetResponse`), `None` for all others.
+fn extract_stream_content(
+    result: &Result<HostResponse, ClientError>,
+) -> Option<freenet_stdlib::client_api::StreamContent> {
+    match result {
+        Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key, contract, ..
+        })) => Some(freenet_stdlib::client_api::StreamContent::GetResponse {
+            key: *key,
+            includes_contract: contract.is_some(),
+        }),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1047,7 +1100,22 @@ async fn process_client_request(
             Ok(None) => return Ok(None),
             Err(e) => {
                 tracing::warn!(%client_id, error = %e, "streaming reassembly error");
-                return Err(Some(e.into()));
+                // Send error response to client instead of killing the connection.
+                // A single malformed chunk (duplicate, out-of-range, etc.) should not
+                // terminate the entire session.
+                let error_msg = match bincode::serialize(&Err::<HostResponse, ClientError>(
+                    ErrorKind::Unhandled {
+                        cause: format!("stream reassembly error: {e}").into(),
+                    }
+                    .into(),
+                )) {
+                    Ok(b) => Some(Message::Binary(b.into())),
+                    Err(ser_err) => {
+                        tracing::error!("failed to serialize reassembly error: {ser_err}");
+                        None
+                    }
+                };
+                return Ok(error_msg);
             }
         }
     } else {
@@ -1253,19 +1321,7 @@ async fn process_host_response(
                 _ => None,
             };
 
-            // Extract StreamContent metadata for streaming-capable clients.
-            // This is used to send a StreamHeader before chunked responses.
-            let stream_content = match &result {
-                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                    key,
-                    contract,
-                    ..
-                })) => Some(freenet_stdlib::client_api::StreamContent::GetResponse {
-                    key: *key,
-                    includes_contract: contract.is_some(),
-                }),
-                _ => None,
-            };
+            let stream_content = extract_stream_content(&result);
 
             let serialized_res = match encoding_protoc {
                 EncodingProtocol::Flatbuffers => match result {
