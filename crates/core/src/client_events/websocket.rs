@@ -1022,35 +1022,33 @@ async fn process_client_request(
         Err(msg) => return Ok(msg),
     };
 
-    // Handle StreamChunk: reassemble chunked requests from streaming clients.
-    // Only process StreamChunk when the connection was opened with streaming=true;
-    // non-streaming clients should never send StreamChunk messages.
-    let req = if conn_state.streaming {
-        if let ClientRequest::StreamChunk {
-            stream_id,
-            index,
-            total,
-            data,
-        } = req
+    // Handle StreamChunk: reassemble chunked requests from any client.
+    // freenet-stdlib 0.2.2+ automatically chunks large ClientRequest messages
+    // (>512 KiB) regardless of the streaming query parameter, so the server
+    // must always reassemble them. The `streaming` flag only controls whether
+    // the server *sends* chunked responses, not whether it accepts them.
+    let req = if let ClientRequest::StreamChunk {
+        stream_id,
+        index,
+        total,
+        data,
+    } = req
+    {
+        match conn_state
+            .reassembly
+            .receive_chunk(stream_id, index, total, data)
         {
-            match conn_state
-                .reassembly
-                .receive_chunk(stream_id, index, total, data)
-            {
-                Ok(Some(complete)) => {
-                    match decode_client_request(&complete, conn_state.encoding_protoc) {
-                        Ok(req) => req,
-                        Err(msg) => return Ok(msg),
-                    }
-                }
-                Ok(None) => return Ok(None),
-                Err(e) => {
-                    tracing::warn!(%client_id, error = %e, "streaming reassembly error");
-                    return Err(Some(e.into()));
+            Ok(Some(complete)) => {
+                match decode_client_request(&complete, conn_state.encoding_protoc) {
+                    Ok(req) => req,
+                    Err(msg) => return Ok(msg),
                 }
             }
-        } else {
-            req
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(%client_id, error = %e, "streaming reassembly error");
+                return Err(Some(e.into()));
+            }
         }
     } else {
         req
