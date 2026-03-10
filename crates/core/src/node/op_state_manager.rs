@@ -1141,6 +1141,12 @@ impl OpManager {
         peer_addr: SocketAddr,
         pub_key: &TransportPublicKey,
     ) -> Vec<(SocketAddr, NetMessage)> {
+        // Cancel any pending deferred interest removal for this peer.
+        // If the peer reconnected within the grace period, their interests
+        // are preserved — no re-registration needed via heartbeat.
+        self.interest_manager
+            .cancel_deferred_removal(&PeerKey::from(pub_key.clone()));
+
         let mut messages = Vec::with_capacity(2);
 
         let interest_hashes = self.interest_manager.get_all_interest_hashes();
@@ -1175,11 +1181,19 @@ impl OpManager {
         messages
     }
 
-    /// Removes all tracked state for a peer that left the ring.
+    /// Handles a peer leaving the ring.
+    ///
+    /// Proximity cache entries are removed immediately (no TTL mechanism exists).
+    /// Interest removal is deferred for a grace period — if the peer reconnects
+    /// within the window, interests are preserved. This prevents permanent interest
+    /// loss for peers with unstable connections (e.g., ~60s disconnect/reconnect
+    /// cycles from stale pending reservations). Stale interest entries during the
+    /// grace period are harmless: `get_peer_by_pub_key()` returns `None` for
+    /// disconnected peers, so broadcasts skip them automatically.
     pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
         self.proximity_cache.on_peer_disconnected(pub_key);
         self.interest_manager
-            .remove_all_peer_interests(&PeerKey::from(pub_key.clone()));
+            .schedule_deferred_removal(&PeerKey::from(pub_key.clone()));
     }
 }
 

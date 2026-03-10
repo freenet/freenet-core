@@ -66,6 +66,15 @@ pub const INTEREST_TTL: Duration = Duration::from_secs(INTEREST_HEARTBEAT_INTERV
 /// Interval for background sweep to clean up expired interests.
 pub const INTEREST_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
 
+/// Grace period before removing a disconnected peer's interests.
+///
+/// When a peer disconnects, we defer interest removal for this duration instead of
+/// wiping immediately. If the peer reconnects within the grace period, the pending
+/// removal is cancelled and interests are preserved. This prevents permanent interest
+/// loss for peers with unstable connections (e.g., stale pending reservations causing
+/// ~60s disconnect/reconnect cycles). Set to 90s to comfortably survive such cycles.
+pub const INTEREST_DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(90);
+
 use crate::config::GlobalExecutor;
 use crate::config::GlobalRng;
 
@@ -298,6 +307,14 @@ pub struct InterestManager<T: TimeSource> {
     /// so they can skip sending us data we already have. This DashMap tracks the last
     /// notification time per contract to avoid flooding (minimum 100ms interval).
     summary_notify_timestamps: DashMap<ContractKey, Instant>,
+
+    /// Deferred interest removals for disconnected peers.
+    ///
+    /// Instead of immediately wiping a peer's interests on disconnect, we record a
+    /// deadline (now + INTEREST_DISCONNECT_GRACE_PERIOD). The sweep task executes
+    /// the removal after the deadline passes. If the peer reconnects before the
+    /// deadline, the entry is removed from this map and interests are preserved.
+    pending_removals: DashMap<PeerKey, Instant>,
 }
 
 impl<T: TimeSource> InterestManager<T> {
@@ -317,6 +334,7 @@ impl<T: TimeSource> InterestManager<T> {
             delta_bytes_saved: AtomicU64::new(0),
             resync_requests_received: AtomicU64::new(0),
             summary_notify_timestamps: DashMap::new(),
+            pending_removals: DashMap::new(),
         }
     }
 
@@ -547,6 +565,62 @@ impl<T: TimeSource> InterestManager<T> {
         removed_count
     }
 
+    /// Schedule deferred removal of a peer's interests after a grace period.
+    ///
+    /// Instead of immediately wiping interests on disconnect, this records a deadline.
+    /// The sweep task will execute the actual removal after the grace period expires.
+    /// If the peer reconnects before the deadline (via `cancel_deferred_removal`),
+    /// interests are preserved — avoiding permanent interest loss during connection blips.
+    pub fn schedule_deferred_removal(&self, peer: &PeerKey) {
+        let deadline = self.time_source.now() + INTEREST_DISCONNECT_GRACE_PERIOD;
+        self.pending_removals.insert(peer.clone(), deadline);
+        tracing::debug!(
+            peer = %peer.0,
+            grace_secs = INTEREST_DISCONNECT_GRACE_PERIOD.as_secs(),
+            "Scheduled deferred interest removal"
+        );
+    }
+
+    /// Cancel a pending deferred removal for a reconnecting peer.
+    ///
+    /// Returns true if a pending removal was cancelled (peer reconnected in time).
+    pub fn cancel_deferred_removal(&self, peer: &PeerKey) -> bool {
+        let cancelled = self.pending_removals.remove(peer).is_some();
+        if cancelled {
+            tracing::debug!(
+                peer = %peer.0,
+                "Cancelled deferred interest removal — peer reconnected"
+            );
+        }
+        cancelled
+    }
+
+    /// Execute any deferred removals whose grace period has expired.
+    ///
+    /// Called by the sweep task alongside expired-interest cleanup.
+    /// Returns the number of peers whose interests were removed.
+    pub fn execute_pending_removals(&self) -> usize {
+        let now = self.time_source.now();
+        let expired_peers: Vec<PeerKey> = self
+            .pending_removals
+            .iter()
+            .filter(|entry| now >= *entry.value())
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        let count = expired_peers.len();
+        for peer in &expired_peers {
+            self.pending_removals.remove(peer);
+            let removed = self.remove_all_peer_interests(peer);
+            tracing::info!(
+                peer = %peer.0,
+                removed_interests = removed,
+                "Executed deferred interest removal — peer did not reconnect"
+            );
+        }
+        count
+    }
+
     /// Register local interest in a contract (for tracking our reasons).
     pub fn register_local_interest(&self, contract: &ContractKey) -> &Self {
         self.local_interests.entry(*contract).or_default();
@@ -734,6 +808,15 @@ impl<T: TimeSource> InterestManager<T> {
 
         loop {
             interval.tick().await;
+
+            // Execute any deferred removals whose grace period has expired
+            let deferred_removed = manager.execute_pending_removals();
+            if deferred_removed > 0 {
+                tracing::info!(
+                    peers_removed = deferred_removed,
+                    "Interest sweep: executed deferred peer removals"
+                );
+            }
 
             // Capture stats before sweep for the health snapshot
             let stats = manager.stats();
@@ -1985,5 +2068,92 @@ mod tests {
             !manager.has_local_interest(&contract),
             "No downstream subscribers left — should lose interest"
         );
+    }
+
+    #[test]
+    fn test_deferred_removal_executes_after_grace_period() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        // Register interest
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(manager.get_peer_interest(&contract, &peer).is_some());
+
+        // Schedule deferred removal
+        manager.schedule_deferred_removal(&peer);
+
+        // Before grace period expires, interests should still exist
+        time.advance_time(INTEREST_DISCONNECT_GRACE_PERIOD - Duration::from_secs(1));
+        let removed = manager.execute_pending_removals();
+        assert_eq!(removed, 0);
+        assert!(manager.get_peer_interest(&contract, &peer).is_some());
+
+        // After grace period expires, interests should be removed
+        time.advance_time(Duration::from_secs(2));
+        let removed = manager.execute_pending_removals();
+        assert_eq!(removed, 1);
+        assert!(manager.get_peer_interest(&contract, &peer).is_none());
+    }
+
+    #[test]
+    fn test_deferred_removal_cancelled_on_reconnect() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        // Register interest
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+
+        // Schedule deferred removal (peer disconnected)
+        manager.schedule_deferred_removal(&peer);
+
+        // Peer reconnects within grace period
+        time.advance_time(Duration::from_secs(30));
+        let cancelled = manager.cancel_deferred_removal(&peer);
+        assert!(cancelled);
+
+        // Even after grace period, interests should still exist
+        time.advance_time(INTEREST_DISCONNECT_GRACE_PERIOD);
+        let removed = manager.execute_pending_removals();
+        assert_eq!(removed, 0);
+        assert!(manager.get_peer_interest(&contract, &peer).is_some());
+    }
+
+    #[test]
+    fn test_deferred_removal_replaces_on_repeated_disconnect() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+
+        // First disconnect
+        manager.schedule_deferred_removal(&peer);
+        time.advance_time(Duration::from_secs(60));
+
+        // Second disconnect before first grace period expires — resets deadline
+        manager.schedule_deferred_removal(&peer);
+
+        // Original deadline would have passed, but new one hasn't
+        time.advance_time(Duration::from_secs(60));
+        let removed = manager.execute_pending_removals();
+        assert_eq!(removed, 0, "Second schedule should have reset the deadline");
+        assert!(manager.get_peer_interest(&contract, &peer).is_some());
+
+        // Now exceed the second deadline
+        time.advance_time(Duration::from_secs(31));
+        let removed = manager.execute_pending_removals();
+        assert_eq!(removed, 1);
+        assert!(manager.get_peer_interest(&contract, &peer).is_none());
+    }
+
+    #[test]
+    fn test_cancel_deferred_removal_returns_false_when_none_pending() {
+        let (manager, _time) = make_manager();
+        let peer = make_peer_key(1);
+
+        // No pending removal — cancel should return false
+        assert!(!manager.cancel_deferred_removal(&peer));
     }
 }
