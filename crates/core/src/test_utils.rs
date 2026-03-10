@@ -404,11 +404,43 @@ pub async fn make_node_diagnostics(
     Ok(())
 }
 
+/// Cache for compiled contract WASM bytes, keyed by contract name.
+/// Prevents redundant `cargo build` invocations when multiple tests in the
+/// same binary use the same contract. The first call compiles; subsequent
+/// calls reuse the cached bytes. Concurrent first-callers may both compile
+/// (cargo handles its own locking), but only one result is stored.
+static COMPILED_CONTRACT_CACHE: LazyLock<dashmap::DashMap<String, Vec<u8>>> =
+    LazyLock::new(dashmap::DashMap::new);
+
+/// Pre-compile a test contract WASM binary without loading it.
+/// Call this BEFORE any test timeout to ensure `cargo build` time
+/// doesn't count against the test's deadline. Thread-safe and idempotent.
+pub fn ensure_contract_compiled(name: &str) -> anyhow::Result<()> {
+    if COMPILED_CONTRACT_CACHE.contains_key(name) {
+        return Ok(());
+    }
+    // Concurrent first-callers may both invoke cargo build, but that's safe
+    // (cargo serializes via its own file lock). The cache deduplicates via
+    // or_insert so only one copy is stored.
+    let bytes = compile_contract(name)?;
+    COMPILED_CONTRACT_CACHE
+        .entry(name.to_string())
+        .or_insert(bytes);
+    Ok(())
+}
+
 pub fn load_contract(name: &str, params: Parameters<'static>) -> anyhow::Result<ContractContainer> {
-    let contract_bytes = WrappedContract::new(
-        Arc::new(ContractCode::from(compile_contract(name)?)),
-        params,
-    );
+    let wasm_bytes = match COMPILED_CONTRACT_CACHE.get(name) {
+        Some(entry) => entry.value().clone(),
+        None => {
+            let bytes = compile_contract(name)?;
+            COMPILED_CONTRACT_CACHE
+                .entry(name.to_string())
+                .or_insert(bytes.clone());
+            bytes
+        }
+    };
+    let contract_bytes = WrappedContract::new(Arc::new(ContractCode::from(wasm_bytes)), params);
     let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_bytes));
     Ok(contract)
 }

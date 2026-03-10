@@ -38,9 +38,54 @@ use common::{
     APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
 };
 
+/// Maximum number of retries when port allocation fails
+const MAX_PORT_RETRY_ATTEMPTS: usize = 5;
+
 /// Test for subscription propagation in a partially connected network.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=MAX_PORT_RETRY_ATTEMPTS {
+        match run_partially_connected_test(attempt).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let error_str = format!("{:#}", e);
+                if error_str.contains("Address already in use")
+                    || error_str.contains("os error 98")
+                    || error_str.contains("os error 48")
+                {
+                    tracing::warn!(
+                        attempt,
+                        MAX_PORT_RETRY_ATTEMPTS,
+                        "Port collision detected, retrying: {}",
+                        error_str
+                    );
+                    last_error = Some(e);
+                    // Jitter ±20% to avoid thundering herd on port retry
+                    let jitter = 80
+                        + (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos()
+                            % 41) as u64; // 80..=120
+                    tokio::time::sleep(Duration::from_millis(jitter)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!(
+            "Port allocation failed after {} attempts",
+            MAX_PORT_RETRY_ATTEMPTS
+        )
+    }))
+}
+
+async fn run_partially_connected_test(attempt: usize) -> anyhow::Result<()> {
     /*
      * This test verifies how subscription propagation works in a partially connected network.
      *
@@ -56,7 +101,11 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
      * - Uses a deterministic approach to create partial connectivity between regular nodes
      */
 
-    std::env::set_var("FREENET_RUNTIME_POOL_SIZE", "2");
+    tracing::info!(
+        "Starting partially connected test (attempt {}/{})...",
+        attempt,
+        MAX_PORT_RETRY_ATTEMPTS
+    );
 
     // Network configuration parameters
     const NUM_GATEWAYS: usize = 1;
@@ -119,7 +168,11 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
     let mut gateway_configs = Vec::with_capacity(NUM_GATEWAYS);
     let mut gateway_presets = Vec::with_capacity(NUM_GATEWAYS);
 
-    let dir_suffix = "partial";
+    let dir_suffix = if attempt > 1 {
+        format!("partial_{}", attempt)
+    } else {
+        "partial".to_string()
+    };
 
     for i in 0..NUM_GATEWAYS {
         let gw_ip = gateway_ips[i];
@@ -196,7 +249,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         let effective_connections = (NUM_REGULAR_NODES - 1) - blocked_addresses.len();
         node_connections.push(effective_connections);
 
-        let (cfg, preset) = base_node_test_config_with_ip(
+        let (mut cfg, preset) = base_node_test_config_with_ip(
             false,
             serialized_gateways.clone(),
             Some(node_network_ports[i]), // Use reserved network port
@@ -207,6 +260,13 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
             Some(node_ip), // Use varied IP for unique ring location
         )
         .await?;
+
+        // Prevent the topology manager from aggressively pruning connections
+        // in this partially connected network. With only 30% connectivity,
+        // nodes need to retain the few connections they have.
+        // The +1 accounts for the gateway connection (not counted in
+        // effective_connections which only counts regular peer links).
+        cfg.network_api.min_connections = Some(effective_connections + 1);
 
         println!(
             "Node {} data dir: {:?} (IP: {}) - Connected to {} other nodes (blocked: {})",
@@ -243,9 +303,8 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         gateway_futures.push(gateway_future);
     }
 
-    // Give gateway time to start listener and bind ports before nodes connect.
-    // 20s matches other ping tests; 2s was too short on slow CI runners.
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    // No startup sleep needed — gateway futures are not polled until the select
+    // loop below, and connect_ws_with_retry handles waiting for WS readiness.
 
     // Start regular nodes simultaneously — gateway admission control and explicit
     // rejection messages prevent the thundering herd problem (see #2887).
@@ -263,7 +322,7 @@ async fn test_ping_partially_connected_network() -> anyhow::Result<()> {
         regular_node_futures.push(regular_node_future);
     }
 
-    // 420s: 20s gateway startup + 180s node connection + operations + buffer
+    // 420s: 60s WS connect retry + 180s node connection + operations + buffer
     let test = tokio::time::timeout(Duration::from_secs(420), async {
         // Connect to all nodes with retry logic (handles waiting for WS servers)
         // Use the correct IPs for each node (WebSocket servers bind to node IPs, not 127.0.0.1)
