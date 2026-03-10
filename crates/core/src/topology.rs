@@ -713,18 +713,19 @@ impl TopologyManager {
             .map(|nloc| my_loc.signed_distance(*nloc))
             .collect();
 
-        let (largest_gap, point_count) =
+        let (largest_gap, side_count) =
             small_world_rand::largest_gap_size_directional(&signed_distances);
 
-        if point_count == 0 {
-            return TopologyAdjustment::NoChange;
-        }
-
         // Expected largest gap for k uniform points on [0,1]: ~ln(k)/k.
-        // point_count is the number of distinct in-range distances from the
-        // gap analysis, which filters to [D_MIN, D_MAX] and deduplicates.
-        let k = point_count as f64;
-        let expected_gap = k.ln() / k;
+        // side_count is the point count on the side that produced the worst gap.
+        // When a side is empty (count=0, gap=1.0), we use a very small expected gap
+        // to ensure a swap is triggered.
+        let expected_gap = if side_count == 0 {
+            0.01 // Empty side → always trigger swap
+        } else {
+            let k = side_count as f64;
+            k.ln().max(0.01) / k
+        };
 
         // Swap probability proportional to how much the gap exceeds expected.
         // When gap == expected: excess = 0, no swap.
@@ -882,12 +883,14 @@ fn topology_value(
     if peers_at_same_location > 1 {
         return Some(0.0);
     }
-    let gap = small_world_rand::removal_gap_directional(peer_signed_distance, all_signed_distances);
+    let (gap, same_side_count) =
+        small_world_rand::removal_gap_directional(peer_signed_distance, all_signed_distances);
     // Directional removal gap is computed on one half-ring (CW or CCW).
-    // With ~k/2 points per side, removing one merges two adjacent gaps:
-    // expected removal gap = 2/(k_per_side + 1).
-    let k_per_side = (k as f64 / 2.0).max(1.0);
-    let expected_gap = 2.0 / (k_per_side + 1.0);
+    // Use the actual count on that side, not k/2, to handle skewed distributions.
+    // Removing one of k_side peers merges two adjacent gaps:
+    // expected removal gap = 2/(k_side + 1).
+    let k_side = (same_side_count as f64).max(1.0);
+    let expected_gap = 2.0 / (k_side + 1.0);
     let value = gap / expected_gap;
     if value > TOPOLOGY_PROTECTION_THRESHOLD {
         None // topology-critical
@@ -945,11 +948,11 @@ fn select_fallback_peer_to_drop(
         .iter()
         .flat_map(|(loc, conns)| conns.iter().map(move |conn| (loc, conn)))
         .min_by(|(loc_a, _), (loc_b, _)| {
-            let gap_a = small_world_rand::removal_gap_directional(
+            let (gap_a, _) = small_world_rand::removal_gap_directional(
                 my_loc.signed_distance(**loc_a),
                 &all_signed_distances,
             );
-            let gap_b = small_world_rand::removal_gap_directional(
+            let (gap_b, _) = small_world_rand::removal_gap_directional(
                 my_loc.signed_distance(**loc_b),
                 &all_signed_distances,
             );

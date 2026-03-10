@@ -389,26 +389,36 @@ pub(crate) fn kleinberg_score_directional(
 ///
 /// Only considers connections on the same side (CW or CCW) as the peer being
 /// evaluated, giving a directionally-aware measure of topological importance.
-pub(crate) fn removal_gap_directional(peer_signed_distance: f64, signed_distances: &[f64]) -> f64 {
+///
+/// Returns `(gap, same_side_count)` where `same_side_count` is the number of
+/// peers on the evaluated side (including the peer being evaluated).
+pub(crate) fn removal_gap_directional(
+    peer_signed_distance: f64,
+    signed_distances: &[f64],
+) -> (f64, usize) {
     let peer_abs = peer_signed_distance.abs();
     let is_cw = peer_signed_distance >= 0.0;
 
     let (cw_dists, ccw_dists) = split_by_direction(signed_distances);
     let same_side = if is_cw { cw_dists } else { ccw_dists };
+    let count = same_side.len();
 
-    removal_gap(peer_abs, same_side.into_iter())
+    (removal_gap(peer_abs, same_side.into_iter()), count)
 }
 
 /// Compute the largest gap across both half-rings (returns the worse side).
 ///
-/// Also returns the total point count across both sides for expected-gap formulas.
+/// Returns `(gap, side_count)` where `side_count` is the point count on the
+/// side that produced the largest gap — used for per-side expected-gap formulas.
 pub(crate) fn largest_gap_size_directional(signed_distances: &[f64]) -> (f64, usize) {
     let (cw_dists, ccw_dists) = split_by_direction(signed_distances);
     let (cw_gap, cw_count) = largest_gap_size(cw_dists.into_iter());
     let (ccw_gap, ccw_count) = largest_gap_size(ccw_dists.into_iter());
-    // Return the worse side's gap and total point count
-    let gap = cw_gap.max(ccw_gap);
-    (gap, cw_count + ccw_count)
+    if cw_gap >= ccw_gap {
+        (cw_gap, cw_count)
+    } else {
+        (ccw_gap, ccw_count)
+    }
 }
 
 #[cfg(test)]
@@ -1071,18 +1081,20 @@ mod tests {
         let signed: Vec<f64> = vec![d_at(0.25), d_at(0.5), d_at(0.75), -d_at(0.5)];
 
         // Removing the sole CCW connection should give gap=1.0 (entire half-ring empty)
-        let gap_ccw = removal_gap_directional(-d_at(0.5), &signed);
+        let (gap_ccw, ccw_count) = removal_gap_directional(-d_at(0.5), &signed);
         assert!(
             (gap_ccw - 1.0).abs() < 0.01,
             "Removing sole CCW connection should give gap ~1.0, got {gap_ccw}"
         );
+        assert_eq!(ccw_count, 1, "CCW side should have 1 peer");
 
         // Removing one of three CW connections should give gap ~0.5
-        let gap_cw = removal_gap_directional(d_at(0.5), &signed);
+        let (gap_cw, cw_count) = removal_gap_directional(d_at(0.5), &signed);
         assert!(
             (gap_cw - 0.5).abs() < 0.05,
             "Removing middle CW connection should give gap ~0.5, got {gap_cw}"
         );
+        assert_eq!(cw_count, 3, "CW side should have 3 peers");
     }
 
     #[test]
@@ -1097,7 +1109,8 @@ mod tests {
             (gap - 1.0).abs() < 0.01,
             "Should return worse side's gap (1.0 for empty CCW), got {gap}"
         );
-        assert_eq!(count, 3);
+        // CCW side produced the gap; it has 0 peers
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -1119,6 +1132,7 @@ mod tests {
             (gap - 0.25).abs() < 0.02,
             "Both sides have gap ~0.25, got {gap}"
         );
-        assert_eq!(count, 6);
+        // Tie goes to CW side (>= comparison), which has 3 peers
+        assert_eq!(count, 3);
     }
 }
