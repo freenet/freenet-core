@@ -78,6 +78,24 @@ impl Location {
         }
     }
 
+    /// Signed shortest-arc distance from `self` to `other` on the ring.
+    ///
+    /// Positive = clockwise (increasing location mod 1).
+    /// Negative = counterclockwise.
+    /// Range: (-0.5, 0.5]. Distance exactly 0.5 returns +0.5 (arbitrary convention).
+    pub fn signed_distance(&self, other: impl std::borrow::Borrow<Location>) -> f64 {
+        let diff = other.borrow().0 - self.0;
+        if diff > 0.5 {
+            diff - 1.0
+        } else if diff < -0.5 {
+            diff + 1.0
+        } else if diff == -0.5 {
+            0.5 // antipode convention: always positive
+        } else {
+            diff
+        }
+    }
+
     pub fn as_f64(&self) -> f64 {
         self.0
     }
@@ -752,5 +770,57 @@ mod test {
         let l0 = Location(0.75);
         let l1 = Location(0.50);
         assert!(l0.distance(l1) == Distance(0.25));
+    }
+
+    // ============ Signed distance tests ============
+
+    #[rstest]
+    #[case::same_location(0.5, 0.5, 0.0)]
+    #[case::cw_adjacent(0.0, 0.25, 0.25)]
+    #[case::ccw_adjacent(0.25, 0.0, -0.25)]
+    #[case::cw_wrap(0.9, 0.1, 0.2)]
+    #[case::ccw_wrap(0.1, 0.9, -0.2)]
+    #[case::antipode(0.0, 0.5, 0.5)]
+    #[case::antipode_reverse(0.5, 0.0, 0.5)]
+    #[case::antipode_convention(0.25, 0.75, 0.5)]
+    fn test_signed_distance(#[case] from: f64, #[case] to: f64, #[case] expected: f64) {
+        let l0 = Location::new(from);
+        let l1 = Location::new(to);
+        let sd = l0.signed_distance(l1);
+        assert!(
+            (sd - expected).abs() < f64::EPSILON,
+            "signed_distance({from}, {to}) = {sd}, expected {expected}"
+        );
+    }
+
+    #[rstest]
+    #[case::quarter(0.3, 0.55)]
+    #[case::near_boundary(0.05, 0.95)]
+    #[case::wrap(0.8, 0.2)]
+    fn test_signed_distance_antisymmetry(#[case] a: f64, #[case] b: f64) {
+        let la = Location::new(a);
+        let lb = Location::new(b);
+        let sd_ab = la.signed_distance(lb);
+        let sd_ba = lb.signed_distance(la);
+        assert!(
+            (sd_ab + sd_ba).abs() < f64::EPSILON,
+            "signed_distance({a},{b})={sd_ab} + signed_distance({b},{a})={sd_ba} should be 0"
+        );
+    }
+
+    #[test]
+    fn test_signed_distance_abs_equals_distance() {
+        // |signed_distance| should always equal distance()
+        let pairs = [(0.0, 0.25), (0.9, 0.1), (0.3, 0.8), (0.0, 0.5), (0.5, 0.0)];
+        for (a, b) in pairs {
+            let la = Location::new(a);
+            let lb = Location::new(b);
+            let sd = la.signed_distance(lb).abs();
+            let d = la.distance(lb).as_f64();
+            assert!(
+                (sd - d).abs() < f64::EPSILON,
+                "|signed_distance({a},{b})|={sd} != distance({a},{b})={d}"
+            );
+        }
     }
 }

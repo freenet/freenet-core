@@ -652,13 +652,17 @@ impl ConnectionManager {
     /// Measures how much the candidate improves the 1/d distance distribution by
     /// finding the candidate's min distance to its nearest neighbor in log-space.
     fn compute_kleinberg_score(&self, my_location: Location, candidate: Location) -> f64 {
-        let candidate_distance = my_location.distance(candidate).as_f64();
+        let candidate_signed_distance = my_location.signed_distance(candidate);
         let connections = self.connections_by_location.read();
-        crate::topology::small_world_rand::kleinberg_score(
-            candidate_distance,
-            connections.iter().flat_map(|(loc, conns)| {
-                std::iter::repeat(my_location.distance(*loc).as_f64()).take(conns.len())
-            }),
+        let signed_distances: Vec<f64> = connections
+            .iter()
+            .flat_map(|(loc, conns)| {
+                std::iter::repeat(my_location.signed_distance(*loc)).take(conns.len())
+            })
+            .collect();
+        crate::topology::small_world_rand::kleinberg_score_directional(
+            candidate_signed_distance,
+            &signed_distances,
         )
     }
 
