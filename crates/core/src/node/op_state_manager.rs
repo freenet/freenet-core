@@ -1183,13 +1183,8 @@ impl OpManager {
 
     /// Handles a peer leaving the ring.
     ///
-    /// Proximity cache entries are removed immediately (no TTL mechanism exists).
-    /// Interest removal is deferred for a grace period — if the peer reconnects
-    /// within the window, interests are preserved. This prevents permanent interest
-    /// loss for peers with unstable connections (e.g., ~60s disconnect/reconnect
-    /// cycles from stale pending reservations). Stale interest entries during the
-    /// grace period are harmless: `get_peer_by_pub_key()` returns `None` for
-    /// disconnected peers, so broadcasts skip them automatically.
+    /// Proximity cache is cleared immediately. Interest removal is deferred for
+    /// `INTEREST_DISCONNECT_GRACE_PERIOD` to survive transient disconnects.
     pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
         self.proximity_cache.on_peer_disconnected(pub_key);
         self.interest_manager

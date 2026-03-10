@@ -608,7 +608,6 @@ impl<T: TimeSource> InterestManager<T> {
             .map(|entry| entry.key().clone())
             .collect();
 
-        let count = expired_peers.len();
         for peer in &expired_peers {
             self.pending_removals.remove(peer);
             let removed = self.remove_all_peer_interests(peer);
@@ -618,7 +617,7 @@ impl<T: TimeSource> InterestManager<T> {
                 "Executed deferred interest removal — peer did not reconnect"
             );
         }
-        count
+        expired_peers.len()
     }
 
     /// Register local interest in a contract (for tracking our reasons).
@@ -810,13 +809,7 @@ impl<T: TimeSource> InterestManager<T> {
             interval.tick().await;
 
             // Execute any deferred removals whose grace period has expired
-            let deferred_removed = manager.execute_pending_removals();
-            if deferred_removed > 0 {
-                tracing::info!(
-                    peers_removed = deferred_removed,
-                    "Interest sweep: executed deferred peer removals"
-                );
-            }
+            manager.execute_pending_removals();
 
             // Capture stats before sweep for the health snapshot
             let stats = manager.stats();
