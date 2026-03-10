@@ -1,7 +1,7 @@
 use std::{fs::File, io::Write, net::SocketAddr, sync::Arc};
 
 use freenet_stdlib::{client_api::WebApi, prelude::*};
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 use crate::wasm_runtime::DeserializationFmt;
 
@@ -11,7 +11,7 @@ mod v1;
 
 #[derive(Clone)]
 pub(super) struct AppState {
-    pub(crate) local_node: Arc<RwLock<WebApi>>,
+    pub(crate) local_node: Arc<Mutex<WebApi>>,
     config: ExecutorConfig,
 }
 

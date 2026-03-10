@@ -4,9 +4,11 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
 use super::contract_store::ContractStore;
+use super::delegate_store::DelegateStore;
 use super::runtime::InstanceInfo;
 use super::secrets_store::SecretsStore;
 use crate::contract::storages::Storage;
@@ -35,6 +37,19 @@ pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateCallEnv>> =
 pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
     DashMap<ContractInstanceId, HashSet<DelegateKey>>,
 > = LazyLock::new(DashMap::default);
+
+/// Tracks app attestation inherited by child delegates from their parent.
+/// When a delegate with attested_contract creates a child, the child inherits
+/// the same attestation so it can interact with the same app context.
+/// DelegateKey (child) → Vec<ContractInstanceId> (inherited attestations)
+pub(crate) static DELEGATE_INHERITED_ATTESTATIONS: LazyLock<
+    DashMap<DelegateKey, Vec<ContractInstanceId>>,
+> = LazyLock::new(DashMap::default);
+
+/// Global counter of all delegates created via the `create_delegate` host function.
+/// Used to enforce `MAX_CREATED_DELEGATES_PER_NODE` regardless of attestation status.
+/// Decremented on `UnregisterDelegate` to allow reuse of slots.
+pub(crate) static CREATED_DELEGATES_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // Thread-local tracking of the currently-executing delegate instance ID.
 // Set before a WASM process() call, cleared after. This allows the new
@@ -102,11 +117,10 @@ pub mod error_codes {
 pub(super) struct DelegateCallEnv {
     /// Mutable context bytes. The delegate reads/writes this via host functions.
     pub context: Vec<u8>,
-    /// Raw mutable pointer to the runtime's SecretsStore. Valid only during the
-    /// synchronous `process()` call. The WASM Singlepass compiler executes
-    /// on the calling thread, so the pointer cannot outlive the borrow.
-    /// Stored as *mut because set_secret and remove_secret need mutation.
-    secret_store: *mut SecretsStore,
+    /// Interior-mutable pointer to the runtime's SecretsStore. Valid only during
+    /// the synchronous `process()` call. Uses `UnsafeCell` to make the interior
+    /// mutability explicit rather than hiding it behind `#[allow(clippy::mut_from_ref)]`.
+    secret_store: std::cell::UnsafeCell<*mut SecretsStore>,
     /// The delegate key, needed to scope secret access.
     pub delegate_key: DelegateKey,
     /// Read-only pointer to the ContractStore for index lookups
@@ -116,6 +130,15 @@ pub(super) struct DelegateCallEnv {
     /// contract state synchronously via host functions. ReDb is Arc<Database>
     /// internally, so cloning is cheap.
     state_store_db: Option<Storage>,
+    /// Interior-mutable pointer to the runtime's DelegateStore. Valid only during
+    /// synchronous `process()` call. Used for creating child delegates.
+    delegate_store: std::cell::UnsafeCell<*mut DelegateStore>,
+    /// Current delegate creation chain depth (0 for top-level calls).
+    pub(super) creation_depth: u32,
+    /// Number of delegates created so far in this process() call.
+    pub(super) creations_this_call: std::cell::Cell<u32>,
+    /// Attested contract IDs for this delegate (from parent or direct registration).
+    attested_contracts: Vec<ContractInstanceId>,
 }
 
 // SAFETY: DelegateCallEnv is only inserted into DELEGATE_ENV immediately before
@@ -145,6 +168,21 @@ pub(super) enum DelegateEnvError {
     StorageError(String),
 }
 
+/// Errors that can occur during delegate creation via `create_delegate_sync`.
+#[derive(Debug)]
+pub(super) enum DelegateCreateError {
+    /// Delegate creation depth limit exceeded.
+    DepthExceeded,
+    /// Per-call delegate creation limit exceeded.
+    CreationsExceeded,
+    /// Per-node delegate creation limit exceeded.
+    NodeLimitExceeded,
+    /// Invalid WASM bytes (e.g., exceeds size limit).
+    InvalidWasm(String),
+    /// Delegate store or secret store operation failed.
+    StoreFailed(String),
+}
+
 impl DelegateCallEnv {
     /// Create a new call environment.
     ///
@@ -153,32 +191,40 @@ impl DelegateCallEnv {
     /// valid for the entire lifetime of this `DelegateCallEnv` (i.e., until it
     /// is removed from `DELEGATE_ENV`). The caller must also ensure exclusive
     /// access to the SecretsStore during this time (no other references exist).
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         context: Vec<u8>,
         secret_store: &mut SecretsStore,
         contract_store: &ContractStore,
         state_store_db: Option<Storage>,
         delegate_key: DelegateKey,
+        delegate_store: &mut DelegateStore,
+        creation_depth: u32,
+        attested_contracts: Vec<ContractInstanceId>,
     ) -> Self {
         Self {
             context,
-            secret_store: secret_store as *mut SecretsStore,
+            secret_store: std::cell::UnsafeCell::new(secret_store as *mut SecretsStore),
             delegate_key,
             contract_store: contract_store as *const ContractStore,
             state_store_db,
+            delegate_store: std::cell::UnsafeCell::new(delegate_store as *mut DelegateStore),
+            creation_depth,
+            creations_this_call: std::cell::Cell::new(0),
+            attested_contracts,
         }
     }
 
     /// Access the secrets store immutably. Only safe during the synchronous process() call.
     fn secret_store(&self) -> &SecretsStore {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model
-        unsafe { &*self.secret_store }
+        unsafe { &**self.secret_store.get() }
     }
 
     /// Access the secrets store mutably. Only safe during the synchronous process() call.
     ///
-    /// # Safety invariants (why this lint is suppressed)
-    /// This uses interior mutability through a raw pointer, which is safe because:
+    /// # Safety invariants
+    /// Interior mutability via `UnsafeCell` is safe because:
     /// 1. The Runtime holds `&mut self` when calling `process()`, ensuring exclusive access
     /// 2. WASM execution is synchronous on the calling thread (Singlepass compiler)
     /// 3. The `DelegateCallEnv` is created immediately before and destroyed immediately after
@@ -187,7 +233,7 @@ impl DelegateCallEnv {
     fn secret_store_mut(&self) -> &mut SecretsStore {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model.
         // The Runtime holds &mut self when calling process(), ensuring exclusive access.
-        unsafe { &mut *self.secret_store }
+        unsafe { &mut **self.secret_store.get() }
     }
 
     /// Access the contract store for index lookups.
@@ -195,6 +241,122 @@ impl DelegateCallEnv {
     fn contract_store(&self) -> &ContractStore {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model
         unsafe { &*self.contract_store }
+    }
+    /// Access the delegate store mutably. Only safe during the synchronous process() call.
+    #[allow(clippy::mut_from_ref)]
+    fn delegate_store_mut(&self) -> &mut DelegateStore {
+        // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model.
+        // The Runtime holds &mut self when calling process(), ensuring exclusive access.
+        unsafe { &mut **self.delegate_store.get() }
+    }
+
+    /// Maximum WASM code size (10 MiB) accepted by `create_delegate`.
+    /// Prevents a single process() call from allocating excessive host-side memory.
+    pub(crate) const MAX_WASM_CODE_SIZE: usize = 10 * 1024 * 1024;
+
+    /// Create a new delegate synchronously during process() execution.
+    ///
+    /// Validates resource limits, constructs a DelegateContainer from the raw WASM bytes,
+    /// registers it in the delegate store and secret store, and records creator attestation.
+    ///
+    /// Note: WASM bytes are stored as-is. Validation is deferred to execution time
+    /// (when the delegate is actually invoked). Depth tracking is per-call only — child
+    /// delegates invoked later via ApplicationMessages start at depth 0.
+    ///
+    /// # Arguments
+    /// * `wasm_bytes` - Raw WASM code bytes (wrapped into versioned DelegateContainer internally)
+    /// * `params` - Parameter bytes for the new delegate
+    /// * `cipher_bytes` - 32-byte XChaCha20Poly1305 cipher key
+    /// * `nonce_bytes` - 24-byte XNonce
+    ///
+    /// # Returns
+    /// The new delegate's `DelegateKey` on success, or a `DelegateCreateError`.
+    pub(super) fn create_delegate_sync(
+        &self,
+        wasm_bytes: &[u8],
+        params: &[u8],
+        cipher_bytes: [u8; 32],
+        nonce_bytes: [u8; 24],
+    ) -> Result<DelegateKey, DelegateCreateError> {
+        use crate::contract::{
+            MAX_CREATED_DELEGATES_PER_NODE, MAX_DELEGATE_CREATIONS_PER_CALL,
+            MAX_DELEGATE_CREATION_DEPTH,
+        };
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+        use freenet_stdlib::prelude::{
+            Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters,
+        };
+
+        // Check per-call creation limit
+        let current = self.creations_this_call.get();
+        if current >= MAX_DELEGATE_CREATIONS_PER_CALL {
+            return Err(DelegateCreateError::CreationsExceeded);
+        }
+
+        // Check creation depth (per-call only; child delegates start at depth 0 when
+        // invoked via ApplicationMessages in a separate process() call)
+        if self.creation_depth >= MAX_DELEGATE_CREATION_DEPTH {
+            return Err(DelegateCreateError::DepthExceeded);
+        }
+
+        // Check per-node creation limit (counts ALL created delegates, not just attested)
+        if CREATED_DELEGATES_COUNT.load(Ordering::Relaxed) >= MAX_CREATED_DELEGATES_PER_NODE {
+            return Err(DelegateCreateError::NodeLimitExceeded);
+        }
+
+        // Reject oversized WASM to prevent excessive host-side allocations
+        if wasm_bytes.len() > Self::MAX_WASM_CODE_SIZE {
+            return Err(DelegateCreateError::InvalidWasm(format!(
+                "WASM code size {} exceeds maximum {} bytes",
+                wasm_bytes.len(),
+                Self::MAX_WASM_CODE_SIZE
+            )));
+        }
+
+        // Construct DelegateContainer from raw WASM bytes and params.
+        // The caller provides raw WASM; we wrap it into the versioned DelegateContainer.
+        let params_owned = Parameters::from(params.to_vec());
+        let delegate_code = DelegateCode::from(wasm_bytes.to_vec());
+        let delegate = Delegate::from((&delegate_code, &params_owned));
+        let container = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
+
+        let child_key = container.key().clone();
+
+        // Build cipher and nonce
+        let cipher = XChaCha20Poly1305::new((&cipher_bytes).into());
+        let nonce = XNonce::from(nonce_bytes);
+
+        // Register in secret store
+        self.secret_store_mut()
+            .register_delegate(child_key.clone(), cipher, nonce)
+            .map_err(|e| DelegateCreateError::StoreFailed(e.to_string()))?;
+
+        // Store in delegate store; rollback secret store on failure
+        if let Err(e) = self.delegate_store_mut().store_delegate(container) {
+            // Rollback: remove the secret store cipher we just registered
+            self.secret_store_mut().remove_delegate_cipher(&child_key);
+            return Err(DelegateCreateError::StoreFailed(e.to_string()));
+        }
+
+        // Increment per-call counter and global node counter
+        self.creations_this_call.set(current + 1);
+        CREATED_DELEGATES_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        // Propagate app attestation to child
+        if !self.attested_contracts.is_empty() {
+            DELEGATE_INHERITED_ATTESTATIONS
+                .insert(child_key.clone(), self.attested_contracts.clone());
+        }
+
+        tracing::info!(
+            parent = %self.delegate_key,
+            child = %child_key,
+            depth = self.creation_depth,
+            creations = current + 1,
+            "Delegate created child delegate"
+        );
+
+        Ok(child_key)
     }
 
     /// Resolve a ContractInstanceId to a ContractKey using the contract index.
@@ -1378,6 +1540,169 @@ pub(super) mod delegate_contracts {
                     "V2 delegate: subscribe_contract failed"
                 );
                 delegate_env_error_to_code(e)
+            }
+        }
+    }
+}
+
+/// Host functions for delegate management (creating child delegates).
+///
+/// Provides the `create_delegate` host function that allows V2 delegates to
+/// spawn new delegates inline during `process()` execution.
+pub(super) mod delegate_management {
+    use super::*;
+    use crate::wasm_runtime::delegate_api::delegate_mgmt_error_codes;
+
+    /// Implementation of create_delegate host function.
+    ///
+    /// Reads WASM bytes, params, cipher, and nonce from WASM memory,
+    /// calls `env.create_delegate_sync()`, and writes the resulting
+    /// DelegateKey back to WASM memory.
+    ///
+    /// # Parameters (from WASM)
+    /// * `wasm_ptr`, `wasm_len` - Pointer and length of WASM code bytes
+    /// * `params_ptr`, `params_len` - Pointer and length of parameter bytes
+    /// * `cipher_ptr` - Pointer to 32-byte cipher key
+    /// * `nonce_ptr` - Pointer to 24-byte nonce
+    /// * `out_key_ptr` - Pointer to 32-byte output buffer for delegate key hash
+    /// * `out_hash_ptr` - Pointer to 32-byte output buffer for code hash
+    ///
+    /// # Returns
+    /// 0 on success, negative error code on failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_delegate_impl(
+        wasm_ptr: i64,
+        wasm_len: i64,
+        params_ptr: i64,
+        params_len: i64,
+        cipher_ptr: i64,
+        nonce_ptr: i64,
+        out_key_ptr: i64,
+        out_hash_ptr: i64,
+    ) -> i32 {
+        let id = current_instance_id();
+        if id == -1 {
+            tracing::warn!("delegate create_delegate called outside process()");
+            return delegate_mgmt_error_codes::ERR_NOT_IN_PROCESS;
+        }
+
+        // Validate lengths
+        if wasm_len < 0 || params_len < 0 {
+            tracing::warn!("delegate create_delegate: negative length");
+            return delegate_mgmt_error_codes::ERR_INVALID_PARAM;
+        }
+        let wasm_len_usize = wasm_len as usize;
+        let params_len_usize = params_len as usize;
+
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::warn!("instance mem space not recorded for {id}");
+            return delegate_mgmt_error_codes::ERR_NOT_IN_PROCESS;
+        };
+        let start_ptr = info.start_ptr;
+        let mem_size = info.mem_size;
+        drop(info);
+
+        // Read WASM bytes from WASM memory
+        let Some(wasm_src) =
+            validate_and_compute_ptr::<u8>(wasm_ptr, start_ptr, wasm_len_usize, mem_size)
+        else {
+            tracing::error!("Memory bounds violation reading WASM bytes in create_delegate");
+            return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
+        };
+        // SAFETY: validated by validate_and_compute_ptr
+        let wasm_bytes = unsafe { std::slice::from_raw_parts(wasm_src, wasm_len_usize) };
+
+        // Read params from WASM memory
+        let params_bytes = if params_len_usize > 0 {
+            let Some(params_src) =
+                validate_and_compute_ptr::<u8>(params_ptr, start_ptr, params_len_usize, mem_size)
+            else {
+                tracing::error!("Memory bounds violation reading params in create_delegate");
+                return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
+            };
+            // SAFETY: validated by validate_and_compute_ptr
+            unsafe { std::slice::from_raw_parts(params_src, params_len_usize) }
+        } else {
+            &[]
+        };
+
+        // Read 32-byte cipher key
+        let Some(cipher_src) = validate_and_compute_ptr::<u8>(cipher_ptr, start_ptr, 32, mem_size)
+        else {
+            tracing::error!("Memory bounds violation reading cipher in create_delegate");
+            return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
+        };
+        let mut cipher_bytes = [0u8; 32];
+        // SAFETY: cipher_src points to 32 validated bytes (validate_and_compute_ptr above),
+        // cipher_bytes is a stack-local [u8; 32], and they do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(cipher_src, cipher_bytes.as_mut_ptr(), 32) };
+
+        // Read 24-byte nonce
+        let Some(nonce_src) = validate_and_compute_ptr::<u8>(nonce_ptr, start_ptr, 24, mem_size)
+        else {
+            tracing::error!("Memory bounds violation reading nonce in create_delegate");
+            return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
+        };
+        let mut nonce_bytes = [0u8; 24];
+        // SAFETY: nonce_src points to 24 validated bytes (validate_and_compute_ptr above),
+        // nonce_bytes is a stack-local [u8; 24], and they do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(nonce_src, nonce_bytes.as_mut_ptr(), 24) };
+
+        // Validate output buffers
+        let Some(out_key_dst) =
+            validate_and_compute_ptr::<u8>(out_key_ptr, start_ptr, 32, mem_size)
+        else {
+            tracing::error!("Memory bounds violation for out_key_ptr in create_delegate");
+            return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
+        };
+        let Some(out_hash_dst) =
+            validate_and_compute_ptr::<u8>(out_hash_ptr, start_ptr, 32, mem_size)
+        else {
+            tracing::error!("Memory bounds violation for out_hash_ptr in create_delegate");
+            return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
+        };
+
+        // Get the delegate env and perform creation
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            tracing::warn!("delegate call env not set for instance {id}");
+            return delegate_mgmt_error_codes::ERR_NOT_IN_PROCESS;
+        };
+
+        match env.create_delegate_sync(wasm_bytes, params_bytes, cipher_bytes, nonce_bytes) {
+            Ok(child_key) => {
+                // Write the 32-byte key hash to out_key_ptr
+                let key_bytes = child_key.bytes();
+                // SAFETY: out_key_dst validated above
+                unsafe {
+                    std::ptr::copy_nonoverlapping(key_bytes.as_ptr(), out_key_dst, 32);
+                }
+                // Write the 32-byte code hash to out_hash_ptr
+                let code_hash_bytes = child_key.code_hash().as_ref();
+                // SAFETY: out_hash_dst validated above
+                unsafe {
+                    std::ptr::copy_nonoverlapping(code_hash_bytes.as_ptr(), out_hash_dst, 32);
+                }
+                delegate_mgmt_error_codes::SUCCESS
+            }
+            Err(DelegateCreateError::DepthExceeded) => {
+                tracing::warn!("delegate create_delegate: depth limit exceeded");
+                delegate_mgmt_error_codes::ERR_DEPTH_EXCEEDED
+            }
+            Err(DelegateCreateError::CreationsExceeded) => {
+                tracing::warn!("delegate create_delegate: per-call creation limit exceeded");
+                delegate_mgmt_error_codes::ERR_CREATIONS_EXCEEDED
+            }
+            Err(DelegateCreateError::NodeLimitExceeded) => {
+                tracing::warn!("delegate create_delegate: per-node creation limit exceeded");
+                delegate_mgmt_error_codes::ERR_NODE_LIMIT_EXCEEDED
+            }
+            Err(DelegateCreateError::InvalidWasm(msg)) => {
+                tracing::error!("delegate create_delegate: invalid WASM: {msg}");
+                delegate_mgmt_error_codes::ERR_INVALID_WASM
+            }
+            Err(DelegateCreateError::StoreFailed(msg)) => {
+                tracing::error!("delegate create_delegate: store failed: {msg}");
+                delegate_mgmt_error_codes::ERR_STORE_FAILED
             }
         }
     }

@@ -15,7 +15,8 @@ pub mod storages;
 pub(crate) use executor::{
     mediator_channels, mock_runtime::MockRuntime, op_request_channel, run_op_request_mediator,
     Callback, ContractExecutor, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
-    UpsertResult, SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
+    UpsertResult, MAX_CREATED_DELEGATES_PER_NODE, MAX_DELEGATE_CREATIONS_PER_CALL,
+    MAX_DELEGATE_CREATION_DEPTH, SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
 };
 
 // Re-export CRDT emulation functions for testing

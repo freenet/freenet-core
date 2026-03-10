@@ -2483,6 +2483,21 @@ impl Executor<Runtime> {
                     !subscribers.is_empty()
                 });
 
+                // Clean up delegate creation tracking to prevent unbounded growth
+                crate::wasm_runtime::DELEGATE_INHERITED_ATTESTATIONS.remove(&key);
+
+                // Decrement the global created-delegates counter so the slot can be reused.
+                // Only decrement if count > 0 to avoid underflow for delegates not created
+                // via the host function (e.g., registered directly by apps).
+                {
+                    use std::sync::atomic::Ordering;
+                    let count = &crate::wasm_runtime::CREATED_DELEGATES_COUNT;
+                    let prev = count.load(Ordering::Relaxed);
+                    if prev > 0 {
+                        count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
                     Err(err) => {
@@ -2501,8 +2516,18 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
-                // Use the attested_contract directly instead of looking it up in delegate_attested_ids
-                let attested_bytes = attested_contract.map(|c| c.as_bytes());
+                // Use the attested_contract directly, falling back to inherited attestation
+                // from parent delegates that created this delegate via create_delegate host function.
+                let inherited_attested: Option<Vec<u8>> = if attested_contract.is_some() {
+                    None // Direct attestation takes priority
+                } else {
+                    crate::wasm_runtime::DELEGATE_INHERITED_ATTESTATIONS
+                        .get(&key)
+                        .and_then(|ids| ids.first().map(|c| c.as_bytes().to_vec()))
+                };
+                let attested_bytes: Option<&[u8]> = attested_contract
+                    .map(|c| c.as_bytes() as &[u8])
+                    .or(inherited_attested.as_deref());
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,

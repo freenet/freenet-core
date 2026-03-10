@@ -168,6 +168,31 @@ pub mod contract_error_codes {
     pub const ERR_CONTRACT_CODE_NOT_REGISTERED: i32 = -10;
 }
 
+/// Error codes for delegate management host functions (create_delegate, etc.).
+///
+/// Uses the -20..-29 range to avoid collisions with existing error codes.
+#[allow(dead_code)] // Public API — error codes for host function implementations
+pub mod delegate_mgmt_error_codes {
+    /// Delegate creation succeeded.
+    pub const SUCCESS: i32 = 0;
+    /// Called outside of a `process()` context.
+    pub const ERR_NOT_IN_PROCESS: i32 = -1;
+    /// Invalid parameter (e.g., negative length).
+    pub const ERR_INVALID_PARAM: i32 = -4;
+    /// Memory bounds violation (pointer out of range).
+    pub const ERR_MEMORY_BOUNDS: i32 = -9;
+    /// Delegate creation depth limit exceeded.
+    pub const ERR_DEPTH_EXCEEDED: i32 = -20;
+    /// Per-call delegate creation limit exceeded.
+    pub const ERR_CREATIONS_EXCEEDED: i32 = -21;
+    /// Per-node delegate creation limit exceeded (lifetime cap).
+    pub const ERR_NODE_LIMIT_EXCEEDED: i32 = -22;
+    /// Invalid WASM bytes (e.g., exceeds size limit).
+    pub const ERR_INVALID_WASM: i32 = -23;
+    /// Delegate store or secret store operation failed.
+    pub const ERR_STORE_FAILED: i32 = -24;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +318,7 @@ mod tests {
     struct TestEnv {
         _temp_dir: tempfile::TempDir,
         contract_store: ContractStore,
+        delegate_store: super::super::delegate_store::DelegateStore,
         secret_store: SecretsStore,
         db: Storage,
     }
@@ -310,14 +336,13 @@ mod tests {
             let delegate_store =
                 super::super::delegate_store::DelegateStore::new(delegates_dir, 10_000, db.clone())
                     .unwrap();
-            // DelegateStore not stored since we only need contract_store + secret_store
-            drop(delegate_store);
             let secret_store =
                 SecretsStore::new(secrets_dir, Default::default(), db.clone()).unwrap();
 
             Self {
                 _temp_dir: temp_dir,
                 contract_store,
+                delegate_store,
                 secret_store,
                 db,
             }
@@ -347,6 +372,15 @@ mod tests {
         /// # Safety
         /// Caller must ensure the returned env does not outlive `self`.
         unsafe fn make_env(&mut self) -> DelegateCallEnv {
+            // SAFETY: forwarded to make_env_with_depth
+            unsafe { self.make_env_with_depth(0) }
+        }
+
+        /// Create a DelegateCallEnv with a specific creation depth.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env_with_depth(&mut self, depth: u32) -> DelegateCallEnv {
             let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
             // SAFETY: The caller guarantees the returned env does not outlive `self`,
             // which keeps the borrowed `secret_store` and `contract_store` alive.
@@ -357,6 +391,34 @@ mod tests {
                     &self.contract_store,
                     Some(self.db.clone()),
                     delegate_key,
+                    &mut self.delegate_store,
+                    depth,
+                    vec![],
+                )
+            }
+        }
+
+        /// Create a DelegateCallEnv with attested contracts for testing attestation inheritance.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env_with_attestations(
+            &mut self,
+            attestations: Vec<ContractInstanceId>,
+        ) -> DelegateCallEnv {
+            let delegate_key = DelegateKey::new([1u8; 32], CodeHash::new([1u8; 32]));
+            // SAFETY: The caller guarantees the returned env does not outlive `self`,
+            // which keeps the borrowed `secret_store` and `contract_store` alive.
+            unsafe {
+                DelegateCallEnv::new(
+                    vec![],
+                    &mut self.secret_store,
+                    &self.contract_store,
+                    Some(self.db.clone()),
+                    delegate_key,
+                    &mut self.delegate_store,
+                    0,
+                    attestations,
                 )
             }
         }
@@ -446,6 +508,9 @@ mod tests {
                 &env_holder.contract_store,
                 None, // No state store
                 delegate_key,
+                &mut env_holder.delegate_store,
+                0,
+                vec![],
             )
         };
 
@@ -523,6 +588,9 @@ mod tests {
                 &env_holder.contract_store,
                 None,
                 delegate_key,
+                &mut env_holder.delegate_store,
+                0,
+                vec![],
             )
         };
 
@@ -546,6 +614,9 @@ mod tests {
                 &env_holder.contract_store,
                 None,
                 delegate_key,
+                &mut env_holder.delegate_store,
+                0,
+                vec![],
             )
         };
 
@@ -775,5 +846,213 @@ mod tests {
 
         let result3 = call_inc.call(&mut store, 30).unwrap();
         assert_eq!(result3, 31);
+    }
+
+    // ============ Delegate creation resource limit tests ============
+
+    use super::super::native_api::DelegateCreateError;
+    use crate::contract::{MAX_DELEGATE_CREATIONS_PER_CALL, MAX_DELEGATE_CREATION_DEPTH};
+
+    /// Minimal raw WASM bytes for delegate creation tests.
+    /// The host function wraps raw WASM into a versioned DelegateContainer internally.
+    fn minimal_delegate_wasm() -> Vec<u8> {
+        b"\0asm\x01\x00\x00\x00".to_vec() // valid empty WASM module
+    }
+
+    /// create_delegate_sync rejects creation when depth limit is exceeded.
+    #[tokio::test]
+    async fn test_create_delegate_depth_exceeded() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env_with_depth(MAX_DELEGATE_CREATION_DEPTH) };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let result = env.create_delegate_sync(&wasm, &[], cipher, nonce);
+        assert!(
+            matches!(result, Err(DelegateCreateError::DepthExceeded)),
+            "should reject at depth {}: {:?}",
+            MAX_DELEGATE_CREATION_DEPTH,
+            result
+        );
+    }
+
+    /// create_delegate_sync allows creation at depth just below the limit.
+    #[tokio::test]
+    async fn test_create_delegate_depth_just_under_limit() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env_with_depth(MAX_DELEGATE_CREATION_DEPTH - 1) };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let result = env.create_delegate_sync(&wasm, &[], cipher, nonce);
+        assert!(
+            result.is_ok(),
+            "should allow at depth {}: {:?}",
+            MAX_DELEGATE_CREATION_DEPTH - 1,
+            result
+        );
+    }
+
+    /// create_delegate_sync rejects creation when per-call limit is exceeded.
+    #[tokio::test]
+    async fn test_create_delegate_per_call_limit_exceeded() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        // Create up to the limit
+        for i in 0..MAX_DELEGATE_CREATIONS_PER_CALL {
+            let result = env.create_delegate_sync(&wasm, &[i as u8], cipher, nonce);
+            assert!(result.is_ok(), "creation {i} should succeed: {:?}", result);
+        }
+
+        // One more should fail
+        let result = env.create_delegate_sync(&wasm, &[255], cipher, nonce);
+        assert!(
+            matches!(result, Err(DelegateCreateError::CreationsExceeded)),
+            "should reject at creation count {}: {:?}",
+            MAX_DELEGATE_CREATIONS_PER_CALL,
+            result
+        );
+    }
+
+    /// create_delegate_sync accepts arbitrary bytes at creation time.
+    /// Superseded: WASM validation moved from creation to execution time.
+    /// Replaced test_create_delegate_invalid_wasm which expected InvalidWasm error.
+    #[tokio::test]
+    async fn test_create_delegate_accepts_any_bytes_at_creation() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        let arbitrary_bytes = vec![0xFF, 0xFF, 0xFF]; // not valid WASM
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let result = env.create_delegate_sync(&arbitrary_bytes, &[], cipher, nonce);
+        assert!(
+            result.is_ok(),
+            "creation should accept any bytes (validation deferred to execution): {:?}",
+            result
+        );
+    }
+
+    /// create_delegate_sync rejects WASM bytes exceeding the size limit.
+    #[tokio::test]
+    async fn test_create_delegate_rejects_oversized_wasm() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        let oversized = vec![0u8; DelegateCallEnv::MAX_WASM_CODE_SIZE + 1];
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let result = env.create_delegate_sync(&oversized, &[], cipher, nonce);
+        assert!(
+            matches!(result, Err(DelegateCreateError::InvalidWasm(_))),
+            "should reject oversized WASM: {:?}",
+            result
+        );
+    }
+
+    /// create_delegate_sync tracks per-call count correctly via Cell.
+    #[tokio::test]
+    async fn test_create_delegate_counter_tracks_correctly() {
+        let mut env_holder = TestEnv::new().await;
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        assert_eq!(env.creations_this_call.get(), 0);
+
+        env.create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+        assert_eq!(env.creations_this_call.get(), 1);
+
+        env.create_delegate_sync(&wasm, &[2], cipher, nonce)
+            .unwrap();
+        assert_eq!(env.creations_this_call.get(), 2);
+    }
+
+    /// Child delegate inherits parent's attested contracts in DELEGATE_INHERITED_ATTESTATIONS.
+    #[tokio::test]
+    async fn test_create_delegate_inherits_attestations() {
+        use super::super::native_api::DELEGATE_INHERITED_ATTESTATIONS;
+
+        let mut env_holder = TestEnv::new().await;
+
+        let contract_id = ContractInstanceId::new([42u8; 32]);
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env_with_attestations(vec![contract_id]) };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let child_key = env
+            .create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+
+        // Verify the child inherited the parent's attestation
+        let inherited = DELEGATE_INHERITED_ATTESTATIONS.get(&child_key);
+        assert!(
+            inherited.is_some(),
+            "child should have inherited attestations"
+        );
+        assert_eq!(inherited.unwrap().value(), &vec![contract_id]);
+
+        // Cleanup
+        DELEGATE_INHERITED_ATTESTATIONS.remove(&child_key);
+    }
+
+    /// Child created by non-attested parent does NOT appear in DELEGATE_INHERITED_ATTESTATIONS
+    /// but still counts toward the per-node limit via CREATED_DELEGATES_COUNT.
+    #[tokio::test]
+    async fn test_create_delegate_non_attested_still_counts_toward_node_limit() {
+        use super::super::native_api::{CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ATTESTATIONS};
+        use std::sync::atomic::Ordering;
+
+        let mut env_holder = TestEnv::new().await;
+
+        let before = CREATED_DELEGATES_COUNT.load(Ordering::Relaxed);
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() }; // no attestations
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        let child_key = env
+            .create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+
+        // Should NOT be in inherited attestations (parent had none)
+        assert!(
+            DELEGATE_INHERITED_ATTESTATIONS.get(&child_key).is_none(),
+            "non-attested parent should not create attestation entry"
+        );
+
+        // But SHOULD have incremented the global counter
+        let after = CREATED_DELEGATES_COUNT.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "global counter should increment for all creations (before={before}, after={after})"
+        );
+
+        // Cleanup
+        CREATED_DELEGATES_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 }

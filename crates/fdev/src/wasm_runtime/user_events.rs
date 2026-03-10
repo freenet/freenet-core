@@ -305,7 +305,7 @@ impl ClientEventsProxy for StdInput {
                             ));
                         }
                         Ok(Command::GetParams) => {
-                            let node = &mut *self.app_state.local_node.write().await;
+                            let node = &mut *self.app_state.local_node.lock().await;
                             let key = self.contract.key();
                             node.send(ClientRequest::ContractOp(ContractRequest::Get {
                                 key: *key.id(),
