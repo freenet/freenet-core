@@ -1632,10 +1632,10 @@ pub(super) mod delegate_management {
             tracing::error!("Memory bounds violation reading cipher in create_delegate");
             return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
         };
-        // SAFETY: validated by validate_and_compute_ptr (exactly 32 bytes)
-        let cipher_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(cipher_src, 32) }
-            .try_into()
-            .expect("BUG: slice length guaranteed to be 32 by validate_and_compute_ptr");
+        let mut cipher_bytes = [0u8; 32];
+        // SAFETY: cipher_src points to 32 validated bytes (validate_and_compute_ptr above),
+        // cipher_bytes is a stack-local [u8; 32], and they do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(cipher_src, cipher_bytes.as_mut_ptr(), 32) };
 
         // Read 24-byte nonce
         let Some(nonce_src) = validate_and_compute_ptr::<u8>(nonce_ptr, start_ptr, 24, mem_size)
@@ -1643,10 +1643,10 @@ pub(super) mod delegate_management {
             tracing::error!("Memory bounds violation reading nonce in create_delegate");
             return delegate_mgmt_error_codes::ERR_MEMORY_BOUNDS;
         };
-        // SAFETY: validated by validate_and_compute_ptr (exactly 24 bytes)
-        let nonce_bytes: [u8; 24] = unsafe { std::slice::from_raw_parts(nonce_src, 24) }
-            .try_into()
-            .expect("BUG: slice length guaranteed to be 24 by validate_and_compute_ptr");
+        let mut nonce_bytes = [0u8; 24];
+        // SAFETY: nonce_src points to 24 validated bytes (validate_and_compute_ptr above),
+        // nonce_bytes is a stack-local [u8; 24], and they do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(nonce_src, nonce_bytes.as_mut_ptr(), 24) };
 
         // Validate output buffers
         let Some(out_key_dst) =
