@@ -9,7 +9,7 @@
 //! the largest gap in the node's current connection distribution in log-distance space.
 //! This makes target selection adaptive — nodes converge to the ideal 1/d distribution
 //! faster by actively seeking the most deficient distance range. See
-//! `small_world_rand::gap_target`.
+//! `small_world_rand::gap_target_directional`.
 //!
 //! When the node has no existing connections or its own location is unknown (during very
 //! early bootstrap), the fallback is random Kleinberg 1/d sampling via inverse CDF:
@@ -334,7 +334,7 @@ impl TopologyManager {
     ///
     /// When adding connections, targets are selected using gap-based targeting:
     /// the center of the largest gap in the node's connection distribution in
-    /// log-distance space (see `small_world_rand::gap_target`).
+    /// log-distance space (see `small_world_rand::gap_target_directional`).
     /// When own location is unknown, random targets are used as fallback.
     pub(crate) fn adjust_topology(
         &mut self,
@@ -883,9 +883,9 @@ fn topology_value(
         return Some(0.0);
     }
     let gap = small_world_rand::removal_gap_directional(peer_signed_distance, all_signed_distances);
-    // With k points on [0,1], there are k+1 gaps (including boundaries).
-    // Removing one point merges two adjacent gaps: expected removal gap = 2/(k+1).
-    // We use k/2 for per-side expected gap since connections are split across two halves.
+    // Directional removal gap is computed on one half-ring (CW or CCW).
+    // With ~k/2 points per side, removing one merges two adjacent gaps:
+    // expected removal gap = 2/(k_per_side + 1).
     let k_per_side = (k as f64 / 2.0).max(1.0);
     let expected_gap = 2.0 / (k_per_side + 1.0);
     let value = gap / expected_gap;

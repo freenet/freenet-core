@@ -137,21 +137,11 @@ pub(crate) fn largest_gap_size(connection_distances: impl Iterator<Item = f64>) 
         .unwrap_or((1.0, 0))
 }
 
-/// Target the center of the largest gap in the node's current connection
-/// distribution in log-space, mapped back to a ring location.
+/// Pick a distance by targeting the largest gap's midpoint (with jitter) in
+/// a `GapAnalysis`, mapping back from log-space to a ring distance.
 ///
-/// With existing connections, finds the largest gap between consecutive points
-/// in log-distance space (including boundaries 0 and 1), then targets the
-/// midpoint of that gap with some jitter to avoid deterministic targeting.
-///
-/// Falls back to pure Kleinberg 1/d sampling when `connection_distances` is empty.
-#[cfg(test)]
-fn gap_target(my_location: Location, connection_distances: impl Iterator<Item = f64>) -> Location {
-    let analysis = match analyze_gaps(connection_distances) {
-        Some(a) => a,
-        None => return kleinberg_target(my_location),
-    };
-
+/// Returns `None` if the analysis has no gaps (shouldn't happen with valid input).
+fn distance_from_gap_analysis(analysis: GapAnalysis) -> f64 {
     // Collect all gaps within 1% of the best (floating point tolerance)
     let threshold = analysis.largest_gap_size * 0.99;
     let largest_gaps: Vec<(f64, f64)> = analysis
@@ -178,7 +168,25 @@ fn gap_target(my_location: Location, connection_distances: impl Iterator<Item = 
 
     // Map back from log-space unit interval to a ring distance:
     // u = ln(d/D_MIN_TARGET) / LOG_RATIO  =>  d = D_MIN_TARGET * exp(u * LOG_RATIO)
-    let distance = D_MIN_TARGET * (u_target * LOG_RATIO).exp();
+    D_MIN_TARGET * (u_target * LOG_RATIO).exp()
+}
+
+/// Target the center of the largest gap in the node's current connection
+/// distribution in log-space, mapped back to a ring location.
+///
+/// With existing connections, finds the largest gap between consecutive points
+/// in log-distance space (including boundaries 0 and 1), then targets the
+/// midpoint of that gap with some jitter to avoid deterministic targeting.
+///
+/// Falls back to pure Kleinberg 1/d sampling when `connection_distances` is empty.
+#[cfg(test)]
+fn gap_target(my_location: Location, connection_distances: impl Iterator<Item = f64>) -> Location {
+    let analysis = match analyze_gaps(connection_distances) {
+        Some(a) => a,
+        None => return kleinberg_target(my_location),
+    };
+
+    let distance = distance_from_gap_analysis(analysis);
 
     let sign: bool = GlobalRng::random_bool(0.5);
     let offset = if sign { distance } else { -distance };
@@ -329,31 +337,7 @@ pub(crate) fn gap_target_directional(my_location: Location, signed_distances: &[
     };
 
     let distance = match analysis {
-        Some(a) => {
-            // Same gap-midpoint logic as gap_target
-            let threshold = a.largest_gap_size * 0.99;
-            let largest_gaps: Vec<(f64, f64)> = a
-                .gaps
-                .into_iter()
-                .filter(|(_, size)| *size >= threshold)
-                .collect();
-
-            let idx = GlobalRng::with_rng(|rng| {
-                use rand::Rng;
-                rng.random_range(0..largest_gaps.len())
-            });
-            let (best_gap_start, best_gap_size) = largest_gaps[idx];
-
-            let midpoint = best_gap_start + best_gap_size / 2.0;
-            let jitter_range = best_gap_size * 0.25;
-            let jitter: f64 = GlobalRng::with_rng(|rng| {
-                use rand::Rng;
-                rng.random_range(-jitter_range..=jitter_range)
-            });
-            let u_target = (midpoint + jitter).clamp(0.0, 1.0);
-
-            D_MIN_TARGET * (u_target * LOG_RATIO).exp()
-        }
+        Some(a) => distance_from_gap_analysis(a),
         None => {
             // This side has no connections — sample from full Kleinberg range
             random_link_distance(Distance::new(D_MIN_TARGET)).as_f64()
