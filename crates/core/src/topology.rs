@@ -36,9 +36,10 @@
 //! ## Accepting Incoming Connections
 //!
 //! All inbound connection candidates are scored by the **Kleinberg gap score**: the
-//! candidate's minimum distance to its nearest neighbor in log-distance space. Candidates
-//! that fill the largest gap in the distribution score highest. See
-//! `small_world_rand::kleinberg_score`.
+//! candidate's minimum distance to its nearest neighbor in log-distance space on its
+//! own half-ring (CW or CCW), with a deficit bonus for the under-covered side.
+//! Candidates that fill the largest directional gap score highest. See
+//! `small_world_rand::kleinberg_score_directional`.
 //!
 //! Two acceptance policies use this score:
 //!
