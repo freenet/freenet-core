@@ -324,35 +324,37 @@ pub(crate) fn gap_target_directional(my_location: Location, signed_distances: &[
         return kleinberg_target(my_location);
     }
 
-    // If only one side has connections, directional analysis doesn't add value —
-    // the empty side would get a random Kleinberg target that doesn't account for
-    // the existing distribution. Use non-directional gap analysis instead.
-    if cw_analysis.is_none() || ccw_analysis.is_none() {
-        let all_abs = signed_distances.iter().map(|sd| sd.abs());
-        return gap_target(my_location, all_abs);
+    // Both sides must have connections for directional analysis to add value.
+    // When one side is empty, fall back to non-directional gap analysis.
+    match (cw_analysis, ccw_analysis) {
+        (Some(cw), Some(ccw)) => {
+            // Soft weighting: probability of choosing a side proportional to its gap size.
+            let pick_cw_prob = cw.largest_gap_size / (cw.largest_gap_size + ccw.largest_gap_size);
+            let pick_cw = GlobalRng::random_bool(pick_cw_prob);
+
+            let (analysis, sign) = if pick_cw { (cw, 1.0) } else { (ccw, -1.0) };
+            let distance = distance_from_gap_analysis(analysis);
+            Location::new_rounded(my_location.as_f64() + sign * distance)
+        }
+        _ => {
+            // One or both sides empty — use non-directional gap analysis
+            let all_abs = signed_distances.iter().map(|sd| sd.abs());
+            gap_target(my_location, all_abs)
+        }
     }
-
-    let cw_gap = cw_analysis.as_ref().unwrap().largest_gap_size;
-    let ccw_gap = ccw_analysis.as_ref().unwrap().largest_gap_size;
-
-    // Soft weighting: probability of choosing a side proportional to its gap size.
-    let pick_cw_prob = cw_gap / (cw_gap + ccw_gap);
-    let pick_cw = GlobalRng::random_bool(pick_cw_prob);
-
-    let (analysis, sign) = if pick_cw {
-        (cw_analysis.unwrap(), 1.0)
-    } else {
-        (ccw_analysis.unwrap(), -1.0)
-    };
-
-    let distance = distance_from_gap_analysis(analysis);
-    Location::new_rounded(my_location.as_f64() + sign * distance)
 }
 
 /// Score how much a candidate improves the node's distribution, considering direction.
 ///
 /// Evaluates gap-fill quality on the candidate's own half-ring, with a bonus
 /// for the side that has fewer connections (deficit weighting).
+///
+/// Currently only used in tests. Connection acceptance uses non-directional
+/// `kleinberg_score` because directional analysis during bootstrap (when each
+/// half-ring has few connections) produces worse decisions. This function is
+/// kept for future use when a minimum connection threshold for directional
+/// acceptance is implemented.
+#[cfg(test)]
 pub(crate) fn kleinberg_score_directional(
     candidate_signed_distance: f64,
     signed_distances: &[f64],

@@ -27,12 +27,15 @@ WHEN calculating contract location:
 WHEN accepting a new connection (should_accept):
   1. CHECK: Is this a self-connection? → REJECT
   2. CHECK: Are we at max_connections (open + pending)? → REJECT
-  3. Compute Kleinberg gap score (small_world_rand::kleinberg_score_directional):
+  3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)
-     → Score = min distance to nearest neighbor in log-space on same half-ring
-     → Candidates filling the largest directional gap score highest
-     → Includes deficit bonus (up to 50%) for the under-covered side (CW/CCW)
+     → Score = min distance to nearest neighbor in log-space
+     → Candidates filling the largest gap score highest
      → Candidates outside [D_MIN, D_MAX] score 0 (including Sybil-close peers)
+     → Note: connection acceptance uses non-directional scoring because
+       directional analysis during bootstrap has too few data points per side.
+       Directional (CW/CCW) awareness is applied in steady-state topology
+       management (swaps, pruning) via topology.rs.
   4. Below min_connections: probabilistic acceptance (soft filter)
      → Below KLEINBERG_FILTER_MIN_CONNECTIONS (3): always ACCEPT
      → Above that: accept_prob = 0.5 + gap_score (50% floor)
