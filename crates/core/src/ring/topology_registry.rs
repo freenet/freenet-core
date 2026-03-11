@@ -171,7 +171,7 @@ pub fn clear_all_topology_snapshots() {
 pub struct TopologyValidationResult {
     /// Bidirectional cycles detected (pairs of peers)
     pub bidirectional_cycles: Vec<(SocketAddr, SocketAddr)>,
-    /// Orphan seeders (peers seeding without upstream or downstream)
+    /// Orphan hosters (peers hosting without upstream or downstream)
     pub orphan_seeders: Vec<(SocketAddr, ContractInstanceId)>,
     /// Disconnected upstream (seeders with downstream but no upstream, not a source)
     /// These are problematic because downstream peers depend on them but they can't receive updates
@@ -464,7 +464,7 @@ mod tests {
         let contract_id = make_contract_id(1);
         let contract_key = make_contract_key(1);
 
-        // Create orphan seeder: seeding but no upstream, no downstream
+        // Create orphan hoster: hosting but no upstream, no downstream
         let mut snap = TopologySnapshot::new(peer, 0.3);
         snap.set_contract(
             contract_id,

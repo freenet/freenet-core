@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn test_neighbor_cache_tracking() {
+    fn test_neighbor_hosting_tracking() {
         let manager = NeighborHostingManager::new();
         let key = test_contract_key();
         let neighbor = make_pub_key(1);

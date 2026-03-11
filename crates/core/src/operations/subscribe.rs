@@ -1645,10 +1645,10 @@ impl Operation for SubscribeOp {
                                         tx = %msg_id,
                                         contract = %key,
                                         phase = "reseed",
-                                        "Subscribe: Network returned NotFound, re-seeding with local cache"
+                                        "Subscribe: Network returned NotFound, re-hosting from local cache"
                                     );
 
-                                    // Re-seed the network with our local copy
+                                    // Re-host to the network with our local copy
                                     if let Some(contract_code) = contract {
                                         let put_result = op_manager
                                             .notify_contract_handler(

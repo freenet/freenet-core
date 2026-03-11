@@ -193,7 +193,7 @@ impl Ring {
         const SUBSCRIPTION_STATE_INTERVAL: Duration = Duration::from_secs(60);
 
         // Interval for periodic subscription recovery attempts (30 seconds)
-        // This recovers "orphaned seeders" - peers that have contracts in cache
+        // This recovers "orphaned hosters" - peers that have contracts in cache
         // but failed to establish subscription (no upstream in subscription tree)
         const SUBSCRIPTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -260,7 +260,7 @@ impl Ring {
             )),
         );
 
-        // Spawn periodic subscription recovery task to fix "orphaned seeders"
+        // Spawn periodic subscription recovery task to fix "orphaned hosters"
         // (peers that have contracts cached but aren't in the subscription tree)
         task_monitor.register(
             "recover_orphaned_subscriptions",
@@ -795,13 +795,13 @@ impl Ring {
     /// fraction of max (i.e. channel is more than 75% full).
     const RENEWAL_STOP_CAPACITY_FRACTION: usize = 4; // channel_max / 4
 
-    /// Periodically attempt to recover "orphaned seeders" - contracts we're seeding
+    /// Periodically attempt to recover "orphaned hosters" - contracts we're hosting
     /// but don't have an upstream subscription for.
     ///
     /// This can happen when:
     /// - The initial subscription after GET/PUT failed (network issues, timeout)
     /// - Our upstream peer disconnected and we haven't found a new one
-    /// - A race condition left us seeding without subscription
+    /// - A race condition left us hosting without subscription
     ///
     /// The task respects existing backoff mechanisms to avoid subscription spam.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {

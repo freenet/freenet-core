@@ -1680,7 +1680,7 @@ impl Operation for GetOp {
                                             tracing::info!(
                                                 tx = %id,
                                                 %key,
-                                                "Re-seeding network after NotFound response"
+                                                "Re-publishing to network after NotFound response"
                                             );
                                             let put_result = op_manager
                                                 .notify_contract_handler(
@@ -1814,7 +1814,7 @@ impl Operation for GetOp {
                                             tracing::info!(
                                                 tx = %id,
                                                 %key,
-                                                "Re-seeding network after NotFound (max retries)"
+                                                "Re-publishing to network after NotFound (max retries)"
                                             );
                                             let put_result = op_manager
                                                 .notify_contract_handler(

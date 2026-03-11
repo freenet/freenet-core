@@ -997,33 +997,33 @@ impl<'a> NetEventLog<'a> {
         }
     }
 
-    // ==================== Seeding/Subscription Events ====================
+    // ==================== Hosting/Subscription Events ====================
 
-    /// Create a seeding_started event when a local client subscribes to a contract.
-    pub fn seeding_started(ring: &'a Ring, instance_id: ContractInstanceId) -> Option<Self> {
+    /// Create a hosting_started event when a local client subscribes to a contract.
+    pub fn hosting_started(ring: &'a Ring, instance_id: ContractInstanceId) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         Some(NetEventLog {
             tx: Transaction::NULL,
             peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::SeedingStarted {
+            kind: EventKind::Subscribe(SubscribeEvent::HostingStarted {
                 instance_id,
                 timestamp: chrono::Utc::now().timestamp_millis() as u64,
             }),
         })
     }
 
-    /// Create a seeding_stopped event when the last local client unsubscribes from a contract.
+    /// Create a hosting_stopped event when the last local client unsubscribes from a contract.
     #[allow(dead_code)] // Helper available for future use
-    pub fn seeding_stopped(
+    pub fn hosting_stopped(
         ring: &'a Ring,
         instance_id: ContractInstanceId,
-        reason: SeedingStoppedReason,
+        reason: HostingStoppedReason,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         Some(NetEventLog {
             tx: Transaction::NULL,
             peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::SeedingStopped {
+            kind: EventKind::Subscribe(SubscribeEvent::HostingStopped {
                 instance_id,
                 reason,
                 timestamp: chrono::Utc::now().timestamp_millis() as u64,
@@ -3356,7 +3356,7 @@ impl GetEvent {
 /// - Request initiation
 /// - Success when subscription is established
 /// - NotFound when contract doesn't exist after search
-/// - Seeding state changes (local client subscriptions)
+/// - Hosting state changes (local client subscriptions)
 ///
 /// # Serialization Compatibility
 ///
@@ -3418,24 +3418,24 @@ pub(crate) enum SubscribeEvent {
         key: Option<ContractKey>,
         timestamp: u64,
     },
-    /// A local client started seeding a contract (via WebSocket subscription).
+    /// A local client started hosting a contract (via WebSocket subscription).
     ///
     /// This event fires when a local application subscribes to a contract,
     /// indicating this peer is now interested in receiving updates for the contract.
-    SeedingStarted {
-        /// Contract instance being seeded.
+    HostingStarted {
+        /// Contract instance being hosted.
         instance_id: ContractInstanceId,
         timestamp: u64,
     },
-    /// A local client stopped seeding a contract (last WebSocket client unsubscribed).
+    /// A local client stopped hosting a contract (last WebSocket client unsubscribed).
     ///
     /// This event fires when the last local client unsubscribes from a contract,
     /// indicating this peer no longer has local interest in the contract.
-    SeedingStopped {
-        /// Contract instance that is no longer being seeded locally.
+    HostingStopped {
+        /// Contract instance that is no longer being hosted locally.
         instance_id: ContractInstanceId,
-        /// Reason for stopping seeding.
-        reason: SeedingStoppedReason,
+        /// Reason for stopping hosting.
+        reason: HostingStoppedReason,
         timestamp: u64,
     },
     // Reserved discriminants 6-10 for removed variants (2026-01 lease-based refactor).
@@ -3485,8 +3485,8 @@ impl SubscribeEvent {
             SubscribeEvent::ResponseSent { key, .. } => *key,
             SubscribeEvent::Request { .. }
             | SubscribeEvent::SubscribeNotFound { .. }
-            | SubscribeEvent::SeedingStarted { .. }
-            | SubscribeEvent::SeedingStopped { .. }
+            | SubscribeEvent::HostingStarted { .. }
+            | SubscribeEvent::HostingStopped { .. }
             | SubscribeEvent::_Reserved6
             | SubscribeEvent::_Reserved7
             | SubscribeEvent::_Reserved8
@@ -3498,10 +3498,10 @@ impl SubscribeEvent {
     }
 }
 
-/// Reason why local seeding stopped for a contract.
+/// Reason why local hosting stopped for a contract.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
-pub enum SeedingStoppedReason {
+pub enum HostingStoppedReason {
     /// Last local client unsubscribed.
     LastClientUnsubscribed,
     /// Client disconnected.

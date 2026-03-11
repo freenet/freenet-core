@@ -1245,7 +1245,7 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     // - Both clients connect to the SAME node (node-a) via websocket
     // - Client 2 subscribes via GET with subscribe=true
     // - The subscription is registered LOCALLY via register_contract_notifier()
-    //   in the executor, NOT via network peer registration in ring.seeding_manager
+    //   in the executor, NOT via network peer registration in ring.hosting_manager
     // - When Client 1 updates the contract, the update notification is delivered
     //   directly through the executor's notification channels (send_update_notification)
     //
@@ -1333,7 +1333,7 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
     // At this point, Client 2's subscription is registered LOCALLY in the executor
     // via register_contract_notifier(). The subscription is NOT registered in the
-    // network's ring.seeding_manager.subscribers - that's only for remote peer subscriptions.
+    // network's ring.hosting_manager.subscribers - that's only for remote peer subscriptions.
     // This validates the decoupled architecture from Issue #2075.
     tracing::info!(
         "Client 2: Local subscription registered via GET with subscribe=true - \

@@ -424,7 +424,7 @@ mod tests {
         let retrieved = storage.get(&key).await.unwrap();
         assert_eq!(retrieved, Some(state));
 
-        // Store count should still be 0 (seeding doesn't count)
+        // Store count should still be 0 (hosting doesn't count)
         assert_eq!(storage.store_count(), 0);
     }
 

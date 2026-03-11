@@ -2832,8 +2832,8 @@ impl SimNetwork {
                         SubscribeEvent::SubscribeSuccess { .. } => summary.subscribe.succeeded += 1,
                         SubscribeEvent::SubscribeNotFound { .. } => summary.subscribe.failed += 1,
                         SubscribeEvent::ResponseSent { .. }
-                        | SubscribeEvent::SeedingStarted { .. }
-                        | SubscribeEvent::SeedingStopped { .. }
+                        | SubscribeEvent::HostingStarted { .. }
+                        | SubscribeEvent::HostingStopped { .. }
                         | SubscribeEvent::_Reserved6
                         | SubscribeEvent::_Reserved7
                         | SubscribeEvent::_Reserved8

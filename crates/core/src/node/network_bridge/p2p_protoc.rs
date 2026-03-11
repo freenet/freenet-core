@@ -1883,7 +1883,7 @@ impl P2pConnManager {
                                     // Use the actual hosting cache count, not the subscriber count.
                                     // The hosting cache tracks contracts this node is actively hosting,
                                     // while subscribers tracks remote peers subscribed to updates.
-                                    let seeding_contracts =
+                                    let hosting_contracts =
                                         op_manager.ring.hosting_contracts_count() as u32;
                                     // Log memory/operation metrics for debugging (#2928)
                                     let pending_ops = op_manager.pending_op_counts();
@@ -1902,7 +1902,7 @@ impl P2pConnManager {
                                     );
                                     response.system_metrics = Some(SystemMetrics {
                                         active_connections: connected_peer_ids.len() as u32,
-                                        seeding_contracts,
+                                        seeding_contracts: hosting_contracts,
                                     });
                                 }
 

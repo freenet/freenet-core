@@ -542,8 +542,8 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 SubscribeEvent::SubscribeSuccess { .. } => "subscribe_success".to_string(),
                 SubscribeEvent::SubscribeNotFound { .. } => "subscribe_not_found".to_string(),
                 SubscribeEvent::ResponseSent { .. } => "subscribe_response_sent".to_string(),
-                SubscribeEvent::SeedingStarted { .. } => "seeding_started".to_string(),
-                SubscribeEvent::SeedingStopped { .. } => "seeding_stopped".to_string(),
+                SubscribeEvent::HostingStarted { .. } => "hosting_started".to_string(),
+                SubscribeEvent::HostingStopped { .. } => "hosting_stopped".to_string(),
                 // Reserved discriminants for removed variants
                 SubscribeEvent::_Reserved6
                 | SubscribeEvent::_Reserved7
@@ -1048,23 +1048,23 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     }
                     json
                 }
-                SubscribeEvent::SeedingStarted {
+                SubscribeEvent::HostingStarted {
                     instance_id,
                     timestamp,
                 } => {
                     serde_json::json!({
-                        "type": "seeding_started",
+                        "type": "hosting_started",
                         "instance_id": instance_id.to_string(),
                         "timestamp": timestamp,
                     })
                 }
-                SubscribeEvent::SeedingStopped {
+                SubscribeEvent::HostingStopped {
                     instance_id,
                     reason,
                     timestamp,
                 } => {
                     serde_json::json!({
-                        "type": "seeding_stopped",
+                        "type": "hosting_stopped",
                         "instance_id": instance_id.to_string(),
                         "reason": format!("{:?}", reason),
                         "timestamp": timestamp,

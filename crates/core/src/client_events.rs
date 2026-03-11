@@ -282,9 +282,9 @@ async fn register_subscription_listener(
             let result = op_manager
                 .ring
                 .add_client_subscription(&instance_id, client_id);
-            // Emit telemetry if this was the first client (seeding started)
+            // Emit telemetry if this was the first client (hosting started)
             if result.is_first_client {
-                if let Some(event) = NetEventLog::seeding_started(&op_manager.ring, instance_id) {
+                if let Some(event) = NetEventLog::hosting_started(&op_manager.ring, instance_id) {
                     op_manager.ring.register_events(Either::Left(event)).await;
                 }
             }
@@ -1577,10 +1577,10 @@ async fn process_open_request(
                                 // Register client subscription to enable subscription tree pruning on disconnect
                                 let result =
                                     op_manager.ring.add_client_subscription(&key, client_id);
-                                // Emit telemetry if this was the first client (seeding started)
+                                // Emit telemetry if this was the first client (hosting started)
                                 if result.is_first_client {
                                     if let Some(event) =
-                                        NetEventLog::seeding_started(&op_manager.ring, key)
+                                        NetEventLog::hosting_started(&op_manager.ring, key)
                                     {
                                         op_manager.ring.register_events(Either::Left(event)).await;
                                     }

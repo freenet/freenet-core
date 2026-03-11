@@ -4788,17 +4788,17 @@ fn test_pending_op_results_bounded() {
 /// network size during simulation (2 gateways + 6 nodes, 8 contracts).
 #[test]
 #[cfg(feature = "simulation_tests")]
-fn test_neighbor_cache_bounded() {
-    let result = TestConfig::medium("neighbor-cache-bounded", 0x3100_0002).run();
+fn test_neighbor_hosting_bounded() {
+    let result = TestConfig::medium("neighbor-hosting-bounded", 0x3100_0002).run();
     result.assert_ok().verify_state_report();
 
     let updates = freenet::config::GlobalTestMetrics::neighbor_hosting_updates();
 
-    tracing::info!(updates, "neighbor_cache resource metrics");
+    tracing::info!(updates, "neighbor hosting resource metrics");
 
     assert!(
         updates > 0,
-        "Proximity cache should have been exercised (updates = 0)"
+        "Neighbor hosting should have been exercised (updates = 0)"
     );
     // 500 is ~10x expected steady-state for an 8-peer / 8-contract medium network
     assert!(
