@@ -1304,13 +1304,6 @@ async fn handle_interest_sync_message(
             // Find contracts we share interest in
             let matching = op_manager.interest_manager.get_matching_contracts(&hashes);
 
-            tracing::debug!(
-                from = %source,
-                matching_count = matching.len(),
-                hash_count = hashes.len(),
-                "Interests handler matched contracts"
-            );
-
             // Build summaries for shared contracts and register/refresh peer interest
             let mut entries = Vec::with_capacity(matching.len());
             for contract in matching {
@@ -1372,45 +1365,26 @@ async fn handle_interest_sync_message(
             // subscription/GET flow, not via broadcast.
             let peer_key = get_peer_key_from_addr(op_manager, source);
             let mut stale_contracts = Vec::new();
+            // Collect (contract, state_hash) for deferred StateConfirmed telemetry.
+            // Only emitted in direct-runner mode to avoid .await points that change
+            // turmoil task scheduling.
+            let emit_confirmed = crate::config::SimulationIdleTimeout::is_enabled();
+            let mut confirmed_states: Vec<(freenet_stdlib::prelude::ContractKey, String)> =
+                Vec::new();
 
             if let Some(pk) = peer_key {
                 for entry in entries {
-                    let contracts_for_hash = op_manager.interest_manager.lookup_by_hash(entry.hash);
-                    if contracts_for_hash.is_empty() {
-                        tracing::debug!(
-                            from = %source,
-                            hash = entry.hash,
-                            "Summaries handler — no contracts found for hash"
-                        );
-                    }
-                    for contract in contracts_for_hash {
-                        let their_summary = entry.to_summary();
-                        let our_summary = get_contract_summary(op_manager, &contract).await;
-
-                        // Only participate in staleness detection if we have stored
-                        // state for this contract. The hash index may retain entries
-                        // for contracts whose interest was removed but whose state
-                        // still exists in the store. If we have no summary (no
-                        // stored state), skip this contract.
-                        if our_summary.is_none() {
+                    for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
+                        if !op_manager.interest_manager.has_local_interest(&contract) {
                             continue;
                         }
 
-                        // Emit StateConfirmed telemetry so the convergence checker
-                        // has an up-to-date state hash for this contract on this node.
-                        // This covers state changes that may not have emitted
-                        // PutSuccess/UpdateSuccess/BroadcastApplied events.
-                        if let Some(ref summary) = our_summary {
-                            let state_hash = hex::encode(summary.as_ref());
-                            if let Some(event) = crate::tracing::NetEventLog::state_confirmed(
-                                &op_manager.ring,
-                                contract,
-                                state_hash,
-                            ) {
-                                op_manager
-                                    .ring
-                                    .register_events(either::Either::Left(event))
-                                    .await;
+                        let their_summary = entry.to_summary();
+                        let our_summary = get_contract_summary(op_manager, &contract).await;
+
+                        if emit_confirmed {
+                            if let Some(ref summary) = our_summary {
+                                confirmed_states.push((contract, hex::encode(summary.as_ref())));
                             }
                         }
 
@@ -1419,31 +1393,11 @@ async fn handle_interest_sync_message(
                             .zip(their_summary.as_ref())
                             .is_some_and(|(ours, theirs)| ours.as_ref() != theirs.as_ref());
 
-                        // Ensure the source peer is registered as interested
-                        // BEFORE updating their summary and before any repair
-                        // broadcast. The Interests handler registers the peer
-                        // when processing OUR outbound heartbeat, but if the
-                        // peer hasn't sent ITS own heartbeat to us yet, it
-                        // won't appear in our interested_peers and the repair
-                        // BroadcastStateChange will miss it.
-                        if op_manager
-                            .interest_manager
-                            .get_peer_interest(&contract, &pk)
-                            .is_none()
-                        {
-                            op_manager.interest_manager.register_peer_interest(
-                                &contract,
-                                pk.clone(),
-                                their_summary.clone(),
-                                false,
-                            );
-                        } else {
-                            op_manager.interest_manager.update_peer_summary(
-                                &contract,
-                                &pk,
-                                their_summary,
-                            );
-                        }
+                        op_manager.interest_manager.update_peer_summary(
+                            &contract,
+                            &pk,
+                            their_summary,
+                        );
 
                         if is_stale && !stale_contracts.contains(&contract) {
                             stale_contracts.push(contract);
@@ -1452,50 +1406,45 @@ async fn handle_interest_sync_message(
                 }
             }
 
-            // Send full state directly to the stale peer via ResyncResponse.
-            //
-            // Previously we emitted BroadcastStateChange which went through the
-            // generic broadcast path (target resolution → broadcast_state_to_peers).
-            // That path can miss the stale peer if target resolution doesn't include
-            // it or if the event is lost in the notification channel. Sending a
-            // direct ResyncResponse to the source peer (whose summaries we just
-            // compared) guarantees the correct state reaches the specific stale peer.
+            // Push current state to stale peers via the existing broadcast path
             for contract in stale_contracts {
                 let Some(state) = get_contract_state(op_manager, &contract).await else {
                     tracing::trace!(
                         contract = %contract,
-                        "Skipping stale-peer repair — no local state available"
-                    );
-                    continue;
-                };
-                let Some(summary) = get_contract_summary(op_manager, &contract).await else {
-                    tracing::trace!(
-                        contract = %contract,
-                        "Skipping stale-peer repair — no local summary available"
+                        "Skipping stale-peer broadcast — no local state available"
                     );
                     continue;
                 };
                 tracing::info!(
                     contract = %contract,
-                    target = %source,
-                    "Summary mismatch — sending direct ResyncResponse to stale peer"
+                    detected_via = %source,
+                    "Summary mismatch in interest sync — broadcasting to all stale peers"
                 );
                 if let Err(e) = op_manager
-                    .notify_node_event(NodeEvent::SendInterestMessage {
-                        target: source,
-                        message: InterestMessage::ResyncResponse {
-                            key: contract,
-                            state_bytes: state.as_ref().to_vec(),
-                            summary_bytes: summary.as_ref().to_vec(),
-                        },
+                    .notify_node_event(NodeEvent::BroadcastStateChange {
+                        key: contract,
+                        new_state: state,
                     })
                     .await
                 {
                     tracing::warn!(
                         contract = %contract,
                         error = %e,
-                        "Failed to send ResyncResponse for stale peer correction"
+                        "Failed to emit BroadcastStateChange for stale peer correction"
                     );
+                }
+            }
+
+            // Emit deferred StateConfirmed telemetry so the convergence
+            // checker has up-to-date state hashes for CRDT-merged state.
+            for (key, state_hash) in confirmed_states {
+                if let Some(event) =
+                    crate::tracing::NetEventLog::state_confirmed(&op_manager.ring, key, state_hash)
+                {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(event))
+                        .await;
                 }
             }
 
@@ -1680,38 +1629,15 @@ async fn handle_interest_sync_message(
                 .await
             {
                 Ok(ContractHandlerEvent::UpdateResponse {
-                    new_value: Ok(ref new_state),
-                    state_changed,
+                    new_value: Ok(_), ..
                 }) => {
                     tracing::info!(
                         from = %source,
                         contract = %key,
                         event = "resync_applied",
-                        changed = state_changed,
+                        changed = true,
                         "ResyncResponse state applied successfully"
                     );
-
-                    // Emit BroadcastApplied telemetry so the convergence checker
-                    // can observe this node's updated state hash. Without this,
-                    // check_convergence_from_logs would still see the stale hash
-                    // from the last PutSuccess/BroadcastApplied event.
-                    let state_before =
-                        freenet_stdlib::prelude::WrappedState::new(state_bytes.clone());
-                    let resync_tx =
-                        crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
-                    if let Some(event) = crate::tracing::NetEventLog::update_broadcast_applied(
-                        &resync_tx,
-                        &op_manager.ring,
-                        key,
-                        &state_before,
-                        new_state,
-                        state_changed,
-                    ) {
-                        op_manager
-                            .ring
-                            .register_events(either::Either::Left(event))
-                            .await;
-                    }
                 }
                 Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
                     tracing::info!(

@@ -972,7 +972,6 @@ impl ConnectionManager {
     /// Uses two-phase locking to respect the documented lock ordering
     /// (`location_for_peer` before `pending_reservations`). See module-level
     /// comment for the ordering rationale.
-    #[allow(dead_code)]
     pub fn clear_pending_reservations_for(&self, addrs: &[SocketAddr]) {
         // Phase 1: Remove from pending_reservations, collect which were actually removed.
         // Release this lock before acquiring location_for_peer to avoid ABBA deadlock

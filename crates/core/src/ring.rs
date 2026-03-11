@@ -1849,14 +1849,25 @@ impl Ring {
             skip_list.insert(*this_addr);
 
             // Resets both connection (location-based) and gateway (address-based)
-            // backoff state. Used during isolation recovery to ensure all gateways
-            // are retryable when the node has zero ring connections.
+            // backoff state, and clears stale pending reservations for gateways.
+            // Used during isolation recovery to ensure all gateways are retryable
+            // when the node has zero ring connections (#3319).
             // Wakes all tasks sleeping on gateway backoff (initial_join_procedure
             // and any handle_aborted_op retries) so they can retry immediately.
             let reset_all_backoff = || {
                 self.reset_all_connection_backoff();
                 op_manager.gateway_backoff.lock().clear();
                 op_manager.gateway_backoff_cleared.notify_waiters();
+                // Also clear stale pending reservations for gateways — without this,
+                // gateways appear "connected/pending" via has_connection_or_pending()
+                // even after backoff is reset, blocking retry attempts (#3319).
+                let gateway_addrs: Vec<_> = op_manager
+                    .configured_gateways
+                    .iter()
+                    .filter_map(|gw| gw.socket_addr())
+                    .collect();
+                self.connection_manager
+                    .clear_pending_reservations_for(&gateway_addrs);
             };
 
             // Suspend/resume detection: if boot-time elapsed much more than
