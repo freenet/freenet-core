@@ -476,7 +476,7 @@ pub(crate) async fn request_subscribe(
 ///
 /// **Architecture Note (Issue #2075):**
 /// Local client subscriptions are deliberately kept separate from network subscriptions:
-/// - **Network subscriptions** are stored in `ring.seeding_manager.subscribers` and are used
+/// - **Network subscriptions** are stored in `ring.hosting_manager.subscribers` and are used
 ///   for peer-to-peer UPDATE propagation between nodes
 /// - **Local subscriptions** are managed by the contract executor via `update_notifications`
 ///   channels, which deliver `UpdateNotification` directly to WebSocket clients
@@ -1348,7 +1348,7 @@ impl Operation for SubscribeOp {
                             // This ensures UPDATE broadcasts will reach us. Without this,
                             // if the contract was already cached (fetch_contract_if_missing returned early),
                             // neighbors wouldn't know we have the contract and wouldn't broadcast updates to us.
-                            super::announce_contract_cached(op_manager, key).await;
+                            super::announce_contract_hosted(op_manager, key).await;
 
                             // Register the responding peer as our upstream in the interest manager.
                             // This peer fulfilled our subscription, so it's the target for
@@ -1665,12 +1665,12 @@ impl Operation for SubscribeOp {
                                                 new_value: Ok(_),
                                                 ..
                                             }) => {
-                                                tracing::debug!(tx = %msg_id, %key, "Re-seeded contract to network");
-                                                super::announce_contract_cached(op_manager, &key)
+                                                tracing::debug!(tx = %msg_id, %key, "Re-hosted contract to network");
+                                                super::announce_contract_hosted(op_manager, &key)
                                                     .await;
                                             }
                                             _ => {
-                                                tracing::warn!(tx = %msg_id, %key, "Failed to re-seed contract");
+                                                tracing::warn!(tx = %msg_id, %key, "Failed to re-host contract");
                                             }
                                         }
                                     }

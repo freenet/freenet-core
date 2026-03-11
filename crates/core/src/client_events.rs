@@ -1875,7 +1875,7 @@ async fn process_open_request(
                         }
                     }
                     freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo => {
-                        // TODO: Implement proximity cache info query
+                        // TODO: Implement neighbor hosting info query
                         tracing::warn!(
                             client_id = %client_id,
                             request_id = %request_id,

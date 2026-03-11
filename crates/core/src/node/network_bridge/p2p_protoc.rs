@@ -1880,11 +1880,11 @@ impl P2pConnManager {
 
                                 // Collect system metrics
                                 if config.include_system_metrics {
-                                    // Use the actual seeding cache count, not the subscriber count.
-                                    // The seeding cache tracks contracts this node is actively caching,
+                                    // Use the actual hosting cache count, not the subscriber count.
+                                    // The hosting cache tracks contracts this node is actively hosting,
                                     // while subscribers tracks remote peers subscribed to updates.
                                     let seeding_contracts =
-                                        op_manager.ring.seeding_contracts_count() as u32;
+                                        op_manager.ring.hosting_contracts_count() as u32;
                                     // Log memory/operation metrics for debugging (#2928)
                                     let pending_ops = op_manager.pending_op_counts();
                                     let contract_waiters_count =
@@ -2052,8 +2052,8 @@ impl P2pConnManager {
                                     }
                                 }
                             }
-                            NodeEvent::BroadcastProximityCache { message } => {
-                                ctx.handle_broadcast_proximity_cache(message).await;
+                            NodeEvent::BroadcastHostingUpdate { message } => {
+                                ctx.handle_hosting_broadcast(message).await;
                             }
                             NodeEvent::BroadcastChangeInterests { added, removed } => {
                                 ctx.handle_broadcast_change_interests(added, removed).await;
@@ -3982,19 +3982,16 @@ impl P2pConnManager {
         send_all.await;
     }
 
-    /// Broadcast a ProximityCache message to all connected peers.
-    async fn handle_broadcast_proximity_cache(
-        &mut self,
-        message: crate::message::ProximityCacheMessage,
-    ) {
+    /// Broadcast a hosting update message to all connected peers.
+    async fn handle_hosting_broadcast(&mut self, message: crate::message::NeighborHostingMessage) {
         tracing::debug!(
             message = ?message,
             peer_count = self.connections.len(),
             phase = "broadcast",
-            "Broadcasting proximity cache to connected peers"
+            "Broadcasting hosting update to connected peers"
         );
 
-        let msg = crate::message::NetMessage::V1(crate::message::NetMessageV1::ProximityCache {
+        let msg = crate::message::NetMessage::V1(crate::message::NetMessageV1::NeighborHosting {
             message: message.clone(),
         });
         let peers: Vec<SocketAddr> = self.connections.keys().copied().collect();
@@ -5023,7 +5020,7 @@ fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
             | NetMessageV1::Subscribe(_) => None,
             // Other message types don't have sender info
             NetMessageV1::Aborted(_)
-            | NetMessageV1::ProximityCache { .. }
+            | NetMessageV1::NeighborHosting { .. }
             | NetMessageV1::InterestSync { .. }
             | NetMessageV1::ReadyState { .. } => None,
         },
@@ -5041,7 +5038,7 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
             | NetMessageV1::Update(_)
             | NetMessageV1::Subscribe(_) => None,
             NetMessageV1::Aborted(_)
-            | NetMessageV1::ProximityCache { .. }
+            | NetMessageV1::NeighborHosting { .. }
             | NetMessageV1::InterestSync { .. }
             | NetMessageV1::ReadyState { .. } => None,
         },

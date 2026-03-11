@@ -856,7 +856,7 @@ impl HostingManager {
                     contract_key,
                     upstream: None,     // No upstream tracking in lease-based model
                     downstream: vec![], // No downstream tracking in lease-based model
-                    is_seeding: true,   // TODO: Rename to is_hosting in topology_registry
+                    is_hosting: true,
                     has_client_subscriptions,
                 },
             );
@@ -882,7 +882,7 @@ impl HostingManager {
                         contract_key,
                         upstream: None,
                         downstream: vec![],
-                        is_seeding: false, // TODO: Rename to is_hosting
+                        is_hosting: false,
                         has_client_subscriptions,
                     },
                 );

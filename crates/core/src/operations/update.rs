@@ -1411,15 +1411,15 @@ impl OpManager {
     /// The address of the peer that initiated or forwarded this UPDATE to us.
     /// - Used to filter out the sender from broadcast targets (avoid echo)
     /// - When sender equals our own address (local UPDATE initiation), we include ourselves
-    ///   in proximity cache targets if we're seeding the contract
+    ///   in neighbor hosting targets if we're hosting the contract
     ///
     /// # Hybrid Architecture (2026-01 Refactor)
     ///
     /// Updates are propagated via TWO sources:
-    /// 1. Proximity cache: peers who have announced they seed this contract (fast, local knowledge)
+    /// 1. Neighbor hosting: peers who have announced they host this contract (fast, local knowledge)
     /// 2. Interest manager: peers who have expressed interest via the Interest/Summary protocol
     ///
-    /// This hybrid approach ensures updates reach all interested peers even if CacheAnnounce
+    /// This hybrid approach ensures updates reach all interested peers even if HostingAnnounce
     /// messages haven't fully propagated yet.
     pub(crate) fn get_broadcast_targets_update(
         &self,
@@ -1439,7 +1439,7 @@ impl OpManager {
 
         // Source 1: Proximity cache (peers who announced they seed this contract)
         // Returns TransportPublicKey (stable identity), resolve to PeerKeyLocation via pub_key lookup
-        let proximity_pub_keys = self.proximity_cache.neighbors_with_contract(key);
+        let proximity_pub_keys = self.neighbor_hosting.neighbors_with_contract(key);
         let proximity_found = proximity_pub_keys.len();
 
         for pub_key in proximity_pub_keys {
@@ -1833,12 +1833,12 @@ pub(crate) async fn request_update(
     // but not explicitly subscribed (e.g., River chat rooms where both peers cache
     // the contract but haven't established a subscription tree).
     //
-    // Note: The proximity cache is populated asynchronously via CacheAnnounce messages,
-    // so there may be a brief race window after a peer caches a contract before its
+    // Note: The neighbor hosting info is populated asynchronously via HostingAnnounce messages,
+    // so there may be a brief race window after a peer hosts a contract before its
     // neighbors receive the announcement. This is acceptable - the ring-based fallback
-    // handles this case, and the proximity cache improves the common case where
+    // handles this case, and the neighbor hosting info improves the common case where
     // announcements have propagated.
-    let proximity_neighbors: Vec<_> = op_manager.proximity_cache.neighbors_with_contract(&key);
+    let proximity_neighbors: Vec<_> = op_manager.neighbor_hosting.neighbors_with_contract(&key);
 
     let mut target_from_proximity = None;
     for pub_key in &proximity_neighbors {
@@ -1899,9 +1899,9 @@ pub(crate) async fn request_update(
 
             let id = update_op.id;
 
-            // Check if we're seeding this contract
-            let is_seeding = op_manager.ring.is_seeding_contract(&key);
-            let should_handle_update = is_seeding;
+            // Check if we're hosting this contract
+            let is_hosting = op_manager.ring.is_hosting_contract(&key);
+            let should_handle_update = is_hosting;
 
             if !should_handle_update {
                 tracing::error!(
@@ -1914,7 +1914,7 @@ pub(crate) async fn request_update(
 
             // Update the contract locally. This path is reached when:
             // 1. No remote peers are available (isolated node OR no suitable caching peers)
-            // 2. We are seeding the contract (verified above)
+            // 2. We are hosting the contract (verified above)
             let UpdateExecution {
                 value: _updated_value,
                 summary,

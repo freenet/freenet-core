@@ -1422,7 +1422,7 @@ impl<'a> NetEventLog<'a> {
             | NetMessageV1::Get(_)
             | NetMessageV1::Update(_)
             | NetMessageV1::Aborted(_)
-            | NetMessageV1::ProximityCache { .. }
+            | NetMessageV1::NeighborHosting { .. }
             | NetMessageV1::InterestSync { .. }
             | NetMessageV1::ReadyState { .. } => EventKind::Ignored,
         };

@@ -1674,7 +1674,7 @@ fn ring_distance(a: f64, b: f64) -> f64 {
 /// 1. Gateway PUTs a contract with subscribe=true
 /// 2. Wait for topology registration
 /// 3. Verify: gateway's location is within SOURCE_THRESHOLD of contract location
-/// 4. Verify: gateway's snapshot shows it's seeding the contract
+/// 4. Verify: gateway's snapshot shows it's hosting the contract
 /// 5. Verify: no topology issues (no cycles since only one subscriber)
 ///
 /// ## Related
@@ -1789,14 +1789,14 @@ fn test_topology_single_seeder() {
         SOURCE_THRESHOLD
     );
 
-    // Gateway should be seeding (it did PUT with subscribe=true)
+    // Gateway should be hosting (it did PUT with subscribe=true)
     assert!(
-        contract_sub.is_seeding,
-        "Gateway should be seeding the contract after PUT with subscribe=true"
+        contract_sub.is_hosting,
+        "Gateway should be hosting the contract after PUT with subscribe=true"
     );
 
     tracing::info!(
-        "Gateway {} is seeding contract: upstream={:?}, downstream={:?}",
+        "Gateway {} is hosting contract: upstream={:?}, downstream={:?}",
         gateway_snap.peer_addr,
         contract_sub.upstream,
         contract_sub.downstream
@@ -3111,7 +3111,7 @@ fn test_chain_topology_formation() {
 ///
 /// After the lease-based subscription refactor, when a subscription was accepted:
 /// 1. The subscription was registered locally via `ring.subscribe()`
-/// 2. But `announce_contract_cached()` was NOT called
+/// 2. But `announce_contract_hosted()` was NOT called
 /// 3. So the subscriber never announced to neighbors that it has the contract
 /// 4. When the gateway tried to broadcast updates, it had no targets
 /// 5. Updates were silently dropped with "NO_TARGETS" warning
@@ -3173,7 +3173,7 @@ fn test_subscription_broadcast_propagation() {
     // 3. Gateway sends an UPDATE (should broadcast to Node 1)
     //
     // The bug (PR #2794 regression): subscription acceptance doesn't call
-    // announce_contract_cached, so the gateway doesn't know Node 1 has the contract.
+    // announce_contract_hosted, so the gateway doesn't know Node 1 has the contract.
     let operations = vec![
         // Gateway puts with subscribe=true (so it seeds the contract)
         ScheduledOperation::new(
@@ -4792,7 +4792,7 @@ fn test_neighbor_cache_bounded() {
     let result = TestConfig::medium("neighbor-cache-bounded", 0x3100_0002).run();
     result.assert_ok().verify_state_report();
 
-    let updates = freenet::config::GlobalTestMetrics::neighbor_cache_updates();
+    let updates = freenet::config::GlobalTestMetrics::neighbor_hosting_updates();
 
     tracing::info!(updates, "neighbor_cache resource metrics");
 
@@ -4803,7 +4803,7 @@ fn test_neighbor_cache_bounded() {
     // 500 is ~10x expected steady-state for an 8-peer / 8-contract medium network
     assert!(
         updates <= 500,
-        "neighbor_cache_updates ({updates}) exceeded bound of 500 — \
+        "neighbor_hosting_updates ({updates}) exceeded bound of 500 — \
          excessive cache churn for an 8-peer / 8-contract network"
     );
 }

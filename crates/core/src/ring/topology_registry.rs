@@ -61,8 +61,8 @@ pub struct ContractSubscription {
     pub upstream: Option<SocketAddr>,
     /// Downstream peers - peers that receive updates from us
     pub downstream: Vec<SocketAddr>,
-    /// Whether we're seeding this contract (have it cached)
-    pub is_seeding: bool,
+    /// Whether we're hosting this contract (have it cached)
+    pub is_hosting: bool,
     /// Whether we have local client subscriptions for this contract
     pub has_client_subscriptions: bool,
 }
@@ -113,11 +113,11 @@ impl TopologySnapshot {
             .unwrap_or(false)
     }
 
-    /// Check if this peer is seeding a contract.
-    pub fn is_seeding(&self, contract_id: &ContractInstanceId) -> bool {
+    /// Check if this peer is hosting a contract.
+    pub fn is_hosting(&self, contract_id: &ContractInstanceId) -> bool {
         self.contracts
             .get(contract_id)
-            .map(|s| s.is_seeding)
+            .map(|s| s.is_hosting)
             .unwrap_or(false)
     }
 }
@@ -244,7 +244,7 @@ pub fn validate_topology_from_snapshots(
         if let Some(sub) = snapshot.contracts.get(contract_id) {
             subscription_graph.insert(snapshot.peer_addr, (sub.upstream, sub.downstream.clone()));
 
-            if sub.is_seeding {
+            if sub.is_hosting {
                 seeders.insert(snapshot.peer_addr);
             }
         }
@@ -426,7 +426,7 @@ mod tests {
                 contract_key,
                 upstream: Some(peer_b),
                 downstream: vec![peer_b], // B is also downstream
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -438,7 +438,7 @@ mod tests {
                 contract_key,
                 upstream: Some(peer_a),
                 downstream: vec![peer_a], // A is also downstream
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -472,7 +472,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -511,7 +511,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![downstream_peer],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -549,7 +549,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -562,7 +562,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![downstream_peer], // Has downstream but no upstream
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -598,7 +598,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -636,7 +636,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![], // No upstream, no downstream - but it's a source
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -673,7 +673,7 @@ mod tests {
                 contract_key,
                 upstream: Some(upstream_peer),
                 downstream: vec![],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -685,7 +685,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![peer],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -730,7 +730,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![reachable_peer],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -742,7 +742,7 @@ mod tests {
                 contract_key,
                 upstream: Some(source_peer),
                 downstream: vec![],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -755,7 +755,7 @@ mod tests {
                 contract_key,
                 upstream: None, // No upstream!
                 downstream: vec![],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -799,7 +799,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![downstream_peer],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -811,7 +811,7 @@ mod tests {
                 contract_key,
                 upstream: Some(source_peer),
                 downstream: vec![],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -877,7 +877,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![], // Source with no subscribers yet
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -895,7 +895,7 @@ mod tests {
                 contract_key,
                 upstream: None,           // No upstream!
                 downstream: vec![peer_b], // B is downstream
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -907,7 +907,7 @@ mod tests {
                 contract_key,
                 upstream: None,           // No upstream!
                 downstream: vec![peer_a], // A is downstream
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -989,7 +989,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![peer_b],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );
@@ -1001,7 +1001,7 @@ mod tests {
                 contract_key,
                 upstream: None,
                 downstream: vec![peer_a],
-                is_seeding: true,
+                is_hosting: true,
                 has_client_subscriptions: false,
             },
         );

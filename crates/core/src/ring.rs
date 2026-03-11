@@ -1172,14 +1172,6 @@ impl Ring {
         }
     }
 
-    /// Record a PUT access to a contract in the hosting cache.
-    /// Alias for host_contract with Put access type.
-    ///
-    /// Returns only the evicted contracts for backwards compatibility.
-    pub fn seed_contract(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
-        self.host_contract(key, size_bytes, AccessType::Put).evicted
-    }
-
     /// Record an access to a contract in the hosting cache.
     ///
     /// This adds or refreshes the contract in the unified hosting cache.
@@ -1210,12 +1202,6 @@ impl Ring {
     #[inline]
     pub fn is_hosting_contract(&self, key: &ContractKey) -> bool {
         self.hosting_manager.is_hosting_contract(key)
-    }
-
-    /// Alias for backwards compatibility - use is_hosting_contract instead.
-    #[inline]
-    pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
-        self.is_hosting_contract(key)
     }
 
     /// Set the storage reference for hosting metadata persistence.
@@ -1641,11 +1627,6 @@ impl Ring {
     /// This is the actual count of contracts this node is caching/hosting.
     pub fn hosting_contracts_count(&self) -> usize {
         self.hosting_manager.hosting_contracts_count()
-    }
-
-    /// Alias for backwards compatibility - use hosting_contracts_count instead.
-    pub fn seeding_contracts_count(&self) -> usize {
-        self.hosting_contracts_count()
     }
 
     /// Get subscription state for all contracts (for telemetry).

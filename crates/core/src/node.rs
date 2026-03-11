@@ -72,10 +72,10 @@ mod network_bridge;
 // tests compile the lib without cfg(test).
 pub use network_bridge::in_memory::{get_fault_injector, set_fault_injector, FaultInjectorState};
 pub(crate) mod background_task_monitor;
+pub(crate) mod neighbor_hosting;
 pub(crate) mod network_status;
 mod op_state_manager;
 mod p2p_impl;
-pub(crate) mod proximity_cache;
 mod request_router;
 pub(crate) mod testing_impl;
 
@@ -1033,24 +1033,24 @@ where
             // Non-transactional message types: process once and return immediately.
             // These must NOT fall through to the post-loop "Dropping message" warning,
             // which is only meant for operation retry exhaustion.
-            NetMessageV1::ProximityCache { ref message } => {
+            NetMessageV1::NeighborHosting { ref message } => {
                 let Some(source) = source_addr else {
                     tracing::warn!(
-                        "Received ProximityCache message without source address (pure network)"
+                        "Received NeighborHosting message without source address (pure network)"
                     );
                     return Ok(None);
                 };
                 tracing::debug!(
                     from = %source,
-                    "Processing ProximityCache message (pure network)"
+                    "Processing NeighborHosting message (pure network)"
                 );
 
                 // Note: In the simplified architecture (2026-01 refactor), we no longer
-                // attempt to establish subscriptions based on CacheAnnounce messages.
-                // Update propagation uses the proximity cache directly, and subscriptions
+                // attempt to establish subscriptions based on HostingAnnounce messages.
+                // Update propagation uses the neighbor hosting manager directly, and subscriptions
                 // are lease-based with automatic expiry.
 
-                // Resolve source SocketAddr to TransportPublicKey for proximity cache
+                // Resolve source SocketAddr to TransportPublicKey for neighbor hosting
                 let source_pub_key = op_manager
                     .ring
                     .connection_manager
@@ -1059,19 +1059,19 @@ where
                 let Some(source_pub_key) = source_pub_key else {
                     tracing::debug!(
                         %source,
-                        "ProximityCache: could not resolve source addr to pub_key, skipping"
+                        "NeighborHosting: could not resolve source addr to pub_key, skipping"
                     );
                     return Ok(None);
                 };
                 let result = op_manager
-                    .proximity_cache
+                    .neighbor_hosting
                     .handle_message(&source_pub_key, message.clone());
                 if let Some(response) = result.response {
                     // Send response back to sender
                     let response_msg =
-                        NetMessage::V1(NetMessageV1::ProximityCache { message: response });
+                        NetMessage::V1(NetMessageV1::NeighborHosting { message: response });
                     if let Err(err) = conn_manager.send(source, response_msg).await {
-                        tracing::error!(%err, %source, "Failed to send ProximityCache response");
+                        tracing::error!(%err, %source, "Failed to send NeighborHosting response");
                     }
                 }
                 // Proactive state sync: broadcast our state for shared contracts

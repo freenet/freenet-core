@@ -330,7 +330,7 @@ impl Operation for PutOp {
                     );
 
                     // Check if we're already subscribed to this contract BEFORE storing
-                    let was_seeding = op_manager.ring.is_seeding_contract(&key);
+                    let was_hosting = op_manager.ring.is_hosting_contract(&key);
 
                     // Step 1: Store contract locally (all nodes cache)
                     // put_contract returns (merged_value, state_changed) where state_changed
@@ -344,17 +344,20 @@ impl Operation for PutOp {
                     )
                     .await?;
 
-                    // Mark as seeding if not already
-                    if !was_seeding {
-                        let evicted = op_manager.ring.seed_contract(key, value.size() as u64);
-                        super::announce_contract_cached(op_manager, &key).await;
+                    // Mark as hosting if not already
+                    if !was_hosting {
+                        let evicted = op_manager
+                            .ring
+                            .host_contract(key, value.size() as u64, crate::ring::AccessType::Put)
+                            .evicted;
+                        super::announce_contract_hosted(op_manager, &key).await;
 
                         // Clean up interest tracking for evicted contracts
                         let mut removed_contracts = Vec::new();
                         for evicted_key in evicted {
                             if op_manager
                                 .interest_manager
-                                .unregister_local_seeding(&evicted_key)
+                                .unregister_local_hosting(&evicted_key)
                             {
                                 removed_contracts.push(evicted_key);
                             }
@@ -362,7 +365,7 @@ impl Operation for PutOp {
 
                         // Register local interest for delta-based sync
                         let became_interested =
-                            op_manager.interest_manager.register_local_seeding(&key);
+                            op_manager.interest_manager.register_local_hosting(&key);
 
                         // Broadcast interest changes to peers
                         let added = if became_interested { vec![key] } else { vec![] };
@@ -372,10 +375,10 @@ impl Operation for PutOp {
                         }
                     }
 
-                    // Invariant: after storing and seeding, the contract MUST be in the seed list.
+                    // Invariant: after storing and hosting, the contract MUST be in the hosting list.
                     debug_assert!(
-                        op_manager.ring.is_seeding_contract(&key),
-                        "PUT Request: contract {key} must be in seed list after put_contract + seed_contract"
+                        op_manager.ring.is_hosting_contract(&key),
+                        "PUT Request: contract {key} must be in hosting list after put_contract + host_contract"
                     );
 
                     // Network peer notification is now automatic via BroadcastStateChange
@@ -898,7 +901,7 @@ impl Operation for PutOp {
                     }
 
                     // Step 4: Store contract locally (same as regular Request)
-                    let was_seeding = op_manager.ring.is_seeding_contract(&key);
+                    let was_hosting = op_manager.ring.is_hosting_contract(&key);
                     let (merged_value, _state_changed) = put_contract(
                         op_manager,
                         key,
@@ -908,23 +911,26 @@ impl Operation for PutOp {
                     )
                     .await?;
 
-                    // Mark as seeding if not already
-                    if !was_seeding {
-                        let evicted = op_manager.ring.seed_contract(key, value.size() as u64);
-                        super::announce_contract_cached(op_manager, &key).await;
+                    // Mark as hosting if not already
+                    if !was_hosting {
+                        let evicted = op_manager
+                            .ring
+                            .host_contract(key, value.size() as u64, crate::ring::AccessType::Put)
+                            .evicted;
+                        super::announce_contract_hosted(op_manager, &key).await;
 
                         let mut removed_contracts = Vec::new();
                         for evicted_key in evicted {
                             if op_manager
                                 .interest_manager
-                                .unregister_local_seeding(&evicted_key)
+                                .unregister_local_hosting(&evicted_key)
                             {
                                 removed_contracts.push(evicted_key);
                             }
                         }
 
                         let became_interested =
-                            op_manager.interest_manager.register_local_seeding(&key);
+                            op_manager.interest_manager.register_local_hosting(&key);
                         let added = if became_interested { vec![key] } else { vec![] };
                         if !added.is_empty() || !removed_contracts.is_empty() {
                             super::broadcast_change_interests(op_manager, added, removed_contracts)
@@ -932,10 +938,10 @@ impl Operation for PutOp {
                         }
                     }
 
-                    // Invariant: after storing and seeding, the contract MUST be in the seed list.
+                    // Invariant: after storing and hosting, the contract MUST be in the hosting list.
                     debug_assert!(
-                        op_manager.ring.is_seeding_contract(&key),
-                        "PUT Streaming: contract {key} must be in seed list after put_contract + seed_contract"
+                        op_manager.ring.is_hosting_contract(&key),
+                        "PUT Streaming: contract {key} must be in hosting list after put_contract + host_contract"
                     );
 
                     // Step 5: Handle forwarding or final destination

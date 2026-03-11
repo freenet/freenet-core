@@ -2294,7 +2294,7 @@ mod tests {
     /// See issue #2310 for details on the thread explosion this caused.
     #[test]
     fn bincode_serialization_is_fast_enough_for_async() {
-        use crate::message::{NetMessage, NetMessageV1, ProximityCacheMessage};
+        use crate::message::{NeighborHostingMessage, NetMessage, NetMessageV1};
         use freenet_stdlib::prelude::ContractInstanceId;
         use std::time::Instant;
 
@@ -2325,19 +2325,19 @@ mod tests {
         // Test 2: Actual network message types used in production
         // These are the types that go through peer_connection.send()
 
-        // ProximityCache messages (common during connection setup)
-        let cache_msg = NetMessage::V1(NetMessageV1::ProximityCache {
-            message: ProximityCacheMessage::CacheAnnounce {
+        // NeighborHosting messages (common during connection setup)
+        let cache_msg = NetMessage::V1(NetMessageV1::NeighborHosting {
+            message: NeighborHostingMessage::HostingAnnounce {
                 added: vec![ContractInstanceId::new([1u8; 32])],
                 removed: vec![],
                 is_response: false,
             },
         });
-        assert_fast_serialize("ProximityCacheMessage", &cache_msg);
+        assert_fast_serialize("NeighborHostingMessage", &cache_msg);
 
-        // Large cache state response (worst case for ProximityCache)
-        let large_cache = NetMessage::V1(NetMessageV1::ProximityCache {
-            message: ProximityCacheMessage::CacheStateResponse {
+        // Large cache state response (worst case for NeighborHosting)
+        let large_cache = NetMessage::V1(NetMessageV1::NeighborHosting {
+            message: NeighborHostingMessage::CacheStateResponse {
                 contracts: (0..100)
                     .map(|i| ContractInstanceId::new([i as u8; 32]))
                     .collect(),
