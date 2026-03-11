@@ -172,12 +172,12 @@ pub struct TopologyValidationResult {
     /// Bidirectional cycles detected (pairs of peers)
     pub bidirectional_cycles: Vec<(SocketAddr, SocketAddr)>,
     /// Orphan hosters (peers hosting without upstream or downstream)
-    pub orphan_seeders: Vec<(SocketAddr, ContractInstanceId)>,
-    /// Disconnected upstream (seeders with downstream but no upstream, not a source)
+    pub orphan_hosters: Vec<(SocketAddr, ContractInstanceId)>,
+    /// Disconnected upstream (hosters with downstream but no upstream, not a source)
     /// These are problematic because downstream peers depend on them but they can't receive updates
     pub disconnected_upstream: Vec<(SocketAddr, ContractInstanceId)>,
-    /// Unreachable seeders (seeders that can't receive updates from source)
-    pub unreachable_seeders: Vec<(SocketAddr, ContractInstanceId)>,
+    /// Unreachable hosters (hosters that can't receive updates from source)
+    pub unreachable_hosters: Vec<(SocketAddr, ContractInstanceId)>,
     /// Proximity violations (upstream is farther from contract than downstream)
     pub proximity_violations: Vec<ProximityViolation>,
     /// Total number of issues found
@@ -206,8 +206,8 @@ pub struct ProximityViolation {
 ///
 /// This function checks for:
 /// - Bidirectional cycles that create isolated islands
-/// - Orphan seeders without recovery paths
-/// - Unreachable seeders that can't receive updates
+/// - Orphan hosters without recovery paths
+/// - Unreachable hosters that can't receive updates
 /// - Proximity violations in upstream selection
 pub fn validate_topology(
     network_name: &str,
@@ -236,7 +236,7 @@ pub fn validate_topology_from_snapshots(
     let mut subscription_graph: HashMap<SocketAddr, (Option<SocketAddr>, Vec<SocketAddr>)> =
         HashMap::new();
     let mut peer_locations: HashMap<SocketAddr, f64> = HashMap::new();
-    let mut seeders: HashSet<SocketAddr> = HashSet::new();
+    let mut hosters: HashSet<SocketAddr> = HashSet::new();
 
     for snapshot in snapshots {
         peer_locations.insert(snapshot.peer_addr, snapshot.location);
@@ -245,7 +245,7 @@ pub fn validate_topology_from_snapshots(
             subscription_graph.insert(snapshot.peer_addr, (sub.upstream, sub.downstream.clone()));
 
             if sub.is_hosting {
-                seeders.insert(snapshot.peer_addr);
+                hosters.insert(snapshot.peer_addr);
             }
         }
     }
@@ -274,26 +274,26 @@ pub fn validate_topology_from_snapshots(
     // Source detection threshold: peers within 5% of ring distance to contract are considered sources
     const SOURCE_THRESHOLD: f64 = 0.05;
 
-    // Check if any seeder is within SOURCE_THRESHOLD (a "proper" source)
-    let has_proper_source = seeders.iter().any(|seeder| {
+    // Check if any hoster is within SOURCE_THRESHOLD (a "proper" source)
+    let has_proper_source = hosters.iter().any(|hoster| {
         peer_locations
-            .get(seeder)
+            .get(hoster)
             .map(|loc| ring_distance(*loc, contract_location) < SOURCE_THRESHOLD)
             .unwrap_or(false)
     });
 
     // Find de-facto sources: when no peer is within SOURCE_THRESHOLD,
-    // any seeder that is acting as a tree root (no upstream, has downstream) is a valid source.
+    // any hoster that is acting as a tree root (no upstream, has downstream) is a valid source.
     // This is important for Issue #2755 - topology should still be valid even without a "proper" source.
     let de_facto_sources: HashSet<SocketAddr> = if has_proper_source {
         HashSet::new()
     } else {
-        // Find all seeders that are acting as tree roots (no upstream but has downstream)
-        seeders
+        // Find all hosters that are acting as tree roots (no upstream but has downstream)
+        hosters
             .iter()
-            .filter(|seeder| {
+            .filter(|hoster| {
                 subscription_graph
-                    .get(*seeder)
+                    .get(*hoster)
                     .map(|(upstream, downstream)| upstream.is_none() && !downstream.is_empty())
                     .unwrap_or(false)
             })
@@ -301,31 +301,31 @@ pub fn validate_topology_from_snapshots(
             .collect()
     };
 
-    // Check for orphan seeders and disconnected upstream
-    for &seeder in &seeders {
-        if let Some((upstream, downstream)) = subscription_graph.get(&seeder) {
-            // Check if seeder is close to contract location (is source)
+    // Check for orphan hosters and disconnected upstream
+    for &hoster in &hosters {
+        if let Some((upstream, downstream)) = subscription_graph.get(&hoster) {
+            // Check if hoster is close to contract location (is source)
             // Use ring_distance for consistent wrap-around handling
             let is_proper_source = peer_locations
-                .get(&seeder)
+                .get(&hoster)
                 .map(|loc| ring_distance(*loc, contract_location) < SOURCE_THRESHOLD)
                 .unwrap_or(false);
 
             // Also check if this is a de-facto source (acting as tree root when no proper source exists)
-            let is_de_facto_source = de_facto_sources.contains(&seeder);
+            let is_de_facto_source = de_facto_sources.contains(&hoster);
 
             let is_source = is_proper_source || is_de_facto_source;
 
             // Orphan if: not source, no upstream, no downstream
             if !is_source && upstream.is_none() && downstream.is_empty() {
-                result.orphan_seeders.push((seeder, *contract_id));
+                result.orphan_hosters.push((hoster, *contract_id));
                 result.issue_count += 1;
             }
 
             // Disconnected upstream: has downstream but no upstream (not a source)
             // This is problematic because downstream peers depend on us but we can't receive updates
             if !is_source && upstream.is_none() && !downstream.is_empty() {
-                result.disconnected_upstream.push((seeder, *contract_id));
+                result.disconnected_upstream.push((hoster, *contract_id));
                 result.issue_count += 1;
             }
         }
@@ -355,7 +355,7 @@ pub fn validate_topology_from_snapshots(
         }
     }
 
-    // Check for unreachable seeders using BFS from source
+    // Check for unreachable hosters using BFS from source
     // Use ring_distance for consistent wrap-around handling
     let source_candidates: Vec<_> = peer_locations
         .iter()
@@ -375,9 +375,9 @@ pub fn validate_topology_from_snapshots(
             }
         }
 
-        for &seeder in &seeders {
-            if !reachable.contains(&seeder) {
-                result.unreachable_seeders.push((seeder, *contract_id));
+        for &hoster in &hosters {
+            if !reachable.contains(&hoster) {
+                result.unreachable_hosters.push((hoster, *contract_id));
                 result.issue_count += 1;
             }
         }
@@ -456,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_orphan_seeder_detection() {
+    fn test_orphan_hoster_detection() {
         let network = "test-orphan";
         clear_topology_snapshots(network);
 
@@ -481,16 +481,16 @@ mod tests {
 
         let result = validate_topology(network, &contract_id, 0.5);
         assert!(
-            !result.orphan_seeders.is_empty(),
-            "Should detect orphan seeder"
+            !result.orphan_hosters.is_empty(),
+            "Should detect orphan hoster"
         );
 
         clear_topology_snapshots(network);
     }
 
     #[test]
-    fn test_de_facto_source_single_seeder() {
-        // Issue #2755: When no peer is within SOURCE_THRESHOLD, a single seeder
+    fn test_de_facto_source_single_hoster() {
+        // Issue #2755: When no peer is within SOURCE_THRESHOLD, a single hoster
         // acting as tree root (has downstream, no upstream) should be recognized
         // as a valid de-facto source, NOT flagged as disconnected upstream.
         let network = "test-de-facto-source";
@@ -501,9 +501,9 @@ mod tests {
         let contract_id = make_contract_id(1);
         let contract_key = make_contract_key(1);
 
-        // Single seeder acting as tree root: no upstream, has downstream
+        // Single hoster acting as tree root: no upstream, has downstream
         // Location 0.3, contract at 0.5, distance = 0.2 (> 0.05 threshold, not a proper source)
-        // But it's the only seeder and acting as root, so it's a valid de-facto source
+        // But it's the only hoster and acting as root, so it's a valid de-facto source
         let mut snap = TopologySnapshot::new(peer, 0.3);
         snap.set_contract(
             contract_id,
@@ -521,7 +521,7 @@ mod tests {
         let result = validate_topology(network, &contract_id, 0.5);
         assert!(
             result.disconnected_upstream.is_empty(),
-            "Single seeder acting as tree root should be valid de-facto source, not disconnected"
+            "Single hoster acting as tree root should be valid de-facto source, not disconnected"
         );
         assert!(result.is_healthy(), "Topology should be healthy");
 
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_disconnected_upstream_with_proper_source() {
-        // When a proper source EXISTS (within threshold), other seeders acting
+        // When a proper source EXISTS (within threshold), other hosters acting
         // as root (no upstream, has downstream) ARE disconnected upstreams.
         let network = "test-disconnected-with-source";
         clear_topology_snapshots(network);
@@ -608,7 +608,7 @@ mod tests {
         // Contract location at 0.02 - peer at 0.99 is within 0.05 ring distance
         let result = validate_topology(network, &contract_id, 0.02);
         assert!(
-            result.orphan_seeders.is_empty(),
+            result.orphan_hosters.is_empty(),
             "Peer at 0.99 should be considered source for contract at 0.02 (ring distance 0.03)"
         );
         assert!(
@@ -620,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn test_source_seeder_not_orphan() {
+    fn test_source_hoster_not_orphan() {
         let network = "test-source-not-orphan";
         clear_topology_snapshots(network);
 
@@ -645,8 +645,8 @@ mod tests {
 
         let result = validate_topology(network, &contract_id, 0.5);
         assert!(
-            result.orphan_seeders.is_empty(),
-            "Source seeder should not be flagged as orphan"
+            result.orphan_hosters.is_empty(),
+            "Source hoster should not be flagged as orphan"
         );
 
         clear_topology_snapshots(network);
@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unreachable_seeder_detection() {
+    fn test_unreachable_hoster_detection() {
         let network = "test-unreachable";
         clear_topology_snapshots(network);
 
@@ -766,12 +766,12 @@ mod tests {
 
         let result = validate_topology(network, &contract_id, 0.5);
         assert!(
-            !result.unreachable_seeders.is_empty(),
-            "Should detect unreachable seeder"
+            !result.unreachable_hosters.is_empty(),
+            "Should detect unreachable hoster"
         );
         assert!(
             result
-                .unreachable_seeders
+                .unreachable_hosters
                 .iter()
                 .any(|(addr, _)| *addr == unreachable_peer),
             "Unreachable peer should be in the list"
@@ -824,9 +824,9 @@ mod tests {
             result.is_healthy(),
             "Healthy topology should have no issues, got: cycles={}, orphans={}, disconnected={}, unreachable={}, proximity={}",
             result.bidirectional_cycles.len(),
-            result.orphan_seeders.len(),
+            result.orphan_hosters.len(),
             result.disconnected_upstream.len(),
-            result.unreachable_seeders.len(),
+            result.unreachable_hosters.len(),
             result.proximity_violations.len()
         );
 

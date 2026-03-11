@@ -337,16 +337,16 @@ pub(crate) async fn request_subscribe(
     let mut candidates =
         op_manager
             .ring
-            .k_closest_potentially_caching(instance_id, &visited, MAX_BREADTH);
+            .k_closest_potentially_hosting(instance_id, &visited, MAX_BREADTH);
 
-    // First try the best candidates from k_closest_potentially_caching.
+    // First try the best candidates from k_closest_potentially_hosting.
     // If that returns empty, fall back to any available connection.
     // This ensures we join the subscription tree even when the routing algorithm
     // can't find ideal candidates (e.g., due to timing or location filtering).
     let target = if !candidates.is_empty() {
         candidates.remove(0)
     } else {
-        // k_closest_potentially_caching returned empty - try any connected peer as fallback.
+        // k_closest_potentially_hosting returned empty - try any connected peer as fallback.
         // The subscription will be forwarded toward the contract location.
         let connections = op_manager
             .ring
@@ -391,7 +391,7 @@ pub(crate) async fn request_subscribe(
                     return complete_local_subscription(op_manager, *id, key, is_renewal).await;
                 }
                 tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
-                return Err(RingError::NoCachingPeers(*instance_id).into());
+                return Err(RingError::NoHostingPeers(*instance_id).into());
             }
         }
     };
@@ -661,7 +661,7 @@ impl SubscribeOp {
                 phase = "not_found",
                 "Subscribe failed at originator"
             );
-            Err(RingError::NoCachingPeers(instance_id).into())
+            Err(RingError::NoHostingPeers(instance_id).into())
         }
     }
 
@@ -754,7 +754,7 @@ impl SubscribeOp {
                     visited.mark_visited(*addr);
                 }
 
-                let mut new_candidates = op_manager.ring.k_closest_potentially_caching(
+                let mut new_candidates = op_manager.ring.k_closest_potentially_hosting(
                     &instance_id,
                     &visited,
                     MAX_BREADTH,
@@ -1219,7 +1219,7 @@ impl Operation for SubscribeOp {
                         new_visited.mark_visited(requester);
                     }
 
-                    let mut candidates = op_manager.ring.k_closest_potentially_caching(
+                    let mut candidates = op_manager.ring.k_closest_potentially_hosting(
                         instance_id,
                         &new_visited,
                         MAX_BREADTH,
@@ -1547,7 +1547,7 @@ impl Operation for SubscribeOp {
                                 }
 
                                 let mut new_candidates =
-                                    op_manager.ring.k_closest_potentially_caching(
+                                    op_manager.ring.k_closest_potentially_hosting(
                                         instance_id,
                                         &visited,
                                         MAX_BREADTH,

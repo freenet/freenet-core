@@ -256,7 +256,7 @@ impl NeighborHostingManager {
                 }
             }
 
-            NeighborHostingMessage::CacheStateRequest => {
+            NeighborHostingMessage::HostingStateRequest => {
                 let mut contracts: Vec<ContractInstanceId> =
                     self.my_contracts.iter().map(|r| *r.key()).collect();
                 // Sort for deterministic message order (DashSet iteration is non-deterministic)
@@ -269,12 +269,12 @@ impl NeighborHostingManager {
                     "NEIGHBOR_HOSTING: Responding to hosting state request"
                 );
 
-                NeighborHostingResult::response_only(NeighborHostingMessage::CacheStateResponse {
+                NeighborHostingResult::response_only(NeighborHostingMessage::HostingStateResponse {
                     contracts,
                 })
             }
 
-            NeighborHostingMessage::CacheStateResponse { contracts } => {
+            NeighborHostingMessage::HostingStateResponse { contracts } => {
                 let count = contracts.len();
 
                 // Find contracts that overlap with our local cache BEFORE storing.
@@ -391,7 +391,7 @@ impl NeighborHostingManager {
             peer = %pub_key,
             "NEIGHBOR_HOSTING: New ring connection, requesting hosting state"
         );
-        Some(NeighborHostingMessage::CacheStateRequest)
+        Some(NeighborHostingMessage::HostingStateRequest)
     }
 
     /// Initialize my_contracts from contracts loaded from disk.
@@ -451,11 +451,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_announcement_on_new_contract() {
+    fn test_hosting_announcement_on_new_contract() {
         let manager = NeighborHostingManager::new();
         let key = test_contract_key();
 
-        // First cache should return announcement
+        // First hosting should return announcement
         let announcement = manager.on_contract_hosted(&key);
         assert!(announcement.is_some());
 
@@ -476,16 +476,16 @@ mod tests {
             panic!("Expected HostingAnnounce");
         }
 
-        // Second cache of same contract should return None
+        // Second hosting of same contract should return None
         assert!(manager.on_contract_hosted(&key).is_none());
     }
 
     #[test]
-    fn test_cache_eviction() {
+    fn test_contract_unhosting() {
         let manager = NeighborHostingManager::new();
         let key = test_contract_key();
 
-        // Cache the contract
+        // Host the contract
         manager.on_contract_hosted(&key);
 
         // Eviction should return announcement
@@ -537,26 +537,26 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_state_request_response() {
+    fn test_hosting_state_request_response() {
         let manager = NeighborHostingManager::new();
         let key1 = test_contract_key();
         let key2 = test_contract_key_2();
         let neighbor = make_pub_key(1);
 
-        // Cache some contracts locally
+        // Host some contracts locally
         manager.on_contract_hosted(&key1);
         manager.on_contract_hosted(&key2);
 
-        // Handle cache state request
-        let result = manager.handle_message(&neighbor, NeighborHostingMessage::CacheStateRequest);
+        // Handle hosting state request
+        let result = manager.handle_message(&neighbor, NeighborHostingMessage::HostingStateRequest);
         assert!(result.response.is_some());
 
-        if let Some(NeighborHostingMessage::CacheStateResponse { contracts }) = result.response {
+        if let Some(NeighborHostingMessage::HostingStateResponse { contracts }) = result.response {
             assert_eq!(contracts.len(), 2);
             assert!(contracts.contains(key1.id()));
             assert!(contracts.contains(key2.id()));
         } else {
-            panic!("Expected CacheStateResponse");
+            panic!("Expected HostingStateResponse");
         }
     }
 
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_bidirectional_announcement_for_overlapping_contracts() {
-        // Scenario: Node A has contract X cached. Node B announces it also has X.
+        // Scenario: Node A has contract X hosted. Node B announces it also has X.
         // Expected: Node A should respond with its own announcement so B knows A has X too.
         let manager_a = NeighborHostingManager::new();
         let key = test_contract_key();
@@ -970,19 +970,19 @@ mod tests {
 
     // === Reconnection Tests ===
     // These tests cover the scenario where a peer disconnects/reconnects and needs
-    // to re-establish bidirectional awareness via CacheStateRequest/Response.
+    // to re-establish bidirectional awareness via HostingStateRequest/Response.
 
     #[test]
-    fn test_cache_state_response_triggers_announcement_for_overlapping_contracts() {
+    fn test_hosting_state_response_triggers_announcement_for_overlapping_contracts() {
         // CRITICAL: This test catches the bug where peers that reconnect after missing
         // an update broadcast don't receive future updates.
         //
         // Scenario:
-        // 1. Node A has contract X cached
-        // 2. Node B reconnects and has contract X cached
-        // 3. A sends CacheStateRequest to B (via on_ring_connection_established)
-        // 4. B responds with CacheStateResponse containing X
-        // 5. A receives CacheStateResponse - should announce X back to B
+        // 1. Node A has contract X hosted
+        // 2. Node B reconnects and has contract X hosted
+        // 3. A sends HostingStateRequest to B (via on_ring_connection_established)
+        // 4. B responds with HostingStateResponse containing X
+        // 5. A receives HostingStateResponse - should announce X back to B
         // 6. Now B knows A also has X and can include A in UPDATE broadcasts
         //
         // Without this fix, step 5 returned None and B never learned A has X.
@@ -991,11 +991,11 @@ mod tests {
         let key = test_contract_key();
         let key_b = make_pub_key(2);
 
-        // A has contract X cached locally
+        // A has contract X hosted locally
         manager_a.on_contract_hosted(&key);
 
-        // B reconnects and sends CacheStateResponse (as if responding to A's request)
-        let b_state_response = NeighborHostingMessage::CacheStateResponse {
+        // B reconnects and sends HostingStateResponse (as if responding to A's request)
+        let b_state_response = NeighborHostingMessage::HostingStateResponse {
             contracts: vec![*key.id()],
         };
 
@@ -1004,7 +1004,7 @@ mod tests {
 
         assert!(
             a_result.response.is_some(),
-            "CRITICAL: A must announce overlapping contracts when receiving CacheStateResponse"
+            "CRITICAL: A must announce overlapping contracts when receiving HostingStateResponse"
         );
         assert_eq!(a_result.overlapping_contracts.len(), 1);
         assert_eq!(a_result.overlapping_contracts[0], *key.id());
@@ -1032,8 +1032,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_state_response_no_announcement_when_no_overlap() {
-        // When receiving CacheStateResponse with no overlapping contracts,
+    fn test_hosting_state_response_no_announcement_when_no_overlap() {
+        // When receiving HostingStateResponse with no overlapping contracts,
         // no announcement should be sent.
 
         let manager_a = NeighborHostingManager::new();
@@ -1045,7 +1045,7 @@ mod tests {
         manager_a.on_contract_hosted(&key_x);
 
         // B has contract Y (no overlap with A)
-        let b_state_response = NeighborHostingMessage::CacheStateResponse {
+        let b_state_response = NeighborHostingMessage::HostingStateResponse {
             contracts: vec![*key_y.id()],
         };
 
@@ -1079,7 +1079,7 @@ mod tests {
         let key_a = make_pub_key(1);
         let key_b = make_pub_key(2);
 
-        // Both have contract X cached
+        // Both have contract X hosted
         manager_a.on_contract_hosted(&key);
         manager_b.on_contract_hosted(&key);
 
@@ -1087,18 +1087,18 @@ mod tests {
         assert!(manager_a.neighbors_with_contract(&key).is_empty());
         assert!(manager_b.neighbors_with_contract(&key).is_empty());
 
-        // Step 1: A establishes ring connection with B, generates CacheStateRequest
+        // Step 1: A establishes ring connection with B, generates HostingStateRequest
         let a_request = manager_a.on_ring_connection_established(&key_b);
         assert!(matches!(
             a_request,
-            Some(NeighborHostingMessage::CacheStateRequest)
+            Some(NeighborHostingMessage::HostingStateRequest)
         ));
 
-        // Step 2: B receives request, responds with its cache state
+        // Step 2: B receives request, responds with its hosting state
         let b_result = manager_b.handle_message(&key_a, a_request.unwrap());
         assert!(matches!(
             b_result.response,
-            Some(NeighborHostingMessage::CacheStateResponse { .. })
+            Some(NeighborHostingMessage::HostingStateResponse { .. })
         ));
 
         // Step 3: A receives B's state response
@@ -1147,16 +1147,16 @@ mod tests {
         assert!(manager.is_hosted_locally(&key1));
         assert!(manager.is_hosted_locally(&key2));
 
-        // CacheStateRequest should return both
+        // HostingStateRequest should return both
         let neighbor = make_pub_key(1);
-        let result = manager.handle_message(&neighbor, NeighborHostingMessage::CacheStateRequest);
-        if let Some(NeighborHostingMessage::CacheStateResponse { contracts }) = result.response {
+        let result = manager.handle_message(&neighbor, NeighborHostingMessage::HostingStateRequest);
+        if let Some(NeighborHostingMessage::HostingStateResponse { contracts }) = result.response {
             assert_eq!(contracts.len(), 2);
         } else {
-            panic!("Expected CacheStateResponse");
+            panic!("Expected HostingStateResponse");
         }
 
-        // Caching an already-initialized contract should return None (no duplicate announcement)
+        // Hosting an already-initialized contract should return None (no duplicate announcement)
         assert!(manager.on_contract_hosted(&key1).is_none());
     }
 }

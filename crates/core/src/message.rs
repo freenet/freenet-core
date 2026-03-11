@@ -387,9 +387,9 @@ pub enum NeighborHostingMessage {
         is_response: bool,
     },
     /// Request a neighbor's full hosting state (used on new connections).
-    CacheStateRequest,
+    HostingStateRequest,
     /// Response with the neighbor's full hosting state.
-    CacheStateResponse { contracts: Vec<ContractInstanceId> },
+    HostingStateResponse { contracts: Vec<ContractInstanceId> },
 }
 
 /// Messages for the delta-based interest synchronization protocol.

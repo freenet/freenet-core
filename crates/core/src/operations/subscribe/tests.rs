@@ -31,7 +31,7 @@ impl TestRing {
         }
     }
 
-    pub async fn k_closest_potentially_caching(
+    pub async fn k_closest_potentially_hosting(
         &self,
         instance_id: &ContractInstanceId,
         skip_list: impl Contains<SocketAddr> + Clone,
@@ -104,11 +104,11 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     let sub_op = start_op(*contract_key.id(), false);
     assert!(matches!(sub_op.state, SubscribeState::PrepareRequest(_)));
 
-    // 2. Test k_closest_potentially_caching with initial skip list containing self
+    // 2. Test k_closest_potentially_hosting with initial skip list containing self
     let mut initial_skip: HashSet<SocketAddr> = HashSet::new();
     initial_skip.insert(own_addr);
     let initial_candidates = test_ring
-        .k_closest_potentially_caching(contract_key.id(), &initial_skip, 3)
+        .k_closest_potentially_hosting(contract_key.id(), &initial_skip, 3)
         .await;
 
     // 3. Verify initial call was recorded
@@ -116,7 +116,7 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     assert_eq!(
         k_closest_calls.len(),
         1,
-        "Should have called k_closest_potentially_caching once"
+        "Should have called k_closest_potentially_hosting once"
     );
     assert_eq!(
         k_closest_calls[0].0,
@@ -149,7 +149,7 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
 
     // This is the critical call that would happen in the ReturnSub handler
     let candidates_after_failure = test_ring
-        .k_closest_potentially_caching(contract_key.id(), &skip_list, 3)
+        .k_closest_potentially_hosting(contract_key.id(), &skip_list, 3)
         .await;
 
     // 6. Verify the second call used the skip list correctly
@@ -157,7 +157,7 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     assert_eq!(
         k_closest_calls.len(),
         2,
-        "Should have called k_closest_potentially_caching twice"
+        "Should have called k_closest_potentially_hosting twice"
     );
     assert_eq!(
         k_closest_calls[1].0,
@@ -195,14 +195,14 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     // 8. Test multiple failures
     skip_list.insert(peer2_addr); // Second peer also failed
     let final_candidates = test_ring
-        .k_closest_potentially_caching(contract_key.id(), &skip_list, 3)
+        .k_closest_potentially_hosting(contract_key.id(), &skip_list, 3)
         .await;
 
     let k_closest_calls = test_ring.k_closest_calls.lock().await;
     assert_eq!(
         k_closest_calls.len(),
         3,
-        "Should have called k_closest_potentially_caching three times"
+        "Should have called k_closest_potentially_hosting three times"
     );
     assert_eq!(
         k_closest_calls[2].1.len(),
@@ -229,8 +229,8 @@ async fn test_subscription_routing_calls_k_closest_with_skip_list() {
     );
 }
 
-/// Integration test that exercises the production subscription code paths that use k_closest_potentially_caching
-/// This test proves that if k_closest_potentially_caching usage was broken in subscription code, this test would fail
+/// Integration test that exercises the production subscription code paths that use k_closest_potentially_hosting
+/// This test proves that if k_closest_potentially_hosting usage was broken in subscription code, this test would fail
 #[tokio::test]
 async fn test_subscription_production_code_paths_use_k_closest() {
     let contract_key = ContractKey::from_id_and_code(
@@ -251,7 +251,7 @@ async fn test_subscription_production_code_paths_use_k_closest() {
         .socket_addr()
         .expect("own location must have address");
 
-    // Create TestRing that records all k_closest_potentially_caching calls
+    // Create TestRing that records all k_closest_potentially_hosting calls
     let test_ring = TestRing::new(
         vec![peer1.clone(), peer2.clone(), peer3.clone()],
         own_location.clone(),
@@ -261,11 +261,11 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     let sub_op = start_op(*contract_key.id(), false);
     assert!(matches!(sub_op.state, SubscribeState::PrepareRequest(_)));
 
-    // Test 2: Simulate the k_closest_potentially_caching call made in request_subscribe
+    // Test 2: Simulate the k_closest_potentially_hosting call made in request_subscribe
     let mut initial_skip: HashSet<SocketAddr> = HashSet::new();
     initial_skip.insert(own_addr);
     let initial_candidates = test_ring
-        .k_closest_potentially_caching(contract_key.id(), &initial_skip, 3)
+        .k_closest_potentially_hosting(contract_key.id(), &initial_skip, 3)
         .await;
 
     // Verify the call was recorded
@@ -299,11 +299,11 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     );
     assert_eq!(initial_candidates[0], peer1, "Should return peer1 first");
 
-    // Test 3: Simulate the k_closest_potentially_caching call made in SeekNode handler
+    // Test 3: Simulate the k_closest_potentially_hosting call made in SeekNode handler
     let mut skip_list: HashSet<SocketAddr> = HashSet::new();
     skip_list.insert(peer1_addr);
     let seek_candidates = test_ring
-        .k_closest_potentially_caching(contract_key.id(), &skip_list, 3)
+        .k_closest_potentially_hosting(contract_key.id(), &skip_list, 3)
         .await;
 
     // Verify this call was also recorded
@@ -340,10 +340,10 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     );
     assert_eq!(seek_candidates[0], peer2, "Should return peer2 first");
 
-    // Test 4: Simulate the k_closest_potentially_caching call made in ReturnSub(false) handler
+    // Test 4: Simulate the k_closest_potentially_hosting call made in ReturnSub(false) handler
     skip_list.insert(peer2_addr); // Second peer also failed
     let retry_candidates = test_ring
-        .k_closest_potentially_caching(contract_key.id(), &skip_list, 3)
+        .k_closest_potentially_hosting(contract_key.id(), &skip_list, 3)
         .await;
 
     // Verify this call was recorded
@@ -384,14 +384,14 @@ async fn test_subscription_production_code_paths_use_k_closest() {
     );
 }
 
-/// Test that validates the subscription operation would call k_closest_potentially_caching correctly
+/// Test that validates the subscription operation would call k_closest_potentially_hosting correctly
 /// This test demonstrates how the production code flow works without needing full OpManager
 #[tokio::test]
 async fn test_subscription_validates_k_closest_usage() {
     // This test validates that the subscription operation correctly:
-    // 1. Calls k_closest_potentially_caching with a skip list containing the local peer on first attempt
+    // 1. Calls k_closest_potentially_hosting with a skip list containing the local peer on first attempt
     // 2. Accumulates failed peers in the skip list
-    // 3. Calls k_closest_potentially_caching with the skip list on retry
+    // 3. Calls k_closest_potentially_hosting with the skip list on retry
 
     let contract_key =
         ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]));
@@ -408,7 +408,7 @@ async fn test_subscription_validates_k_closest_usage() {
         let mut initial_skip: HashSet<SocketAddr> = HashSet::new();
         initial_skip.insert(test_ring.own_addr);
         let _candidates = test_ring
-            .k_closest_potentially_caching(contract_key.id(), &initial_skip, 3)
+            .k_closest_potentially_hosting(contract_key.id(), &initial_skip, 3)
             .await;
 
         let calls = test_ring.k_closest_calls.lock().await;
@@ -437,7 +437,7 @@ async fn test_subscription_validates_k_closest_usage() {
         let skip_list = [failed_addr];
 
         let candidates = test_ring
-            .k_closest_potentially_caching(contract_key.id(), &skip_list[..], 3)
+            .k_closest_potentially_hosting(contract_key.id(), &skip_list[..], 3)
             .await;
 
         // Verify skip list is used
@@ -1138,7 +1138,7 @@ fn test_create_unsubscribe_op() {
 // =============================================================================
 
 /// Regression test for #3241: forwarding peers must send SubscribeMsgResult::NotFound
-/// instead of returning Err(NoCachingPeers) when they can't route a subscribe request.
+/// instead of returning Err(NoHostingPeers) when they can't route a subscribe request.
 ///
 /// Before the fix, the three failure paths (HTL exhausted, no closer peers, unknown
 /// peer address) returned Err which became a generic Aborted message that was silently
@@ -1204,7 +1204,7 @@ fn test_not_found_result_intermediate_node_sends_notfound() {
 }
 
 /// Regression test for #3241: when we're the originator (no requester_addr),
-/// not_found_result should return Err(NoCachingPeers) so the client gets
+/// not_found_result should return Err(NoHostingPeers) so the client gets
 /// a fast failure notification.
 #[test]
 fn test_not_found_result_originator_returns_error() {
@@ -1214,17 +1214,17 @@ fn test_not_found_result_originator_returns_error() {
     let tx = Transaction::new::<SubscribeMsg>();
     let instance_id = ContractInstanceId::new([42u8; 32]);
 
-    // Originator (no requester_addr) should return Err(RingError::NoCachingPeers)
+    // Originator (no requester_addr) should return Err(RingError::NoHostingPeers)
     let result = SubscribeOp::not_found_result(tx, instance_id, None, "no closer peers");
 
     match result {
-        Err(OpError::RingError(RingError::NoCachingPeers(id))) => {
+        Err(OpError::RingError(RingError::NoHostingPeers(id))) => {
             assert_eq!(
                 id, instance_id,
                 "Error should reference the correct contract"
             );
         }
-        Err(other) => panic!("Expected NoCachingPeers error, got: {other}"),
+        Err(other) => panic!("Expected NoHostingPeers error, got: {other}"),
         Ok(_) => panic!("Originator should get an error, not a message"),
     }
 }

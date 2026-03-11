@@ -476,7 +476,7 @@ impl Operation for UpdateOp {
 
                             let next_target = op_manager
                                 .ring
-                                .closest_potentially_caching(key, skip_list.as_slice());
+                                .closest_potentially_hosting(key, skip_list.as_slice());
 
                             if let Some(forward_target) = next_target {
                                 let forward_addr = forward_target
@@ -536,7 +536,7 @@ impl Operation for UpdateOp {
                                 // No peers available and we don't have the contract - log error
                                 let candidates = op_manager
                                     .ring
-                                    .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
+                                    .k_closest_potentially_hosting(key, skip_list.as_slice(), 5)
                                     .into_iter()
                                     .filter_map(|loc| loc.socket_addr())
                                     .map(|addr| format!("{:.8}", addr))
@@ -552,7 +552,7 @@ impl Operation for UpdateOp {
                                     phase = "error",
                                     "Cannot handle UPDATE: contract not found locally and no peers to forward to"
                                 );
-                                return Err(OpError::RingError(RingError::NoCachingPeers(
+                                return Err(OpError::RingError(RingError::NoHostingPeers(
                                     *key.id(),
                                 )));
                             }
@@ -1885,7 +1885,7 @@ pub(crate) async fn request_update(
         // Find the best peer to send the update to based on ring location
         let remote_target = op_manager
             .ring
-            .closest_potentially_caching(&key, [sender_addr].as_slice());
+            .closest_potentially_hosting(&key, [sender_addr].as_slice());
 
         if let Some(target) = remote_target {
             // Found a remote peer to send the update to
@@ -1909,7 +1909,7 @@ pub(crate) async fn request_update(
                     phase = "error",
                     "UPDATE: Cannot update contract on isolated node - contract not seeded"
                 );
-                return Err(OpError::RingError(RingError::NoCachingPeers(*key.id())));
+                return Err(OpError::RingError(RingError::NoHostingPeers(*key.id())));
             }
 
             // Update the contract locally. This path is reached when:

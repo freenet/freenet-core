@@ -330,7 +330,7 @@ async fn report_op_init_error(
         OpError::RingError(crate::ring::RingError::EmptyRing) => ErrorKind::EmptyRing,
         OpError::RingError(crate::ring::RingError::PeerNotJoined) => ErrorKind::PeerNotJoined,
         OpError::RingError(crate::ring::RingError::ConnError(_))
-        | OpError::RingError(crate::ring::RingError::NoCachingPeers(_))
+        | OpError::RingError(crate::ring::RingError::NoHostingPeers(_))
         | OpError::ConnError(_)
         | OpError::ContractError(_)
         | OpError::ExecutorError(_)
@@ -594,7 +594,7 @@ impl From<crate::ring::RingError> for Error {
             crate::ring::RingError::PeerNotJoined => Error::PeerNotJoined,
             crate::ring::RingError::EmptyRing => Error::EmptyRing,
             other @ crate::ring::RingError::ConnError(_)
-            | other @ crate::ring::RingError::NoCachingPeers(_) => Error::Node(other.to_string()),
+            | other @ crate::ring::RingError::NoHostingPeers(_) => Error::Node(other.to_string()),
         }
     }
 }
@@ -667,7 +667,7 @@ async fn process_open_request(
                         let skip_list: Vec<_> = own_location.socket_addr().into_iter().collect();
                         let has_remote_peers = op_manager
                             .ring
-                            .closest_potentially_caching(&contract_key, skip_list.as_slice())
+                            .closest_potentially_hosting(&contract_key, skip_list.as_slice())
                             .is_some();
 
                         if !has_remote_peers {

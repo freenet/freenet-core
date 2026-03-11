@@ -153,7 +153,7 @@ impl ContractHandler for NetworkContractHandler {
             }
         }
 
-        // Populate neighbor hosting from hosted contracts so CacheStateResponse
+        // Populate neighbor hosting from hosted contracts so HostingStateResponse
         // reports our full contract set when ring connections establish.
         let hosted_keys = op_manager.ring.hosting_contract_keys();
         let hosted_ids = hosted_keys.iter().map(|k| *k.id());

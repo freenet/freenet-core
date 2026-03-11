@@ -197,7 +197,7 @@ WRONG:
 
 ```rust
 // Get k best peers for a contract location
-let peers = connection_manager.k_closest_potentially_caching(
+let peers = connection_manager.k_closest_potentially_hosting(
     contract_location,
     &visited_peers,  // Skip already visited
 );

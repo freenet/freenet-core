@@ -399,7 +399,7 @@ impl Operation for PutOp {
                     let next_hop = if htl > 0 {
                         op_manager
                             .ring
-                            .closest_potentially_caching(&key, &new_skip_list)
+                            .closest_potentially_hosting(&key, &new_skip_list)
                     } else {
                         None
                     };
@@ -766,7 +766,7 @@ impl Operation for PutOp {
                     let next_hop = if htl > 0 {
                         op_manager
                             .ring
-                            .closest_potentially_caching(contract_key, &routing_skip_list)
+                            .closest_potentially_hosting(contract_key, &routing_skip_list)
                     } else {
                         None
                     };

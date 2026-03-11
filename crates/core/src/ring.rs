@@ -1348,11 +1348,11 @@ impl Ring {
         filtered.into_iter()
     }
 
-    /// Return the most optimal peer for caching a given contract.
+    /// Return the most optimal peer for hosting a given contract.
     ///
     /// This function only considers connected peers, not the node itself.
     #[inline]
-    pub fn closest_potentially_caching(
+    pub fn closest_potentially_hosting(
         &self,
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
@@ -1377,9 +1377,9 @@ impl Ring {
         peer
     }
 
-    /// Get k best peers for caching a contract, ranked by routing predictions.
+    /// Get k best peers for hosting a contract, ranked by routing predictions.
     /// Accepts either &ContractKey or &ContractInstanceId (both implement From<&T> for Location).
-    pub fn k_closest_potentially_caching<K>(
+    pub fn k_closest_potentially_hosting<K>(
         &self,
         contract_id: &K,
         skip_list: impl Contains<std::net::SocketAddr> + Clone,
@@ -1468,7 +1468,7 @@ impl Ring {
             target_location = %target_location.as_f64(),
             candidates_found = selected.len(),
             skipped_not_ready,
-            "k_closest_potentially_caching result"
+            "k_closest_potentially_hosting result"
         );
 
         selected.into_iter().cloned().collect()
@@ -2606,8 +2606,8 @@ pub(crate) enum RingError {
     ConnError(#[from] Box<node::ConnectionError>),
     #[error("No ring connections found")]
     EmptyRing,
-    #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
-    NoCachingPeers(ContractInstanceId),
+    #[error("Ran out of, or haven't found any, hosting peers for contract {0}")]
+    NoHostingPeers(ContractInstanceId),
     #[error("Peer has not joined the network yet (no ring location established)")]
     PeerNotJoined,
 }

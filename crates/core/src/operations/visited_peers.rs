@@ -178,7 +178,7 @@ impl Default for VisitedPeers {
     }
 }
 
-/// Implement Contains trait for use with k_closest_potentially_caching.
+/// Implement Contains trait for use with k_closest_potentially_hosting.
 impl crate::util::Contains<SocketAddr> for VisitedPeers {
     fn has_element(&self, target: SocketAddr) -> bool {
         self.probably_visited(target)

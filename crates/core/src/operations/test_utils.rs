@@ -205,8 +205,8 @@ impl MockRing {
         self.host_contract(key, size_bytes);
     }
 
-    /// Simulates k_closest_potentially_caching
-    pub fn k_closest_potentially_caching(
+    /// Simulates k_closest_potentially_hosting
+    pub fn k_closest_potentially_hosting(
         &self,
         key: &ContractKey,
         skip_list: &[SocketAddr],
@@ -534,7 +534,7 @@ mod tests {
         let key = make_contract_key(1);
         let skip = vec![peer1.socket_addr().unwrap()];
 
-        let result = ring.k_closest_potentially_caching(&key, &skip, 3);
+        let result = ring.k_closest_potentially_hosting(&key, &skip, 3);
 
         // peer1 should be skipped
         assert_eq!(result.len(), 2);
@@ -841,7 +841,7 @@ mod tests {
         let contract_key = make_contract_key(1);
         let candidates = node
             .ring
-            .k_closest_potentially_caching(&contract_key, &[], 3);
+            .k_closest_potentially_hosting(&contract_key, &[], 3);
 
         assert_eq!(candidates.len(), 3, "Should return all 3 candidates");
         assert!(candidates.contains(&peer1));

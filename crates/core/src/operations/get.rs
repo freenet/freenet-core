@@ -212,7 +212,7 @@ pub(crate) async fn request_get(
         };
 
         // Find peers to query - we prefer network over local cache for freshness
-        let candidates = op_manager.ring.k_closest_potentially_caching(
+        let candidates = op_manager.ring.k_closest_potentially_hosting(
             instance_id,
             &visited,
             DEFAULT_MAX_BREADTH,
@@ -725,7 +725,7 @@ impl GetOp {
                     new_visited.mark_visited(*addr);
                 }
 
-                let mut new_candidates = op_manager.ring.k_closest_potentially_caching(
+                let mut new_candidates = op_manager.ring.k_closest_potentially_hosting(
                     &instance_id,
                     &new_visited,
                     DEFAULT_MAX_BREADTH,
@@ -1575,7 +1575,7 @@ impl Operation for GetOp {
 
                                 // Get new candidates excluding all tried peers
                                 let mut new_candidates =
-                                    op_manager.ring.k_closest_potentially_caching(
+                                    op_manager.ring.k_closest_potentially_hosting(
                                         &instance_id,
                                         &new_visited,
                                         DEFAULT_MAX_BREADTH,
@@ -2854,7 +2854,7 @@ async fn try_forward_or_return(
         );
         (None, vec![])
     } else {
-        let mut candidates = op_manager.ring.k_closest_potentially_caching(
+        let mut candidates = op_manager.ring.k_closest_potentially_hosting(
             &instance_id,
             &new_visited,
             DEFAULT_MAX_BREADTH,

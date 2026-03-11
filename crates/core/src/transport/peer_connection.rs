@@ -2335,15 +2335,15 @@ mod tests {
         });
         assert_fast_serialize("NeighborHostingMessage", &cache_msg);
 
-        // Large cache state response (worst case for NeighborHosting)
+        // Large hosting state response (worst case for NeighborHosting)
         let large_cache = NetMessage::V1(NetMessageV1::NeighborHosting {
-            message: NeighborHostingMessage::CacheStateResponse {
+            message: NeighborHostingMessage::HostingStateResponse {
                 contracts: (0..100)
                     .map(|i| ContractInstanceId::new([i as u8; 32]))
                     .collect(),
             },
         });
-        assert_fast_serialize("Large CacheStateResponse", &large_cache);
+        assert_fast_serialize("Large HostingStateResponse", &large_cache);
     }
 
     /// Test that flightsize is properly accounted for retransmitted packets.

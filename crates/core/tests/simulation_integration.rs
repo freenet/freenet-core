@@ -1650,14 +1650,14 @@ fn test_turmoil_with_real_simulation_socket() -> turmoil::Result {
 // Subscription Topology Validation
 // =============================================================================
 // These tests validate the subscription topology infrastructure to detect
-// issues like bidirectional cycles (#2720), orphan seeders (#2719), etc.
+// issues like bidirectional cycles (#2720), orphan hosters (#2719), etc.
 
 /// Source detection threshold: peers within 5% of ring distance to contract
 /// are considered sources. Must match SOURCE_THRESHOLD in topology_registry.rs.
 const SOURCE_THRESHOLD: f64 = 0.05;
 
-/// Network name for single seeder topology test.
-const SINGLE_SEEDER_NETWORK: &str = "single-seeder-test";
+/// Network name for single hoster topology test.
+const SINGLE_HOSTER_NETWORK: &str = "single-hoster-test";
 
 /// Calculate ring distance (handles wrap-around at 0/1 boundary).
 fn ring_distance(a: f64, b: f64) -> f64 {
@@ -1665,7 +1665,7 @@ fn ring_distance(a: f64, b: f64) -> f64 {
     diff.min(1.0 - diff)
 }
 
-/// Test topology capture with a single seeder (gateway only).
+/// Test topology capture with a single hoster (gateway only).
 ///
 /// This test validates the topology infrastructure without triggering the
 /// bidirectional cycle issue (#2720) by using only a single subscriber.
@@ -1679,9 +1679,9 @@ fn ring_distance(a: f64, b: f64) -> f64 {
 ///
 /// ## Related
 /// - For Issue #2720 (bidirectional cycles), that bug is now fixed
-/// - For Issue #2755 (orphan/disconnected seeders), see `test_orphan_seeders_no_source` (ignored)
+/// - For Issue #2755 (orphan/disconnected hosters), see `test_orphan_hosters_no_source` (ignored)
 #[test_log::test]
-fn test_topology_single_seeder() {
+fn test_topology_single_hoster() {
     use freenet::dev_tool::{
         validate_topology_from_snapshots, Location, NodeLabel, ScheduledOperation, SimOperation,
     };
@@ -1697,7 +1697,7 @@ fn test_topology_single_seeder() {
     // Create SimNetwork and get gateway location
     let (sim, gateway_location) = rt.block_on(async {
         let sim = SimNetwork::new(
-            SINGLE_SEEDER_NETWORK,
+            SINGLE_HOSTER_NETWORK,
             1,  // 1 gateway
             2,  // 2 peers (they won't subscribe)
             7,  // max_htl
@@ -1731,7 +1731,7 @@ fn test_topology_single_seeder() {
     // Schedule only ONE operation: gateway PUTs the contract with subscribe=true
     // No other nodes subscribe - this avoids #2720 bidirectional cycle issue
     let operations = vec![ScheduledOperation::new(
-        NodeLabel::gateway(SINGLE_SEEDER_NETWORK, 0),
+        NodeLabel::gateway(SINGLE_HOSTER_NETWORK, 0),
         SimOperation::Put {
             contract: contract.clone(),
             state: initial_state.clone(),
@@ -1808,17 +1808,17 @@ fn test_topology_single_seeder() {
     tracing::info!(
         "Topology validation: cycles={}, orphans={}, disconnected={}, unreachable={}, proximity={}",
         result.bidirectional_cycles.len(),
-        result.orphan_seeders.len(),
+        result.orphan_hosters.len(),
         result.disconnected_upstream.len(),
-        result.unreachable_seeders.len(),
+        result.unreachable_hosters.len(),
         result.proximity_violations.len()
     );
 
     // CRITICAL: With only one subscriber, there should NEVER be cycles
-    // This is the primary assertion - single seeder cannot form cycles
+    // This is the primary assertion - single hoster cannot form cycles
     assert!(
         result.bidirectional_cycles.is_empty(),
-        "Single seeder should have no bidirectional cycles, found: {:?}",
+        "Single hoster should have no bidirectional cycles, found: {:?}",
         result.bidirectional_cycles
     );
 
@@ -1832,28 +1832,28 @@ fn test_topology_single_seeder() {
             SOURCE_THRESHOLD
         );
 
-        // Source seeder should have healthy topology
+        // Source hoster should have healthy topology
         assert!(
-            result.orphan_seeders.is_empty(),
-            "Source seeder (within threshold) should not be marked as orphan, found: {:?}",
-            result.orphan_seeders
+            result.orphan_hosters.is_empty(),
+            "Source hoster (within threshold) should not be marked as orphan, found: {:?}",
+            result.orphan_hosters
         );
 
         assert!(
             result.disconnected_upstream.is_empty(),
-            "Source seeder (within threshold) should not be disconnected, found: {:?}",
+            "Source hoster (within threshold) should not be disconnected, found: {:?}",
             result.disconnected_upstream
         );
 
         assert!(
-            result.unreachable_seeders.is_empty(),
-            "Source seeder should have no unreachable seeders, found: {:?}",
-            result.unreachable_seeders
+            result.unreachable_hosters.is_empty(),
+            "Source hoster should have no unreachable hosters, found: {:?}",
+            result.unreachable_hosters
         );
 
         assert!(
             result.is_healthy(),
-            "Single source seeder topology should be healthy, got {} issues",
+            "Single source hoster topology should be healthy, got {} issues",
             result.issue_count
         );
     } else {
@@ -1862,12 +1862,12 @@ fn test_topology_single_seeder() {
             gateway_distance, SOURCE_THRESHOLD
         );
 
-        // Non-source seeder will have orphan/disconnected issues - this is expected behavior
+        // Non-source hoster will have orphan/disconnected issues - this is expected behavior
         // The key assertion (no cycles) already passed above
-        if !result.orphan_seeders.is_empty() {
+        if !result.orphan_hosters.is_empty() {
             tracing::info!(
                 "Expected: Gateway flagged as orphan (not a source, no upstream): {:?}",
-                result.orphan_seeders
+                result.orphan_hosters
             );
         }
         if !result.disconnected_upstream.is_empty() {
@@ -1879,7 +1879,7 @@ fn test_topology_single_seeder() {
     }
 
     tracing::info!(
-        "Single seeder topology test passed - gateway_is_source={}, cycles=0, other_issues={}",
+        "Single hoster topology test passed - gateway_is_source={}, cycles=0, other_issues={}",
         gateway_is_source,
         result.issue_count
     );
@@ -2902,7 +2902,7 @@ fn test_stale_summary_cache_multiple_branches() {
 /// Test: CRDT convergence in large network (12 nodes).
 ///
 /// This test validates that updates propagate correctly and converge
-/// in a larger network where update broadcasts must reach all 12 seeders.
+/// in a larger network where update broadcasts must reach all 12 hosters.
 #[test_log::test]
 fn test_max_downstream_limit_reached() {
     const SEED: u64 = 0x0A0D_0001_0001;
@@ -3297,7 +3297,7 @@ fn test_subscription_broadcast_propagation() {
 ///
 /// ## What This Test Does
 ///
-/// 1. Node 1 PUTs a contract (becomes the seeder/fulfiller)
+/// 1. Node 1 PUTs a contract (becomes the hoster/fulfiller)
 /// 2. Node 2 SUBSCRIBES — the subscribe routes through the gateway to node 1
 /// 3. Node 1 sends an UPDATE
 /// 4. Verify node 2 received the update (has matching state)
@@ -3403,13 +3403,13 @@ fn test_subscription_relay_propagation() {
         peer_states.keys().collect::<Vec<_>>()
     );
 
-    // ASSERTION: At least 3 peers must have state (node-1 seeder + gateway relay + node-2 subscriber)
+    // ASSERTION: At least 3 peers must have state (node-1 hoster + gateway relay + node-2 subscriber)
     // Without the relay fix, only node-1 and gateway would have state (2 peers);
     // node-2 wouldn't receive updates because the gateway didn't register it as downstream.
     assert!(
         peer_states.len() >= 3,
         "BUG (#3390): Relay subscription failed! Only {} peer(s) have state for contract {}. \
-         Expected at least 3 (seeder + gateway relay + subscriber). \
+         Expected at least 3 (hoster + gateway relay + subscriber). \
          The relay node (gateway) likely didn't register the subscriber as downstream. \
          Peers with state: {:?}",
         peer_states.len(),
@@ -6615,7 +6615,7 @@ async fn test_connection_growth_stall_regression() {
 /// timeout (`OPTIMISTIC_READY_TIMEOUT`) uses real wall-clock `Instant::now()`,
 /// not virtual time, so it cannot fire during this test (~0.5s wall-clock).
 ///
-/// Before the fix, `k_closest_potentially_caching` returned empty → GET failed
+/// Before the fix, `k_closest_potentially_hosting` returned empty → GET failed
 /// with EmptyRing. After the fix, it falls back to using not-yet-ready peers.
 /// Verified: this test FAILS without the fallback (confirmed by reverting the
 /// fix and observing the assertion fire).
@@ -6707,7 +6707,7 @@ fn test_get_succeeds_despite_readiness_gating() {
     assert!(
         node1_state.is_some(),
         "Node 1 should have contract state after GET, but storage is empty. \
-         This indicates k_closest_potentially_caching returned empty due to \
+         This indicates k_closest_potentially_hosting returned empty due to \
          readiness gating (the bug from #3356/#3423)."
     );
 

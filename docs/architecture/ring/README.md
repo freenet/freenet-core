@@ -250,7 +250,7 @@ The `HostingManager` maintains an LRU cache of hosted contracts:
 | Min TTL | 300s | Recently accessed contracts protected |
 
 **Operations:**
-- `seed_contract()` - Add to hosting cache
+- `host_contract()` - Add to hosting cache
 - `host_contract()` - Record access (updates TTL)
 - `should_host()` - Check if should continue hosting
 
@@ -293,9 +293,9 @@ flowchart LR
 | Method | Purpose |
 |--------|---------|
 | `open_connections()` | Current connection count |
-| `k_closest_potentially_caching()` | Find k best peers for contract |
+| `k_closest_potentially_hosting()` | Find k best peers for contract |
 | `subscribe()` / `unsubscribe()` | Subscription management |
-| `seed_contract()` / `host_contract()` | Hosting cache management |
+| `host_contract()` | Hosting cache management |
 | `is_hosting_contract()` | Check if hosting |
 
 ### ConnectionManager
