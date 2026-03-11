@@ -733,6 +733,20 @@ impl Operation for UpdateOp {
                     };
                     tracing::debug!("Contract successfully updated - BroadcastTo - update");
 
+                    // Ensure this contract is in the interest hash index so the
+                    // heartbeat mechanism can detect staleness and repair divergence.
+                    // Without this, a node that receives a contract ONLY via BroadcastTo
+                    // (never via PUT/GET/SUBSCRIBE) has state stored but is invisible
+                    // to the interest-sync protocol — no heartbeat hashes are sent,
+                    // no Summaries are exchanged, and stale state persists forever.
+                    //
+                    // We use register_local_interest (not register_local_seeding)
+                    // to index the hash without changing the node's seeding status.
+                    // The node won't initiate repairs from its side, but majority
+                    // nodes that DO have local interest will detect the staleness
+                    // via Summaries exchange and broadcast the correct state.
+                    op_manager.interest_manager.register_local_interest(key);
+
                     // NOTE: We intentionally do NOT refresh hosting TTL on UPDATE.
                     // Only GET and SUBSCRIBE should extend hosting lifetime.
                     // If UPDATE refreshed TTL, a malicious contract author could spam
@@ -748,6 +762,13 @@ impl Operation for UpdateOp {
                         changed,
                     ) {
                         op_manager.ring.register_events(Either::Left(event)).await;
+                    } else {
+                        tracing::warn!(
+                            tx = %id,
+                            %key,
+                            changed,
+                            "BroadcastApplied telemetry skipped — get_own_peer_id returned None"
+                        );
                     }
 
                     if !changed {

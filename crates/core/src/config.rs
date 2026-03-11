@@ -2193,6 +2193,7 @@ impl GlobalSimulationTime {
 
 std::thread_local! {
     static SIMULATION_TRANSPORT_OPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_IDLE_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Opt-in transport timer optimization for large-scale simulations.
@@ -2227,6 +2228,35 @@ impl SimulationTransportOpt {
     /// Returns `true` if relaxed transport timers are enabled on this thread.
     pub fn is_enabled() -> bool {
         SIMULATION_TRANSPORT_OPT.with(|f| f.get())
+    }
+}
+
+/// Extended idle timeout for simulation connections.
+///
+/// In `start_paused(true)` simulations, virtual time can jump past the default
+/// 120s idle timeout when tasks await `spawn_blocking` (WASM execution). This
+/// causes spurious connection drops even with keepalive enabled, because tokio
+/// auto-advances time while the blocking thread pool runs.
+///
+/// This flag is separate from `SimulationTransportOpt` because ALL simulation
+/// sizes need the extended timeout, whereas only large simulations (50+ nodes)
+/// benefit from relaxed ACK intervals and disabled keepalive.
+pub struct SimulationIdleTimeout;
+
+impl SimulationIdleTimeout {
+    /// Enable extended idle timeout for the current thread.
+    pub fn enable() {
+        SIMULATION_IDLE_TIMEOUT.with(|f| f.set(true));
+    }
+
+    /// Disable extended idle timeout (restore production behavior).
+    pub fn disable() {
+        SIMULATION_IDLE_TIMEOUT.with(|f| f.set(false));
+    }
+
+    /// Returns `true` if extended idle timeout is enabled on this thread.
+    pub fn is_enabled() -> bool {
+        SIMULATION_IDLE_TIMEOUT.with(|f| f.get())
     }
 }
 

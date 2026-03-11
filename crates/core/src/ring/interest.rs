@@ -84,7 +84,18 @@ const DELTA_CACHE_SIZE: usize = 1024;
 /// Timeout for contract handler queries in the broadcast path (summary and
 /// delta computation). Much shorter than the default 300s to prevent spawned
 /// broadcast tasks from accumulating when the contract handler is slow.
-const BROADCAST_CH_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// In simulation mode (`start_paused(true)`), virtual time auto-advances while
+/// `spawn_blocking` threads run WASM execution. A 10s timeout can fire before
+/// the handler responds if WASM takes >10 virtual seconds, silently dropping
+/// broadcasts. Use 300s (the default handler timeout) in simulations.
+fn broadcast_ch_timeout() -> Duration {
+    if crate::config::SimulationIdleTimeout::is_enabled() {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(10)
+    }
+}
 
 /// Identifies a peer for interest tracking purposes.
 ///
@@ -647,6 +658,13 @@ impl<T: TimeSource> InterestManager<T> {
     /// Returns true if this caused us to lose interest (no other reasons remain).
     pub fn unregister_local_seeding(&self, contract: &ContractKey) -> bool {
         if let Some(mut entry) = self.local_interests.get_mut(contract) {
+            if !entry.seeding {
+                // Was never seeding — don't remove the entry. It may exist as a
+                // "weak" registration from register_local_interest (BroadcastTo
+                // receivers) which keeps the contract in the hash index for the
+                // interest-sync heartbeat protocol.
+                return false;
+            }
             entry.seeding = false;
             let lost_interest = !entry.is_interested();
             if lost_interest {
@@ -728,6 +746,16 @@ impl<T: TimeSource> InterestManager<T> {
             .get(contract)
             .map(|entry| entry.is_interested())
             .unwrap_or(false)
+    }
+
+    /// Check if a contract is registered locally (has any entry in local_interests).
+    ///
+    /// Unlike `has_local_interest`, this returns true even for passive entries
+    /// created by `register_local_interest` (e.g., contracts received only via
+    /// BroadcastTo). These nodes have state stored but aren't actively
+    /// seeding/subscribing/client.
+    pub fn has_contract_registered(&self, contract: &ContractKey) -> bool {
+        self.local_interests.contains_key(contract)
     }
 
     /// Remove local interest entry if no longer interested.
@@ -880,8 +908,13 @@ impl<T: TimeSource> InterestManager<T> {
         let has_local_interest = self.has_local_interest(contract);
 
         if !has_peer_interest && !has_local_interest {
-            self.unindex_contract_hash(contract);
-            // Clean up summary notification timestamp when no interest remains
+            // NOTE: We intentionally do NOT unindex from contract_hash_index here.
+            // The contract's state may still exist in the store even after interest
+            // is removed (e.g., hosting cache eviction removes seeding status but
+            // leaves state in place). Keeping the hash indexed allows the interest-
+            // sync heartbeat protocol to detect and repair stale state on this node.
+            // The hash index entry will be removed when the state is actually deleted
+            // from the store via explicit_remove_contract_hash().
             self.summary_notify_timestamps.remove(contract);
         }
     }
@@ -966,7 +999,7 @@ impl<T: TimeSource> InterestManager<T> {
         match op_manager
             .notify_contract_handler_with_timeout(
                 ContractHandlerEvent::GetSummaryQuery { key: *key },
-                BROADCAST_CH_TIMEOUT,
+                broadcast_ch_timeout(),
             )
             .await
         {
@@ -1050,7 +1083,7 @@ impl<T: TimeSource> InterestManager<T> {
                     key: *key,
                     their_summary: their_summary.clone(),
                 },
-                BROADCAST_CH_TIMEOUT,
+                broadcast_ch_timeout(),
             )
             .await
         {
