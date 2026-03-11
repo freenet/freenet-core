@@ -125,6 +125,17 @@ impl CommandSender {
         tracing::info!(?cmd, "handshake: sending command");
         self.0.send(cmd).await
     }
+
+    /// Non-blocking send that returns false if the channel is full or closed.
+    /// Use this in code paths that run inside the event loop's critical section
+    /// (e.g., zombie cleanup) to avoid deadlocking with the handshake driver.
+    pub fn try_send(&self, cmd: Command) -> bool {
+        match self.0.try_send(cmd) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
 }
 
 /// Stream wrapper around the asynchronous handshake driver.
@@ -431,5 +442,28 @@ mod tests {
             .expect("second peer should still be tracked independently");
         assert_eq!(second.peer, peer_b);
         assert!(second.transient);
+    }
+
+    #[test]
+    fn command_sender_try_send_returns_false_when_full() {
+        // Channel capacity 1 — fill it, then verify try_send returns false
+        let (tx, _rx) = mpsc::channel(1);
+        let sender = CommandSender(tx);
+        let peer = make_peer(4500);
+
+        // First send should succeed
+        assert!(sender.try_send(Command::DropConnection { peer: peer.clone() }));
+        // Channel is now full — second send should return false, not block
+        assert!(!sender.try_send(Command::DropConnection { peer }));
+    }
+
+    #[test]
+    fn command_sender_try_send_returns_false_when_closed() {
+        let (tx, rx) = mpsc::channel(16);
+        let sender = CommandSender(tx);
+        let peer = make_peer(4600);
+        drop(rx); // Close the channel
+
+        assert!(!sender.try_send(Command::DropConnection { peer }));
     }
 }
