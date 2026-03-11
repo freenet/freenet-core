@@ -37,3 +37,14 @@ pub(super) const TOPOLOGY_WEIGHT: f64 = 1.0;
 /// A topology_value of 2.0 means the gap would be 2× expected — this peer
 /// fills a critical position in the Kleinberg distribution.
 pub(super) const TOPOLOGY_PROTECTION_THRESHOLD: f64 = 2.0;
+
+/// Floor value for expected gap calculations when the per-side point count is
+/// very low or zero. Used in two contexts:
+///
+/// 1. When a half-ring is completely empty (side_count=0), the expected gap is
+///    set to this value so that the gap ratio (1.0 / EXPECTED_GAP_FLOOR = 100)
+///    is large enough to always trigger a swap.
+///
+/// 2. As a floor for ln(k) when k=1 (ln(1)=0 would make expected gap 0,
+///    causing division issues).
+pub(super) const EXPECTED_GAP_FLOOR: f64 = 0.01;

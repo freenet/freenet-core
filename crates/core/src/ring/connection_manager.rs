@@ -651,6 +651,10 @@ impl ConnectionManager {
     ///
     /// Measures how much the candidate improves the 1/d distance distribution by
     /// finding the candidate's min distance to its nearest neighbor in log-space.
+    ///
+    /// Uses non-directional scoring: connection acceptance happens during bootstrap
+    /// when the ring is forming. Directional (CW/CCW) analysis is applied later
+    /// during steady-state topology management (swaps and pruning in topology.rs).
     fn compute_kleinberg_score(&self, my_location: Location, candidate: Location) -> f64 {
         let candidate_distance = my_location.distance(candidate).as_f64();
         let connections = self.connections_by_location.read();

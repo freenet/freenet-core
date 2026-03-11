@@ -9,7 +9,7 @@
 //! the largest gap in the node's current connection distribution in log-distance space.
 //! This makes target selection adaptive — nodes converge to the ideal 1/d distribution
 //! faster by actively seeking the most deficient distance range. See
-//! `small_world_rand::gap_target`.
+//! `small_world_rand::gap_target_directional`.
 //!
 //! When the node has no existing connections or its own location is unknown (during very
 //! early bootstrap), the fallback is random Kleinberg 1/d sampling via inverse CDF:
@@ -36,9 +36,10 @@
 //! ## Accepting Incoming Connections
 //!
 //! All inbound connection candidates are scored by the **Kleinberg gap score**: the
-//! candidate's minimum distance to its nearest neighbor in log-distance space. Candidates
-//! that fill the largest gap in the distribution score highest. See
-//! `small_world_rand::kleinberg_score`.
+//! candidate's minimum distance to its nearest neighbor in log-distance space on its
+//! own half-ring (CW or CCW), with a deficit bonus for the under-covered side.
+//! Candidates that fill the largest directional gap score highest. See
+//! `small_world_rand::kleinberg_score_directional`.
 //!
 //! Two acceptance policies use this score:
 //!
@@ -334,7 +335,7 @@ impl TopologyManager {
     ///
     /// When adding connections, targets are selected using gap-based targeting:
     /// the center of the largest gap in the node's connection distribution in
-    /// log-distance space (see `small_world_rand::gap_target`).
+    /// log-distance space (see `small_world_rand::gap_target_directional`).
     /// When own location is unknown, random targets are used as fallback.
     pub(crate) fn adjust_topology(
         &mut self,
@@ -501,12 +502,12 @@ impl TopologyManager {
     ) -> Vec<Location> {
         match my_location {
             Some(loc) => {
-                let distances: Vec<f64> = neighbor_locations
+                let signed_distances: Vec<f64> = neighbor_locations
                     .keys()
-                    .map(|nloc| loc.distance(*nloc).as_f64())
+                    .map(|nloc| loc.signed_distance(*nloc))
                     .collect();
                 (0..count)
-                    .map(|_| small_world_rand::gap_target(*loc, distances.iter().copied()))
+                    .map(|_| small_world_rand::gap_target_directional(*loc, &signed_distances))
                     .collect()
             }
             None => (0..count).map(|_| Location::random()).collect(),
@@ -546,37 +547,37 @@ impl TopologyManager {
         let function_span = span!(Level::INFO, "remove_connections");
         let _enter = function_span.enter();
 
-        // Collect all connection distances for topology scoring.
-        let all_distances: Vec<f64> = match my_location {
+        // Collect all signed connection distances for directional topology scoring.
+        let all_signed_distances: Vec<f64> = match my_location {
             Some(my_loc) => neighbor_locations
                 .keys()
-                .map(|nloc| my_loc.distance(*nloc).as_f64())
+                .map(|nloc| my_loc.signed_distance(*nloc))
                 .collect(),
             None => Vec::new(),
         };
 
         // Build a peer-location index for O(1) lookup (avoids O(N²) scan).
-        // Stores (distance, peers_at_same_location) for each peer.
+        // Stores (signed_distance, peers_at_same_location) for each peer.
         let peer_to_loc_info: std::collections::HashMap<PeerKeyLocation, (f64, usize)> =
             match my_location {
                 Some(my_loc) => neighbor_locations
                     .iter()
                     .flat_map(|(loc, conns)| {
-                        let dist = my_loc.distance(*loc).as_f64();
+                        let signed_dist = my_loc.signed_distance(*loc);
                         let count = conns.len();
                         conns
                             .iter()
-                            .map(move |c| (c.location.clone(), (dist, count)))
+                            .map(move |c| (c.location.clone(), (signed_dist, count)))
                     })
                     .collect(),
                 None => std::collections::HashMap::new(),
             };
 
-        // Pass 1: collect candidates with raw routing values and distances.
+        // Pass 1: collect candidates with raw routing values and signed distances.
         struct Candidate {
             peer: PeerKeyLocation,
             routing_value: f64,
-            peer_distance: Option<f64>,
+            peer_signed_distance: Option<f64>,
             peers_at_location: usize,
         }
         let mut candidates = Vec::new();
@@ -602,15 +603,15 @@ impl TopologyManager {
                 } else {
                     0.0
                 };
-                let (peer_distance, peers_at_location) = match peer_to_loc_info.get(&peer) {
-                    Some(&(dist, count)) => (Some(dist), count),
+                let (peer_signed_distance, peers_at_location) = match peer_to_loc_info.get(&peer) {
+                    Some(&(sd, count)) => (Some(sd), count),
                     None => (None, 1),
                 };
 
                 candidates.push(Candidate {
                     peer,
                     routing_value,
-                    peer_distance,
+                    peer_signed_distance,
                     peers_at_location,
                 });
             }
@@ -632,12 +633,12 @@ impl TopologyManager {
                 0.0
             };
 
-            let effective_value = match c.peer_distance {
-                Some(dist) => {
+            let effective_value = match c.peer_signed_distance {
+                Some(signed_dist) => {
                     match composite_score(
                         normalized_routing,
-                        dist,
-                        &all_distances,
+                        signed_dist,
+                        &all_signed_distances,
                         c.peers_at_location,
                     ) {
                         Some(score) => score,
@@ -708,23 +709,24 @@ impl TopologyManager {
             return TopologyAdjustment::NoChange;
         };
 
-        let distances: Vec<f64> = neighbor_locations
+        let signed_distances: Vec<f64> = neighbor_locations
             .keys()
-            .map(|nloc| my_loc.distance(*nloc).as_f64())
+            .map(|nloc| my_loc.signed_distance(*nloc))
             .collect();
 
-        let (largest_gap, point_count) =
-            small_world_rand::largest_gap_size(distances.iter().copied());
-
-        if point_count == 0 {
-            return TopologyAdjustment::NoChange;
-        }
+        let (largest_gap, side_count) =
+            small_world_rand::largest_gap_size_directional(&signed_distances);
 
         // Expected largest gap for k uniform points on [0,1]: ~ln(k)/k.
-        // point_count is the number of distinct in-range distances from the
-        // gap analysis, which filters to [D_MIN, D_MAX] and deduplicates.
-        let k = point_count as f64;
-        let expected_gap = k.ln() / k;
+        // side_count is the point count on the side that produced the worst gap.
+        // When a side is empty (count=0, gap=1.0), we use a very small expected gap
+        // to ensure a swap is triggered.
+        let expected_gap = if side_count == 0 {
+            EXPECTED_GAP_FLOOR
+        } else {
+            let k = side_count as f64;
+            k.ln().max(EXPECTED_GAP_FLOOR) / k
+        };
 
         // Swap probability proportional to how much the gap exceeds expected.
         // When gap == expected: excess = 0, no swap.
@@ -760,11 +762,16 @@ impl TopologyManager {
                 conns.iter().map(move |conn| (loc, conn, count))
             })
             .map(|(loc, conn, count)| {
-                let peer_dist = my_loc.distance(*loc).as_f64();
+                let peer_signed_dist = my_loc.signed_distance(*loc);
                 let routing_value = self
                     .outbound_request_counter
                     .get_request_count(&conn.location) as f64;
-                (conn.location.clone(), peer_dist, routing_value, count)
+                (
+                    conn.location.clone(),
+                    peer_signed_dist,
+                    routing_value,
+                    count,
+                )
             })
             .collect();
 
@@ -777,13 +784,18 @@ impl TopologyManager {
         // routing value and topology importance, respecting the topology guard.
         let remove = peers_with_routing
             .into_iter()
-            .filter_map(|(peer, peer_dist, routing_value, peers_at_loc)| {
+            .filter_map(|(peer, peer_signed_dist, routing_value, peers_at_loc)| {
                 let normalized = if max_routing > 0.0 {
                     routing_value / max_routing
                 } else {
                     0.0
                 };
-                let score = composite_score(normalized, peer_dist, &distances, peers_at_loc)?;
+                let score = composite_score(
+                    normalized,
+                    peer_signed_dist,
+                    &signed_distances,
+                    peers_at_loc,
+                )?;
                 Some((peer, score))
             })
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
@@ -794,7 +806,7 @@ impl TopologyManager {
         };
 
         // Target the largest gap for the replacement connection.
-        let add_location = small_world_rand::gap_target(my_loc, distances.iter().copied());
+        let add_location = small_world_rand::gap_target_directional(my_loc, &signed_distances);
 
         info!(
             largest_gap,
@@ -848,22 +860,23 @@ fn bootstrap_target_locations(
     }
 }
 
-/// Compute the topology value for a peer at `peer_distance` given the full
-/// set of connection distances. Returns `None` if the peer is topology-critical
+/// Compute the topology value for a peer given its signed distance and the full
+/// set of signed connection distances. Returns `None` if the peer is topology-critical
 /// (removal would create a gap > `TOPOLOGY_PROTECTION_THRESHOLD` times expected).
+///
+/// Uses directional (CW/CCW) gap analysis: the removal gap is computed only on
+/// the peer's own half-ring, giving an accurate measure of its importance to
+/// that side's Kleinberg distribution.
 ///
 /// `peers_at_same_location`: how many connections share this peer's Location.
 /// If > 1, removing this peer doesn't change the topology (others still cover it),
 /// so the topology value is 0.0 (most prunable from topology perspective).
-///
-/// The topology value is the removal gap normalized by the expected gap (2/k),
-/// so a value of 1.0 means the peer is averagely positioned.
 fn topology_value(
-    peer_distance: f64,
-    all_distances: &[f64],
+    peer_signed_distance: f64,
+    all_signed_distances: &[f64],
     peers_at_same_location: usize,
 ) -> Option<f64> {
-    let k = all_distances.len();
+    let k = all_signed_distances.len();
     if k < 3 {
         return Some(1.0);
     }
@@ -871,10 +884,14 @@ fn topology_value(
     if peers_at_same_location > 1 {
         return Some(0.0);
     }
-    let gap = small_world_rand::removal_gap(peer_distance, all_distances.iter().copied());
-    // With k points on [0,1], there are k+1 gaps (including boundaries).
-    // Removing one point merges two adjacent gaps: expected removal gap = 2/(k+1).
-    let expected_gap = 2.0 / (k + 1) as f64;
+    let (gap, same_side_count) =
+        small_world_rand::removal_gap_directional(peer_signed_distance, all_signed_distances);
+    // Directional removal gap is computed on one half-ring (CW or CCW).
+    // Use the actual count on that side, not k/2, to handle skewed distributions.
+    // Removing one of k_side peers merges two adjacent gaps:
+    // expected removal gap = 2/(k_side + 1).
+    let k_side = (same_side_count as f64).max(1.0);
+    let expected_gap = 2.0 / (k_side + 1.0);
     let value = gap / expected_gap;
     if value > TOPOLOGY_PROTECTION_THRESHOLD {
         None // topology-critical
@@ -886,15 +903,21 @@ fn topology_value(
 /// Compute the composite pruning score for a peer: lower = more likely to prune.
 ///
 /// `normalized_routing` should be in [0, 1] (divided by max routing value among peers).
+/// `peer_signed_distance`: signed distance to the peer (positive=CW, negative=CCW).
+/// `all_signed_distances`: signed distances to all neighbors.
 /// `peers_at_same_location`: how many connections share this peer's Location.
 /// Returns `None` if the peer is topology-critical and should not be pruned.
 fn composite_score(
     normalized_routing: f64,
-    peer_distance: f64,
-    all_distances: &[f64],
+    peer_signed_distance: f64,
+    all_signed_distances: &[f64],
     peers_at_same_location: usize,
 ) -> Option<f64> {
-    let topo = topology_value(peer_distance, all_distances, peers_at_same_location)?;
+    let topo = topology_value(
+        peer_signed_distance,
+        all_signed_distances,
+        peers_at_same_location,
+    )?;
     Some(normalized_routing + TOPOLOGY_WEIGHT * topo)
 }
 
@@ -916,9 +939,9 @@ fn select_fallback_peer_to_drop(
             .map(|conn| conn.location.clone());
     };
 
-    let all_distances: Vec<f64> = neighbor_locations
+    let all_signed_distances: Vec<f64> = neighbor_locations
         .keys()
-        .map(|nloc| my_loc.distance(*nloc).as_f64())
+        .map(|nloc| my_loc.signed_distance(*nloc))
         .collect();
 
     // Pick the peer whose removal creates the smallest gap (least important)
@@ -926,13 +949,13 @@ fn select_fallback_peer_to_drop(
         .iter()
         .flat_map(|(loc, conns)| conns.iter().map(move |conn| (loc, conn)))
         .min_by(|(loc_a, _), (loc_b, _)| {
-            let gap_a = small_world_rand::removal_gap(
-                my_loc.distance(**loc_a).as_f64(),
-                all_distances.iter().copied(),
+            let (gap_a, _) = small_world_rand::removal_gap_directional(
+                my_loc.signed_distance(**loc_a),
+                &all_signed_distances,
             );
-            let gap_b = small_world_rand::removal_gap(
-                my_loc.distance(**loc_b).as_f64(),
-                all_distances.iter().copied(),
+            let (gap_b, _) = small_world_rand::removal_gap_directional(
+                my_loc.signed_distance(**loc_b),
+                &all_signed_distances,
             );
             gap_a.partial_cmp(&gap_b).unwrap_or(Ordering::Equal)
         })
@@ -1817,14 +1840,16 @@ mod tests {
         };
         let mut tm = TopologyManager::new(limits);
 
-        // Create 10 peers evenly distributed in log-distance space.
+        // Create 10 peers evenly distributed in log-distance space on BOTH sides.
         let my_location = Location::new(0.5);
         let d_at = |u: f64| 0.001_f64 * (0.5_f64 / 0.001).powf(u); // D_MIN_TARGET * (D_MAX/D_MIN_TARGET)^u
         let mut neighbor_locations: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
         for i in 0..10 {
-            let u = (i as f64 + 0.5) / 10.0; // evenly spaced in [0, 1]
-            let dist = d_at(u);
-            let loc = Location::new_rounded(my_location.as_f64() + dist);
+            let u = (i as f64 + 0.5) / 5.0; // 5 evenly spaced per side
+            let dist = d_at(u.min(0.999)); // clamp for safety
+                                           // Alternate CW and CCW
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let loc = Location::new_rounded(my_location.as_f64() + sign * dist);
             let peer = PeerKeyLocation::random();
             tm.outbound_request_counter.record_request(peer.clone());
             neighbor_locations
@@ -1973,7 +1998,8 @@ mod tests {
         let mut resource_manager = setup_topology_manager(1000.0);
         let my_location = Location::new(0.5);
 
-        // 5 clustered peers at short distances (0.01 apart)
+        // 5 clustered peers at short distances on CW side,
+        // plus 3 CCW peers for directional balance
         let mut peers = Vec::new();
         let mut neighbor_locations: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
         for i in 0..5 {
@@ -1986,7 +2012,7 @@ mod tests {
             peers.push(peer);
         }
 
-        // 1 isolated peer at a long distance — this fills a critical gap
+        // 1 isolated peer at a long distance CW — this fills a critical gap
         let isolated_loc = Location::new(my_location.as_f64() + 0.4);
         let isolated_peer = PeerKeyLocation::random();
         neighbor_locations
@@ -1995,15 +2021,27 @@ mod tests {
             .push(Connection::new(isolated_peer.clone()));
         peers.push(isolated_peer.clone());
 
+        // 3 CCW peers for directional balance (so the test focuses on CW critical peer)
+        for i in 0..3 {
+            let loc = Location::new_rounded(my_location.as_f64() - 0.05 - (i as f64 * 0.1));
+            let peer = PeerKeyLocation::random();
+            neighbor_locations
+                .entry(loc)
+                .or_default()
+                .push(Connection::new(peer.clone()));
+            peers.push(peer);
+        }
+
         // Give all peers high bandwidth usage
         let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
-        let bw_usage = vec![2000, 2000, 2000, 2000, 2000, 2000];
+        let bw_usage = vec![2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000];
         report_resource_usage(&mut resource_manager, &peers, &bw_usage, report_time);
 
         // Give the clustered peers moderate routing; give isolated peer ZERO routing.
         // Without topology protection, the isolated peer would be pruned (worst
         // value-per-bandwidth). With protection, it should be kept.
-        let requests = vec![10, 10, 10, 10, 10, 0];
+        // CCW peers get moderate routing too.
+        let requests = vec![10, 10, 10, 10, 10, 0, 10, 10, 10];
         report_outbound_requests(&mut resource_manager, &peers, &requests);
 
         let adjustment = resource_manager.adjust_topology(
@@ -2051,29 +2089,52 @@ mod tests {
 
     #[test]
     fn test_topology_value_critical_peer_returns_none() {
-        // An isolated peer at a unique position with large gaps on both sides.
-        // With 4 uniform points, expected_gap = 2/5 = 0.4.
-        // If removal creates gap > 2 * 0.4 = 0.8, it's critical.
+        // Tests use signed distances: positive = CW, negative = CCW.
+        // With directional analysis, removal_gap only looks at the peer's own side.
         let d_at = |u: f64| 0.001_f64 * 500.0_f64.powf(u);
 
-        // 4 points: at 0.1, 0.3, 0.5, 0.9 in log-space
-        // Removing 0.5 creates gap from 0.3 to 0.9 = 0.6
-        // expected_gap = 2/5 = 0.4, value = 0.6/0.4 = 1.5 — not critical
-        let distances = [d_at(0.1), d_at(0.3), d_at(0.5), d_at(0.9)];
-        assert!(topology_value(d_at(0.5), &distances, 1).is_some());
+        // 4 points split across sides: 2 CW + 2 CCW, well-spaced.
+        // Removing any one shouldn't be critical (its side still has 1 peer).
+        let distances = [d_at(0.2), d_at(0.8), -d_at(0.2), -d_at(0.8)];
+        assert!(topology_value(d_at(0.2), &distances, 1).is_some());
 
-        // Now: 3 clustered + 1 isolated.
-        // Points at 0.01, 0.02, 0.03, 0.95 in log-space.
-        // Removing 0.95 creates gap from 0.03 to 1.0 = 0.97
-        // expected_gap = 2/5 = 0.4, value = 0.97/0.4 = 2.425 > 2.0 — critical!
-        let distances2 = [d_at(0.01), d_at(0.02), d_at(0.03), d_at(0.95)];
+        // 4 points: 3 clustered CW + 1 isolated CW at far end.
+        // The isolated peer is the sole coverage of the far CW range.
+        // On its CW side: 4 points, removing the isolated one creates
+        // a gap from 0.03 to 1.0 = 0.97 in log-space.
+        // Per-side k_per_side = 4/2 = 2, expected = 2/3 = 0.667,
+        // value = 0.97/0.667 = 1.45. Not critical with 4 total.
+        // With 6 total (3 CW + 3 CCW), k_per_side = 3, expected = 2/4 = 0.5,
+        // value = 0.97/0.5 = 1.94. Still not quite > 2.0.
+        // With 8 total (4 CW + 4 CCW), k_per_side = 4, expected = 2/5 = 0.4,
+        // value = 0.97/0.4 = 2.425 > 2.0 — critical!
+        let distances2 = [
+            d_at(0.01),
+            d_at(0.02),
+            d_at(0.03),
+            d_at(0.95),
+            -d_at(0.1),
+            -d_at(0.3),
+            -d_at(0.6),
+            -d_at(0.9),
+        ];
         assert!(topology_value(d_at(0.95), &distances2, 1).is_none());
     }
 
     #[test]
     fn test_composite_score_returns_none_for_critical() {
         let d_at = |u: f64| 0.001_f64 * 500.0_f64.powf(u);
-        let distances = [d_at(0.01), d_at(0.02), d_at(0.03), d_at(0.95)];
+        // Same setup as topology_value critical test above
+        let distances = [
+            d_at(0.01),
+            d_at(0.02),
+            d_at(0.03),
+            d_at(0.95),
+            -d_at(0.1),
+            -d_at(0.3),
+            -d_at(0.6),
+            -d_at(0.9),
+        ];
 
         // Critical peer → None regardless of routing value
         assert!(composite_score(1.0, d_at(0.95), &distances, 1).is_none());

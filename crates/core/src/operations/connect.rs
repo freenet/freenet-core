@@ -2234,18 +2234,16 @@ pub(crate) async fn join_ring_request(
         // Use gap_target: find the largest gap in our current connections
         // and target its midpoint for Kleinberg-optimal placement.
         if let Some(my_loc) = own.location() {
-            let neighbor_distances: Vec<f64> = op_manager
+            let distances: Vec<f64> = op_manager
                 .ring
                 .connection_manager
                 .location_for_all_peers()
                 .into_iter()
                 .map(|peer_loc| my_loc.distance(peer_loc).as_f64())
                 .collect();
-            if neighbor_distances.len() >= GAP_TARGET_THRESHOLD {
-                let target = crate::topology::small_world_rand::gap_target(
-                    my_loc,
-                    neighbor_distances.into_iter(),
-                );
+            if distances.len() >= GAP_TARGET_THRESHOLD {
+                let target =
+                    crate::topology::small_world_rand::gap_target(my_loc, distances.into_iter());
                 tracing::info!(
                     current_connections,
                     own_location = %my_loc,
@@ -4495,7 +4493,7 @@ mod tests {
     /// This is a regression test for the bootstrap topology bug: before the fix,
     /// join_ring_request always targeted the joiner's own location with up to ±0.25
     /// jitter, producing median connection distance ~0.12 instead of the Kleinberg-
-    /// optimal ~0.02. Now, with ≥3 existing connections, gap_target is used instead.
+    /// optimal ~0.02. Now, with ≥3 existing connections, gap_target is used.
     #[test]
     fn test_gap_target_produces_shorter_connections_than_jitter() {
         use crate::topology::small_world_rand::gap_target;
@@ -4506,11 +4504,11 @@ mod tests {
 
         // Simulate a peer with 5 existing connections at various distances
         let existing_connections = [
-            Location::new(0.501), // very close
-            Location::new(0.51),  // close
-            Location::new(0.55),  // nearby
-            Location::new(0.7),   // medium
-            Location::new(0.9),   // far
+            Location::new(0.501), // very close CW
+            Location::new(0.51),  // close CW
+            Location::new(0.55),  // nearby CW
+            Location::new(0.7),   // medium CW
+            Location::new(0.9),   // far CW
         ];
 
         let distances: Vec<f64> = existing_connections

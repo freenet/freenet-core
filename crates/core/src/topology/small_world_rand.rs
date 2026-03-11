@@ -137,23 +137,11 @@ pub(crate) fn largest_gap_size(connection_distances: impl Iterator<Item = f64>) 
         .unwrap_or((1.0, 0))
 }
 
-/// Target the center of the largest gap in the node's current connection
-/// distribution in log-space, mapped back to a ring location.
+/// Pick a distance by targeting the largest gap's midpoint (with jitter) in
+/// a `GapAnalysis`, mapping back from log-space to a ring distance.
 ///
-/// With existing connections, finds the largest gap between consecutive points
-/// in log-distance space (including boundaries 0 and 1), then targets the
-/// midpoint of that gap with some jitter to avoid deterministic targeting.
-///
-/// Falls back to pure Kleinberg 1/d sampling when `connection_distances` is empty.
-pub(crate) fn gap_target(
-    my_location: Location,
-    connection_distances: impl Iterator<Item = f64>,
-) -> Location {
-    let analysis = match analyze_gaps(connection_distances) {
-        Some(a) => a,
-        None => return kleinberg_target(my_location),
-    };
-
+/// Panics if the analysis has no gaps (shouldn't happen with valid input).
+fn distance_from_gap_analysis(analysis: GapAnalysis) -> f64 {
     // Collect all gaps within 1% of the best (floating point tolerance)
     let threshold = analysis.largest_gap_size * 0.99;
     let largest_gaps: Vec<(f64, f64)> = analysis
@@ -180,7 +168,32 @@ pub(crate) fn gap_target(
 
     // Map back from log-space unit interval to a ring distance:
     // u = ln(d/D_MIN_TARGET) / LOG_RATIO  =>  d = D_MIN_TARGET * exp(u * LOG_RATIO)
-    let distance = D_MIN_TARGET * (u_target * LOG_RATIO).exp();
+    D_MIN_TARGET * (u_target * LOG_RATIO).exp()
+}
+
+/// Target the center of the largest gap in the node's current connection
+/// distribution in log-space, mapped back to a ring location.
+///
+/// With existing connections, finds the largest gap between consecutive points
+/// in log-distance space (including boundaries 0 and 1), then targets the
+/// midpoint of that gap with some jitter to avoid deterministic targeting.
+///
+/// Falls back to pure Kleinberg 1/d sampling when `connection_distances` is empty.
+///
+/// This non-directional variant is used during connection establishment (bootstrap
+/// and join_ring_request) where the ring is still forming and directional analysis
+/// has too few data points per side. Directional targeting is applied during
+/// steady-state topology management in `topology.rs`.
+pub(crate) fn gap_target(
+    my_location: Location,
+    connection_distances: impl Iterator<Item = f64>,
+) -> Location {
+    let analysis = match analyze_gaps(connection_distances) {
+        Some(a) => a,
+        None => return kleinberg_target(my_location),
+    };
+
+    let distance = distance_from_gap_analysis(analysis);
 
     let sign: bool = GlobalRng::random_bool(0.5);
     let offset = if sign { distance } else { -distance };
@@ -271,6 +284,145 @@ pub(crate) fn removal_gap(peer_distance: f64, all_distances: impl Iterator<Item 
     }
 
     above - below
+}
+
+// ======================== Directional (CW/CCW) variants ========================
+
+/// Split signed distances into (clockwise, counterclockwise) absolute distance vectors.
+///
+/// CW = positive signed distances, CCW = negative (stored as positive f64).
+/// d=0.5 (antipode) goes into CW by convention (signed_distance returns +0.5).
+fn split_by_direction(signed_distances: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let mut cw = Vec::new();
+    let mut ccw = Vec::new();
+    for &sd in signed_distances {
+        if sd >= 0.0 {
+            cw.push(sd);
+        } else {
+            ccw.push(-sd); // store as positive absolute distance
+        }
+    }
+    (cw, ccw)
+}
+
+/// Target the largest gap across both half-rings, preferring the side with worse coverage.
+///
+/// Runs independent gap analysis on CW and CCW distances. Selects which side to
+/// target with probability proportional to that side's largest gap size (soft
+/// deficit weighting to avoid noisy hard-switching at low degree). Then targets
+/// the midpoint of the largest gap on the chosen side.
+///
+/// Falls back to `kleinberg_target` when there are no valid distances on either side.
+pub(crate) fn gap_target_directional(my_location: Location, signed_distances: &[f64]) -> Location {
+    let (cw_dists, ccw_dists) = split_by_direction(signed_distances);
+
+    let cw_analysis = analyze_gaps(cw_dists.into_iter());
+    let ccw_analysis = analyze_gaps(ccw_dists.into_iter());
+
+    // If both sides are empty, fall back to pure Kleinberg sampling
+    if cw_analysis.is_none() && ccw_analysis.is_none() {
+        return kleinberg_target(my_location);
+    }
+
+    // Both sides must have connections for directional analysis to add value.
+    // When one side is empty, fall back to non-directional gap analysis.
+    match (cw_analysis, ccw_analysis) {
+        (Some(cw), Some(ccw)) => {
+            // Soft weighting: probability of choosing a side proportional to its gap size.
+            let pick_cw_prob = cw.largest_gap_size / (cw.largest_gap_size + ccw.largest_gap_size);
+            let pick_cw = GlobalRng::random_bool(pick_cw_prob);
+
+            let (analysis, sign) = if pick_cw { (cw, 1.0) } else { (ccw, -1.0) };
+            let distance = distance_from_gap_analysis(analysis);
+            Location::new_rounded(my_location.as_f64() + sign * distance)
+        }
+        _ => {
+            // One or both sides empty — use non-directional gap analysis
+            let all_abs = signed_distances.iter().map(|sd| sd.abs());
+            gap_target(my_location, all_abs)
+        }
+    }
+}
+
+/// Score how much a candidate improves the node's distribution, considering direction.
+///
+/// Evaluates gap-fill quality on the candidate's own half-ring, with a bonus
+/// for the side that has fewer connections (deficit weighting).
+///
+/// Currently only used in tests. Connection acceptance uses non-directional
+/// `kleinberg_score` because directional analysis during bootstrap (when each
+/// half-ring has few connections) produces worse decisions. This function is
+/// kept for future use when a minimum connection threshold for directional
+/// acceptance is implemented.
+#[cfg(test)]
+pub(crate) fn kleinberg_score_directional(
+    candidate_signed_distance: f64,
+    signed_distances: &[f64],
+) -> f64 {
+    let candidate_abs = candidate_signed_distance.abs();
+    if candidate_abs <= 0.0 || candidate_abs > D_MAX {
+        return 0.0;
+    }
+
+    let (cw_dists, ccw_dists) = split_by_direction(signed_distances);
+    let is_cw = candidate_signed_distance >= 0.0;
+
+    let (same_side, other_side) = if is_cw {
+        (&cw_dists, &ccw_dists)
+    } else {
+        (&ccw_dists, &cw_dists)
+    };
+
+    // Base score: gap-fill quality on the candidate's own side
+    let base = kleinberg_score(candidate_abs, same_side.iter().copied());
+
+    let total = same_side.len() + other_side.len();
+    if total == 0 {
+        return base;
+    }
+
+    // deficit_ratio: 0.0 when balanced, up to 1.0 when all connections on other side
+    let actual_fraction = same_side.len() as f64 / total as f64;
+    let deficit = (0.5 - actual_fraction).max(0.0) / 0.5;
+
+    // Boost by up to 50% for a fully deficit side
+    base * (1.0 + 0.5 * deficit)
+}
+
+/// Compute the gap that would exist on a peer's half-ring if it were removed.
+///
+/// Only considers connections on the same side (CW or CCW) as the peer being
+/// evaluated, giving a directionally-aware measure of topological importance.
+///
+/// Returns `(gap, same_side_count)` where `same_side_count` is the number of
+/// peers on the evaluated side (including the peer being evaluated).
+pub(crate) fn removal_gap_directional(
+    peer_signed_distance: f64,
+    signed_distances: &[f64],
+) -> (f64, usize) {
+    let peer_abs = peer_signed_distance.abs();
+    let is_cw = peer_signed_distance >= 0.0;
+
+    let (cw_dists, ccw_dists) = split_by_direction(signed_distances);
+    let same_side = if is_cw { cw_dists } else { ccw_dists };
+    let count = same_side.len();
+
+    (removal_gap(peer_abs, same_side.into_iter()), count)
+}
+
+/// Compute the largest gap across both half-rings (returns the worse side).
+///
+/// Returns `(gap, side_count)` where `side_count` is the point count on the
+/// side that produced the largest gap — used for per-side expected-gap formulas.
+pub(crate) fn largest_gap_size_directional(signed_distances: &[f64]) -> (f64, usize) {
+    let (cw_dists, ccw_dists) = split_by_direction(signed_distances);
+    let (cw_gap, cw_count) = largest_gap_size(cw_dists.into_iter());
+    let (ccw_gap, ccw_count) = largest_gap_size(ccw_dists.into_iter());
+    if cw_gap >= ccw_gap {
+        (cw_gap, cw_count)
+    } else {
+        (ccw_gap, ccw_count)
+    }
 }
 
 #[cfg(test)]
@@ -810,5 +962,182 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- directional function tests ---
+
+    #[test]
+    fn split_by_direction_basic() {
+        let signed = [0.1, -0.2, 0.3, -0.05, 0.0];
+        let (cw, ccw) = split_by_direction(&signed);
+        assert_eq!(cw, vec![0.1, 0.3, 0.0]); // 0.0 goes to CW
+        assert_eq!(ccw, vec![0.2, 0.05]); // stored as positive
+    }
+
+    #[test]
+    fn gap_target_directional_falls_back_when_one_side_empty() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xD121_0001);
+        let my_loc = Location::new(0.5);
+
+        // All connections CW (positive signed distance), none CCW.
+        // When one side is empty, directional analysis falls back to
+        // non-directional gap_target which splits ~50/50 CW/CCW.
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+        let signed: Vec<f64> = [d_at(0.25), d_at(0.5), d_at(0.75)].to_vec();
+
+        let mut ccw_count = 0;
+        let trials = 200;
+        for _ in 0..trials {
+            let target = gap_target_directional(my_loc, &signed);
+            let sd = my_loc.signed_distance(target);
+            if sd < 0.0 {
+                ccw_count += 1;
+            }
+        }
+        // Non-directional fallback uses random sign, so ~50% should be CCW
+        let ccw_frac = ccw_count as f64 / trials as f64;
+        assert!(
+            (0.3..=0.7).contains(&ccw_frac),
+            "Expected ~50% CCW (non-directional fallback), got {ccw_count}/{trials} ({ccw_frac:.2})"
+        );
+    }
+
+    #[test]
+    fn gap_target_directional_balanced_splits_evenly() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xD121_0002);
+        let my_loc = Location::new(0.5);
+
+        // Symmetric connections: same distances on both sides
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+        let signed: Vec<f64> = vec![d_at(0.5), -d_at(0.5), d_at(0.25), -d_at(0.25)];
+
+        let mut cw_count = 0;
+        let trials = 200;
+        for _ in 0..trials {
+            let target = gap_target_directional(my_loc, &signed);
+            let sd = my_loc.signed_distance(target);
+            if sd >= 0.0 {
+                cw_count += 1;
+            }
+        }
+        let ratio = cw_count as f64 / trials as f64;
+        assert!(
+            (0.3..0.7).contains(&ratio),
+            "Balanced connections should yield ~50/50 direction split, got {ratio:.2}"
+        );
+    }
+
+    #[test]
+    fn gap_target_directional_no_connections_falls_back() {
+        let _guard = crate::config::GlobalRng::seed_guard(0xD121_0003);
+        let my_loc = Location::new(0.5);
+
+        for _ in 0..100 {
+            let target = gap_target_directional(my_loc, &[]);
+            let v = target.as_f64();
+            assert!(
+                (0.0..1.0).contains(&v),
+                "Fallback target {v} outside valid range"
+            );
+        }
+    }
+
+    #[test]
+    fn kleinberg_score_directional_boosts_deficit_side() {
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+
+        // 3 connections CW, 0 CCW
+        let signed: Vec<f64> = vec![d_at(0.25), d_at(0.5), d_at(0.75)];
+
+        // Candidate on CCW side (deficit) vs same distance on CW side
+        let candidate_dist = d_at(0.4);
+        let score_ccw = kleinberg_score_directional(-candidate_dist, &signed);
+        let score_cw = kleinberg_score_directional(candidate_dist, &signed);
+
+        assert!(
+            score_ccw > score_cw,
+            "CCW (deficit side) score {score_ccw:.4} should beat CW score {score_cw:.4}"
+        );
+    }
+
+    #[test]
+    fn kleinberg_score_directional_balanced_no_boost() {
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+
+        // Equal connections on both sides at same distances
+        let signed: Vec<f64> = vec![d_at(0.25), -d_at(0.25), d_at(0.75), -d_at(0.75)];
+
+        let candidate_dist = d_at(0.5);
+        let score_cw = kleinberg_score_directional(candidate_dist, &signed);
+        let score_ccw = kleinberg_score_directional(-candidate_dist, &signed);
+
+        // Should be equal (no deficit on either side)
+        assert!(
+            (score_cw - score_ccw).abs() < 0.01,
+            "Balanced sides should score equally: CW={score_cw:.4} CCW={score_ccw:.4}"
+        );
+    }
+
+    #[test]
+    fn removal_gap_directional_per_side() {
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+
+        // CW: 3 connections well-spaced. CCW: 1 connection (critical).
+        let signed: Vec<f64> = vec![d_at(0.25), d_at(0.5), d_at(0.75), -d_at(0.5)];
+
+        // Removing the sole CCW connection should give gap=1.0 (entire half-ring empty)
+        let (gap_ccw, ccw_count) = removal_gap_directional(-d_at(0.5), &signed);
+        assert!(
+            (gap_ccw - 1.0).abs() < 0.01,
+            "Removing sole CCW connection should give gap ~1.0, got {gap_ccw}"
+        );
+        assert_eq!(ccw_count, 1, "CCW side should have 1 peer");
+
+        // Removing one of three CW connections should give gap ~0.5
+        let (gap_cw, cw_count) = removal_gap_directional(d_at(0.5), &signed);
+        assert!(
+            (gap_cw - 0.5).abs() < 0.05,
+            "Removing middle CW connection should give gap ~0.5, got {gap_cw}"
+        );
+        assert_eq!(cw_count, 3, "CW side should have 3 peers");
+    }
+
+    #[test]
+    fn largest_gap_size_directional_uses_worse_side() {
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+
+        // CW: 3 well-spaced connections (gap ~0.25). CCW: empty (gap = 1.0).
+        let signed: Vec<f64> = vec![d_at(0.25), d_at(0.5), d_at(0.75)];
+
+        let (gap, count) = largest_gap_size_directional(&signed);
+        assert!(
+            (gap - 1.0).abs() < 0.01,
+            "Should return worse side's gap (1.0 for empty CCW), got {gap}"
+        );
+        // CCW side produced the gap; it has 0 peers
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn largest_gap_size_directional_balanced() {
+        let d_at = |u: f64| D_MIN_TARGET * (D_MAX / D_MIN_TARGET).powf(u);
+
+        // Symmetric: same spacing on both sides
+        let signed: Vec<f64> = vec![
+            d_at(0.25),
+            d_at(0.5),
+            d_at(0.75),
+            -d_at(0.25),
+            -d_at(0.5),
+            -d_at(0.75),
+        ];
+
+        let (gap, count) = largest_gap_size_directional(&signed);
+        assert!(
+            (gap - 0.25).abs() < 0.02,
+            "Both sides have gap ~0.25, got {gap}"
+        );
+        // Tie goes to CW side (>= comparison), which has 3 peers
+        assert_eq!(count, 3);
     }
 }

@@ -32,6 +32,10 @@ WHEN accepting a new connection (should_accept):
      → Score = min distance to nearest neighbor in log-space
      → Candidates filling the largest gap score highest
      → Candidates outside [D_MIN, D_MAX] score 0 (including Sybil-close peers)
+     → Note: connection acceptance uses non-directional scoring because
+       directional analysis during bootstrap has too few data points per side.
+       Directional (CW/CCW) awareness is applied in steady-state topology
+       management (swaps, pruning) via topology.rs.
   4. Below min_connections: probabilistic acceptance (soft filter)
      → Below KLEINBERG_FILTER_MIN_CONNECTIONS (3): always ACCEPT
      → Above that: accept_prob = 0.5 + gap_score (50% floor)
