@@ -1506,10 +1506,14 @@ impl P2pConnManager {
                                     count = all_addrs.len(),
                                     "DropAllConnections: closing all connections (suspend/resume recovery)"
                                 );
-                                // Use drop_zombie_connection (non-blocking) to avoid the
-                                // same circular deadlock as zombie cleanup (#3519).
+                                // Use drop_connection_by_addr (blocking, 1s timeout) here
+                                // rather than drop_zombie_connection because these may be
+                                // healthy connections that need proper close notification.
+                                // The deadlock risk is low: DropAllConnections fires only
+                                // during suspend/resume recovery (rare), and during resume
+                                // there are few inbound connections to fill the events channel.
                                 for peer_addr in all_addrs {
-                                    ctx.drop_zombie_connection(peer_addr, &handshake_cmd_sender)
+                                    ctx.drop_connection_by_addr(peer_addr, &handshake_cmd_sender)
                                         .await;
                                 }
                             }
