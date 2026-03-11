@@ -443,4 +443,27 @@ mod tests {
         assert_eq!(second.peer, peer_b);
         assert!(second.transient);
     }
+
+    #[test]
+    fn command_sender_try_send_returns_false_when_full() {
+        // Channel capacity 1 — fill it, then verify try_send returns false
+        let (tx, _rx) = mpsc::channel(1);
+        let sender = CommandSender(tx);
+        let peer = make_peer(4500);
+
+        // First send should succeed
+        assert!(sender.try_send(Command::DropConnection { peer: peer.clone() }));
+        // Channel is now full — second send should return false, not block
+        assert!(!sender.try_send(Command::DropConnection { peer }));
+    }
+
+    #[test]
+    fn command_sender_try_send_returns_false_when_closed() {
+        let (tx, rx) = mpsc::channel(16);
+        let sender = CommandSender(tx);
+        let peer = make_peer(4600);
+        drop(rx); // Close the channel
+
+        assert!(!sender.try_send(Command::DropConnection { peer }));
+    }
 }

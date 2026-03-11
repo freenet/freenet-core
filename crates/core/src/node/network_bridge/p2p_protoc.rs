@@ -884,11 +884,12 @@ impl P2pConnManager {
                 // An absolute threshold of 10 min overrides pending reservations to
                 // catch gateway transports stuck in a pending-refresh cycle.
                 //
-                // IMPORTANT: We cap the batch size to avoid blocking the event loop
-                // for too long. A large batch of sequential drop_connection_by_addr
-                // calls can deadlock with the handshake driver: the event loop blocks
-                // on sending DropConnection commands while the handshake driver blocks
-                // on sending InboundConnection events back to the event loop (#3519).
+                // IMPORTANT: We use drop_zombie_connection (non-blocking try_send)
+                // instead of drop_connection_by_addr to avoid a circular deadlock
+                // with the handshake driver (#3519). We also cap the batch size to
+                // limit event loop latency — each zombie cleanup involves topology
+                // pruning and orphaned transaction handling. With a 100ms timeout
+                // per zombie, 64 zombies = ~6.4s worst case per cycle.
                 // Remaining zombies will be cleaned up in the next 30s cycle.
                 const MAX_ZOMBIE_CLEANUP_PER_CYCLE: usize = 64;
                 let zombie_addrs: Vec<SocketAddr> = ctx
@@ -1505,8 +1506,10 @@ impl P2pConnManager {
                                     count = all_addrs.len(),
                                     "DropAllConnections: closing all connections (suspend/resume recovery)"
                                 );
+                                // Use drop_zombie_connection (non-blocking) to avoid the
+                                // same circular deadlock as zombie cleanup (#3519).
                                 for peer_addr in all_addrs {
-                                    ctx.drop_connection_by_addr(peer_addr, &handshake_cmd_sender)
+                                    ctx.drop_zombie_connection(peer_addr, &handshake_cmd_sender)
                                         .await;
                                 }
                             }
@@ -2211,8 +2214,10 @@ impl P2pConnManager {
         };
         let pub_key_to_remove = entry.pub_key.clone();
 
-        // Non-blocking send to handshake driver to avoid deadlock.
-        // If the channel is full, the expected_inbound entry will expire naturally.
+        // Non-blocking send to handshake driver to avoid deadlock (#3519).
+        // For zombie transports (already established connections), the expected_inbound
+        // entry was already consumed when the inbound connection arrived, so the
+        // DropConnection command is effectively a no-op.
         if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { peer: peer.clone() }) {
             tracing::debug!(
                 peer = %peer,
