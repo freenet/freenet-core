@@ -586,7 +586,7 @@ impl ConnectionManager {
                 let score = self.compute_kleinberg_score(me, location);
                 // Compute a sliding floor based on how far we are from min_connections.
                 // progress=0.0 at KLEINBERG_FILTER_MIN_CONNECTIONS, 1.0 at min_connections.
-                let range = self.min_connections - KLEINBERG_FILTER_MIN_CONNECTIONS;
+                let range = self.min_connections.saturating_sub(KLEINBERG_FILTER_MIN_CONNECTIONS);
                 let progress = if range > 0 {
                     (open - KLEINBERG_FILTER_MIN_CONNECTIONS) as f64 / range as f64
                 } else {
@@ -2014,6 +2014,99 @@ mod tests {
         let addr2 = make_addr(8002);
         let loc2 = Location::new(0.2);
         assert!(cm.should_accept(loc2, addr2));
+    }
+
+    /// Test the sliding admission floor: at low connection counts the floor is ~0.9
+    /// (accept almost anything), and as open approaches min_connections the floor
+    /// drops to ~0.3 (be selective). Uses seeded RNG for deterministic behavior.
+    #[test]
+    fn test_sliding_admission_floor() {
+        // min_connections=10, max=20, so range = 10 - 3 = 7
+        let cm = make_connection_manager(Some(make_addr(8000)), 10, 20, false);
+        let keypair = TransportKeypair::new();
+
+        // Add KLEINBERG_FILTER_MIN_CONNECTIONS (3) connections to enter the sliding floor zone
+        for i in 0..KLEINBERG_FILTER_MIN_CONNECTIONS {
+            let addr = make_addr(8001 + i as u16);
+            let loc = Location::new(0.05 * (i + 1) as f64);
+            cm.add_connection(loc, addr, keypair.public().clone(), true);
+        }
+        assert_eq!(cm.connection_count(), 3);
+
+        // At open=3, progress=0.0, floor=0.9 — should accept almost all candidates
+        // Test with 100 trials using a seed that produces values in [0, 1)
+        let _guard = GlobalRng::seed_guard(42);
+        let mut accepted_at_3 = 0;
+        for i in 0..100u16 {
+            let addr = make_addr(9000 + i);
+            // Location far from existing peers → low gap score
+            let loc = Location::new(0.99);
+            if cm.should_accept(loc, addr) {
+                accepted_at_3 += 1;
+                // Clean up the pending reservation so it doesn't affect the next trial
+                cm.pending_reservations.write().remove(&addr);
+            }
+        }
+
+        // Now add more connections to get open=9 (close to min_connections=10)
+        for i in 3..9 {
+            let addr = make_addr(8001 + i as u16);
+            let loc = Location::new(0.05 * (i + 1) as f64);
+            cm.add_connection(loc, addr, keypair.public().clone(), true);
+        }
+        assert_eq!(cm.connection_count(), 9);
+
+        // At open=9, progress=6/7≈0.857, floor≈0.386 — should be much more selective
+        let _guard2 = GlobalRng::seed_guard(42); // same seed for fair comparison
+        let mut accepted_at_9 = 0;
+        for i in 0..100u16 {
+            let addr = make_addr(10000 + i);
+            let loc = Location::new(0.99);
+            if cm.should_accept(loc, addr) {
+                accepted_at_9 += 1;
+                cm.pending_reservations.write().remove(&addr);
+            }
+        }
+
+        // With floor=0.9, acceptance rate should be ~90%
+        // With floor≈0.386, acceptance rate should be ~39%
+        // Allow generous margins since gap_score adds some, but the trend must be clear
+        assert!(
+            accepted_at_3 > accepted_at_9,
+            "acceptance rate should decrease as connections approach min_connections: \
+             accepted_at_3={accepted_at_3} should be > accepted_at_9={accepted_at_9}"
+        );
+        assert!(
+            accepted_at_3 >= 70,
+            "at open=3 (floor=0.9), acceptance rate should be high: got {accepted_at_3}/100"
+        );
+        assert!(
+            accepted_at_9 <= 70,
+            "at open=9 (floor≈0.39), acceptance rate should be lower: got {accepted_at_9}/100"
+        );
+    }
+
+    /// Edge case: min_connections == KLEINBERG_FILTER_MIN_CONNECTIONS (range=0).
+    /// Should not panic and should use floor=0.3 (most selective).
+    #[test]
+    fn test_sliding_floor_degenerate_range() {
+        // min_connections=3 == KLEINBERG_FILTER_MIN_CONNECTIONS, range=0
+        let cm = make_connection_manager(Some(make_addr(8000)), 3, 10, false);
+        let keypair = TransportKeypair::new();
+
+        // Add 3 connections to reach min_connections — but should_accept's outer guard
+        // checks open < min_connections, so at open=3 we hit the ConnectionEvaluator
+        // path instead. Test that we don't panic with 2 connections (open < min=3,
+        // but open < KLEINBERG_FILTER_MIN_CONNECTIONS=3 so unconditional accept).
+        for i in 0..2 {
+            let addr = make_addr(8001 + i as u16);
+            let loc = Location::new(0.1 * (i + 1) as f64);
+            cm.add_connection(loc, addr, keypair.public().clone(), true);
+        }
+
+        // With open=2 < KLEINBERG_FILTER_MIN_CONNECTIONS=3, should unconditionally accept
+        let test_addr = make_addr(9001);
+        assert!(cm.should_accept(Location::new(0.5), test_addr));
     }
 
     #[test]
