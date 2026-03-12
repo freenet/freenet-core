@@ -1287,10 +1287,8 @@ impl Operation for SubscribeOp {
                             requester_addr: self.requester_addr,
                             requester_pub_key: self.requester_pub_key,
                             is_renewal: self.is_renewal,
-                            // Track which peer we forwarded to so that if the forward
-                            // times out, the failure is reported to PeerHealthTracker
-                            // and the router's failure estimator. Previously `None`,
-                            // making intermediate-node failures invisible. (#3523)
+                            // Track the forward target so timeouts report to
+                            // PeerHealthTracker and the failure estimator.
                             stats: Some(SubscribeStats {
                                 target_peer: next_hop.clone(),
                                 contract_location: Location::from(instance_id),

@@ -1023,13 +1023,9 @@ impl P2pConnManager {
 
                             match peer_connection {
                                 Some(peer_connection) => {
-                                    // Use try_send to avoid blocking the event loop
-                                    // when a peer's outbound channel is full. A full
-                                    // channel indicates the peer's transport is
-                                    // congested or dead; blocking here would stall
-                                    // ALL peers' message processing (head-of-line
-                                    // blocking). The operation will time out and retry
-                                    // via an alternative peer. (#3523)
+                                    // try_send avoids head-of-line blocking: a full
+                                    // channel means the peer is congested/dead, so we
+                                    // drop the message and let the op timeout + retry.
                                     match peer_connection.sender.try_send(Left(msg.clone())) {
                                         Ok(()) => {
                                             tracing::trace!(
