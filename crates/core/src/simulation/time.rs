@@ -210,6 +210,20 @@ impl TimeSource for RealTime {
     fn supports_keepalive(&self) -> bool {
         !crate::config::SimulationTransportOpt::is_enabled()
     }
+
+    /// Use a very long idle timeout in simulation mode.
+    ///
+    /// In `start_paused(true)` mode, virtual time can jump past 120s when
+    /// tasks await `spawn_blocking` (WASM execution), triggering false timeouts
+    /// even with keepalive enabled. This affects ALL simulation sizes, not just
+    /// large ones with `SimulationTransportOpt` enabled.
+    fn connection_idle_timeout(&self) -> Duration {
+        if crate::config::SimulationIdleTimeout::is_enabled() {
+            Duration::from_secs(86400) // 24 hours — matches VirtualTime
+        } else {
+            Duration::from_secs(120) // production default
+        }
+    }
 }
 
 // ============================================================================

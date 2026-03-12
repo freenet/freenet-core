@@ -729,7 +729,8 @@ impl super::StateVerifier {
                     let key_str = format!("{:?}", key);
                     *resync_bytes.entry(key_str).or_insert(0) += state_size;
                 }
-                EventKind::Connect(_)
+                EventKind::InterestSync(InterestSyncEvent::StateConfirmed { .. })
+                | EventKind::Connect(_)
                 | EventKind::Put(_)
                 | EventKind::Get(_)
                 | EventKind::Subscribe(_)

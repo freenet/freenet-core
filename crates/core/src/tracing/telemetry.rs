@@ -603,6 +603,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 InterestSyncEvent::ResyncResponseSent { .. } => {
                     "interest_resync_response_sent".to_string()
                 }
+                InterestSyncEvent::StateConfirmed { .. } => "interest_state_confirmed".to_string(),
             }
         }
         EventKind::RoutingDecision(_) => "routing_decision".to_string(),
@@ -1500,6 +1501,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "to_peer_addr": to_peer.peer_addr.to_string(),
                         "state_size": state_size,
                         "timestamp": timestamp,
+                    })
+                }
+                InterestSyncEvent::StateConfirmed { key, state_hash } => {
+                    serde_json::json!({
+                        "type": "state_confirmed",
+                        "contract_key": key.to_string(),
+                        "contract_id": key.id().to_string(),
+                        "state_hash": state_hash,
                     })
                 }
             }

@@ -1482,6 +1482,20 @@ impl<'a> NetEventLog<'a> {
             }),
         })
     }
+
+    /// Create a StateConfirmed event.
+    ///
+    /// Emitted during Summaries handler processing to record the actual
+    /// current state hash for a contract. This ensures the convergence
+    /// checker has accurate data even when other telemetry events are stale.
+    pub fn state_confirmed(ring: &'a Ring, key: ContractKey, state_hash: String) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx: Transaction::NULL,
+            peer_id,
+            kind: EventKind::InterestSync(InterestSyncEvent::StateConfirmed { key, state_hash }),
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2540,9 +2554,10 @@ impl EventKind {
             | EventKind::Disconnected { .. }
             | EventKind::Timeout { .. }
             | EventKind::TransportSnapshot(_)
-            | EventKind::InterestSync(_)
             | EventKind::RoutingDecision(_)
             | EventKind::RouterSnapshot(_) => None,
+            EventKind::InterestSync(InterestSyncEvent::StateConfirmed { key, .. }) => Some(*key),
+            EventKind::InterestSync(_) => None,
         }
     }
 
@@ -2598,9 +2613,12 @@ impl EventKind {
             | EventKind::Disconnected { .. }
             | EventKind::Timeout { .. }
             | EventKind::TransportSnapshot(_)
-            | EventKind::InterestSync(_)
             | EventKind::RoutingDecision(_)
             | EventKind::RouterSnapshot(_) => None,
+            EventKind::InterestSync(InterestSyncEvent::StateConfirmed { state_hash, .. }) => {
+                Some(state_hash.as_str())
+            }
+            EventKind::InterestSync(_) => None,
         }
     }
 
@@ -3679,6 +3697,19 @@ pub enum InterestSyncEvent {
         state_size: usize,
         /// Timestamp of the event.
         timestamp: u64,
+    },
+    /// Periodic confirmation of a contract's current state hash.
+    ///
+    /// Emitted by the Summaries handler during interest-sync heartbeat
+    /// processing. This ensures the convergence checker has up-to-date
+    /// state hashes even when state changes occur through code paths
+    /// that don't emit PutSuccess/UpdateSuccess/BroadcastApplied events
+    /// (e.g., CRDT merge with version-based comparison).
+    StateConfirmed {
+        /// Contract whose state was confirmed.
+        key: ContractKey,
+        /// Blake3 hash of the current state (hex string).
+        state_hash: String,
     },
 }
 

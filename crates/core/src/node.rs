@@ -1365,6 +1365,12 @@ async fn handle_interest_sync_message(
             // subscription/GET flow, not via broadcast.
             let peer_key = get_peer_key_from_addr(op_manager, source);
             let mut stale_contracts = Vec::new();
+            // Collect (contract, state_hash) for deferred StateConfirmed telemetry.
+            // Only emitted in direct-runner mode to avoid .await points that change
+            // turmoil task scheduling.
+            let emit_confirmed = crate::config::SimulationIdleTimeout::is_enabled();
+            let mut confirmed_states: Vec<(freenet_stdlib::prelude::ContractKey, String)> =
+                Vec::new();
 
             if let Some(pk) = peer_key {
                 for entry in entries {
@@ -1375,6 +1381,12 @@ async fn handle_interest_sync_message(
 
                         let their_summary = entry.to_summary();
                         let our_summary = get_contract_summary(op_manager, &contract).await;
+
+                        if emit_confirmed {
+                            if let Some(ref summary) = our_summary {
+                                confirmed_states.push((contract, hex::encode(summary.as_ref())));
+                            }
+                        }
 
                         let is_stale = our_summary
                             .as_ref()
@@ -1420,6 +1432,19 @@ async fn handle_interest_sync_message(
                         error = %e,
                         "Failed to emit BroadcastStateChange for stale peer correction"
                     );
+                }
+            }
+
+            // Emit deferred StateConfirmed telemetry so the convergence
+            // checker has up-to-date state hashes for CRDT-merged state.
+            for (key, state_hash) in confirmed_states {
+                if let Some(event) =
+                    crate::tracing::NetEventLog::state_confirmed(&op_manager.ring, key, state_hash)
+                {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(event))
+                        .await;
                 }
             }
 

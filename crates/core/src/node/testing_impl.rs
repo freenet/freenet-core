@@ -3901,14 +3901,17 @@ impl SimNetwork {
 
         let total_peer_num = self.gateways.len() + self.nodes.len();
 
-        // Relax transport timers for large-scale simulation (disables keepalive,
-        // uses 5x slower ACK/resend/rate-update intervals). This reduces timer
-        // firings from ~900K/sec to ~180K/sec across all connections.
-        // Only enable for large networks where timer overhead dominates; small
-        // tests (< 50 nodes) need production-like timer behavior for convergence.
-        if total_peer_num >= 50 {
-            SimulationTransportOpt::enable();
-        }
+        // Extend connection idle timeout for ALL simulations. In start_paused(true)
+        // mode, virtual time jumps past 120s during spawn_blocking (WASM execution),
+        // causing spurious connection drops even with keepalive enabled.
+        crate::config::SimulationIdleTimeout::enable();
+
+        // Relax transport timers for ALL direct-runner simulations. Disables keepalive
+        // and uses 5x slower ACK/resend/rate-update intervals. In start_paused(true)
+        // mode, production-rate timer firings create excessive virtual time advances
+        // that interfere with heartbeat and broadcast scheduling, causing
+        // non-deterministic convergence failures even in small networks.
+        SimulationTransportOpt::enable();
         let use_mock_wasm = self.use_mock_wasm;
 
         let result: anyhow::Result<()> = rt.block_on(async {
@@ -4208,35 +4211,44 @@ impl SimNetwork {
                 tokio::time::sleep(event_wait).await;
             }
 
-            // Wait for events to fully propagate.
-            // Must be long enough for broadcast retries (up to 3 retries × 3s backoff = 9s)
-            // plus subscription establishment and update forwarding. Recent routing changes
-            // (connect visited filter, acceptor diversity) can create topologies where
-            // subscriptions take longer to establish, making 2s insufficient.
+            // Wait for convergence with interest-sync repair.
+            //
+            // Poll convergence periodically while advancing virtual time.
+            // Each poll interval lets heartbeat timers fire and broadcast
+            // processing complete. The heartbeat interval is 300s, so
+            // 1800s covers six full cycles — enough for cascading repair
+            // broadcasts to propagate even when multiple state versions
+            // compete across multi-hop topologies.
+            //
+            // Early exit: if all contracts converge, we break immediately.
             tokio::time::sleep(Duration::from_secs(15)).await;
 
-            // Convergence check
-            let subscribed_count = {
-                use std::collections::HashSet;
-                let logs = event_logs.lock().await;
-                let mut subscribed_contracts: HashSet<String> = HashSet::new();
-                for log in logs.iter() {
-                    if let crate::tracing::EventKind::Subscribe(
-                        crate::tracing::SubscribeEvent::SubscribeSuccess { key, .. },
-                    ) = &log.kind
-                    {
-                        subscribed_contracts.insert(format!("{:?}", key));
+            let converged = 'convergence: {
+                for round in 0..30u32 {
+                    let result = check_convergence_from_logs(&event_logs).await;
+                    let total = result.converged.len() + result.diverged.len();
+                    if total > 0 && result.diverged.is_empty() {
+                        tracing::info!(
+                            converged = result.converged.len(),
+                            round,
+                            "Convergence achieved during propagation"
+                        );
+                        break 'convergence true;
                     }
+                    tracing::debug!(
+                        converged = result.converged.len(),
+                        diverged = result.diverged.len(),
+                        round,
+                        "Convergence not yet achieved, waiting..."
+                    );
+                    tokio::time::sleep(Duration::from_secs(60)).await;
                 }
-                subscribed_contracts.len()
+                false
             };
-
-            if subscribed_count > 0 {
-                info!(
-                    "Found {} subscribed contracts, waiting for convergence...",
-                    subscribed_count
+            if !converged {
+                tracing::warn!(
+                    "Propagation timeout — convergence not achieved after 30 rounds (1800s)"
                 );
-                tokio::time::sleep(Duration::from_secs(10)).await;
             }
 
             // Shutdown: abort chaos driver, time driver, then check node tasks
