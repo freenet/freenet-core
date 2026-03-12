@@ -168,7 +168,7 @@ impl Runtime {
         };
         let origin_buf_ptr = {
             let bytes = match origin {
-                Some(o) => bincode::serialize(o).unwrap_or_default(),
+                Some(o) => bincode::serialize(o)?,
                 None => Vec::new(),
             };
             let mut origin_buf = self.init_buf(handle, &bytes)?;

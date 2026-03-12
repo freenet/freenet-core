@@ -701,7 +701,7 @@ impl std::fmt::Display for ContractHandlerEvent {
             } => {
                 write!(
                     f,
-                    "delegate request {{ key: {:?}, attested: {:?} }}",
+                    "delegate request {{ key: {:?}, origin: {:?} }}",
                     req.key(),
                     origin_contract
                 )
