@@ -28,7 +28,7 @@ concurrency:
 jobs:
   large-scale-simulation:
     name: Large Scale Simulation
-    runs-on: self-hosted
+    runs-on: ubicloud-standard-16
     timeout-minutes: 120
 
     env:
@@ -59,6 +59,11 @@ jobs:
         with:
           prefix-key: simulation-large
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
 
       - name: Install nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
