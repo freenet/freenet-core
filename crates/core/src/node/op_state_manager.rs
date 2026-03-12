@@ -1641,10 +1641,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // Cap retries per GC tick to avoid flooding the notification channel.
                 // The gateway subscribes to 90+ contracts; retrying all at once saturates
                 // the 2048-capacity event loop channel, blocking UPDATEs and broadcasts.
-                // Value of 5: low enough to leave most channel capacity for normal ops
-                // (UPDATEs, broadcasts, etc.), high enough to cycle through 90+ contracts
-                // within a few minutes at the 5-second GC interval.
-                const MAX_SUBSCRIBE_RETRIES_PER_TICK: usize = 5;
+                // Value of 10: at 5s GC interval, processes 120 retries/minute — enough
+                // to cycle through 90+ contracts within OPERATION_TTL (60s). Low enough
+                // to leave most channel capacity for normal ops (UPDATEs, broadcasts).
+                const MAX_SUBSCRIBE_RETRIES_PER_TICK: usize = 10;
                 {
                     // Clean up entries for completed operations
                     subscribe_retried.retain(|tx, _| ops.subscribe.contains_key(tx));
