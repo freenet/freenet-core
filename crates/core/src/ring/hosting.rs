@@ -86,6 +86,11 @@ const MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT: usize = 512;
 /// (in-memory only). Without this window, `contracts_needing_renewal()` returns
 /// nothing until a WebSocket client reconnects and subscribes, leaving hosted
 /// contracts stale. See #3489.
+///
+/// This window should be shorter than `INITIAL_CYCLES * interval` in the
+/// `recover_orphaned_subscriptions` loop (ring.rs) so all startup renewals
+/// benefit from the larger `INITIAL_BATCH_LIMIT`. Currently: 120s window vs
+/// 5 cycles × 30s = 150s of high-batch processing.
 const STARTUP_REVALIDATION_WINDOW: Duration = Duration::from_secs(120); // 2 minutes
 
 // =============================================================================
@@ -1580,6 +1585,69 @@ mod tests {
         assert!(
             !needs_renewal.contains(&contract),
             "Already-subscribed contract should not be duplicated in renewal list"
+        );
+    }
+
+    /// Test that after the startup window expires, hosted-only contracts
+    /// revert to being excluded from renewal.
+    #[test]
+    fn test_startup_revalidation_window_expires() {
+        let manager = HostingManager::new_past_startup();
+        let contract = make_contract_key(1);
+
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+
+        // Past startup window — hosted-only contract excluded
+        let needs_renewal = manager.contracts_needing_renewal();
+        assert!(
+            !needs_renewal.contains(&contract),
+            "Hosted-only contract should NOT be in renewal list after startup window"
+        );
+    }
+
+    /// Test startup revalidation with multiple contracts, some with active
+    /// subscriptions, verifying deduplication and correct filtering.
+    #[test]
+    fn test_startup_revalidation_multiple_contracts() {
+        let manager = HostingManager::new();
+        let contract_a = make_contract_key(1);
+        let contract_b = make_contract_key(2);
+        let contract_c = make_contract_key(3);
+
+        // Host all three
+        manager.record_contract_access(contract_a, 1000, AccessType::Get);
+        manager.record_contract_access(contract_b, 1000, AccessType::Get);
+        manager.record_contract_access(contract_c, 1000, AccessType::Get);
+
+        // Subscribe to contract_b (simulating one already renewed)
+        manager.subscribe(contract_b);
+
+        // Also add a client subscription to contract_c (step 2 + step 3 overlap)
+        let client_id = crate::client_events::ClientId::next();
+        manager.add_client_subscription(contract_c.id(), client_id);
+
+        let needs_renewal = manager.contracts_needing_renewal();
+
+        // contract_a: hosted-only, no subscription → included by startup window
+        assert!(
+            needs_renewal.contains(&contract_a),
+            "Hosted-only contract_a should be included"
+        );
+        // contract_b: has active subscription → excluded (not expiring soon)
+        assert!(
+            !needs_renewal.contains(&contract_b),
+            "Subscribed contract_b should be excluded"
+        );
+        // contract_c: has client subscription + startup window → included exactly once
+        assert!(
+            needs_renewal.contains(&contract_c),
+            "Client-subscribed contract_c should be included"
+        );
+        // Verify no duplicates (contract_c found by both step 2 and step 3)
+        let c_count = needs_renewal.iter().filter(|k| *k == &contract_c).count();
+        assert_eq!(
+            c_count, 1,
+            "contract_c should appear exactly once (no duplicates)"
         );
     }
 
