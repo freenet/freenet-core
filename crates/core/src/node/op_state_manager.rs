@@ -1629,7 +1629,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                 // Retry SUBSCRIBE operations at the originator that have been waiting
                 // too long. Only originator-initiated subscribes are retried — intermediate
-                // hops just time out and send NotFound upstream.
+                // hops just time out silently (the originator retries independently).
                 //
                 // 5s chosen because subscribe is a lightweight handshake (no state transfer),
                 // so a response should arrive quickly. This allows multiple retries before
@@ -1644,8 +1644,11 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         let tx = *entry.key();
                         let sub_op = entry.value();
 
-                        // Only retry at the originator (no requester_addr means we initiated it)
-                        if !sub_op.is_originator() {
+                        // Only retry at the originator (no requester_addr means we initiated it).
+                        // Also skip ops without routing stats — these are unsubscribe-routing
+                        // ops created by create_unsubscribe_op(), which use the subscribe map
+                        // for address routing but should not be retried as subscribe requests.
+                        if !sub_op.is_originator() || sub_op.failure_routing_info().is_none() {
                             continue;
                         }
 

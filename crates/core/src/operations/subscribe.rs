@@ -626,14 +626,6 @@ impl SubscribeOp {
         self.requester_addr.is_none()
     }
 
-    /// The address of the upstream peer that requested this subscription, if any.
-    /// `None` means this node is the originator.
-    /// Currently unused but needed when intermediate-hop timeout sends NotFound upstream.
-    #[allow(dead_code)]
-    pub(crate) fn requester_addr(&self) -> Option<std::net::SocketAddr> {
-        self.requester_addr
-    }
-
     /// Retry the subscribe operation with the next alternative peer.
     ///
     /// Similar to GET's `retry_with_next_alternative`: picks the next untried peer
