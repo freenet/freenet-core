@@ -1638,6 +1638,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // so a response should arrive quickly. This allows multiple retries before
                 // OPERATION_TTL expires.
                 const SUBSCRIBE_RETRY_THRESHOLD: Duration = Duration::from_secs(5);
+                // Cap retries per GC tick to avoid flooding the notification channel.
+                // The gateway subscribes to 90+ contracts; retrying all at once saturates
+                // the 2048-capacity event loop channel, blocking UPDATEs and broadcasts.
+                const MAX_SUBSCRIBE_RETRIES_PER_TICK: usize = 5;
                 {
                     // Clean up entries for completed operations
                     subscribe_retried.retain(|tx, _| ops.subscribe.contains_key(tx));
@@ -1682,7 +1686,15 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
                             .collect();
 
-                        for tx in retry_candidates {
+                        if retry_candidates.len() > MAX_SUBSCRIBE_RETRIES_PER_TICK {
+                            tracing::debug!(
+                                total = retry_candidates.len(),
+                                processing = MAX_SUBSCRIBE_RETRIES_PER_TICK,
+                                "Capping subscribe retries per tick"
+                            );
+                        }
+
+                        for tx in retry_candidates.into_iter().take(MAX_SUBSCRIBE_RETRIES_PER_TICK) {
                             if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
                                 let max_htl = ring.max_hops_to_live;
                                 match sub_op.retry_with_next_alternative(max_htl, &all_connected) {
