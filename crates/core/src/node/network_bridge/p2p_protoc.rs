@@ -2605,30 +2605,11 @@ impl P2pConnManager {
                 let loc = was_transient
                     .and_then(|e| e.location)
                     .unwrap_or_else(|| Location::from_address(&peer_addr));
-                // Re-run admission + cap guard when promoting a transient connection.
-                let should_accept = connection_manager.should_accept(loc, peer_addr);
-                if !should_accept {
-                    tracing::warn!(
-                        tx = %tx,
-                        %peer,
-                        %loc,
-                        transient_expired,
-                        "connect_peer: promotion rejected by admission logic"
-                    );
-                    callback
-                        .send_result(Err(()))
-                        .await
-                        .inspect_err(|err| {
-                            tracing::debug!(
-                                tx = %tx,
-                                remote = %peer,
-                                ?err,
-                                "connect_peer: failed to notify rejected-promotion callback"
-                            );
-                        })
-                        .ok();
-                    return Ok(());
-                }
+                // Don't re-run should_accept() here — the connection was already
+                // accepted at the protocol level (connect.rs:572) and NAT traversal
+                // already succeeded. Re-evaluating the probabilistic Kleinberg filter
+                // would discard hard-won connections for no capacity reason (#3545).
+                // Only enforce the hard max_connections cap as a resource safety limit.
                 let current = connection_manager.connection_count();
                 if current >= connection_manager.max_connections {
                     tracing::warn!(
@@ -2783,21 +2764,21 @@ impl P2pConnManager {
             return Ok(());
         }
 
-        // Early admission check: avoid expensive NAT hole-punching for connections
-        // that would be rejected by should_accept() after establishment. Only applies
-        // to non-transient (ring-bound) connections — transient gateway connections
-        // don't go through admission.
+        // Pre-flight max_connections check: avoid expensive NAT hole-punching when
+        // we're already at capacity. We don't re-run should_accept() here because
+        // the connection was already accepted at the protocol level (connect.rs:572)
+        // and re-rolling the probabilistic Kleinberg filter would discard connections
+        // after costly NAT traversal for no capacity reason (#3545).
         if !transient && !peer_addr.ip().is_unspecified() {
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            let loc = peer
-                .location()
-                .unwrap_or_else(|| Location::from_address(&peer_addr));
-            if !connection_manager.should_accept(loc, peer_addr) {
+            let current = connection_manager.connection_count();
+            if current >= connection_manager.max_connections {
                 tracing::info!(
                     tx = %tx,
                     remote = %peer_addr,
-                    %loc,
-                    "connect_peer: skipping connection — admission would reject"
+                    current_connections = current,
+                    max_connections = connection_manager.max_connections,
+                    "connect_peer: skipping connection — at max_connections"
                 );
                 callback
                     .send_result(Err(()))
@@ -2807,7 +2788,7 @@ impl P2pConnManager {
                             tx = %tx,
                             remote = %peer_addr,
                             ?err,
-                            "connect_peer: failed to notify early-rejection callback"
+                            "connect_peer: failed to notify max-connections-rejection callback"
                         );
                     })
                     .ok();
@@ -3464,21 +3445,12 @@ impl P2pConnManager {
                     pending_loc_known = pending_loc.is_some(),
                     "handle_successful_connection: evaluating promotion to ring"
                 );
-                // Re-apply admission logic on promotion to avoid bypassing capacity/heuristic checks.
-                let should_accept = connection_manager.should_accept(loc, peer_addr);
-                if !should_accept {
-                    tracing::warn!(
-                        %peer_addr,
-                        %loc,
-                        "handle_successful_connection: promotion rejected by admission logic"
-                    );
-                    // Drop the connection immediately instead of letting it linger
-                    // as a zombie for up to 5 minutes confusing the dashboard.
-                    crate::node::network_status::record_peer_disconnected(peer_addr);
-                    self.drop_connection_by_addr(peer_addr, handshake_commands)
-                        .await;
-                    return Ok(());
-                }
+                // Don't re-run should_accept() here — the connection was already
+                // accepted at the protocol level (connect.rs:572) and transport
+                // establishment (NAT traversal) already succeeded. Re-evaluating
+                // the probabilistic Kleinberg filter would discard hard-won
+                // connections for no capacity reason (#3545).
+                // Only enforce the hard max_connections cap below.
                 let current = connection_manager.connection_count();
                 if current >= connection_manager.max_connections {
                     tracing::warn!(
