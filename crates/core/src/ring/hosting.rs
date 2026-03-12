@@ -181,7 +181,6 @@ impl HostingManager {
             downstream_subscribers: DashMap::new(),
             time_source: InstantTimeSrc::new(),
             pending_subscription_requests: DashSet::new(),
-
             subscription_backoff: RwLock::new(TrackedBackoff::new(
                 backoff_config,
                 MAX_SUBSCRIPTION_BACKOFF_ENTRIES,

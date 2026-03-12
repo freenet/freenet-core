@@ -838,9 +838,6 @@ impl Ring {
         let mut interval = tokio::time::interval(interval_duration);
         // Skip the first immediate tick — we run the first pass immediately
         // below (no tick wait) so client subscriptions get prompt renewal.
-        // This is safe because the startup revalidation window has been removed:
-        // contracts_needing_renewal() only returns contracts with client interest,
-        // not all hosted contracts.
         interval.tick().await;
 
         let mut first_pass = true;
