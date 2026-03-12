@@ -1024,13 +1024,14 @@ impl P2pConnManager {
                             match peer_connection {
                                 Some(peer_connection) => {
                                     // Short timeout avoids head-of-line blocking: if
-                                    // the channel doesn't drain within 100ms the peer
+                                    // the channel doesn't drain within 500ms the peer
                                     // is congested/dead, so we drop the message and
-                                    // let the op timeout + retry. 100ms gives transient
-                                    // bursts a chance to clear while preventing the
-                                    // event loop from stalling on dead peers.
+                                    // let the op timeout + retry. 500ms gives transient
+                                    // bursts and slow CI runners time to clear while
+                                    // preventing the event loop from stalling on dead
+                                    // peers (which would block indefinitely).
                                     const SEND_TIMEOUT: std::time::Duration =
-                                        std::time::Duration::from_millis(100);
+                                        std::time::Duration::from_millis(500);
                                     let msg_type = match &msg {
                                         NetMessage::V1(v1) => match v1 {
                                             NetMessageV1::Connect(_) => "Connect",
