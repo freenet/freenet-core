@@ -574,17 +574,36 @@ impl ConnectionManager {
             // stalling bootstrap when many peers try to connect.
             //
             // Below KLEINBERG_FILTER_MIN_CONNECTIONS we always accept (too few
-            // connections for a meaningful gap score). Above that, higher gap
-            // scores get higher acceptance probability, with a 50% floor so
-            // bootstrap is never blocked.
+            // connections for a meaningful gap score). Above that, selectivity
+            // scales with how close we are to min_connections:
+            //   - At KLEINBERG_FILTER_MIN_CONNECTIONS: floor ~0.9 (accept almost all)
+            //   - Approaching min_connections: floor ~0.3 (be selective)
+            // This prevents bootstrap stalls when NAT traversal is unreliable
+            // while still shaping topology as the node fills up.
             let accepted = if open < KLEINBERG_FILTER_MIN_CONNECTIONS {
                 true
             } else if let Some(me) = self.get_stored_location() {
                 let score = self.compute_kleinberg_score(me, location);
-                // score ranges from 0.0 (next to existing connection) to ~0.5
-                // (centered in empty range). Normalize to [0, 1] and apply
-                // a 50% floor: accept_prob = 0.5 + score (clamped to 1.0).
-                let accept_prob = (0.5 + score).min(1.0);
+                // Compute a sliding floor based on how far we are from min_connections.
+                // progress=0.0 at KLEINBERG_FILTER_MIN_CONNECTIONS, 1.0 at min_connections.
+                let range = self.min_connections - KLEINBERG_FILTER_MIN_CONNECTIONS;
+                let progress = if range > 0 {
+                    (open - KLEINBERG_FILTER_MIN_CONNECTIONS) as f64 / range as f64
+                } else {
+                    1.0
+                };
+                // Floor slides from 0.9 (desperate for connections) to 0.3 (nearly full).
+                let floor = 0.9 - 0.6 * progress;
+                let accept_prob = (floor + score).min(1.0);
+                tracing::debug!(
+                    open,
+                    min = self.min_connections,
+                    %progress,
+                    %floor,
+                    %score,
+                    %accept_prob,
+                    "should_accept: sliding Kleinberg floor"
+                );
                 GlobalRng::random_range(0.0..1.0) < accept_prob
             } else {
                 true
