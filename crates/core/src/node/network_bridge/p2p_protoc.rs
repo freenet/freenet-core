@@ -1023,23 +1023,61 @@ impl P2pConnManager {
 
                             match peer_connection {
                                 Some(peer_connection) => {
-                                    if let Err(e) =
-                                        peer_connection.sender.send(Left(msg.clone())).await
+                                    // Short timeout avoids head-of-line blocking: if
+                                    // the channel doesn't drain within 500ms the peer
+                                    // is congested/dead, so we drop the message and
+                                    // let the op timeout + retry. 500ms gives transient
+                                    // bursts and slow CI runners time to clear while
+                                    // preventing the event loop from stalling on dead
+                                    // peers (which would block indefinitely).
+                                    const SEND_TIMEOUT: std::time::Duration =
+                                        std::time::Duration::from_millis(500);
+                                    let msg_type = match &msg {
+                                        NetMessage::V1(v1) => match v1 {
+                                            NetMessageV1::Connect(_) => "Connect",
+                                            NetMessageV1::Put(_) => "Put",
+                                            NetMessageV1::Get(_) => "Get",
+                                            NetMessageV1::Subscribe(_) => "Subscribe",
+                                            NetMessageV1::Update(_) => "Update",
+                                            NetMessageV1::Aborted(_) => "Aborted",
+                                            NetMessageV1::ProximityCache { .. } => "ProximityCache",
+                                            NetMessageV1::InterestSync { .. } => "InterestSync",
+                                            NetMessageV1::ReadyState { .. } => "ReadyState",
+                                        },
+                                    };
+                                    match tokio::time::timeout(
+                                        SEND_TIMEOUT,
+                                        peer_connection.sender.send(Left(msg.clone())),
+                                    )
+                                    .await
                                     {
-                                        tracing::error!(
-                                            tx = %msg.id(),
-                                            peer_addr = %target_addr,
-                                            error = %e,
-                                            phase = "error",
-                                            "Failed to send message to peer connection"
-                                        );
-                                    } else {
-                                        tracing::trace!(
-                                            tx = %msg.id(),
-                                            peer_addr = %target_addr,
-                                            phase = "send",
-                                            "Message sent to peer connection"
-                                        );
+                                        Ok(Ok(())) => {
+                                            tracing::trace!(
+                                                tx = %msg.id(),
+                                                peer_addr = %target_addr,
+                                                phase = "send",
+                                                "Message sent to peer connection"
+                                            );
+                                        }
+                                        Ok(Err(_closed)) => {
+                                            tracing::error!(
+                                                tx = %msg.id(),
+                                                peer_addr = %target_addr,
+                                                msg_type,
+                                                phase = "error",
+                                                "Peer connection channel closed"
+                                            );
+                                        }
+                                        Err(_timeout) => {
+                                            tracing::warn!(
+                                                tx = %msg.id(),
+                                                peer_addr = %target_addr,
+                                                msg_type,
+                                                phase = "backpressure",
+                                                "Outbound channel full after {SEND_TIMEOUT:?}, \
+                                                 dropping message to avoid event loop stall"
+                                            );
+                                        }
                                     }
                                 }
                                 None => {

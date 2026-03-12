@@ -1651,3 +1651,98 @@ fn test_retry_constants() {
     assert_eq!(MAX_BREADTH, 3, "MAX_BREADTH should be 3 (same as GET)");
     assert_eq!(MAX_RETRIES, 10, "MAX_RETRIES should be 10 (same as GET)");
 }
+
+// ── Black-hole peer detection tests (#3523) ────────────────────────────
+
+use crate::operations::OpOutcome;
+use crate::ring::Location;
+
+/// Build a `SubscribeOp` in `AwaitingResponse` state with the given stats.
+fn awaiting_op(
+    instance_id: ContractInstanceId,
+    next_hop: Option<SocketAddr>,
+    stats: Option<SubscribeStats>,
+) -> SubscribeOp {
+    let id = Transaction::new::<SubscribeMsg>();
+    SubscribeOp {
+        id,
+        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
+            next_hop,
+            instance_id,
+            retries: 0,
+            current_hop: 3,
+            tried_peers: HashSet::new(),
+            alternatives: Vec::new(),
+            attempts_at_hop: 1,
+            visited: crate::operations::VisitedPeers::new(&id),
+        }),
+        requester_addr: next_hop.map(|_| "127.0.0.1:12345".parse().unwrap()),
+        requester_pub_key: None,
+        is_renewal: false,
+        stats,
+    }
+}
+
+/// An intermediate forward with stats reports ContractOpFailure on timeout,
+/// feeding PeerHealthTracker and the failure estimator.
+#[test]
+fn intermediate_forward_with_stats_reports_failure() {
+    let target_peer = random_peer();
+    let contract_location = Location::random();
+    let instance_id = ContractInstanceId::new([1u8; 32]);
+
+    let op = awaiting_op(
+        instance_id,
+        target_peer.socket_addr(),
+        Some(SubscribeStats {
+            target_peer,
+            contract_location,
+        }),
+    );
+
+    let info = op
+        .failure_routing_info()
+        .expect("should have routing info for timeout reporting");
+    assert_eq!(info.1, contract_location);
+    assert!(!op.finalized());
+    assert!(
+        matches!(op.outcome(), OpOutcome::ContractOpFailure { .. }),
+        "timed-out forward should report failure, not Incomplete"
+    );
+}
+
+/// Without stats (target peer not yet known), outcome is Incomplete.
+#[test]
+fn subscribe_without_stats_returns_incomplete() {
+    let op = awaiting_op(ContractInstanceId::new([2u8; 32]), None, None);
+
+    assert!(op.failure_routing_info().is_none());
+    assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+}
+
+/// A completed subscribe with stats reports success.
+#[test]
+fn completed_subscribe_reports_success() {
+    let target_peer = random_peer();
+    let contract_location = Location::random();
+    let key =
+        ContractKey::from_id_and_code(ContractInstanceId::new([3u8; 32]), CodeHash::new([4u8; 32]));
+
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: SubscribeState::Completed(CompletedData { key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: Some(SubscribeStats {
+            target_peer,
+            contract_location,
+        }),
+    };
+
+    assert!(op.finalized());
+    assert!(matches!(
+        op.outcome(),
+        OpOutcome::ContractOpSuccessUntimed { .. }
+    ));
+}
