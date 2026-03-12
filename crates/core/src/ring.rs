@@ -836,14 +836,21 @@ impl Ring {
         tokio::time::sleep(jitter).await;
 
         let mut interval = tokio::time::interval(interval_duration);
-        // Consume tokio's immediate first tick so the loop starts with a full
-        // interval wait. This avoids firing renewals immediately on startup,
-        // which previously contributed to subscription storms when combined
-        // with the (now-removed) startup revalidation window.
+        // Skip the first immediate tick — we run the first pass immediately
+        // below (no tick wait) so client subscriptions get prompt renewal.
+        // This is safe because the startup revalidation window has been removed:
+        // contracts_needing_renewal() only returns contracts with client interest,
+        // not all hosted contracts.
         interval.tick().await;
 
+        let mut first_pass = true;
+
         loop {
-            interval.tick().await;
+            if first_pass {
+                first_pass = false;
+            } else {
+                interval.tick().await;
+            }
 
             // First, expire any stale subscriptions
             let expired = ring.expire_stale_subscriptions();
