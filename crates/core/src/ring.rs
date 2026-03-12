@@ -836,7 +836,10 @@ impl Ring {
         tokio::time::sleep(jitter).await;
 
         let mut interval = tokio::time::interval(interval_duration);
-        // Skip the first immediate tick (we run the first pass below)
+        // Consume tokio's immediate first tick so the loop starts with a full
+        // interval wait. This avoids firing renewals immediately on startup,
+        // which previously contributed to subscription storms when combined
+        // with the (now-removed) startup revalidation window.
         interval.tick().await;
 
         loop {

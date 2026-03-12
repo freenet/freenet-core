@@ -11,9 +11,10 @@
 //! into a single `HostingCache` that serves as the source of truth for which contracts
 //! this peer is hosting.
 //!
-//! 1. **Hosting = subscription renewal**: All hosted contracts automatically get
-//!    their subscriptions renewed. This fixes the bug where GET-triggered subscriptions
-//!    would expire and never be renewed.
+//! 1. **Hosting ≠ subscription renewal**: Hosted contracts are cached locally but
+//!    only contracts with active client subscriptions or downstream subscribers
+//!    get their subscriptions renewed. Contracts persisted to disk without active
+//!    interest serve as a recovery mechanism (last-resort data source) only.
 //!
 //! 2. **Subscriptions are lease-based**: Active subscriptions have a lease that expires
 //!    unless renewed. Clients must re-subscribe periodically (every ~2 minutes).
@@ -23,7 +24,7 @@
 //! ## Data Flow
 //!
 //! - GET/PUT/SUBSCRIBE operations add contracts to the hosting cache
-//! - All hosted contracts get subscription renewal via `contracts_needing_renewal()`
+//! - Only client-subscribed contracts get subscription renewal via `contracts_needing_renewal()`
 //! - Active subscriptions prevent eviction from the hosting cache
 //! - TTL protects recently accessed contracts from premature eviction
 
@@ -1431,33 +1432,6 @@ mod tests {
         assert!(manager.is_receiving_updates(&contract));
     }
 
-    // Superseded: hosted-only contracts are never renewed. Startup revalidation
-    // window (#3489) was removed to fix subscription accumulation storms.
-    // See test_contracts_needing_renewal_excludes_hosted_only.
-    #[ignore]
-    #[test]
-    fn test_hosted_contract_renewed_despite_no_interest() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(42);
-
-        // Add contract to hosting cache via GET access
-        manager.record_contract_access(contract, 1000, AccessType::Get);
-        assert!(manager.is_hosting_contract(&contract));
-
-        // should_unsubscribe_upstream still returns true (no clients, no downstream)
-        assert!(
-            manager.should_unsubscribe_upstream(&contract),
-            "should_unsubscribe_upstream does not check hosting cache"
-        );
-
-        // But contracts_needing_renewal() includes it anyway
-        let renewals = manager.contracts_needing_renewal();
-        assert!(
-            renewals.contains(&contract),
-            "Hosted contract should be included in subscription renewals"
-        );
-    }
-
     #[test]
     fn test_contracts_needing_renewal_excludes_hosted_only() {
         let manager = HostingManager::new();
@@ -1485,57 +1459,48 @@ mod tests {
         );
     }
 
-    // Superseded: startup revalidation window removed to fix subscription
-    // accumulation storm. Hosted contracts loaded from disk are no longer
-    // auto-subscribed on startup. See PR that removes STARTUP_REVALIDATION_WINDOW.
-    #[ignore]
+    /// Regression test for subscription accumulation (#3546).
+    ///
+    /// Verifies that hosting hundreds of contracts (simulating relay-cached
+    /// contracts loaded from disk) does NOT cause them to appear in the
+    /// renewal list. Only explicitly client-subscribed contracts should
+    /// be renewed.
     #[test]
-    fn test_startup_revalidation_includes_hosted_contracts() {
+    fn test_hosted_contracts_not_renewed_at_scale() {
         let manager = HostingManager::new();
-        let contract = make_contract_key(1);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+
+        // Simulate 200 relay-cached contracts loaded from disk
+        for i in 0..200u8 {
+            let contract = make_contract_key(i);
+            manager.record_contract_access(contract, 1000, AccessType::Get);
+        }
+        assert_eq!(manager.hosting_contracts_count(), 200);
+
+        // None should appear in renewal list
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
-            needs_renewal.contains(&contract),
-            "Hosted contract should be in renewal list during startup window"
+            needs_renewal.is_empty(),
+            "200 hosted-only contracts should NOT be in renewal list, found {}",
+            needs_renewal.len()
         );
-    }
 
-    // Superseded: startup revalidation window removed.
-    #[ignore]
-    #[test]
-    fn test_startup_revalidation_skips_already_subscribed() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(1);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
-        manager.subscribe(contract);
+        // Subscribe to exactly 2 (simulating River client)
+        let client_id = crate::client_events::ClientId::next();
+        let contract_a = make_contract_key(42);
+        let contract_b = make_contract_key(99);
+        manager.add_client_subscription(contract_a.id(), client_id);
+        manager.add_client_subscription(contract_b.id(), client_id);
+
+        // Only those 2 should need renewal
         let needs_renewal = manager.contracts_needing_renewal();
-        assert!(
-            !needs_renewal.contains(&contract),
-            "Already-subscribed contract should not be duplicated in renewal list"
+        assert_eq!(
+            needs_renewal.len(),
+            2,
+            "Only 2 client-subscribed contracts should need renewal, found {}",
+            needs_renewal.len()
         );
-    }
-
-    // Superseded: startup revalidation window removed.
-    #[ignore]
-    #[test]
-    fn test_startup_revalidation_window_expires() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(1);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
-        let needs_renewal = manager.contracts_needing_renewal();
-        assert!(
-            !needs_renewal.contains(&contract),
-            "Hosted-only contract should NOT be in renewal list"
-        );
-    }
-
-    // Superseded: startup revalidation window removed.
-    #[ignore]
-    #[test]
-    fn test_startup_revalidation_multiple_contracts() {
-        let manager = HostingManager::new();
-        let _ = make_contract_key(1);
+        assert!(needs_renewal.contains(&contract_a));
+        assert!(needs_renewal.contains(&contract_b));
     }
 
     /// Validates that backoff constants are internally consistent.
