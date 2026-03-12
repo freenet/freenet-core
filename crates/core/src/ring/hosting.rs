@@ -539,34 +539,6 @@ impl HostingManager {
         expired_counts
     }
 
-    /// Remove a specific peer from all downstream subscriber entries.
-    /// Returns affected contracts paired with whether the contract lost ALL downstream subscribers.
-    pub fn remove_peer_from_all_downstream(&self, peer: &PeerKey) -> Vec<(ContractKey, bool)> {
-        let mut affected = Vec::new();
-
-        let keys: Vec<ContractKey> = self
-            .downstream_subscribers
-            .iter()
-            .map(|entry| *entry.key())
-            .collect();
-
-        for key in keys {
-            if let Some(mut peers) = self.downstream_subscribers.get_mut(&key) {
-                if peers.remove(peer).is_some() {
-                    let now_empty = peers.is_empty();
-                    if now_empty {
-                        drop(peers);
-                        self.downstream_subscribers
-                            .remove_if(&key, |_, peers| peers.is_empty());
-                    }
-                    affected.push((key, now_empty));
-                }
-            }
-        }
-
-        affected
-    }
-
     /// Check if a contract has no local clients and no downstream subscribers,
     /// meaning we can safely unsubscribe upstream.
     pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
@@ -2278,36 +2250,5 @@ mod tests {
             !interest.has_local_interest(&contract),
             "downstream_subscriber_count should be 0 after syncing with TTL expiry"
         );
-    }
-
-    /// Regression test: remove_peer_from_all_downstream must remove a specific
-    /// peer from all contracts and return affected contracts.
-    #[test]
-    fn test_remove_peer_from_all_downstream() {
-        let manager = HostingManager::new();
-        let contract_a = make_contract_key(92);
-        let contract_b = make_contract_key(93);
-        let peer = make_peer_key(92);
-        let other_peer = make_peer_key(93);
-
-        // peer subscribes to both contracts
-        manager.add_downstream_subscriber(&contract_a, peer.clone());
-        manager.add_downstream_subscriber(&contract_b, peer.clone());
-        // other_peer subscribes to contract_b only
-        manager.add_downstream_subscriber(&contract_b, other_peer.clone());
-
-        let affected = manager.remove_peer_from_all_downstream(&peer);
-        assert_eq!(affected.len(), 2, "Peer was downstream for 2 contracts");
-
-        // contract_a had only peer -> now_empty = true
-        let a_entry = affected.iter().find(|(c, _)| *c == contract_a).unwrap();
-        assert!(a_entry.1, "contract_a should have no remaining downstream");
-
-        // contract_b had peer + other_peer -> now_empty = false
-        let b_entry = affected.iter().find(|(c, _)| *c == contract_b).unwrap();
-        assert!(!b_entry.1, "contract_b should still have other_peer");
-
-        assert!(!manager.has_downstream_subscribers(&contract_a));
-        assert!(manager.has_downstream_subscribers(&contract_b));
     }
 }

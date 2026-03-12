@@ -1569,10 +1569,6 @@ impl Ring {
         self.hosting_manager.expire_stale_downstream_subscribers()
     }
 
-    pub fn remove_peer_from_all_downstream(&self, peer: &PeerKey) -> Vec<(ContractKey, bool)> {
-        self.hosting_manager.remove_peer_from_all_downstream(peer)
-    }
-
     pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.should_unsubscribe_upstream(contract)
     }
