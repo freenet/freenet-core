@@ -738,7 +738,10 @@ impl SubscribeOp {
                         requester_addr,
                         requester_pub_key,
                         is_renewal,
-                        stats,
+                        stats: stats.map(|mut s| {
+                            s.target_peer = next_target.clone();
+                            s
+                        }),
                     };
 
                     op_manager
@@ -798,7 +801,10 @@ impl SubscribeOp {
                             requester_addr,
                             requester_pub_key,
                             is_renewal,
-                            stats,
+                            stats: stats.map(|mut s| {
+                                s.target_peer = next_target.clone();
+                                s
+                            }),
                         };
 
                         op_manager
@@ -1287,7 +1293,12 @@ impl Operation for SubscribeOp {
                             requester_addr: self.requester_addr,
                             requester_pub_key: self.requester_pub_key,
                             is_renewal: self.is_renewal,
-                            stats: None,
+                            // Track the forward target so timeouts report to
+                            // PeerHealthTracker and the failure estimator.
+                            stats: Some(SubscribeStats {
+                                target_peer: next_hop.clone(),
+                                contract_location: Location::from(instance_id),
+                            }),
                         }),
                         stream_data: None,
                     })
@@ -1533,7 +1544,10 @@ impl Operation for SubscribeOp {
                                             requester_addr: self.requester_addr,
                                             requester_pub_key: self.requester_pub_key,
                                             is_renewal: self.is_renewal,
-                                            stats: self.stats,
+                                            stats: self.stats.map(|mut s| {
+                                                s.target_peer = next_target.clone();
+                                                s
+                                            }),
                                         }),
                                         stream_data: None,
                                     });
@@ -1597,7 +1611,10 @@ impl Operation for SubscribeOp {
                                                 requester_addr: self.requester_addr,
                                                 requester_pub_key: self.requester_pub_key,
                                                 is_renewal: self.is_renewal,
-                                                stats: self.stats,
+                                                stats: self.stats.map(|mut s| {
+                                                    s.target_peer = next_target.clone();
+                                                    s
+                                                }),
                                             }),
                                             stream_data: None,
                                         });
