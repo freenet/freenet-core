@@ -24,19 +24,44 @@ on:
       - 'LICENSE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/FUNDING.yml'
+  merge_group:
 
 concurrency:
   group: claude-pr-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
+  # Auto-pass rule-review/findings for merge queue commits.
+  # Findings were already acknowledged on the PR; the merge queue creates new
+  # merge commits that would never receive this commit status otherwise.
+  merge-queue-pass:
+    name: Claude Rule Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'merge_group'
+    permissions:
+      statuses: write
+    steps:
+      - name: Set rule-review/findings to success
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'success',
+              context: 'rule-review/findings',
+              description: 'Auto-passed for merge queue (findings acknowledged on PR)',
+            });
+
   rule-review:
     name: Claude Rule Review
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Skip draft PRs, release branches, and dependabot.
+    # Skip draft PRs, release branches, dependabot, and merge queue events.
     # For label events, only run when the 'claude-review' label was added.
     if: |
+      github.event_name != 'merge_group' &&
       !github.event.pull_request.draft &&
       !startsWith(github.event.pull_request.head.ref, 'release/v') &&
       !startsWith(github.event.pull_request.head.ref, 'dependabot/') &&
