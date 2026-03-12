@@ -1242,11 +1242,11 @@ pub struct NodeInfo {
     pub location: f64,
     /// IP address the node binds to (varied loopback for test isolation)
     pub ip: std::net::Ipv4Addr,
-    /// Shared attested-contracts map for this node's API server.
+    /// Shared origin-contracts map for this node's API server.
     ///
     /// Pre-populate entries here to simulate clients authenticated via an HTTP
-    /// contract page before connecting over WebSocket (see `insert_attested_contract`).
-    pub attested_contracts: crate::server::client_api::AttestedContractMap,
+    /// contract page before connecting over WebSocket (see `insert_origin_contract`).
+    pub origin_contracts: crate::server::client_api::OriginContractMap,
 }
 
 impl NodeInfo {
@@ -1258,21 +1258,21 @@ impl NodeInfo {
         )
     }
 
-    /// Pre-register an auth token → contract mapping in this node's attested-contracts map.
+    /// Pre-register an auth token → contract mapping in this node's origin-contracts map.
     ///
     /// Call this before connecting via WebSocket with an `Authorization: Bearer <token>`
     /// header to simulate a client that authenticated via an HTTP contract page.  The
     /// delegate's `process()` function will then receive the contract ID bytes in its
-    /// `attested` parameter.
-    pub fn insert_attested_contract(
+    /// `origin` parameter.
+    pub fn insert_origin_contract(
         &self,
         token: crate::client_events::AuthToken,
         contract_id: freenet_stdlib::prelude::ContractInstanceId,
     ) {
         use crate::client_events::ClientId;
-        use crate::server::client_api::AttestedContract;
-        self.attested_contracts
-            .insert(token, AttestedContract::new(contract_id, ClientId::FIRST));
+        use crate::server::client_api::OriginContract;
+        self.origin_contracts
+            .insert(token, OriginContract::new(contract_id, ClientId::FIRST));
     }
 
     /// Wait for this node to become ready using a two-phase check.

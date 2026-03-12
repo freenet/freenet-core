@@ -129,7 +129,7 @@ use crate::{
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
-use crate::server::client_api::AttestedContractMap;
+use crate::server::client_api::OriginContractMap;
 
 /// Checks if a WebSocket Origin header value refers to localhost.
 ///
@@ -242,14 +242,14 @@ const PARALLELISM: usize = 256;
 
 impl WebSocketProxy {
     pub fn create_router(server_routing: Router) -> (Self, Router) {
-        // Create a default empty attested contracts map
-        let attested_contracts = Arc::new(DashMap::new());
-        Self::create_router_with_attested_contracts(server_routing, attested_contracts)
+        // Create a default empty origin contracts map
+        let origin_contracts = Arc::new(DashMap::new());
+        Self::create_router_with_origin_contracts(server_routing, origin_contracts)
     }
 
-    pub fn create_router_with_attested_contracts(
+    pub fn create_router_with_origin_contracts(
         server_routing: Router,
-        attested_contracts: AttestedContractMap,
+        origin_contracts: OriginContractMap,
     ) -> (Self, Router) {
         let (proxy_request_sender, proxy_server_request) = mpsc::channel(PARALLELISM);
 
@@ -267,7 +267,7 @@ impl WebSocketProxy {
         let router = server_routing
             .merge(v1_route)
             .merge(v2_route)
-            .layer(Extension(attested_contracts))
+            .layer(Extension(origin_contracts))
             .layer(Extension(ws_request))
             .layer(axum::middleware::from_fn(connection_info));
 
@@ -291,7 +291,7 @@ impl WebSocketProxy {
         key: ContractInstanceId,
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
-        attested_contract: Option<ContractInstanceId>,
+        origin_contract: Option<ContractInstanceId>,
     ) -> Option<OpenRequest<'static>> {
         let (tx, rx) =
             tokio::sync::mpsc::channel(crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
@@ -311,7 +311,7 @@ impl WebSocketProxy {
             OpenRequest::new(client_id, req)
                 .with_notification(tx)
                 .with_token(auth_token)
-                .with_attested_contract(attested_contract),
+                .with_origin_contract(origin_contract),
         )
     }
 
@@ -340,7 +340,7 @@ impl WebSocketProxy {
                 client_id,
                 req,
                 auth_token,
-                attested_contract,
+                origin_contract,
                 ..
             } => {
                 // Extract the subscription key if this request needs a notification channel.
@@ -367,20 +367,15 @@ impl WebSocketProxy {
 
                 let open_req = if let Some(key) = sub_key {
                     tracing::debug!(%client_id, contract = %key, "setting up subscription channel");
-                    match self.setup_subscription(
-                        client_id,
-                        key,
-                        req,
-                        auth_token,
-                        attested_contract,
-                    ) {
+                    match self.setup_subscription(client_id, key, req, auth_token, origin_contract)
+                    {
                         Some(r) => r,
                         None => return Ok(None),
                     }
                 } else {
                     OpenRequest::new(client_id, req)
                         .with_token(auth_token)
-                        .with_attested_contract(attested_contract)
+                        .with_origin_contract(origin_contract)
                 };
                 Ok(Some(open_req))
             }
@@ -535,7 +530,7 @@ async fn websocket_commands(
     Extension(encoding_protoc): Extension<EncodingProtocol>,
     Extension(streaming): Extension<bool>,
     Extension(rs): Extension<WebSocketRequest>,
-    Extension(attested_contracts): Extension<AttestedContractMap>,
+    Extension(origin_contracts): Extension<OriginContractMap>,
     Extension(api_version): Extension<ApiVersion>,
 ) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
@@ -545,14 +540,14 @@ async fn websocket_commands(
             // Only collect and log map contents when trace is enabled
             if tracing::enabled!(tracing::Level::TRACE) {
                 let map_contents: Vec<_> =
-                    attested_contracts.iter().map(|e| e.key().clone()).collect();
-                tracing::trace!(?token, "attested_contracts map keys: {:?}", map_contents);
+                    origin_contracts.iter().map(|e| e.key().clone()).collect();
+                tracing::trace!(?token, "origin_contracts map keys: {:?}", map_contents);
             }
 
-            if let Some(entry) = attested_contracts.get(token) {
-                let attested = entry.value();
-                tracing::trace!(?token, contract_id = ?attested.contract_id, "Found token in attested_contracts map");
-                (Some((token.clone(), attested.contract_id)), false)
+            if let Some(entry) = origin_contracts.get(token) {
+                let origin = entry.value();
+                tracing::trace!(?token, contract_id = ?origin.contract_id, "Found token in origin_contracts map");
+                (Some((token.clone(), origin.contract_id)), false)
             } else {
                 // Rate-limit warnings: only log once per unique token to avoid log spam
                 // when clients repeatedly retry with the same stale token
@@ -570,7 +565,7 @@ async fn websocket_commands(
                     // First time seeing this invalid token - log it
                     tracing::warn!(
                         ?token,
-                        "Auth token not found in attested_contracts map. \
+                        "Auth token not found in origin_contracts map. \
                          This usually means the node was restarted and the client has a stale token. \
                          Client should refresh the page to get a new token."
                     );
@@ -633,7 +628,7 @@ async fn notify_disconnect(
             client_id,
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: auth_token.as_ref().map(|t| t.0.clone()),
-            attested_contract: auth_token.as_ref().map(|t| t.1),
+            origin_contract: auth_token.as_ref().map(|t| t.1),
             api_version,
         })
         .await
@@ -1024,7 +1019,7 @@ async fn process_client_request(
     msg: Result<Message, axum::Error>,
     request_sender: &mpsc::Sender<ClientConnection>,
     auth_token: &mut Option<AuthToken>,
-    attested_contract: Option<ContractInstanceId>,
+    origin_contract: Option<ContractInstanceId>,
     api_version: ApiVersion,
     rate_limiter: &mut DelegateRateLimiter,
     conn_state: &mut ConnectionState,
@@ -1154,13 +1149,13 @@ async fn process_client_request(
         }
     }
 
-    // Scope check: contract web apps (identified by attested_contract) cannot use NodeQueries.
+    // Scope check: contract web apps (identified by origin_contract) cannot use NodeQueries.
     // This prevents malicious contracts from exfiltrating peer topology data.
-    if attested_contract.is_some() {
+    if origin_contract.is_some() {
         if let ClientRequest::NodeQueries(_) = &req {
             tracing::warn!(
                 %client_id,
-                contract = ?attested_contract,
+                contract = ?origin_contract,
                 "Blocked NodeQueries from contract web app"
             );
             let error: ClientError = ErrorKind::Unhandled {
@@ -1199,7 +1194,7 @@ async fn process_client_request(
             client_id,
             req: Box::new(req),
             auth_token: auth_token.clone(),
-            attested_contract,
+            origin_contract,
             api_version,
         })
         .await

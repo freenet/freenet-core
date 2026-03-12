@@ -32,7 +32,7 @@ impl DelegateInterface for Delegate {
     fn process(
         _ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        _attested: Option<&'static [u8]>,
+        _origin: Option<MessageOrigin>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match messages {
@@ -62,8 +62,7 @@ impl DelegateInterface for Delegate {
 
                         let response_payload = bincode::serialize(&OutboundAppMessage::MessageSent)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(incoming_app.app, response_payload)
-                            .processed(true);
+                        let response = ApplicationMessage::new(response_payload).processed(true);
 
                         Ok(vec![
                             OutboundDelegateMsg::SendDelegateMessage(msg),
@@ -74,8 +73,7 @@ impl DelegateInterface for Delegate {
                         let response_payload =
                             bincode::serialize(&OutboundAppMessage::PingResponse { data })
                                 .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(incoming_app.app, response_payload)
-                            .processed(true);
+                        let response = ApplicationMessage::new(response_payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
                 }
@@ -89,10 +87,7 @@ impl DelegateInterface for Delegate {
                     })
                     .map_err(|err| DelegateError::Other(format!("{err}")))?;
 
-                // Use a dummy app id — in real usage the delegate would
-                // track which app to notify via context.
-                let app = ContractInstanceId::new([0u8; 32]);
-                let response = ApplicationMessage::new(app, response_payload).processed(true);
+                let response = ApplicationMessage::new(response_payload).processed(true);
                 Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
             }
             _ => Err(DelegateError::Other(

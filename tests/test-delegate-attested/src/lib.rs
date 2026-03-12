@@ -21,21 +21,19 @@ impl DelegateInterface for Delegate {
     fn process(
         _ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        attested: Option<&'static [u8]>,
+        origin: Option<MessageOrigin>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match messages {
             InboundDelegateMsg::ApplicationMessage(incoming) => {
-                let _: InboundAppMessage =
-                    bincode::deserialize(incoming.payload.as_slice()).map_err(|e| {
-                        DelegateError::Other(format!("deserialize inbound: {e}"))
-                    })?;
+                let _: InboundAppMessage = bincode::deserialize(incoming.payload.as_slice())
+                    .map_err(|e| DelegateError::Other(format!("deserialize inbound: {e}")))?;
 
-                let response = OutboundAppMessage::Attested(attested.map(|b| b.to_vec()));
-                let payload = bincode::serialize(&response).map_err(|e| {
-                    DelegateError::Other(format!("serialize response: {e}"))
-                })?;
-                let app_msg = ApplicationMessage::new(incoming.app, payload).processed(true);
+                let response =
+                    OutboundAppMessage::Attested(origin.map(|o| bincode::serialize(&o).unwrap()));
+                let payload = bincode::serialize(&response)
+                    .map_err(|e| DelegateError::Other(format!("serialize response: {e}")))?;
+                let app_msg = ApplicationMessage::new(payload).processed(true);
                 Ok(vec![OutboundDelegateMsg::ApplicationMessage(app_msg)])
             }
             _ => Err(DelegateError::Other("unsupported message type".into())),
@@ -53,13 +51,18 @@ fn test_delegate_attested_unit() -> Result<(), Box<dyn std::error::Error>> {
     );
     let app_id = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
-    // Test with Some attested bytes
-    let attested_bytes: &'static [u8] = Box::leak(Box::new([42u8; 32]));
+    // Test with Some origin (WebApp)
+    let origin = MessageOrigin::WebApp(app_id);
     let payload = bincode::serialize(&InboundAppMessage::CheckAttested).unwrap();
-    let msg = ApplicationMessage::new(app_id, payload);
+    let msg = ApplicationMessage::new(payload);
     let inbound = InboundDelegateMsg::ApplicationMessage(msg);
     let mut ctx = DelegateCtx::default();
-    let output = Delegate::process(&mut ctx, Parameters::from(vec![]), Some(attested_bytes), inbound)?;
+    let output = Delegate::process(
+        &mut ctx,
+        Parameters::from(vec![]),
+        Some(origin.clone()),
+        inbound,
+    )?;
 
     assert_eq!(output.len(), 1);
     let app_msg = match output.first().unwrap() {
@@ -70,14 +73,15 @@ fn test_delegate_attested_unit() -> Result<(), Box<dyn std::error::Error>> {
     let resp: OutboundAppMessage = bincode::deserialize(&app_msg.payload)?;
     match resp {
         OutboundAppMessage::Attested(Some(bytes)) => {
-            assert_eq!(bytes.as_slice(), attested_bytes);
+            let deserialized: MessageOrigin = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(deserialized, origin);
         }
         other => panic!("Expected Attested(Some(..)), got {:?}", other),
     }
 
     // Test with None (no auth token)
     let payload2 = bincode::serialize(&InboundAppMessage::CheckAttested).unwrap();
-    let msg2 = ApplicationMessage::new(app_id, payload2);
+    let msg2 = ApplicationMessage::new(payload2);
     let inbound2 = InboundDelegateMsg::ApplicationMessage(msg2);
     let mut ctx2 = DelegateCtx::default();
     let output2 = Delegate::process(&mut ctx2, Parameters::from(vec![]), None, inbound2)?;

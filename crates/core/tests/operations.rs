@@ -2243,10 +2243,10 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
         TestRequest(String),
     }
 
-    let app_id = ContractInstanceId::new([0; 32]);
+    let _app_id = ContractInstanceId::new([0; 32]);
     let request_data = "test-request-data".to_string();
     let payload = bincode::serialize(&InboundAppMessage::TestRequest(request_data.clone()))?;
-    let app_msg = ApplicationMessage::new(app_id, payload);
+    let app_msg = ApplicationMessage::new(payload);
 
     // Send request to the delegate
     client
@@ -2366,7 +2366,7 @@ async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> Tes
     // a WebSocket connection.
     let token = AuthToken::from("test-attested-contract-token-e2e-12345".to_string());
     let expected_contract_id = ContractInstanceId::new([42u8; 32]);
-    gateway.insert_attested_contract(token.clone(), expected_contract_id);
+    gateway.insert_origin_contract(token.clone(), expected_contract_id);
 
     // Step 2: compile / load the delegate WASM
     let params = Parameters::from(vec![]);
@@ -2410,9 +2410,9 @@ async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> Tes
 
     // Step 5: send an ApplicationMessage that causes the delegate to echo back
     // whatever bytes it received in the `attested` parameter.
-    let app_id = ContractInstanceId::new([0; 32]);
+    let _app_id = ContractInstanceId::new([0; 32]);
     let payload = bincode::serialize(&InboundAppMessage::CheckAttested)?;
-    let app_msg = ApplicationMessage::new(app_id, payload);
+    let app_msg = ApplicationMessage::new(payload);
 
     client
         .send(ClientRequest::DelegateOp(
@@ -3777,13 +3777,13 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
     let initial_state = test_utils::create_empty_todo_list();
     tracing::info!("Step 2: Delegate PUT contract (empty todo list)");
 
-    let app_id = ContractInstanceId::new([42u8; 32]);
+    let _app_id = ContractInstanceId::new([42u8; 32]);
     let put_cmd = DelegateCommand::PutContractState {
         contract: contract.clone(),
         state: initial_state.clone(),
     };
     let put_payload = bincode::serialize(&put_cmd)?;
-    let app_msg = ApplicationMessage::new(app_id, put_payload);
+    let app_msg = ApplicationMessage::new(put_payload);
 
     client
         .send(ClientRequest::DelegateOp(
@@ -3878,7 +3878,7 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
         state: updated_state.clone(),
     };
     let update_payload = bincode::serialize(&update_cmd)?;
-    let update_msg = ApplicationMessage::new(app_id, update_payload);
+    let update_msg = ApplicationMessage::new(update_payload);
 
     client
         .send(ClientRequest::DelegateOp(
@@ -4060,13 +4060,13 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
     // Step 3: GET contract via delegate
     tracing::info!("Step 3: Delegate GET contract state");
     let contract_instance_id = *contract_key.id();
-    let app_id = ContractInstanceId::new([42u8; 32]);
+    let _app_id = ContractInstanceId::new([42u8; 32]);
 
     let get_cmd = DelegateCommand::GetContractState {
         contract_id: contract_instance_id,
     };
     let get_payload = bincode::serialize(&get_cmd)?;
-    let get_msg = ApplicationMessage::new(app_id, get_payload);
+    let get_msg = ApplicationMessage::new(get_payload);
 
     client
         .send(ClientRequest::DelegateOp(

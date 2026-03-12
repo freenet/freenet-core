@@ -147,7 +147,7 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
     async fn execute_delegate_request(
         &mut self,
         _req: DelegateRequest<'_>,
-        _attested_contract: Option<&ContractInstanceId>,
+        _origin_contract: Option<&ContractInstanceId>,
     ) -> Response {
         Err(ExecutorError::other(anyhow::anyhow!(
             "delegates not supported in MockWasmRuntime"

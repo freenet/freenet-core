@@ -127,10 +127,9 @@ async fn test_delegate_e2e_wasmtime() -> anyhow::Result<()> {
             params: &Parameters<'static>,
             request_data: &str,
         ) -> anyhow::Result<()> {
-            let app_id = ContractInstanceId::new([0; 32]);
             let payload =
                 bincode::serialize(&InboundAppMessage::TestRequest(request_data.to_string()))?;
-            let app_msg = ApplicationMessage::new(app_id, payload);
+            let app_msg = ApplicationMessage::new(payload);
 
             client
                 .send(ClientRequest::DelegateOp(
