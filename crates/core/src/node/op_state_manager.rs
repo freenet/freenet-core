@@ -1641,6 +1641,9 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // Cap retries per GC tick to avoid flooding the notification channel.
                 // The gateway subscribes to 90+ contracts; retrying all at once saturates
                 // the 2048-capacity event loop channel, blocking UPDATEs and broadcasts.
+                // Value of 5: low enough to leave most channel capacity for normal ops
+                // (UPDATEs, broadcasts, etc.), high enough to cycle through 90+ contracts
+                // within a few minutes at the 5-second GC interval.
                 const MAX_SUBSCRIBE_RETRIES_PER_TICK: usize = 5;
                 {
                     // Clean up entries for completed operations
@@ -1692,6 +1695,9 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 processing = MAX_SUBSCRIBE_RETRIES_PER_TICK,
                                 "Capping subscribe retries per tick"
                             );
+                            // Shuffle to prevent DashMap iteration order from starving
+                            // some candidates when we can only process a subset per tick.
+                            crate::config::GlobalRng::shuffle(&mut retry_candidates);
                         }
 
                         for tx in retry_candidates.into_iter().take(MAX_SUBSCRIBE_RETRIES_PER_TICK) {
