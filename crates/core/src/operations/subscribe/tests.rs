@@ -1651,3 +1651,119 @@ fn test_retry_constants() {
     assert_eq!(MAX_BREADTH, 3, "MAX_BREADTH should be 3 (same as GET)");
     assert_eq!(MAX_RETRIES, 10, "MAX_RETRIES should be 10 (same as GET)");
 }
+
+// ── Black-hole peer detection tests (#3523) ────────────────────────────
+
+/// Verify that an intermediate node's forwarded subscribe op has stats set,
+/// so that if the forward times out, the failure is reported to
+/// PeerHealthTracker and the router's failure estimator.
+///
+/// Before #3523, intermediate nodes had `stats: None`, making black-hole
+/// peers invisible to the routing system.
+#[test]
+fn intermediate_subscribe_forward_reports_failure_on_timeout() {
+    use crate::operations::OpOutcome;
+    use crate::ring::Location;
+
+    let target_peer = random_peer();
+    let contract_location = Location::random();
+    let instance_id = ContractInstanceId::new([1u8; 32]);
+
+    // Simulate an intermediate node that forwarded a subscribe to target_peer
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
+            next_hop: target_peer.socket_addr(),
+            instance_id,
+            retries: 0,
+            current_hop: 3,
+            tried_peers: HashSet::new(),
+            alternatives: Vec::new(),
+            attempts_at_hop: 1,
+            visited: super::super::VisitedPeers::new(&Transaction::new::<SubscribeMsg>()),
+        }),
+        requester_addr: Some("127.0.0.1:12345".parse().unwrap()),
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: Some(SubscribeStats {
+            target_peer: target_peer.clone(),
+            contract_location,
+        }),
+    };
+
+    // Stats should be present — failure_routing_info returns the target peer
+    let info = op
+        .failure_routing_info()
+        .expect("intermediate forward should have routing info for timeout reporting");
+    assert_eq!(info.1, contract_location);
+
+    // If the op times out (not finalized, has stats), outcome is ContractOpFailure
+    // which feeds PeerHealthTracker and the isotonic failure estimator
+    assert!(!op.finalized());
+    assert!(
+        matches!(op.outcome(), OpOutcome::ContractOpFailure { .. }),
+        "timed-out intermediate forward should report failure, not Incomplete"
+    );
+}
+
+/// Verify that a subscribe op without stats returns Incomplete (no routing
+/// event generated). This is the state before the target peer is known.
+#[test]
+fn subscribe_without_stats_returns_incomplete() {
+    use crate::operations::OpOutcome;
+
+    let instance_id = ContractInstanceId::new([2u8; 32]);
+
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
+            next_hop: None,
+            instance_id,
+            retries: 0,
+            current_hop: 0,
+            tried_peers: HashSet::new(),
+            alternatives: Vec::new(),
+            attempts_at_hop: 0,
+            visited: super::super::VisitedPeers::new(&Transaction::new::<SubscribeMsg>()),
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+
+    assert!(op.failure_routing_info().is_none());
+    assert!(matches!(op.outcome(), OpOutcome::Incomplete));
+}
+
+/// Verify that a completed subscribe op with stats reports success.
+#[test]
+fn completed_subscribe_with_stats_reports_success() {
+    use crate::operations::OpOutcome;
+    use crate::ring::Location;
+
+    let target_peer = random_peer();
+    let contract_location = Location::random();
+    let key = ContractKey::from_id_and_code(
+        ContractInstanceId::new([3u8; 32]),
+        CodeHash::new([4u8; 32]),
+    );
+
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: SubscribeState::Completed(CompletedData { key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: Some(SubscribeStats {
+            target_peer,
+            contract_location,
+        }),
+    };
+
+    assert!(op.finalized());
+    assert!(matches!(
+        op.outcome(),
+        OpOutcome::ContractOpSuccessUntimed { .. }
+    ));
+}

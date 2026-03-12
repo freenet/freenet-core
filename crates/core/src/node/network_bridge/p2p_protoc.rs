@@ -1023,23 +1023,39 @@ impl P2pConnManager {
 
                             match peer_connection {
                                 Some(peer_connection) => {
-                                    if let Err(e) =
-                                        peer_connection.sender.send(Left(msg.clone())).await
-                                    {
-                                        tracing::error!(
-                                            tx = %msg.id(),
-                                            peer_addr = %target_addr,
-                                            error = %e,
-                                            phase = "error",
-                                            "Failed to send message to peer connection"
-                                        );
-                                    } else {
-                                        tracing::trace!(
-                                            tx = %msg.id(),
-                                            peer_addr = %target_addr,
-                                            phase = "send",
-                                            "Message sent to peer connection"
-                                        );
+                                    // Use try_send to avoid blocking the event loop
+                                    // when a peer's outbound channel is full. A full
+                                    // channel indicates the peer's transport is
+                                    // congested or dead; blocking here would stall
+                                    // ALL peers' message processing (head-of-line
+                                    // blocking). The operation will time out and retry
+                                    // via an alternative peer. (#3523)
+                                    match peer_connection.sender.try_send(Left(msg.clone())) {
+                                        Ok(()) => {
+                                            tracing::trace!(
+                                                tx = %msg.id(),
+                                                peer_addr = %target_addr,
+                                                phase = "send",
+                                                "Message sent to peer connection"
+                                            );
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            tracing::warn!(
+                                                tx = %msg.id(),
+                                                peer_addr = %target_addr,
+                                                phase = "backpressure",
+                                                "Outbound channel full, dropping message \
+                                                 to avoid event loop stall"
+                                            );
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(..)) => {
+                                            tracing::error!(
+                                                tx = %msg.id(),
+                                                peer_addr = %target_addr,
+                                                phase = "error",
+                                                "Peer connection channel closed"
+                                            );
+                                        }
                                     }
                                 }
                                 None => {
