@@ -1188,10 +1188,19 @@ impl OpManager {
     ///
     /// Proximity cache is cleared immediately. Interest removal is deferred for
     /// `INTEREST_DISCONNECT_GRACE_PERIOD` to survive transient disconnects.
+    /// Downstream subscriber entries are removed immediately (they have their
+    /// own lease-based TTL, so no grace period is needed).
     pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
+        let peer_key = PeerKey::from(pub_key.clone());
         self.neighbor_hosting.on_peer_disconnected(pub_key);
-        self.interest_manager
-            .schedule_deferred_removal(&PeerKey::from(pub_key.clone()));
+        self.interest_manager.schedule_deferred_removal(&peer_key);
+
+        // Remove this peer from hosting manager's downstream subscribers
+        // and decrement the interest manager's downstream_subscriber_count.
+        let affected = self.ring.remove_peer_from_all_downstream(&peer_key);
+        for (contract, _) in &affected {
+            self.interest_manager.remove_downstream_subscriber(contract);
+        }
     }
 }
 
