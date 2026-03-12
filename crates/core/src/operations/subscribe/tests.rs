@@ -1725,10 +1725,8 @@ fn subscribe_without_stats_returns_incomplete() {
 fn completed_subscribe_reports_success() {
     let target_peer = random_peer();
     let contract_location = Location::random();
-    let key = ContractKey::from_id_and_code(
-        ContractInstanceId::new([3u8; 32]),
-        CodeHash::new([4u8; 32]),
-    );
+    let key =
+        ContractKey::from_id_and_code(ContractInstanceId::new([3u8; 32]), CodeHash::new([4u8; 32]));
 
     let op = SubscribeOp {
         id: Transaction::new::<SubscribeMsg>(),
