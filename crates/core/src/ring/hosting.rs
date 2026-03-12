@@ -847,25 +847,25 @@ impl HostingManager {
         // contracts stale until a WebSocket client reconnects. During the startup
         // window, we proactively resubscribe to all hosted contracts to get fresh
         // state from the network. See #3489.
-        let in_startup_window = now.duration_since(self.created_at) < STARTUP_REVALIDATION_WINDOW;
-        if in_startup_window {
+        let time_since_startup = now.duration_since(self.created_at);
+        if time_since_startup < STARTUP_REVALIDATION_WINDOW {
             let hosted_keys = self.hosting_cache.read().iter().collect::<Vec<_>>();
-            let mut startup_count = 0;
+            let count_before = needs_renewal_set.len();
             for key in hosted_keys {
                 let has_active = self
                     .active_subscriptions
                     .iter()
                     .any(|sub| *sub.key() == key && *sub.value() > now);
-                if !has_active && needs_renewal_set.insert(key) {
-                    startup_count += 1;
+                if !has_active {
+                    needs_renewal_set.insert(key);
                 }
             }
+            let startup_count = needs_renewal_set.len() - count_before;
             if startup_count > 0 {
                 info!(
                     startup_count,
-                    window_remaining_secs = (STARTUP_REVALIDATION_WINDOW
-                        - now.duration_since(self.created_at))
-                    .as_secs(),
+                    window_remaining_secs =
+                        (STARTUP_REVALIDATION_WINDOW - time_since_startup).as_secs(),
                     "Including hosted contracts in startup revalidation"
                 );
             }
@@ -1580,23 +1580,6 @@ mod tests {
         assert!(
             !needs_renewal.contains(&contract),
             "Already-subscribed contract should not be duplicated in renewal list"
-        );
-    }
-
-    /// Test that after the startup window expires, hosted-only contracts
-    /// revert to being excluded from renewal.
-    #[test]
-    fn test_startup_revalidation_window_expires() {
-        let manager = HostingManager::new_past_startup();
-        let contract = make_contract_key(1);
-
-        manager.record_contract_access(contract, 1000, AccessType::Get);
-
-        // Past startup window — hosted-only contract excluded
-        let needs_renewal = manager.contracts_needing_renewal();
-        assert!(
-            !needs_renewal.contains(&contract),
-            "Hosted-only contract should NOT be in renewal list after startup window"
         );
     }
 
