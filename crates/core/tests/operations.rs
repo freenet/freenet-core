@@ -2448,20 +2448,24 @@ async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> Tes
             let response: OutboundAppMessage = bincode::deserialize(&app_msg.payload)?;
             match response {
                 OutboundAppMessage::Attested(Some(bytes)) => {
-                    assert_eq!(
-                        bytes.as_slice(),
-                        expected_contract_id.as_bytes(),
-                        "Attested bytes do not match the expected ContractInstanceId"
-                    );
+                    let origin: MessageOrigin = bincode::deserialize(&bytes)
+                        .expect("Failed to deserialize MessageOrigin from delegate response");
+                    match origin {
+                        MessageOrigin::WebApp(contract_id) => {
+                            assert_eq!(
+                                contract_id, expected_contract_id,
+                                "MessageOrigin contract ID does not match expected"
+                            );
+                        }
+                    }
                     tracing::info!(
-                        "SUCCESS: attested contract correctly passed to delegate process function"
+                        "SUCCESS: MessageOrigin correctly passed to delegate process function"
                     );
                 }
                 OutboundAppMessage::Attested(None) => {
                     bail!(
-                        "Delegate received attested=None but expected Some(contract_id). \
-                         PR #1513 fix is not working: the attested contract was NOT \
-                         passed to the delegate process function."
+                        "Delegate received origin=None but expected Some(MessageOrigin::WebApp(..)). \
+                         The origin contract was NOT passed to the delegate process function."
                     );
                 }
             }
