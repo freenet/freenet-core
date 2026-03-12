@@ -38,11 +38,11 @@ pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
     DashMap<ContractInstanceId, HashSet<DelegateKey>>,
 > = LazyLock::new(DashMap::default);
 
-/// Tracks app attestation inherited by child delegates from their parent.
-/// When a delegate with attested_contract creates a child, the child inherits
-/// the same attestation so it can interact with the same app context.
-/// DelegateKey (child) → Vec<ContractInstanceId> (inherited attestations)
-pub(crate) static DELEGATE_INHERITED_ATTESTATIONS: LazyLock<
+/// Tracks message origins inherited by child delegates from their parent.
+/// When a delegate with an origin contract creates a child, the child inherits
+/// the same origin so it can interact with the same app context.
+/// DelegateKey (child) → Vec<ContractInstanceId> (inherited origins)
+pub(crate) static DELEGATE_INHERITED_ORIGINS: LazyLock<
     DashMap<DelegateKey, Vec<ContractInstanceId>>,
 > = LazyLock::new(DashMap::default);
 
@@ -137,8 +137,8 @@ pub(super) struct DelegateCallEnv {
     pub(super) creation_depth: u32,
     /// Number of delegates created so far in this process() call.
     pub(super) creations_this_call: std::cell::Cell<u32>,
-    /// Attested contract IDs for this delegate (from parent or direct registration).
-    attested_contracts: Vec<ContractInstanceId>,
+    /// Origin contract IDs for this delegate (from parent or direct registration).
+    origin_contracts: Vec<ContractInstanceId>,
 }
 
 // SAFETY: DelegateCallEnv is only inserted into DELEGATE_ENV immediately before
@@ -200,7 +200,7 @@ impl DelegateCallEnv {
         delegate_key: DelegateKey,
         delegate_store: &mut DelegateStore,
         creation_depth: u32,
-        attested_contracts: Vec<ContractInstanceId>,
+        origin_contracts: Vec<ContractInstanceId>,
     ) -> Self {
         Self {
             context,
@@ -211,7 +211,7 @@ impl DelegateCallEnv {
             delegate_store: std::cell::UnsafeCell::new(delegate_store as *mut DelegateStore),
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
-            attested_contracts,
+            origin_contracts,
         }
     }
 
@@ -299,7 +299,7 @@ impl DelegateCallEnv {
             return Err(DelegateCreateError::DepthExceeded);
         }
 
-        // Check per-node creation limit (counts ALL created delegates, not just attested)
+        // Check per-node creation limit (counts ALL created delegates, not just origin)
         if CREATED_DELEGATES_COUNT.load(Ordering::Relaxed) >= MAX_CREATED_DELEGATES_PER_NODE {
             return Err(DelegateCreateError::NodeLimitExceeded);
         }
@@ -343,9 +343,8 @@ impl DelegateCallEnv {
         CREATED_DELEGATES_COUNT.fetch_add(1, Ordering::Relaxed);
 
         // Propagate app attestation to child
-        if !self.attested_contracts.is_empty() {
-            DELEGATE_INHERITED_ATTESTATIONS
-                .insert(child_key.clone(), self.attested_contracts.clone());
+        if !self.origin_contracts.is_empty() {
+            DELEGATE_INHERITED_ORIGINS.insert(child_key.clone(), self.origin_contracts.clone());
         }
 
         tracing::info!(

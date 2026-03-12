@@ -76,7 +76,7 @@ pub(super) async fn contract_home(
                 .into(),
             ),
             auth_token: None,
-            attested_contract: None,
+            origin_contract: None,
             api_version: Default::default(),
         })
         .await
@@ -193,7 +193,7 @@ pub(super) async fn contract_home(
             client_id,
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
-            attested_contract: None,
+            origin_contract: None,
             api_version: Default::default(),
         })
         .await

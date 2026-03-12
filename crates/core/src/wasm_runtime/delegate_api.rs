@@ -988,10 +988,10 @@ mod tests {
         assert_eq!(env.creations_this_call.get(), 2);
     }
 
-    /// Child delegate inherits parent's attested contracts in DELEGATE_INHERITED_ATTESTATIONS.
+    /// Child delegate inherits parent's attested contracts in DELEGATE_INHERITED_ORIGINS.
     #[tokio::test]
     async fn test_create_delegate_inherits_attestations() {
-        use super::super::native_api::DELEGATE_INHERITED_ATTESTATIONS;
+        use super::super::native_api::DELEGATE_INHERITED_ORIGINS;
 
         let mut env_holder = TestEnv::new().await;
 
@@ -1007,7 +1007,7 @@ mod tests {
             .unwrap();
 
         // Verify the child inherited the parent's attestation
-        let inherited = DELEGATE_INHERITED_ATTESTATIONS.get(&child_key);
+        let inherited = DELEGATE_INHERITED_ORIGINS.get(&child_key);
         assert!(
             inherited.is_some(),
             "child should have inherited attestations"
@@ -1015,14 +1015,14 @@ mod tests {
         assert_eq!(inherited.unwrap().value(), &vec![contract_id]);
 
         // Cleanup
-        DELEGATE_INHERITED_ATTESTATIONS.remove(&child_key);
+        DELEGATE_INHERITED_ORIGINS.remove(&child_key);
     }
 
-    /// Child created by non-attested parent does NOT appear in DELEGATE_INHERITED_ATTESTATIONS
+    /// Child created by non-attested parent does NOT appear in DELEGATE_INHERITED_ORIGINS
     /// but still counts toward the per-node limit via CREATED_DELEGATES_COUNT.
     #[tokio::test]
     async fn test_create_delegate_non_attested_still_counts_toward_node_limit() {
-        use super::super::native_api::{CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ATTESTATIONS};
+        use super::super::native_api::{CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS};
         use std::sync::atomic::Ordering;
 
         let mut env_holder = TestEnv::new().await;
@@ -1041,7 +1041,7 @@ mod tests {
 
         // Should NOT be in inherited attestations (parent had none)
         assert!(
-            DELEGATE_INHERITED_ATTESTATIONS.get(&child_key).is_none(),
+            DELEGATE_INHERITED_ORIGINS.get(&child_key).is_none(),
             "non-attested parent should not create attestation entry"
         );
 
