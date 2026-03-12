@@ -52,10 +52,8 @@ impl DelegateState {
         self.operation_context
             .as_ref()
             .and_then(|bytes| {
-                ContractInstanceId::try_from(
-                    String::from_utf8(bytes.clone()).unwrap_or_default(),
-                )
-                .ok()
+                ContractInstanceId::try_from(String::from_utf8(bytes.clone()).unwrap_or_default())
+                    .ok()
             })
             .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]))
     }
@@ -100,9 +98,7 @@ pub enum DelegateCommand {
 
     /// Request to subscribe to a contract's state changes
     /// Emits SubscribeContractRequest which the runtime handles
-    SubscribeContract {
-        contract_id: ContractInstanceId,
-    },
+    SubscribeContract { contract_id: ContractInstanceId },
     // Future capabilities for #2827:
     // RegisterDelegate { delegate_code: Vec<u8>, params: Vec<u8> },
     // UnregisterDelegate { delegate_key: Vec<u8> },
@@ -159,11 +155,20 @@ impl DelegateInterface for TestDelegate {
     fn process(
         _ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        _attested: Option<&'static [u8]>,
+        _origin: Option<MessageOrigin>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
-            InboundDelegateMsg::ApplicationMessage(app_msg) => handle_application_message(app_msg),
+            InboundDelegateMsg::ApplicationMessage(app_msg) => {
+                // Extract app_id from origin for response routing, fall back to zeros
+                let app_id = _origin
+                    .as_ref()
+                    .map(|o| match o {
+                        MessageOrigin::WebApp(id) => *id,
+                    })
+                    .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]));
+                handle_application_message(app_msg, app_id)
+            }
             InboundDelegateMsg::GetContractResponse(response) => {
                 handle_get_contract_response(response)
             }
@@ -179,7 +184,7 @@ impl DelegateInterface for TestDelegate {
             InboundDelegateMsg::ContractNotification(notification) => {
                 handle_contract_notification(notification)
             }
-            InboundDelegateMsg::UserResponse(_) => {
+            InboundDelegateMsg::UserResponse(_) | InboundDelegateMsg::DelegateMessage(_) => {
                 // Not used by this delegate
                 Ok(vec![])
             }
@@ -189,6 +194,7 @@ impl DelegateInterface for TestDelegate {
 
 fn handle_application_message(
     app_msg: ApplicationMessage,
+    app_id: ContractInstanceId,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let command: DelegateCommand = bincode::deserialize(&app_msg.payload)
         .map_err(|e| DelegateError::Other(format!("Failed to deserialize command: {}", e)))?;
@@ -198,7 +204,7 @@ fn handle_application_message(
             // Store state so we know what we're waiting for
             let state = DelegateState {
                 pending_contract_get: Some(contract_id),
-                operation_context: Some(app_msg.app.as_bytes().to_vec()),
+                operation_context: Some(app_id.as_bytes().to_vec()),
                 ..Default::default()
             };
 
@@ -218,7 +224,7 @@ fn handle_application_message(
                 let response = DelegateResponse::MultipleContractStates { results: vec![] };
                 let payload = bincode::serialize(&response)
                     .map_err(|e| DelegateError::Other(format!("Serialize error: {}", e)))?;
-                let msg = ApplicationMessage::new(app_msg.app, payload)
+                let msg = ApplicationMessage::new(payload)
                     .processed(true)
                     .with_context(DelegateContext::default());
                 return Ok(vec![OutboundDelegateMsg::ApplicationMessage(msg)]);
@@ -230,7 +236,7 @@ fn handle_application_message(
 
             let state = DelegateState {
                 pending_contract_get: Some(first),
-                operation_context: Some(app_msg.app.as_bytes().to_vec()),
+                operation_context: Some(app_id.as_bytes().to_vec()),
                 remaining_contracts: remaining,
                 accumulated_results: vec![],
                 echo_message: None,
@@ -251,25 +257,22 @@ fn handle_application_message(
                 WrappedState::new(state),
                 RelatedContracts::default(),
             );
-            request.context = DelegateState::for_app(&app_msg.app).to_context();
+            request.context = DelegateState::for_app(&app_id).to_context();
 
             Ok(vec![OutboundDelegateMsg::PutContractRequest(request)])
         }
 
-        DelegateCommand::UpdateContractState {
-            contract_id,
-            state,
-        } => {
+        DelegateCommand::UpdateContractState { contract_id, state } => {
             let update = UpdateData::State(freenet_stdlib::prelude::State::from(state));
             let mut request = UpdateContractRequest::new(contract_id, update);
-            request.context = DelegateState::for_app(&app_msg.app).to_context();
+            request.context = DelegateState::for_app(&app_id).to_context();
 
             Ok(vec![OutboundDelegateMsg::UpdateContractRequest(request)])
         }
 
         DelegateCommand::SubscribeContract { contract_id } => {
             let mut request = SubscribeContractRequest::new(contract_id);
-            request.context = DelegateState::for_app(&app_msg.app).to_context();
+            request.context = DelegateState::for_app(&app_id).to_context();
 
             Ok(vec![OutboundDelegateMsg::SubscribeContractRequest(request)])
         }
@@ -280,7 +283,7 @@ fn handle_application_message(
         } => {
             let state = DelegateState {
                 pending_contract_get: Some(contract_id),
-                operation_context: Some(app_msg.app.as_bytes().to_vec()),
+                operation_context: Some(app_id.as_bytes().to_vec()),
                 echo_message: Some(echo_message.clone()),
                 ..Default::default()
             };
@@ -298,7 +301,7 @@ fn handle_application_message(
             };
             let echo_payload = bincode::serialize(&echo_response)
                 .map_err(|e| DelegateError::Other(format!("Serialize error: {}", e)))?;
-            let echo_msg = ApplicationMessage::new(app_msg.app, echo_payload)
+            let echo_msg = ApplicationMessage::new(echo_payload)
                 .processed(true)
                 .with_context(DelegateContext::default());
 
@@ -330,7 +333,7 @@ fn handle_get_contract_response(
         )));
     }
 
-    let app_id = state.app_id();
+    let _app_id = state.app_id();
 
     // Check if this is a multi-contract fetch
     if !state.remaining_contracts.is_empty() || !state.accumulated_results.is_empty() {
@@ -346,7 +349,7 @@ fn handle_get_contract_response(
             };
             let payload = bincode::serialize(&response_payload)
                 .map_err(|e| DelegateError::Other(format!("Serialize error: {}", e)))?;
-            let app_msg = ApplicationMessage::new(app_id, payload)
+            let app_msg = ApplicationMessage::new(payload)
                 .processed(true)
                 .with_context(DelegateContext::default());
             return Ok(vec![OutboundDelegateMsg::ApplicationMessage(app_msg)]);
@@ -373,7 +376,7 @@ fn handle_get_contract_response(
     let payload = bincode::serialize(&response_payload)
         .map_err(|e| DelegateError::Other(format!("Failed to serialize response: {}", e)))?;
 
-    let app_msg = ApplicationMessage::new(app_id, payload)
+    let app_msg = ApplicationMessage::new(payload)
         .processed(true)
         .with_context(DelegateContext::default());
 
@@ -388,12 +391,12 @@ fn build_contract_response(
     context: &DelegateContext,
     response_payload: DelegateResponse,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-    let app_id = DelegateState::from_context(context).app_id();
+    let _app_id = DelegateState::from_context(context).app_id();
 
     let payload = bincode::serialize(&response_payload)
         .map_err(|e| DelegateError::Other(format!("Failed to serialize response: {}", e)))?;
 
-    let app_msg = ApplicationMessage::new(app_id, payload)
+    let app_msg = ApplicationMessage::new(payload)
         .processed(true)
         .with_context(DelegateContext::default());
 
@@ -465,7 +468,7 @@ fn handle_contract_notification(
     let payload = bincode::serialize(&response_payload)
         .map_err(|e| DelegateError::Other(format!("Failed to serialize response: {}", e)))?;
 
-    let app_msg = ApplicationMessage::new(ContractInstanceId::new([0u8; 32]), payload)
+    let app_msg = ApplicationMessage::new(payload)
         .processed(true)
         .with_context(DelegateContext::default());
 
@@ -487,11 +490,10 @@ mod tests {
     #[test]
     fn test_get_contract_state_request() {
         let contract_id = ContractInstanceId::new([1u8; 32]);
-        let app_id = ContractInstanceId::new([2u8; 32]);
 
         let command = DelegateCommand::GetContractState { contract_id };
         let payload = bincode::serialize(&command).unwrap();
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
@@ -581,13 +583,11 @@ mod tests {
 
     #[test]
     fn test_get_multiple_contracts_empty() {
-        let app_id = ContractInstanceId::new([2u8; 32]);
-
         let command = DelegateCommand::GetMultipleContractStates {
             contract_ids: vec![],
         };
         let payload = bincode::serialize(&command).unwrap();
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
@@ -613,13 +613,12 @@ mod tests {
         let contract1 = ContractInstanceId::new([1u8; 32]);
         let contract2 = ContractInstanceId::new([2u8; 32]);
         let contract3 = ContractInstanceId::new([3u8; 32]);
-        let app_id = ContractInstanceId::new([10u8; 32]);
 
         let command = DelegateCommand::GetMultipleContractStates {
             contract_ids: vec![contract1, contract2, contract3],
         };
         let payload = bincode::serialize(&command).unwrap();
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
@@ -732,7 +731,6 @@ mod tests {
     #[test]
     fn test_get_contract_with_echo() {
         let contract_id = ContractInstanceId::new([1u8; 32]);
-        let app_id = ContractInstanceId::new([2u8; 32]);
         let echo_message = "Hello from test!".to_string();
 
         let command = DelegateCommand::GetContractWithEcho {
@@ -740,7 +738,7 @@ mod tests {
             echo_message: echo_message.clone(),
         };
         let payload = bincode::serialize(&command).unwrap();
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
@@ -782,7 +780,6 @@ mod tests {
 
     #[test]
     fn test_put_contract_request() {
-        let app_id = ContractInstanceId::new([2u8; 32]);
         let contract = make_test_contract();
         let contract_key = contract.key();
 
@@ -791,7 +788,7 @@ mod tests {
             state: vec![1, 2, 3, 4],
         };
         let payload = bincode::serialize(&command).unwrap();
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
@@ -871,9 +868,7 @@ mod tests {
             OutboundDelegateMsg::ApplicationMessage(msg) => {
                 let response: DelegateResponse = bincode::deserialize(&msg.payload).unwrap();
                 match response {
-                    DelegateResponse::ContractPutResult {
-                        success, error, ..
-                    } => {
+                    DelegateResponse::ContractPutResult { success, error, .. } => {
                         assert!(!success);
                         assert_eq!(error, Some("contract validation failed".to_string()));
                     }
@@ -887,14 +882,13 @@ mod tests {
     #[test]
     fn test_update_contract_request() {
         let contract_id = ContractInstanceId::new([1u8; 32]);
-        let app_id = ContractInstanceId::new([2u8; 32]);
 
         let command = DelegateCommand::UpdateContractState {
             contract_id,
             state: vec![10, 20, 30],
         };
         let payload = bincode::serialize(&command).unwrap();
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
@@ -925,8 +919,7 @@ mod tests {
             context: state.to_context(),
         };
 
-        let result =
-            call_process(InboundDelegateMsg::UpdateContractResponse(response)).unwrap();
+        let result = call_process(InboundDelegateMsg::UpdateContractResponse(response)).unwrap();
 
         assert_eq!(result.len(), 1);
         match &result[0] {
@@ -967,17 +960,14 @@ mod tests {
             context: state.to_context(),
         };
 
-        let result =
-            call_process(InboundDelegateMsg::UpdateContractResponse(response)).unwrap();
+        let result = call_process(InboundDelegateMsg::UpdateContractResponse(response)).unwrap();
 
         assert_eq!(result.len(), 1);
         match &result[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => {
                 let response: DelegateResponse = bincode::deserialize(&msg.payload).unwrap();
                 match response {
-                    DelegateResponse::ContractUpdateResult {
-                        success, error, ..
-                    } => {
+                    DelegateResponse::ContractUpdateResult { success, error, .. } => {
                         assert!(!success);
                         assert_eq!(error, Some("update validation failed".to_string()));
                     }
@@ -991,11 +981,10 @@ mod tests {
     #[test]
     fn test_subscribe_contract_request() {
         let contract_id = ContractInstanceId::new([1u8; 32]);
-        let app_id = ContractInstanceId::new([2u8; 32]);
 
         let command = DelegateCommand::SubscribeContract { contract_id };
         let payload = bincode::serialize(&command).unwrap();
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let result = call_process(InboundDelegateMsg::ApplicationMessage(app_msg)).unwrap();
 
@@ -1026,8 +1015,7 @@ mod tests {
             context: state.to_context(),
         };
 
-        let result =
-            call_process(InboundDelegateMsg::SubscribeContractResponse(response)).unwrap();
+        let result = call_process(InboundDelegateMsg::SubscribeContractResponse(response)).unwrap();
 
         assert_eq!(result.len(), 1);
         match &result[0] {
@@ -1068,17 +1056,14 @@ mod tests {
             context: state.to_context(),
         };
 
-        let result =
-            call_process(InboundDelegateMsg::SubscribeContractResponse(response)).unwrap();
+        let result = call_process(InboundDelegateMsg::SubscribeContractResponse(response)).unwrap();
 
         assert_eq!(result.len(), 1);
         match &result[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => {
                 let response: DelegateResponse = bincode::deserialize(&msg.payload).unwrap();
                 match response {
-                    DelegateResponse::ContractSubscribeResult {
-                        success, error, ..
-                    } => {
+                    DelegateResponse::ContractSubscribeResult { success, error, .. } => {
                         assert!(!success);
                         assert_eq!(error, Some("contract not found".to_string()));
                     }
@@ -1100,8 +1085,7 @@ mod tests {
             context: DelegateContext::default(),
         };
 
-        let result =
-            call_process(InboundDelegateMsg::ContractNotification(notification)).unwrap();
+        let result = call_process(InboundDelegateMsg::ContractNotification(notification)).unwrap();
 
         assert_eq!(result.len(), 1);
         match &result[0] {
@@ -1133,8 +1117,7 @@ mod tests {
             context: DelegateContext::default(),
         };
 
-        let result =
-            call_process(InboundDelegateMsg::ContractNotification(notification)).unwrap();
+        let result = call_process(InboundDelegateMsg::ContractNotification(notification)).unwrap();
 
         assert_eq!(result.len(), 1);
         match &result[0] {

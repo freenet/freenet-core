@@ -44,7 +44,7 @@ impl DelegateInterface for Delegate {
     fn process(
         ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        _attested: Option<&'static [u8]>,
+        _origin: Option<MessageOrigin>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match messages {
@@ -78,16 +78,14 @@ impl DelegateInterface for Delegate {
                         }
                         .map_err(|err| DelegateError::Other(format!("{err}")))?;
 
-                        let response = ApplicationMessage::new(incoming_app.app, response_payload)
-                            .processed(true);
+                        let response = ApplicationMessage::new(response_payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
                     InboundAppMessage::Ping { data } => {
                         let response_payload =
                             bincode::serialize(&OutboundAppMessage::PingResponse { data })
                                 .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(incoming_app.app, response_payload)
-                            .processed(true);
+                        let response = ApplicationMessage::new(response_payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
                 }

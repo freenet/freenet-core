@@ -161,11 +161,10 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
 
         // Step 1: Sanity check — ping parent delegate
         {
-            let app_id = ContractInstanceId::new([0; 32]);
             let payload = bincode::serialize(&InboundAppMessage::Ping {
                 data: b"hello-parent".to_vec(),
             })?;
-            let app_msg = ApplicationMessage::new(app_id, payload);
+            let app_msg = ApplicationMessage::new(payload);
 
             client
                 .send(ClientRequest::DelegateOp(
@@ -206,12 +205,11 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
 
         // Step 2: Create child delegate via host function
         let (child_key_bytes, child_code_hash_bytes) = {
-            let app_id = ContractInstanceId::new([0; 32]);
             let payload = bincode::serialize(&InboundAppMessage::CreateChildDelegate {
                 child_wasm: child_wasm_bytes.clone(),
                 child_params: child_params_bytes.clone(),
             })?;
-            let app_msg = ApplicationMessage::new(app_id, payload);
+            let app_msg = ApplicationMessage::new(payload);
 
             client
                 .send(ClientRequest::DelegateOp(
@@ -281,11 +279,10 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
             let child_key = DelegateKey::new(child_key_arr, CodeHash::new(child_hash_arr));
             let child_params = Parameters::from(child_params_bytes.clone());
 
-            let app_id = ContractInstanceId::new([0; 32]);
             let payload = bincode::serialize(&ChildInboundAppMessage::Ping {
                 data: b"hello-child".to_vec(),
             })?;
-            let app_msg = ApplicationMessage::new(app_id, payload);
+            let app_msg = ApplicationMessage::new(payload);
 
             client
                 .send(ClientRequest::DelegateOp(
@@ -333,12 +330,12 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
         // covered by unit test `test_create_delegate_per_call_limit_exceeded`.
         {
             tracing::info!("Testing sequential delegate creation...");
-            let app_id = ContractInstanceId::new([0; 32]);
+
             let payload = bincode::serialize(&InboundAppMessage::CreateChildDelegate {
                 child_wasm: child_wasm_bytes.clone(),
                 child_params: vec![99u8],
             })?;
-            let app_msg = ApplicationMessage::new(app_id, payload);
+            let app_msg = ApplicationMessage::new(payload);
 
             client
                 .send(ClientRequest::DelegateOp(

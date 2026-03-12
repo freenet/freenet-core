@@ -737,7 +737,7 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
-        attested_contract: Option<&ContractInstanceId>,
+        origin_contract: Option<&ContractInstanceId>,
     ) -> impl Future<Output = Response> + Send;
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
@@ -818,8 +818,8 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     /// Used when executor is standalone (not in a pool).
     subscriber_summaries:
         HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>,
-    /// Attested contract instances for a given delegate.
-    delegate_attested_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
+    /// Origin contract instances for a given delegate.
+    delegate_origin_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
     /// Tracks contracts that are being initialized and operations queued for them
     init_tracker: ContractInitTracker,
 
@@ -880,7 +880,7 @@ where
             update_notifications: HashMap::default(),
             client_subscription_counts: HashMap::default(),
             subscriber_summaries: HashMap::default(),
-            delegate_attested_ids: HashMap::default(),
+            delegate_origin_ids: HashMap::default(),
             init_tracker: ContractInitTracker::new(),
             op_sender,
             op_manager,
