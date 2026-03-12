@@ -418,21 +418,33 @@ struct ConnectionEntry {
 /// promoted to ring and not pending reservation.
 ///
 /// Two thresholds:
-/// - `ZOMBIE_THRESHOLD` (300s): catches connections with no pending reservation.
-/// - `ABSOLUTE_ZOMBIE_THRESHOLD` (600s): overrides `has_pending` to break the
-///   refresh cycle where `connection_maintenance()` perpetually renews pending
-///   reservations on gateway transports.
-fn is_zombie(created_at_elapsed: Duration, in_ring: bool, has_pending: bool) -> bool {
-    const ZOMBIE_THRESHOLD: Duration = Duration::from_secs(300);
-    const ABSOLUTE_ZOMBIE_THRESHOLD: Duration = Duration::from_secs(600);
+/// Zombie thresholds are derived from `transient_ttl` (configurable, default 30s):
+///
+/// - `zombie_threshold` = `transient_ttl * 3`: catches connections with no pending
+///   reservation. Must be greater than `PENDING_RESERVATION_TTL` (60s) so that a
+///   connection isn't immediately killed after its reservation expires. Previous
+///   hardcoded value of 300s caused gateways to accumulate ~250 zombie transports,
+///   overwhelming the packet processing channel and dropping keepalive packets.
+/// - `absolute_zombie_threshold` = `transient_ttl * 6`: overrides `has_pending` to
+///   break the refresh cycle where `connection_maintenance()` perpetually renews
+///   pending reservations on gateway transports. Previous hardcoded value of 600s
+///   allowed zombie transports to linger far too long.
+fn is_zombie(
+    created_at_elapsed: Duration,
+    in_ring: bool,
+    has_pending: bool,
+    transient_ttl: Duration,
+) -> bool {
+    let zombie_threshold = transient_ttl * 3;
+    let absolute_zombie_threshold = transient_ttl * 6;
 
     if in_ring {
         return false;
     }
-    if created_at_elapsed > ZOMBIE_THRESHOLD && !has_pending {
+    if created_at_elapsed > zombie_threshold && !has_pending {
         return true;
     }
-    if created_at_elapsed > ABSOLUTE_ZOMBIE_THRESHOLD {
+    if created_at_elapsed > absolute_zombie_threshold {
         return true;
     }
     false
@@ -879,10 +891,10 @@ impl P2pConnManager {
                 slow_event_count = 0;
                 last_stats_log = Instant::now();
 
-                // Zombie transport cleanup: remove connections older than 5 min
+                // Zombie transport cleanup: remove connections older than 3× transient_ttl
                 // that haven't been promoted to ring and have no pending reservation.
-                // An absolute threshold of 10 min overrides pending reservations to
-                // catch gateway transports stuck in a pending-refresh cycle.
+                // An absolute threshold of 6× transient_ttl overrides pending reservations
+                // to catch gateway transports stuck in a pending-refresh cycle.
                 //
                 // IMPORTANT: We use drop_zombie_connection (non-blocking try_send)
                 // instead of drop_connection_by_addr to avoid a circular deadlock
@@ -892,6 +904,7 @@ impl P2pConnManager {
                 // per zombie, 64 zombies = ~6.4s worst case per cycle.
                 // Remaining zombies will be cleaned up in the next 30s cycle.
                 const MAX_ZOMBIE_CLEANUP_PER_CYCLE: usize = 64;
+                let transient_ttl = op_manager.ring.connection_manager.transient_ttl();
                 let zombie_addrs: Vec<SocketAddr> = ctx
                     .connections
                     .iter()
@@ -903,6 +916,7 @@ impl P2pConnManager {
                                 .ring
                                 .connection_manager
                                 .has_connection_or_pending(**addr),
+                            transient_ttl,
                         )
                     })
                     .map(|(addr, _)| *addr)
@@ -5316,12 +5330,15 @@ mod tests {
 
     // ============ Zombie detection tests ============
 
+    const TEST_TRANSIENT_TTL: Duration = Duration::from_secs(30);
+    // With TTL=30s: zombie_threshold=90s, absolute_zombie_threshold=180s
+
     #[test]
     fn test_zombie_detection_ignores_young_connections() {
-        // Connection younger than 5 min should never be a zombie
-        let elapsed = Duration::from_secs(200); // < 300s
+        // Connection younger than zombie threshold (90s) should never be a zombie
+        let elapsed = Duration::from_secs(60);
         assert!(
-            !super::is_zombie(elapsed, false, false),
+            !super::is_zombie(elapsed, false, false, TEST_TRANSIENT_TTL),
             "Young connection should not be zombie"
         );
     }
@@ -5329,9 +5346,9 @@ mod tests {
     #[test]
     fn test_zombie_detection_ignores_ring_connections() {
         // In-ring connection should never be a zombie regardless of age
-        let elapsed = Duration::from_secs(600);
+        let elapsed = Duration::from_secs(400);
         assert!(
-            !super::is_zombie(elapsed, true, false),
+            !super::is_zombie(elapsed, true, false, TEST_TRANSIENT_TTL),
             "Ring connection should not be zombie"
         );
     }
@@ -5339,9 +5356,9 @@ mod tests {
     #[test]
     fn test_zombie_detection_catches_old_unpromoted() {
         // Old connection that isn't in ring, no pending → zombie
-        let elapsed = Duration::from_secs(301);
+        let elapsed = Duration::from_secs(91); // > 90s
         assert!(
-            super::is_zombie(elapsed, false, false),
+            super::is_zombie(elapsed, false, false, TEST_TRANSIENT_TTL),
             "Old unpromoted connection should be zombie"
         );
     }
@@ -5349,43 +5366,88 @@ mod tests {
     #[test]
     fn test_zombie_detection_ignores_pending_reservation() {
         // Old connection not in ring, but has pending reservation → not zombie (under absolute)
-        let elapsed = Duration::from_secs(400); // > 300s but < 600s
+        let elapsed = Duration::from_secs(120); // > 90s but < 180s
         assert!(
-            !super::is_zombie(elapsed, false, true),
+            !super::is_zombie(elapsed, false, true, TEST_TRANSIENT_TTL),
             "Connection with pending reservation below absolute threshold should not be zombie"
         );
     }
 
     #[test]
     fn test_zombie_absolute_threshold_overrides_pending() {
-        // Connection 601s old, has_pending=true, not in ring → IS zombie
-        // The absolute threshold (600s) overrides has_pending
-        let elapsed = Duration::from_secs(601);
+        // Connection 181s old, has_pending=true, not in ring → IS zombie
+        // The absolute threshold (180s) overrides has_pending
+        let elapsed = Duration::from_secs(181);
         assert!(
-            super::is_zombie(elapsed, false, true),
+            super::is_zombie(elapsed, false, true, TEST_TRANSIENT_TTL),
             "Absolute threshold should override has_pending"
         );
     }
 
     #[test]
     fn test_zombie_absolute_threshold_spares_ring() {
-        // Connection 601s old, in_ring=true → NOT zombie
-        let elapsed = Duration::from_secs(601);
+        // Connection 181s old, in_ring=true → NOT zombie
+        let elapsed = Duration::from_secs(181);
         assert!(
-            !super::is_zombie(elapsed, true, true),
+            !super::is_zombie(elapsed, true, true, TEST_TRANSIENT_TTL),
             "Ring connection should never be zombie even past absolute threshold"
         );
     }
 
     #[test]
-    fn test_zombie_boundary_exactly_300s() {
-        // Exactly 300s, no pending, not in ring → NOT zombie (uses > not >=)
-        assert!(!super::is_zombie(Duration::from_secs(300), false, false));
+    fn test_zombie_boundary_exactly_at_threshold() {
+        // Exactly 90s, no pending, not in ring → NOT zombie (uses > not >=)
+        assert!(!super::is_zombie(
+            Duration::from_secs(90),
+            false,
+            false,
+            TEST_TRANSIENT_TTL
+        ));
     }
 
     #[test]
-    fn test_zombie_boundary_exactly_600s() {
-        // Exactly 600s, has_pending, not in ring → NOT zombie (uses > not >=)
-        assert!(!super::is_zombie(Duration::from_secs(600), false, true));
+    fn test_zombie_boundary_exactly_at_absolute() {
+        // Exactly 180s, has_pending, not in ring → NOT zombie (uses > not >=)
+        assert!(!super::is_zombie(
+            Duration::from_secs(180),
+            false,
+            true,
+            TEST_TRANSIENT_TTL
+        ));
+    }
+
+    #[test]
+    fn test_zombie_thresholds_scale_with_ttl() {
+        // With larger TTL (120s, as used in tests), thresholds scale:
+        // zombie_threshold=360s, absolute=720s
+        let large_ttl = Duration::from_secs(120);
+        // 200s: not zombie even without pending (< 360s)
+        assert!(!super::is_zombie(
+            Duration::from_secs(200),
+            false,
+            false,
+            large_ttl
+        ));
+        // 400s: zombie without pending (> 360s)
+        assert!(super::is_zombie(
+            Duration::from_secs(400),
+            false,
+            false,
+            large_ttl
+        ));
+        // 400s with pending: not zombie (< 720s)
+        assert!(!super::is_zombie(
+            Duration::from_secs(400),
+            false,
+            true,
+            large_ttl
+        ));
+        // 721s: zombie even with pending (> 720s)
+        assert!(super::is_zombie(
+            Duration::from_secs(721),
+            false,
+            true,
+            large_ttl
+        ));
     }
 }

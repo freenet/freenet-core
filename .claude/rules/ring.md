@@ -38,7 +38,7 @@ WHEN accepting a new connection (should_accept):
        management (swaps, pruning) via topology.rs.
   4. Below min_connections: probabilistic acceptance (soft filter)
      → Below KLEINBERG_FILTER_MIN_CONNECTIONS (3): always ACCEPT
-     → Above that: accept_prob = 0.5 + gap_score (50% floor)
+     → Above that: sliding floor from 0.9 (at KLEINBERG_FILTER_MIN_CONNECTIONS) to 0.3 (at min_connections), accept_prob = floor + gap_score
      → Use ACTUAL open count, NOT speculative totals
   5. At/above min_connections: strict ConnectionEvaluator
      → Feed gap score into evaluator (accepts best candidate per window)
