@@ -1040,7 +1040,7 @@ impl P2pConnManager {
                                             NetMessageV1::Subscribe(_) => "Subscribe",
                                             NetMessageV1::Update(_) => "Update",
                                             NetMessageV1::Aborted(_) => "Aborted",
-                                            NetMessageV1::ProximityCache { .. } => "ProximityCache",
+                                            NetMessageV1::NeighborHosting { .. } => "NeighborHosting",
                                             NetMessageV1::InterestSync { .. } => "InterestSync",
                                             NetMessageV1::ReadyState { .. } => "ReadyState",
                                         },

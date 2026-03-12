@@ -7,7 +7,7 @@
 //!
 //! ## Key Design (2026-01 Unified Hosting Refactor)
 //!
-//! This module unifies the previously separate "seeding" and "GET subscription" caches
+//! This module unifies the previously separate "hosting" and "GET subscription" caches
 //! into a single `HostingCache` that serves as the source of truth for which contracts
 //! this peer is hosting.
 //!

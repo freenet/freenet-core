@@ -1824,11 +1824,11 @@ pub(crate) async fn request_update(
 
     // Find the best peer to send this update to.
     // In the simplified architecture (2026-01 refactor), we use:
-    // 1. Proximity cache - peers who have announced they seed this contract
-    // 2. Ring-based routing - find closest potentially-caching peer
+    // 1. Neighbor hosting - peers who have announced they host this contract
+    // 2. Ring-based routing - find closest potentially-hosting peer
     let sender_addr = op_manager.ring.connection_manager.peer_addr()?;
 
-    // Check proximity cache for neighbors that have announced caching this contract.
+    // Check neighbor hosting info for neighbors that have announced hosting this contract.
     // This is critical for peer-to-peer updates when peers are directly connected
     // but not explicitly subscribed (e.g., River chat rooms where both peers cache
     // the contract but haven't established a subscription tree).
@@ -1907,13 +1907,13 @@ pub(crate) async fn request_update(
                 tracing::error!(
                     contract = %key,
                     phase = "error",
-                    "UPDATE: Cannot update contract on isolated node - contract not seeded"
+                    "UPDATE: Cannot update contract on isolated node - contract not hosted"
                 );
                 return Err(OpError::RingError(RingError::NoHostingPeers(*key.id())));
             }
 
             // Update the contract locally. This path is reached when:
-            // 1. No remote peers are available (isolated node OR no suitable caching peers)
+            // 1. No remote peers are available (isolated node OR no suitable hosting peers)
             // 2. We are hosting the contract (verified above)
             let UpdateExecution {
                 value: _updated_value,

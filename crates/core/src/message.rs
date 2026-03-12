@@ -374,6 +374,7 @@ pub(crate) enum NetMessageV1 {
 /// This protocol allows neighbors to inform each other which contracts they are hosting,
 /// enabling UPDATE forwarding to hosts who may not be explicitly subscribed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names)]
 pub enum NeighborHostingMessage {
     /// Announce changes to our hosted contracts.
     HostingAnnounce {

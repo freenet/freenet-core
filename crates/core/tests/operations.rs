@@ -490,7 +490,7 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
         &mut client_api_a,
         initial_wrapped_state.clone(),
         contract.clone(),
-        "first PUT (cache seed)",
+        "first PUT (initial hosting)",
         Some(contract_key),
     )
     .await?;
@@ -2475,7 +2475,7 @@ async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> Tes
     Ok(())
 }
 
-/// Ensure a client-only peer receives PutResponse when the contract is seeded on a third hop.
+/// Ensure a client-only peer receives PutResponse when the contract is hosted on a third hop.
 ///
 /// This test verifies that PUT responses are properly routed back through forwarding peers,
 /// even when the contract is stored on a node that is multiple hops away from the client.
