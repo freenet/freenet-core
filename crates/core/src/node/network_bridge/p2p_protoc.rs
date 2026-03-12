@@ -2606,7 +2606,7 @@ impl P2pConnManager {
                     .and_then(|e| e.location)
                     .unwrap_or_else(|| Location::from_address(&peer_addr));
                 // Don't re-run should_accept() here — the connection was already
-                // accepted at the protocol level (connect.rs:572) and NAT traversal
+                // accepted at the protocol level (the CONNECT terminus handler in connect.rs) and NAT traversal
                 // already succeeded. Re-evaluating the probabilistic Kleinberg filter
                 // would discard hard-won connections for no capacity reason (#3545).
                 // Only enforce the hard max_connections cap as a resource safety limit.
@@ -2766,7 +2766,7 @@ impl P2pConnManager {
 
         // Pre-flight max_connections check: avoid expensive NAT hole-punching when
         // we're already at capacity. We don't re-run should_accept() here because
-        // the connection was already accepted at the protocol level (connect.rs:572)
+        // the connection was already accepted at the protocol level (the CONNECT terminus handler in connect.rs)
         // and re-rolling the probabilistic Kleinberg filter would discard connections
         // after costly NAT traversal for no capacity reason (#3545).
         if !transient && !peer_addr.ip().is_unspecified() {
@@ -3446,7 +3446,7 @@ impl P2pConnManager {
                     "handle_successful_connection: evaluating promotion to ring"
                 );
                 // Don't re-run should_accept() here — the connection was already
-                // accepted at the protocol level (connect.rs:572) and transport
+                // accepted at the protocol level (the CONNECT terminus handler in connect.rs) and transport
                 // establishment (NAT traversal) already succeeded. Re-evaluating
                 // the probabilistic Kleinberg filter would discard hard-won
                 // connections for no capacity reason (#3545).
