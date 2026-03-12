@@ -198,7 +198,7 @@ impl HostingManager {
             downstream_subscribers: DashMap::new(),
             time_source: InstantTimeSrc::new(),
             pending_subscription_requests: DashSet::new(),
-            created_at: Instant::now(),
+            created_at: InstantTimeSrc::new().now(),
             subscription_backoff: RwLock::new(TrackedBackoff::new(
                 backoff_config,
                 MAX_SUBSCRIPTION_BACKOFF_ENTRIES,
@@ -212,7 +212,8 @@ impl HostingManager {
     #[cfg(test)]
     pub fn new_past_startup() -> Self {
         let mut manager = Self::new();
-        manager.created_at = Instant::now() - STARTUP_REVALIDATION_WINDOW - Duration::from_secs(1);
+        manager.created_at =
+            manager.time_source.now() - STARTUP_REVALIDATION_WINDOW - Duration::from_secs(1);
         manager
     }
 
@@ -231,7 +232,7 @@ impl HostingManager {
     /// Creates a new subscription or renews an existing one. The subscription
     /// will expire after `SUBSCRIPTION_LEASE_DURATION` unless renewed.
     pub fn subscribe(&self, contract: ContractKey) -> SubscribeResult {
-        let expires_at = Instant::now() + SUBSCRIPTION_LEASE_DURATION;
+        let expires_at = self.time_source.now() + SUBSCRIPTION_LEASE_DURATION;
         let is_new = self
             .active_subscriptions
             .insert(contract, expires_at)
@@ -255,7 +256,7 @@ impl HostingManager {
     #[allow(dead_code)] // Used in tests, may be used for explicit renewal in future
     pub fn renew_subscription(&self, contract: &ContractKey) -> bool {
         if let Some(mut entry) = self.active_subscriptions.get_mut(contract) {
-            *entry = Instant::now() + SUBSCRIPTION_LEASE_DURATION;
+            *entry = self.time_source.now() + SUBSCRIPTION_LEASE_DURATION;
             debug!(%contract, "renew_subscription: lease extended");
             true
         } else {
@@ -279,13 +280,13 @@ impl HostingManager {
     pub fn is_subscribed(&self, contract: &ContractKey) -> bool {
         self.active_subscriptions
             .get(contract)
-            .map(|expires_at| *expires_at > Instant::now())
+            .map(|expires_at| *expires_at > self.time_source.now())
             .unwrap_or(false)
     }
 
     /// Get all contracts with active subscriptions.
     pub fn get_subscribed_contracts(&self) -> Vec<ContractKey> {
-        let now = Instant::now();
+        let now = self.time_source.now();
         let mut contracts: Vec<ContractKey> = self
             .active_subscriptions
             .iter()
@@ -313,7 +314,7 @@ impl HostingManager {
     }
 
     pub fn expire_stale_subscriptions(&self) -> Vec<ContractKey> {
-        let now = Instant::now();
+        let now = self.time_source.now();
         let mut expired = Vec::new();
 
         // Collect expired subscriptions
@@ -342,7 +343,7 @@ impl HostingManager {
     /// Get the number of active subscriptions.
     #[allow(dead_code)] // Used in tests, may be used for metrics in future
     pub fn active_subscription_count(&self) -> usize {
-        let now = Instant::now();
+        let now = self.time_source.now();
         self.active_subscriptions
             .iter()
             .filter(|entry| *entry.value() > now)
@@ -768,7 +769,7 @@ impl HostingManager {
     ///
     /// Returns: (contract, has_client_subscription, is_active_subscription, expires_at)
     pub fn get_subscription_states(&self) -> Vec<(ContractKey, bool, bool, Option<Instant>)> {
-        let now = Instant::now();
+        let now = self.time_source.now();
         let mut states: Vec<_> = self
             .active_subscriptions
             .iter()
@@ -798,7 +799,7 @@ impl HostingManager {
     /// NOT renewed. Caching is a durability mechanism (stale fallback);
     /// subscriptions are a freshness mechanism for active consumers only.
     pub fn contracts_needing_renewal(&self) -> Vec<ContractKey> {
-        let now = Instant::now();
+        let now = self.time_source.now();
         let renewal_threshold = now + SUBSCRIPTION_RENEWAL_INTERVAL;
 
         // Use HashSet for O(1) deduplication instead of O(n) Vec::contains
@@ -900,7 +901,7 @@ impl HostingManager {
         use super::topology_registry::{ContractSubscription, TopologySnapshot};
 
         let mut snapshot = TopologySnapshot::new(peer_addr, location);
-        let now = tokio::time::Instant::now();
+        let now = self.time_source.now();
 
         // Add all hosted contracts
         // Collect and sort for deterministic iteration order
