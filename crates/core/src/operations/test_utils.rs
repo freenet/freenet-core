@@ -166,8 +166,8 @@ pub struct MockRing {
     pub own_location: PeerKeyLocation,
     /// Available candidates to return from k_closest queries
     pub candidates: Vec<PeerKeyLocation>,
-    /// Contracts this mock is "seeding"
-    pub seeding_contracts: Arc<Mutex<Vec<ContractKey>>>,
+    /// Contracts this mock is "hosting"
+    pub hosting_contracts: Arc<Mutex<Vec<ContractKey>>>,
     /// Records of k_closest calls: (key, skip_count, k)
     pub k_closest_calls: Arc<Mutex<Vec<(ContractKey, usize, usize)>>>,
 }
@@ -177,7 +177,7 @@ impl MockRing {
         Self {
             own_location,
             candidates,
-            seeding_contracts: Arc::new(Mutex::new(Vec::new())),
+            hosting_contracts: Arc::new(Mutex::new(Vec::new())),
             k_closest_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -186,27 +186,27 @@ impl MockRing {
         &self.own_location
     }
 
-    pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
-        self.seeding_contracts.lock().unwrap().contains(key)
+    pub fn is_hosting_contract(&self, key: &ContractKey) -> bool {
+        self.hosting_contracts.lock().unwrap().contains(key)
     }
 
-    pub fn seed_contract(&self, key: ContractKey, _size_bytes: u64) {
-        let mut seeding = self.seeding_contracts.lock().unwrap();
-        if !seeding.contains(&key) {
-            seeding.push(key);
+    pub fn host_contract(&self, key: ContractKey, _size_bytes: u64) {
+        let mut hosting = self.hosting_contracts.lock().unwrap();
+        if !hosting.contains(&key) {
+            hosting.push(key);
         }
     }
 
     pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) {
-        self.seed_contract(key, size_bytes);
+        self.host_contract(key, size_bytes);
     }
 
     pub fn record_subscribe_access(&self, key: ContractKey, size_bytes: u64) {
-        self.seed_contract(key, size_bytes);
+        self.host_contract(key, size_bytes);
     }
 
-    /// Simulates k_closest_potentially_caching
-    pub fn k_closest_potentially_caching(
+    /// Simulates k_closest_potentially_hosting
+    pub fn k_closest_potentially_hosting(
         &self,
         key: &ContractKey,
         skip_list: &[SocketAddr],
@@ -511,15 +511,15 @@ mod tests {
     }
 
     #[test]
-    fn mock_ring_tracks_seeding() {
+    fn mock_ring_tracks_hosting() {
         let own = make_peer(4000);
         let ring = MockRing::new(own, vec![]);
 
         let key = make_contract_key(1);
-        assert!(!ring.is_seeding_contract(&key));
+        assert!(!ring.is_hosting_contract(&key));
 
-        ring.seed_contract(key, 100);
-        assert!(ring.is_seeding_contract(&key));
+        ring.host_contract(key, 100);
+        assert!(ring.is_hosting_contract(&key));
     }
 
     #[test]
@@ -534,7 +534,7 @@ mod tests {
         let key = make_contract_key(1);
         let skip = vec![peer1.socket_addr().unwrap()];
 
-        let result = ring.k_closest_potentially_caching(&key, &skip, 3);
+        let result = ring.k_closest_potentially_hosting(&key, &skip, 3);
 
         // peer1 should be skipped
         assert_eq!(result.len(), 2);
@@ -841,7 +841,7 @@ mod tests {
         let contract_key = make_contract_key(1);
         let candidates = node
             .ring
-            .k_closest_potentially_caching(&contract_key, &[], 3);
+            .k_closest_potentially_hosting(&contract_key, &[], 3);
 
         assert_eq!(candidates.len(), 3, "Should return all 3 candidates");
         assert!(candidates.contains(&peer1));

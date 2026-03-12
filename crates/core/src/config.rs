@@ -2242,7 +2242,7 @@ std::thread_local! {
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static GLOBAL_NEIGHBOR_CACHE_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_ANTI_STARVATION_TRIGGERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -2276,7 +2276,7 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
-        GLOBAL_NEIGHBOR_CACHE_UPDATES.with(|c| c.set(0));
+        GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
         GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.set(0));
     }
 
@@ -2338,12 +2338,12 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_HWM.with(|c| c.get())
     }
 
-    pub fn record_neighbor_cache_update() {
-        GLOBAL_NEIGHBOR_CACHE_UPDATES.with(|c| c.set(c.get() + 1));
+    pub fn record_neighbor_hosting_update() {
+        GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(c.get() + 1));
     }
 
-    pub fn neighbor_cache_updates() -> u64 {
-        GLOBAL_NEIGHBOR_CACHE_UPDATES.with(|c| c.get())
+    pub fn neighbor_hosting_updates() -> u64 {
+        GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.get())
     }
 
     pub fn record_anti_starvation_trigger() {

@@ -472,16 +472,16 @@ impl<T> From<SendError<T>> for OpError {
     }
 }
 
-/// Announces to the proximity cache that we've cached a contract.
+/// Announces to neighbors that we're hosting a contract.
 /// This broadcasts to all connected peers so they know to forward UPDATEs to us.
-pub(crate) async fn announce_contract_cached(op_manager: &OpManager, key: &ContractKey) {
-    if let Some(announcement) = op_manager.proximity_cache.on_contract_cached(key) {
+pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &ContractKey) {
+    if let Some(announcement) = op_manager.neighbor_hosting.on_contract_hosted(key) {
         tracing::debug!(
             %key,
-            "PROXIMITY_CACHE: Announcing contract cached to neighbors"
+            "NEIGHBOR_HOSTING: Announcing contract hosted to neighbors"
         );
         if let Err(err) = op_manager
-            .notify_node_event(crate::message::NodeEvent::BroadcastProximityCache {
+            .notify_node_event(crate::message::NodeEvent::BroadcastHostingUpdate {
                 message: announcement,
             })
             .await
@@ -490,7 +490,7 @@ pub(crate) async fn announce_contract_cached(op_manager: &OpManager, key: &Contr
                 contract = %key,
                 error = %err,
                 phase = "error",
-                "PROXIMITY_CACHE: Failed to broadcast cache announcement"
+                "NEIGHBOR_HOSTING: Failed to broadcast hosting announcement"
             );
         }
     }

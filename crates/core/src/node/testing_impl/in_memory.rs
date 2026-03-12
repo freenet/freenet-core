@@ -478,12 +478,14 @@ async fn append_contracts(
             op_manager.ring.connection_manager.get_own_addr().unwrap()
         );
         if subscription {
-            op_manager.ring.seed_contract(key, state_size);
+            op_manager
+                .ring
+                .host_contract(key, state_size, crate::ring::AccessType::Put);
             // In the new lease-based model, register an active subscription
             op_manager.ring.subscribe(key);
         }
         // Note: contract_subscribers is ignored in the new model.
-        // Proximity cache handles peer-to-peer awareness for update propagation.
+        // Neighbor hosting handles peer-to-peer awareness for update propagation.
     }
     Ok(())
 }

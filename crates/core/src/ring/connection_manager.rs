@@ -1510,7 +1510,7 @@ impl ConnectionManager {
         }
 
         // If all connected peers failed the readiness check, fall back to using them anyway.
-        // Same rationale as k_closest_potentially_caching: routing to not-ready peers is
+        // Same rationale as k_closest_potentially_hosting: routing to not-ready peers is
         // better than returning empty (which causes EmptyRing / no routing target for
         // PUT, UPDATE, and other operations that use this path).
         if check_readiness && candidates.is_empty() && !not_ready_fallback.is_empty() {

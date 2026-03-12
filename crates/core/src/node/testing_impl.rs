@@ -2832,8 +2832,8 @@ impl SimNetwork {
                         SubscribeEvent::SubscribeSuccess { .. } => summary.subscribe.succeeded += 1,
                         SubscribeEvent::SubscribeNotFound { .. } => summary.subscribe.failed += 1,
                         SubscribeEvent::ResponseSent { .. }
-                        | SubscribeEvent::SeedingStarted { .. }
-                        | SubscribeEvent::SeedingStopped { .. }
+                        | SubscribeEvent::HostingStarted { .. }
+                        | SubscribeEvent::HostingStopped { .. }
                         | SubscribeEvent::_Reserved6
                         | SubscribeEvent::_Reserved7
                         | SubscribeEvent::_Reserved8
@@ -4303,8 +4303,8 @@ impl SimNetwork {
     ///
     /// Checks for:
     /// - Bidirectional cycles that create isolated islands
-    /// - Orphan seeders without recovery paths
-    /// - Unreachable seeders
+    /// - Orphan hosters without recovery paths
+    /// - Unreachable hosters
     /// - Proximity violations in upstream selection
     ///
     /// Returns a validation result with any issues found.
@@ -4350,19 +4350,19 @@ impl SimNetwork {
                 ));
             }
 
-            if !result.orphan_seeders.is_empty() {
+            if !result.orphan_hosters.is_empty() {
                 issues.push(format!(
-                    "ISSUE #2719: {} orphan seeders found: {:?}",
-                    result.orphan_seeders.len(),
-                    result.orphan_seeders
+                    "ISSUE #2719: {} orphan hosters found: {:?}",
+                    result.orphan_hosters.len(),
+                    result.orphan_hosters
                 ));
             }
 
-            if !result.unreachable_seeders.is_empty() {
+            if !result.unreachable_hosters.is_empty() {
                 issues.push(format!(
-                    "ISSUE #2720: {} unreachable seeders found: {:?}",
-                    result.unreachable_seeders.len(),
-                    result.unreachable_seeders
+                    "ISSUE #2720: {} unreachable hosters found: {:?}",
+                    result.unreachable_hosters.len(),
+                    result.unreachable_hosters
                 ));
             }
 

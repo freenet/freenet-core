@@ -351,9 +351,9 @@ pub(crate) enum NetMessageV1 {
     Subscribe(SubscribeMsg),
     Update(UpdateMsg),
     Aborted(Transaction),
-    /// Proximity cache protocol message for tracking which neighbors cache which contracts.
-    ProximityCache {
-        message: ProximityCacheMessage,
+    /// Neighbor hosting protocol message for tracking which neighbors host which contracts.
+    NeighborHosting {
+        message: NeighborHostingMessage,
     },
     /// Interest synchronization protocol for delta-based updates.
     InterestSync {
@@ -369,28 +369,28 @@ pub(crate) enum NetMessageV1 {
     },
 }
 
-/// Messages for the proximity cache protocol.
+/// Messages for the neighbor hosting protocol.
 ///
-/// This protocol allows neighbors to inform each other which contracts they have cached,
-/// enabling UPDATE forwarding to seeders who may not be explicitly subscribed.
+/// This protocol allows neighbors to inform each other which contracts they are hosting,
+/// enabling UPDATE forwarding to hosts who may not be explicitly subscribed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)]
-pub enum ProximityCacheMessage {
-    /// Announce changes to our cached contracts.
-    CacheAnnounce {
-        /// Contracts we've started caching.
+pub enum NeighborHostingMessage {
+    /// Announce changes to our hosted contracts.
+    HostingAnnounce {
+        /// Contracts we've started hosting.
         added: Vec<ContractInstanceId>,
-        /// Contracts we've stopped caching.
+        /// Contracts we've stopped hosting.
         removed: Vec<ContractInstanceId>,
         /// True if this is a response to a received announcement.
         /// Recipients should not respond to responses (prevents ping-pong).
         #[serde(default)]
         is_response: bool,
     },
-    /// Request a neighbor's full cache state (used on new connections).
-    CacheStateRequest,
-    /// Response with the neighbor's full cache state.
-    CacheStateResponse { contracts: Vec<ContractInstanceId> },
+    /// Request a neighbor's full hosting state (used on new connections).
+    HostingStateRequest,
+    /// Response with the neighbor's full hosting state.
+    HostingStateResponse { contracts: Vec<ContractInstanceId> },
 }
 
 /// Messages for the delta-based interest synchronization protocol.
@@ -580,7 +580,7 @@ impl Versioned for NetMessageV1 {
             // Version 2.0.0 for delta-based BroadcastTo format
             NetMessageV1::Update(_) => semver::Version::new(2, 0, 0),
             NetMessageV1::Aborted(_) => semver::Version::new(1, 0, 0),
-            NetMessageV1::ProximityCache { .. } => semver::Version::new(1, 0, 0),
+            NetMessageV1::NeighborHosting { .. } => semver::Version::new(1, 0, 0),
             // Version 1.1.0 for delta-based interest sync
             NetMessageV1::InterestSync { .. } => semver::Version::new(1, 1, 0),
             NetMessageV1::ReadyState { .. } => semver::Version::new(1, 2, 0),
@@ -644,7 +644,7 @@ pub(crate) enum NodeEvent {
     /// Local client subscriptions are handled separately from network peer subscriptions:
     /// - Subsequent contract updates are delivered via the executor's `update_notifications`
     ///   channels (see `send_update_notification` in runtime.rs)
-    /// - Network peer subscriptions use the `seeding_manager.subscribers` for UPDATE propagation
+    /// - Network peer subscriptions use the `hosting_manager.subscribers` for UPDATE propagation
     LocalSubscribeComplete {
         tx: Transaction,
         key: ContractKey,
@@ -657,8 +657,8 @@ pub(crate) enum NodeEvent {
         addr: SocketAddr,
     },
     /// Broadcast a proximity cache message to all connected peers.
-    BroadcastProximityCache {
-        message: ProximityCacheMessage,
+    BroadcastHostingUpdate {
+        message: NeighborHostingMessage,
     },
     /// Broadcast a ChangeInterests message to all connected peers for delta sync.
     BroadcastChangeInterests {
@@ -761,8 +761,8 @@ impl Display for NodeEvent {
             NodeEvent::ExpectPeerConnection { addr } => {
                 write!(f, "ExpectPeerConnection (from {addr})")
             }
-            NodeEvent::BroadcastProximityCache { message } => {
-                write!(f, "BroadcastProximityCache ({message:?})")
+            NodeEvent::BroadcastHostingUpdate { message } => {
+                write!(f, "BroadcastHostingUpdate ({message:?})")
             }
             NodeEvent::BroadcastChangeInterests { added, removed } => {
                 write!(
@@ -805,7 +805,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Subscribe(op) => op.id(),
             NetMessageV1::Update(op) => op.id(),
             NetMessageV1::Aborted(tx) => tx,
-            NetMessageV1::ProximityCache { .. } => Transaction::NULL,
+            NetMessageV1::NeighborHosting { .. } => Transaction::NULL,
             NetMessageV1::InterestSync { .. } => Transaction::NULL,
             NetMessageV1::ReadyState { .. } => Transaction::NULL,
         }
@@ -819,7 +819,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::Subscribe(op) => op.requested_location(),
             NetMessageV1::Update(op) => op.requested_location(),
             NetMessageV1::Aborted(_) => None,
-            NetMessageV1::ProximityCache { .. } => None,
+            NetMessageV1::NeighborHosting { .. } => None,
             NetMessageV1::InterestSync { .. } => None,
             NetMessageV1::ReadyState { .. } => None,
         }
@@ -838,8 +838,8 @@ impl Display for NetMessage {
                 Subscribe(msg) => msg.fmt(f)?,
                 Update(msg) => msg.fmt(f)?,
                 Aborted(msg) => msg.fmt(f)?,
-                ProximityCache { message } => {
-                    write!(f, "ProximityCache {{ {message:?} }}")?;
+                NeighborHosting { message } => {
+                    write!(f, "NeighborHosting {{ {message:?} }}")?;
                 }
                 InterestSync { message } => {
                     write!(f, "InterestSync {{ {message:?} }}")?;

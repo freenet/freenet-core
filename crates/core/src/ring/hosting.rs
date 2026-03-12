@@ -7,7 +7,7 @@
 //!
 //! ## Key Design (2026-01 Unified Hosting Refactor)
 //!
-//! This module unifies the previously separate "seeding" and "GET subscription" caches
+//! This module unifies the previously separate "hosting" and "GET subscription" caches
 //! into a single `HostingCache` that serves as the source of truth for which contracts
 //! this peer is hosting.
 //!
@@ -856,7 +856,7 @@ impl HostingManager {
                     contract_key,
                     upstream: None,     // No upstream tracking in lease-based model
                     downstream: vec![], // No downstream tracking in lease-based model
-                    is_seeding: true,   // TODO: Rename to is_hosting in topology_registry
+                    is_hosting: true,
                     has_client_subscriptions,
                 },
             );
@@ -882,7 +882,7 @@ impl HostingManager {
                         contract_key,
                         upstream: None,
                         downstream: vec![],
-                        is_seeding: false, // TODO: Rename to is_hosting
+                        is_hosting: false,
                         has_client_subscriptions,
                     },
                 );

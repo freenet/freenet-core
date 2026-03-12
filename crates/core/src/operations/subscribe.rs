@@ -337,16 +337,16 @@ pub(crate) async fn request_subscribe(
     let mut candidates =
         op_manager
             .ring
-            .k_closest_potentially_caching(instance_id, &visited, MAX_BREADTH);
+            .k_closest_potentially_hosting(instance_id, &visited, MAX_BREADTH);
 
-    // First try the best candidates from k_closest_potentially_caching.
+    // First try the best candidates from k_closest_potentially_hosting.
     // If that returns empty, fall back to any available connection.
     // This ensures we join the subscription tree even when the routing algorithm
     // can't find ideal candidates (e.g., due to timing or location filtering).
     let target = if !candidates.is_empty() {
         candidates.remove(0)
     } else {
-        // k_closest_potentially_caching returned empty - try any connected peer as fallback.
+        // k_closest_potentially_hosting returned empty - try any connected peer as fallback.
         // The subscription will be forwarded toward the contract location.
         let connections = op_manager
             .ring
@@ -391,7 +391,7 @@ pub(crate) async fn request_subscribe(
                     return complete_local_subscription(op_manager, *id, key, is_renewal).await;
                 }
                 tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
-                return Err(RingError::NoCachingPeers(*instance_id).into());
+                return Err(RingError::NoHostingPeers(*instance_id).into());
             }
         }
     };
@@ -476,7 +476,7 @@ pub(crate) async fn request_subscribe(
 ///
 /// **Architecture Note (Issue #2075):**
 /// Local client subscriptions are deliberately kept separate from network subscriptions:
-/// - **Network subscriptions** are stored in `ring.seeding_manager.subscribers` and are used
+/// - **Network subscriptions** are stored in `ring.hosting_manager.subscribers` and are used
 ///   for peer-to-peer UPDATE propagation between nodes
 /// - **Local subscriptions** are managed by the contract executor via `update_notifications`
 ///   channels, which deliver `UpdateNotification` directly to WebSocket clients
@@ -661,7 +661,7 @@ impl SubscribeOp {
                 phase = "not_found",
                 "Subscribe failed at originator"
             );
-            Err(RingError::NoCachingPeers(instance_id).into())
+            Err(RingError::NoHostingPeers(instance_id).into())
         }
     }
 
@@ -757,7 +757,7 @@ impl SubscribeOp {
                     visited.mark_visited(*addr);
                 }
 
-                let mut new_candidates = op_manager.ring.k_closest_potentially_caching(
+                let mut new_candidates = op_manager.ring.k_closest_potentially_hosting(
                     &instance_id,
                     &visited,
                     MAX_BREADTH,
@@ -1225,7 +1225,7 @@ impl Operation for SubscribeOp {
                         new_visited.mark_visited(requester);
                     }
 
-                    let mut candidates = op_manager.ring.k_closest_potentially_caching(
+                    let mut candidates = op_manager.ring.k_closest_potentially_hosting(
                         instance_id,
                         &new_visited,
                         MAX_BREADTH,
@@ -1359,7 +1359,7 @@ impl Operation for SubscribeOp {
                             // This ensures UPDATE broadcasts will reach us. Without this,
                             // if the contract was already cached (fetch_contract_if_missing returned early),
                             // neighbors wouldn't know we have the contract and wouldn't broadcast updates to us.
-                            super::announce_contract_cached(op_manager, key).await;
+                            super::announce_contract_hosted(op_manager, key).await;
 
                             // Register the responding peer as our upstream in the interest manager.
                             // This peer fulfilled our subscription, so it's the target for
@@ -1561,7 +1561,7 @@ impl Operation for SubscribeOp {
                                 }
 
                                 let mut new_candidates =
-                                    op_manager.ring.k_closest_potentially_caching(
+                                    op_manager.ring.k_closest_potentially_hosting(
                                         instance_id,
                                         &visited,
                                         MAX_BREADTH,
@@ -1662,10 +1662,10 @@ impl Operation for SubscribeOp {
                                         tx = %msg_id,
                                         contract = %key,
                                         phase = "reseed",
-                                        "Subscribe: Network returned NotFound, re-seeding with local cache"
+                                        "Subscribe: Network returned NotFound, re-hosting from local cache"
                                     );
 
-                                    // Re-seed the network with our local copy
+                                    // Re-host to the network with our local copy
                                     if let Some(contract_code) = contract {
                                         let put_result = op_manager
                                             .notify_contract_handler(
@@ -1682,12 +1682,12 @@ impl Operation for SubscribeOp {
                                                 new_value: Ok(_),
                                                 ..
                                             }) => {
-                                                tracing::debug!(tx = %msg_id, %key, "Re-seeded contract to network");
-                                                super::announce_contract_cached(op_manager, &key)
+                                                tracing::debug!(tx = %msg_id, %key, "Re-hosted contract to network");
+                                                super::announce_contract_hosted(op_manager, &key)
                                                     .await;
                                             }
                                             _ => {
-                                                tracing::warn!(tx = %msg_id, %key, "Failed to re-seed contract");
+                                                tracing::warn!(tx = %msg_id, %key, "Failed to re-host contract");
                                             }
                                         }
                                     }

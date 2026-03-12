@@ -282,9 +282,9 @@ async fn register_subscription_listener(
             let result = op_manager
                 .ring
                 .add_client_subscription(&instance_id, client_id);
-            // Emit telemetry if this was the first client (seeding started)
+            // Emit telemetry if this was the first client (hosting started)
             if result.is_first_client {
-                if let Some(event) = NetEventLog::seeding_started(&op_manager.ring, instance_id) {
+                if let Some(event) = NetEventLog::hosting_started(&op_manager.ring, instance_id) {
                     op_manager.ring.register_events(Either::Left(event)).await;
                 }
             }
@@ -330,7 +330,7 @@ async fn report_op_init_error(
         OpError::RingError(crate::ring::RingError::EmptyRing) => ErrorKind::EmptyRing,
         OpError::RingError(crate::ring::RingError::PeerNotJoined) => ErrorKind::PeerNotJoined,
         OpError::RingError(crate::ring::RingError::ConnError(_))
-        | OpError::RingError(crate::ring::RingError::NoCachingPeers(_))
+        | OpError::RingError(crate::ring::RingError::NoHostingPeers(_))
         | OpError::ConnError(_)
         | OpError::ContractError(_)
         | OpError::ExecutorError(_)
@@ -594,7 +594,7 @@ impl From<crate::ring::RingError> for Error {
             crate::ring::RingError::PeerNotJoined => Error::PeerNotJoined,
             crate::ring::RingError::EmptyRing => Error::EmptyRing,
             other @ crate::ring::RingError::ConnError(_)
-            | other @ crate::ring::RingError::NoCachingPeers(_) => Error::Node(other.to_string()),
+            | other @ crate::ring::RingError::NoHostingPeers(_) => Error::Node(other.to_string()),
         }
     }
 }
@@ -667,7 +667,7 @@ async fn process_open_request(
                         let skip_list: Vec<_> = own_location.socket_addr().into_iter().collect();
                         let has_remote_peers = op_manager
                             .ring
-                            .closest_potentially_caching(&contract_key, skip_list.as_slice())
+                            .closest_potentially_hosting(&contract_key, skip_list.as_slice())
                             .is_some();
 
                         if !has_remote_peers {
@@ -1577,10 +1577,10 @@ async fn process_open_request(
                                 // Register client subscription to enable subscription tree pruning on disconnect
                                 let result =
                                     op_manager.ring.add_client_subscription(&key, client_id);
-                                // Emit telemetry if this was the first client (seeding started)
+                                // Emit telemetry if this was the first client (hosting started)
                                 if result.is_first_client {
                                     if let Some(event) =
-                                        NetEventLog::seeding_started(&op_manager.ring, key)
+                                        NetEventLog::hosting_started(&op_manager.ring, key)
                                     {
                                         op_manager.ring.register_events(Either::Left(event)).await;
                                     }
@@ -1875,11 +1875,12 @@ async fn process_open_request(
                         }
                     }
                     freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo => {
-                        // TODO: Implement proximity cache info query
+                        // TODO: Implement neighbor hosting info query
+                        // Note: ProximityCacheInfo is defined in freenet-stdlib; rename there separately
                         tracing::warn!(
                             client_id = %client_id,
                             request_id = %request_id,
-                            "ProximityCacheInfo query not yet implemented"
+                            "NeighborHostingInfo query not yet implemented"
                         );
                         return Ok(None);
                     }

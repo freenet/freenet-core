@@ -1,7 +1,7 @@
 //! Unified hosting cache for contract state caching.
 //!
 //! This module implements a byte-budget aware LRU cache with TTL protection for hosted contracts.
-//! It unifies the previously separate `SeedingCache` and `GetSubscriptionCache` into a single
+//! It unifies the previously separate `SeedingCache` (now called hosting cache) and `GetSubscriptionCache` into a single
 //! source of truth for which contracts a peer is hosting.
 //!
 //! # Design Principles

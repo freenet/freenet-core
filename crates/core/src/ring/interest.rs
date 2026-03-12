@@ -147,8 +147,8 @@ impl PeerInterest {
 /// when ALL reasons are removed.
 #[derive(Clone, Debug, Default)]
 pub struct LocalInterest {
-    /// Whether we're seeding this contract (in our local cache).
-    pub seeding: bool,
+    /// Whether we're hosting this contract (in our local cache).
+    pub hosting: bool,
 
     /// Number of local WebSocket clients subscribed to this contract.
     pub local_client_count: usize,
@@ -160,14 +160,14 @@ pub struct LocalInterest {
 impl LocalInterest {
     /// Check if we have any reason to be interested in this contract.
     pub fn is_interested(&self) -> bool {
-        self.seeding || self.local_client_count > 0 || self.downstream_subscriber_count > 0
+        self.hosting || self.local_client_count > 0 || self.downstream_subscriber_count > 0
     }
 
     /// Increment the local client count and return whether this is the first client.
     pub fn add_client(&mut self) -> bool {
         let was_first = self.local_client_count == 0;
         self.local_client_count += 1;
-        was_first && !self.seeding && self.downstream_subscriber_count == 0
+        was_first && !self.hosting && self.downstream_subscriber_count == 0
     }
 
     /// Decrement the local client count and return whether interest was lost.
@@ -179,7 +179,7 @@ impl LocalInterest {
     /// Increment the downstream subscriber count and return whether this is the first.
     pub fn add_downstream(&mut self) -> bool {
         let was_first =
-            self.downstream_subscriber_count == 0 && self.local_client_count == 0 && !self.seeding;
+            self.downstream_subscriber_count == 0 && self.local_client_count == 0 && !self.hosting;
         self.downstream_subscriber_count += 1;
         was_first
     }
@@ -190,10 +190,10 @@ impl LocalInterest {
         !self.is_interested()
     }
 
-    /// Set seeding status and return whether interest state changed.
-    pub fn set_seeding(&mut self, seeding: bool) -> bool {
+    /// Set hosting status and return whether interest state changed.
+    pub fn set_hosting(&mut self, hosting: bool) -> bool {
         let was_interested = self.is_interested();
-        self.seeding = seeding;
+        self.hosting = hosting;
         let is_interested = self.is_interested();
         was_interested != is_interested
     }
@@ -633,21 +633,21 @@ impl<T: TimeSource> InterestManager<T> {
         self
     }
 
-    /// Register that we're seeding a contract locally.
+    /// Register that we're hosting a contract locally.
     /// Returns true if this caused us to become interested (wasn't interested before).
-    pub fn register_local_seeding(&self, contract: &ContractKey) -> bool {
+    pub fn register_local_hosting(&self, contract: &ContractKey) -> bool {
         let mut entry = self.local_interests.entry(*contract).or_default();
         let was_interested = entry.is_interested();
-        entry.seeding = true;
+        entry.hosting = true;
         self.index_contract_hash(contract);
         !was_interested
     }
 
-    /// Unregister that we're seeding a contract locally.
+    /// Unregister that we're hosting a contract locally.
     /// Returns true if this caused us to lose interest (no other reasons remain).
-    pub fn unregister_local_seeding(&self, contract: &ContractKey) -> bool {
+    pub fn unregister_local_hosting(&self, contract: &ContractKey) -> bool {
         if let Some(mut entry) = self.local_interests.get_mut(contract) {
-            entry.seeding = false;
+            entry.hosting = false;
             let lost_interest = !entry.is_interested();
             if lost_interest {
                 drop(entry);
@@ -1204,9 +1204,9 @@ mod tests {
         // Initially no interest
         assert!(!manager.has_local_interest(&contract));
 
-        // Add seeding interest
+        // Add hosting interest
         manager.with_local_interest(&contract, |interest| {
-            interest.set_seeding(true);
+            interest.set_hosting(true);
         });
         assert!(manager.has_local_interest(&contract));
 
@@ -1216,9 +1216,9 @@ mod tests {
         });
         assert!(manager.has_local_interest(&contract));
 
-        // Remove seeding - still interested due to client
+        // Remove hosting - still interested due to client
         manager.with_local_interest(&contract, |interest| {
-            interest.set_seeding(false);
+            interest.set_hosting(false);
         });
         assert!(manager.has_local_interest(&contract));
 
@@ -1297,7 +1297,7 @@ mod tests {
 
         // Register interests (use methods that properly index)
         manager.register_peer_interest(&contract1, peer.clone(), None, false);
-        manager.register_local_seeding(&contract2);
+        manager.register_local_hosting(&contract2);
 
         let hashes = manager.get_all_interest_hashes();
         assert_eq!(hashes.len(), 2);
@@ -1406,7 +1406,7 @@ mod tests {
         manager.register_peer_interest(&contract1, peer1.clone(), None, false);
         manager.register_peer_interest(&contract1, peer2.clone(), None, false);
         manager.register_peer_interest(&contract2, peer1, None, true);
-        manager.with_local_interest(&contract1, |i| i.set_seeding(true));
+        manager.with_local_interest(&contract1, |i| i.set_hosting(true));
 
         let stats = manager.stats();
         assert_eq!(stats.total_contracts, 2);
@@ -1448,9 +1448,9 @@ mod tests {
         let contract2 = make_contract_key(2);
         let contract3 = make_contract_key(3);
 
-        // Register local interest in contracts 1 and 2 (using set_seeding which indexes)
-        manager.register_local_seeding(&contract1);
-        manager.register_local_seeding(&contract2);
+        // Register local interest in contracts 1 and 2 (using set_hosting which indexes)
+        manager.register_local_hosting(&contract1);
+        manager.register_local_hosting(&contract2);
 
         // Get hashes
         let hash1 = contract_hash(&contract1);
@@ -1493,13 +1493,13 @@ mod tests {
         let summary1 = StateSummary::from(vec![1, 1, 1]);
         let summary2 = StateSummary::from(vec![2, 2, 2]);
 
-        // Setup: A is interested in contracts 1, 2 (using set_seeding which indexes)
-        manager_a.register_local_seeding(&contract1);
-        manager_a.register_local_seeding(&contract2);
+        // Setup: A is interested in contracts 1, 2 (using set_hosting which indexes)
+        manager_a.register_local_hosting(&contract1);
+        manager_a.register_local_hosting(&contract2);
 
-        // Setup: B is interested in contracts 2, 3 (using set_seeding which indexes)
-        manager_b.register_local_seeding(&contract2);
-        manager_b.register_local_seeding(&contract3);
+        // Setup: B is interested in contracts 2, 3 (using set_hosting which indexes)
+        manager_b.register_local_hosting(&contract2);
+        manager_b.register_local_hosting(&contract3);
 
         // Step 1: A sends its interest hashes to B
         let a_hashes = manager_a.get_all_interest_hashes();
@@ -1551,8 +1551,8 @@ mod tests {
         let hash1 = contract_hash(&contract1);
         let hash2 = contract_hash(&contract2);
 
-        // Setup: local interest in contract1 (using set_seeding which indexes)
-        manager.register_local_seeding(&contract1);
+        // Setup: local interest in contract1 (using set_hosting which indexes)
+        manager.register_local_hosting(&contract1);
 
         // Peer declares interest in contract1 and contract2
         let added_hashes = vec![hash1, hash2];
@@ -1636,8 +1636,8 @@ mod tests {
         let new_summary = StateSummary::from(vec![4, 5, 6]); // B's correct summary
 
         // Setup: both peers have interest in the contract
-        manager_a.register_local_seeding(&contract);
-        manager_b.register_local_seeding(&contract);
+        manager_a.register_local_hosting(&contract);
+        manager_b.register_local_hosting(&contract);
 
         // A tracks B's summary, B tracks A's summary
         manager_a.register_peer_interest(
@@ -1697,8 +1697,8 @@ mod tests {
         let peer_with_summary = make_peer_key(1);
         let peer_without_summary = make_peer_key(2);
 
-        // Register local seeding to index the contract
-        manager.register_local_seeding(&contract);
+        // Register local hosting to index the contract
+        manager.register_local_hosting(&contract);
 
         // Small summary (efficient for delta)
         let small_summary = StateSummary::from(vec![1; 100]); // 100 bytes
@@ -1774,7 +1774,7 @@ mod tests {
         let summary3 = StateSummary::from(vec![3, 2, 1]);
 
         // Setup: register all peers with interest
-        manager.register_local_seeding(&contract);
+        manager.register_local_hosting(&contract);
         manager.register_peer_interest(&contract, peer1.clone(), Some(summary1.clone()), false);
         manager.register_peer_interest(&contract, peer2.clone(), None, false);
         manager.register_peer_interest(&contract, peer3.clone(), Some(summary3.clone()), false);
@@ -1845,9 +1845,9 @@ mod tests {
         let peer = make_peer_key(1);
 
         // We have local interest in all three contracts
-        manager.register_local_seeding(&contract1);
-        manager.register_local_seeding(&contract2);
-        manager.register_local_seeding(&contract3);
+        manager.register_local_hosting(&contract1);
+        manager.register_local_hosting(&contract2);
+        manager.register_local_hosting(&contract3);
 
         // Initial state: peer is interested in contracts 1 and 2
         manager.register_peer_interest(&contract1, peer.clone(), None, false);

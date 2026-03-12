@@ -476,7 +476,7 @@ impl Operation for UpdateOp {
 
                             let next_target = op_manager
                                 .ring
-                                .closest_potentially_caching(key, skip_list.as_slice());
+                                .closest_potentially_hosting(key, skip_list.as_slice());
 
                             if let Some(forward_target) = next_target {
                                 let forward_addr = forward_target
@@ -536,7 +536,7 @@ impl Operation for UpdateOp {
                                 // No peers available and we don't have the contract - log error
                                 let candidates = op_manager
                                     .ring
-                                    .k_closest_potentially_caching(key, skip_list.as_slice(), 5)
+                                    .k_closest_potentially_hosting(key, skip_list.as_slice(), 5)
                                     .into_iter()
                                     .filter_map(|loc| loc.socket_addr())
                                     .map(|addr| format!("{:.8}", addr))
@@ -552,7 +552,7 @@ impl Operation for UpdateOp {
                                     phase = "error",
                                     "Cannot handle UPDATE: contract not found locally and no peers to forward to"
                                 );
-                                return Err(OpError::RingError(RingError::NoCachingPeers(
+                                return Err(OpError::RingError(RingError::NoHostingPeers(
                                     *key.id(),
                                 )));
                             }
@@ -1411,15 +1411,15 @@ impl OpManager {
     /// The address of the peer that initiated or forwarded this UPDATE to us.
     /// - Used to filter out the sender from broadcast targets (avoid echo)
     /// - When sender equals our own address (local UPDATE initiation), we include ourselves
-    ///   in proximity cache targets if we're seeding the contract
+    ///   in neighbor hosting targets if we're hosting the contract
     ///
     /// # Hybrid Architecture (2026-01 Refactor)
     ///
     /// Updates are propagated via TWO sources:
-    /// 1. Proximity cache: peers who have announced they seed this contract (fast, local knowledge)
+    /// 1. Neighbor hosting: peers who have announced they host this contract (fast, local knowledge)
     /// 2. Interest manager: peers who have expressed interest via the Interest/Summary protocol
     ///
-    /// This hybrid approach ensures updates reach all interested peers even if CacheAnnounce
+    /// This hybrid approach ensures updates reach all interested peers even if HostingAnnounce
     /// messages haven't fully propagated yet.
     pub(crate) fn get_broadcast_targets_update(
         &self,
@@ -1439,7 +1439,7 @@ impl OpManager {
 
         // Source 1: Proximity cache (peers who announced they seed this contract)
         // Returns TransportPublicKey (stable identity), resolve to PeerKeyLocation via pub_key lookup
-        let proximity_pub_keys = self.proximity_cache.neighbors_with_contract(key);
+        let proximity_pub_keys = self.neighbor_hosting.neighbors_with_contract(key);
         let proximity_found = proximity_pub_keys.len();
 
         for pub_key in proximity_pub_keys {
@@ -1824,21 +1824,21 @@ pub(crate) async fn request_update(
 
     // Find the best peer to send this update to.
     // In the simplified architecture (2026-01 refactor), we use:
-    // 1. Proximity cache - peers who have announced they seed this contract
-    // 2. Ring-based routing - find closest potentially-caching peer
+    // 1. Neighbor hosting - peers who have announced they host this contract
+    // 2. Ring-based routing - find closest potentially-hosting peer
     let sender_addr = op_manager.ring.connection_manager.peer_addr()?;
 
-    // Check proximity cache for neighbors that have announced caching this contract.
+    // Check neighbor hosting info for neighbors that have announced hosting this contract.
     // This is critical for peer-to-peer updates when peers are directly connected
     // but not explicitly subscribed (e.g., River chat rooms where both peers cache
     // the contract but haven't established a subscription tree).
     //
-    // Note: The proximity cache is populated asynchronously via CacheAnnounce messages,
-    // so there may be a brief race window after a peer caches a contract before its
+    // Note: The neighbor hosting info is populated asynchronously via HostingAnnounce messages,
+    // so there may be a brief race window after a peer hosts a contract before its
     // neighbors receive the announcement. This is acceptable - the ring-based fallback
-    // handles this case, and the proximity cache improves the common case where
+    // handles this case, and the neighbor hosting info improves the common case where
     // announcements have propagated.
-    let proximity_neighbors: Vec<_> = op_manager.proximity_cache.neighbors_with_contract(&key);
+    let proximity_neighbors: Vec<_> = op_manager.neighbor_hosting.neighbors_with_contract(&key);
 
     let mut target_from_proximity = None;
     for pub_key in &proximity_neighbors {
@@ -1885,7 +1885,7 @@ pub(crate) async fn request_update(
         // Find the best peer to send the update to based on ring location
         let remote_target = op_manager
             .ring
-            .closest_potentially_caching(&key, [sender_addr].as_slice());
+            .closest_potentially_hosting(&key, [sender_addr].as_slice());
 
         if let Some(target) = remote_target {
             // Found a remote peer to send the update to
@@ -1899,22 +1899,22 @@ pub(crate) async fn request_update(
 
             let id = update_op.id;
 
-            // Check if we're seeding this contract
-            let is_seeding = op_manager.ring.is_seeding_contract(&key);
-            let should_handle_update = is_seeding;
+            // Check if we're hosting this contract
+            let is_hosting = op_manager.ring.is_hosting_contract(&key);
+            let should_handle_update = is_hosting;
 
             if !should_handle_update {
                 tracing::error!(
                     contract = %key,
                     phase = "error",
-                    "UPDATE: Cannot update contract on isolated node - contract not seeded"
+                    "UPDATE: Cannot update contract on isolated node - contract not hosted"
                 );
-                return Err(OpError::RingError(RingError::NoCachingPeers(*key.id())));
+                return Err(OpError::RingError(RingError::NoHostingPeers(*key.id())));
             }
 
             // Update the contract locally. This path is reached when:
-            // 1. No remote peers are available (isolated node OR no suitable caching peers)
-            // 2. We are seeding the contract (verified above)
+            // 1. No remote peers are available (isolated node OR no suitable hosting peers)
+            // 2. We are hosting the contract (verified above)
             let UpdateExecution {
                 value: _updated_value,
                 summary,

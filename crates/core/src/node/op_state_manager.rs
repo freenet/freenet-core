@@ -47,7 +47,7 @@ use crate::{
 };
 
 use super::{
-    network_bridge::EventLoopNotificationsSender, proximity_cache::ProximityCacheManager,
+    neighbor_hosting::NeighborHostingManager, network_bridge::EventLoopNotificationsSender,
     NetEventRegister, NodeConfig, RequestRouter,
 };
 
@@ -234,8 +234,8 @@ pub(crate) struct OpManager {
     /// Operations can register to be notified when a specific contract is stored.
     contract_waiters:
         Arc<Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>>,
-    /// Proximity cache manager for tracking neighbor contract caches
-    pub proximity_cache: Arc<ProximityCacheManager>,
+    /// Neighbor hosting manager for tracking neighbor contract hosting
+    pub neighbor_hosting: Arc<NeighborHostingManager>,
     /// Interest manager for delta-based state synchronization
     pub interest_manager: Arc<crate::ring::interest::InterestManager<InstantTimeSrc>>,
     /// Dedup cache for skipping redundant broadcast WASM merges
@@ -294,7 +294,7 @@ impl Clone for OpManager {
             is_gateway: self.is_gateway,
             sub_op_tracker: self.sub_op_tracker.clone(),
             contract_waiters: self.contract_waiters.clone(),
-            proximity_cache: self.proximity_cache.clone(),
+            neighbor_hosting: self.neighbor_hosting.clone(),
             interest_manager: self.interest_manager.clone(),
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
             request_router: self.request_router.clone(),
@@ -378,7 +378,7 @@ impl OpManager {
             tracing::debug!("Regular peer node: peer_ready will be set after first handshake");
         }
 
-        let proximity_cache = Arc::new(ProximityCacheManager::new());
+        let neighbor_hosting = Arc::new(NeighborHostingManager::new());
         let interest_manager = Arc::new(crate::ring::interest::InterestManager::new(
             InstantTimeSrc::new(),
         ));
@@ -410,7 +410,7 @@ impl OpManager {
             is_gateway,
             sub_op_tracker,
             contract_waiters,
-            proximity_cache,
+            neighbor_hosting,
             interest_manager,
             broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
             request_router,
@@ -1161,10 +1161,13 @@ impl OpManager {
             ));
         }
 
-        if let Some(cache_msg) = self.proximity_cache.on_ring_connection_established(pub_key) {
+        if let Some(cache_msg) = self
+            .neighbor_hosting
+            .on_ring_connection_established(pub_key)
+        {
             messages.push((
                 peer_addr,
-                NetMessage::V1(NetMessageV1::ProximityCache { message: cache_msg }),
+                NetMessage::V1(NetMessageV1::NeighborHosting { message: cache_msg }),
             ));
         }
 
@@ -1186,7 +1189,7 @@ impl OpManager {
     /// Proximity cache is cleared immediately. Interest removal is deferred for
     /// `INTEREST_DISCONNECT_GRACE_PERIOD` to survive transient disconnects.
     pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
-        self.proximity_cache.on_peer_disconnected(pub_key);
+        self.neighbor_hosting.on_peer_disconnected(pub_key);
         self.interest_manager
             .schedule_deferred_removal(&PeerKey::from(pub_key.clone()));
     }

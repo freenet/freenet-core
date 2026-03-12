@@ -212,7 +212,7 @@ pub(crate) async fn request_get(
         };
 
         // Find peers to query - we prefer network over local cache for freshness
-        let candidates = op_manager.ring.k_closest_potentially_caching(
+        let candidates = op_manager.ring.k_closest_potentially_hosting(
             instance_id,
             &visited,
             DEFAULT_MAX_BREADTH,
@@ -725,7 +725,7 @@ impl GetOp {
                     new_visited.mark_visited(*addr);
                 }
 
-                let mut new_candidates = op_manager.ring.k_closest_potentially_caching(
+                let mut new_candidates = op_manager.ring.k_closest_potentially_hosting(
                     &instance_id,
                     &new_visited,
                     DEFAULT_MAX_BREADTH,
@@ -1575,7 +1575,7 @@ impl Operation for GetOp {
 
                                 // Get new candidates excluding all tried peers
                                 let mut new_candidates =
-                                    op_manager.ring.k_closest_potentially_caching(
+                                    op_manager.ring.k_closest_potentially_hosting(
                                         &instance_id,
                                         &new_visited,
                                         DEFAULT_MAX_BREADTH,
@@ -1663,7 +1663,7 @@ impl Operation for GetOp {
                                             tx = %id,
                                             contract = %key,
                                             phase = "complete",
-                                            "GET: Network returned NotFound, returning local cache and re-seeding network"
+                                            "GET: Network returned NotFound, returning local cache and re-hosting to network"
                                         );
 
                                         // Complete with local cached version
@@ -1675,12 +1675,12 @@ impl Operation for GetOp {
                                             contract: contract.clone(),
                                         });
 
-                                        // Re-seed the network with our local copy
+                                        // Re-host to the network with our local copy
                                         if let Some(contract_code) = contract {
                                             tracing::info!(
                                                 tx = %id,
                                                 %key,
-                                                "Re-seeding network after NotFound response"
+                                                "Re-publishing to network after NotFound response"
                                             );
                                             let put_result = op_manager
                                                 .notify_contract_handler(
@@ -1698,14 +1698,14 @@ impl Operation for GetOp {
                                                     new_value: Ok(_),
                                                     ..
                                                 }) => {
-                                                    tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
-                                                    super::announce_contract_cached(
+                                                    tracing::debug!(tx = %id, %key, "Re-hosted contract to network");
+                                                    super::announce_contract_hosted(
                                                         op_manager, &key,
                                                     )
                                                     .await;
                                                 }
                                                 _ => {
-                                                    tracing::warn!(tx = %id, %key, "Failed to re-seed contract");
+                                                    tracing::warn!(tx = %id, %key, "Failed to re-host contract");
                                                 }
                                             }
                                         }
@@ -1797,7 +1797,7 @@ impl Operation for GetOp {
                                             tx = %id,
                                             contract = %key,
                                             phase = "complete",
-                                            "GET: Max retries reached, returning local cache and re-seeding network"
+                                            "GET: Max retries reached, returning local cache and re-hosting to network"
                                         );
 
                                         // Complete with local cached version
@@ -1809,12 +1809,12 @@ impl Operation for GetOp {
                                             contract: contract.clone(),
                                         });
 
-                                        // Re-seed the network with our local copy
+                                        // Re-host to the network with our local copy
                                         if let Some(contract_code) = contract {
                                             tracing::info!(
                                                 tx = %id,
                                                 %key,
-                                                "Re-seeding network after NotFound (max retries)"
+                                                "Re-publishing to network after NotFound (max retries)"
                                             );
                                             let put_result = op_manager
                                                 .notify_contract_handler(
@@ -1832,14 +1832,14 @@ impl Operation for GetOp {
                                                     new_value: Ok(_),
                                                     ..
                                                 }) => {
-                                                    tracing::debug!(tx = %id, %key, "Re-seeded contract to network");
-                                                    super::announce_contract_cached(
+                                                    tracing::debug!(tx = %id, %key, "Re-hosted contract to network");
+                                                    super::announce_contract_hosted(
                                                         op_manager, &key,
                                                     )
                                                     .await;
                                                 }
                                                 _ => {
-                                                    tracing::warn!(tx = %id, %key, "Failed to re-seed contract");
+                                                    tracing::warn!(tx = %id, %key, "Failed to re-host contract");
                                                 }
                                             }
                                         }
@@ -2022,7 +2022,7 @@ impl Operation for GetOp {
                             );
 
                             // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
-                            // Previously, we only recorded access if !is_seeding_contract(),
+                            // Previously, we only recorded access if !is_hosting_contract(),
                             // which meant re-GETs on cached contracts wouldn't refresh the
                             // hosting cache's TTL/LRU position, causing subscriptions to expire.
                             //
@@ -2036,7 +2036,7 @@ impl Operation for GetOp {
                             for evicted_key in &access_result.evicted {
                                 if op_manager
                                     .interest_manager
-                                    .unregister_local_seeding(evicted_key)
+                                    .unregister_local_hosting(evicted_key)
                                 {
                                     removed_contracts.push(*evicted_key);
                                 }
@@ -2045,11 +2045,11 @@ impl Operation for GetOp {
                             // Only do first-time hosting setup if newly hosting
                             if access_result.is_new {
                                 tracing::debug!(tx = %id, %key, "Contract newly hosted");
-                                super::announce_contract_cached(op_manager, &key).await;
+                                super::announce_contract_hosted(op_manager, &key).await;
 
                                 // Register local interest for delta-based sync
                                 let became_interested =
-                                    op_manager.interest_manager.register_local_seeding(&key);
+                                    op_manager.interest_manager.register_local_hosting(&key);
 
                                 // Broadcast interest changes to peers
                                 let added = if became_interested { vec![key] } else { vec![] };
@@ -2120,7 +2120,7 @@ impl Operation for GetOp {
                                         for evicted_key in &access_result.evicted {
                                             if op_manager
                                                 .interest_manager
-                                                .unregister_local_seeding(evicted_key)
+                                                .unregister_local_hosting(evicted_key)
                                             {
                                                 removed_contracts.push(*evicted_key);
                                             }
@@ -2128,12 +2128,12 @@ impl Operation for GetOp {
 
                                         // Only do first-time hosting setup if newly hosting
                                         if access_result.is_new {
-                                            super::announce_contract_cached(op_manager, &key).await;
+                                            super::announce_contract_hosted(op_manager, &key).await;
 
                                             // Register local interest for delta-based sync
                                             let became_interested = op_manager
                                                 .interest_manager
-                                                .register_local_seeding(&key);
+                                                .register_local_hosting(&key);
 
                                             // Broadcast interest changes to peers
                                             let added =
@@ -2257,7 +2257,7 @@ impl Operation for GetOp {
                     } else {
                         // Forward response to upstream. Opportunistically cache contract
                         // code so this relay peer can serve future GET requests with
-                        // fetch_contract=true. We don't call announce_contract_cached()
+                        // fetch_contract=true. We don't call announce_contract_hosted()
                         // here because relay peers should not advertise contracts they
                         // are not responsible for in the ring.
                         tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
@@ -2854,7 +2854,7 @@ async fn try_forward_or_return(
         );
         (None, vec![])
     } else {
-        let mut candidates = op_manager.ring.k_closest_potentially_caching(
+        let mut candidates = op_manager.ring.k_closest_potentially_hosting(
             &instance_id,
             &new_visited,
             DEFAULT_MAX_BREADTH,

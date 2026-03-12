@@ -490,7 +490,7 @@ async fn test_put_merge_persists_state(ctx: &mut TestContext) -> TestResult {
         &mut client_api_a,
         initial_wrapped_state.clone(),
         contract.clone(),
-        "first PUT (cache seed)",
+        "first PUT (initial hosting)",
         Some(contract_key),
     )
     .await?;
@@ -1245,7 +1245,7 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     // - Both clients connect to the SAME node (node-a) via websocket
     // - Client 2 subscribes via GET with subscribe=true
     // - The subscription is registered LOCALLY via register_contract_notifier()
-    //   in the executor, NOT via network peer registration in ring.seeding_manager
+    //   in the executor, NOT via network peer registration in ring.hosting_manager
     // - When Client 1 updates the contract, the update notification is delivered
     //   directly through the executor's notification channels (send_update_notification)
     //
@@ -1333,7 +1333,7 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
 
     // At this point, Client 2's subscription is registered LOCALLY in the executor
     // via register_contract_notifier(). The subscription is NOT registered in the
-    // network's ring.seeding_manager.subscribers - that's only for remote peer subscriptions.
+    // network's ring.hosting_manager.subscribers - that's only for remote peer subscriptions.
     // This validates the decoupled architecture from Issue #2075.
     tracing::info!(
         "Client 2: Local subscription registered via GET with subscribe=true - \
@@ -2475,7 +2475,7 @@ async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> Tes
     Ok(())
 }
 
-/// Ensure a client-only peer receives PutResponse when the contract is seeded on a third hop.
+/// Ensure a client-only peer receives PutResponse when the contract is hosted on a third hop.
 ///
 /// This test verifies that PUT responses are properly routed back through forwarding peers,
 /// even when the contract is stored on a node that is multiple hops away from the client.

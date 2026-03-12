@@ -572,11 +572,11 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
 
     // Test UPDATE propagation via proximity cache (issue #2294 regression test).
     // At this point:
-    // - Peer1 cached the contract via PUT, sent CacheAnnounce to neighbors
-    // - Peer2 cached the contract via GET, sent CacheAnnounce to neighbors
-    // - Both peers should have each other in proximity_cache.neighbors_with_contract()
-    // - UPDATE from peer1 should route to peer2 via proximity cache, not ring routing
-    tracing::info!("Testing UPDATE propagation via proximity cache");
+    // - Peer1 hosted the contract via PUT, sent HostingAnnounce to neighbors
+    // - Peer2 hosted the contract via GET, sent HostingAnnounce to neighbors
+    // - Both peers should have each other in neighbor_hosting.neighbors_with_contract()
+    // - UPDATE from peer1 should route to peer2 via neighbor hosting, not ring routing
+    tracing::info!("Testing UPDATE propagation via neighbor hosting");
 
     // Explicitly subscribe peer2 to receive update notifications
     make_subscribe(&mut client2, contract_key).await?;
@@ -601,7 +601,7 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
         }
     }
 
-    // Allow time for CacheAnnounce messages to propagate
+    // Allow time for HostingAnnounce messages to propagate
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Create updated state

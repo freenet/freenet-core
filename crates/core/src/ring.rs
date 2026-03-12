@@ -193,7 +193,7 @@ impl Ring {
         const SUBSCRIPTION_STATE_INTERVAL: Duration = Duration::from_secs(60);
 
         // Interval for periodic subscription recovery attempts (30 seconds)
-        // This recovers "orphaned seeders" - peers that have contracts in cache
+        // This recovers "orphaned hosters" - peers that have contracts in cache
         // but failed to establish subscription (no upstream in subscription tree)
         const SUBSCRIPTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -260,7 +260,7 @@ impl Ring {
             )),
         );
 
-        // Spawn periodic subscription recovery task to fix "orphaned seeders"
+        // Spawn periodic subscription recovery task to fix "orphaned hosters"
         // (peers that have contracts cached but aren't in the subscription tree)
         task_monitor.register(
             "recover_orphaned_subscriptions",
@@ -795,13 +795,13 @@ impl Ring {
     /// fraction of max (i.e. channel is more than 75% full).
     const RENEWAL_STOP_CAPACITY_FRACTION: usize = 4; // channel_max / 4
 
-    /// Periodically attempt to recover "orphaned seeders" - contracts we're seeding
+    /// Periodically attempt to recover "orphaned hosters" - contracts we're hosting
     /// but don't have an upstream subscription for.
     ///
     /// This can happen when:
     /// - The initial subscription after GET/PUT failed (network issues, timeout)
     /// - Our upstream peer disconnected and we haven't found a new one
-    /// - A race condition left us seeding without subscription
+    /// - A race condition left us hosting without subscription
     ///
     /// The task respects existing backoff mechanisms to avoid subscription spam.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
@@ -1172,14 +1172,6 @@ impl Ring {
         }
     }
 
-    /// Record a PUT access to a contract in the hosting cache.
-    /// Alias for host_contract with Put access type.
-    ///
-    /// Returns only the evicted contracts for backwards compatibility.
-    pub fn seed_contract(&self, key: ContractKey, size_bytes: u64) -> Vec<ContractKey> {
-        self.host_contract(key, size_bytes, AccessType::Put).evicted
-    }
-
     /// Record an access to a contract in the hosting cache.
     ///
     /// This adds or refreshes the contract in the unified hosting cache.
@@ -1210,12 +1202,6 @@ impl Ring {
     #[inline]
     pub fn is_hosting_contract(&self, key: &ContractKey) -> bool {
         self.hosting_manager.is_hosting_contract(key)
-    }
-
-    /// Alias for backwards compatibility - use is_hosting_contract instead.
-    #[inline]
-    pub fn is_seeding_contract(&self, key: &ContractKey) -> bool {
-        self.is_hosting_contract(key)
     }
 
     /// Set the storage reference for hosting metadata persistence.
@@ -1362,11 +1348,11 @@ impl Ring {
         filtered.into_iter()
     }
 
-    /// Return the most optimal peer for caching a given contract.
+    /// Return the most optimal peer for hosting a given contract.
     ///
     /// This function only considers connected peers, not the node itself.
     #[inline]
-    pub fn closest_potentially_caching(
+    pub fn closest_potentially_hosting(
         &self,
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
@@ -1391,9 +1377,9 @@ impl Ring {
         peer
     }
 
-    /// Get k best peers for caching a contract, ranked by routing predictions.
+    /// Get k best peers for hosting a contract, ranked by routing predictions.
     /// Accepts either &ContractKey or &ContractInstanceId (both implement From<&T> for Location).
-    pub fn k_closest_potentially_caching<K>(
+    pub fn k_closest_potentially_hosting<K>(
         &self,
         contract_id: &K,
         skip_list: impl Contains<std::net::SocketAddr> + Clone,
@@ -1482,7 +1468,7 @@ impl Ring {
             target_location = %target_location.as_f64(),
             candidates_found = selected.len(),
             skipped_not_ready,
-            "k_closest_potentially_caching result"
+            "k_closest_potentially_hosting result"
         );
 
         selected.into_iter().cloned().collect()
@@ -1641,11 +1627,6 @@ impl Ring {
     /// This is the actual count of contracts this node is caching/hosting.
     pub fn hosting_contracts_count(&self) -> usize {
         self.hosting_manager.hosting_contracts_count()
-    }
-
-    /// Alias for backwards compatibility - use hosting_contracts_count instead.
-    pub fn seeding_contracts_count(&self) -> usize {
-        self.hosting_contracts_count()
     }
 
     /// Get subscription state for all contracts (for telemetry).
@@ -2625,8 +2606,8 @@ pub(crate) enum RingError {
     ConnError(#[from] Box<node::ConnectionError>),
     #[error("No ring connections found")]
     EmptyRing,
-    #[error("Ran out of, or haven't found any, caching peers for contract {0}")]
-    NoCachingPeers(ContractInstanceId),
+    #[error("Ran out of, or haven't found any, hosting peers for contract {0}")]
+    NoHostingPeers(ContractInstanceId),
     #[error("Peer has not joined the network yet (no ring location established)")]
     PeerNotJoined,
 }

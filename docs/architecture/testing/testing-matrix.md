@@ -31,7 +31,7 @@ Freenet Core uses **five distinct testing approaches**, each serving different p
 | **Ring/DHT** |
 | Location calculation | ✅ 47 | - | - | - | - |
 | Peer proximity | ✅ 68 | - | - | - | - |
-| Seeding cache | ✅ 78 | - | - | - | - |
+| Hosting cache | ✅ 78 | - | - | - | - |
 | Ring topology | - | ✅ | ✅ | ✅ | ✅ |
 | **Contract Operations** |
 | PUT | ✅ mocks | ✅ | ✅ | ✅ | ✅ |
@@ -96,7 +96,7 @@ This matrix shows which testing approaches cover each major codebase area:
 | Location math | `ring/location.rs` | ✅ 47 | - | - | - |
 | Peer key location | `ring/peer_key_location.rs` | ✅ 68 | - | - | - |
 | Connection manager | `ring/connection_manager.rs` | ✅ 72 | ✅ | ✅ | ✅ |
-| Seeding cache | `ring/seeding.rs` | ✅ 78 | - | - | - |
+| Hosting cache | `ring/hosting.rs` | ✅ 78 | - | - | - |
 | **Operations** |
 | Connect operation | `operations/connect.rs` | ✅ 12 | ✅ | ✅ | ✅ |
 | Put operation | `operations/put.rs` | ✅ 28 | ✅ | ✅ | ✅ |
@@ -168,7 +168,7 @@ Simulation         ████░░░░░░░░  ░░░░░░░�
 | Module | Tests | Key Focus |
 |--------|------:|-----------|
 | transport/ledbat | 183 | Congestion control math |
-| ring/seeding | 78 | Peer seeding cache |
+| ring/hosting | 78 | Peer hosting cache |
 | transport/streaming_buffer | 73 | Buffer management |
 | ring/connection_manager | 72 | Connection backoff |
 | ring/peer_key_location | 68 | DHT key location |

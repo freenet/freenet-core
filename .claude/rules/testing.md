@@ -78,7 +78,7 @@ Running specific integration test?
 ```rust
 fn new(time_source: impl TimeSource) -> Self { ... }
 ```
-See: `crates/core/src/ring/seeding_cache.rs:76`
+See: `crates/core/src/ring/hosting/cache.rs`
 
 **RNG usage:**
 ```rust
