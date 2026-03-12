@@ -9,7 +9,7 @@ use crate::wasm_runtime::{
     BackendEngine, RuntimeConfig, SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE,
 };
 use dashmap::DashMap;
-use freenet_stdlib::prelude::{MessageOrigin, RelatedContract};
+use freenet_stdlib::prelude::RelatedContract;
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -658,10 +658,10 @@ impl ContractExecutor for RuntimePool {
     async fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
-        origin_contract: Option<&ContractInstanceId>,
+        attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
         let mut executor = self.pop_executor().await;
-        let result = executor.delegate_request(req, origin_contract);
+        let result = executor.delegate_request(req, attested_contract);
         self.return_checked(executor, "execute_delegate_request")
             .await;
         result
@@ -2140,9 +2140,9 @@ impl ContractExecutor for Executor<Runtime> {
     async fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
-        origin_contract: Option<&ContractInstanceId>,
+        attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
-        self.delegate_request(req, origin_contract)
+        self.delegate_request(req, attested_contract)
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
@@ -2435,10 +2435,10 @@ impl Executor<Runtime> {
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
-        origin_contract: Option<&ContractInstanceId>,
+        attested_contract: Option<&ContractInstanceId>,
     ) -> Response {
         tracing::debug!(
-            origin_contract = ?origin_contract,
+            attested_contract = ?attested_contract,
             "received delegate request"
         );
         match req {
@@ -2452,8 +2452,8 @@ impl Executor<Runtime> {
                 let arr = (&cipher).into();
                 let cipher = XChaCha20Poly1305::new(arr);
                 let nonce = nonce.into();
-                if let Some(contract) = origin_contract {
-                    self.delegate_origin_ids
+                if let Some(contract) = attested_contract {
+                    self.delegate_attested_ids
                         .entry(key.clone())
                         .or_default()
                         .push(*contract);
@@ -2475,7 +2475,7 @@ impl Executor<Runtime> {
                 }
             }
             DelegateRequest::UnregisterDelegate(key) => {
-                self.delegate_origin_ids.remove(&key);
+                self.delegate_attested_ids.remove(&key);
 
                 // Remove delegate from all contract subscription entries
                 crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subscribers| {
@@ -2484,7 +2484,7 @@ impl Executor<Runtime> {
                 });
 
                 // Clean up delegate creation tracking to prevent unbounded growth
-                crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS.remove(&key);
+                crate::wasm_runtime::DELEGATE_INHERITED_ATTESTATIONS.remove(&key);
 
                 // Decrement the global created-delegates counter so the slot can be reused.
                 // Only decrement if count > 0 to avoid underflow for delegates not created
@@ -2516,19 +2516,22 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
-                // Resolve the message origin: use the direct origin_contract, falling back
-                // to inherited origin from parent delegates created via create_delegate host function.
-                let origin: Option<MessageOrigin> = if let Some(contract_id) = origin_contract {
-                    Some(MessageOrigin::WebApp(*contract_id))
+                // Use the attested_contract directly, falling back to inherited attestation
+                // from parent delegates that created this delegate via create_delegate host function.
+                let inherited_attested: Option<Vec<u8>> = if attested_contract.is_some() {
+                    None // Direct attestation takes priority
                 } else {
-                    crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS
+                    crate::wasm_runtime::DELEGATE_INHERITED_ATTESTATIONS
                         .get(&key)
-                        .and_then(|ids| ids.first().map(|c| MessageOrigin::WebApp(*c)))
+                        .and_then(|ids| ids.first().map(|c| c.as_bytes().to_vec()))
                 };
+                let attested_bytes: Option<&[u8]> = attested_contract
+                    .map(|c| c.as_bytes() as &[u8])
+                    .or(inherited_attested.as_deref());
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,
-                    origin.as_ref(),
+                    attested_bytes,
                     inbound
                         .into_iter()
                         .map(InboundDelegateMsg::into_owned)

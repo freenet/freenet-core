@@ -78,7 +78,7 @@ impl DelegateInterface for Delegate {
     fn process(
         ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        _origin: Option<MessageOrigin>,
+        _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match messages {
@@ -94,7 +94,8 @@ impl DelegateInterface for Delegate {
                             let payload =
                                 bincode::serialize(&OutboundAppMessage::SecretStoreFailed)
                                     .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                            let response = ApplicationMessage::new(payload).processed(true);
+                            let response = ApplicationMessage::new(incoming_app.app, payload)
+                                .processed(true);
                             return Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)]);
                         }
 
@@ -102,7 +103,8 @@ impl DelegateInterface for Delegate {
                             OutboundAppMessage::CreateInboxResponse(PUB_KEY.to_vec());
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -116,7 +118,8 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::MessageSigned(signature);
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -127,7 +130,8 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::ContextWritten;
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -138,7 +142,8 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::ContextData(data);
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -149,7 +154,8 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::ContextCleared;
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -169,7 +175,8 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::CounterValue(new_value);
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -179,7 +186,8 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::SecretExists(exists);
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -189,7 +197,8 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::SecretResult(result);
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -198,14 +207,16 @@ impl DelegateInterface for Delegate {
                             let payload =
                                 bincode::serialize(&OutboundAppMessage::SecretStoreFailed)
                                     .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                            let response = ApplicationMessage::new(payload).processed(true);
+                            let response = ApplicationMessage::new(incoming_app.app, payload)
+                                .processed(true);
                             return Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)]);
                         }
 
                         let response_msg_content = OutboundAppMessage::SecretStored;
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -215,7 +226,8 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::SecretRemoved;
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -227,7 +239,8 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::LargeContextWritten(size);
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
 
@@ -238,14 +251,16 @@ impl DelegateInterface for Delegate {
                             let payload =
                                 bincode::serialize(&OutboundAppMessage::SecretStoreFailed)
                                     .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                            let response = ApplicationMessage::new(payload).processed(true);
+                            let response = ApplicationMessage::new(incoming_app.app, payload)
+                                .processed(true);
                             return Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)]);
                         }
 
                         let response_msg_content = OutboundAppMessage::LargeSecretStored(size);
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                        let response = ApplicationMessage::new(payload).processed(true);
+                        let response =
+                            ApplicationMessage::new(incoming_app.app, payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
                 }

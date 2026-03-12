@@ -19,19 +19,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Detect local path dependencies and mount them into the container.
-# This allows `freenet-stdlib = { path = "..." }` to resolve inside Docker.
-EXTRA_MOUNTS=()
-if grep -q 'path.*=.*"/Volumes/PRO-G40/projects/freenet-stdlib' "$REPO_ROOT/Cargo.toml" 2>/dev/null; then
-    STDLIB_PATH="/Volumes/PRO-G40/projects/freenet-stdlib"
-    if [ -d "$STDLIB_PATH" ]; then
-        EXTRA_MOUNTS+=(-v "$STDLIB_PATH":/workspace-stdlib:ro)
-    fi
-fi
-
 docker run --rm \
     -v "$REPO_ROOT":/workspace:ro \
-    "${EXTRA_MOUNTS[@]}" \
     -v freenet-test-build:/build \
     -v freenet-test-target:/build/target \
     -v freenet-test-cargo:/usr/local/cargo/registry \

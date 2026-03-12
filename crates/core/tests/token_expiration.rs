@@ -181,7 +181,7 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
     use freenet::{
         config::WebsocketApiConfig,
         dev_tool::{AuthToken, ClientId},
-        server::{serve_client_api_for_test, OriginContract},
+        server::{serve_client_api_for_test, AttestedContract},
         test_utils,
     };
     use std::time::Duration;
@@ -213,8 +213,8 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
         // Start the client API server (which spawns the cleanup task)
         let (gw, _ws_proxy) = serve_client_api_for_test(config).await?;
 
-        // Access the origin_contracts map via the test-only method
-        let origin_contracts = gw.origin_contracts();
+        // Access the attested_contracts map via the test-only method
+        let attested_contracts = gw.attested_contracts();
 
         info!("Creating test tokens and contract IDs");
 
@@ -238,22 +238,22 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
         let client_id3 = ClientId::next();
 
         // Insert tokens into the map
-        origin_contracts.insert(
+        attested_contracts.insert(
             token1.clone(),
-            OriginContract::new(contract_id1, client_id1),
+            AttestedContract::new(contract_id1, client_id1),
         );
-        origin_contracts.insert(
+        attested_contracts.insert(
             token2.clone(),
-            OriginContract::new(contract_id2, client_id2),
+            AttestedContract::new(contract_id2, client_id2),
         );
-        origin_contracts.insert(
+        attested_contracts.insert(
             token3.clone(),
-            OriginContract::new(contract_id3, client_id3),
+            AttestedContract::new(contract_id3, client_id3),
         );
 
-        info!("Inserted 3 tokens into origin_contracts map");
+        info!("Inserted 3 tokens into attested_contracts map");
         assert_eq!(
-            origin_contracts.len(),
+            attested_contracts.len(),
             3,
             "Should have 3 tokens before expiration"
         );
@@ -267,7 +267,7 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
         sleep(wait_time).await;
 
         // Check that tokens have been removed
-        let remaining_count = origin_contracts.len();
+        let remaining_count = attested_contracts.len();
         info!("After cleanup: {} tokens remaining", remaining_count);
 
         assert_eq!(
@@ -277,15 +277,15 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
 
         // Verify individual tokens are gone
         assert!(
-            !origin_contracts.contains_key(&token1),
+            !attested_contracts.contains_key(&token1),
             "Token 1 should be removed"
         );
         assert!(
-            !origin_contracts.contains_key(&token2),
+            !attested_contracts.contains_key(&token2),
             "Token 2 should be removed"
         );
         assert!(
-            !origin_contracts.contains_key(&token3),
+            !attested_contracts.contains_key(&token3),
             "Token 3 should be removed"
         );
 

@@ -21,7 +21,7 @@ impl DelegateInterface for Delegate {
     fn process(
         _ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        _origin: Option<MessageOrigin>,
+        _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match messages {
@@ -47,7 +47,7 @@ impl DelegateInterface for Delegate {
                             })?;
 
                         // Create the response message for the application
-                        let response_app_msg = ApplicationMessage::new(payload)
+                        let response_app_msg = ApplicationMessage::new(incoming_app.app, payload)
                             .processed(true)
                             .with_context(incoming_app.context);
 
@@ -64,10 +64,16 @@ impl DelegateInterface for Delegate {
 
 #[test]
 fn test_delegate() -> Result<(), Box<dyn std::error::Error>> {
+    let contract = WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(vec![1])),
+        Parameters::from(vec![]),
+    );
+    let app_id = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
     let request_data = "test-data".to_string();
     let payload: Vec<u8> =
         bincode::serialize(&InboundAppMessage::TestRequest(request_data.clone())).unwrap();
-    let test_request_msg = ApplicationMessage::new(payload).processed(false);
+    let test_request_msg = ApplicationMessage::new(app_id, payload).processed(false);
 
     let inbound = InboundDelegateMsg::ApplicationMessage(test_request_msg);
     let mut ctx = DelegateCtx::default();

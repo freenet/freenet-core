@@ -602,7 +602,7 @@ struct InternalCHEvent {
 pub(crate) enum ContractHandlerEvent {
     DelegateRequest {
         req: DelegateRequest<'static>,
-        origin_contract: Option<ContractInstanceId>,
+        attested_contract: Option<ContractInstanceId>,
     },
     DelegateResponse(Vec<OutboundDelegateMsg>),
     /// Try to push/put a new value into the contract
@@ -697,13 +697,13 @@ impl std::fmt::Display for ContractHandlerEvent {
         match self {
             ContractHandlerEvent::DelegateRequest {
                 req,
-                origin_contract,
+                attested_contract,
             } => {
                 write!(
                     f,
-                    "delegate request {{ key: {:?}, origin: {:?} }}",
+                    "delegate request {{ key: {:?}, attested: {:?} }}",
                     req.key(),
-                    origin_contract
+                    attested_contract
                 )
             }
             ContractHandlerEvent::DelegateResponse(_) => {

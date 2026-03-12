@@ -154,10 +154,11 @@ async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
 
         // Step 1: Sanity check — ping delegate A
         {
+            let app_id = ContractInstanceId::new([0; 32]);
             let payload = bincode::serialize(&InboundAppMessage::Ping {
                 data: b"hello".to_vec(),
             })?;
-            let app_msg = ApplicationMessage::new(payload);
+            let app_msg = ApplicationMessage::new(app_id, payload);
 
             client
                 .send(ClientRequest::DelegateOp(
@@ -198,12 +199,13 @@ async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
 
         // Step 2: Send delegate-to-delegate message from A to B
         {
+            let app_id = ContractInstanceId::new([0; 32]);
             let payload = bincode::serialize(&InboundAppMessage::SendToDelegate {
                 target_key_bytes: key_b.bytes().to_vec(),
                 target_code_hash: key_b.code_hash().as_ref().to_vec(),
                 payload: b"inter-delegate-e2e".to_vec(),
             })?;
-            let app_msg = ApplicationMessage::new(payload);
+            let app_msg = ApplicationMessage::new(app_id, payload);
 
             client
                 .send(ClientRequest::DelegateOp(

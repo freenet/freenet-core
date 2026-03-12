@@ -134,7 +134,7 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                                 request,
                                 notification_channel,
                                 token,
-                                origin_contract,
+                                attested_contract,
                             }) => {
                                 let id = *self.external_clients[idx]
                                     .entry(external)
@@ -150,7 +150,7 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                                     request,
                                     notification_channel,
                                     token,
-                                    origin_contract,
+                                    attested_contract,
                                 })
                             }
                             err @ Err(_) => err,
@@ -290,7 +290,7 @@ async fn client_fn(
                         request,
                         notification_channel,
                         token,
-                        origin_contract,
+                        attested_contract,
                     }) => {
                         tracing::debug!(
                             "received msg @ combinator from external id {client_id}, msg: {request}"
@@ -302,7 +302,7 @@ async fn client_fn(
                                 request,
                                 notification_channel,
                                 token,
-                                origin_contract,
+                                attested_contract,
                             }))
                             .await
                             .is_err()

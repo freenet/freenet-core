@@ -775,7 +775,7 @@ mod tests {
                         params: Parameters::from(vec![]),
                         inbound: vec![],
                     },
-                    origin_contract: None,
+                    attested_contract: None,
                 },
             ),
             (

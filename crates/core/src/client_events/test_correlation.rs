@@ -33,7 +33,7 @@ mod tests {
             request: Box::new(ClientRequest::Disconnect { cause: None }),
             notification_channel: None,
             token: None,
-            origin_contract: None,
+            attested_contract: None,
         };
 
         assert_eq!(req.request_id, request_id);

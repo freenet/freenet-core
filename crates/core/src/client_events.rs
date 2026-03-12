@@ -178,7 +178,7 @@ pub struct OpenRequest<'a> {
     pub request: Box<ClientRequest<'a>>,
     pub notification_channel: Option<mpsc::Sender<HostResult>>,
     pub token: Option<AuthToken>,
-    pub origin_contract: Option<ContractInstanceId>,
+    pub attested_contract: Option<ContractInstanceId>,
 }
 
 impl Display for OpenRequest<'_> {
@@ -206,7 +206,7 @@ impl<'a> OpenRequest<'a> {
             request,
             notification_channel: None,
             token: None,
-            origin_contract: None,
+            attested_contract: None,
         }
     }
 
@@ -220,8 +220,8 @@ impl<'a> OpenRequest<'a> {
         self
     }
 
-    pub fn with_origin_contract(mut self, contract: Option<ContractInstanceId>) -> Self {
-        self.origin_contract = contract;
+    pub fn with_attested_contract(mut self, contract: Option<ContractInstanceId>) -> Self {
+        self.attested_contract = contract;
         self
     }
 }
@@ -1733,12 +1733,12 @@ async fn process_open_request(
                     "Received delegate operation from client"
                 );
                 let delegate_key = req.key().clone();
-                let origin_contract = request.origin_contract;
+                let attested_contract = request.attested_contract;
 
                 let res = match op_manager
                     .notify_contract_handler(ContractHandlerEvent::DelegateRequest {
                         req,
-                        origin_contract,
+                        attested_contract,
                     })
                     .await
                 {
@@ -2082,7 +2082,7 @@ pub(crate) mod test {
                 request,
                 notification_channel,
                 token: None,
-                origin_contract: None,
+                attested_contract: None,
             }
             .into_owned()
         }

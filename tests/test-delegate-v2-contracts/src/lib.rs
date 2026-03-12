@@ -92,7 +92,7 @@ impl DelegateInterface for Delegate {
     fn process(
         _ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        _origin: Option<MessageOrigin>,
+        _attested: Option<&'static [u8]>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match messages {
@@ -118,7 +118,8 @@ impl DelegateInterface for Delegate {
 
                 let payload = bincode::serialize(&response)
                     .map_err(|err| DelegateError::Other(format!("{err}")))?;
-                let response_msg = ApplicationMessage::new(payload).processed(true);
+                let response_msg =
+                    ApplicationMessage::new(incoming_app.app, payload).processed(true);
                 Ok(vec![OutboundDelegateMsg::ApplicationMessage(response_msg)])
             }
             _ => Err(DelegateError::Other(
