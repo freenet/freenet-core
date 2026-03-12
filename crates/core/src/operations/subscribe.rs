@@ -669,13 +669,26 @@ impl SubscribeOp {
                     unreachable!();
                 };
 
-                let next_target = data.alternatives.remove(0);
                 let instance_id = data.instance_id;
                 let is_renewal = self.is_renewal;
-                if let Some(addr) = next_target.socket_addr() {
-                    data.tried_peers.insert(addr);
-                    data.next_hop = Some(addr);
-                }
+
+                // Find next alternative with a known socket address.
+                // Skip peers without addresses — they can't be contacted.
+                let next_target = loop {
+                    if data.alternatives.is_empty() {
+                        // All remaining alternatives lack addresses
+                        self.state = SubscribeState::AwaitingResponse(data);
+                        return Err(Box::new(self));
+                    }
+                    let candidate = data.alternatives.remove(0);
+                    if candidate.socket_addr().is_some() {
+                        break candidate;
+                    }
+                };
+
+                let addr = next_target.socket_addr().expect("verified above");
+                data.tried_peers.insert(addr);
+                data.next_hop = Some(addr);
                 data.attempts_at_hop += 1;
                 let visited = data.visited.clone();
 
