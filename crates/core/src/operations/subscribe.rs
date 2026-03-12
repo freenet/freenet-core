@@ -620,6 +620,108 @@ impl SubscribeOp {
         }
     }
 
+    /// Whether this node is the originator of this subscribe operation.
+    /// The originator has no `requester_addr` (no upstream peer to respond to).
+    pub(crate) fn is_originator(&self) -> bool {
+        self.requester_addr.is_none()
+    }
+
+    /// Retry the subscribe operation with the next alternative peer.
+    ///
+    /// Similar to GET's `retry_with_next_alternative`: picks the next untried peer
+    /// from local alternatives, or injects fallback peers if alternatives are exhausted.
+    /// Returns `Ok((op, msg))` with the updated op and new Request message,
+    /// or `Err(op)` if no alternatives remain.
+    pub(crate) fn retry_with_next_alternative(
+        mut self,
+        max_hops_to_live: usize,
+        fallback_peers: &[PeerKeyLocation],
+    ) -> Result<(SubscribeOp, SubscribeMsg), Box<SubscribeOp>> {
+        match self.state {
+            SubscribeState::AwaitingResponse(ref mut data) => {
+                // If local alternatives exhausted, inject fallback peers we haven't tried
+                if data.alternatives.is_empty() && !fallback_peers.is_empty() {
+                    for peer in fallback_peers {
+                        if let Some(addr) = peer.socket_addr() {
+                            if !data.tried_peers.contains(&addr) {
+                                data.alternatives.push(peer.clone());
+                            }
+                        }
+                    }
+                    if !data.alternatives.is_empty() {
+                        tracing::info!(
+                            tx = %self.id,
+                            contract = %data.instance_id,
+                            new_candidates = data.alternatives.len(),
+                            "Subscribe broadening search to all connected peers (fallback)"
+                        );
+                    }
+                }
+
+                if data.alternatives.is_empty() {
+                    return Err(Box::new(self));
+                }
+
+                // Take ownership of state to modify it
+                let SubscribeState::AwaitingResponse(mut data) =
+                    std::mem::replace(&mut self.state, SubscribeState::Failed)
+                else {
+                    unreachable!();
+                };
+
+                let instance_id = data.instance_id;
+                let is_renewal = self.is_renewal;
+
+                // Find next alternative with a known socket address.
+                // Skip peers without addresses — they can't be contacted.
+                let (next_target, addr) = loop {
+                    if data.alternatives.is_empty() {
+                        // All remaining alternatives lack addresses
+                        self.state = SubscribeState::AwaitingResponse(data);
+                        return Err(Box::new(self));
+                    }
+                    let candidate = data.alternatives.remove(0);
+                    if let Some(addr) = candidate.socket_addr() {
+                        break (candidate, addr);
+                    }
+                };
+                data.tried_peers.insert(addr);
+                data.next_hop = Some(addr);
+                data.attempts_at_hop += 1;
+                let visited = data.visited.clone();
+
+                tracing::info!(
+                    tx = %self.id,
+                    contract = %instance_id,
+                    target = ?next_target.socket_addr(),
+                    remaining_alternatives = data.alternatives.len(),
+                    "Subscribe retrying with alternative peer after timeout"
+                );
+
+                // Update stats for the new target
+                self.stats = Some(SubscribeStats {
+                    target_peer: next_target,
+                    contract_location: Location::from(&instance_id),
+                });
+
+                self.state = SubscribeState::AwaitingResponse(data);
+
+                let msg = SubscribeMsg::Request {
+                    id: self.id,
+                    instance_id,
+                    htl: max_hops_to_live,
+                    visited,
+                    is_renewal,
+                };
+
+                Ok((self, msg))
+            }
+            SubscribeState::PrepareRequest(_)
+            | SubscribeState::Completed(_)
+            | SubscribeState::Failed => Err(Box::new(self)),
+        }
+    }
+
     /// Build a NotFound result to send back to the requester, or fail locally if we're the originator.
     ///
     /// # Information disclosure note

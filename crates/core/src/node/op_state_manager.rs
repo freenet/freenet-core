@@ -1362,6 +1362,11 @@ fn remove_update_and_report_failure(
 
 /// Removes a subscribe operation from the ops map and notifies timeout if found.
 /// Returns `Some(())` if the operation was found and removed, `None` otherwise.
+///
+/// Note: For intermediate nodes, the subscribe times out silently without sending
+/// NotFound upstream. This is acceptable because the originator retries independently
+/// after SUBSCRIBE_RETRY_THRESHOLD (5s), so it doesn't depend on NotFound for fast
+/// failure detection. The intermediate node's stale op chain is harmless.
 fn remove_subscribe_and_notify_timeout(
     ops: &Ops,
     tx: &Transaction,
@@ -1499,6 +1504,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     let mut delayed = vec![];
     let mut get_retried: std::collections::HashMap<Transaction, usize> =
         std::collections::HashMap::new();
+    let mut subscribe_retried: std::collections::HashMap<Transaction, usize> =
+        std::collections::HashMap::new();
     loop {
         crate::deterministic_select! {
             tx = new_transactions.recv() => {
@@ -1623,6 +1630,96 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     }
                 }
 
+                // Retry SUBSCRIBE operations at the originator that have been waiting
+                // too long. Only originator-initiated subscribes are retried — intermediate
+                // hops just time out silently (the originator retries independently).
+                //
+                // 5s chosen because subscribe is a lightweight handshake (no state transfer),
+                // so a response should arrive quickly. This allows multiple retries before
+                // OPERATION_TTL expires.
+                const SUBSCRIBE_RETRY_THRESHOLD: Duration = Duration::from_secs(5);
+                {
+                    // Clean up entries for completed operations
+                    subscribe_retried.retain(|tx, _| ops.subscribe.contains_key(tx));
+
+                    let mut retry_candidates: Vec<Transaction> = Vec::new();
+                    for entry in ops.subscribe.iter() {
+                        let tx = *entry.key();
+                        let sub_op = entry.value();
+
+                        // Only retry at the originator (no requester_addr means we initiated it).
+                        // Also skip ops without routing stats — these are unsubscribe-routing
+                        // ops created by create_unsubscribe_op(), which use the subscribe map
+                        // for address routing but should not be retried as subscribe requests.
+                        if !sub_op.is_originator() || sub_op.failure_routing_info().is_none() {
+                            continue;
+                        }
+
+                        let elapsed = tx.elapsed();
+                        let retry_count = subscribe_retried.get(&tx).copied().unwrap_or(0);
+                        let base = SUBSCRIBE_RETRY_THRESHOLD * (retry_count as u32 + 1);
+                        // Only consume GlobalRng when elapsed exceeds 80% of base
+                        // (minimum possible jittered threshold). This avoids shifting
+                        // the global RNG state on every GC tick for ops that are
+                        // nowhere near retry time.
+                        let min_jittered = base.mul_f64(0.8);
+                        if elapsed > min_jittered {
+                            let jitter_factor: f64 =
+                                crate::config::GlobalRng::random_range(0.8..=1.2);
+                            let jitter = base.mul_f64(jitter_factor);
+                            if elapsed > jitter {
+                                retry_candidates.push(tx);
+                            }
+                        }
+                    }
+
+                    if !retry_candidates.is_empty() {
+                        // Collect all connected peers for fallback
+                        let all_connected: Vec<_> = ring
+                            .connection_manager
+                            .get_connections_by_location()
+                            .values()
+                            .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
+                            .collect();
+
+                        for tx in retry_candidates {
+                            if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
+                                let max_htl = ring.max_hops_to_live;
+                                match sub_op.retry_with_next_alternative(max_htl, &all_connected) {
+                                    Ok((new_op, msg)) => {
+                                        let msg = crate::message::NetMessage::from(msg);
+                                        // Insert op BEFORE sending message to avoid race
+                                        ops.subscribe.insert(tx, new_op);
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(1),
+                                            event_loop_notifier
+                                                .notifications_sender
+                                                .send(Either::Left(msg)),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {
+                                                *subscribe_retried.entry(tx).or_insert(0) += 1;
+                                            }
+                                            Ok(Err(_)) | Err(_) => {
+                                                tracing::warn!(
+                                                    %tx,
+                                                    "Failed to send subscribe retry message, \
+                                                     will retry next tick"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(sub_op) => {
+                                        // No alternatives — put it back for normal timeout
+                                        ops.subscribe.insert(tx, *sub_op);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing.drain(..) {
                     if let Some(tx) = ops.completed.remove(&tx) {
@@ -1658,6 +1755,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         delayed.push(tx);
                     } else {
                         get_retried.remove(&tx);
+                        subscribe_retried.remove(&tx);
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
                         tracing::info!(
