@@ -1745,4 +1745,258 @@ fn completed_subscribe_reports_success() {
         op.outcome(),
         OpOutcome::ContractOpSuccessUntimed { .. }
     ));
+// ── Subscribe retry tests ──────────────────────────────────────────────
+
+/// Test that `retry_with_next_alternative` picks the next untried peer.
+#[test]
+fn test_retry_with_next_alternative_picks_next_peer() {
+    let instance_id = ContractInstanceId::new([50u8; 32]);
+    let tx_id = Transaction::new::<SubscribeMsg>();
+
+    let peer1 = random_peer();
+    let peer2 = random_peer();
+    let peer3 = random_peer();
+
+    let peer1_addr = peer1.socket_addr().unwrap();
+
+    let mut tried = HashSet::new();
+    tried.insert(peer1_addr);
+
+    let op = SubscribeOp {
+        id: tx_id,
+        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
+            next_hop: Some(peer1_addr),
+            instance_id,
+            retries: 0,
+            current_hop: 10,
+            tried_peers: tried,
+            alternatives: vec![peer2.clone(), peer3.clone()],
+            attempts_at_hop: 1,
+            visited: crate::operations::VisitedPeers::new(&tx_id),
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+
+    assert!(op.is_originator(), "No requester_addr means originator");
+
+    let (new_op, msg) = op
+        .retry_with_next_alternative(10, &[])
+        .map_err(|_| "retry should succeed with alternatives available")
+        .unwrap();
+
+    // Should have picked peer2 (first in alternatives)
+    match &msg {
+        SubscribeMsg::Request {
+            id,
+            instance_id: iid,
+            htl,
+            ..
+        } => {
+            assert_eq!(*id, tx_id);
+            assert_eq!(*iid, instance_id);
+            assert_eq!(*htl, 10);
+        }
+        SubscribeMsg::Response { .. } | SubscribeMsg::Unsubscribe { .. } => {
+            panic!("Expected Request message")
+        }
+    }
+
+    // peer2 should now be in tried_peers
+    if let SubscribeState::AwaitingResponse(data) = &new_op.state {
+        assert!(data.tried_peers.contains(&peer2.socket_addr().unwrap()));
+        assert_eq!(data.alternatives.len(), 1, "peer3 should remain");
+    } else {
+        panic!("Expected AwaitingResponse state");
+    }
+}
+
+/// Test that `retry_with_next_alternative` returns Err when no alternatives remain.
+#[test]
+fn test_retry_with_no_alternatives_returns_err() {
+    let instance_id = ContractInstanceId::new([51u8; 32]);
+    let tx_id = Transaction::new::<SubscribeMsg>();
+    let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+    let op = SubscribeOp {
+        id: tx_id,
+        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
+            next_hop: Some(peer_addr),
+            instance_id,
+            retries: 0,
+            current_hop: 10,
+            tried_peers: HashSet::new(),
+            alternatives: vec![], // No alternatives
+            attempts_at_hop: 1,
+            visited: crate::operations::VisitedPeers::new(&tx_id),
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+
+    // No alternatives and no fallback peers
+    let result = op.retry_with_next_alternative(10, &[]);
+    assert!(result.is_err(), "Should fail when no alternatives remain");
+}
+
+/// Test that `retry_with_next_alternative` uses fallback peers when alternatives are exhausted.
+#[test]
+fn test_retry_uses_fallback_peers() {
+    let instance_id = ContractInstanceId::new([52u8; 32]);
+    let tx_id = Transaction::new::<SubscribeMsg>();
+    let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+    let fallback_peer = random_peer();
+
+    let op = SubscribeOp {
+        id: tx_id,
+        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
+            next_hop: Some(peer_addr),
+            instance_id,
+            retries: 0,
+            current_hop: 10,
+            tried_peers: HashSet::new(),
+            alternatives: vec![], // No local alternatives
+            attempts_at_hop: 1,
+            visited: crate::operations::VisitedPeers::new(&tx_id),
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+
+    // Pass fallback peers — should pick from those
+    let (new_op, _msg) = op
+        .retry_with_next_alternative(10, std::slice::from_ref(&fallback_peer))
+        .map_err(|_| "retry should succeed with fallback peers")
+        .unwrap();
+
+    if let SubscribeState::AwaitingResponse(data) = &new_op.state {
+        assert!(
+            data.tried_peers
+                .contains(&fallback_peer.socket_addr().unwrap()),
+            "Fallback peer should be marked as tried"
+        );
+    } else {
+        panic!("Expected AwaitingResponse state");
+    }
+}
+
+/// Test that `retry_with_next_alternative` skips already-tried fallback peers.
+#[test]
+fn test_retry_skips_tried_fallback_peers() {
+    let instance_id = ContractInstanceId::new([53u8; 32]);
+    let tx_id = Transaction::new::<SubscribeMsg>();
+
+    let tried_peer = random_peer();
+    let tried_addr = tried_peer.socket_addr().unwrap();
+
+    let mut tried = HashSet::new();
+    tried.insert(tried_addr);
+
+    let op = SubscribeOp {
+        id: tx_id,
+        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
+            next_hop: Some(tried_addr),
+            instance_id,
+            retries: 0,
+            current_hop: 10,
+            tried_peers: tried,
+            alternatives: vec![],
+            attempts_at_hop: 1,
+            visited: crate::operations::VisitedPeers::new(&tx_id),
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+
+    // Fallback peer was already tried — should return Err
+    let result = op.retry_with_next_alternative(10, &[tried_peer]);
+    assert!(
+        result.is_err(),
+        "Should fail when all fallback peers already tried"
+    );
+}
+
+/// Test that non-originator subscribe ops are correctly identified.
+#[test]
+fn test_is_originator_false_for_intermediate_hop() {
+    let instance_id = ContractInstanceId::new([54u8; 32]);
+    let tx_id = Transaction::new::<SubscribeMsg>();
+    let requester: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+
+    let op = SubscribeOp {
+        id: tx_id,
+        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
+            next_hop: None,
+            instance_id,
+            retries: 0,
+            current_hop: 10,
+            tried_peers: HashSet::new(),
+            alternatives: vec![],
+            attempts_at_hop: 0,
+            visited: crate::operations::VisitedPeers::new(&tx_id),
+        }),
+        requester_addr: Some(requester), // Has upstream requester
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+
+    assert!(
+        !op.is_originator(),
+        "Op with requester_addr should not be originator"
+    );
+}
+
+/// Test that retry doesn't work on non-AwaitingResponse states.
+#[test]
+fn test_retry_fails_on_wrong_state() {
+    let instance_id = ContractInstanceId::new([55u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([56u8; 32]));
+    let tx_id = Transaction::new::<SubscribeMsg>();
+
+    // PrepareRequest state
+    let op = SubscribeOp {
+        id: tx_id,
+        state: SubscribeState::PrepareRequest(super::PrepareRequestData {
+            id: tx_id,
+            instance_id,
+            is_renewal: false,
+        }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(op.retry_with_next_alternative(10, &[]).is_err());
+
+    // Completed state
+    let op = SubscribeOp {
+        id: tx_id,
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(op.retry_with_next_alternative(10, &[]).is_err());
+
+    // Failed state
+    let op = SubscribeOp {
+        id: tx_id,
+        state: SubscribeState::Failed,
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: None,
+    };
+    assert!(op.retry_with_next_alternative(10, &[]).is_err());
 }
