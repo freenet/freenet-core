@@ -1655,11 +1655,18 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         let elapsed = tx.elapsed();
                         let retry_count = subscribe_retried.get(&tx).copied().unwrap_or(0);
                         let base = SUBSCRIBE_RETRY_THRESHOLD * (retry_count as u32 + 1);
-                        let jitter_factor: f64 =
-                            crate::config::GlobalRng::random_range(0.8..=1.2);
-                        let jitter = base.mul_f64(jitter_factor);
-                        if elapsed > jitter {
-                            retry_candidates.push(tx);
+                        // Only consume GlobalRng when elapsed exceeds 80% of base
+                        // (minimum possible jittered threshold). This avoids shifting
+                        // the global RNG state on every GC tick for ops that are
+                        // nowhere near retry time.
+                        let min_jittered = base.mul_f64(0.8);
+                        if elapsed > min_jittered {
+                            let jitter_factor: f64 =
+                                crate::config::GlobalRng::random_range(0.8..=1.2);
+                            let jitter = base.mul_f64(jitter_factor);
+                            if elapsed > jitter {
+                                retry_candidates.push(tx);
+                            }
                         }
                     }
 

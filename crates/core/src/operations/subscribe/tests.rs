@@ -1745,6 +1745,8 @@ fn completed_subscribe_reports_success() {
         op.outcome(),
         OpOutcome::ContractOpSuccessUntimed { .. }
     ));
+}
+
 // ── Subscribe retry tests ──────────────────────────────────────────────
 
 /// Test that `retry_with_next_alternative` picks the next untried peer.
