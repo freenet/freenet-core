@@ -2732,10 +2732,8 @@ impl P2pConnManager {
         // This check is done AFTER the existing connection check above, so that:
         // 1. If we already have a connection (possibly from inbound), we reuse it
         // 2. Backoff only blocks NEW outbound connection attempts
-        // NOTE: Backoff must run BEFORE the early admission check because
-        // should_accept() has a side effect (inserts pending_reservation on
-        // acceptance). If backoff rejects after should_accept passes, the
-        // reservation leaks until TTL.
+        // NOTE: Backoff runs before the max_connections pre-flight check
+        // to avoid unnecessary work when the peer is in backoff.
         if !peer_addr.ip().is_unspecified() && state.peer_backoff.is_in_backoff(peer_addr) {
             let remaining = state
                 .peer_backoff
