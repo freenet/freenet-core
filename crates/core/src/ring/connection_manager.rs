@@ -586,7 +586,9 @@ impl ConnectionManager {
                 let score = self.compute_kleinberg_score(me, location);
                 // Compute a sliding floor based on how far we are from min_connections.
                 // progress=0.0 at KLEINBERG_FILTER_MIN_CONNECTIONS, 1.0 at min_connections.
-                let range = self.min_connections.saturating_sub(KLEINBERG_FILTER_MIN_CONNECTIONS);
+                let range = self
+                    .min_connections
+                    .saturating_sub(KLEINBERG_FILTER_MIN_CONNECTIONS);
                 let progress = if range > 0 {
                     (open - KLEINBERG_FILTER_MIN_CONNECTIONS) as f64 / range as f64
                 } else {
