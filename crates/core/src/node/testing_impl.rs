@@ -2159,6 +2159,24 @@ impl SimNetwork {
         peers_connections
     }
 
+    /// Returns the set of neighbor public keys for a given node label.
+    ///
+    /// Uses the event listener's `connections()` to get the current peer set,
+    /// returning just the `TransportPublicKey`s (without distances).
+    pub fn neighbor_peer_keys(&self, label: &NodeLabel) -> Option<HashSet<TransportPublicKey>> {
+        let key = self
+            .labels
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, k)| k)?;
+        Some(
+            self.event_listener
+                .connections(key)
+                .map(|(k, _)| k.pub_key)
+                .collect(),
+        )
+    }
+
     /// Start an event chain for this simulation. Allows passing a different controller for the peers.
     ///
     /// This method borrows the SimNetwork, allowing you to call verification methods
