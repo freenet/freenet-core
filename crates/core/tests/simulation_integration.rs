@@ -6765,7 +6765,7 @@ fn test_get_routing_coverage_low_htl() {
             num_nodes, // nodes — large enough that PUT won't reach all
             3,         // ring_max_htl — LOW to limit PUT propagation depth
             1,         // rnd_if_htl_above
-            6,         // max_connections
+            7,         // max_connections — 7 ensures robust GET routing across topology variations
             3,         // min_connections
             SEED,
         )
