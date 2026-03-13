@@ -868,19 +868,24 @@ impl Ring {
                 );
             }
 
-            // Expire stale downstream subscribers
+            // Expire stale downstream subscribers and decrement interest manager
             let ds_expired = ring.expire_stale_downstream_subscribers();
             if !ds_expired.is_empty() {
                 tracing::debug!(
                     expired_count = ds_expired.len(),
                     "Expired stale downstream subscribers"
                 );
-            }
 
-            // Send Unsubscribe upstream for contracts that lost all downstream subscribers
-            if !ds_expired.is_empty() {
                 if let Some(op_manager) = ring.upgrade_op_manager() {
-                    for contract in &ds_expired {
+                    for (contract, expired_count) in &ds_expired {
+                        // Decrement interest manager for each expired peer
+                        for _ in 0..*expired_count {
+                            op_manager
+                                .interest_manager
+                                .remove_downstream_subscriber(contract);
+                        }
+
+                        // Send Unsubscribe upstream if no remaining interest
                         if ring.should_unsubscribe_upstream(contract) {
                             let op_mgr = op_manager.clone();
                             let contract = *contract;
@@ -1560,7 +1565,7 @@ impl Ring {
         self.hosting_manager.has_downstream_subscribers(contract)
     }
 
-    pub fn expire_stale_downstream_subscribers(&self) -> Vec<ContractKey> {
+    pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
         self.hosting_manager.expire_stale_downstream_subscribers()
     }
 

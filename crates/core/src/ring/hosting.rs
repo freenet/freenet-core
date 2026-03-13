@@ -507,10 +507,10 @@ impl HostingManager {
     }
 
     /// Remove downstream subscribers whose leases have expired.
-    /// Returns the contracts that lost all downstream subscribers.
-    pub fn expire_stale_downstream_subscribers(&self) -> Vec<ContractKey> {
+    /// Returns each affected contract paired with the number of expired peers.
+    pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
         let now = self.time_source.now();
-        let mut fully_unsubscribed = Vec::new();
+        let mut expired_counts = Vec::new();
 
         let keys: Vec<ContractKey> = self
             .downstream_subscribers
@@ -520,19 +520,23 @@ impl HostingManager {
 
         for key in keys {
             if let Some(mut peers) = self.downstream_subscribers.get_mut(&key) {
+                let before = peers.len();
                 peers.retain(|_, last_renewed| {
                     now.duration_since(*last_renewed) < SUBSCRIPTION_LEASE_DURATION
                 });
+                let expired = before - peers.len();
+                if expired > 0 {
+                    expired_counts.push((key, expired));
+                }
                 if peers.is_empty() {
                     drop(peers);
                     self.downstream_subscribers
                         .remove_if(&key, |_, peers| peers.is_empty());
-                    fully_unsubscribed.push(key);
                 }
             }
         }
 
-        fully_unsubscribed
+        expired_counts
     }
 
     /// Check if a contract has no local clients and no downstream subscribers,
@@ -1910,9 +1914,10 @@ mod tests {
         assert_eq!(
             expired.len(),
             1,
-            "Should detect one contract with fully expired downstream"
+            "Should detect one contract with expired downstream"
         );
-        assert_eq!(expired[0], contract);
+        assert_eq!(expired[0].0, contract);
+        assert_eq!(expired[0].1, 1, "One peer should have expired");
 
         // Now should unsubscribe (no client, no downstream)
         assert!(
@@ -1943,12 +1948,11 @@ mod tests {
             );
         }
 
-        // Run expiry sweep - contract should NOT be in the fully-unsubscribed list
+        // Run expiry sweep - one stale peer expired but fresh peer remains
         let expired = manager.expire_stale_downstream_subscribers();
-        assert!(
-            expired.is_empty(),
-            "Contract with remaining fresh downstream should not appear in expired list"
-        );
+        assert_eq!(expired.len(), 1, "One contract had expired peers");
+        assert_eq!(expired[0].0, contract);
+        assert_eq!(expired[0].1, 1, "One peer should have expired");
 
         // fresh_peer still present -> should NOT unsubscribe
         assert!(
@@ -2196,6 +2200,55 @@ mod tests {
         assert!(
             manager.add_downstream_subscriber(&contract, first_peer),
             "Existing peer should be able to renew at limit"
+        );
+    }
+
+    // =========================================================================
+    // Regression tests for #3469: downstream_subscriber_count leak
+    // =========================================================================
+
+    /// Regression test: expire_stale_downstream_subscribers must return the
+    /// count of expired peers so the interest manager can be decremented.
+    #[test]
+    fn test_expire_returns_expired_count_for_interest_sync() {
+        let manager = HostingManager::new();
+        let interest = make_interest_manager();
+        let contract = make_contract_key(90);
+        let peer_a = make_peer_key(90);
+        let peer_b = make_peer_key(91);
+
+        // Register two downstream subscribers in both managers
+        manager.add_downstream_subscriber(&contract, peer_a.clone());
+        interest.add_downstream_subscriber(&contract);
+        manager.add_downstream_subscriber(&contract, peer_b.clone());
+        interest.add_downstream_subscriber(&contract);
+
+        // Verify interest manager tracks 2 downstream
+        let count = interest.with_local_interest(&contract, |li| li.downstream_subscriber_count);
+        assert_eq!(count, 2);
+
+        // Make both stale
+        if let Some(mut peers) = manager.downstream_subscribers.get_mut(&contract) {
+            let stale = Instant::now() - SUBSCRIPTION_LEASE_DURATION - Duration::from_secs(1);
+            peers.insert(peer_a, stale);
+            peers.insert(peer_b, stale);
+        }
+
+        // Expire and sync interest manager (mimics ring.rs TTL expiry path)
+        let expired = manager.expire_stale_downstream_subscribers();
+        assert_eq!(expired.len(), 1);
+        let (expired_contract, expired_count) = &expired[0];
+        assert_eq!(*expired_contract, contract);
+        assert_eq!(*expired_count, 2);
+
+        for _ in 0..*expired_count {
+            interest.remove_downstream_subscriber(expired_contract);
+        }
+
+        // Interest manager should now show 0 downstream
+        assert!(
+            !interest.has_local_interest(&contract),
+            "downstream_subscriber_count should be 0 after syncing with TTL expiry"
         );
     }
 }
