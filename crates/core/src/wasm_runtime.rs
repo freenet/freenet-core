@@ -11,7 +11,6 @@ mod runtime;
 mod secrets_store;
 pub(crate) mod simulation_runtime;
 mod state_store;
-mod store;
 #[cfg(all(test, feature = "wasmtime-backend"))]
 mod tests;
 
