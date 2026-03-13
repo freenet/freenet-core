@@ -41,11 +41,11 @@
 //!
 //! **V1 (request/response):**
 //! ```text
-//! fn process(ctx, params, attested, msg) -> Vec<OutboundDelegateMsg> {
+//! fn process(ctx, params, origin, msg) -> Vec<OutboundDelegateMsg> {
 //!     match msg {
 //!         ApplicationMessage(app_msg) => {
 //!             // Can't get contract state inline — must return a request
-//!             let state = DelegateState { pending_contract: contract_id, app };
+//!             let state = DelegateState { pending_contract: contract_id };
 //!             let context = DelegateContext::new(serialize(&state));
 //!             vec![GetContractRequest { contract_id, context, processed: false }]
 //!         }
@@ -62,7 +62,7 @@
 //!
 //! **V2 (host function):**
 //! ```text
-//! fn process(ctx, params, attested, msg) -> Vec<OutboundDelegateMsg> {
+//! fn process(ctx, params, origin, msg) -> Vec<OutboundDelegateMsg> {
 //!     match msg {
 //!         ApplicationMessage(app_msg) => {
 //!             // Get contract state inline — no round-trip!

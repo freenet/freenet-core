@@ -14,13 +14,13 @@ struct TokenDelegate;
 #[delegate]
 impl DelegateInterface for TokenDelegate {
     fn process(
+        _ctx: &mut DelegateCtx,
         params: Parameters<'static>,
-        _attested: Option<&'static [u8]>,
+        _origin: Option<MessageOrigin>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
             InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
-                app,
                 payload,
                 context,
                 processed,
@@ -36,7 +36,7 @@ impl DelegateInterface for TokenDelegate {
                 let params = DelegateParameters::try_from(params)?;
                 match msg {
                     TokenDelegateMessage::RequestNewToken(req) => {
-                        allocate_token(params, &mut context, app, req)
+                        allocate_token(params, &mut context, req)
                     }
                     TokenDelegateMessage::Failure(reason) => Err(DelegateError::Other(format!(
                         "unexpected message type: failure; reason: {reason}"
@@ -59,10 +59,7 @@ impl DelegateInterface for TokenDelegate {
                 let context: DelegateContext = (&context).try_into()?;
                 Ok(vec![OutboundDelegateMsg::ContextUpdated(context)])
             }
-            InboundDelegateMsg::GetSecretResponse(GetSecretResponse { .. }) => Err(
-                DelegateError::Other("unexpected message type: get secret".into()),
-            ),
-            InboundDelegateMsg::GetSecretRequest(_) => unreachable!(),
+            _ => Err(DelegateError::Other("unexpected message type".into())),
         }
     }
 }
@@ -86,7 +83,6 @@ fn user_input(criteria: &AllocationCriteria, assignee: &Assignee) -> Notificatio
 fn allocate_token(
     params: DelegateParameters,
     context: &mut Context,
-    app: ContractInstanceId,
     RequestNewToken {
         request_id,
         delegate_id,
@@ -116,7 +112,7 @@ fn allocate_token(
                     assignment_hash,
                 });
                 OutboundDelegateMsg::ApplicationMessage(
-                    ApplicationMessage::new(app, msg.serialize()?).with_context(context),
+                    ApplicationMessage::new(msg.serialize()?).with_context(context),
                 )
             };
             let request_user_input = OutboundDelegateMsg::RequestUserInput(UserInputRequest {
@@ -141,7 +137,7 @@ fn allocate_token(
                     assignment_hash,
                 });
                 OutboundDelegateMsg::ApplicationMessage(
-                    ApplicationMessage::new(app, msg.serialize()?).with_context(context),
+                    ApplicationMessage::new(msg.serialize()?).with_context(context),
                 )
             };
             Ok(vec![req_allocation])
@@ -159,7 +155,7 @@ fn allocate_token(
                             criteria,
                         });
                         return Ok(vec![OutboundDelegateMsg::ApplicationMessage(
-                            ApplicationMessage::new(app, msg.serialize()?).with_context(context),
+                            ApplicationMessage::new(msg.serialize()?).with_context(context),
                         )]);
                     };
                     let msg = TokenDelegateMessage::AllocatedToken {
@@ -168,7 +164,7 @@ fn allocate_token(
                         records,
                     };
                     OutboundDelegateMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, msg.serialize()?)
+                        ApplicationMessage::new(msg.serialize()?)
                             .processed(true)
                             .with_context(context),
                     )
@@ -177,7 +173,7 @@ fn allocate_token(
                     let context: DelegateContext = (&*context).try_into()?;
                     let msg = TokenDelegateMessage::Failure(FailureReason::UserPermissionDenied);
                     OutboundDelegateMsg::ApplicationMessage(
-                        ApplicationMessage::new(app, msg.serialize()?).with_context(context),
+                        ApplicationMessage::new(msg.serialize()?).with_context(context),
                     )
                 }
             };
