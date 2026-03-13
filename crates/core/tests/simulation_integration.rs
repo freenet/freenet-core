@@ -7337,7 +7337,9 @@ async fn test_connection_growth_plateau_diagnostic() {
         }
     }
 
-    // Sanity: at least some nodes should have connections
+    // Intentionally weak sanity check — this is a diagnostic test (see doc comment),
+    // not a regression test for min_connections. The full regression test is
+    // test_connection_growth_stall_regression which asserts >=90% reach min_connections.
     let total_connected = final_counts.iter().filter(|&&c| c > 0).count();
     assert!(
         total_connected > NODES / 2,

@@ -26,6 +26,9 @@ WHEN calculating contract location:
 ```
 WHEN accepting a new connection (should_accept):
   1. CHECK: Is this a self-connection? → REJECT
+  1b. CHECK: Is this peer already connected or pending? → REJECT
+      (Forces CONNECT to route uphill, discovering new unconnected peers
+       instead of silently no-op'ing on already-known ones. See PR #3557.)
   2. CHECK: Are we at max_connections (open + pending)? → REJECT
   3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)
