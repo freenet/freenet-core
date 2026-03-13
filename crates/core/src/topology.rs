@@ -504,16 +504,19 @@ impl TopologyManager {
         adj
     }
 
-    /// Sample `count` target locations using gap-based targeting.
+    /// Sample `count` target locations using a mix of gap-based and random
+    /// Kleinberg targeting to balance distribution quality with exploration.
     ///
-    /// Targets the center of the largest gap in the node's current connection
-    /// distribution in log-distance space. Falls back to random Kleinberg 1/d
-    /// sampling when own location is unknown or there are no existing connections.
+    /// Pure gap-based targeting converges: the same gap repeatedly produces
+    /// the same terminus peer (already connected), wasting CONNECT attempts.
+    /// To break this cycle, every other target uses random Kleinberg 1/d
+    /// sampling, which discovers new peers via different routing paths.
     ///
-    /// Note: when `count > 1`, all targets may cluster in the same gap since
-    /// the distance snapshot is not updated between iterations. This is
-    /// self-correcting: after connections succeed, subsequent calls to
-    /// `adjust_topology` will see filled gaps and target different ranges.
+    /// Gap-based targets insert synthetic neighbors so subsequent gap targets
+    /// shift to different gaps rather than clustering.
+    ///
+    /// Falls back to pure random Kleinberg 1/d sampling when own location
+    /// is unknown or there are no existing connections.
     fn sample_targets(
         my_location: &Option<Location>,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
@@ -521,13 +524,28 @@ impl TopologyManager {
     ) -> Vec<Location> {
         match my_location {
             Some(loc) => {
-                let signed_distances: Vec<f64> = neighbor_locations
+                let mut signed_distances: Vec<f64> = neighbor_locations
                     .keys()
                     .map(|nloc| loc.signed_distance(*nloc))
                     .collect();
-                (0..count)
-                    .map(|_| small_world_rand::gap_target_directional(*loc, &signed_distances))
-                    .collect()
+                let mut targets = Vec::with_capacity(count);
+                for i in 0..count {
+                    // Alternate between gap-based and random Kleinberg targets.
+                    // Gap-based fills the largest distribution hole; random
+                    // Kleinberg explores diverse routing paths to find new peers
+                    // that gap targeting misses (because the gap's terminus peer
+                    // is already connected).
+                    let target = if i % 2 == 0 {
+                        let t = small_world_rand::gap_target_directional(*loc, &signed_distances);
+                        // Insert synthetic neighbor to shift next gap target
+                        signed_distances.push(loc.signed_distance(t));
+                        t
+                    } else {
+                        small_world_rand::kleinberg_target(*loc)
+                    };
+                    targets.push(target);
+                }
+                targets
             }
             None => (0..count).map(|_| Location::random()).collect(),
         }

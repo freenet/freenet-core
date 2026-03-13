@@ -2723,6 +2723,93 @@ impl EventKind {
         matches!(self, EventKind::Connect(_))
     }
 
+    /// Returns true if this is a Disconnected event.
+    pub fn is_disconnected(&self) -> bool {
+        matches!(self, EventKind::Disconnected { .. })
+    }
+
+    /// Returns true if this is a ConnectEvent::RequestReceived where accepted=true.
+    pub fn is_connect_accepted(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Connect(ConnectEvent::RequestReceived { accepted: true, .. })
+        )
+    }
+
+    /// Returns true if this is a ConnectEvent::RequestReceived where accepted=false.
+    pub fn is_connect_not_accepted(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Connect(ConnectEvent::RequestReceived {
+                accepted: false,
+                ..
+            })
+        )
+    }
+
+    /// Returns true if this is a ConnectEvent::Connected.
+    pub fn is_connect_connected(&self) -> bool {
+        matches!(self, EventKind::Connect(ConnectEvent::Connected { .. }))
+    }
+
+    /// Returns true if this is a ConnectEvent::RequestSent with is_initial=true.
+    pub fn is_connect_initiated(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Connect(ConnectEvent::RequestSent {
+                is_initial: true,
+                ..
+            })
+        )
+    }
+
+    /// Returns true if this is a terminus acceptance (accepted=true, forwarded_to=None).
+    pub fn is_connect_terminus_accepted(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Connect(ConnectEvent::RequestReceived {
+                accepted: true,
+                forwarded_to: None,
+                ..
+            })
+        )
+    }
+
+    /// Returns true if this is a terminus rejection (accepted=false, forwarded_to=None).
+    pub fn is_connect_terminus_rejected(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Connect(ConnectEvent::RequestReceived {
+                accepted: false,
+                forwarded_to: None,
+                ..
+            })
+        )
+    }
+
+    /// Returns true if this is a forwarded request (forwarded_to=Some).
+    pub fn is_connect_forwarded(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Connect(ConnectEvent::RequestReceived {
+                forwarded_to: Some(_),
+                ..
+            })
+        )
+    }
+
+    /// Returns the connection count from a ConnectEvent::Connected event.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn connect_peer_connection_count(&self) -> Option<usize> {
+        match self {
+            EventKind::Connect(ConnectEvent::Connected {
+                this_peer_connection_count,
+                ..
+            }) => Some(*this_peer_connection_count),
+            _ => None,
+        }
+    }
+
     /// Returns the contract instance id if this is an UnsubscribeReceived event.
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn unsubscribe_received_instance_id(&self) -> Option<&ContractInstanceId> {
