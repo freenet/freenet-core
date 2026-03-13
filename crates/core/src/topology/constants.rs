@@ -73,9 +73,11 @@ pub(super) const DIVERSITY_SHUFFLE_MAX_PROB: f64 = 0.3;
 pub(super) const STALENESS_WEIGHT: f64 = 0.5;
 
 /// Age after which a connection is considered "stale" for diversity purposes.
+/// Compared against virtual time (`at_time - connected_at`) so it works
+/// correctly in both production and DST simulation.
 ///
-/// In tests (simulation), connections stabilize faster so a shorter threshold
-/// (120s) ensures shuffling activates within a reasonable virtual-time window.
+/// In tests, connections stabilize faster so a shorter threshold (120s)
+/// ensures shuffling activates within a reasonable virtual-time window.
 /// In production, connections may be useful for much longer, so 30 minutes.
 #[cfg(test)]
 pub(super) const CONNECTION_STALENESS_THRESHOLD: Duration = Duration::from_secs(120);

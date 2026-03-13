@@ -493,6 +493,7 @@ impl TopologyManager {
                     my_location,
                     neighbor_locations,
                     current_connections,
+                    at_time,
                 );
                 if !matches!(shuffle, TopologyAdjustment::NoChange) {
                     return shuffle;
@@ -853,6 +854,7 @@ impl TopologyManager {
         my_location: &Option<Location>,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
         current_connections: usize,
+        at_time: Instant,
     ) -> TopologyAdjustment {
         if current_connections < self.limits.min_connections {
             return TopologyAdjustment::NoChange;
@@ -889,7 +891,9 @@ impl TopologyManager {
         let stale_count = neighbor_locations
             .values()
             .flatten()
-            .filter(|conn| conn.connected_at.elapsed() > CONNECTION_STALENESS_THRESHOLD)
+            .filter(|conn| {
+                at_time.duration_since(conn.connected_at) > CONNECTION_STALENESS_THRESHOLD
+            })
             .count();
         let stale_fraction = stale_count as f64 / total_conns as f64;
 
