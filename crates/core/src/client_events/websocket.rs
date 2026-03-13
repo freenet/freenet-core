@@ -686,8 +686,17 @@ async fn websocket_interface(
 
         send_response_message(&mut server_sink, serialized_error, &mut conn_state, None).await?;
 
-        tracing::debug!("Sent AUTH_TOKEN_INVALID error to client");
-        // Don't close connection immediately - let client handle the error gracefully
+        tracing::debug!("Sent AUTH_TOKEN_INVALID error to client, closing connection");
+        // Close the connection after sending the error. Keeping it open causes delegate
+        // failures: all subsequent messages would be processed with origin_contract=None
+        // (since auth_token=None), so the delegate receives origin=None and fails with
+        // "missing message origin". The client handles AUTH_TOKEN_INVALID by reloading
+        // the page to get a fresh token, so closing is the correct behavior.
+        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+        if let Err(e) = server_sink.send(Message::Close(None)).await {
+            tracing::debug!(error = %e, "Failed to send WebSocket close frame after auth error");
+        }
+        return Ok(());
     }
 
     // Per-connection rate limiter for delegate operations (#3305, #3332)
