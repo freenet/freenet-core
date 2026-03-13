@@ -2159,8 +2159,8 @@ mod tests {
         assert!(cm.should_accept(loc, addr));
         cm.add_connection(loc, addr, keypair.public().clone(), true);
 
-        // Same peer should still return true (already connected)
-        assert!(cm.should_accept(loc, addr));
+        // Same peer should return false — reject to route uphill for diversity
+        assert!(!cm.should_accept(loc, addr));
     }
 
     // ============ add_connection / prune_connection tests ============
