@@ -63,7 +63,7 @@ const MAX_DELEGATE_DRAIN_BATCH: usize = 16;
 async fn handle_delegate_with_contract_requests<CH>(
     contract_handler: &mut CH,
     initial_req: DelegateRequest<'static>,
-    attested_contract: Option<&ContractInstanceId>,
+    origin_contract: Option<&ContractInstanceId>,
     delegate_key: &DelegateKey,
 ) -> Vec<OutboundDelegateMsg>
 where
@@ -98,7 +98,7 @@ where
         // Execute the delegate request
         let values = match contract_handler
             .executor()
-            .execute_delegate_request(current_req, attested_contract)
+            .execute_delegate_request(current_req, origin_contract)
             .await
         {
             Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
@@ -437,7 +437,7 @@ where
         //   delegate registry — they are passed per-request at the API layer. If a target
         //   delegate's process() relies on params, the caller must use ApplicationMessages
         //   directly. This is a known v1 limitation.
-        // - attested_contract is None for inter-delegate delivery since the message
+        // - origin_contract is None for inter-delegate delivery since the message
         //   originates from another delegate, not from a contract attestation context.
         // - Inter-delegate messaging only works via ApplicationMessages path; messages
         //   from handle_delegate_notification (contract state change callbacks) do not
@@ -706,7 +706,6 @@ async fn handle_delegate_notification<CH>(
             OutboundDelegateMsg::ApplicationMessage(app_msg) => {
                 tracing::warn!(
                     delegate = %delegate_key,
-                    app = %app_msg.app,
                     payload_len = app_msg.payload.len(),
                     "Delegate produced ApplicationMessage from contract notification \
                      but no client routing is available yet — message dropped"
@@ -1047,12 +1046,12 @@ where
         }
         ContractHandlerEvent::DelegateRequest {
             req,
-            attested_contract,
+            origin_contract,
         } => {
             let delegate_key = req.key().clone();
             tracing::debug!(
                 delegate_key = %delegate_key,
-                ?attested_contract,
+                ?origin_contract,
                 "Processing delegate request"
             );
 
@@ -1060,7 +1059,7 @@ where
             let response = handle_delegate_with_contract_requests(
                 contract_handler,
                 req,
-                attested_contract.as_ref(),
+                origin_contract.as_ref(),
                 &delegate_key,
             )
             .await;

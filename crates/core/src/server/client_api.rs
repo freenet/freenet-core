@@ -36,9 +36,9 @@ impl std::ops::Deref for HttpClientApiRequest {
     }
 }
 
-/// Represents an attested contract entry with metadata for token expiration.
+/// Represents an origin contract entry with metadata for token expiration.
 #[derive(Clone, Debug)]
-pub struct AttestedContract {
+pub struct OriginContract {
     /// The contract instance ID
     pub contract_id: ContractInstanceId,
     /// The client ID associated with this token
@@ -47,8 +47,8 @@ pub struct AttestedContract {
     pub last_accessed: Instant,
 }
 
-impl AttestedContract {
-    /// Create a new attested contract entry
+impl OriginContract {
+    /// Create a new origin contract entry
     pub fn new(contract_id: ContractInstanceId, client_id: ClientId) -> Self {
         Self {
             contract_id,
@@ -58,12 +58,12 @@ impl AttestedContract {
     }
 }
 
-/// Maps authentication tokens to attested contract metadata.
-pub type AttestedContractMap = Arc<DashMap<AuthToken, AttestedContract>>;
+/// Maps authentication tokens to origin contract metadata.
+pub type OriginContractMap = Arc<DashMap<AuthToken, OriginContract>>;
 
 /// Handles HTTP client requests for contract access and interaction.
 pub struct HttpClientApi {
-    pub(crate) attested_contracts: AttestedContractMap,
+    pub(crate) origin_contracts: OriginContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
 }
@@ -71,16 +71,16 @@ pub struct HttpClientApi {
 impl HttpClientApi {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
-        let attested_contracts = Arc::new(DashMap::new());
-        Self::as_router_with_attested_contracts(socket, attested_contracts)
+        let origin_contracts = Arc::new(DashMap::new());
+        Self::as_router_with_origin_contracts(socket, origin_contracts)
     }
 
-    /// Returns the uninitialized axum router with a provided attested_contracts map.
+    /// Returns the uninitialized axum router with a provided origin_contracts map.
     ///
     /// Merges V1 and V2 HTTP routes; both currently share the same handler logic.
-    pub fn as_router_with_attested_contracts(
+    pub fn as_router_with_origin_contracts(
         socket: &SocketAddr,
-        attested_contracts: AttestedContractMap,
+        origin_contracts: OriginContractMap,
     ) -> (Self, Router) {
         // Controls the cookie Secure flag: when true, cookies are sent over HTTP
         // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
@@ -111,23 +111,23 @@ impl HttpClientApi {
             )
             .merge(v1::routes(config.clone()))
             .merge(v2::routes(config))
-            .layer(Extension(attested_contracts.clone()))
+            .layer(Extension(origin_contracts.clone()))
             .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
 
         (
             Self {
                 proxy_server_request: request_to_server,
-                attested_contracts,
+                origin_contracts,
                 response_channels: HashMap::new(),
             },
             router,
         )
     }
 
-    /// Returns a reference to the attested contracts map (for integration testing).
+    /// Returns a reference to the origin contracts map (for integration testing).
     /// This allows tests to verify token expiration behavior.
-    pub fn attested_contracts(&self) -> &AttestedContractMap {
-        &self.attested_contracts
+    pub fn origin_contracts(&self) -> &OriginContractMap {
+        &self.origin_contracts
     }
 }
 
@@ -279,14 +279,13 @@ impl ClientEventsProxy for HttpClientApi {
                             .send(HostCallbackResult::NewId { id: cli_id })
                             .map_err(|_e| ErrorKind::NodeUnavailable)?;
                         if let Some((assigned_token, contract)) = assigned_token {
-                            let attested = AttestedContract::new(contract, cli_id);
-                            self.attested_contracts
-                                .insert(assigned_token.clone(), attested);
+                            let origin = OriginContract::new(contract, cli_id);
+                            self.origin_contracts.insert(assigned_token.clone(), origin);
                             tracing::debug!(
                                 ?assigned_token,
                                 ?contract,
                                 ?cli_id,
-                                "Stored assigned token in attested_contracts map"
+                                "Stored assigned token in origin_contracts map"
                             );
                         }
                         self.response_channels.insert(cli_id, callbacks);
@@ -296,12 +295,12 @@ impl ClientEventsProxy for HttpClientApi {
                         client_id,
                         req,
                         auth_token,
-                        attested_contract,
+                        origin_contract,
                         ..
                     } => {
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)
-                            .with_attested_contract(attested_contract))
+                            .with_origin_contract(origin_contract))
                     }
                 }
             }

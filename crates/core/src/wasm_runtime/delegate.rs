@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
-    ApplicationMessage, ClientResponse, ContractInstanceId, DelegateContainer, DelegateContext,
-    DelegateError, DelegateInterfaceResult, DelegateKey, DelegateMessage, GetContractRequest,
-    InboundDelegateMsg, OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId,
+    ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
+    DelegateInterfaceResult, DelegateKey, DelegateMessage, GetContractRequest, InboundDelegateMsg,
+    MessageOrigin, OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId,
     SubscribeContractRequest, UpdateContractRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,7 @@ pub(crate) trait DelegateRuntimeInterface {
         &mut self,
         key: &DelegateKey,
         params: &Parameters,
-        attested: Option<&[u8]>,
+        origin: Option<&MessageOrigin>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 
@@ -92,7 +92,7 @@ impl Runtime {
         &mut self,
         delegate_key: &DelegateKey,
         params: &Parameters<'_>,
-        attested: Option<&[u8]>,
+        origin: Option<&MessageOrigin>,
         msg: &InboundDelegateMsg,
         context: Vec<u8>,
         handle: &InstanceHandle,
@@ -104,16 +104,11 @@ impl Runtime {
         // SAFETY: `self.secret_store` and `self.contract_store` are valid for the
         // duration of the WASM `process()` call below, and the `DelegateEnvGuard`
         // ensures the env is removed from `DELEGATE_ENV` before this function returns.
-        // Build the attested_contracts list from the attested bytes passed in.
-        // Each attested byte slice is a 32-byte ContractInstanceId.
-        let attested_contracts = attested
-            .filter(|a| a.len() == 32)
-            .map(|a| {
-                let mut id = [0u8; 32];
-                id.copy_from_slice(a);
-                vec![ContractInstanceId::new(id)]
-            })
-            .unwrap_or_default();
+        // Build the origin_contracts list from the MessageOrigin.
+        let origin_contracts = match origin {
+            Some(MessageOrigin::WebApp(contract_id)) => vec![*contract_id],
+            None => Vec::new(),
+        };
 
         // SAFETY: The `DelegateCallEnv` does not outlive `self`. The raw pointers to
         // `secret_store`, `contract_store`, and `delegate_store` remain valid for the
@@ -128,7 +123,7 @@ impl Runtime {
                 delegate_key.clone(),
                 &mut self.delegate_store,
                 0, // creation_depth: always 0 for top-level calls
-                attested_contracts,
+                origin_contracts,
             )
         };
 
@@ -146,7 +141,7 @@ impl Runtime {
         // Execute the WASM process function.
         // V2 delegates use call_async (async host functions for contract access).
         // V1 delegates use synchronous call.
-        let result = self.exec_inbound(params, attested, msg, handle, api_version);
+        let result = self.exec_inbound(params, origin, msg, handle, api_version);
 
         // Read back the (possibly mutated) context before guard drops
         let updated_context = DELEGATE_ENV
@@ -161,7 +156,7 @@ impl Runtime {
     fn exec_inbound(
         &mut self,
         params: &Parameters<'_>,
-        attested: Option<&[u8]>,
+        origin: Option<&MessageOrigin>,
         msg: &InboundDelegateMsg,
         handle: &InstanceHandle,
         api_version: DelegateApiVersion,
@@ -171,11 +166,14 @@ impl Runtime {
             param_buf.write(params)?;
             param_buf.ptr()
         };
-        let attested_buf_ptr = {
-            let bytes = attested.unwrap_or(&[]);
-            let mut attested_buf = self.init_buf(handle, bytes)?;
-            attested_buf.write(bytes)?;
-            attested_buf.ptr()
+        let origin_buf_ptr = {
+            let bytes = match origin {
+                Some(o) => bincode::serialize(o)?,
+                None => Vec::new(),
+            };
+            let mut origin_buf = self.init_buf(handle, &bytes)?;
+            origin_buf.write(bytes)?;
+            origin_buf.ptr()
         };
         let msg_ptr = {
             let msg = bincode::serialize(msg)?;
@@ -207,7 +205,7 @@ impl Runtime {
                     handle,
                     "process",
                     param_buf_ptr as i64,
-                    attested_buf_ptr as i64,
+                    origin_buf_ptr as i64,
                     msg_ptr as i64,
                 )?
             }
@@ -218,7 +216,7 @@ impl Runtime {
                     handle,
                     "process",
                     param_buf_ptr as i64,
-                    attested_buf_ptr as i64,
+                    origin_buf_ptr as i64,
                     msg_ptr as i64,
                 )?
             }
@@ -243,8 +241,7 @@ impl Runtime {
                 .iter()
                 .map(|m| match m {
                     OutboundDelegateMsg::ApplicationMessage(am) => format!(
-                        "ApplicationMessage(app={}, payload_len={}, processed={}, context_len={})",
-                        am.app,
+                        "ApplicationMessage(payload_len={}, processed={}, context_len={})",
                         am.payload.len(),
                         am.processed,
                         am.context.as_ref().len()
@@ -290,12 +287,12 @@ impl Runtime {
     fn log_process_outbound_entry(
         &self,
         delegate_key: &DelegateKey,
-        attested: Option<&[u8]>,
+        origin: Option<&MessageOrigin>,
         outbound_msgs: &VecDeque<OutboundDelegateMsg>,
     ) {
         tracing::debug!(
             delegate_key = ?delegate_key,
-            ?attested,
+            ?origin,
             outbound_msgs_len = outbound_msgs.len(),
             outbound_msg_details = debug(if tracing::enabled!(tracing::Level::DEBUG) {
                 outbound_msgs.iter().map(|msg| {
@@ -325,18 +322,17 @@ impl Runtime {
         _handle: &InstanceHandle,
         _instance_id: i64,
         _params: &Parameters<'_>,
-        attested: Option<&[u8]>,
+        origin: Option<&MessageOrigin>,
         outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
         context: &mut Vec<u8>,
         results: &mut Vec<OutboundDelegateMsg>,
     ) -> RuntimeResult<()> {
-        self.log_process_outbound_entry(delegate_key, attested, outbound_msgs);
+        self.log_process_outbound_entry(delegate_key, origin, outbound_msgs);
 
         while let Some(outbound) = outbound_msgs.pop_front() {
             match outbound {
                 OutboundDelegateMsg::ApplicationMessage(mut msg) => {
                     tracing::debug!(
-                        app = %msg.app,
                         payload_len = msg.payload.len(),
                         processed = msg.processed,
                         "Adding ApplicationMessage to results"
@@ -483,7 +479,7 @@ impl DelegateRuntimeInterface for Runtime {
         &mut self,
         delegate_key: &DelegateKey,
         params: &Parameters,
-        attested: Option<&[u8]>,
+        origin: Option<&MessageOrigin>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
@@ -508,13 +504,12 @@ impl DelegateRuntimeInterface for Runtime {
             for msg in inbound {
                 match msg {
                     InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
-                        app,
                         payload,
                         processed,
                         ..
                     }) => {
                         let app_msg = InboundDelegateMsg::ApplicationMessage(
-                            ApplicationMessage::new(app, payload)
+                            ApplicationMessage::new(payload)
                                 .processed(processed)
                                 .with_context(DelegateContext::new(context.clone())),
                         );
@@ -522,7 +517,7 @@ impl DelegateRuntimeInterface for Runtime {
                         let (outbound, updated_context) = self.exec_inbound_with_env(
                             delegate_key,
                             params,
-                            attested,
+                            origin,
                             &app_msg,
                             context.clone(),
                             &running.handle,
@@ -537,7 +532,7 @@ impl DelegateRuntimeInterface for Runtime {
                             &running.handle,
                             instance_id,
                             params,
-                            attested,
+                            origin,
                             &mut outbound_queue,
                             &mut context,
                             &mut results,
@@ -547,7 +542,7 @@ impl DelegateRuntimeInterface for Runtime {
                         let (outbound, updated_context) = self.exec_inbound_with_env(
                             delegate_key,
                             params,
-                            attested,
+                            origin,
                             &InboundDelegateMsg::UserResponse(response),
                             context.clone(),
                             &running.handle,
@@ -562,7 +557,7 @@ impl DelegateRuntimeInterface for Runtime {
                             &running.handle,
                             instance_id,
                             params,
-                            attested,
+                            origin,
                             &mut outbound_queue,
                             &mut context,
                             &mut results,
@@ -572,7 +567,7 @@ impl DelegateRuntimeInterface for Runtime {
                         let (outbound, updated_context) = self.exec_inbound_with_env(
                             delegate_key,
                             params,
-                            attested,
+                            origin,
                             &InboundDelegateMsg::GetContractResponse(response),
                             context.clone(),
                             &running.handle,
@@ -587,7 +582,7 @@ impl DelegateRuntimeInterface for Runtime {
                             &running.handle,
                             instance_id,
                             params,
-                            attested,
+                            origin,
                             &mut outbound_queue,
                             &mut context,
                             &mut results,
@@ -601,7 +596,7 @@ impl DelegateRuntimeInterface for Runtime {
                         let (outbound, updated_context) = self.exec_inbound_with_env(
                             delegate_key,
                             params,
-                            attested,
+                            origin,
                             &msg,
                             context.clone(),
                             &running.handle,
@@ -616,7 +611,7 @@ impl DelegateRuntimeInterface for Runtime {
                             &running.handle,
                             instance_id,
                             params,
-                            attested,
+                            origin,
                             &mut outbound_queue,
                             &mut context,
                             &mut results,
@@ -824,13 +819,13 @@ mod test {
 
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
         let target_contract_id = ContractInstanceId::new([42u8; 32]);
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
 
         let command = DelegateCommand::GetContractState {
             contract_id: target_contract_id,
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -907,13 +902,13 @@ mod test {
 
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
         let target_contract_id = ContractInstanceId::new([99u8; 32]);
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
 
         let command = DelegateCommand::GetContractState {
             contract_id: target_contract_id,
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -986,13 +981,13 @@ mod test {
         let contract1 = ContractInstanceId::new([1u8; 32]);
         let contract2 = ContractInstanceId::new([2u8; 32]);
         let contract3 = ContractInstanceId::new([3u8; 32]);
-        let app_id = ContractInstanceId::new([10u8; 32]);
+        let _app_id = ContractInstanceId::new([10u8; 32]);
 
         let command = DelegateCommand::GetMultipleContractStates {
             contract_ids: vec![contract1, contract2, contract3],
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -1121,7 +1116,7 @@ mod test {
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
 
         let contract_id = ContractInstanceId::new([42u8; 32]);
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
         let echo_message = "Hello from test!".to_string();
 
         let command = DelegateCommand::GetContractWithEcho {
@@ -1129,7 +1124,7 @@ mod test {
             echo_message: echo_message.clone(),
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -1246,10 +1241,10 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
-        let create_msg = ApplicationMessage::new(app, payload);
+        let create_msg = ApplicationMessage::new(payload);
         let inbound = InboundDelegateMsg::ApplicationMessage(create_msg);
         let outbound =
             runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
@@ -1264,7 +1259,7 @@ mod test {
 
         let payload: Vec<u8> =
             bincode::serialize(&InboundAppMessage::PleaseSignMessage(vec![1, 2, 3])).unwrap();
-        let sign_msg = ApplicationMessage::new(app, payload);
+        let sign_msg = ApplicationMessage::new(payload);
         let inbound = InboundDelegateMsg::ApplicationMessage(sign_msg);
         let outbound =
             runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
@@ -1290,7 +1285,7 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let test_data = vec![1, 2, 3, 4, 5];
 
@@ -1299,8 +1294,8 @@ mod test {
         let read_payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
 
         let messages = vec![
-            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, write_payload)),
-            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, read_payload)),
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(write_payload)),
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(read_payload)),
         ];
 
         let outbound =
@@ -1367,10 +1362,10 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let payload = bincode::serialize(&InboundAppMessage::IncrementCounter)?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1393,7 +1388,7 @@ mod test {
         assert!(matches!(response, OutboundAppMessage::CounterValue(1)));
 
         let payload = bincode::serialize(&InboundAppMessage::IncrementCounter)?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1428,13 +1423,13 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let secret_key = vec![10, 20, 30];
         let secret_value = vec![100, 200];
 
         let payload = bincode::serialize(&InboundAppMessage::HasSecret(secret_key.clone()))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1460,7 +1455,7 @@ mod test {
             key: secret_key.clone(),
             value: secret_value.clone(),
         })?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let _ = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1469,7 +1464,7 @@ mod test {
         )?;
 
         let payload = bincode::serialize(&InboundAppMessage::HasSecret(secret_key.clone()))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1504,12 +1499,12 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let nonexistent_key = vec![99, 98, 97];
         let payload =
             bincode::serialize(&InboundAppMessage::GetNonExistentSecret(nonexistent_key))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1544,7 +1539,7 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let secret_key = vec![42, 43, 44];
         let secret_value = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -1553,7 +1548,7 @@ mod test {
             key: secret_key.clone(),
             value: secret_value.clone(),
         })?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1577,7 +1572,7 @@ mod test {
 
         let payload =
             bincode::serialize(&InboundAppMessage::GetNonExistentSecret(secret_key.clone()))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1632,7 +1627,7 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         // Make secrets directory read-only so store_secret fails with an I/O error
         let secrets_dir = temp_dir.path().join("secrets");
@@ -1642,7 +1637,7 @@ mod test {
             key: vec![1, 2, 3],
             value: vec![4, 5, 6],
         })?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1683,10 +1678,10 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1739,11 +1734,11 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let test_data = vec![1, 2, 3, 4, 5];
         let payload = bincode::serialize(&InboundAppMessage::WriteContext(test_data.clone()))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let _ = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1752,7 +1747,7 @@ mod test {
         )?;
 
         let payload = bincode::serialize(&InboundAppMessage::ClearContext)?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1775,7 +1770,7 @@ mod test {
         assert!(matches!(response, OutboundAppMessage::ContextCleared));
 
         let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1828,12 +1823,12 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let messages: Vec<InboundDelegateMsg> = (0..3)
             .map(|_| {
                 let payload = bincode::serialize(&InboundAppMessage::IncrementCounter).unwrap();
-                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, payload))
+                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload))
             })
             .collect();
 
@@ -1889,7 +1884,7 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let secret_key = vec![50, 51, 52];
         let secret_value = vec![200, 201, 202];
@@ -1898,7 +1893,7 @@ mod test {
             key: secret_key.clone(),
             value: secret_value.clone(),
         })?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let _ = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1907,7 +1902,7 @@ mod test {
         )?;
 
         let payload = bincode::serialize(&InboundAppMessage::HasSecret(secret_key.clone()))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1929,7 +1924,7 @@ mod test {
         assert!(matches!(response, OutboundAppMessage::SecretExists(true)));
 
         let payload = bincode::serialize(&InboundAppMessage::RemoveSecret(secret_key.clone()))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1951,7 +1946,7 @@ mod test {
         assert!(matches!(response, OutboundAppMessage::SecretRemoved));
 
         let payload = bincode::serialize(&InboundAppMessage::HasSecret(secret_key.clone()))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -1985,12 +1980,12 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let large_size = 1024 * 1024;
 
         let payload = bincode::serialize(&InboundAppMessage::WriteLargeContext(large_size))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -2030,7 +2025,7 @@ mod test {
         }
 
         let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -2082,7 +2077,7 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let large_size = 256 * 1024;
 
@@ -2090,8 +2085,8 @@ mod test {
         let read_payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
 
         let messages = vec![
-            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, write_payload)),
-            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app, read_payload)),
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(write_payload)),
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(read_payload)),
         ];
 
         let outbound =
@@ -2154,7 +2149,7 @@ mod test {
             Parameters::from(vec![]),
         );
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let secret_key = vec![77, 88, 99];
         let large_size = 1024 * 1024;
@@ -2163,7 +2158,7 @@ mod test {
             key: secret_key.clone(),
             size: large_size,
         })?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -2204,7 +2199,7 @@ mod test {
 
         let payload =
             bincode::serialize(&InboundAppMessage::GetNonExistentSecret(secret_key.clone()))?;
-        let msg = ApplicationMessage::new(app, payload);
+        let msg = ApplicationMessage::new(payload);
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
@@ -2264,7 +2259,7 @@ mod test {
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let runtime1 = Arc::new(std::sync::Mutex::new(runtime1));
         let runtime2 = Arc::new(std::sync::Mutex::new(runtime2));
@@ -2287,7 +2282,7 @@ mod test {
                 value: secret_value.clone(),
             })
             .unwrap();
-            let msg = ApplicationMessage::new(app, payload);
+            let msg = ApplicationMessage::new(payload);
             {
                 let mut runtime = runtime1_clone.lock().unwrap();
                 let _ = runtime
@@ -2303,7 +2298,7 @@ mod test {
             let payload =
                 bincode::serialize(&InboundAppMessage::GetNonExistentSecret(secret_key.clone()))
                     .unwrap();
-            let msg = ApplicationMessage::new(app, payload);
+            let msg = ApplicationMessage::new(payload);
             let outbound = {
                 let mut runtime = runtime1_clone.lock().unwrap();
                 runtime
@@ -2367,7 +2362,7 @@ mod test {
                 value: secret_value.clone(),
             })
             .unwrap();
-            let msg = ApplicationMessage::new(app, payload);
+            let msg = ApplicationMessage::new(payload);
             {
                 let mut runtime = runtime2_clone.lock().unwrap();
                 let _ = runtime
@@ -2383,7 +2378,7 @@ mod test {
             let payload =
                 bincode::serialize(&InboundAppMessage::GetNonExistentSecret(secret_key.clone()))
                     .unwrap();
-            let msg = ApplicationMessage::new(app, payload);
+            let msg = ApplicationMessage::new(payload);
             let outbound = {
                 let mut runtime = runtime2_clone.lock().unwrap();
                 runtime
@@ -2498,10 +2493,10 @@ mod test {
             Arc::new(ContractCode::from(vec![1])),
             Parameters::from(vec![]),
         );
-        let app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
         let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
-        let create_msg = ApplicationMessage::new(app, payload);
+        let create_msg = ApplicationMessage::new(payload);
         let inbound = InboundDelegateMsg::ApplicationMessage(create_msg);
         let outbound =
             runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
@@ -2630,12 +2625,12 @@ mod test {
         runtime.drop_running_instance(&mut running);
 
         // Send a message asking the delegate to read the contract state
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
         let command = InboundAppMessage::GetContractState {
             contract_id: [42u8; 32],
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -2718,12 +2713,12 @@ mod test {
                 .register_delegate(delegate.key().clone(), cipher, nonce);
 
         // Ask for a contract that doesn't exist
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
         let command = InboundAppMessage::GetContractState {
             contract_id: [99u8; 32],
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -2834,9 +2829,9 @@ mod test {
         delegate: &DelegateContainer,
         message: &v2_contracts_messages::InboundAppMessage,
     ) -> Result<v2_contracts_messages::OutboundAppMessage, Box<dyn std::error::Error>> {
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
         let payload = bincode::serialize(message)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -3031,7 +3026,7 @@ mod test {
 
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
 
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
 
         let code = ContractCode::from(vec![0u8; 10]);
         let params = Parameters::from(vec![]);
@@ -3044,7 +3039,7 @@ mod test {
             state: vec![10, 20, 30],
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -3125,14 +3120,14 @@ mod test {
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
 
         let contract_id = ContractInstanceId::new([42u8; 32]);
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
 
         let command = DelegateCommand::UpdateContractState {
             contract_id,
             state: vec![10, 20, 30],
         };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -3218,11 +3213,11 @@ mod test {
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_CAPABILITIES).await?;
 
         let contract_id = ContractInstanceId::new([42u8; 32]);
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
 
         let command = DelegateCommand::SubscribeContract { contract_id };
         let payload = bincode::serialize(&command)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             delegate.key(),
@@ -3418,14 +3413,14 @@ mod test {
                 .register_delegate(delegate.key().clone(), cipher, nonce);
 
         let delegate_key = delegate.key().clone();
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
 
         // --- Step 1: Delegate subscribes to the contract ---
         let subscribe_cmd = DelegateCommand::SubscribeContract {
             contract_id: contract_instance_id,
         };
         let payload = bincode::serialize(&subscribe_cmd)?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             &delegate_key,
@@ -3740,13 +3735,13 @@ mod test {
         let target_key_bytes = vec![42u8; 32];
         let target_code_hash = vec![99u8; 32];
 
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
         let payload = bincode::serialize(&InboundAppMessage::SendToDelegate {
             target_key_bytes: target_key_bytes.clone(),
             target_code_hash: target_code_hash.clone(),
             payload: b"hello".to_vec(),
         })?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound = runtime.inbound_app_message(
             &key_a,
@@ -3864,13 +3859,13 @@ mod test {
         let key_b = delegate_b.key().clone();
 
         // Step 1: Send command to A: "send a message to B"
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
         let payload = bincode::serialize(&InboundAppMessage::SendToDelegate {
             target_key_bytes: key_b.bytes().to_vec(),
             target_code_hash: key_b.code_hash().as_ref().to_vec(),
             payload: b"inter-delegate".to_vec(),
         })?;
-        let app_msg = ApplicationMessage::new(app_id, payload);
+        let app_msg = ApplicationMessage::new(payload);
 
         let outbound_a = runtime_a.inbound_app_message(
             &key_a,
@@ -3961,7 +3956,7 @@ mod test {
         // Send two messages via two separate inbound ApplicationMessages.
         // The first triggers SendDelegateMessage → break + drain, so
         // the second SendDelegateMessage goes through drain(..).
-        let app_id = ContractInstanceId::new([1u8; 32]);
+        let _app_id = ContractInstanceId::new([1u8; 32]);
         let payload1 =
             bincode::serialize(&messaging_messages::InboundAppMessage::SendToDelegate {
                 target_key_bytes: target_b.bytes().to_vec(),
@@ -3980,8 +3975,8 @@ mod test {
             &vec![1u8].into(),
             None,
             vec![
-                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app_id, payload1)),
-                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(app_id, payload2)),
+                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload1)),
+                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload2)),
             ],
         )?;
 

@@ -36,7 +36,7 @@ use crate::{
 pub use app_packaging::WebApp;
 
 // Export types needed for integration testing
-pub use client_api::{AttestedContract, AttestedContractMap};
+pub use client_api::{OriginContract, OriginContractMap};
 
 /// API version for websocket and HTTP client API **routing**.
 ///
@@ -78,7 +78,7 @@ pub(crate) enum ClientConnection {
         client_id: ClientId,
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
-        attested_contract: Option<ContractInstanceId>,
+        origin_contract: Option<ContractInstanceId>,
         /// Plumbing for future V2-specific dispatch; not yet read.
         #[allow(dead_code)]
         api_version: ApiVersion,
@@ -255,23 +255,23 @@ pub mod local_node {
                         .await
                 }
                 ClientRequest::DelegateOp(op) => {
-                    let attested_contract = token.and_then(|token| {
-                        gw.attested_contracts
+                    let origin_contract = token.and_then(|token| {
+                        gw.origin_contracts
                             .get(&token)
                             .map(|entry| entry.contract_id)
                     });
-                    executor.delegate_request(op, attested_contract.as_ref())
+                    executor.delegate_request(op, origin_contract.as_ref())
                 }
                 ClientRequest::Disconnect { cause } => {
                     if let Some(cause) = cause {
                         tracing::info!("disconnecting cause: {cause}");
                     }
                     // fixme: token must live for a bit to allow reconnections
-                    if let Some(rm_token) = gw.attested_contracts.iter().find_map(|entry| {
-                        let (k, attested) = entry.pair();
-                        (attested.client_id == id).then(|| k.clone())
+                    if let Some(rm_token) = gw.origin_contracts.iter().find_map(|entry| {
+                        let (k, origin) = entry.pair();
+                        (origin.client_id == id).then(|| k.clone())
                     }) {
-                        gw.attested_contracts.remove(&rm_token);
+                        gw.origin_contracts.remove(&rm_token);
                     }
                     continue;
                 }
@@ -334,21 +334,21 @@ pub async fn serve_client_api_with_listener(
     Ok([Box::new(gw), Box::new(ws_proxy)])
 }
 
-/// Like [`serve_client_api_with_listener`] but also returns the `AttestedContractMap`.
+/// Like [`serve_client_api_with_listener`] but also returns the `OriginContractMap`.
 ///
 /// Use this in integration tests that need to pre-populate auth token → contract
 /// mappings in order to test delegate attestation behaviour (issue #1523).
 pub async fn serve_client_api_with_listener_and_contracts(
     config: WebsocketApiConfig,
     listener: std::net::TcpListener,
-) -> std::io::Result<([BoxedClient; 2], AttestedContractMap)> {
+) -> std::io::Result<([BoxedClient; 2], OriginContractMap)> {
     let (gw, ws_proxy) = serve_client_api_in_impl(config, Some(listener)).await?;
-    let attested_contracts = gw.attested_contracts.clone();
-    Ok(([Box::new(gw), Box::new(ws_proxy)], attested_contracts))
+    let origin_contracts = gw.origin_contracts.clone();
+    Ok(([Box::new(gw), Box::new(ws_proxy)], origin_contracts))
 }
 
 /// Serves the client API and returns the concrete types (for integration testing).
-/// This allows tests to access internal state like the attested_contracts map.
+/// This allows tests to access internal state like the origin_contracts map.
 pub async fn serve_client_api_for_test(
     config: WebsocketApiConfig,
 ) -> std::io::Result<(
@@ -370,21 +370,21 @@ async fn serve_client_api_in_impl(
 ) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
     let ws_socket = (config.address, config.port).into();
 
-    // Create a shared attested_contracts map with token expiration support
-    let attested_contracts: AttestedContractMap = Arc::new(DashMap::new());
+    // Create a shared origin_contracts map with token expiration support
+    let origin_contracts: OriginContractMap = Arc::new(DashMap::new());
 
     // Spawn background task to clean up expired tokens
     spawn_token_cleanup_task(
-        attested_contracts.clone(),
+        origin_contracts.clone(),
         config.token_ttl_seconds,
         config.token_cleanup_interval_seconds,
     );
 
     // Pass the shared map to both the HTTP client API and WebSocketProxy
     let (gw, gw_router) =
-        HttpClientApi::as_router_with_attested_contracts(&ws_socket, attested_contracts.clone());
+        HttpClientApi::as_router_with_origin_contracts(&ws_socket, origin_contracts.clone());
     let (ws_proxy, ws_router) =
-        WebSocketProxy::create_router_with_attested_contracts(gw_router, attested_contracts);
+        WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts);
 
     // When bound to a non-loopback address, reject connections from non-private
     // source IPs. This is sufficient security: only LAN clients can connect.
@@ -430,11 +430,11 @@ async fn private_network_filter(
 /// This prevents memory leaks and ensures old tokens don't remain valid indefinitely.
 ///
 /// # Arguments
-/// * `attested_contracts` - The shared map of authentication tokens
+/// * `origin_contracts` - The shared map of authentication tokens
 /// * `token_ttl_seconds` - How long tokens remain valid without activity (in seconds)
 /// * `cleanup_interval_seconds` - How often to run the cleanup task (in seconds)
 fn spawn_token_cleanup_task(
-    attested_contracts: AttestedContractMap,
+    origin_contracts: OriginContractMap,
     token_ttl_seconds: u64,
     cleanup_interval_seconds: u64,
 ) {
@@ -450,18 +450,18 @@ fn spawn_token_cleanup_task(
 
             // Clean up expired tokens
             let now = Instant::now();
-            let initial_count = attested_contracts.len();
+            let initial_count = origin_contracts.len();
 
             // Remove tokens that haven't been accessed in token_ttl
-            attested_contracts.retain(|token, attested| {
-                let elapsed = now.duration_since(attested.last_accessed);
+            origin_contracts.retain(|token, origin| {
+                let elapsed = now.duration_since(origin.last_accessed);
                 let should_keep = elapsed < token_ttl;
 
                 if !should_keep {
                     tracing::info!(
                         ?token,
-                        contract_id = ?attested.contract_id,
-                        client_id = ?attested.client_id,
+                        contract_id = ?origin.contract_id,
+                        client_id = ?origin.client_id,
                         elapsed_hours = elapsed.as_secs() / 3600,
                         "Removing expired authentication token"
                     );
@@ -470,11 +470,11 @@ fn spawn_token_cleanup_task(
                 should_keep
             });
 
-            let removed_count = initial_count - attested_contracts.len();
+            let removed_count = initial_count - origin_contracts.len();
             if removed_count > 0 {
                 tracing::debug!(
                     removed_count,
-                    remaining_count = attested_contracts.len(),
+                    remaining_count = origin_contracts.len(),
                     "Token cleanup completed"
                 );
             }
