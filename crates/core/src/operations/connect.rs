@@ -126,6 +126,21 @@ const RECENCY_COOLDOWN: Duration = Duration::from_secs(30);
 /// preventing routing through known-bad paths.
 const MIN_FORWARD_SCORE: f64 = 0.15;
 
+/// Ring distance threshold below which a relay may probabilistically accept a
+/// connection even when it can still forward. This implements "near-terminus
+/// acceptance" — relays that are close to the target both accept AND forward,
+/// giving the joiner more diverse connection options without waiting to reach
+/// the strict terminus.
+///
+/// Value 0.05 = within 5% of the ring from the target. At this distance the
+/// relay is topologically relevant to the joiner.
+const NEAR_TERMINUS_DISTANCE: f64 = 0.05;
+
+/// Base probability that a near-terminus relay accepts while forwarding.
+/// Actual probability scales linearly with proximity: closer = higher chance.
+/// At distance 0 this is the full probability; at `NEAR_TERMINUS_DISTANCE` it's 0.
+const NEAR_TERMINUS_ACCEPT_PROB: f64 = 0.6;
+
 /// Filter out scored peers below `MIN_FORWARD_SCORE` when alternatives exist.
 ///
 /// If filtering would leave zero scored peers AND zero eligible (unscored) peers,
@@ -542,6 +557,49 @@ impl RelayState {
                 "connect: forwarding join request to next hop (not accepting - not at terminus)"
             );
             actions.forward = Some(self.forward_to_peer(ctx, next, forward_attempts, now));
+
+            // Near-terminus acceptance: if this relay is close to the target,
+            // probabilistically also accept while forwarding. This gives the
+            // joiner more diverse connections without waiting for strict terminus.
+            if !self.accepted_locally {
+                let my_dist = ring_distance(
+                    ctx.self_location().location(),
+                    Some(self.request.desired_location),
+                );
+                if let Some(d) = my_dist {
+                    if d < NEAR_TERMINUS_DISTANCE {
+                        // Probability scales linearly: closer → higher chance
+                        let accept_prob =
+                            NEAR_TERMINUS_ACCEPT_PROB * (1.0 - d / NEAR_TERMINUS_DISTANCE);
+                        let roll: f64 = GlobalRng::random_range(0.0..1.0);
+                        if roll < accept_prob {
+                            if let Ok(joiner_known) =
+                                KnownPeerKeyLocation::try_from(&self.request.joiner)
+                            {
+                                if ctx.should_accept(&joiner_known) {
+                                    self.accepted_locally = true;
+                                    let self_loc = ctx.self_location();
+                                    let acceptor = PeerKeyLocation::with_unknown_addr(
+                                        self_loc.pub_key().clone(),
+                                    );
+                                    actions.accept_response = Some(ConnectResponse {
+                                        acceptor: acceptor.clone(),
+                                    });
+                                    actions.expect_connection_from =
+                                        Some(self.request.joiner.clone());
+                                    tracing::info!(
+                                        acceptor_loc = ?self_loc.location(),
+                                        joiner_loc = ?self.request.joiner.location(),
+                                        ring_distance = d,
+                                        accept_prob,
+                                        "connect: near-terminus acceptance (also forwarding)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Only accept at terminus (can't forward to a closer peer)
@@ -798,12 +856,14 @@ impl RelayContext for RelayEnv<'_> {
         visited: &VisitedPeers,
         recency: &HashMap<PeerKeyLocation, Instant>,
     ) -> Option<PeerKeyLocation> {
-        // UPHILL ROUTING: When at terminus but can't accept, try any available peer.
+        // SMARTER UPHILL ROUTING: When at terminus but can't accept, prefer
+        // uphill peers that are still relatively close to the target.
         //
         // This method is only called when select_next_hop returned None (terminus).
-        // That means no peer passed the "closer to target than us" filter.
-        // Therefore, ALL remaining candidates are by definition "uphill" (farther from target).
-        // We don't need to re-check distances - just find any available peer.
+        // All remaining candidates are "uphill" (farther from target than us).
+        // We prefer peers that are still within a reasonable distance of the
+        // target, as they are more likely to have neighbors near the target
+        // that we don't know about.
         //
         let now = Instant::now();
         let excluded_peers = self
@@ -842,12 +902,29 @@ impl RelayContext for RelayEnv<'_> {
                 target = %desired_location,
                 "connect: no uphill candidates available"
             );
-            None
+            return None;
+        }
+
+        // Partition into "close uphill" (within 2× NEAR_TERMINUS_DISTANCE of target)
+        // and "far uphill". Prefer close uphill peers as they're more likely to know
+        // peers near the target that we don't.
+        let close_threshold = NEAR_TERMINUS_DISTANCE * 2.0;
+        let (close, far): (Vec<_>, Vec<_>) = eligible.into_iter().partition(|cand| {
+            cand.location()
+                .map(|loc| loc.distance(desired_location).as_f64() < close_threshold)
+                .unwrap_or(false)
+        });
+
+        if !close.is_empty() {
+            tracing::debug!(
+                target = %desired_location,
+                close_count = close.len(),
+                far_count = far.len(),
+                "connect: preferring close uphill peer"
+            );
+            router.select_peer(close.iter(), desired_location).cloned()
         } else {
-            // Use the router to select among available peers
-            router
-                .select_peer(eligible.iter(), desired_location)
-                .cloned()
+            router.select_peer(far.iter(), desired_location).cloned()
         }
     }
 }

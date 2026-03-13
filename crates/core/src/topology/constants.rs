@@ -48,3 +48,36 @@ pub(super) const TOPOLOGY_PROTECTION_THRESHOLD: f64 = 2.0;
 /// 2. As a floor for ln(k) when k=1 (ln(1)=0 would make expected gap 0,
 ///    causing division issues).
 pub(super) const EXPECTED_GAP_FLOOR: f64 = 0.01;
+
+/// Minimum gap-excess + staleness deficit before diversity shuffling activates.
+///
+/// The diversity shuffle fires independently from `maybe_swap_connection` and
+/// targets neighborhoods that are both topologically suboptimal *and* stale
+/// (connections unchanged for a long time). A threshold of 0.3 means:
+/// at least 30% combined deficit from gap excess and staleness before any
+/// shuffle is considered.
+pub(super) const DIVERSITY_SHUFFLE_THRESHOLD: f64 = 0.3;
+
+/// Maximum per-tick probability of a diversity shuffle (analogous to
+/// `MAX_SWAP_PROB_PER_TICK`). At 60s maintenance ticks this yields at most
+/// ~one shuffle every 3 minutes under maximum deficit.
+pub(super) const DIVERSITY_SHUFFLE_MAX_PROB: f64 = 0.3;
+
+/// Weight of the staleness fraction in the diversity shuffle deficit score.
+///
+/// `deficit = gap_excess + STALENESS_WEIGHT * stale_fraction`
+///
+/// With a weight of 0.5, a fully stale neighborhood (100% of connections
+/// older than `CONNECTION_STALENESS_THRESHOLD`) contributes 0.5 to the
+/// deficit, which alone exceeds `DIVERSITY_SHUFFLE_THRESHOLD`.
+pub(super) const STALENESS_WEIGHT: f64 = 0.5;
+
+/// Age after which a connection is considered "stale" for diversity purposes.
+///
+/// In tests (simulation), connections stabilize faster so a shorter threshold
+/// (120s) ensures shuffling activates within a reasonable virtual-time window.
+/// In production, connections may be useful for much longer, so 30 minutes.
+#[cfg(test)]
+pub(super) const CONNECTION_STALENESS_THRESHOLD: Duration = Duration::from_secs(120);
+#[cfg(not(test))]
+pub(super) const CONNECTION_STALENESS_THRESHOLD: Duration = Duration::from_secs(1800);

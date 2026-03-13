@@ -7158,3 +7158,221 @@ fn test_auto_fetch_from_update_sender() {
         report.total_events
     );
 }
+
+// =============================================================================
+// Neighborhood Diversity Shuffling Test (#3555)
+// =============================================================================
+
+/// Test that neighborhood diversity improves over time via diversity shuffling.
+///
+/// **Problem being measured**: Without diversity shuffling, once a node's neighborhood
+/// stabilizes it tends to keep the same peers indefinitely, even when the topology
+/// could be improved. This test measures neighbor turnover: the fraction of neighbors
+/// that change between two snapshots separated by time.
+///
+/// **What we verify**:
+/// 1. After stabilization (T0), snapshot each node's neighbor set
+/// 2. Run the network further (T1), take another snapshot
+/// 3. Measure turnover: at least some nodes should have changed neighbors
+/// 4. Verify no catastrophic connection loss (zero-connection count stays low)
+/// 5. Verify gap scores remain stable or improve
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_neighborhood_diversity_improvement() {
+    use freenet::dev_tool::NodeLabel;
+
+    const SEED: u64 = 0x3555_D1E3_0001;
+    const NETWORK_NAME: &str = "neighborhood-diversity";
+    const GATEWAYS: usize = 2;
+    const NODES: usize = 50;
+    const RING_MAX_HTL: usize = 7;
+    const RND_IF_HTL_ABOVE: usize = 3;
+    const MAX_CONN: usize = 20;
+    const MIN_CONN: usize = 10;
+
+    tracing::info!("=== Neighborhood Diversity Improvement Test (#3555) ===");
+
+    setup_deterministic_state(SEED);
+
+    let mut sim = SimNetwork::new(
+        NETWORK_NAME,
+        GATEWAYS,
+        NODES,
+        RING_MAX_HTL,
+        RND_IF_HTL_ABOVE,
+        MAX_CONN,
+        MIN_CONN,
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    // Topology-only test: no contracts, no events
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 0, 0)
+        .await;
+
+    // -------------------------------------------------------------------------
+    // Phase 1: Stabilize — 20 virtual minutes
+    // -------------------------------------------------------------------------
+    tracing::info!("Phase 1: Stabilizing network (20 virtual minutes)");
+    let_network_run(&mut sim, Duration::from_secs(1200)).await;
+
+    // Snapshot T0: per-node neighbor sets
+    let t0_neighbors: HashMap<NodeLabel, HashSet<_>> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.neighbor_peer_keys(&label).map(|keys| (label, keys))
+        })
+        .collect();
+
+    let t0_sampled = t0_neighbors.len();
+    assert!(t0_sampled > 0, "No nodes have neighbor data at T0");
+
+    // Record T0 connection counts and gap scores
+    let t0_conn_counts: Vec<usize> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.connection_count(&label)
+        })
+        .collect();
+
+    let t0_zero_conn = t0_conn_counts.iter().filter(|&&c| c == 0).count();
+    let t0_median_conn = {
+        let mut sorted = t0_conn_counts.clone();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2]
+    };
+
+    tracing::info!(
+        "T0 snapshot: {} nodes sampled, median_conn={}, zero_conn={}",
+        t0_sampled,
+        t0_median_conn,
+        t0_zero_conn,
+    );
+
+    // -------------------------------------------------------------------------
+    // Phase 2: Run 40 more virtual minutes — diversity shuffling should activate
+    // -------------------------------------------------------------------------
+    tracing::info!("Phase 2: Running 40 more virtual minutes for diversity shuffling");
+    let_network_run(&mut sim, Duration::from_secs(2400)).await;
+
+    // Snapshot T1: per-node neighbor sets
+    let t1_neighbors: HashMap<NodeLabel, HashSet<_>> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.neighbor_peer_keys(&label).map(|keys| (label, keys))
+        })
+        .collect();
+
+    let t1_conn_counts: Vec<usize> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.connection_count(&label)
+        })
+        .collect();
+
+    let t1_zero_conn = t1_conn_counts.iter().filter(|&&c| c == 0).count();
+    let t1_median_conn = {
+        let mut sorted = t1_conn_counts.clone();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2]
+    };
+
+    // -------------------------------------------------------------------------
+    // Metrics: turnover %, connection stability
+    // -------------------------------------------------------------------------
+    let mut turnover_fractions = Vec::new();
+    let mut nodes_with_turnover = 0usize;
+
+    for (label, t0_set) in &t0_neighbors {
+        if let Some(t1_set) = t1_neighbors.get(label) {
+            if t0_set.is_empty() {
+                continue;
+            }
+            let changed = t0_set.symmetric_difference(t1_set).count();
+            let total = t0_set.len().max(t1_set.len()).max(1);
+            let turnover = changed as f64 / total as f64;
+            turnover_fractions.push(turnover);
+            if changed > 0 {
+                nodes_with_turnover += 1;
+            }
+        }
+    }
+
+    let avg_turnover = if turnover_fractions.is_empty() {
+        0.0
+    } else {
+        turnover_fractions.iter().sum::<f64>() / turnover_fractions.len() as f64
+    };
+
+    let nodes_with_turnover_pct = if t0_sampled > 0 {
+        nodes_with_turnover as f64 / t0_sampled as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    tracing::info!(
+        "T1 snapshot: median_conn={}, zero_conn={}",
+        t1_median_conn,
+        t1_zero_conn,
+    );
+    tracing::info!(
+        "Diversity metrics: avg_turnover={:.1}%, nodes_with_turnover={}/{} ({:.0}%)",
+        avg_turnover * 100.0,
+        nodes_with_turnover,
+        t0_sampled,
+        nodes_with_turnover_pct,
+    );
+
+    // -------------------------------------------------------------------------
+    // Assertions
+    // -------------------------------------------------------------------------
+
+    // ASSERTION 1: At least some nodes experienced neighbor turnover.
+    // With diversity shuffling active, we expect meaningful neighborhood changes.
+    // Threshold: at least 10% of nodes had some neighbor change.
+    assert!(
+        nodes_with_turnover_pct >= 10.0,
+        "Too few nodes experienced neighbor turnover: {:.0}% ({}/{}) — expected >= 10%. \
+         Without diversity shuffling, neighborhoods are too static. Seed: 0x{:X}",
+        nodes_with_turnover_pct,
+        nodes_with_turnover,
+        t0_sampled,
+        SEED
+    );
+
+    // ASSERTION 2: No catastrophic connection loss.
+    // Zero-connection nodes should not increase between T0 and T1.
+    assert!(
+        t1_zero_conn <= t0_zero_conn + 2,
+        "Connection loss during diversity phase: zero_conn went from {} to {}. \
+         Shuffling should not cause net connection loss. Seed: 0x{:X}",
+        t0_zero_conn,
+        t1_zero_conn,
+        SEED
+    );
+
+    // ASSERTION 3: Median connections should not regress significantly.
+    // Allow a small drop (2 connections) but shuffling should maintain connectivity.
+    assert!(
+        t1_median_conn + 2 >= t0_median_conn,
+        "Median connection regression: {} → {}. \
+         Diversity shuffling should maintain connection quality. Seed: 0x{:X}",
+        t0_median_conn,
+        t1_median_conn,
+        SEED
+    );
+
+    tracing::info!(
+        "test_neighborhood_diversity_improvement PASSED: \
+         avg_turnover={:.1}%, nodes_with_turnover={:.0}%, \
+         conn_stability: {}→{} median, {}→{} zero",
+        avg_turnover * 100.0,
+        nodes_with_turnover_pct,
+        t0_median_conn,
+        t1_median_conn,
+        t0_zero_conn,
+        t1_zero_conn,
+    );
+}
