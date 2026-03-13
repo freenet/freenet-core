@@ -26,9 +26,9 @@ mod secret;
 pub use secret::*;
 
 /// Default maximum number of connections for the peer.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 20;
+pub const DEFAULT_MAX_CONNECTIONS: usize = crate::ring::Ring::DEFAULT_MAX_CONNECTIONS;
 /// Default minimum number of connections for the peer.
-pub const DEFAULT_MIN_CONNECTIONS: usize = 10;
+pub const DEFAULT_MIN_CONNECTIONS: usize = crate::ring::Ring::DEFAULT_MIN_CONNECTIONS;
 /// Default threshold for randomizing potential peers for new connections.
 ///
 /// If the hops left for the operation is above or equal to this threshold
