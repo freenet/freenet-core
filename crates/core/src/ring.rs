@@ -152,9 +152,9 @@ pub struct PruneConnectionResult {
 }
 
 impl Ring {
-    const DEFAULT_MIN_CONNECTIONS: usize = 25;
+    pub const DEFAULT_MIN_CONNECTIONS: usize = 25;
 
-    const DEFAULT_MAX_CONNECTIONS: usize = 200;
+    pub const DEFAULT_MAX_CONNECTIONS: usize = 200;
 
     const DEFAULT_MAX_UPSTREAM_BANDWIDTH: Rate = Rate::new_per_second(1_000_000.0);
 
