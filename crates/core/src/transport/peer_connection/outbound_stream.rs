@@ -360,9 +360,14 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     let mut sent_so_far = 0u64;
     let mut fragment_number = 1u32;
     let mut pending_metadata = metadata;
+    // Leftover bytes from reducing fragment #1 payload to fit embedded metadata.
+    // Rather than creating an extra fragment (which cascades across hops), leftover
+    // is prepended to the next inbound fragment. This propagates through subsequent
+    // fragments until the last one absorbs it, maintaining the same fragment count.
+    let mut leftover: Option<Bytes> = None;
 
     while let Some(result) = stream.next().await {
-        let payload = match result {
+        let inbound_payload = match result {
             Ok(data) => data,
             Err(e) => {
                 let elapsed = time_source.now().saturating_sub(start_time);
@@ -376,6 +381,77 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 );
                 return Err(TransportError::ConnectionClosed(destination_addr));
             }
+        };
+
+        // Prepend any leftover from a previous fragment's metadata split.
+        let payload = if let Some(lo) = leftover.take() {
+            let mut combined = bytes::BytesMut::with_capacity(lo.len() + inbound_payload.len());
+            combined.extend_from_slice(&lo);
+            combined.extend_from_slice(&inbound_payload);
+            combined.freeze()
+        } else {
+            inbound_payload
+        };
+
+        // Embed metadata in fragment #1 for reliability (fix #2757).
+        // For piped streams, if the inbound payload is too large to fit metadata,
+        // reduce the payload and carry the remainder as leftover to prepend to the
+        // next fragment. This mirrors send_stream()'s approach of reducing fragment
+        // #1 payload to make room for metadata.
+        //
+        // Uses the module-level MAX_DATA_SIZE (packet_data::MAX_DATA_SIZE - 41) which
+        // accounts for StreamFragment serialization overhead, matching send_stream().
+        //
+        // The leftover propagates through subsequent fragments (each absorbs the
+        // previous leftover, possibly creating a new one if combined > MAX_DATA_SIZE)
+        // until the last fragment absorbs it. This maintains the same fragment count
+        // across hops, avoiding cascading fragment growth that would overflow the
+        // receiver's buffer.
+        let (metadata_bytes, payload) = if fragment_number == 1 {
+            if let Some(meta) = pending_metadata.take() {
+                let meta_overhead = 1 + 8 + meta.len();
+                let available = MAX_DATA_SIZE.saturating_sub(meta_overhead);
+                if payload.len() <= available {
+                    (Some(meta), payload)
+                } else if available > 0 {
+                    let leftover_bytes = payload.slice(available..);
+                    let leftover_len = leftover_bytes.len();
+                    let reduced = payload.slice(..available);
+                    tracing::debug!(
+                        stream_id = %outbound_stream_id.0,
+                        original_len = available + leftover_len,
+                        reduced_len = reduced.len(),
+                        leftover_len,
+                        meta_len = meta.len(),
+                        destination = %destination_addr,
+                        "Reduced piped fragment #1 payload to fit metadata"
+                    );
+                    leftover = Some(leftover_bytes);
+                    (Some(meta), reduced)
+                } else {
+                    tracing::warn!(
+                        stream_id = %outbound_stream_id.0,
+                        payload_len = payload.len(),
+                        meta_len = meta.len(),
+                        destination = %destination_addr,
+                        "Cannot fit any payload with metadata in piped fragment #1"
+                    );
+                    (None, payload)
+                }
+            } else {
+                (None, payload)
+            }
+        } else {
+            (None, payload)
+        };
+
+        // If the payload (possibly with prepended leftover) exceeds MAX_DATA_SIZE,
+        // truncate and carry the excess forward.
+        let payload = if payload.len() > MAX_DATA_SIZE {
+            leftover = Some(payload.slice(MAX_DATA_SIZE..));
+            payload.slice(..MAX_DATA_SIZE)
+        } else {
+            payload
         };
 
         let packet_size = payload.len();
@@ -425,35 +501,6 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             time_source.sleep(wait_time).await;
         }
 
-        // Embed metadata in fragment #1 for reliability (fix #2757).
-        // For piped streams, only embed if it fits within MAX_DATA_SIZE without
-        // exceeding the limit. If the fragment #1 payload is too large, skip
-        // embedding and rely on the separate metadata message instead.
-        let metadata_bytes = if fragment_number == 1 {
-            if let Some(meta) = pending_metadata.take() {
-                // Note: The 41-byte overhead already includes Option discriminant (1 byte)
-                // and length prefix (8 bytes). Only add the metadata data length.
-                let required_size = payload.len() + 41 + meta.len();
-                if required_size <= packet_data::MAX_DATA_SIZE {
-                    Some(meta)
-                } else {
-                    tracing::debug!(
-                        stream_id = %outbound_stream_id.0,
-                        payload_len = payload.len(),
-                        meta_len = meta.len(),
-                        required_size,
-                        max_size = packet_data::MAX_DATA_SIZE,
-                        "Skipping metadata embedding in piped fragment #1 - would exceed MAX_DATA_SIZE"
-                    );
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
         let token = congestion_controller.on_send_with_token(packet_size);
 
@@ -469,6 +516,57 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 fragment_number,
                 payload,
                 metadata_bytes,
+            },
+            sent_packet_tracker.as_ref(),
+            token,
+        )
+        .await
+        {
+            let elapsed = time_source.now().saturating_sub(start_time);
+            emit_transfer_failed(
+                outbound_stream_id.0 as u64,
+                destination_addr,
+                sent_so_far,
+                e.to_string(),
+                elapsed.as_millis() as u64,
+                TransferDirection::Send,
+            );
+            return Err(e);
+        }
+
+        sent_so_far += packet_size as u64;
+        fragment_number += 1;
+    }
+
+    // Leftover should always be absorbed by the last fragment since it is
+    // typically smaller than MAX_DATA_SIZE. In the degenerate case of a
+    // single-chunk stream where metadata overhead exceeds the available space,
+    // leftover could remain — send it as an additional fragment rather than
+    // silently dropping data.
+    if let Some(lo) = leftover.take() {
+        tracing::warn!(
+            stream_id = %outbound_stream_id.0,
+            leftover_len = lo.len(),
+            destination = %destination_addr,
+            "pipe_stream: sending residual leftover as extra fragment"
+        );
+
+        let packet_size = lo.len();
+        let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let token = congestion_controller.on_send_with_token(packet_size);
+
+        if let Err(e) = super::packet_sending(
+            destination_addr,
+            &socket,
+            packet_id,
+            &outbound_symmetric_key,
+            vec![],
+            symmetric_message::StreamFragment {
+                stream_id: outbound_stream_id,
+                total_length_bytes: total_bytes,
+                fragment_number,
+                payload: lo,
+                metadata_bytes: None,
             },
             sent_packet_tracker.as_ref(),
             token,
