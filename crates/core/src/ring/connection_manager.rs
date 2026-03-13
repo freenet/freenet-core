@@ -510,13 +510,16 @@ impl ConnectionManager {
         }
 
         if self.location_for_peer.read().get(&addr).is_some() {
-            // We've already accepted this peer (pending or active); treat as a no-op acceptance.
+            // Already connected or pending with this peer. Reject so the CONNECT
+            // routes uphill to discover new, unconnected peers. Without this,
+            // gap-based targeting repeatedly terminates at the same already-connected
+            // peer, preventing connection growth beyond the initial neighborhood.
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
-                "Peer already pending/connected; acknowledging acceptance"
+                "Peer already pending/connected; rejecting to route uphill for diversity"
             );
-            return true;
+            return false;
         }
 
         {
