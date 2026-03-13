@@ -7176,7 +7176,10 @@ fn test_auto_fetch_from_update_sender() {
 /// 3. Measure turnover: at least some nodes should have changed neighbors
 /// 4. Verify no catastrophic connection loss (zero-connection count stays low)
 /// 5. Verify gap scores remain stable or improve
+///
+/// NOTE: Gated by nightly_tests — runs ~8 min wall clock, exceeds CI timeout.
 #[test_log::test(tokio::test(flavor = "current_thread"))]
+#[cfg(feature = "nightly_tests")]
 async fn test_neighborhood_diversity_improvement() {
     use freenet::dev_tool::NodeLabel;
 
