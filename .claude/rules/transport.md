@@ -111,15 +111,15 @@ Keep-alive:
 ### WHEN closing connections
 
 ```
-Graceful:
-  1. Send final packets with delivery confirmation
-  2. Wait for ACK (timeout: 5 seconds)
-  3. Send explicit close message
-  4. Clean up state
+Current behavior (no wire-level close message):
+  → Local side: drop_connection_by_addr tears down local state and
+    exits the per-connection task. No packet sent to remote.
+  → Remote side: detects closure via keepalive timeout (120s idle).
+  → SymmetricMessagePayload has no Close/Goodbye variant.
 
-Timeout-based:
-  → No traffic for idle timeout
-  → Mark CLOSING, stop sending, cleanup after grace period
+NOTE: The transport has no graceful close protocol. When one side
+drops a connection, the remote peer must rely on the 120s idle
+timeout to detect it. This is a known limitation (#3545).
 ```
 
 ## Rate Limiting Rules
