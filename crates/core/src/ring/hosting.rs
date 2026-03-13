@@ -1458,6 +1458,102 @@ mod tests {
         );
     }
 
+    // Superseded: startup revalidation window removed in #3546 to prevent
+    // subscription accumulation storms. Hosted-only contracts are no longer
+    // proactively renewed at startup. Replaced by test_hosted_contracts_not_renewed_at_scale.
+    #[ignore]
+    #[test]
+    fn test_hosted_contract_renewed_despite_no_interest() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(42);
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        assert!(manager.is_hosting_contract(&contract));
+        // Before #3546: contracts_needing_renewal() included this during startup window
+        // After #3546: hosted-only contracts are never included
+        let renewals = manager.contracts_needing_renewal();
+        assert!(
+            !renewals.contains(&contract),
+            "Hosted contract should NOT be in renewal list (startup window removed in #3546)"
+        );
+    }
+
+    // Superseded: startup revalidation window removed in #3546.
+    // Hosted contracts loaded from disk are no longer auto-subscribed on startup.
+    #[ignore]
+    #[test]
+    fn test_startup_revalidation_includes_hosted_contracts() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        // Before #3546: during startup window, this would be in renewal list
+        // After #3546: hosted-only contracts are never renewed
+        let needs_renewal = manager.contracts_needing_renewal();
+        assert!(
+            !needs_renewal.contains(&contract),
+            "Hosted contract should NOT be in renewal list (startup window removed in #3546)"
+        );
+    }
+
+    // Superseded: startup revalidation window removed in #3546.
+    #[ignore]
+    #[test]
+    fn test_startup_revalidation_skips_already_subscribed() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.subscribe(contract);
+        let needs_renewal = manager.contracts_needing_renewal();
+        assert!(
+            !needs_renewal.contains(&contract),
+            "Already-subscribed contract should not be in renewal list"
+        );
+    }
+
+    // Superseded: startup revalidation window removed in #3546.
+    #[ignore]
+    #[test]
+    fn test_startup_revalidation_window_expires() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        let needs_renewal = manager.contracts_needing_renewal();
+        assert!(
+            !needs_renewal.contains(&contract),
+            "Hosted-only contract should NOT be in renewal list"
+        );
+    }
+
+    // Superseded: startup revalidation window removed in #3546.
+    #[ignore]
+    #[test]
+    fn test_startup_revalidation_multiple_contracts() {
+        let manager = HostingManager::new();
+        let contract_a = make_contract_key(1);
+        let contract_b = make_contract_key(2);
+        let contract_c = make_contract_key(3);
+        manager.record_contract_access(contract_a, 1000, AccessType::Get);
+        manager.record_contract_access(contract_b, 1000, AccessType::Get);
+        manager.record_contract_access(contract_c, 1000, AccessType::Get);
+        manager.subscribe(contract_b);
+        let client_id = crate::client_events::ClientId::next();
+        manager.add_client_subscription(contract_c.id(), client_id);
+        let needs_renewal = manager.contracts_needing_renewal();
+        // Before #3546: contract_a would be included by startup window
+        // After #3546: only contract_c (client subscription) is included
+        assert!(
+            !needs_renewal.contains(&contract_a),
+            "Hosted-only contract_a should NOT be included (startup window removed)"
+        );
+        assert!(
+            !needs_renewal.contains(&contract_b),
+            "Subscribed contract_b should be excluded (not expiring soon)"
+        );
+        assert!(
+            needs_renewal.contains(&contract_c),
+            "Client-subscribed contract_c should be included"
+        );
+    }
+
     /// Regression test for subscription accumulation (#3546).
     ///
     /// Verifies that hosting hundreds of contracts (simulating relay-cached
