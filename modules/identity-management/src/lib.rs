@@ -108,11 +108,14 @@ impl TryFrom<&[u8]> for IdentityManagement {
 #[delegate]
 impl DelegateInterface for IdentityManagement {
     fn process(
+        ctx: &mut DelegateCtx,
         params: Parameters<'static>,
-        _attested: Option<&'static [u8]>,
+        _origin: Option<MessageOrigin>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         let params = IdentityParams::try_from(params)?;
+        let secret_key =
+            serde_json::to_vec(&params).map_err(|e| DelegateError::Deser(format!("{e}")))?;
         match message {
             InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
                 payload,
@@ -120,21 +123,7 @@ impl DelegateInterface for IdentityManagement {
                 ..
             }) => {
                 let msg = IdentityMsg::try_from(&*payload)?;
-                let action = match msg {
-                    IdentityMsg::CreateIdentity { alias, key, extra } => {
-                        #[cfg(feature = "contract")]
-                        {
-                            freenet_stdlib::log::info(&format!(
-                                "create alias new {alias} for {}",
-                                params.as_secret_id()
-                            ));
-                        }
-                        serde_json::to_vec(&IdentityMsg::CreateIdentity { alias, key, extra })
-                            .unwrap()
-                    }
-                    IdentityMsg::DeleteIdentity { alias } => {
-                        serde_json::to_vec(&IdentityMsg::DeleteIdentity { alias }).unwrap()
-                    }
+                match msg {
                     IdentityMsg::Init => {
                         #[cfg(feature = "contract")]
                         {
@@ -143,59 +132,43 @@ impl DelegateInterface for IdentityManagement {
                                 params.as_secret_id()
                             ));
                         }
-                        let set_secret = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
-                            key: params.as_secret_id(),
-                            value: Some(
-                                serde_json::to_vec(&IdentityManagement::default()).unwrap(),
-                            ),
-                        });
-                        return Ok(vec![set_secret]);
+                        let default_value = serde_json::to_vec(&IdentityManagement::default())
+                            .map_err(|e| DelegateError::Deser(format!("{e}")))?;
+                        ctx.set_secret(&secret_key, &default_value);
+                        Ok(vec![])
                     }
-                };
-                let context: DelegateContext = DelegateContext::new(action);
-                let get_secret = OutboundDelegateMsg::GetSecretRequest(GetSecretRequest {
-                    key: SecretsId::new(serde_json::to_vec(&params).unwrap()),
-                    context,
-                    processed: false,
-                });
-                Ok(vec![get_secret])
-            }
-            InboundDelegateMsg::GetSecretResponse(GetSecretResponse {
-                value: Some(value),
-                context,
-                ..
-            }) => {
-                #[cfg(feature = "contract")]
-                {
-                    freenet_stdlib::log::info(&format!(
-                        "got request for {}",
-                        params.as_secret_id()
-                    ));
-                }
-                if !context.as_ref().is_empty() {
-                    let context = IdentityMsg::try_from(context.as_ref()).unwrap();
-                    let mut manager = IdentityManagement::try_from(&*value)?;
-                    match context {
-                        IdentityMsg::CreateIdentity { alias, key, extra } => {
-                            manager.identities.insert(alias, AliasInfo { key, extra });
+                    IdentityMsg::CreateIdentity { alias, key, extra } => {
+                        #[cfg(feature = "contract")]
+                        {
+                            freenet_stdlib::log::info(&format!(
+                                "create alias new {alias} for {}",
+                                params.as_secret_id()
+                            ));
                         }
-                        IdentityMsg::DeleteIdentity { alias } => {
-                            manager.identities.remove(alias.as_str());
-                        }
-                        IdentityMsg::Init => {
-                            unreachable!()
-                        }
-                    };
-                    let outbound = OutboundDelegateMsg::SetSecretRequest(SetSecretRequest {
-                        key: params.as_secret_id(),
-                        value: Some(serde_json::to_vec(&manager).unwrap()),
-                    });
-                    Ok(vec![outbound])
-                } else {
-                    Err(DelegateError::Other("invalid request".into()))
+                        let value = ctx
+                            .get_secret(&secret_key)
+                            .ok_or_else(|| DelegateError::Other("secret not found".into()))?;
+                        let mut manager = IdentityManagement::try_from(value.as_slice())?;
+                        manager.identities.insert(alias, AliasInfo { key, extra });
+                        let updated = serde_json::to_vec(&manager)
+                            .map_err(|e| DelegateError::Deser(format!("{e}")))?;
+                        ctx.set_secret(&secret_key, &updated);
+                        Ok(vec![])
+                    }
+                    IdentityMsg::DeleteIdentity { alias } => {
+                        let value = ctx
+                            .get_secret(&secret_key)
+                            .ok_or_else(|| DelegateError::Other("secret not found".into()))?;
+                        let mut manager = IdentityManagement::try_from(value.as_slice())?;
+                        manager.identities.remove(alias.as_str());
+                        let updated = serde_json::to_vec(&manager)
+                            .map_err(|e| DelegateError::Deser(format!("{e}")))?;
+                        ctx.set_secret(&secret_key, &updated);
+                        Ok(vec![])
+                    }
                 }
             }
-            _ => unreachable!(),
+            _ => Err(DelegateError::Other("unexpected message type".into())),
         }
     }
 }
