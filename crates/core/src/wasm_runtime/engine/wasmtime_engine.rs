@@ -205,7 +205,7 @@ impl ResourceLimiter for HostState {
         current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> std::result::Result<bool, WasmtimeError> {
         if desired > self.memory_limit_bytes {
             tracing::warn!(
                 current_bytes = current,
@@ -224,7 +224,7 @@ impl ResourceLimiter for HostState {
         _current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> std::result::Result<bool, WasmtimeError> {
         // Allow table growth up to a reasonable limit
         const MAX_TABLE_ELEMENTS: usize = 10_000;
         Ok(desired <= MAX_TABLE_ELEMENTS)
@@ -266,7 +266,7 @@ impl WasmEngine for WasmtimeEngine {
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|state| state); // Enable ResourceLimiter
         if enabled_metering {
-            store.set_fuel(max_fuel)?;
+            store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
         }
 
         // Host memory sharing is not yet implemented in the wasmtime backend.
@@ -336,7 +336,9 @@ impl WasmEngine for WasmtimeEngine {
 
         // Reset fuel if metering is enabled
         if self.enabled_metering {
-            store.set_fuel(self.max_fuel).map_err(WasmError::Other)?;
+            store
+                .set_fuel(self.max_fuel)
+                .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
         }
 
         // Instantiate the module using the pre-configured linker
@@ -684,7 +686,7 @@ impl WasmtimeEngine {
         let mut store = Store::new(&backend, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|state| state);
         if enabled_metering {
-            store.set_fuel(max_fuel)?;
+            store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
         }
 
         if host_mem {
@@ -765,7 +767,8 @@ impl WasmtimeEngine {
             }
         }
 
-        let engine = Engine::new(&wasmtime_config).map_err(WasmError::Other)?;
+        let engine =
+            Engine::new(&wasmtime_config).map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         Ok((engine, max_fuel, config.enable_metering))
     }
@@ -863,7 +866,7 @@ impl WasmtimeEngine {
                     native_api::log::info(id, ptr, len);
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         // Rand namespace
         linker
@@ -875,7 +878,7 @@ impl WasmtimeEngine {
                     native_api::rand::rand_bytes(id, ptr, len);
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         // Time namespace
         linker
@@ -887,7 +890,7 @@ impl WasmtimeEngine {
                     native_api::time::utc_now(id, ptr);
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         // Delegate context namespace (synchronous)
         // These use the thread-local CURRENT_DELEGATE_INSTANCE for the instance ID.
@@ -901,7 +904,7 @@ impl WasmtimeEngine {
                     native_api::delegate_context::context_len()
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap(
@@ -913,7 +916,7 @@ impl WasmtimeEngine {
                     native_api::delegate_context::context_read(ptr, len)
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap(
@@ -925,7 +928,7 @@ impl WasmtimeEngine {
                     native_api::delegate_context::context_write(ptr, len)
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         // Delegate secrets namespace (synchronous)
         linker
@@ -942,7 +945,7 @@ impl WasmtimeEngine {
                     native_api::delegate_secrets::get_secret(key_ptr, key_len, out_ptr, out_len)
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap(
@@ -954,7 +957,7 @@ impl WasmtimeEngine {
                     native_api::delegate_secrets::get_secret_len(key_ptr, key_len)
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap(
@@ -970,7 +973,7 @@ impl WasmtimeEngine {
                     native_api::delegate_secrets::set_secret(key_ptr, key_len, val_ptr, val_len)
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap(
@@ -982,7 +985,7 @@ impl WasmtimeEngine {
                     native_api::delegate_secrets::has_secret(key_ptr, key_len)
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap(
@@ -994,7 +997,7 @@ impl WasmtimeEngine {
                     native_api::delegate_secrets::remove_secret(key_ptr, key_len)
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         // Delegate contracts namespace (async host functions for V2 delegates)
         // These are registered as async to support future async operations,
@@ -1023,7 +1026,7 @@ impl WasmtimeEngine {
                     })
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap_async(
@@ -1037,7 +1040,7 @@ impl WasmtimeEngine {
                     })
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap_async(
@@ -1054,7 +1057,7 @@ impl WasmtimeEngine {
                     })
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap_async(
@@ -1071,7 +1074,7 @@ impl WasmtimeEngine {
                     })
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
             .func_wrap_async(
@@ -1085,7 +1088,7 @@ impl WasmtimeEngine {
                     })
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         // ============================================================
         // freenet_delegate_management namespace — delegate creation
@@ -1121,7 +1124,7 @@ impl WasmtimeEngine {
                     })
                 },
             )
-            .map_err(WasmError::Other)?;
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         Ok(())
     }
