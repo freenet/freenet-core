@@ -718,11 +718,8 @@ impl WasmtimeEngine {
             wasmtime_config.consume_fuel(true);
         }
 
-        // Enable async support (needed for async host functions)
-        wasmtime_config.async_support(true);
-
         // Set memory limits via config
-        // async_stack_size must exceed max_wasm_stack when async_support is enabled
+        // async_stack_size must exceed max_wasm_stack
         wasmtime_config.max_wasm_stack(WASM_STACK_SIZE);
         wasmtime_config.async_stack_size(WASM_STACK_SIZE * 2);
 
