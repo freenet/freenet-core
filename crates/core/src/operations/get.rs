@@ -4388,29 +4388,30 @@ mod tests {
         // Transaction was created at ~1_700_000_000_000 (base + tiny counter offset)
         let base_ms = 1_700_000_000_000u64;
 
-        let threshold = std::time::Duration::from_secs(20);
+        // ACK_TIMEOUT is 3s (matches op_state_manager.rs GC task)
+        let threshold = std::time::Duration::from_secs(3);
 
-        // At 25s: retry_count=0 threshold=20s → eligible
-        GlobalSimulationTime::set_time_ms(base_ms + 25_000);
+        // At 4s: retry_count=0 threshold=3s → eligible
+        GlobalSimulationTime::set_time_ms(base_ms + 4_000);
         let base_0 = threshold * 1;
-        assert!(tx.elapsed() > base_0, "First retry should fire at ~20s");
+        assert!(tx.elapsed() > base_0, "First retry should fire at ~3s");
 
-        // At 25s: retry_count=1 threshold=40s → NOT eligible
+        // At 4s: retry_count=1 threshold=6s → NOT eligible
         let base_1 = threshold * 2;
         assert!(
             tx.elapsed() < base_1,
-            "Second retry should NOT fire at 25s (needs ~40s)"
+            "Second retry should NOT fire at 4s (needs ~6s)"
         );
 
-        // At 45s: retry_count=1 threshold=40s → eligible
-        GlobalSimulationTime::set_time_ms(base_ms + 45_000);
-        assert!(tx.elapsed() > base_1, "Second retry should fire at ~40s");
+        // At 7s: retry_count=1 threshold=6s → eligible
+        GlobalSimulationTime::set_time_ms(base_ms + 7_000);
+        assert!(tx.elapsed() > base_1, "Second retry should fire at ~6s");
 
-        // At 45s: retry_count=2 threshold=60s → NOT eligible
+        // At 7s: retry_count=2 threshold=9s → NOT eligible
         let base_2 = threshold * 3;
         assert!(
             tx.elapsed() < base_2,
-            "Third retry should NOT fire at 45s (needs ~60s)"
+            "Third retry should NOT fire at 7s (needs ~9s)"
         );
     }
 
@@ -4438,12 +4439,38 @@ mod tests {
     }
 
     // === Tests for ACK-aware GC retry logic ===
+    //
+    // These tests replicate the GC task's decision logic from op_state_manager.rs
+    // to verify the retry/skip conditions at the unit level.
+
+    /// Helper that replicates the GC task's retry eligibility check for a GET op.
+    /// Returns true if the op would be selected as a retry candidate.
+    fn gc_would_retry(op: &GetOp, retry_count: usize) -> bool {
+        const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        const MAX_SPECULATIVE_PATHS: u8 = 2;
+
+        // Must be originator
+        if !op.is_client_initiated() {
+            return false;
+        }
+        // ACK received → trust chain, don't retry
+        if op.ack_received {
+            return false;
+        }
+        // Capped speculative paths
+        if op.speculative_paths >= MAX_SPECULATIVE_PATHS {
+            return false;
+        }
+        // Check elapsed vs threshold (without jitter for deterministic testing)
+        let elapsed = op.id.elapsed();
+        let base = ACK_TIMEOUT * (retry_count as u32 + 1);
+        elapsed > base
+    }
 
     #[test]
     fn ack_received_prevents_gc_retry() {
         use crate::config::GlobalSimulationTime;
 
-        // Create op with ack_received = true
         let base_ms = 1_700_000_000_000;
         GlobalSimulationTime::set_time_ms(base_ms);
 
@@ -4453,25 +4480,27 @@ mod tests {
         // Advance time well past ACK_TIMEOUT (3s)
         GlobalSimulationTime::set_time_ms(base_ms + 10_000);
 
-        // The GC task logic checks ack_received before retrying.
-        // When ack_received is true, the op should NOT be considered for retry.
         assert!(
-            op.ack_received,
-            "Op with ack_received should not be retried"
+            !gc_would_retry(&op, 0),
+            "Op with ack_received should NOT be retried by GC"
         );
     }
 
     #[test]
     fn speculative_paths_caps_at_max() {
-        // Create op at max speculative paths
+        use crate::config::GlobalSimulationTime;
+
+        let base_ms = 1_700_000_000_000;
+        GlobalSimulationTime::set_time_ms(base_ms);
+
         let mut op = make_awaiting_op(vec![make_peer(5001), make_peer(5002)], &[]);
         op.speculative_paths = 2; // MAX_SPECULATIVE_PATHS
 
-        // The GC task checks speculative_paths < MAX_SPECULATIVE_PATHS.
-        // At the cap, no more retries should be attempted.
+        GlobalSimulationTime::set_time_ms(base_ms + 10_000);
+
         assert!(
-            op.speculative_paths >= 2,
-            "Op at max speculative paths should not be retried"
+            !gc_would_retry(&op, 0),
+            "Op at MAX_SPECULATIVE_PATHS should NOT be retried by GC"
         );
     }
 
@@ -4479,7 +4508,6 @@ mod tests {
     fn no_ack_allows_gc_retry_after_timeout() {
         use crate::config::GlobalSimulationTime;
 
-        // Create op with ack_received = false (default)
         let base_ms = 1_700_000_000_000;
         GlobalSimulationTime::set_time_ms(base_ms);
 
@@ -4487,18 +4515,53 @@ mod tests {
         assert!(!op.ack_received);
         assert_eq!(op.speculative_paths, 0);
 
-        // Advance time past ACK_TIMEOUT (3s)
-        GlobalSimulationTime::set_time_ms(base_ms + 4_000);
-
-        // The op should be eligible for retry
-        let elapsed = op.id.elapsed();
+        // Before ACK_TIMEOUT — should NOT retry
+        GlobalSimulationTime::set_time_ms(base_ms + 2_000);
         assert!(
-            elapsed > std::time::Duration::from_secs(3),
-            "Op without ACK should be retryable after 3s"
+            !gc_would_retry(&op, 0),
+            "Op should NOT be retried before ACK_TIMEOUT (3s)"
+        );
+
+        // After ACK_TIMEOUT — SHOULD retry
+        GlobalSimulationTime::set_time_ms(base_ms + 4_000);
+        assert!(
+            gc_would_retry(&op, 0),
+            "Op without ACK should be retried after 3s"
         );
 
         // And retry should succeed since alternatives exist
         let result = op.retry_with_next_alternative(7, &[]);
         assert!(result.is_ok(), "Should retry with available alternative");
+    }
+
+    #[test]
+    fn gc_retry_increments_speculative_paths_and_resets_ack() {
+        use crate::config::GlobalSimulationTime;
+
+        let base_ms = 1_700_000_000_000;
+        GlobalSimulationTime::set_time_ms(base_ms);
+
+        let mut op = make_awaiting_op(vec![make_peer(5001), make_peer(5002)], &[]);
+        assert_eq!(op.speculative_paths, 0);
+        assert!(!op.ack_received);
+
+        // Simulate first retry (as GC task does)
+        GlobalSimulationTime::set_time_ms(base_ms + 4_000);
+        let (mut new_op, _msg) = op
+            .retry_with_next_alternative(7, &[])
+            .map_err(|_| "retry_with_next_alternative failed")
+            .unwrap();
+        new_op.speculative_paths += 1;
+        new_op.ack_received = false;
+
+        assert_eq!(new_op.speculative_paths, 1);
+        assert!(!new_op.ack_received);
+
+        // After ACK arrives on the new path
+        new_op.ack_received = true;
+        assert!(
+            !gc_would_retry(&new_op, 1),
+            "Op with ACK on new path should NOT be retried"
+        );
     }
 }

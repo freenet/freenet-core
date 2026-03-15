@@ -1418,7 +1418,8 @@ impl<'a> NetEventLog<'a> {
                 })
             }
             // ForwardingAck is advisory — no telemetry event needed
-            NetMessageV1::Subscribe(SubscribeMsg::ForwardingAck { .. }) => EventKind::Ignored,
+            NetMessageV1::Get(GetMsg::ForwardingAck { .. })
+            | NetMessageV1::Subscribe(SubscribeMsg::ForwardingAck { .. }) => EventKind::Ignored,
             NetMessageV1::Connect(_)
             | NetMessageV1::Put(_)
             | NetMessageV1::Get(_)

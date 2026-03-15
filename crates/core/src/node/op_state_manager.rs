@@ -1522,7 +1522,11 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     for entry in ops.get.iter() {
                         let tx = *entry.key();
                         let get_op = entry.value();
-                        let elapsed = tx.elapsed();
+
+                        // Only the originator speculates — relays just forward and ACK.
+                        if !get_op.is_client_initiated() {
+                            continue;
+                        }
 
                         // If ACK received, the downstream chain is alive — don't retry.
                         // Wait for OPERATION_TTL to expire naturally.
@@ -1536,13 +1540,21 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         }
 
                         // No ACK after ACK_TIMEOUT — speculative retry with ±20% jitter
+                        let elapsed = tx.elapsed();
                         let retry_count = get_retried.get(&tx).copied().unwrap_or(0);
                         let base = ACK_TIMEOUT * (retry_count as u32 + 1);
-                        let jitter_factor: f64 =
-                            crate::config::GlobalRng::random_range(0.8..=1.2);
-                        let jitter = base.mul_f64(jitter_factor);
-                        if elapsed > jitter {
-                            retry_candidates.push(tx);
+                        // Only consume GlobalRng when elapsed exceeds 80% of base
+                        // (minimum possible jittered threshold). This avoids shifting
+                        // the global RNG state on every GC tick for ops that are
+                        // nowhere near retry time.
+                        let min_jittered = base.mul_f64(0.8);
+                        if elapsed > min_jittered {
+                            let jitter_factor: f64 =
+                                crate::config::GlobalRng::random_range(0.8..=1.2);
+                            let jitter = base.mul_f64(jitter_factor);
+                            if elapsed > jitter {
+                                retry_candidates.push(tx);
+                            }
                         }
                     }
 
