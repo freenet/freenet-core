@@ -449,7 +449,7 @@ impl OpManager {
     /// Uses try_send to avoid blocking the caller (which may be the node
     /// event loop). If the result router channel is full, the result is
     /// dropped and the client will see a timeout.
-    pub(crate) async fn send_client_result(&self, tx: Transaction, host_result: HostResult) {
+    pub(crate) fn send_client_result(&self, tx: Transaction, host_result: HostResult) {
         if let Err(err) = self.result_router_tx.try_send((tx, host_result)) {
             tracing::error!(
                 %tx,
