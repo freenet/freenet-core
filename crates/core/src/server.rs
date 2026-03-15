@@ -376,6 +376,7 @@ pub(crate) type AllowedHosts = Arc<HashSet<String>>;
 /// The set includes:
 /// - Localhost variants (localhost, 127.0.0.1, [::1]) — always allowed
 /// - The machine's hostname (via `hostname::get()`)
+/// - The machine's IP addresses (resolved from hostname)
 /// - The bound IP address (if not unspecified/0.0.0.0)
 /// - Any explicitly configured hostnames (`--allowed-host`)
 /// - All of the above with and without the port suffix
@@ -398,10 +399,16 @@ fn build_allowed_hosts(
     add("127.0.0.1");
     add("[::1]");
 
-    // Add machine hostname
+    // Add machine hostname and resolve its IPs
     if let Ok(name) = hostname::get() {
         if let Some(name_str) = name.to_str() {
             add(name_str);
+            // Resolve hostname to IPs so LAN access via IP works when bound to 0.0.0.0
+            if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(name_str, port)) {
+                for addr in addrs {
+                    add(&addr.ip().to_string());
+                }
+            }
         }
     }
 
