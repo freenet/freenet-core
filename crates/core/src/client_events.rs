@@ -350,11 +350,12 @@ async fn report_op_init_error(
 
     let error_response = Err(error_kind.into());
 
-    if let Err(e) = op_manager.result_router_tx.send((tx, error_response)).await {
+    if let Err(e) = op_manager.result_router_tx.try_send((tx, error_response)) {
         tracing::error!(
             tx = %tx,
             error = %e,
-            "Failed to send {op_name} error to result router"
+            "Failed to send {op_name} error to result router \
+             (channel full or closed)"
         );
     }
 

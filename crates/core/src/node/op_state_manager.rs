@@ -444,17 +444,18 @@ impl OpManager {
         }
     }
 
-    /// Send a result to the client via the result router, awaiting delivery.
+    /// Send a result to the client via the result router.
     ///
-    /// This ensures the result is actually queued for delivery before returning,
-    /// preventing race conditions where the operation is marked complete before
-    /// the client receives the response.
+    /// Uses try_send to avoid blocking the caller (which may be the node
+    /// event loop). If the result router channel is full, the result is
+    /// dropped and the client will see a timeout.
     pub(crate) async fn send_client_result(&self, tx: Transaction, host_result: HostResult) {
-        if let Err(err) = self.result_router_tx.send((tx, host_result)).await {
+        if let Err(err) = self.result_router_tx.try_send((tx, host_result)) {
             tracing::error!(
                 %tx,
                 error = %err,
-                "failed to dispatch operation result to client"
+                "failed to dispatch operation result to client \
+                 (result router channel full or closed)"
             );
             return;
         }
@@ -462,8 +463,7 @@ impl OpManager {
         if let Err(err) = self
             .to_event_listener
             .notifications_sender
-            .send(Either::Right(NodeEvent::TransactionCompleted(tx)))
-            .await
+            .try_send(Either::Right(NodeEvent::TransactionCompleted(tx)))
         {
             tracing::warn!(
                 %tx,
@@ -474,24 +474,23 @@ impl OpManager {
     }
 
     /// Fire-and-forget version for cases where blocking is not acceptable.
-    /// Use sparingly - prefer send_client_result() to ensure delivery.
     fn spawn_client_result(&self, tx: Transaction, host_result: HostResult) {
         let router_tx = self.result_router_tx.clone();
         let notifier = self.to_event_listener.clone();
         GlobalExecutor::spawn(async move {
-            if let Err(err) = router_tx.send((tx, host_result)).await {
+            if let Err(err) = router_tx.try_send((tx, host_result)) {
                 tracing::error!(
                     %tx,
                     error = %err,
-                    "failed to dispatch operation result to client"
+                    "failed to dispatch operation result to client \
+                     (result router channel full or closed)"
                 );
                 return;
             }
 
             if let Err(err) = notifier
                 .notifications_sender
-                .send(Either::Right(NodeEvent::TransactionCompleted(tx)))
-                .await
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(tx)))
             {
                 tracing::warn!(
                     %tx,
@@ -1808,7 +1807,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 cause: format!("Sub-operation {} timed out", tx).into(),
                             }.into());
 
-                            if let Err(e) = result_router_tx.send((parent_tx, error_result)).await {
+                            if let Err(e) = result_router_tx.try_send((parent_tx, error_result)) {
                                 tracing::warn!(tx = %parent_tx, error = %e, "failed to send sub-op timeout to result router");
                             }
                         }
@@ -1900,7 +1899,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 cause: format!("Sub-operation {} timed out", tx).into(),
                             }.into());
 
-                            if let Err(e) = result_router_tx.send((parent_tx, error_result)).await {
+                            if let Err(e) = result_router_tx.try_send((parent_tx, error_result)) {
                                 tracing::warn!(tx = %parent_tx, error = %e, "failed to send sub-op timeout to result router");
                             }
                         }

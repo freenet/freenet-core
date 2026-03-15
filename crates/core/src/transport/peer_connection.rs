@@ -1369,8 +1369,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // New stream - register with streaming registry
                     let streaming_handle = self
                         .streaming_registry
-                        .register(stream_id, total_length_bytes)
-                        .await;
+                        .register(stream_id, total_length_bytes);
                     if let Err(e) = streaming_handle.push_fragment(fragment_number, payload.clone())
                     {
                         if matches!(e, streaming::StreamError::Cancelled) {
