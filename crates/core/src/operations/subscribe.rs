@@ -223,6 +223,8 @@ pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> Sub
         requester_pub_key: None,
         is_renewal,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     }
 }
 
@@ -243,6 +245,8 @@ pub(crate) fn start_op_with_id(
         requester_pub_key: None,
         is_renewal,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     }
 }
 
@@ -272,6 +276,8 @@ pub(crate) fn create_unsubscribe_op(
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     }
 }
 
@@ -450,6 +456,8 @@ pub(crate) async fn request_subscribe(
             target_peer: target.clone(),
             contract_location: Location::from(instance_id),
         }),
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     // Renewals use non-blocking send to fail fast under congestion rather
@@ -543,6 +551,12 @@ pub(crate) struct SubscribeOp {
     is_renewal: bool,
     /// Routing stats for failure reporting.
     stats: Option<SubscribeStats>,
+    /// True when a downstream relay has acknowledged forwarding this request.
+    /// Used by the GC task to distinguish "peer is dead" from "peer is working on it".
+    pub(crate) ack_received: bool,
+    /// Number of speculative parallel paths launched by the originator's GC task.
+    /// Capped at MAX_SPECULATIVE_PATHS to bound network overhead.
+    pub(crate) speculative_paths: u8,
 }
 
 impl SubscribeOp {
@@ -844,6 +858,8 @@ impl SubscribeOp {
                             s.target_peer = next_target.clone();
                             s
                         }),
+                        ack_received: false,
+                        speculative_paths: 0,
                     };
 
                     op_manager
@@ -907,6 +923,8 @@ impl SubscribeOp {
                                 s.target_peer = next_target.clone();
                                 s
                             }),
+                            ack_received: false,
+                            speculative_paths: 0,
                         };
 
                         op_manager
@@ -936,6 +954,8 @@ impl SubscribeOp {
                     requester_pub_key,
                     is_renewal,
                     stats,
+                    ack_received: false,
+                    speculative_paths: 0,
                 };
 
                 op_manager
@@ -1095,6 +1115,7 @@ impl Operation for SubscribeOp {
             SubscribeMsg::Request { .. } => "Request",
             SubscribeMsg::Response { .. } => "Response",
             SubscribeMsg::Unsubscribe { .. } => "Unsubscribe",
+            SubscribeMsg::ForwardingAck { .. } => "ForwardingAck",
         };
         tracing::debug!(
             tx = %id,
@@ -1125,12 +1146,15 @@ impl Operation for SubscribeOp {
             Ok(None) => {
                 // Check if this is a response message - if so, the operation was likely
                 // cleaned up due to timeout and we should not create a new operation
-                if matches!(msg, SubscribeMsg::Response { .. }) {
+                if matches!(
+                    msg,
+                    SubscribeMsg::Response { .. } | SubscribeMsg::ForwardingAck { .. }
+                ) {
                     tracing::debug!(
                         tx = %id,
                         %msg_type,
                         phase = "load_or_init",
-                        "SUBSCRIBE_OP_MISSING: response arrived for non-existent operation"
+                        "SUBSCRIBE_OP_MISSING: response/ack arrived for non-existent operation"
                     );
                     return Err(OpError::OpNotPresent(id));
                 }
@@ -1143,7 +1167,9 @@ impl Operation for SubscribeOp {
                         ..
                     } => (*is_renewal, *instance_id),
                     SubscribeMsg::Unsubscribe { instance_id, .. } => (false, *instance_id),
-                    _ => unreachable!("Response case handled above"),
+                    SubscribeMsg::Response { .. } | SubscribeMsg::ForwardingAck { .. } => {
+                        unreachable!("Response/ForwardingAck handled above")
+                    }
                 };
                 // Resolve requester's public key at init time, when the connection
                 // is freshest. This avoids addr->pubkey lookup failures during NAT
@@ -1172,6 +1198,8 @@ impl Operation for SubscribeOp {
                         requester_pub_key,
                         is_renewal,
                         stats: None,
+                        ack_received: false,
+                        speculative_paths: 0,
                     },
                     source_addr,
                 })
@@ -1186,7 +1214,7 @@ impl Operation for SubscribeOp {
 
     fn process_message<'a, NB: NetworkBridge>(
         self,
-        _conn_manager: &'a mut NB,
+        conn_manager: &'a mut NB,
         op_manager: &'a OpManager,
         input: &'a Self::Message,
         source_addr: Option<std::net::SocketAddr>,
@@ -1252,6 +1280,8 @@ impl Operation for SubscribeOp {
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
+                                    ack_received: false,
+                                    speculative_paths: 0,
                                 },
                             )));
                         }
@@ -1300,6 +1330,8 @@ impl Operation for SubscribeOp {
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
+                                    ack_received: false,
+                                    speculative_paths: 0,
                                 },
                             )));
                         }
@@ -1369,6 +1401,17 @@ impl Operation for SubscribeOp {
 
                     tracing::debug!(tx = %id, %instance_id, next = %next_addr, alternatives = candidates.len(), is_renewal, "Forwarding subscribe request");
 
+                    // Send ForwardingAck to requester peer before forwarding.
+                    // This tells the requester "I'm working on it" so the GC task
+                    // can distinguish dead peers from slow multi-hop chains.
+                    if let Some(requester) = self.requester_addr {
+                        let ack = NetMessage::from(SubscribeMsg::ForwardingAck {
+                            id: *id,
+                            instance_id: *instance_id,
+                        });
+                        drop(conn_manager.send(requester, ack).await);
+                    }
+
                     Ok(OperationResult::SendAndContinue {
                         msg: NetMessage::from(SubscribeMsg::Request {
                             id: *id,
@@ -1399,6 +1442,8 @@ impl Operation for SubscribeOp {
                                 target_peer: next_hop.clone(),
                                 contract_location: Location::from(instance_id),
                             }),
+                            ack_received: false,
+                            speculative_paths: 0,
                         }),
                         stream_data: None,
                     })
@@ -1554,6 +1599,8 @@ impl Operation for SubscribeOp {
                                         requester_pub_key: None,
                                         is_renewal: self.is_renewal,
                                         stats: self.stats,
+                                        ack_received: false,
+                                        speculative_paths: 0,
                                     },
                                 )))
                             }
@@ -1648,6 +1695,8 @@ impl Operation for SubscribeOp {
                                                 s.target_peer = next_target.clone();
                                                 s
                                             }),
+                                            ack_received: false,
+                                            speculative_paths: 0,
                                         }),
                                         stream_data: None,
                                     });
@@ -1715,6 +1764,8 @@ impl Operation for SubscribeOp {
                                                     s.target_peer = next_target.clone();
                                                     s
                                                 }),
+                                                ack_received: false,
+                                                speculative_paths: 0,
                                             }),
                                             stream_data: None,
                                         });
@@ -1812,6 +1863,8 @@ impl Operation for SubscribeOp {
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                             stats: self.stats,
+                                            ack_received: false,
+                                            speculative_paths: 0,
                                         },
                                     )))
                                 } else {
@@ -1858,6 +1911,8 @@ impl Operation for SubscribeOp {
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                             stats: self.stats,
+                                            ack_received: false,
+                                            speculative_paths: 0,
                                         },
                                     )))
                                 }
@@ -1948,6 +2003,22 @@ impl Operation for SubscribeOp {
 
                     Ok(OperationResult::Completed)
                 }
+
+                SubscribeMsg::ForwardingAck { id, instance_id } => {
+                    // A downstream relay has acknowledged forwarding our request.
+                    // Mark the op so the GC task knows the chain is alive.
+                    tracing::debug!(
+                        tx = %id,
+                        %instance_id,
+                        "Received forwarding ACK from downstream relay"
+                    );
+                    Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
+                        SubscribeOp {
+                            ack_received: true,
+                            ..self
+                        },
+                    )))
+                }
             }
         })
     }
@@ -2012,6 +2083,15 @@ mod messages {
             id: Transaction,
             instance_id: ContractInstanceId,
         },
+
+        /// Lightweight ACK sent by a relay peer back to its upstream when it forwards
+        /// a SUBSCRIBE request to the next hop. Tells the upstream "I'm working on it"
+        /// so the GC task can distinguish dead peers from slow multi-hop chains.
+        /// Fire-and-forget — no response expected.
+        ForwardingAck {
+            id: Transaction,
+            instance_id: ContractInstanceId,
+        },
     }
 
     impl InnerMessage for SubscribeMsg {
@@ -2019,7 +2099,8 @@ mod messages {
             match self {
                 Self::Request { id, .. }
                 | Self::Response { id, .. }
-                | Self::Unsubscribe { id, .. } => id,
+                | Self::Unsubscribe { id, .. }
+                | Self::ForwardingAck { id, .. } => id,
             }
         }
 
@@ -2027,7 +2108,8 @@ mod messages {
             match self {
                 Self::Request { instance_id, .. }
                 | Self::Response { instance_id, .. }
-                | Self::Unsubscribe { instance_id, .. } => Some(Location::from(instance_id)),
+                | Self::Unsubscribe { instance_id, .. }
+                | Self::ForwardingAck { instance_id, .. } => Some(Location::from(instance_id)),
             }
         }
     }
@@ -2057,6 +2139,12 @@ mod messages {
                     write!(
                         f,
                         "Subscribe::Unsubscribe(id: {id}, contract: {instance_id})"
+                    )
+                }
+                Self::ForwardingAck { instance_id, .. } => {
+                    write!(
+                        f,
+                        "Subscribe::ForwardingAck(id: {id}, instance_id: {instance_id})"
                     )
                 }
             }

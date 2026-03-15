@@ -1417,6 +1417,8 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
+            // ForwardingAck is advisory — no telemetry event needed
+            NetMessageV1::Subscribe(SubscribeMsg::ForwardingAck { .. }) => EventKind::Ignored,
             NetMessageV1::Connect(_)
             | NetMessageV1::Put(_)
             | NetMessageV1::Get(_)
