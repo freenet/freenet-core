@@ -134,6 +134,7 @@ impl Default for ConfigArgs {
                 ws_api_port: Some(default_ws_api_port()),
                 token_ttl_seconds: None,
                 token_cleanup_interval_seconds: None,
+                allowed_host: None,
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -617,6 +618,7 @@ impl ConfigArgs {
                     .ws_api
                     .token_cleanup_interval_seconds
                     .unwrap_or(default_token_cleanup_interval_seconds()),
+                allowed_hosts: self.ws_api.allowed_host.unwrap_or_default(),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -1218,7 +1220,7 @@ fn default_bbr_startup_rate() -> Option<u64> {
     None
 }
 
-#[derive(clap::Parser, Debug, Default, Copy, Clone, Serialize, Deserialize)]
+#[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiArgs {
     /// Address to bind to for the websocket API, default is 0.0.0.0
     #[arg(
@@ -1246,6 +1248,14 @@ pub struct WebsocketApiArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub token_cleanup_interval_seconds: Option<u64>,
+
+    /// Additional hostname(s) to accept in the Host header for WebSocket connections.
+    /// Use when accessing the node via a custom domain (e.g., through a reverse proxy).
+    /// Can be specified multiple times. If omitted, only the machine's hostname and
+    /// bound IP are accepted.
+    #[arg(long, env = "ALLOWED_HOST")]
+    #[serde(rename = "allowed-host", skip_serializing_if = "Option::is_none")]
+    pub allowed_host: Option<Vec<String>>,
 }
 
 /// Default telemetry endpoint (nova.locut.us OTLP collector).
@@ -1340,7 +1350,7 @@ impl Default for TelemetryConfig {
     }
 }
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiConfig {
     /// Address to bind to
     #[serde(default = "default_listening_address", rename = "ws-api-address")]
@@ -1360,6 +1370,11 @@ pub struct WebsocketApiConfig {
         rename = "token-cleanup-interval-seconds"
     )]
     pub token_cleanup_interval_seconds: u64,
+
+    /// Additional hostnames allowed in the Host header for WebSocket connections.
+    /// Empty means only auto-detected hostnames (machine hostname + bound IP) are allowed.
+    #[serde(default, rename = "allowed-host")]
+    pub allowed_hosts: Vec<String>,
 }
 
 #[inline]
@@ -1379,6 +1394,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             port: addr.port(),
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -1391,6 +1407,7 @@ impl Default for WebsocketApiConfig {
             port: default_ws_api_port(),
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
+            allowed_hosts: Vec::new(),
         }
     }
 }

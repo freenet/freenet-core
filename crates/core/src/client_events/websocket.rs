@@ -161,27 +161,19 @@ fn is_localhost_origin(origin: &str) -> bool {
     prefixes.iter().any(|p| origin.starts_with(p)) || exact.contains(&origin)
 }
 
-/// Checks if the WebSocket Origin header matches the request's Host header (same-origin check).
+/// Checks if the request's Host header matches the server's allowed hostnames.
 ///
-/// Extracts the host portion from the Origin URL (e.g. "nova.locut.us:7509" from
-/// "http://nova.locut.us:7509") and compares it against the Host header. This allows
-/// remote browsers to connect back to the same server while blocking cross-site attacks.
-fn is_same_origin(origin: &str, headers: &axum::http::HeaderMap) -> bool {
+/// This prevents DNS rebinding attacks: instead of comparing Origin against Host
+/// (both attacker-controlled), we validate Host against the server's known addresses
+/// (auto-detected at startup + operator-configured via --allowed-host).
+fn is_allowed_host(headers: &axum::http::HeaderMap, allowed_hosts: &HashSet<String>) -> bool {
     let Some(host_header) = headers
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
     else {
         return false;
     };
-    // Extract host from origin URL: "http://host:port" -> "host:port"
-    let origin_host = origin
-        .find("://")
-        .map(|i| &origin[i + 3..])
-        .unwrap_or(origin);
-    // Strip any trailing path from origin host
-    let origin_host = origin_host.split('/').next().unwrap_or(origin_host);
-
-    origin_host.eq_ignore_ascii_case(host_header)
+    allowed_hosts.contains(&host_header.to_lowercase())
 }
 
 /// Checks if an error represents a client-side disconnect rather than a server error.
@@ -429,6 +421,7 @@ async fn connection_info(
         encoding_protocol,
         streaming,
     }): Query<ConnectionInfo>,
+    Extension(allowed_hosts): Extension<crate::server::AllowedHosts>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -488,11 +481,15 @@ async fn connection_info(
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
     if is_ws_upgrade {
+        // For non-localhost origins, validate the Host header against the server's
+        // known addresses. This prevents DNS rebinding: an attacker who tricks
+        // evil.com to resolve to the gateway's IP will have Host: evil.com,
+        // which won't match any allowed host.
         if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
             if let Ok(origin_str) = origin.to_str() {
-                let allowed =
-                    is_localhost_origin(origin_str) || is_same_origin(origin_str, req.headers());
-                if !allowed {
+                if !is_localhost_origin(origin_str)
+                    && !is_allowed_host(req.headers(), &allowed_hosts)
+                {
                     let host_header = req
                         .headers()
                         .get(axum::http::header::HOST)
@@ -500,7 +497,8 @@ async fn connection_info(
                     tracing::warn!(
                         origin = origin_str,
                         host = ?host_header,
-                        "Rejected WebSocket connection from disallowed origin"
+                        "Rejected WebSocket connection: Host header not in allowed hosts \
+                         (possible DNS rebinding attack)"
                     );
                     return (
                         StatusCode::FORBIDDEN,
@@ -1642,7 +1640,25 @@ mod tests {
     }
 
     #[test]
-    fn test_is_same_origin() {
+    fn test_is_allowed_host() {
+        let allowed: HashSet<String> = [
+            "localhost",
+            "localhost:7509",
+            "127.0.0.1",
+            "127.0.0.1:7509",
+            "[::1]",
+            "[::1]:7509",
+            "myhost",
+            "myhost:7509",
+            "192.168.1.50",
+            "192.168.1.50:7509",
+            "mynode.example.com",
+            "mynode.example.com:7509",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
         fn headers_with_host(host: &str) -> axum::http::HeaderMap {
             let mut map = axum::http::HeaderMap::new();
             map.insert(
@@ -1652,29 +1668,27 @@ mod tests {
             map
         }
 
-        // Same origin — should be allowed
-        let h = headers_with_host("nova.locut.us:7509");
-        assert!(is_same_origin("http://nova.locut.us:7509", &h));
-        assert!(is_same_origin("http://nova.locut.us:7509/path", &h));
+        // Allowed hosts
+        let h = headers_with_host("192.168.1.50:7509");
+        assert!(is_allowed_host(&h, &allowed));
 
-        // Different host — cross-site attack
-        assert!(!is_same_origin("http://evil.com", &h));
-        assert!(!is_same_origin("http://evil.com:7509", &h));
+        let h = headers_with_host("mynode.example.com:7509");
+        assert!(is_allowed_host(&h, &allowed));
 
-        // Same host, different port
-        assert!(!is_same_origin("http://nova.locut.us:8080", &h));
-
-        // Case-insensitive host comparison
-        assert!(is_same_origin("http://Nova.Locut.Us:7509", &h));
-
-        // No Host header — reject
-        let empty = axum::http::HeaderMap::new();
-        assert!(!is_same_origin("http://nova.locut.us:7509", &empty));
-
-        // Localhost same-origin
         let h = headers_with_host("localhost:7509");
-        assert!(is_same_origin("http://localhost:7509", &h));
-        assert!(!is_same_origin("http://evil.com", &h));
+        assert!(is_allowed_host(&h, &allowed));
+
+        // DNS rebinding: evil.com is NOT in allowed hosts
+        let h = headers_with_host("evil.com:7509");
+        assert!(!is_allowed_host(&h, &allowed));
+
+        // No Host header
+        let empty = axum::http::HeaderMap::new();
+        assert!(!is_allowed_host(&empty, &allowed));
+
+        // Case insensitive
+        let h = headers_with_host("MyHost:7509");
+        assert!(is_allowed_host(&h, &allowed));
     }
 
     #[test]

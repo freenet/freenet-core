@@ -71,7 +71,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
 async fn run_local(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in local mode");
-    let socket = config.ws_api;
+    let socket = config.ws_api.clone();
 
     let executor = Executor::from_config_local(Arc::new(config))
         .await
@@ -89,7 +89,7 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // This gives a clear error message instead of a generic "address in use".
     check_for_existing_process(&config);
 
-    let clients = serve_client_api(config.ws_api)
+    let clients = serve_client_api(config.ws_api.clone())
         .await
         .with_context(|| "failed to start HTTP/WebSocket client API")?;
     tracing::info!("Initializing node configuration");
