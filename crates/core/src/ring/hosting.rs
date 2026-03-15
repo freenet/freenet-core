@@ -67,11 +67,10 @@ const INITIAL_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(15);
 
 /// Maximum backoff duration for subscription retries.
 ///
-/// MUST be shorter than SUBSCRIPTION_LEASE_DURATION (8 min), otherwise a
-/// contract in max-backoff will have its subscription expire before the next
-/// retry attempt, causing permanent subscription loss until the next
-/// recovery cycle picks it up.
-const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(120); // 2 minutes
+/// Computed as 1/4 of SUBSCRIPTION_LEASE_DURATION so that a contract in
+/// max-backoff always retries well before its subscription expires.
+const MAX_SUBSCRIPTION_BACKOFF: Duration =
+    Duration::from_secs(SUBSCRIPTION_LEASE_DURATION.as_secs() / 4); // 2 minutes
 
 /// Maximum number of tracked subscription backoff entries.
 const MAX_SUBSCRIPTION_BACKOFF_ENTRIES: usize = 4096;
