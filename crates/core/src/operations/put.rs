@@ -156,16 +156,17 @@ impl PutOp {
             }
             .into());
 
-        // Send the error to the client via the result router
+        // Send the error to the client via the result router.
+        // Use try_send to avoid blocking the event loop (see channel-safety.md).
         if let Err(err) = op_manager
             .result_router_tx
-            .send((self.id, error_result))
-            .await
+            .try_send((self.id, error_result))
         {
             tracing::error!(
                 tx = %self.id,
                 error = %err,
-                "Failed to send abort notification to client"
+                "Failed to send abort notification to client \
+                 (result router channel full or closed)"
             );
         }
 

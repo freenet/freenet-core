@@ -234,16 +234,17 @@ impl UpdateOp {
             }
             .into());
 
-        // Send the error to the client via the result router
+        // Send the error to the client via the result router.
+        // Use try_send to avoid blocking the event loop (see channel-safety.md).
         if let Err(err) = op_manager
             .result_router_tx
-            .send((self.id, error_result))
-            .await
+            .try_send((self.id, error_result))
         {
             tracing::error!(
                 tx = %self.id,
                 error = %err,
-                "Failed to send abort notification to client"
+                "Failed to send abort notification to client \
+                 (result router channel full or closed)"
             );
         }
 
@@ -2047,12 +2048,12 @@ pub(crate) async fn request_update(
         upstream_addr: None,
     };
     let host_result = op.to_host_result();
+    // Use try_send to avoid blocking spawned executor tasks (see channel-safety.md).
     op_manager
         .result_router_tx
-        .send((id, host_result))
-        .await
+        .try_send((id, host_result))
         .map_err(|error| {
-            tracing::error!(tx = %id, error = %error, phase = "error", "Failed to send UPDATE result to result router");
+            tracing::error!(tx = %id, error = %error, phase = "error", "Failed to send UPDATE result to result router (channel full or closed)");
             OpError::NotificationError
         })?;
 
@@ -2082,25 +2083,25 @@ async fn deliver_update_result(
     // Note: record_contract_updated is called in commit_state_update (the single
     // chokepoint for all state updates), so we don't call it here to avoid double-counting.
 
+    // Use try_send to avoid blocking spawned executor tasks (see channel-safety.md).
     op_manager
         .result_router_tx
-        .send((id, host_result))
-        .await
+        .try_send((id, host_result))
         .map_err(|error| {
             tracing::error!(
                 tx = %id,
                 error = %error,
                 phase = "error",
-                "Failed to send UPDATE result to result router"
+                "Failed to send UPDATE result to result router (channel full or closed)"
             );
             OpError::NotificationError
         })?;
 
+    // Use try_send to avoid blocking (see channel-safety.md).
     if let Err(error) = op_manager
         .to_event_listener
         .notifications_sender()
-        .send(Either::Right(NodeEvent::TransactionCompleted(id)))
-        .await
+        .try_send(Either::Right(NodeEvent::TransactionCompleted(id)))
     {
         tracing::warn!(
             tx = %id,

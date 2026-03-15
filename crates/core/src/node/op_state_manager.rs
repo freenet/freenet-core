@@ -473,34 +473,6 @@ impl OpManager {
         }
     }
 
-    /// Fire-and-forget version for cases where blocking is not acceptable.
-    fn spawn_client_result(&self, tx: Transaction, host_result: HostResult) {
-        let router_tx = self.result_router_tx.clone();
-        let notifier = self.to_event_listener.clone();
-        GlobalExecutor::spawn(async move {
-            if let Err(err) = router_tx.try_send((tx, host_result)) {
-                tracing::error!(
-                    %tx,
-                    error = %err,
-                    "failed to dispatch operation result to client \
-                     (result router channel full or closed)"
-                );
-                return;
-            }
-
-            if let Err(err) = notifier
-                .notifications_sender
-                .try_send(Either::Right(NodeEvent::TransactionCompleted(tx)))
-            {
-                tracing::warn!(
-                    %tx,
-                    error = %err,
-                    "failed to notify event loop about transaction completion"
-                );
-            }
-        });
-    }
-
     /// Timeout for sending notifications to the event loop.
     /// If the channel is full for this long, the event loop is stuck and sending will never succeed.
     const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -950,7 +922,7 @@ impl OpManager {
                     self.completed(parent_tx);
 
                     let host_result = parent_op.to_host_result();
-                    self.spawn_client_result(parent_tx, host_result);
+                    self.send_client_result(parent_tx, host_result);
                 }
             }
         }
@@ -1022,7 +994,7 @@ impl OpManager {
                 self.completed(parent_tx);
             }
 
-            self.spawn_client_result(parent_tx, error_result);
+            self.send_client_result(parent_tx, error_result);
         } else {
             tracing::warn!(
                 child_tx = %child,
@@ -1302,17 +1274,13 @@ fn remove_put_and_report_failure(
                 cause: "PUT operation timed out".into(),
             }
             .into());
-            let router_tx = result_router_tx.clone();
-            let tx = *tx;
-            GlobalExecutor::spawn(async move {
-                if let Err(e) = router_tx.send((tx, error_result)).await {
-                    tracing::warn!(
-                        %tx,
-                        error = %e,
-                        "failed to send PUT timeout error to client"
-                    );
-                }
-            });
+            if let Err(e) = result_router_tx.try_send((*tx, error_result)) {
+                tracing::warn!(
+                    %tx,
+                    error = %e,
+                    "failed to send PUT timeout error to client"
+                );
+            }
         }
         true
     } else {
@@ -1346,17 +1314,13 @@ fn remove_update_and_report_failure(
                 cause: "UPDATE operation timed out".into(),
             }
             .into());
-            let router_tx = result_router_tx.clone();
-            let tx = *tx;
-            GlobalExecutor::spawn(async move {
-                if let Err(e) = router_tx.send((tx, error_result)).await {
-                    tracing::warn!(
-                        %tx,
-                        error = %e,
-                        "failed to send UPDATE timeout error to client"
-                    );
-                }
-            });
+            if let Err(e) = result_router_tx.try_send((*tx, error_result)) {
+                tracing::warn!(
+                    %tx,
+                    error = %e,
+                    "failed to send UPDATE timeout error to client"
+                );
+            }
         }
         true
     } else {
@@ -1418,17 +1382,13 @@ fn remove_get_and_report_failure(
                 cause: "GET operation timed out".into(),
             }
             .into());
-            let router_tx = result_router_tx.clone();
-            let tx = *tx;
-            GlobalExecutor::spawn(async move {
-                if let Err(e) = router_tx.send((tx, error_result)).await {
-                    tracing::warn!(
-                        %tx,
-                        error = %e,
-                        "failed to send GET timeout error to client"
-                    );
-                }
-            });
+            if let Err(e) = result_router_tx.try_send((*tx, error_result)) {
+                tracing::warn!(
+                    %tx,
+                    error = %e,
+                    "failed to send GET timeout error to client"
+                );
+            }
         }
         true
     } else {
