@@ -357,8 +357,8 @@ impl ConfigArgs {
             .zip(self.network_api.public_port)
             .map(|(addr, port)| {
                 PeerId::new(
-                    (addr, port).into(),
                     secrets.transport_keypair.public().clone(),
+                    (addr, port).into(),
                 )
             });
         let gateways_file = config_paths.config_dir.join("gateways.toml");

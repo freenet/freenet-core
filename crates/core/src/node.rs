@@ -23,9 +23,7 @@ use freenet_stdlib::{
 };
 use std::{
     borrow::Cow,
-    fmt::Display,
     fs::File,
-    hash::Hash,
     io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::Arc,
@@ -36,7 +34,7 @@ use std::{collections::HashSet, convert::Infallible};
 use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
-    config::{Address, GatewayConfig, GlobalRng, WebsocketApiConfig},
+    config::{Address, GatewayConfig, WebsocketApiConfig},
     contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
@@ -276,14 +274,14 @@ impl NodeConfig {
             config.network_api.port
         );
         if let Some(own_addr) = &config.peer_id {
-            tracing::info!("Node external address: {}", own_addr.addr);
+            tracing::info!("Node external address: {}", own_addr.socket_addr());
         }
         Ok(NodeConfig {
             should_connect: true,
             is_gateway: config.is_gateway,
             key_pair: config.transport_keypair().clone(),
             gateways,
-            own_addr: config.peer_id.clone().map(|p| p.addr),
+            own_addr: config.peer_id.clone().map(|p| p.socket_addr()),
             network_listener_ip: config.network_api.address,
             network_listener_port: config.network_api.port,
             location: config.location.map(Location::new),
@@ -1971,119 +1969,14 @@ async fn handle_aborted_op(
     Ok(())
 }
 
-/// The identifier of a peer in the network is composed of its address and public key.
+/// The identifier of a peer in the network: a known public key and socket address.
 ///
-/// A regular peer will have its `PeerId` set when it connects to a gateway as it get's
-/// its external address from the gateway.
+/// This is a type alias for [`ring::KnownPeerKeyLocation`], which bundles a peer's
+/// cryptographic identity (public key) with its guaranteed-known network address.
 ///
-/// A gateway will have its `PeerId` set when it is created since it will know its own address
-/// from the start.
-#[derive(Serialize, Deserialize, Eq, Clone)]
-pub struct PeerId {
-    pub addr: SocketAddr,
-    pub pub_key: TransportPublicKey,
-}
-
-impl Hash for PeerId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
-    }
-}
-
-impl PartialEq<PeerId> for PeerId {
-    fn eq(&self, other: &PeerId) -> bool {
-        self.addr == other.addr
-    }
-}
-
-impl Ord for PeerId {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.addr.cmp(&other.addr)
-    }
-}
-
-impl PartialOrd for PeerId {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PeerId {
-    pub fn new(addr: SocketAddr, pub_key: TransportPublicKey) -> Self {
-        Self { addr, pub_key }
-    }
-}
-
-thread_local! {
-    static PEER_ID: std::cell::RefCell<Option<TransportPublicKey>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-impl<'a> arbitrary::Arbitrary<'a> for PeerId {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let addr: ([u8; 4], u16) = u.arbitrary()?;
-
-        let pub_key = PEER_ID.with(|peer_id| {
-            let mut peer_id = peer_id.borrow_mut();
-            match &*peer_id {
-                Some(k) => k.clone(),
-                None => {
-                    let key = TransportKeypair::new().public().clone();
-                    peer_id.replace(key.clone());
-                    key
-                }
-            }
-        });
-
-        Ok(Self {
-            addr: addr.into(),
-            pub_key,
-        })
-    }
-}
-
-impl PeerId {
-    pub fn random() -> Self {
-        let mut addr = [0; 4];
-        GlobalRng::fill_bytes(&mut addr[..]);
-        // Use random port instead of get_free_port() for speed - tests don't actually bind
-        let port: u16 = GlobalRng::random_range(1024u16..65535u16);
-
-        let pub_key = PEER_ID.with(|peer_id| {
-            let mut peer_id = peer_id.borrow_mut();
-            match &*peer_id {
-                Some(k) => k.clone(),
-                None => {
-                    let key = TransportKeypair::new().public().clone();
-                    peer_id.replace(key.clone());
-                    key
-                }
-            }
-        });
-
-        Self {
-            addr: (addr, port).into(),
-            pub_key,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn to_bytes(self) -> Vec<u8> {
-        bincode::serialize(&self).unwrap()
-    }
-}
-
-impl std::fmt::Debug for PeerId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as Display>::fmt(self, f)
-    }
-}
-
-impl Display for PeerId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.pub_key)
-    }
-}
+/// Use `KnownPeerKeyLocation` directly when you need the full type name for clarity.
+/// Use `PeerKeyLocation` when the address may be unknown (e.g., during NAT traversal).
+pub type PeerId = crate::ring::KnownPeerKeyLocation;
 
 pub async fn run_local_node(
     mut executor: Executor,
@@ -2211,7 +2104,7 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
                 node.inner
                     .peer_id
                     .as_ref()
-                    .map(|id| Location::from_address(&id.addr))
+                    .map(|id| Location::from_address(&id.socket_addr()))
             })
             .flatten()
     };
@@ -2372,20 +2265,36 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // PeerId equality tests
-    #[rstest]
-    #[case::same_addr_different_keys(8080, 8080, true)]
-    #[case::different_addr_same_key(8080, 8081, false)]
-    fn test_peer_id_equality(#[case] port1: u16, #[case] port2: u16, #[case] expected_equal: bool) {
+    // PeerId (KnownPeerKeyLocation) equality tests
+    // PeerId now uses full-field equality (both addr and pub_key), matching identity semantics.
+    #[test]
+    fn test_peer_id_equality_same_key_same_addr() {
+        let keypair = TransportKeypair::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let peer1 = PeerId::new(keypair.public().clone(), addr);
+        let peer2 = PeerId::new(keypair.public().clone(), addr);
+        assert_eq!(peer1, peer2);
+    }
+
+    #[test]
+    fn test_peer_id_equality_different_key_same_addr() {
         let keypair1 = TransportKeypair::new();
         let keypair2 = TransportKeypair::new();
-        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port1);
-        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port2);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        // Different keys at same addr are different peers (key is identity)
+        let peer1 = PeerId::new(keypair1.public().clone(), addr);
+        let peer2 = PeerId::new(keypair2.public().clone(), addr);
+        assert_ne!(peer1, peer2);
+    }
 
-        let peer1 = PeerId::new(addr1, keypair1.public().clone());
-        let peer2 = PeerId::new(addr2, keypair2.public().clone());
-
-        assert_eq!(peer1 == peer2, expected_equal);
+    #[test]
+    fn test_peer_id_equality_different_addr() {
+        let keypair = TransportKeypair::new();
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081);
+        let peer1 = PeerId::new(keypair.public().clone(), addr1);
+        let peer2 = PeerId::new(keypair.public().clone(), addr2);
+        assert_ne!(peer1, peer2);
     }
 
     #[rstest]
@@ -2396,8 +2305,8 @@ mod tests {
         let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), lower_port);
         let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), higher_port);
 
-        let peer1 = PeerId::new(addr1, keypair.public().clone());
-        let peer2 = PeerId::new(addr2, keypair.public().clone());
+        let peer1 = PeerId::new(keypair.public().clone(), addr1);
+        let peer2 = PeerId::new(keypair.public().clone(), addr2);
 
         assert!(peer1 < peer2);
         assert!(peer2 > peer1);
@@ -2408,19 +2317,18 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let keypair1 = TransportKeypair::new();
-        let keypair2 = TransportKeypair::new();
+        let keypair = TransportKeypair::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
-        let peer1 = PeerId::new(addr, keypair1.public().clone());
-        let peer2 = PeerId::new(addr, keypair2.public().clone());
+        let peer1 = PeerId::new(keypair.public().clone(), addr);
+        let peer2 = PeerId::new(keypair.public().clone(), addr);
 
         let mut hasher1 = DefaultHasher::new();
         let mut hasher2 = DefaultHasher::new();
         peer1.hash(&mut hasher1);
         peer2.hash(&mut hasher2);
 
-        // Same address should produce same hash
+        // Same key + same address should produce same hash
         assert_eq!(hasher1.finish(), hasher2.finish());
     }
 
@@ -2430,7 +2338,7 @@ mod tests {
         let peer2 = PeerId::random();
 
         // Random peers should have different addresses (with high probability)
-        assert_ne!(peer1.addr, peer2.addr);
+        assert_ne!(peer1.socket_addr(), peer2.socket_addr());
     }
 
     #[test]
@@ -2441,7 +2349,7 @@ mod tests {
 
         // Should be deserializable
         let deserialized: PeerId = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(peer.addr, deserialized.addr);
+        assert_eq!(peer.socket_addr(), deserialized.socket_addr());
     }
 
     #[test]

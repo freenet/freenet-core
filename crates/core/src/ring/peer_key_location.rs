@@ -391,6 +391,45 @@ impl Display for KnownPeerKeyLocation {
     }
 }
 
+impl KnownPeerKeyLocation {
+    /// Creates a random `KnownPeerKeyLocation` for use as a placeholder (e.g., in timeout events).
+    pub fn random() -> Self {
+        use crate::config::GlobalRng;
+        use crate::transport::TransportKeypair;
+        use std::cell::RefCell;
+
+        thread_local! {
+            static CACHED_KEY: RefCell<Option<crate::transport::TransportPublicKey>> = const { RefCell::new(None) };
+        }
+
+        let mut addr_bytes = [0u8; 4];
+        GlobalRng::fill_bytes(&mut addr_bytes[..]);
+        let port: u16 = GlobalRng::random_range(1024u16..65535u16);
+
+        let pub_key = CACHED_KEY.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            match &*cached {
+                Some(k) => k.clone(),
+                None => {
+                    let key = TransportKeypair::new().public().clone();
+                    cached.replace(key.clone());
+                    key
+                }
+            }
+        });
+
+        KnownPeerKeyLocation {
+            pub_key,
+            addr: (addr_bytes, port).into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn to_bytes(self) -> Vec<u8> {
+        bincode::serialize(&self).unwrap()
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static CACHED_PUB_KEY: std::cell::RefCell<Option<crate::transport::TransportPublicKey>> = const { std::cell::RefCell::new(None) };
@@ -417,6 +456,26 @@ impl<'a> arbitrary::Arbitrary<'a> for PeerKeyLocation {
             pub_key,
             peer_addr: PeerAddr::Known(addr),
         })
+    }
+}
+
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for KnownPeerKeyLocation {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        use crate::transport::TransportKeypair;
+        let addr: SocketAddr = u.arbitrary()?;
+        let pub_key = CACHED_PUB_KEY.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            match &*cached {
+                Some(k) => k.clone(),
+                None => {
+                    let key = TransportKeypair::new().public().clone();
+                    cached.replace(key.clone());
+                    key
+                }
+            }
+        });
+        Ok(KnownPeerKeyLocation { pub_key, addr })
     }
 }
 

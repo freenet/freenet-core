@@ -1275,8 +1275,8 @@ impl Ring {
         let min_ready = self.connection_manager.min_ready_connections;
         let was_ready = min_ready == 0 || self.connection_manager.connection_count() >= min_ready;
 
-        let addr = peer.addr;
-        let pub_key = peer.pub_key.clone();
+        let addr = peer.socket_addr();
+        let pub_key = peer.pub_key().clone();
         let added = self
             .connection_manager
             .add_connection(loc, addr, pub_key, was_reserved);
@@ -1302,9 +1302,9 @@ impl Ring {
 
     pub fn update_connection_identity(&self, old_peer: &PeerId, new_peer: PeerId) {
         if self.connection_manager.update_peer_identity(
-            old_peer.addr,
-            new_peer.addr,
-            new_peer.pub_key,
+            old_peer.socket_addr(),
+            new_peer.socket_addr(),
+            new_peer.pub_key().clone(),
         ) {
             self.refresh_density_request_cache();
         }
@@ -1682,8 +1682,10 @@ impl Ring {
         use crate::tracing::DisconnectReason;
 
         tracing::debug!(%peer, "Removing connection");
-        crate::node::network_status::record_peer_disconnected(peer.addr);
-        let orphaned_transactions = self.live_tx_tracker.prune_transactions_from_peer(peer.addr);
+        crate::node::network_status::record_peer_disconnected(peer.socket_addr());
+        let orphaned_transactions = self
+            .live_tx_tracker
+            .prune_transactions_from_peer(peer.socket_addr());
 
         if !orphaned_transactions.is_empty() {
             tracing::debug!(
@@ -1699,10 +1701,13 @@ impl Ring {
         // Capture connection duration before pruning
         let connection_duration_ms = self
             .connection_manager
-            .get_connection_duration_ms(peer.addr);
+            .get_connection_duration_ms(peer.socket_addr());
 
         // This case would be when a connection is being open, so peer location hasn't been recorded yet
-        let Some(_loc) = self.connection_manager.prune_alive_connection(peer.addr) else {
+        let Some(_loc) = self
+            .connection_manager
+            .prune_alive_connection(peer.socket_addr())
+        else {
             return PruneConnectionResult {
                 orphaned_transactions,
                 became_unready: false,

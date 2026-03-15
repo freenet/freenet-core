@@ -66,7 +66,7 @@ impl super::StateVerifier {
             if is_update_broadcast && !history.applied_broadcasts.contains(&(tx, peer)) {
                 // Find the received state hash from the transitions
                 let received_hash = self.events.iter().find_map(|e| {
-                    if e.tx == tx && e.peer_id.addr == peer {
+                    if e.tx == tx && e.peer_id.socket_addr() == peer {
                         if let EventKind::Update(UpdateEvent::BroadcastReceived {
                             state_hash,
                             ..
@@ -613,7 +613,7 @@ impl super::StateVerifier {
                 EventKind::Put(PutEvent::Request { id, .. }) => {
                     tx_states.entry(*id).or_insert((
                         "put".into(),
-                        event.peer_id.addr,
+                        event.peer_id.socket_addr(),
                         event.datetime,
                         false,
                     ));
@@ -627,7 +627,7 @@ impl super::StateVerifier {
                 EventKind::Get(GetEvent::Request { id, .. }) => {
                     tx_states.entry(*id).or_insert((
                         "get".into(),
-                        event.peer_id.addr,
+                        event.peer_id.socket_addr(),
                         event.datetime,
                         false,
                     ));
@@ -642,7 +642,7 @@ impl super::StateVerifier {
                 EventKind::Update(UpdateEvent::Request { id, .. }) => {
                     tx_states.entry(*id).or_insert((
                         "update".into(),
-                        event.peer_id.addr,
+                        event.peer_id.socket_addr(),
                         event.datetime,
                         false,
                     ));
@@ -655,7 +655,7 @@ impl super::StateVerifier {
                 EventKind::Subscribe(SubscribeEvent::Request { id, .. }) => {
                     tx_states.entry(*id).or_insert((
                         "subscribe".into(),
-                        event.peer_id.addr,
+                        event.peer_id.socket_addr(),
                         event.datetime,
                         false,
                     ));

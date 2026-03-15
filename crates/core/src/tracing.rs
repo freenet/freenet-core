@@ -248,7 +248,7 @@ impl<'a> NetEventLog<'a> {
         let own_loc = ring.connection_manager.own_location();
         own_loc
             .socket_addr()
-            .map(|addr| PeerId::new(addr, own_loc.pub_key().clone()))
+            .map(|addr| PeerId::new(own_loc.pub_key().clone(), addr))
     }
 
     pub fn route_event(
@@ -263,6 +263,34 @@ impl<'a> NetEventLog<'a> {
             kind: EventKind::Route(route_event.clone()),
         })
     }
+
+
+    pub fn connected(ring: &'a Ring, peer: PeerId, _location: Location) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let connected = peer.as_peer_key_location();
+        let connection_count = ring.connection_manager.connection_count();
+        let is_gateway = ring.connection_manager.is_gateway();
+        // Note: location is computed from address, so we don't need to set it separately
+        Some(NetEventLog {
+            tx: Transaction::NULL,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::Connected {
+                this: ring.connection_manager.own_location(),
+                connected,
+                // None since we don't have transaction timing for this path
+                elapsed_ms: None,
+                connection_type: if is_gateway {
+                    ConnectionType::Gateway
+                } else {
+                    ConnectionType::Direct
+                },
+                latency_ms: None, // RTT not available at this layer
+                this_peer_connection_count: connection_count,
+                initiated_by: None, // Not available in this context
+            }),
+        })
+    }
+
 
     /// Create a disconnected event with full context.
     ///
@@ -1053,7 +1081,7 @@ impl<'a> NetEventLog<'a> {
         let Some(own_addr) = own_loc.socket_addr() else {
             return Either::Right(vec![]);
         };
-        let peer_id = PeerId::new(own_addr, own_loc.pub_key().clone());
+        let peer_id = PeerId::new(own_loc.pub_key().clone(), own_addr);
         let connection_count = ring.connection_manager.connection_count();
         let is_gateway = ring.connection_manager.is_gateway();
         let kind = match msg {
@@ -1174,8 +1202,8 @@ impl<'a> NetEventLog<'a> {
                 else {
                     return Either::Right(vec![]);
                 };
-                let acceptor_peer_id = PeerId::new(acceptor_addr, acceptor.pub_key().clone());
-                let this_peer_id = PeerId::new(this_addr, this_peer.pub_key().clone());
+                let acceptor_peer_id = PeerId::new(acceptor.pub_key().clone(), acceptor_addr);
+                let this_peer_id = PeerId::new(this_peer.pub_key().clone(), this_addr);
                 let elapsed_ms = Some(msg.id().elapsed().as_millis() as u64);
                 // The joiner (this_peer) initiated the connection
                 let initiated_by = Some(this_peer_id.clone());
@@ -1433,7 +1461,7 @@ impl<'a> NetEventLog<'a> {
         let Some(own_addr) = own_loc.socket_addr() else {
             return Either::Right(vec![]);
         };
-        let peer_id = PeerId::new(own_addr, own_loc.pub_key().clone());
+        let peer_id = PeerId::new(own_loc.pub_key().clone(), own_addr);
         Either::Left(NetEventLog {
             tx: msg.id(),
             peer_id,
@@ -1875,16 +1903,16 @@ async fn send_to_metrics_server(
                 (this_peer.location(), connected_peer.location())
             {
                 let this_id = PeerId::new(
+                    this_peer.pub_key().clone(),
                     this_peer
                         .socket_addr()
                         .expect("this peer should have address"),
-                    this_peer.pub_key().clone(),
                 );
                 let connected_id = PeerId::new(
+                    connected_peer.pub_key().clone(),
                     connected_peer
                         .socket_addr()
                         .expect("connected peer should have address"),
-                    connected_peer.pub_key().clone(),
                 );
                 let msg = PeerChange::added_connection_msg(
                     (&send_msg.tx != Transaction::NULL).then(|| send_msg.tx.to_string()),
@@ -1912,7 +1940,7 @@ async fn send_to_metrics_server(
         }) => {
             if let Some(target_addr) = target.socket_addr() {
                 let contract_location = Location::from_contract_key(key.as_bytes());
-                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let target_id = PeerId::new(target.pub_key().clone(), target_addr);
                 let msg = ContractChange::put_request_msg(
                     send_msg.tx.to_string(),
                     key.to_string(),
@@ -1935,7 +1963,7 @@ async fn send_to_metrics_server(
         }) => {
             if let Some(target_addr) = target.socket_addr() {
                 let contract_location = Location::from_contract_key(key.as_bytes());
-                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let target_id = PeerId::new(target.pub_key().clone(), target_addr);
                 let msg = ContractChange::put_success_msg(
                     send_msg.tx.to_string(),
                     key.to_string(),
@@ -2024,7 +2052,7 @@ async fn send_to_metrics_server(
         }) => {
             if let (Some(at_addr), Some(at_loc)) = (at.socket_addr(), at.location()) {
                 let contract_location = Location::from_contract_key(key.as_bytes());
-                let at_id = PeerId::new(at_addr, at.pub_key().clone());
+                let at_id = PeerId::new(at.pub_key().clone(), at_addr);
                 let msg = ContractChange::subscribed_msg(
                     requester.to_string(),
                     id.to_string(),
@@ -2051,7 +2079,7 @@ async fn send_to_metrics_server(
         }) => {
             if let Some(target_addr) = target.socket_addr() {
                 let contract_location = Location::from_contract_key(key.as_bytes());
-                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let target_id = PeerId::new(target.pub_key().clone(), target_addr);
                 let msg = ContractChange::update_request_msg(
                     id.to_string(),
                     key.to_string(),
@@ -2075,7 +2103,7 @@ async fn send_to_metrics_server(
         }) => {
             if let Some(target_addr) = target.socket_addr() {
                 let contract_location = Location::from_contract_key(key.as_bytes());
-                let target_id = PeerId::new(target_addr, target.pub_key().clone());
+                let target_id = PeerId::new(target.pub_key().clone(), target_addr);
                 let msg = ContractChange::update_success_msg(
                     id.to_string(),
                     key.to_string(),
@@ -4330,7 +4358,7 @@ pub(super) mod test {
                 return false;
             };
             logs.iter().any(|log| {
-                &log.peer_id.pub_key == peer
+                log.peer_id.pub_key() == peer
                     && matches!(log.kind, EventKind::Connect(ConnectEvent::Connected { .. }))
             })
         }
@@ -4361,7 +4389,7 @@ pub(super) mod test {
                     }) = &l.kind
                     {
                         let connected_id =
-                            PeerId::new(connected.socket_addr()?, connected.pub_key().clone());
+                            PeerId::new(connected.pub_key().clone(), connected.socket_addr()?);
                         let disconnected = disconnects
                             .get(&connected_id)
                             .iter()
@@ -4463,8 +4491,8 @@ pub(super) mod test {
                 tx: &tx,
                 peer_id: peer_id.clone(),
                 kind: EventKind::Connect(ConnectEvent::Connected {
-                    this: PeerKeyLocation::new(peer_id.pub_key.clone(), peer_id.addr),
-                    connected: PeerKeyLocation::new(other.pub_key.clone(), other.addr),
+                    this: peer_id.as_peer_key_location(),
+                    connected: other.as_peer_key_location(),
                     elapsed_ms: None,
                     connection_type: ConnectionType::Direct,
                     latency_ms: None,
@@ -4476,7 +4504,7 @@ pub(super) mod test {
 
         futures::future::join_all(futs).await;
 
-        let distances: Vec<_> = listener.connections(&peer_id.pub_key).collect();
+        let distances: Vec<_> = listener.connections(peer_id.pub_key()).collect();
         assert_eq!(distances.len(), 3, "Should have 3 connections");
         // Verify each distance is valid (between 0 and 0.5 on the ring)
         for (_, dist) in &distances {

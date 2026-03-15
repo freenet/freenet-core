@@ -2152,7 +2152,7 @@ impl SimNetwork {
             let conns = self
                 .event_listener
                 .connections(key)
-                .map(|(k, d)| (key_to_label[&k.pub_key].clone(), d))
+                .map(|(k, d)| (key_to_label[k.pub_key()].clone(), d))
                 .collect::<HashMap<_, _>>();
             peers_connections.insert(label.clone(), (key.clone(), conns));
         }
@@ -2172,7 +2172,7 @@ impl SimNetwork {
         Some(
             self.event_listener
                 .connections(key)
-                .map(|(k, _)| k.pub_key)
+                .map(|(k, _)| k.pub_key().clone())
                 .collect(),
         )
     }
@@ -2362,7 +2362,7 @@ impl SimNetwork {
                 let state_hash = log.kind.state_hash().map(String::from);
                 EventSummary {
                     tx: log.tx,
-                    peer_addr: log.peer_id.addr,
+                    peer_addr: log.peer_id.socket_addr(),
                     event_kind_name,
                     contract_key,
                     state_hash,
@@ -2519,7 +2519,7 @@ impl SimNetwork {
                 contract_states
                     .entry(contract_key)
                     .or_default()
-                    .insert(log.peer_id.addr, state_hash);
+                    .insert(log.peer_id.socket_addr(), state_hash);
             }
         }
 
@@ -4735,7 +4735,7 @@ pub async fn check_convergence_from_logs(
             contract_states
                 .entry(contract_key)
                 .or_default()
-                .insert(log.peer_id.addr, state_hash);
+                .insert(log.peer_id.socket_addr(), state_hash);
         }
     }
 

@@ -168,7 +168,7 @@ impl StateVerifier {
         let mut peer_states: BTreeMap<SocketAddr, String> = BTreeMap::new();
 
         for &(seq, event) in events {
-            let peer = event.peer_id.addr;
+            let peer = event.peer_id.socket_addr();
 
             match &event.kind {
                 // PUT events

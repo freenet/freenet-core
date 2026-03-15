@@ -7,7 +7,7 @@ pub(crate) mod topology_generated;
 use freenet_stdlib::prelude::ContractKey;
 pub use topology_generated::*;
 
-use crate::{message::Transaction, node::PeerId};
+use crate::message::Transaction;
 
 pub trait TryFromFbs<'a>: Sized + 'a {
     fn try_decode_fbs(buf: &'a [u8]) -> Result<Self, flatbuffers::InvalidFlatbuffer>;
