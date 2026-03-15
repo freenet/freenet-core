@@ -12,7 +12,7 @@ use freenet_stdlib::{
 };
 use xz2::read::XzDecoder;
 
-use crate::config::{BaseConfig, PutConfig, UpdateConfig};
+use crate::config::{BaseConfig, GetConfig, PutConfig, SubscribeConfig, UpdateConfig};
 
 mod v1;
 
@@ -381,6 +381,149 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     close_api_client(&mut client).await;
 
     result
+}
+
+pub async fn get(config: GetConfig, other: BaseConfig) -> anyhow::Result<()> {
+    let instance_id = ContractInstanceId::try_from(config.key)?;
+    let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
+    eprintln!("Getting contract {key}");
+    let request = ContractRequest::Get {
+        key: *key.id(),
+        return_contract_code: config.return_code,
+        subscribe: false,
+        blocking_subscribe: false,
+    }
+    .into();
+    let mut client = start_api_client(other).await?;
+    execute_command(request, &mut client).await?;
+
+    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key: response_key,
+            state,
+            ..
+        }))) => {
+            let state_bytes: &[u8] = state.as_ref();
+            eprintln!("Contract {response_key}: {} bytes", state_bytes.len());
+            if let Some(output_path) = &config.output {
+                std::fs::write(output_path, state_bytes)?;
+                eprintln!("State written to {}", output_path.display());
+            } else {
+                use std::io::Write;
+                std::io::stdout().write_all(state_bytes)?;
+            }
+            Ok(())
+        }
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }))) => {
+            Err(anyhow::anyhow!("Contract not found: {instance_id}"))
+        }
+        Ok(Ok(HostResponse::ContractResponse(other))) => {
+            Err(anyhow::anyhow!("Unexpected contract response: {:?}", other))
+        }
+        Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "Timeout waiting for get response for contract {key} after {} seconds",
+            RESPONSE_TIMEOUT.as_secs()
+        )),
+    };
+
+    close_api_client(&mut client).await;
+    result
+}
+
+pub async fn subscribe(config: SubscribeConfig, other: BaseConfig) -> anyhow::Result<()> {
+    let instance_id = ContractInstanceId::try_from(config.key)?;
+    let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
+    eprintln!("Subscribing to contract {key}");
+    let request = ContractRequest::Subscribe {
+        key: *key.id(),
+        summary: None,
+    }
+    .into();
+    let mut client = start_api_client(other).await?;
+    execute_command(request, &mut client).await?;
+
+    // Wait for initial subscribe confirmation
+    match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key: response_key,
+            subscribed: true,
+        }))) => {
+            eprintln!("Subscribed to {response_key}, waiting for updates (Ctrl+C to stop)...");
+        }
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key: response_key,
+            subscribed: false,
+        }))) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!(
+                "Subscription rejected for contract {response_key}"
+            ));
+        }
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }))) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!("Contract not found: {instance_id}"));
+        }
+        Ok(Ok(other)) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!("Unexpected response: {:?}", other));
+        }
+        Ok(Err(e)) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!("Failed to receive response: {e}"));
+        }
+        Err(_) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!(
+                "Timeout waiting for subscribe response after {} seconds",
+                RESPONSE_TIMEOUT.as_secs()
+            ));
+        }
+    }
+
+    // Stream update notifications until interrupted
+    let mut update_count: u64 = 0;
+    loop {
+        tokio::select! {
+            response = client.recv() => {
+                match response {
+                    Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                        key: update_key,
+                        update,
+                    })) => {
+                        update_count += 1;
+                        let update_size = update.size();
+                        eprintln!(
+                            "Update #{update_count} for {update_key}: {update_size} bytes ({update:?})",
+                        );
+                        let serialized = bincode::serialize(&update)
+                            .map_err(|e| anyhow::anyhow!("Failed to serialize update: {e}"))?;
+                        if let Some(output_path) = &config.output {
+                            std::fs::write(output_path, &serialized)?;
+                            eprintln!("Update written to {}", output_path.display());
+                        } else {
+                            use std::io::Write;
+                            std::io::stdout().write_all(&serialized)?;
+                            std::io::stdout().flush()?;
+                        }
+                    }
+                    Ok(other) => {
+                        tracing::debug!("Received non-update response: {:?}", other);
+                    }
+                    Err(e) => {
+                        close_api_client(&mut client).await;
+                        return Err(anyhow::anyhow!("Connection error: {e}"));
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nReceived {update_count} updates total");
+                close_api_client(&mut client).await;
+                return Ok(());
+            }
+        }
+    }
 }
 
 pub(crate) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {

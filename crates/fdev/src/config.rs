@@ -90,8 +90,35 @@ pub struct RunCliConfig {
 #[derive(clap::Subcommand, Clone)]
 pub enum NodeCommand {
     Put(PutConfig),
+    /// Get the current state of a contract.
+    Get(GetConfig),
     Update(UpdateConfig),
+    /// Subscribe to a contract and stream update notifications.
+    Subscribe(SubscribeConfig),
     GetContractId(crate::commands::GetContractIdConfig),
+}
+
+/// Retrieves the current state of a contract from the network.
+#[derive(clap::Parser, Clone)]
+pub struct GetConfig {
+    /// Contract key in Base58 format.
+    pub(crate) key: String,
+    /// Also return the contract code in the response.
+    #[arg(long)]
+    pub(crate) return_code: bool,
+    /// Write the state to a file instead of stdout.
+    #[arg(short, long)]
+    pub(crate) output: Option<PathBuf>,
+}
+
+/// Subscribes to a contract and streams update notifications until interrupted.
+#[derive(clap::Parser, Clone)]
+pub struct SubscribeConfig {
+    /// Contract key in Base58 format.
+    pub(crate) key: String,
+    /// Write each update to a file (overwritten on each update) instead of stdout.
+    #[arg(short, long)]
+    pub(crate) output: Option<PathBuf>,
 }
 
 /// Updates a contract in the network.
