@@ -606,7 +606,7 @@ update_versions() {
     # Update fdev version and its freenet dependency
     echo -n "  Updating fdev to $FDEV_VERSION... "
     sed_inplace "s/^version = \".*\"/version = \"$FDEV_VERSION\"/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
-    sed_inplace "s/freenet = { path = \"..\/core\", version = \".*\" }/freenet = { path = \"..\/core\", version = \"$VERSION\" }/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
+    sed_inplace "s/\(freenet = { path = \"..\/core\", version = \)\"[^\"]*\"/\1\"$VERSION\"/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
     echo "✓"
 
     # Update Cargo.lock to match new versions
