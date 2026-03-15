@@ -473,10 +473,21 @@ impl Stream for StreamingInboundStream {
             return Poll::Ready(None); // Stream complete
         }
 
-        // If the stream has enough data but this fragment slot is empty, we're done.
-        // The overflow slot (allocated for potential metadata overhead in fragment #1)
-        // may not be used when fragment #1 has full payload capacity.
-        if self.handle.buffer.is_complete() && self.handle.buffer.get(next_idx).is_none() {
+        // If the stream has enough data AND we've already yielded enough bytes
+        // to cover the declared stream size, the overflow slot is genuinely
+        // unused — stop iterating.
+        //
+        // IMPORTANT: We must check bytes_read, not just is_complete(). When
+        // metadata is embedded in fragment #1 (reducing its payload), the sender
+        // uses one extra fragment in the overflow slot. is_complete() fires when
+        // min_complete_fragments are contiguous (the base count), but the overflow
+        // fragment may still be in transit. Returning None prematurely here would
+        // cause piped stream forwarding to skip the last fragment, leaving all
+        // downstream nodes stuck waiting for it (see freenet-core#3451).
+        if self.handle.buffer.is_complete()
+            && self.handle.buffer.get(next_idx).is_none()
+            && self.bytes_read >= self.handle.total_bytes
+        {
             return Poll::Ready(None);
         }
 
@@ -658,9 +669,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_inbound_stream_basic() {
-        let handle = StreamHandle::new(make_stream_id(), 15);
+        let handle = StreamHandle::new(make_stream_id(), 5);
 
-        // Push all fragments
+        // Push one fragment covering the full stream
         handle
             .push_fragment(1, Bytes::from_static(b"hello"))
             .unwrap();
@@ -670,7 +681,7 @@ mod tests {
         assert!(chunk.is_some());
         assert_eq!(chunk.unwrap().unwrap(), Bytes::from_static(b"hello"));
 
-        // Stream should be exhausted
+        // Stream should be exhausted (overflow slot unused, bytes_read == total_bytes)
         let chunk = stream.next().await;
         assert!(chunk.is_none());
     }
@@ -1465,5 +1476,88 @@ mod tests {
         assert!(result.is_ok(), "assemble should succeed: {:?}", result);
         let data = result.unwrap();
         assert_eq!(data.len(), total as usize);
+    }
+
+    /// Regression test for freenet-core#3451: piped stream iterator must not
+    /// terminate early when is_complete() fires before the overflow fragment
+    /// arrives.
+    ///
+    /// When metadata is embedded in fragment #1, the sender uses one extra
+    /// "overflow" fragment. The receiver's is_complete() fires after
+    /// min_complete_fragments (base count) are contiguous, but the overflow
+    /// fragment may still be in transit. The stream iterator was returning None
+    /// at that point, causing piped stream forwarding to skip the last fragment
+    /// and leaving all downstream nodes stuck.
+    #[tokio::test]
+    async fn test_stream_iterator_waits_for_overflow_fragment() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use futures::StreamExt;
+
+        // Create a stream where base = 3, total = 4 (3 base + 1 overflow).
+        // Simulate metadata reducing fragment #1 payload so the sender
+        // actually sends 4 fragments.
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        // Buffer has 4 slots: fragments 1-3 (base) + 4 (overflow).
+        assert_eq!(handle.buffer.total_fragments(), 4);
+
+        // Push base fragments 1-3 with slightly reduced payloads
+        // (simulating metadata overhead in frag #1).
+        let reduced = FRAGMENT_PAYLOAD_SIZE - 100;
+        let frag1_data = Bytes::from(vec![1u8; reduced]);
+        let frag2_data = Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]);
+        let frag3_data = Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]);
+        // Overflow fragment carries the remaining bytes.
+        let remaining = total as usize - reduced - FRAGMENT_PAYLOAD_SIZE * 2;
+        let frag4_data = Bytes::from(vec![4u8; remaining]);
+
+        handle.push_fragment(1, frag1_data.clone()).unwrap();
+        handle.push_fragment(2, frag2_data.clone()).unwrap();
+        handle.push_fragment(3, frag3_data.clone()).unwrap();
+
+        // At this point is_complete() is true (3 >= 3 base fragments),
+        // but the overflow fragment hasn't arrived yet.
+        assert!(handle.buffer.is_complete());
+
+        // Create a stream iterator (as piped stream forwarding would).
+        let mut stream = handle.stream();
+
+        // Read fragments 1-3 — these should yield immediately.
+        let c1 = stream.next().await.unwrap().unwrap();
+        assert_eq!(c1.len(), reduced);
+        let c2 = stream.next().await.unwrap().unwrap();
+        assert_eq!(c2.len(), FRAGMENT_PAYLOAD_SIZE);
+        let c3 = stream.next().await.unwrap().unwrap();
+        assert_eq!(c3.len(), FRAGMENT_PAYLOAD_SIZE);
+
+        // The iterator is now at fragment 4 (the overflow slot).
+        // is_complete() is true, but fragment 4 is not yet present.
+        // BUG (before fix): poll_next would return None here.
+        // CORRECT: poll_next should return Pending and wait.
+
+        // Push the overflow fragment from a background task.
+        let handle_clone = handle.clone();
+        let _producer = GlobalExecutor::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            handle_clone.push_fragment(4, frag4_data).unwrap();
+        });
+
+        // The stream should yield fragment 4 (not None).
+        let c4 = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            stream.next(),
+        )
+        .await
+        .expect("stream should yield fragment 4, not hang or return None");
+
+        assert!(c4.is_some(), "stream returned None instead of fragment 4");
+        let c4 = c4.unwrap().unwrap();
+        assert_eq!(c4.len(), remaining);
+
+        // After fragment 4, the stream should end.
+        let total_read = c1.len() + c2.len() + c3.len() + c4.len();
+        assert_eq!(total_read, total as usize);
+        assert!(stream.next().await.is_none());
     }
 }
