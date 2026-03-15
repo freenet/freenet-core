@@ -25,6 +25,13 @@ impl ResultRouter {
         }
     }
 
+    /// Timeout for forwarding results to the session actor.
+    ///
+    /// If the session actor channel is full for longer than this, the result
+    /// is dropped rather than blocking the router (which would cascade
+    /// backpressure to all event loops sending to `result_router_tx`).
+    const SESSION_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// Main routing loop
     pub async fn run(mut self) {
         while let Some((tx, host_result)) = self.network_results.recv().await {
@@ -37,22 +44,29 @@ impl ResultRouter {
                 "ResultRouter sending result to SessionActor for transaction: {}",
                 tx
             );
-            if let Err(e) = self.session_actor_tx.send(msg).await {
-                // TODO: Add metric for router send failures
-                // metrics::ROUTER_SEND_FAILURES.increment();
-
-                // mpsc::error::SendError only occurs when channel is closed
-                let error_reason = "channel_closed";
-
-                tracing::error!(
-                    error_reason = error_reason,
-                    transaction = %tx,
-                    error = %e,
-                    "CRITICAL: Session actor channel send failed - result routing failed. \
-                     Session actor has crashed. Actor-based client delivery is broken."
-                );
-                // Router can't continue without session actor - exit loop
-                break;
+            match tokio::time::timeout(Self::SESSION_SEND_TIMEOUT, self.session_actor_tx.send(msg))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // Channel closed — session actor has crashed
+                    tracing::error!(
+                        transaction = %tx,
+                        error = %e,
+                        "CRITICAL: Session actor channel closed - result routing failed. \
+                         Actor-based client delivery is broken."
+                    );
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — session actor is too slow, drop the result
+                    // rather than blocking the router (and cascading to event loops)
+                    tracing::warn!(
+                        transaction = %tx,
+                        timeout_secs = Self::SESSION_SEND_TIMEOUT.as_secs(),
+                        "ResultRouter dropping result: session actor channel full"
+                    );
+                }
             }
         }
 

@@ -61,6 +61,13 @@ Need a channel for notifications, events, or responses?
   → unbounded_channel() is only acceptable for internal control flow where the
     sender count is statically known and bounded (e.g., handler event loops)
 
+NEVER use .send().await in event loops or recv loops.
+  → See .claude/rules/channel-safety.md for full rules and incident history.
+  → Use try_send() or tokio::time::timeout() instead.
+
+NEVER create a bounded channel whose receiver is unused.
+  → .send().await blocks forever once the buffer fills.
+
 Is cancellation possible?
   → Document cancellation safety in function docs
 

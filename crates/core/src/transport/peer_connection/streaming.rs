@@ -35,7 +35,6 @@ use futures::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use tokio::sync::mpsc;
 
 use super::streaming_buffer::LockFreeStreamBuffer;
 use super::StreamId;
@@ -520,22 +519,13 @@ pub struct StreamRegistry {
     /// Active streams indexed by stream ID.
     /// Uses DashMap for lock-free concurrent access.
     streams: DashMap<StreamId, StreamHandle>,
-    /// Channel for notifying about new streams.
-    #[allow(dead_code)]
-    new_stream_tx: mpsc::Sender<StreamId>,
-    /// Receiver for new stream notifications (held by listener).
-    #[allow(dead_code)]
-    new_stream_rx: parking_lot::Mutex<Option<mpsc::Receiver<StreamId>>>,
 }
 
 impl StreamRegistry {
     /// Creates a new stream registry.
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel(64);
         Self {
             streams: DashMap::new(),
-            new_stream_tx: tx,
-            new_stream_rx: parking_lot::Mutex::new(Some(rx)),
         }
     }
 
@@ -544,20 +534,12 @@ impl StreamRegistry {
     /// Returns a handle for pushing fragments to the stream.
     ///
     /// If a stream with this ID already exists, returns the existing handle.
-    pub(crate) async fn register(&self, stream_id: StreamId, total_bytes: u64) -> StreamHandle {
+    pub(crate) fn register(&self, stream_id: StreamId, total_bytes: u64) -> StreamHandle {
         // Use entry API to avoid race conditions
-        let handle = self
-            .streams
+        self.streams
             .entry(stream_id)
             .or_insert_with(|| StreamHandle::new(stream_id, total_bytes))
-            .clone();
-
-        // Notify listeners about the new stream; receiver may not be listening
-        if let Err(e) = self.new_stream_tx.send(stream_id).await {
-            tracing::debug!(%stream_id, error = %e, "no listener for new stream notification");
-        }
-
-        handle
+            .clone()
     }
 
     /// Gets a handle to an existing stream.
@@ -575,14 +557,6 @@ impl StreamRegistry {
     #[allow(dead_code)]
     pub(crate) fn remove(&self, stream_id: StreamId) -> Option<StreamHandle> {
         self.streams.remove(&stream_id).map(|(_, h)| h)
-    }
-
-    /// Takes the new stream receiver for listening to new stream registrations.
-    ///
-    /// This can only be called once. Subsequent calls return `None`.
-    #[allow(dead_code)]
-    pub(crate) fn take_new_stream_receiver(&self) -> Option<mpsc::Receiver<StreamId>> {
-        self.new_stream_rx.lock().take()
     }
 
     /// Returns the number of active streams.
@@ -750,7 +724,7 @@ mod tests {
         let registry = StreamRegistry::new();
         let id = make_stream_id();
 
-        let handle = registry.register(id, 1000).await;
+        let handle = registry.register(id, 1000);
         assert_eq!(handle.stream_id(), id);
 
         let retrieved = registry.get(id);
@@ -763,8 +737,8 @@ mod tests {
         let registry = StreamRegistry::new();
         let id = make_stream_id();
 
-        let handle1 = registry.register(id, 1000).await;
-        let handle2 = registry.register(id, 2000).await; // Different size
+        let handle1 = registry.register(id, 1000);
+        let handle2 = registry.register(id, 2000); // Different size
 
         // Should return the same handle (first registration wins)
         assert_eq!(handle1.total_bytes(), handle2.total_bytes());
@@ -775,7 +749,7 @@ mod tests {
         let registry = StreamRegistry::new();
         let id = make_stream_id();
 
-        registry.register(id, 1000).await;
+        registry.register(id, 1000);
         assert_eq!(registry.stream_count(), 1);
 
         let removed = registry.remove(id);
@@ -784,26 +758,6 @@ mod tests {
 
         // Get should return None after removal
         assert!(registry.get(id).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_stream_registry_new_stream_notifications() {
-        let registry = StreamRegistry::new();
-        let mut rx = registry.take_new_stream_receiver().unwrap();
-
-        let id1 = make_stream_id();
-        let id2 = make_stream_id();
-
-        registry.register(id1, 100).await;
-        registry.register(id2, 200).await;
-
-        // Should receive notifications
-        let notified_id1 = rx.recv().await.unwrap();
-        let notified_id2 = rx.recv().await.unwrap();
-
-        assert!(notified_id1 == id1 || notified_id1 == id2);
-        assert!(notified_id2 == id1 || notified_id2 == id2);
-        assert_ne!(notified_id1, notified_id2);
     }
 
     #[tokio::test]
@@ -1099,8 +1053,8 @@ mod tests {
         let id1 = make_stream_id();
         let id2 = make_stream_id();
 
-        let handle1 = registry.register(id1, 100).await;
-        let handle2 = registry.register(id2, 200).await;
+        let handle1 = registry.register(id1, 100);
+        let handle2 = registry.register(id2, 200);
 
         // Cancel all (now clears the registry too)
         registry.cancel_all();
@@ -1127,9 +1081,9 @@ mod tests {
         let id3 = make_stream_id();
 
         // Register multiple streams
-        let handle1 = registry.register(id1, 100).await;
-        let _handle2 = registry.register(id2, 200).await;
-        let _handle3 = registry.register(id3, 300).await;
+        let handle1 = registry.register(id1, 100);
+        let _handle2 = registry.register(id2, 200);
+        let _handle3 = registry.register(id3, 300);
 
         assert_eq!(registry.stream_count(), 3);
 
@@ -1158,17 +1112,6 @@ mod tests {
         assert!(registry.get(id1).is_none());
         assert!(registry.get(id2).is_none());
         assert!(registry.get(id3).is_none());
-    }
-
-    #[test]
-    fn test_take_receiver_twice() {
-        let registry = StreamRegistry::new();
-
-        let rx1 = registry.take_new_stream_receiver();
-        let rx2 = registry.take_new_stream_receiver();
-
-        assert!(rx1.is_some());
-        assert!(rx2.is_none()); // Second call returns None
     }
 
     #[test]

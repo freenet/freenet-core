@@ -1003,15 +1003,13 @@ async fn notify_abort_failure(
                 cause: "Subscribe operation failed: peer connection dropped".into(),
             }
             .into());
-        if let Err(err) = op_manager
-            .result_router_tx
-            .send((tx_id, error_result))
-            .await
-        {
+        // Use try_send to avoid blocking the event loop (see channel-safety.md).
+        if let Err(err) = op_manager.result_router_tx.try_send((tx_id, error_result)) {
             tracing::error!(
                 tx = %tx_id,
                 error = %err,
-                "Failed to send abort notification to client"
+                "Failed to send abort notification to client \
+                 (result router channel full or closed)"
             );
         }
     }

@@ -566,9 +566,7 @@ async fn report_result(
                     // before the operation is considered complete. This prevents timeout
                     // issues where the operation completes but the response hasn't been
                     // delivered through the channel chain yet.
-                    op_manager
-                        .send_client_result(transaction, host_result)
-                        .await;
+                    op_manager.send_client_result(transaction, host_result);
                 }
             }
 
@@ -648,7 +646,7 @@ async fn report_result(
                             cause: err.to_string().into(),
                         },
                     );
-                    op_manager.send_client_result(tx, Err(client_error)).await;
+                    op_manager.send_client_result(tx, Err(client_error));
                 }
 
                 op_manager.completed(tx);

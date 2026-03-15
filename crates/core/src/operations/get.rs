@@ -1743,7 +1743,7 @@ impl Operation for GetOp {
                                             op_manager,
                                             id,
                                             &format!("contract {instance_id} not found after exhausting all peers"),
-                                        ).await;
+                                        );
                                         return_msg = None;
                                         new_state = None;
                                     }
@@ -1875,7 +1875,7 @@ impl Operation for GetOp {
                                             op_manager,
                                             id,
                                             &format!("contract {instance_id} not found after max retries"),
-                                        ).await;
+                                        );
                                         return_msg = None;
                                         new_state = None;
                                     }
@@ -2975,8 +2975,7 @@ async fn try_forward_or_return(
             op_manager,
             id,
             &format!("contract {instance_id} not found, no peers available to forward"),
-        )
-        .await;
+        );
 
         build_op_result(GetOpResult {
             id,
@@ -2999,16 +2998,14 @@ impl IsOperationCompleted for GetOp {
 }
 
 /// Notify the client that a GET operation failed with the given reason.
-async fn notify_get_failed(op_manager: &OpManager, tx: Transaction, reason: &str) {
-    op_manager
-        .send_client_result(
-            tx,
-            Err(ErrorKind::OperationError {
-                cause: reason.to_string().into(),
-            }
-            .into()),
-        )
-        .await;
+fn notify_get_failed(op_manager: &OpManager, tx: Transaction, reason: &str) {
+    op_manager.send_client_result(
+        tx,
+        Err(ErrorKind::OperationError {
+            cause: reason.to_string().into(),
+        }
+        .into()),
+    );
 }
 
 mod messages {

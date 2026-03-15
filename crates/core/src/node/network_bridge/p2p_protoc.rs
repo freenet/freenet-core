@@ -2057,7 +2057,10 @@ impl P2pConnManager {
                                     ContractResponse::SubscribeResponse { key, subscribed },
                                 ));
 
-                                match op_manager.result_router_tx.send((tx, response)).await {
+                                // Use try_send to avoid blocking the event loop.
+                                // If the result router channel is full, the client
+                                // will see a timeout rather than deadlocking the node.
+                                match op_manager.result_router_tx.try_send((tx, response)) {
                                     Ok(()) => {
                                         tracing::debug!(
                                             tx = %tx,
@@ -2101,7 +2104,8 @@ impl P2pConnManager {
                                             tx = %tx,
                                             error = %e,
                                             phase = "error",
-                                            "Failed to send standalone subscribe response to client"
+                                            "Failed to send standalone subscribe response to client \
+                                             (result router channel full or closed)"
                                         );
                                     }
                                 }
