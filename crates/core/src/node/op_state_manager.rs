@@ -1502,16 +1502,18 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     }
                 }
 
-                // Retry GET operations that have been waiting too long.
-                // If a GET has been pending for > GET_RETRY_THRESHOLD and has untried
-                // alternative peers, remove it from the map, advance to the next
-                // alternative, and re-submit. This prevents silent timeout when the
-                // selected peer is unreachable or drops the request.
+                // ACK-aware speculative retry for GET operations.
                 //
-                // 20s chosen to be long enough for a normal response round-trip
-                // (including streaming) but short enough to retry multiple times
-                // before OPERATION_TTL expires.
-                const GET_RETRY_THRESHOLD: Duration = Duration::from_secs(20);
+                // When a relay forwards a GET request, it sends a ForwardingAck back
+                // to its upstream within milliseconds. If no ACK arrives within 3s,
+                // the downstream peer is likely dead — launch a speculative retry on
+                // a different path (same tx ID). If an ACK has been received, the
+                // chain is alive — trust it and wait for OPERATION_TTL (60s).
+                //
+                // Only the originator speculates (max 2 parallel paths). Relay peers
+                // just forward once, so network overhead is bounded.
+                const ACK_TIMEOUT: Duration = Duration::from_secs(3);
+                const MAX_SPECULATIVE_PATHS: u8 = 2;
                 {
                     // Clean up entries for completed operations
                     get_retried.retain(|tx, _| ops.get.contains_key(tx));
@@ -1519,16 +1521,40 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     let mut retry_candidates: Vec<Transaction> = Vec::new();
                     for entry in ops.get.iter() {
                         let tx = *entry.key();
+                        let get_op = entry.value();
+
+                        // Only the originator speculates — relays just forward and ACK.
+                        if !get_op.is_client_initiated() {
+                            continue;
+                        }
+
+                        // If ACK received, the downstream chain is alive — don't retry.
+                        // Wait for OPERATION_TTL to expire naturally.
+                        if get_op.ack_received {
+                            continue;
+                        }
+
+                        // Cap speculative paths to bound network overhead
+                        if get_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
+                            continue;
+                        }
+
+                        // No ACK after ACK_TIMEOUT — speculative retry with ±20% jitter
                         let elapsed = tx.elapsed();
-                        // Allow retry every GET_RETRY_THRESHOLD seconds with ±20% jitter:
-                        // first retry at ~20s, second at ~40s, etc.
                         let retry_count = get_retried.get(&tx).copied().unwrap_or(0);
-                        let base = GET_RETRY_THRESHOLD * (retry_count as u32 + 1);
-                        let jitter_factor: f64 =
-                            crate::config::GlobalRng::random_range(0.8..=1.2);
-                        let jitter = base.mul_f64(jitter_factor);
-                        if elapsed > jitter {
-                            retry_candidates.push(tx);
+                        let base = ACK_TIMEOUT * (retry_count as u32 + 1);
+                        // Only consume GlobalRng when elapsed exceeds 80% of base
+                        // (minimum possible jittered threshold). This avoids shifting
+                        // the global RNG state on every GC tick for ops that are
+                        // nowhere near retry time.
+                        let min_jittered = base.mul_f64(0.8);
+                        if elapsed > min_jittered {
+                            let jitter_factor: f64 =
+                                crate::config::GlobalRng::random_range(0.8..=1.2);
+                            let jitter = base.mul_f64(jitter_factor);
+                            if elapsed > jitter {
+                                retry_candidates.push(tx);
+                            }
                         }
                     }
 
@@ -1546,8 +1572,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 let max_htl = ring.max_hops_to_live;
                                 match get_op.retry_with_next_alternative(max_htl, &all_connected)
                                 {
-                                    Ok((new_op, msg)) => {
+                                    Ok((mut new_op, msg)) => {
                                         let msg = crate::message::NetMessage::from(msg);
+                                        // Track speculative path for ACK-aware retry bounds
+                                        new_op.speculative_paths += 1;
+                                        // Reset ack_received for the new path
+                                        new_op.ack_received = false;
                                         // Insert op BEFORE sending message to avoid race
                                         // where the response arrives before the op is stored.
                                         ops.get.insert(tx, new_op);
@@ -1594,20 +1624,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     }
                 }
 
-                // Retry SUBSCRIBE operations at the originator that have been waiting
-                // too long. Only originator-initiated subscribes are retried — intermediate
-                // hops just time out silently (the originator retries independently).
+                // ACK-aware speculative retry for SUBSCRIBE operations.
+                // Same logic as GET: 3s ACK timeout, max 2 speculative paths.
+                // Only the originator retries — relays just forward and ACK.
                 //
-                // 5s chosen because subscribe is a lightweight handshake (no state transfer),
-                // so a response should arrive quickly. This allows multiple retries before
-                // OPERATION_TTL expires.
-                const SUBSCRIBE_RETRY_THRESHOLD: Duration = Duration::from_secs(5);
                 // Cap retries per GC tick to avoid flooding the notification channel.
                 // The gateway subscribes to 90+ contracts; retrying all at once saturates
                 // the 2048-capacity event loop channel, blocking UPDATEs and broadcasts.
-                // Value of 10: at 5s GC interval, processes 120 retries/minute — enough
-                // to cycle through 90+ contracts within OPERATION_TTL (60s). Low enough
-                // to leave most channel capacity for normal ops (UPDATEs, broadcasts).
                 const MAX_SUBSCRIBE_RETRIES_PER_TICK: usize = 10;
                 {
                     // Clean up entries for completed operations
@@ -1626,9 +1649,19 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             continue;
                         }
 
+                        // If ACK received, the downstream chain is alive — don't retry
+                        if sub_op.ack_received {
+                            continue;
+                        }
+
+                        // Cap speculative paths
+                        if sub_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
+                            continue;
+                        }
+
                         let elapsed = tx.elapsed();
                         let retry_count = subscribe_retried.get(&tx).copied().unwrap_or(0);
-                        let base = SUBSCRIBE_RETRY_THRESHOLD * (retry_count as u32 + 1);
+                        let base = ACK_TIMEOUT * (retry_count as u32 + 1);
                         // Only consume GlobalRng when elapsed exceeds 80% of base
                         // (minimum possible jittered threshold). This avoids shifting
                         // the global RNG state on every GC tick for ops that are
@@ -1668,8 +1701,11 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
                                 let max_htl = ring.max_hops_to_live;
                                 match sub_op.retry_with_next_alternative(max_htl, &all_connected) {
-                                    Ok((new_op, msg)) => {
+                                    Ok((mut new_op, msg)) => {
                                         let msg = crate::message::NetMessage::from(msg);
+                                        // Track speculative path for ACK-aware retry bounds
+                                        new_op.speculative_paths += 1;
+                                        new_op.ack_received = false;
                                         // Insert op BEFORE sending message to avoid race
                                         ops.subscribe.insert(tx, new_op);
                                         match tokio::time::timeout(

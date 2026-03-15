@@ -475,6 +475,8 @@ async fn test_subscription_validates_k_closest_usage() {
             requester_pub_key: None,
             is_renewal: false,
             stats: None,
+            ack_received: false,
+            speculative_paths: 0,
         };
 
         // State is simplified - skip list is now in the Request message, not state
@@ -572,6 +574,8 @@ fn test_subscribe_op_state_lifecycle() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     assert!(
@@ -600,6 +604,8 @@ fn test_subscribe_op_state_lifecycle() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     assert!(
@@ -624,6 +630,8 @@ fn test_subscribe_op_state_lifecycle() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     assert!(
@@ -658,6 +666,8 @@ fn test_subscribe_op_failed_state_returns_error() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     // Verify to_host_result returns error
@@ -693,6 +703,8 @@ fn test_local_subscription_completion_state() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     // Verify operation is in completed state
@@ -730,6 +742,8 @@ fn test_is_renewal_flag() {
         requester_pub_key: None,
         is_renewal: true,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(renewal_op.is_renewal());
 
@@ -740,6 +754,8 @@ fn test_is_renewal_flag() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(!client_op.is_renewal());
 }
@@ -759,6 +775,8 @@ fn test_op_enum_is_subscription_renewal() {
         requester_pub_key: None,
         is_renewal: true,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     });
     assert!(renewal.is_subscription_renewal());
 
@@ -769,6 +787,8 @@ fn test_op_enum_is_subscription_renewal() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     });
     assert!(!non_renewal.is_subscription_renewal());
 }
@@ -795,6 +815,8 @@ fn test_subscribe_failure_outcome() {
             target_peer: target_peer.clone(),
             contract_location,
         }),
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     match op_with_stats.outcome() {
@@ -826,6 +848,8 @@ fn test_subscribe_failure_outcome() {
             target_peer: target_peer.clone(),
             contract_location,
         }),
+        ack_received: false,
+        speculative_paths: 0,
     };
     match op_completed.outcome() {
         OpOutcome::ContractOpSuccessUntimed {
@@ -851,6 +875,8 @@ fn test_subscribe_failure_outcome() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(
         matches!(op_no_stats.outcome(), OpOutcome::Incomplete),
@@ -868,6 +894,8 @@ fn test_subscribe_failure_outcome() {
             target_peer: target_peer.clone(),
             contract_location,
         }),
+        ack_received: false,
+        speculative_paths: 0,
     };
     let (peer, loc) = op_for_info
         .failure_routing_info()
@@ -899,6 +927,8 @@ fn test_subscribe_outcome_success_untimed_with_stats() {
             target_peer: target_peer.clone(),
             contract_location,
         }),
+        ack_received: false,
+        speculative_paths: 0,
     };
     match op.outcome() {
         OpOutcome::ContractOpSuccessUntimed {
@@ -932,6 +962,8 @@ fn test_subscribe_outcome_irrelevant_without_stats() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
 }
@@ -955,6 +987,8 @@ fn test_subscribe_outcome_failure_with_stats() {
             target_peer: target_peer.clone(),
             contract_location,
         }),
+        ack_received: false,
+        speculative_paths: 0,
     };
     match op.outcome() {
         OpOutcome::ContractOpFailure {
@@ -983,6 +1017,8 @@ fn test_subscribe_outcome_incomplete_without_stats() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(matches!(op.outcome(), OpOutcome::Incomplete));
 }
@@ -1015,6 +1051,8 @@ fn test_subscribe_stats_lifecycle() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(matches!(op.outcome(), OpOutcome::Incomplete));
 
@@ -1079,6 +1117,8 @@ fn test_subscribe_renewal_reports_outcome() {
             target_peer: target_peer.clone(),
             contract_location,
         }),
+        ack_received: false,
+        speculative_paths: 0,
     };
     // Renewal should still report success
     match op.outcome() {
@@ -1440,6 +1480,8 @@ fn test_retry_phase3_intermediate_node_forwards_notfound() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     // Intermediate node has requester_addr → should forward NotFound
@@ -1483,6 +1525,8 @@ fn test_retry_phase3_originator_fails_locally() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     // Originator has no requester_addr → should fail locally
@@ -1512,6 +1556,8 @@ fn test_non_awaiting_response_states_skip_retry() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(
         !matches!(op_prepare.state, SubscribeState::AwaitingResponse(_)),
@@ -1526,6 +1572,8 @@ fn test_non_awaiting_response_states_skip_retry() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(
         !matches!(op_completed.state, SubscribeState::AwaitingResponse(_)),
@@ -1540,6 +1588,8 @@ fn test_non_awaiting_response_states_skip_retry() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(
         !matches!(op_failed.state, SubscribeState::AwaitingResponse(_)),
@@ -1680,6 +1730,8 @@ fn awaiting_op(
         requester_pub_key: None,
         is_renewal: false,
         stats,
+        ack_received: false,
+        speculative_paths: 0,
     }
 }
 
@@ -1738,6 +1790,8 @@ fn completed_subscribe_reports_success() {
             target_peer,
             contract_location,
         }),
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     assert!(op.finalized());
@@ -1780,6 +1834,8 @@ fn test_retry_with_next_alternative_picks_next_peer() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     assert!(op.is_originator(), "No requester_addr means originator");
@@ -1801,7 +1857,9 @@ fn test_retry_with_next_alternative_picks_next_peer() {
             assert_eq!(*iid, instance_id);
             assert_eq!(*htl, 10);
         }
-        SubscribeMsg::Response { .. } | SubscribeMsg::Unsubscribe { .. } => {
+        SubscribeMsg::Response { .. }
+        | SubscribeMsg::Unsubscribe { .. }
+        | SubscribeMsg::ForwardingAck { .. } => {
             panic!("Expected Request message")
         }
     }
@@ -1838,6 +1896,8 @@ fn test_retry_with_no_alternatives_returns_err() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     // No alternatives and no fallback peers
@@ -1870,6 +1930,8 @@ fn test_retry_uses_fallback_peers() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     // Pass fallback peers — should pick from those
@@ -1917,6 +1979,8 @@ fn test_retry_skips_tried_fallback_peers() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     // Fallback peer was already tried — should return Err
@@ -1950,6 +2014,8 @@ fn test_is_originator_false_for_intermediate_hop() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     assert!(
@@ -1977,6 +2043,8 @@ fn test_retry_fails_on_wrong_state() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(op.retry_with_next_alternative(10, &[]).is_err());
 
@@ -1988,6 +2056,8 @@ fn test_retry_fails_on_wrong_state() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(op.retry_with_next_alternative(10, &[]).is_err());
 
@@ -1999,6 +2069,31 @@ fn test_retry_fails_on_wrong_state() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
     assert!(op.retry_with_next_alternative(10, &[]).is_err());
+}
+
+// === Tests for ForwardingAck serde round-trip ===
+
+#[test]
+fn subscribe_forwarding_ack_serde_roundtrip() {
+    let id = Transaction::new::<SubscribeMsg>();
+    let instance_id = ContractInstanceId::new([42; 32]);
+    let msg = SubscribeMsg::ForwardingAck { id, instance_id };
+
+    let serialized = bincode::serialize(&msg).expect("serialize");
+    let deserialized: SubscribeMsg = bincode::deserialize(&serialized).expect("deserialize");
+
+    match deserialized {
+        SubscribeMsg::ForwardingAck {
+            id: deser_id,
+            instance_id: deser_iid,
+        } => {
+            assert_eq!(deser_id, id);
+            assert_eq!(deser_iid, instance_id);
+        }
+        other => panic!("Expected ForwardingAck, got {other}"),
+    }
 }

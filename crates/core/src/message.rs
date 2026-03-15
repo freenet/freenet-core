@@ -575,8 +575,8 @@ impl Versioned for NetMessageV1 {
         match self {
             NetMessageV1::Connect(_) => semver::Version::new(1, 1, 0),
             NetMessageV1::Put(_) => semver::Version::new(1, 0, 0),
-            NetMessageV1::Get(_) => semver::Version::new(1, 0, 0),
-            NetMessageV1::Subscribe(_) => semver::Version::new(1, 0, 0),
+            NetMessageV1::Get(_) => semver::Version::new(1, 1, 0),
+            NetMessageV1::Subscribe(_) => semver::Version::new(1, 1, 0),
             // Version 2.0.0 for delta-based BroadcastTo format
             NetMessageV1::Update(_) => semver::Version::new(2, 0, 0),
             NetMessageV1::Aborted(_) => semver::Version::new(1, 0, 0),
