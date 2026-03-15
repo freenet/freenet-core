@@ -18,7 +18,7 @@ mod wasm_runtime;
 
 use crate::{
     build::build_package,
-    commands::{put, update},
+    commands::{get, put, subscribe, update},
     config::{Config, SubCommand},
     inspect::inspect,
     new_package::create_new_package,
@@ -66,8 +66,12 @@ fn main() -> anyhow::Result<()> {
             SubCommand::Publish(publish_config) => put(publish_config, config.additional).await,
             SubCommand::Execute(cmd_config) => match cmd_config.command {
                 config::NodeCommand::Put(put_config) => put(put_config, config.additional).await,
+                config::NodeCommand::Get(get_config) => get(get_config, config.additional).await,
                 config::NodeCommand::Update(update_config) => {
                     update(update_config, config.additional).await
+                }
+                config::NodeCommand::Subscribe(subscribe_config) => {
+                    subscribe(subscribe_config, config.additional).await
                 }
                 config::NodeCommand::GetContractId(get_contract_id_config) => {
                     commands::get_contract_id(get_contract_id_config).await

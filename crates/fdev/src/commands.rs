@@ -12,7 +12,7 @@ use freenet_stdlib::{
 };
 use xz2::read::XzDecoder;
 
-use crate::config::{BaseConfig, PutConfig, UpdateConfig};
+use crate::config::{BaseConfig, GetConfig, PutConfig, SubscribeConfig, UpdateConfig};
 
 mod v1;
 
@@ -383,6 +383,152 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     result
 }
 
+pub async fn get(config: GetConfig, other: BaseConfig) -> anyhow::Result<()> {
+    let instance_id = ContractInstanceId::try_from(config.key)?;
+    // Placeholder code hash — the node resolves the contract by instance ID, not full key
+    let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
+    eprintln!("Getting contract {key}");
+    let request = ContractRequest::Get {
+        key: *key.id(),
+        return_contract_code: config.return_code,
+        subscribe: false,
+        blocking_subscribe: false,
+    }
+    .into();
+    let mut client = start_api_client(other).await?;
+    execute_command(request, &mut client).await?;
+
+    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key: response_key,
+            state,
+            ..
+        }))) => {
+            let state_bytes: &[u8] = state.as_ref();
+            eprintln!("Contract {response_key}: {} bytes", state_bytes.len());
+            if let Some(output_path) = &config.output {
+                std::fs::write(output_path, state_bytes)?;
+                eprintln!("State written to {}", output_path.display());
+            } else {
+                use std::io::Write;
+                std::io::stdout().write_all(state_bytes)?;
+                std::io::stdout().flush()?;
+            }
+            Ok(())
+        }
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }))) => {
+            Err(anyhow::anyhow!("Contract not found: {instance_id}"))
+        }
+        Ok(Ok(HostResponse::ContractResponse(other))) => {
+            Err(anyhow::anyhow!("Unexpected contract response: {:?}", other))
+        }
+        Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "Timeout waiting for get response for contract {key} after {} seconds",
+            RESPONSE_TIMEOUT.as_secs()
+        )),
+    };
+
+    close_api_client(&mut client).await;
+    result
+}
+
+pub async fn subscribe(config: SubscribeConfig, other: BaseConfig) -> anyhow::Result<()> {
+    let instance_id = ContractInstanceId::try_from(config.key)?;
+    // Placeholder code hash — the node resolves the contract by instance ID, not full key
+    let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
+    eprintln!("Subscribing to contract {key}");
+    let request = ContractRequest::Subscribe {
+        key: *key.id(),
+        summary: None,
+    }
+    .into();
+    let mut client = start_api_client(other).await?;
+    execute_command(request, &mut client).await?;
+
+    // Wait for initial subscribe confirmation
+    match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key: response_key,
+            subscribed: true,
+        }))) => {
+            eprintln!("Subscribed to {response_key}, waiting for updates (Ctrl+C to stop)...");
+        }
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key: response_key,
+            subscribed: false,
+        }))) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!(
+                "Subscription rejected for contract {response_key}"
+            ));
+        }
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }))) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!("Contract not found: {instance_id}"));
+        }
+        Ok(Ok(other)) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!("Unexpected response: {:?}", other));
+        }
+        Ok(Err(e)) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!("Failed to receive response: {e}"));
+        }
+        Err(_) => {
+            close_api_client(&mut client).await;
+            return Err(anyhow::anyhow!(
+                "Timeout waiting for subscribe response after {} seconds",
+                RESPONSE_TIMEOUT.as_secs()
+            ));
+        }
+    }
+
+    // Stream update notifications until interrupted
+    let mut update_count: u64 = 0;
+    loop {
+        tokio::select! {
+            response = client.recv() => {
+                match response {
+                    Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                        key: update_key,
+                        update,
+                    })) => {
+                        update_count += 1;
+                        let update_bytes = extract_update_bytes(&update);
+                        eprintln!(
+                            "Update #{update_count} for {update_key}: {} bytes ({})",
+                            update_bytes.len(),
+                            describe_update_variant(&update),
+                        );
+                        if let Some(output_path) = &config.output {
+                            atomic_write(output_path, update_bytes)?;
+                            eprintln!("Update written to {}", output_path.display());
+                        } else {
+                            use std::io::Write;
+                            std::io::stdout().write_all(update_bytes)?;
+                            std::io::stdout().flush()?;
+                        }
+                    }
+                    Ok(other) => {
+                        tracing::debug!("Received non-update response: {:?}", other);
+                    }
+                    Err(e) => {
+                        close_api_client(&mut client).await;
+                        return Err(anyhow::anyhow!("Connection error: {e}"));
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nReceived {update_count} updates total");
+                close_api_client(&mut client).await;
+                return Ok(());
+            }
+        }
+    }
+}
+
 pub(crate) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {
     v1::start_api_client(cfg).await
 }
@@ -395,6 +541,41 @@ pub(crate) async fn close_api_client(client: &mut WebApi) {
     let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
     // Brief delay to allow the close handshake to complete
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}
+
+/// Extract the primary state or delta bytes from an update notification.
+fn extract_update_bytes<'a>(update: &'a UpdateData<'_>) -> &'a [u8] {
+    match update {
+        UpdateData::State(state) => state.as_ref(),
+        UpdateData::Delta(delta) => delta.as_ref(),
+        UpdateData::StateAndDelta { state, .. } => state.as_ref(),
+        UpdateData::RelatedState { state, .. } => state.as_ref(),
+        UpdateData::RelatedDelta { delta, .. } => delta.as_ref(),
+        UpdateData::RelatedStateAndDelta { state, .. } => state.as_ref(),
+    }
+}
+
+fn describe_update_variant(update: &UpdateData<'_>) -> &'static str {
+    match update {
+        UpdateData::State(_) => "state",
+        UpdateData::Delta(_) => "delta",
+        UpdateData::StateAndDelta { .. } => "state+delta",
+        UpdateData::RelatedState { .. } => "related-state",
+        UpdateData::RelatedDelta { .. } => "related-delta",
+        UpdateData::RelatedStateAndDelta { .. } => "related-state+delta",
+    }
+}
+
+/// Write to a file atomically (write to temp, then rename) to prevent partial reads.
+fn atomic_write(path: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub(crate) async fn execute_command(

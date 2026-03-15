@@ -184,6 +184,39 @@ fdev execute update <BASE58_CONTRACT_KEY> \
 
 ---
 
+## Getting Contract State
+
+To retrieve the current state of a contract:
+
+```bash
+# Output state bytes to stdout
+fdev execute get <BASE58_CONTRACT_KEY>
+
+# Save state to a file
+fdev execute get <BASE58_CONTRACT_KEY> --output state.bin
+
+# Also return the contract code
+fdev execute get <BASE58_CONTRACT_KEY> --return-code
+```
+
+---
+
+## Subscribing to Contract Updates
+
+To subscribe to a contract and stream update notifications until interrupted:
+
+```bash
+# Stream updates to stdout
+fdev execute subscribe <BASE58_CONTRACT_KEY>
+
+# Write each update to a file (overwritten on each update)
+fdev execute subscribe <BASE58_CONTRACT_KEY> --output updates.bin
+```
+
+Press Ctrl+C to stop. Status messages go to stderr so stdout can be piped.
+
+---
+
 ## Contract State Builder Example
 
 Sometimes you only want to build the “state artifact” for a contract or a web front-end. `fdev build` can do this if your `freenet.toml` includes a `state-sources` or webapp config.  
@@ -353,29 +386,37 @@ Below are a few typical steps you might perform:
    fdev execute update <contract_key> \
        --delta path/to/delta.json
    ```
-5. **Inspect** a compiled WASM:
+5. **Get** current contract state:
+   ```bash
+   fdev execute get <contract_key> --output state.bin
+   ```
+6. **Subscribe** to updates:
+   ```bash
+   fdev execute subscribe <contract_key>
+   ```
+7. **Inspect** a compiled WASM:
    ```bash
    fdev inspect code build/freenet/my_contract.wasm
    ```
-6. **Run local TUI** (optionally):
+8. **Run local TUI** (optionally):
    ```bash
    fdev wasm-runtime \
        --input-file my_input.json \
        --terminal-output \
        --deserialization-format json
    ```
-7. **Check open peers**:
+9. **Check open peers**:
    ```bash
    fdev query
    ```
-8. **Simulate** a small test network:
-   ```bash
-   fdev test --nodes 5 --gateways 1 single-process
-   ```
-9. **(Optional) Start metrics server**:
-   ```bash
-   fdev network-metrics-server --log-directory /path/to/logs
-   ```
+10. **Simulate** a small test network:
+    ```bash
+    fdev test --nodes 5 --gateways 1 single-process
+    ```
+11. **(Optional) Start metrics server**:
+    ```bash
+    fdev network-metrics-server --log-directory /path/to/logs
+    ```
 
 Feel free to run `fdev <subcommand> --help` for more details on any step. Enjoy building with Freenet!Below is a comprehensive README for `fdev` that combines the existing reference documentation and the original README content. You can drop it in place of your current `README.md`.
 
@@ -548,6 +589,39 @@ fdev execute update <BASE58_CONTRACT_KEY> \
 
 ---
 
+## Getting Contract State
+
+To retrieve the current state of a contract:
+
+```bash
+# Output state bytes to stdout
+fdev execute get <BASE58_CONTRACT_KEY>
+
+# Save state to a file
+fdev execute get <BASE58_CONTRACT_KEY> --output state.bin
+
+# Also return the contract code
+fdev execute get <BASE58_CONTRACT_KEY> --return-code
+```
+
+---
+
+## Subscribing to Contract Updates
+
+To subscribe to a contract and stream update notifications until interrupted:
+
+```bash
+# Stream updates to stdout
+fdev execute subscribe <BASE58_CONTRACT_KEY>
+
+# Write each update to a file (overwritten on each update)
+fdev execute subscribe <BASE58_CONTRACT_KEY> --output updates.bin
+```
+
+Press Ctrl+C to stop. Status messages go to stderr so stdout can be piped.
+
+---
+
 ## Contract State Builder Example
 
 Sometimes you only want to build the “state artifact” for a contract or a web front-end. `fdev build` can do this if your `freenet.toml` includes a `state-sources` or webapp config.  
@@ -717,28 +791,36 @@ Below are a few typical steps you might perform:
    fdev execute update <contract_key> \
        --delta path/to/delta.json
    ```
-5. **Inspect** a compiled WASM:
+5. **Get** current contract state:
+   ```bash
+   fdev execute get <contract_key> --output state.bin
+   ```
+6. **Subscribe** to updates:
+   ```bash
+   fdev execute subscribe <contract_key>
+   ```
+7. **Inspect** a compiled WASM:
    ```bash
    fdev inspect code build/freenet/my_contract.wasm
    ```
-6. **Run local TUI** (optionally):
+8. **Run local TUI** (optionally):
    ```bash
    fdev wasm-runtime \
        --input-file my_input.json \
        --terminal-output \
        --deserialization-format json
    ```
-7. **Check open peers**:
+9. **Check open peers**:
    ```bash
    fdev query
    ```
-8. **Simulate** a small test network:
-   ```bash
-   fdev test --nodes 5 --gateways 1 single-process
-   ```
-9. **(Optional) Start metrics server**:
-   ```bash
-   fdev network-metrics-server --log-directory /path/to/logs
-   ```
+10. **Simulate** a small test network:
+    ```bash
+    fdev test --nodes 5 --gateways 1 single-process
+    ```
+11. **(Optional) Start metrics server**:
+    ```bash
+    fdev network-metrics-server --log-directory /path/to/logs
+    ```
 
 Feel free to run `fdev <subcommand> --help` for more details on any step. Enjoy building with Freenet!
