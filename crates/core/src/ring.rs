@@ -189,22 +189,10 @@ impl Ring {
             GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone())),
         );
 
-        // Interval for periodic subscription state telemetry snapshots (1 minute)
-        const SUBSCRIPTION_STATE_INTERVAL: Duration = Duration::from_secs(60);
-
-        // Interval for periodic subscription recovery attempts (30 seconds)
-        // This recovers "orphaned hosters" - peers that have contracts in cache
-        // but failed to establish subscription (no upstream in subscription tree)
-        const SUBSCRIPTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
-
-        // Interval for hosting cache sweep (60 seconds)
-        // Cleans up expired hosted contracts
-        //
         // Interval for topology snapshot registration (1 second in test mode)
         // Registers subscription topology with the global registry for validation
         #[cfg(any(test, feature = "testing"))]
         const TOPOLOGY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
-        const GET_SUBSCRIPTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
         let ring = Ring {
@@ -256,7 +244,7 @@ impl Ring {
             "emit_subscription_state_telemetry",
             GlobalExecutor::spawn(Self::emit_subscription_state_telemetry(
                 ring.clone(),
-                SUBSCRIPTION_STATE_INTERVAL,
+                Self::SUBSCRIPTION_STATE_INTERVAL,
             )),
         );
 
@@ -266,7 +254,7 @@ impl Ring {
             "recover_orphaned_subscriptions",
             GlobalExecutor::spawn(Self::recover_orphaned_subscriptions(
                 ring.clone(),
-                SUBSCRIPTION_RECOVERY_INTERVAL,
+                Self::SUBSCRIPTION_RECOVERY_INTERVAL,
             )),
         );
 
@@ -276,7 +264,7 @@ impl Ring {
             "sweep_get_subscription_cache",
             GlobalExecutor::spawn(Self::sweep_get_subscription_cache(
                 ring.clone(),
-                GET_SUBSCRIPTION_SWEEP_INTERVAL,
+                Self::GET_SUBSCRIPTION_SWEEP_INTERVAL,
             )),
         );
 
@@ -794,6 +782,18 @@ impl Ring {
     /// Stop spawning mid-cycle when remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 75% full).
     const RENEWAL_STOP_CAPACITY_FRACTION: usize = 4; // channel_max / 4
+
+    /// Interval for periodic subscription state telemetry snapshots.
+    pub(crate) const SUBSCRIPTION_STATE_INTERVAL: Duration = Duration::from_secs(60);
+
+    /// Interval for periodic subscription recovery attempts.
+    ///
+    /// This recovers "orphaned hosters" - peers that have contracts in cache
+    /// but failed to establish subscription (no upstream in subscription tree).
+    pub(crate) const SUBSCRIPTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+    /// Interval for periodic GET subscription cache sweep.
+    pub(crate) const GET_SUBSCRIPTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
     /// Periodically attempt to recover "orphaned hosters" - contracts we're hosting
     /// but don't have an upstream subscription for.
