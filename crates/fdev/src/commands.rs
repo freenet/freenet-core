@@ -385,6 +385,7 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
 
 pub async fn get(config: GetConfig, other: BaseConfig) -> anyhow::Result<()> {
     let instance_id = ContractInstanceId::try_from(config.key)?;
+    // Placeholder code hash — the node resolves the contract by instance ID, not full key
     let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
     eprintln!("Getting contract {key}");
     let request = ContractRequest::Get {
@@ -411,6 +412,7 @@ pub async fn get(config: GetConfig, other: BaseConfig) -> anyhow::Result<()> {
             } else {
                 use std::io::Write;
                 std::io::stdout().write_all(state_bytes)?;
+                std::io::stdout().flush()?;
             }
             Ok(())
         }
@@ -434,6 +436,7 @@ pub async fn get(config: GetConfig, other: BaseConfig) -> anyhow::Result<()> {
 
 pub async fn subscribe(config: SubscribeConfig, other: BaseConfig) -> anyhow::Result<()> {
     let instance_id = ContractInstanceId::try_from(config.key)?;
+    // Placeholder code hash — the node resolves the contract by instance ID, not full key
     let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
     eprintln!("Subscribing to contract {key}");
     let request = ContractRequest::Subscribe {
@@ -493,18 +496,18 @@ pub async fn subscribe(config: SubscribeConfig, other: BaseConfig) -> anyhow::Re
                         update,
                     })) => {
                         update_count += 1;
-                        let update_size = update.size();
+                        let update_bytes = extract_update_bytes(&update);
                         eprintln!(
-                            "Update #{update_count} for {update_key}: {update_size} bytes ({update:?})",
+                            "Update #{update_count} for {update_key}: {} bytes ({})",
+                            update_bytes.len(),
+                            describe_update_variant(&update),
                         );
-                        let serialized = bincode::serialize(&update)
-                            .map_err(|e| anyhow::anyhow!("Failed to serialize update: {e}"))?;
                         if let Some(output_path) = &config.output {
-                            std::fs::write(output_path, &serialized)?;
+                            atomic_write(output_path, update_bytes)?;
                             eprintln!("Update written to {}", output_path.display());
                         } else {
                             use std::io::Write;
-                            std::io::stdout().write_all(&serialized)?;
+                            std::io::stdout().write_all(update_bytes)?;
                             std::io::stdout().flush()?;
                         }
                     }
@@ -538,6 +541,41 @@ pub(crate) async fn close_api_client(client: &mut WebApi) {
     let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
     // Brief delay to allow the close handshake to complete
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}
+
+/// Extract the primary state or delta bytes from an update notification.
+fn extract_update_bytes<'a>(update: &'a UpdateData<'_>) -> &'a [u8] {
+    match update {
+        UpdateData::State(state) => state.as_ref(),
+        UpdateData::Delta(delta) => delta.as_ref(),
+        UpdateData::StateAndDelta { state, .. } => state.as_ref(),
+        UpdateData::RelatedState { state, .. } => state.as_ref(),
+        UpdateData::RelatedDelta { delta, .. } => delta.as_ref(),
+        UpdateData::RelatedStateAndDelta { state, .. } => state.as_ref(),
+    }
+}
+
+fn describe_update_variant(update: &UpdateData<'_>) -> &'static str {
+    match update {
+        UpdateData::State(_) => "state",
+        UpdateData::Delta(_) => "delta",
+        UpdateData::StateAndDelta { .. } => "state+delta",
+        UpdateData::RelatedState { .. } => "related-state",
+        UpdateData::RelatedDelta { .. } => "related-delta",
+        UpdateData::RelatedStateAndDelta { .. } => "related-state+delta",
+    }
+}
+
+/// Write to a file atomically (write to temp, then rename) to prevent partial reads.
+fn atomic_write(path: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub(crate) async fn execute_command(
