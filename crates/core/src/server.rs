@@ -638,22 +638,24 @@ mod tests {
     }
 
     #[test]
-    fn test_build_allowed_hosts_localhost() {
+    fn test_build_allowed_hosts_always_includes_localhost() {
         let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509, &[]);
         assert!(hosts.contains("localhost"));
-        assert!(hosts.contains("127.0.0.1"));
-        assert!(hosts.contains("[::1]"));
         assert!(hosts.contains("localhost:7509"));
+        assert!(hosts.contains("127.0.0.1"));
         assert!(hosts.contains("127.0.0.1:7509"));
+        assert!(hosts.contains("[::1]"));
+        assert!(hosts.contains("[::1]:7509"));
     }
 
     #[test]
-    fn test_build_allowed_hosts_lan() {
+    fn test_build_allowed_hosts_includes_machine_hostname() {
         let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509, &[]);
-        assert!(hosts.contains("localhost"));
-        assert!(hosts.contains("127.0.0.1"));
-        // Should have the machine's hostname too (can't assert exact value)
-        assert!(hosts.len() > 6);
+        if let Ok(name) = hostname::get() {
+            if let Some(name_str) = name.to_str() {
+                assert!(hosts.contains(&name_str.to_lowercase()));
+            }
+        }
     }
 
     #[test]
@@ -665,12 +667,21 @@ mod tests {
         );
         assert!(hosts.contains("mynode.example.com"));
         assert!(hosts.contains("mynode.example.com:7509"));
+        assert!(hosts.contains("localhost"));
     }
 
     #[test]
-    fn test_build_allowed_hosts_specific_ip() {
+    fn test_build_allowed_hosts_specific_bind_addr() {
         let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 7509, &[]);
         assert!(hosts.contains("192.168.1.50"));
         assert!(hosts.contains("192.168.1.50:7509"));
+        assert!(hosts.contains("localhost"));
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_excludes_unspecified() {
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509, &[]);
+        assert!(!hosts.contains("0.0.0.0"));
+        assert!(!hosts.contains("0.0.0.0:7509"));
     }
 }

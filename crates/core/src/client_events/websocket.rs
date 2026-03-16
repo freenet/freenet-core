@@ -1660,27 +1660,43 @@ mod tests {
             map
         }
 
-        // Allowed hosts
-        let h = headers_with_host("192.168.1.50:7509");
-        assert!(is_allowed_host(&h, &allowed));
+        // Allowed: host with port
+        assert!(is_allowed_host(
+            &headers_with_host("192.168.1.50:7509"),
+            &allowed
+        ));
+        assert!(is_allowed_host(
+            &headers_with_host("mynode.example.com:7509"),
+            &allowed
+        ));
+        assert!(is_allowed_host(
+            &headers_with_host("localhost:7509"),
+            &allowed
+        ));
 
-        let h = headers_with_host("mynode.example.com:7509");
-        assert!(is_allowed_host(&h, &allowed));
+        // Allowed: host without port
+        assert!(is_allowed_host(&headers_with_host("localhost"), &allowed));
+        assert!(is_allowed_host(
+            &headers_with_host("192.168.1.50"),
+            &allowed
+        ));
 
-        let h = headers_with_host("localhost:7509");
-        assert!(is_allowed_host(&h, &allowed));
+        // Rejected: DNS rebinding
+        assert!(!is_allowed_host(
+            &headers_with_host("evil.com:7509"),
+            &allowed
+        ));
+        assert!(!is_allowed_host(&headers_with_host("evil.com"), &allowed));
 
-        // DNS rebinding: evil.com is NOT in allowed hosts
-        let h = headers_with_host("evil.com:7509");
-        assert!(!is_allowed_host(&h, &allowed));
+        // Rejected: no Host header
+        assert!(!is_allowed_host(&axum::http::HeaderMap::new(), &allowed));
 
-        // No Host header
-        let empty = axum::http::HeaderMap::new();
-        assert!(!is_allowed_host(&empty, &allowed));
-
-        // Case insensitive
-        let h = headers_with_host("MyHost:7509");
-        assert!(is_allowed_host(&h, &allowed));
+        // Allowed: case insensitive
+        assert!(is_allowed_host(&headers_with_host("MyHost:7509"), &allowed));
+        assert!(is_allowed_host(
+            &headers_with_host("LOCALHOST:7509"),
+            &allowed
+        ));
     }
 
     #[test]
