@@ -31,7 +31,9 @@
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use event_listener::EventListener;
 use futures::Stream;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
@@ -198,6 +200,7 @@ impl StreamHandle {
             next_fragment: 1,
             bytes_read: 0,
             auto_reclaim: false,
+            listener: None,
         }
     }
 
@@ -246,15 +249,29 @@ impl StreamHandle {
             next_fragment: 1,
             bytes_read: 0,
             auto_reclaim: true,
+            listener: None,
         }
     }
 
     /// Forks this handle, creating an independent consumer.
     ///
-    /// The forked handle shares the same underlying buffer but maintains
-    /// its own read position when used with `.stream()`.
+    /// The forked handle shares the same underlying buffer but has its own
+    /// independent `SyncState` (cancelled flag and wakers). This means:
+    /// - Cancelling the original handle does NOT cancel the fork
+    /// - Each consumer has its own waker list
+    /// - Fragment notifications reach the fork via the buffer's `Event` notifier
+    ///
+    /// This independence is critical for piped stream forwarding: when the
+    /// upstream `PeerConnection` drops and cancels its handles, the pipe task
+    /// (which reads from a forked handle) must continue forwarding data that's
+    /// already in the shared buffer.
     pub fn fork(&self) -> Self {
-        self.clone()
+        Self {
+            buffer: self.buffer.clone(),
+            sync: Arc::new(parking_lot::RwLock::new(SyncState::new())),
+            stream_id: self.stream_id,
+            total_bytes: self.total_bytes,
+        }
     }
 
     /// Inserts a fragment into the stream buffer.
@@ -415,6 +432,11 @@ pub struct StreamingInboundStream {
     /// If true, fragments are taken (removed) from the buffer after reading.
     /// This enables progressive memory reclamation for single-consumer scenarios.
     auto_reclaim: bool,
+    /// Listener for buffer data_available notifications.
+    /// Created when poll_next returns Pending, consumed when notified.
+    /// Uses the buffer's `event_listener::Event` which is fired by every
+    /// `buffer.insert()` — independent of which handle called `push_fragment`.
+    listener: Option<Pin<Box<EventListener>>>,
 }
 
 impl StreamingInboundStream {
@@ -460,7 +482,7 @@ impl Stream for StreamingInboundStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next_idx = self.next_fragment;
 
-        // Check cancelled state (sync lock)
+        // Check cancelled state (per-handle, not shared)
         if self.handle.sync.read().cancelled {
             return Poll::Ready(Some(Err(StreamError::Cancelled)));
         }
@@ -482,29 +504,56 @@ impl Stream for StreamingInboundStream {
 
         // Try to get the next fragment (lock-free)
         if let Some(data) = self.try_get_fragment(next_idx) {
+            self.listener = None; // Clear any pending listener
             self.next_fragment = next_idx + 1;
             self.bytes_read += data.len() as u64;
             return Poll::Ready(Some(Ok(data)));
         }
 
-        // Fragment not yet available, register waker
+        // Fragment not yet available — use buffer's Event notifier.
+        //
+        // We use the buffer's `data_available` Event (fired by every buffer.insert())
+        // instead of SyncState wakers. This is critical for forked handles: since
+        // fork() creates an independent SyncState, push_fragment() on the original
+        // handle's sync won't wake the fork's wakers. But buffer.insert() always
+        // fires data_available regardless of which handle is used, so all consumers
+        // (including forks) get notified.
+        //
+        // We also keep the SyncState waker path as a belt-and-suspenders backup
+        // for the non-forked case (which also wakes via cancel()).
         {
             let mut sync = self.handle.sync.write();
-            // Re-check cancelled after acquiring write lock
             if sync.cancelled {
                 return Poll::Ready(Some(Err(StreamError::Cancelled)));
             }
-            // Re-check buffer (fragment may have arrived)
+            // Re-check buffer under lock (fragment may have arrived)
             if let Some(data) = self.try_get_fragment(next_idx) {
-                drop(sync); // Release lock before modifying self
+                drop(sync);
+                self.listener = None;
                 self.next_fragment = next_idx + 1;
                 self.bytes_read += data.len() as u64;
                 return Poll::Ready(Some(Ok(data)));
             }
+            // Register waker on SyncState (for cancel() wakeup and non-forked case)
             sync.wakers.push(cx.waker().clone());
         }
 
-        Poll::Pending
+        // Create or poll EventListener for buffer notifications (for forked case).
+        // This is the primary notification path for forked handles.
+        if self.listener.is_none() {
+            let notifier = self.handle.buffer.notifier();
+            self.listener = Some(Box::pin(notifier.listen()));
+        }
+        let listener = self.listener.as_mut().unwrap();
+        match listener.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                // Notified — clear listener and re-check on next poll
+                self.listener = None;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -654,6 +703,72 @@ mod tests {
         assert!(handle.is_complete());
         assert!(forked.is_complete());
         assert_eq!(handle.try_assemble(), forked.try_assemble());
+    }
+
+    #[test]
+    fn test_fork_independent_cancellation() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        // Use exact fragment size so one fragment completes the stream
+        let total = FRAGMENT_PAYLOAD_SIZE as u64;
+        let data = vec![42u8; FRAGMENT_PAYLOAD_SIZE];
+        let handle = StreamHandle::new(make_stream_id(), total);
+        handle.push_fragment(1, Bytes::from(data.clone())).unwrap();
+
+        let forked = handle.fork();
+
+        // Cancel the original — simulates PeerConnection::Drop
+        handle.cancel();
+
+        // Original is cancelled
+        assert!(handle.sync.read().cancelled);
+        assert!(matches!(
+            handle.push_fragment(1, Bytes::from(vec![0u8; 10])),
+            Err(StreamError::Cancelled)
+        ));
+
+        // Fork is NOT cancelled — pipe task can continue reading
+        assert!(!forked.sync.read().cancelled);
+
+        // Fork can still read data from the shared buffer
+        assert!(forked.is_complete());
+        assert_eq!(forked.try_assemble(), Some(data));
+    }
+
+    #[tokio::test]
+    async fn test_fork_stream_reads_after_original_cancel() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        // Push both fragments via the original handle
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        handle
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        // Fork and create a stream from it
+        let forked = handle.fork();
+        let mut stream = forked.stream();
+
+        // Cancel the original (simulates PeerConnection drop)
+        handle.cancel();
+
+        // The forked stream should still be able to read all fragments
+        let chunk1 = stream.next().await;
+        assert!(chunk1.is_some());
+        assert_eq!(chunk1.unwrap().unwrap().len(), FRAGMENT_PAYLOAD_SIZE);
+
+        let chunk2 = stream.next().await;
+        assert!(chunk2.is_some());
+        assert_eq!(chunk2.unwrap().unwrap().len(), FRAGMENT_PAYLOAD_SIZE);
+
+        // Stream complete
+        let chunk3 = stream.next().await;
+        assert!(chunk3.is_none());
     }
 
     #[tokio::test]
