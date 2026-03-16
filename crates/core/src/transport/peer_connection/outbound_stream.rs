@@ -361,8 +361,51 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     let mut fragment_number = 1u32;
     let mut pending_metadata = metadata;
 
-    while let Some(result) = stream.next().await {
-        let payload = match result {
+    // Inactivity timeout for piped streams. If no fragment arrives from the
+    // inbound buffer within this duration, the pipe fails rather than hanging
+    // indefinitely. This matches STREAM_INACTIVITY_TIMEOUT used by assemble().
+    use super::streaming::STREAM_INACTIVITY_TIMEOUT;
+    let inactivity_timeout = STREAM_INACTIVITY_TIMEOUT;
+
+    loop {
+        // Use tokio::select! with time_source.sleep() for DST compatibility.
+        // tokio::time::timeout uses real timers which don't advance in
+        // VirtualTime simulation tests.
+        let next_fragment = tokio::select! {
+            result = stream.next() => {
+                match result {
+                    Some(r) => r,
+                    None => break, // Stream complete
+                }
+            }
+            _ = time_source.sleep(inactivity_timeout) => {
+                // No fragment arrived within the inactivity timeout
+                let elapsed = time_source.now().saturating_sub(start_time);
+                tracing::warn!(
+                    stream_id = %outbound_stream_id.0,
+                    destination = %destination_addr,
+                    sent_so_far,
+                    total_bytes,
+                    fragment_number,
+                    elapsed_ms = elapsed.as_millis(),
+                    "pipe_stream stalled: no fragment received within {}s",
+                    inactivity_timeout.as_secs()
+                );
+                emit_transfer_failed(
+                    outbound_stream_id.0 as u64,
+                    destination_addr,
+                    sent_so_far,
+                    format!(
+                        "pipe stalled: no fragment for {}s (sent {sent_so_far}/{total_bytes} bytes)",
+                        inactivity_timeout.as_secs()
+                    ),
+                    elapsed.as_millis() as u64,
+                    TransferDirection::Send,
+                );
+                return Err(TransportError::ConnectionClosed(destination_addr));
+            }
+        };
+        let payload = match next_fragment {
             Ok(data) => data,
             Err(e) => {
                 let elapsed = time_source.now().saturating_sub(start_time);
