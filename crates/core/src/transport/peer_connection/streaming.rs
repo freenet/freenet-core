@@ -547,48 +547,43 @@ impl Stream for StreamingInboundStream {
             return Poll::Ready(Some(Ok(data)));
         }
 
-        // Poll the listener. When notified, we don't wake_by_ref —
-        // instead we clear the listener and let the next poll_next call
-        // re-check the buffer via the fast path above.
-        let listener = self.listener.as_mut().unwrap();
-        match listener.as_mut().poll(cx) {
-            Poll::Ready(()) => {
-                // Notified — clear listener so next poll creates a fresh one.
-                // Re-check buffer immediately rather than deferring to a
-                // separate poll cycle (avoids wake_by_ref spin-loop).
-                self.listener = None;
-                // Re-check: the notification may be for our fragment
-                if self.handle.sync.read().cancelled {
-                    return Poll::Ready(Some(Err(StreamError::Cancelled)));
-                }
-                if let Some(data) = self.try_get_fragment(next_idx) {
-                    self.next_fragment = next_idx + 1;
-                    self.bytes_read += data.len() as u64;
-                    return Poll::Ready(Some(Ok(data)));
-                }
-                // Notification was for a different fragment or spurious.
-                // Create a new listener and return Pending.
-                self.listener = Some(Box::pin(self.handle.buffer.notifier().listen()));
-                // Re-check once more (another fragment may have arrived
-                // between clearing the old listener and creating the new one)
-                if let Some(data) = self.try_get_fragment(next_idx) {
+        // Poll the listener. The listener is guaranteed to be Some here
+        // (set above), but we use if-let to satisfy the no-unwrap rule.
+        if let Some(listener) = self.listener.as_mut() {
+            match listener.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    // Notified — clear listener and re-check buffer inline
+                    // (avoids wake_by_ref spin-loop).
                     self.listener = None;
-                    self.next_fragment = next_idx + 1;
-                    self.bytes_read += data.len() as u64;
-                    return Poll::Ready(Some(Ok(data)));
-                }
-                // Register waker with the new listener
-                let listener = self.listener.as_mut().unwrap();
-                match listener.as_mut().poll(cx) {
-                    Poll::Ready(()) => {
-                        // Immediate notification — will re-check on next poll
-                        self.listener = None;
+                    if self.handle.sync.read().cancelled {
+                        return Poll::Ready(Some(Err(StreamError::Cancelled)));
                     }
-                    Poll::Pending => { /* waker registered */ }
+                    if let Some(data) = self.try_get_fragment(next_idx) {
+                        self.next_fragment = next_idx + 1;
+                        self.bytes_read += data.len() as u64;
+                        return Poll::Ready(Some(Ok(data)));
+                    }
+                    // Spurious notification. Create a fresh listener,
+                    // re-check, and register waker.
+                    self.listener = Some(Box::pin(self.handle.buffer.notifier().listen()));
+                    if let Some(data) = self.try_get_fragment(next_idx) {
+                        self.listener = None;
+                        self.next_fragment = next_idx + 1;
+                        self.bytes_read += data.len() as u64;
+                        return Poll::Ready(Some(Ok(data)));
+                    }
+                    if let Some(new_listener) = self.listener.as_mut() {
+                        match new_listener.as_mut().poll(cx) {
+                            Poll::Ready(()) => self.listener = None,
+                            Poll::Pending => {}
+                        }
+                    }
+                    Poll::Pending
                 }
-                Poll::Pending
+                Poll::Pending => Poll::Pending,
             }
-            Poll::Pending => Poll::Pending,
+        } else {
+            Poll::Pending
         }
     }
 }
