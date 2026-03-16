@@ -482,7 +482,7 @@ impl Stream for StreamingInboundStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next_idx = self.next_fragment;
 
-        // Check cancelled state (per-handle, not shared)
+        // Check cancelled state (per-handle, independent for forks)
         if self.handle.sync.read().cancelled {
             return Poll::Ready(Some(Err(StreamError::Cancelled)));
         }
@@ -502,54 +502,78 @@ impl Stream for StreamingInboundStream {
             return Poll::Ready(None);
         }
 
-        // Try to get the next fragment (lock-free)
+        // Try to get the next fragment (lock-free fast path)
         if let Some(data) = self.try_get_fragment(next_idx) {
-            self.listener = None; // Clear any pending listener
+            self.listener = None;
             self.next_fragment = next_idx + 1;
             self.bytes_read += data.len() as u64;
             return Poll::Ready(Some(Ok(data)));
         }
 
-        // Fragment not yet available — use buffer's Event notifier.
+        // Fragment not yet available.
         //
-        // We use the buffer's `data_available` Event (fired by every buffer.insert())
-        // instead of SyncState wakers. This is critical for forked handles: since
-        // fork() creates an independent SyncState, push_fragment() on the original
-        // handle's sync won't wake the fork's wakers. But buffer.insert() always
-        // fires data_available regardless of which handle is used, so all consumers
-        // (including forks) get notified.
+        // Following the event_listener pattern: create the listener BEFORE
+        // re-checking the condition. This prevents a TOCTOU race where a
+        // notification fires between the check and listener creation.
         //
-        // We also keep the SyncState waker path as a belt-and-suspenders backup
-        // for the non-forked case (which also wakes via cancel()).
-        {
-            let mut sync = self.handle.sync.write();
-            if sync.cancelled {
-                return Poll::Ready(Some(Err(StreamError::Cancelled)));
-            }
-            // Re-check buffer under lock (fragment may have arrived)
-            if let Some(data) = self.try_get_fragment(next_idx) {
-                drop(sync);
-                self.listener = None;
-                self.next_fragment = next_idx + 1;
-                self.bytes_read += data.len() as u64;
-                return Poll::Ready(Some(Ok(data)));
-            }
-            // Register waker on SyncState (for cancel() wakeup and non-forked case)
-            sync.wakers.push(cx.waker().clone());
+        // We use the buffer's `data_available` Event (fired by every
+        // buffer.insert()) as the primary notification mechanism. This works
+        // for both original and forked handles since buffer.insert() fires
+        // regardless of which handle called push_fragment().
+        //
+        // cancel() also fires buffer.notifier().notify(), so the listener
+        // covers both data arrival and cancellation.
+        if self.listener.is_none() {
+            self.listener = Some(Box::pin(self.handle.buffer.notifier().listen()));
         }
 
-        // Create or poll EventListener for buffer notifications (for forked case).
-        // This is the primary notification path for forked handles.
-        if self.listener.is_none() {
-            let notifier = self.handle.buffer.notifier();
-            self.listener = Some(Box::pin(notifier.listen()));
+        // Re-check after listener creation (the event_listener pattern):
+        // if a fragment arrived between the fast-path check and listen(),
+        // we catch it here instead of missing the notification.
+        if self.handle.sync.read().cancelled {
+            self.listener = None;
+            return Poll::Ready(Some(Err(StreamError::Cancelled)));
         }
+        if let Some(data) = self.try_get_fragment(next_idx) {
+            self.listener = None;
+            self.next_fragment = next_idx + 1;
+            self.bytes_read += data.len() as u64;
+            return Poll::Ready(Some(Ok(data)));
+        }
+
+        // Poll the listener. When notified, we don't wake_by_ref —
+        // instead we clear the listener and let the next poll_next call
+        // re-check the buffer via the fast path above.
         let listener = self.listener.as_mut().unwrap();
         match listener.as_mut().poll(cx) {
             Poll::Ready(()) => {
-                // Notified — clear listener and re-check on next poll
+                // Notified — clear listener so next poll creates a fresh one.
+                // Re-check buffer immediately rather than deferring to a
+                // separate poll cycle (avoids wake_by_ref spin-loop).
                 self.listener = None;
-                cx.waker().wake_by_ref();
+                // Re-check: the notification may be for our fragment
+                if self.handle.sync.read().cancelled {
+                    return Poll::Ready(Some(Err(StreamError::Cancelled)));
+                }
+                if let Some(data) = self.try_get_fragment(next_idx) {
+                    self.next_fragment = next_idx + 1;
+                    self.bytes_read += data.len() as u64;
+                    return Poll::Ready(Some(Ok(data)));
+                }
+                // Notification was for a different fragment or spurious.
+                // Create a new listener and return Pending.
+                self.listener = Some(Box::pin(self.handle.buffer.notifier().listen()));
+                // Re-check once more (another fragment may have arrived
+                // between clearing the old listener and creating the new one)
+                if let Some(data) = self.try_get_fragment(next_idx) {
+                    self.listener = None;
+                    self.next_fragment = next_idx + 1;
+                    self.bytes_read += data.len() as u64;
+                    return Poll::Ready(Some(Ok(data)));
+                }
+                // Register with the new listener
+                let listener = self.listener.as_mut().unwrap();
+                let _ = listener.as_mut().poll(cx);
                 Poll::Pending
             }
             Poll::Pending => Poll::Pending,
@@ -769,6 +793,61 @@ mod tests {
         // Stream complete
         let chunk3 = stream.next().await;
         assert!(chunk3.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fork_incremental_wakeup() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        // Push only fragment #1
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        // Fork and start reading
+        let forked = handle.fork();
+        let mut stream = forked.stream();
+
+        // Read fragment #1 (available immediately)
+        let chunk1 = stream.next().await;
+        assert!(chunk1.is_some());
+        assert_eq!(chunk1.unwrap().unwrap(), vec![1u8; FRAGMENT_PAYLOAD_SIZE]);
+
+        // Fragment #2 arrives later via the ORIGINAL handle's push_fragment.
+        // The forked stream must wake up via the buffer's EventListener
+        // (not via SyncState wakers, which are on the fork's independent sync).
+        let handle_clone = handle.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            handle_clone
+                .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        });
+
+        // The forked stream should receive fragment #2 via EventListener
+        let chunk2 = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await;
+        assert!(
+            chunk2.is_ok(),
+            "fork should wake up when fragment arrives via original handle"
+        );
+        let chunk2 = chunk2.unwrap();
+        assert!(chunk2.is_some());
+        assert_eq!(chunk2.unwrap().unwrap(), vec![2u8; FRAGMENT_PAYLOAD_SIZE]);
+
+        // Push fragment #3 and verify
+        handle
+            .push_fragment(3, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        let chunk3 = stream.next().await;
+        assert!(chunk3.is_some());
+        assert_eq!(chunk3.unwrap().unwrap(), vec![3u8; FRAGMENT_PAYLOAD_SIZE]);
+
+        // Stream complete
+        let end = stream.next().await;
+        assert!(end.is_none());
     }
 
     #[tokio::test]

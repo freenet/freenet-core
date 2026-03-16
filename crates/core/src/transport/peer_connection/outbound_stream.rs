@@ -368,10 +368,17 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     let inactivity_timeout = STREAM_INACTIVITY_TIMEOUT;
 
     loop {
-        let next_fragment = match tokio::time::timeout(inactivity_timeout, stream.next()).await {
-            Ok(Some(result)) => result,
-            Ok(None) => break, // Stream complete
-            Err(_) => {
+        // Use tokio::select! with time_source.sleep() for DST compatibility.
+        // tokio::time::timeout uses real timers which don't advance in
+        // VirtualTime simulation tests.
+        let next_fragment = tokio::select! {
+            result = stream.next() => {
+                match result {
+                    Some(r) => r,
+                    None => break, // Stream complete
+                }
+            }
+            _ = time_source.sleep(inactivity_timeout) => {
                 // No fragment arrived within the inactivity timeout
                 let elapsed = time_source.now().saturating_sub(start_time);
                 tracing::warn!(
