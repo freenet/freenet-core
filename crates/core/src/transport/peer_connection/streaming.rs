@@ -266,9 +266,15 @@ impl StreamHandle {
     /// (which reads from a forked handle) must continue forwarding data that's
     /// already in the shared buffer.
     pub fn fork(&self) -> Self {
+        // Preserve the current cancelled state so forking an already-dead
+        // stream doesn't resurrect it. Future cancellations on the original
+        // won't propagate to the fork (independent SyncState).
+        let already_cancelled = self.sync.read().cancelled;
+        let mut sync = SyncState::new();
+        sync.cancelled = already_cancelled;
         Self {
             buffer: self.buffer.clone(),
-            sync: Arc::new(parking_lot::RwLock::new(SyncState::new())),
+            sync: Arc::new(parking_lot::RwLock::new(sync)),
             stream_id: self.stream_id,
             total_bytes: self.total_bytes,
         }
