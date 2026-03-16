@@ -577,9 +577,15 @@ impl Stream for StreamingInboundStream {
                     self.bytes_read += data.len() as u64;
                     return Poll::Ready(Some(Ok(data)));
                 }
-                // Register with the new listener
+                // Register waker with the new listener
                 let listener = self.listener.as_mut().unwrap();
-                let _ = listener.as_mut().poll(cx);
+                match listener.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        // Immediate notification — will re-check on next poll
+                        self.listener = None;
+                    }
+                    Poll::Pending => { /* waker registered */ }
+                }
                 Poll::Pending
             }
             Poll::Pending => Poll::Pending,
