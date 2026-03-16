@@ -365,64 +365,81 @@ pub(crate) async fn serve_client_api_in(
     serve_client_api_in_impl(config, None).await
 }
 
-/// Set of hostnames/IPs accepted in the Host header for WebSocket connections.
-/// Used as an Axum Extension to share with the connection_info middleware.
+/// Hostnames and IPs accepted in the HTTP `Host` header for WebSocket connections.
 pub(crate) type AllowedHosts = Arc<HashSet<String>>;
 
-/// Builds the set of hostnames/IPs that are allowed in the HTTP `Host` header
-/// for WebSocket connections. This prevents DNS rebinding attacks where an
-/// attacker tricks the browser into sending requests with a malicious Host header.
+/// Builds the allowlist of hostnames/IPs for WebSocket `Host` header validation.
 ///
-/// The set includes:
-/// - Localhost variants (localhost, 127.0.0.1, [::1]) — always allowed
-/// - The machine's hostname (via `hostname::get()`)
-/// - The machine's IP addresses (resolved from hostname)
-/// - The bound IP address (if not unspecified/0.0.0.0)
-/// - Any explicitly configured hostnames (`--allowed-host`)
-/// - All of the above with and without the port suffix
+/// Each entry is stored with and without the port suffix so both
+/// `Host: myhost` and `Host: myhost:7509` are accepted.
 fn build_allowed_hosts(
     bind_addr: IpAddr,
     port: u16,
     extra_allowed_hosts: &[String],
 ) -> HashSet<String> {
-    let mut hosts = HashSet::new();
-    let port_str = port.to_string();
+    let mut hosts = HostAllowlistBuilder::new(port);
 
-    let mut add = |host: &str| {
-        let host_lower = host.to_lowercase();
-        hosts.insert(format!("{host_lower}:{port_str}"));
-        hosts.insert(host_lower);
-    };
+    hosts.add_localhost();
+    hosts.add_machine_hostname();
 
-    // Always allow localhost variants
-    add("localhost");
-    add("127.0.0.1");
-    add("[::1]");
+    if !bind_addr.is_unspecified() {
+        hosts.add(&bind_addr.to_string());
+    }
 
-    // Add machine hostname and resolve its IPs
-    if let Ok(name) = hostname::get() {
-        if let Some(name_str) = name.to_str() {
-            add(name_str);
-            // Resolve hostname to IPs so LAN access via IP works when bound to 0.0.0.0
-            if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(name_str, port)) {
-                for addr in addrs {
-                    add(&addr.ip().to_string());
-                }
-            }
+    for host in extra_allowed_hosts {
+        hosts.add(host);
+    }
+
+    hosts.build()
+}
+
+struct HostAllowlistBuilder {
+    hosts: HashSet<String>,
+    port: u16,
+}
+
+impl HostAllowlistBuilder {
+    fn new(port: u16) -> Self {
+        Self {
+            hosts: HashSet::new(),
+            port,
         }
     }
 
-    // Add bound address if it's a specific IP (not 0.0.0.0 / ::)
-    if !bind_addr.is_unspecified() {
-        add(&bind_addr.to_string());
+    fn add(&mut self, host: &str) {
+        let host_lower = host.to_lowercase();
+        self.hosts.insert(format!("{host_lower}:{}", self.port));
+        self.hosts.insert(host_lower);
     }
 
-    // Add user-configured hostnames
-    for h in extra_allowed_hosts {
-        add(h);
+    fn add_localhost(&mut self) {
+        self.add("localhost");
+        self.add("127.0.0.1");
+        self.add("[::1]");
     }
 
-    hosts
+    fn add_machine_hostname(&mut self) {
+        let Ok(name) = hostname::get() else { return };
+        let Some(name_str) = name.to_str() else {
+            return;
+        };
+
+        self.add(name_str);
+        self.resolve_hostname_ips(name_str);
+    }
+
+    fn resolve_hostname_ips(&mut self, hostname: &str) {
+        let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(hostname, self.port)) else {
+            return;
+        };
+        for addr in addrs {
+            self.add(&addr.ip().to_string());
+        }
+    }
+
+    fn build(self) -> HashSet<String> {
+        self.hosts
+    }
 }
 
 async fn serve_client_api_in_impl(
@@ -447,7 +464,6 @@ async fn serve_client_api_in_impl(
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts);
 
-    // Build allowlist of hostnames/IPs for Host header validation (DNS rebinding defense)
     let allowed_hosts: AllowedHosts = Arc::new(build_allowed_hosts(
         config.address,
         config.port,

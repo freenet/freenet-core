@@ -161,11 +161,7 @@ fn is_localhost_origin(origin: &str) -> bool {
     prefixes.iter().any(|p| origin.starts_with(p)) || exact.contains(&origin)
 }
 
-/// Checks if the request's Host header matches the server's allowed hostnames.
-///
-/// This prevents DNS rebinding attacks: instead of comparing Origin against Host
-/// (both attacker-controlled), we validate Host against the server's known addresses
-/// (auto-detected at startup + operator-configured via --allowed-host).
+/// Returns `true` if the request's `Host` header is in the allowed set.
 fn is_allowed_host(headers: &axum::http::HeaderMap, allowed_hosts: &HashSet<String>) -> bool {
     let Some(host_header) = headers
         .get(axum::http::header::HOST)
@@ -481,10 +477,6 @@ async fn connection_info(
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
     if is_ws_upgrade {
-        // For non-localhost origins, validate the Host header against the server's
-        // known addresses. This prevents DNS rebinding: an attacker who tricks
-        // evil.com to resolve to the gateway's IP will have Host: evil.com,
-        // which won't match any allowed host.
         if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
             if let Ok(origin_str) = origin.to_str() {
                 if !is_localhost_origin(origin_str)
