@@ -1594,7 +1594,7 @@ impl Operation for SubscribeOp {
                                         op_manager.ring.connection_manager.own_location()
                                     });
                                 if let Some(event) = NetEventLog::subscribe_response_sent(
-                                    &msg_id,
+                                    msg_id,
                                     &op_manager.ring,
                                     to,
                                     Some(*key),
