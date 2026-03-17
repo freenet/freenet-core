@@ -7497,6 +7497,57 @@ fn test_get_reliability_diagnostic() {
         0.0
     };
 
+    // Detect response-lost and ForwardingAck patterns from event logs
+    let (response_sent_count, ack_received_count, response_lost_txs, retry_storm_txs) = rt
+        .block_on(async {
+            let logs = logs_handle.lock().await;
+            let mut response_sent_txs: HashSet<String> = HashSet::new();
+            let mut success_txs: HashSet<String> = HashSet::new();
+            let mut ack_received = 0u64;
+            let mut request_count_per_tx: HashMap<String, usize> = HashMap::new();
+
+            for log in logs.iter() {
+                let tx_str = log.tx.to_string();
+                if log.kind.is_get_response_sent() {
+                    response_sent_txs.insert(tx_str.clone());
+                }
+                if log.kind.get_outcome() == Some(true) {
+                    success_txs.insert(tx_str.clone());
+                }
+                if log.kind.is_forwarding_ack_received() {
+                    ack_received += 1;
+                }
+                if log.kind.get_outcome().is_some()
+                    || log.kind.is_get_response_sent()
+                    || log.kind.is_forwarding_ack_received()
+                {
+                    // Count unique request events per tx for retry-storm detection
+                } else if log.kind.is_get_request() {
+                    *request_count_per_tx.entry(tx_str).or_insert(0) += 1;
+                }
+            }
+
+            // Response-lost: response_sent exists but no get_success for that tx
+            let response_lost: Vec<_> = response_sent_txs
+                .difference(&success_txs)
+                .cloned()
+                .collect();
+
+            // Retry-storm: transactions with >10 request events (same tx hitting many peers)
+            let retry_storms: Vec<_> = request_count_per_tx
+                .iter()
+                .filter(|(_, &count)| count > 10)
+                .map(|(tx, count)| (tx.clone(), *count))
+                .collect();
+
+            (
+                response_sent_txs.len(),
+                ack_received,
+                response_lost,
+                retry_storms,
+            )
+        });
+
     tracing::info!("=== GET Reliability Diagnostic (#3570) ===");
     tracing::info!(
         "Network: {} gateways + {} nodes = {} total peers",
@@ -7525,6 +7576,19 @@ fn test_get_reliability_diagnostic() {
         p99,
         max_latency
     );
+    tracing::info!(
+        "ForwardingAck: {} ACKs received, {} response_sent events, {} response-lost txs",
+        ack_received_count,
+        response_sent_count,
+        response_lost_txs.len()
+    );
+    if !retry_storm_txs.is_empty() {
+        tracing::info!(
+            "Retry storms (>10 requests per tx): {} txs, max {} requests",
+            retry_storm_txs.len(),
+            retry_storm_txs.iter().map(|(_, c)| c).max().unwrap_or(&0)
+        );
+    }
 
     // Check which nodes got the contract state
     let mut nodes_with_state = 0;

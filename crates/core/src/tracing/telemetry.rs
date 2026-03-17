@@ -534,6 +534,8 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 GetEvent::GetNotFound { .. } => "get_not_found".to_string(),
                 GetEvent::GetFailure { .. } => "get_failure".to_string(),
                 GetEvent::ResponseSent { .. } => "get_response_sent".to_string(),
+                GetEvent::ForwardingAckSent { .. } => "get_forwarding_ack_sent".to_string(),
+                GetEvent::ForwardingAckReceived { .. } => "get_forwarding_ack_received".to_string(),
             }
         }
         EventKind::Subscribe(subscribe_event) => {
@@ -978,6 +980,38 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         json["key"] = serde_json::Value::String(k.to_string());
                     }
                     json
+                }
+                GetEvent::ForwardingAckSent {
+                    id,
+                    from,
+                    to,
+                    instance_id,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "get_forwarding_ack_sent",
+                        "id": id.to_string(),
+                        "from": from.to_string(),
+                        "to": to.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "timestamp": timestamp,
+                    })
+                }
+                GetEvent::ForwardingAckReceived {
+                    id,
+                    receiver,
+                    instance_id,
+                    elapsed_ms,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "get_forwarding_ack_received",
+                        "id": id.to_string(),
+                        "receiver": receiver.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
+                    })
                 }
             }
         }

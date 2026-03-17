@@ -1531,6 +1531,23 @@ impl Operation for GetOp {
                                 let ack =
                                     NetMessage::from(GetMsg::ForwardingAck { id, instance_id });
                                 drop(conn_manager.send(upstream, ack).await);
+
+                                // Emit telemetry for ForwardingAck sent (#3570 diagnostics)
+                                let upstream_peer = op_manager
+                                    .ring
+                                    .connection_manager
+                                    .get_peer_by_addr(upstream)
+                                    .unwrap_or_else(|| {
+                                        op_manager.ring.connection_manager.own_location()
+                                    });
+                                if let Some(event) = NetEventLog::get_forwarding_ack_sent(
+                                    &id,
+                                    &op_manager.ring,
+                                    instance_id,
+                                    upstream_peer,
+                                ) {
+                                    op_manager.ring.register_events(Either::Left(event)).await;
+                                }
                             }
 
                             // Forward using standard routing helper
@@ -2850,6 +2867,16 @@ impl Operation for GetOp {
                         %instance_id,
                         "Received forwarding ACK from downstream relay"
                     );
+
+                    // Emit telemetry for ForwardingAck received (#3570 diagnostics)
+                    if let Some(event) = NetEventLog::get_forwarding_ack_received(
+                        &self.id,
+                        &op_manager.ring,
+                        *instance_id,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+
                     return Ok(OperationResult::ContinueOp(OpEnum::Get(GetOp {
                         id: self.id,
                         state: self.state,

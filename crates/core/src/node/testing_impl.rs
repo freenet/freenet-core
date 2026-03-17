@@ -2839,7 +2839,10 @@ impl SimNetwork {
                         GetEvent::Request { .. } => summary.get.requested += 1,
                         GetEvent::GetSuccess { .. } => summary.get.succeeded += 1,
                         GetEvent::GetFailure { .. } => summary.get.failed += 1,
-                        GetEvent::GetNotFound { .. } | GetEvent::ResponseSent { .. } => {}
+                        GetEvent::GetNotFound { .. }
+                        | GetEvent::ResponseSent { .. }
+                        | GetEvent::ForwardingAckSent { .. }
+                        | GetEvent::ForwardingAckReceived { .. } => {}
                     }
                 }
                 // Subscribe operations
