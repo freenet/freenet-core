@@ -31,6 +31,13 @@ const MAX_RETRIES: usize = 10;
 /// Maximum number of peer attempts at each hop level
 const DEFAULT_MAX_BREADTH: usize = 3;
 
+/// Minimum HTL for speculative retries.
+///
+/// Retries use a reduced HTL (capped at current_hop) to avoid full-depth
+/// traversal storms. This floor ensures retries still reach peers 2-3 hops
+/// away, which is the minimum useful search depth in any topology.
+const MIN_RETRY_HTL: usize = 3;
+
 pub(crate) fn start_op(
     instance_id: ContractInstanceId,
     fetch_contract: bool,
@@ -1029,7 +1036,7 @@ impl GetOp {
                 // Use reduced HTL for retries instead of resetting to max.
                 // Retries target peers at a similar distance, so full-depth
                 // traversal wastes network resources and causes retry storms (#3570).
-                let retry_htl = max_hops_to_live.min(data.current_hop.max(3));
+                let retry_htl = max_hops_to_live.min(data.current_hop.max(MIN_RETRY_HTL));
 
                 self.state = Some(GetState::AwaitingResponse(data));
 
