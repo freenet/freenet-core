@@ -1291,11 +1291,8 @@ impl Ring {
         if let Some(own_loc) = self.connection_manager.own_location().location() {
             crate::node::network_status::set_own_location(own_loc.as_f64());
         }
-        if let Some(event) = NetEventLog::connected(self, peer, loc) {
-            self.event_register
-                .register_events(Either::Left(event))
-                .await;
-        }
+        // ConnectEvent::Connected telemetry is emitted by the CONNECT state
+        // machine with proper transaction context; not duplicated here (#3578).
         self.refresh_density_request_cache();
 
         let is_ready = self.connection_manager.is_self_ready();
@@ -1780,6 +1777,20 @@ impl Ring {
         // deterministic simulation support.
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
         let mut zero_connections_since: Option<Instant> = None;
+
+        // Adaptive fast-tick backoff: increase the fast-tick interval when
+        // connection count stops growing, to avoid hammering the network
+        // with CONNECTs indefinitely (#3578).
+        let mut last_conn_count: usize = 0;
+        let mut no_progress_ticks: u32 = 0;
+        // After this many consecutive no-progress ticks, start doubling
+        // the fast-tick interval.
+        const FAST_TICK_BACKOFF_THRESHOLD: u32 = 6; // 30s at 5s/tick
+
+        // Maximum fast-tick multiplier: caps backoff at the normal tick rate.
+        // Derived from tick ratio so invariant holds in both prod and test cfg.
+        const MAX_FAST_TICK_MULTIPLIER: u32 =
+            (CHECK_TICK_DURATION.as_secs() / FAST_CHECK_TICK_DURATION.as_secs()) as u32;
 
         // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
         // which advances during suspend (unlike std/tokio Instant which use CLOCK_MONOTONIC).
@@ -2276,6 +2287,38 @@ impl Ring {
             let needs_fast_tick = current_connections < self.connection_manager.min_connections;
 
             if needs_fast_tick {
+                // Adaptive backoff: reset on any connection count change
+                // (gain OR loss), otherwise slow down. A loss means topology
+                // changed and we should re-enter aggressive mode.
+                if current_connections != last_conn_count {
+                    no_progress_ticks = 0;
+                } else {
+                    no_progress_ticks = no_progress_ticks.saturating_add(1);
+                }
+                last_conn_count = current_connections;
+
+                let multiplier = if no_progress_ticks <= FAST_TICK_BACKOFF_THRESHOLD {
+                    1u32
+                } else {
+                    let excess = no_progress_ticks - FAST_TICK_BACKOFF_THRESHOLD;
+                    2u32.saturating_pow(excess).min(MAX_FAST_TICK_MULTIPLIER)
+                };
+                // Apply ±20% jitter to prevent synchronized CONNECT bursts
+                // across peers that bootstrapped simultaneously.
+                let jitter: f64 = crate::config::GlobalRng::random_range(0.8..=1.2);
+                let adaptive_duration =
+                    FAST_CHECK_TICK_DURATION.mul_f64(multiplier as f64 * jitter);
+
+                if multiplier > 1 {
+                    tracing::debug!(
+                        current_connections,
+                        min_connections = self.connection_manager.min_connections,
+                        no_progress_ticks,
+                        tick_interval_secs = adaptive_duration.as_secs(),
+                        "Fast-tick backed off due to no connection progress"
+                    );
+                }
+
                 // Uses sleep() instead of the check_interval so we don't need a
                 // second Interval object. We reset check_interval on transition
                 // back to steady-state to avoid an immediate burst tick.
@@ -2283,9 +2326,13 @@ impl Ring {
                   _ = refresh_density_map.tick() => {
                     self.refresh_density_request_cache();
                   },
-                  _ = tokio::time::sleep(FAST_CHECK_TICK_DURATION) => {},
+                  _ = tokio::time::sleep(adaptive_duration) => {},
                 }
             } else {
+                // Reached min_connections: reset backoff for next time.
+                no_progress_ticks = 0;
+                last_conn_count = current_connections;
+
                 // Reset the interval on transition from fast to normal tick so
                 // accumulated missed ticks don't cause an immediate burst.
                 check_interval.reset();
