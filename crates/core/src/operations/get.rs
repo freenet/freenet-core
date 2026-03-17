@@ -717,6 +717,11 @@ impl GetOp {
                     visited: visited.clone(),
                 }));
 
+                // Note: handle_abort uses current_hop directly (not the attempts-based
+                // reduction from retry_with_next_alternative). Connection aborts are
+                // immediate failures, not timeout-based retries, so they don't contribute
+                // to retry storms the same way. The bloom filter and tried_peers already
+                // prevent cycling through the same peers. (#3570)
                 let msg = GetMsg::Request {
                     id: self.id,
                     instance_id,
