@@ -2861,7 +2861,6 @@ impl SimNetwork {
                         | SubscribeEvent::UnsubscribeReceived { .. } => {}
                     }
                 }
-                // Update operations (no UpdateFailure variant exists)
                 crate::tracing::EventKind::Update(update_event) => {
                     use crate::tracing::UpdateEvent;
                     match update_event {
@@ -2870,7 +2869,8 @@ impl SimNetwork {
                         UpdateEvent::BroadcastReceived { .. } => {
                             summary.update.broadcasts_received += 1
                         }
-                        UpdateEvent::BroadcastEmitted { .. }
+                        UpdateEvent::UpdateFailure { .. }
+                        | UpdateEvent::BroadcastEmitted { .. }
                         | UpdateEvent::BroadcastComplete { .. }
                         | UpdateEvent::BroadcastApplied { .. }
                         | UpdateEvent::BroadcastDeliverySummary { .. } => {}

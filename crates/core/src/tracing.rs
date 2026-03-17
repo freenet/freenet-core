@@ -876,6 +876,99 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create a Get response sent event.
+    ///
+    /// Emitted when a relay peer sends a GET response (Found or NotFound) back upstream.
+    /// This provides sender-side visibility for tracing how results propagate.
+    pub fn get_response_sent(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        to: PeerKeyLocation,
+        key: Option<ContractKey>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::ResponseSent {
+                id: *tx,
+                from: own_loc,
+                to,
+                key,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a Subscribe response sent event.
+    ///
+    /// Emitted when a relay peer sends a subscribe response back upstream.
+    pub fn subscribe_response_sent(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        to: PeerKeyLocation,
+        key: Option<ContractKey>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Subscribe(SubscribeEvent::ResponseSent {
+                id: *tx,
+                from: own_loc,
+                to,
+                key,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create an Update failure event.
+    pub fn update_failure(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        reason: OperationFailure,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::UpdateFailure {
+                id: *tx,
+                requester: own_loc.clone(),
+                target: own_loc,
+                key,
+                reason,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a Connect rejected event.
+    ///
+    /// Emitted when a peer sends a Rejected message upstream for a connect request.
+    pub fn connect_rejected(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        desired_location: Location,
+        reason: &str,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::Rejected {
+                desired_location,
+                reason: reason.to_string(),
+            }),
+        })
+    }
+
     /// Create a peer startup event.
     ///
     /// This should be called once when the node starts and is ready to participate in the network.
@@ -3008,6 +3101,13 @@ pub(crate) enum ConnectEvent {
         /// Time elapsed since we sent the original request (milliseconds).
         elapsed_ms: u64,
     },
+    /// A ConnectRequest was rejected (sent back to upstream).
+    Rejected {
+        /// The target ring location that was being requested.
+        desired_location: Location,
+        /// Reason for rejection.
+        reason: String,
+    },
 }
 
 /// Reason for operation failure.
@@ -3238,6 +3338,18 @@ pub(crate) enum UpdateEvent {
         /// Short hash of the broadcast state (first 4 bytes of Blake3, 8 hex chars).
         state_hash: Option<String>,
     },
+    /// Update operation failed.
+    UpdateFailure {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        target: PeerKeyLocation,
+        key: ContractKey,
+        /// Reason for the failure.
+        reason: OperationFailure,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
     /// Emitted after broadcasting completes with delta sync statistics.
     /// This provides telemetry for monitoring delta sync effectiveness.
     BroadcastComplete {
@@ -3315,6 +3427,7 @@ impl UpdateEvent {
             | UpdateEvent::BroadcastComplete { key, .. }
             | UpdateEvent::BroadcastReceived { key, .. }
             | UpdateEvent::BroadcastApplied { key, .. }
+            | UpdateEvent::UpdateFailure { key, .. }
             | UpdateEvent::BroadcastDeliverySummary { key, .. } => *key,
         }
     }
@@ -3331,6 +3444,7 @@ impl UpdateEvent {
             UpdateEvent::BroadcastEmitted { state_hash, .. }
             | UpdateEvent::BroadcastReceived { state_hash, .. } => state_hash.as_deref(),
             UpdateEvent::Request { .. }
+            | UpdateEvent::UpdateFailure { .. }
             | UpdateEvent::BroadcastComplete { .. }
             | UpdateEvent::BroadcastDeliverySummary { .. } => None,
         }
@@ -3354,6 +3468,7 @@ impl UpdateEvent {
                 state_hash_after, ..
             } => state_hash_after.as_deref(),
             UpdateEvent::Request { .. }
+            | UpdateEvent::UpdateFailure { .. }
             | UpdateEvent::BroadcastEmitted { .. }
             | UpdateEvent::BroadcastComplete { .. }
             | UpdateEvent::BroadcastReceived { .. }

@@ -1430,6 +1430,15 @@ impl Operation for ConnectOp {
                                 upstream = %upstream_addr,
                                 "connect: gateway overloaded, rejecting request"
                             );
+                            // Emit telemetry: connect rejected (gateway overloaded)
+                            if let Some(event) = NetEventLog::connect_rejected(
+                                &self.id,
+                                &op_manager.ring,
+                                payload.desired_location,
+                                "gateway overloaded",
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
                             let reject_msg = ConnectMsg::Rejected {
                                 id: self.id,
                                 desired_location: payload.desired_location,
@@ -1555,6 +1564,15 @@ impl Operation for ConnectOp {
                     }
 
                     if actions.rejected {
+                        // Emit telemetry: connect rejected
+                        if let Some(event) = NetEventLog::connect_rejected(
+                            &self.id,
+                            &op_manager.ring,
+                            payload.desired_location,
+                            "rejected by handle_request",
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
                         let reject_msg = ConnectMsg::Rejected {
                             id: self.id,
                             desired_location: payload.desired_location,
@@ -1964,6 +1982,15 @@ impl Operation for ConnectOp {
                                 failed_peer = ?failed_peer,
                                 "connect: relay forwarding rejection upstream (no retry peers available)"
                             );
+                            // Emit telemetry: relay forwarding rejection upstream
+                            if let Some(event) = NetEventLog::connect_rejected(
+                                &self.id,
+                                &op_manager.ring,
+                                *desired_location,
+                                "relay no retry peers available",
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
                             let reject_msg = ConnectMsg::Rejected {
                                 id: self.id,
                                 desired_location: *desired_location,

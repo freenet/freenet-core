@@ -511,6 +511,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 ConnectEvent::RequestReceived { .. } => "connect_request_received".to_string(),
                 ConnectEvent::ResponseSent { .. } => "connect_response_sent".to_string(),
                 ConnectEvent::ResponseReceived { .. } => "connect_response_received".to_string(),
+                ConnectEvent::Rejected { .. } => "connect_rejected".to_string(),
             }
         }
         EventKind::Disconnected { .. } => "disconnect".to_string(),
@@ -563,6 +564,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 UpdateEvent::BroadcastComplete { .. } => "update_broadcast_complete".to_string(),
                 UpdateEvent::BroadcastReceived { .. } => "update_broadcast_received".to_string(),
                 UpdateEvent::BroadcastApplied { .. } => "update_broadcast_applied".to_string(),
+                UpdateEvent::UpdateFailure { .. } => "update_failure".to_string(),
                 UpdateEvent::BroadcastDeliverySummary { .. } => {
                     "update_broadcast_delivery_summary".to_string()
                 }
@@ -710,6 +712,16 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "type": "response_received",
                         "acceptor": acceptor.to_string(),
                         "elapsed_ms": elapsed_ms,
+                    })
+                }
+                ConnectEvent::Rejected {
+                    desired_location,
+                    reason,
+                } => {
+                    serde_json::json!({
+                        "type": "rejected",
+                        "desired_location": desired_location.as_f64(),
+                        "reason": reason,
                     })
                 }
             }
@@ -1274,6 +1286,26 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "skipped_summary_match": skipped_summary_match,
                         "targets_sent": targets_sent,
                         "send_failed": send_failed,
+                        "timestamp": timestamp,
+                    })
+                }
+                UpdateEvent::UpdateFailure {
+                    id,
+                    requester,
+                    target,
+                    key,
+                    reason,
+                    elapsed_ms,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "update_failure",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "target": target.to_string(),
+                        "key": key.to_string(),
+                        "reason": reason.to_string(),
+                        "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
                 }

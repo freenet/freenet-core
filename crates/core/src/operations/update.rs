@@ -14,7 +14,7 @@ use crate::transport::peer_connection::StreamId;
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager},
-    tracing::{state_hash_full, NetEventLog},
+    tracing::{state_hash_full, NetEventLog, OperationFailure},
 };
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -490,6 +490,16 @@ impl Operation for UpdateOp {
                                     "Forwarding UPDATE to peer that might have contract"
                                 );
 
+                                // Emit telemetry: relay forwarding update request
+                                if let Some(event) = NetEventLog::update_request(
+                                    id,
+                                    &op_manager.ring,
+                                    *key,
+                                    forward_target.clone(),
+                                ) {
+                                    op_manager.ring.register_events(Either::Left(event)).await;
+                                }
+
                                 // Forward RequestUpdate to the next hop
                                 // Check if we should use streaming for this payload
                                 let payload = UpdateStreamingPayload {
@@ -553,6 +563,15 @@ impl Operation for UpdateOp {
                                     phase = "error",
                                     "Cannot handle UPDATE: contract not found locally and no peers to forward to"
                                 );
+                                // Emit telemetry: update failure at relay
+                                if let Some(event) = NetEventLog::update_failure(
+                                    id,
+                                    &op_manager.ring,
+                                    *key,
+                                    OperationFailure::NoPeersAvailable,
+                                ) {
+                                    op_manager.ring.register_events(Either::Left(event)).await;
+                                }
                                 return Err(OpError::RingError(RingError::NoHostingPeers(
                                     *key.id(),
                                 )));
