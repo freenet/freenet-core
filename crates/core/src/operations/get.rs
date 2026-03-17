@@ -2402,7 +2402,7 @@ impl Operation for GetOp {
                                 },
                             });
                         }
-                        tracing::debug!(tx = %id, upstream = ?self.upstream_addr, "Returning contract to upstream");
+                        tracing::debug!(tx = %id, %key, upstream = ?self.upstream_addr, "Returning contract to upstream");
                         result = Some(GetResult {
                             key,
                             state: value.clone(),
