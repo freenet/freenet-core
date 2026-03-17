@@ -978,11 +978,15 @@ impl GetOp {
         };
         match state {
             GetState::AwaitingResponse(mut data) => {
-                // If local alternatives exhausted, inject fallback peers we haven't tried
+                // If local alternatives exhausted, inject fallback peers we haven't tried.
+                // Filter through BOTH tried_peers (this hop) AND visited bloom filter
+                // (all hops) to avoid retry storms cycling through the same peers (#3570).
                 if data.alternatives.is_empty() && !fallback_peers.is_empty() {
                     for peer in fallback_peers {
                         if let Some(addr) = peer.socket_addr() {
-                            if !data.tried_peers.contains(&addr) {
+                            if !data.tried_peers.contains(&addr)
+                                && !data.visited.probably_visited(addr)
+                            {
                                 data.alternatives.push(peer.clone());
                             }
                         }
@@ -1007,6 +1011,9 @@ impl GetOp {
                 let fetch_contract = data.fetch_contract;
                 if let Some(addr) = next_target.socket_addr() {
                     data.tried_peers.insert(addr);
+                    // Mark in bloom filter so downstream peers won't forward back,
+                    // and future retries won't select this peer again (#3570).
+                    data.visited.mark_visited(addr);
                 }
                 tracing::info!(
                     tx = %self.id,
@@ -1019,13 +1026,18 @@ impl GetOp {
                 data.attempts_at_hop += 1;
                 let visited = data.visited.clone();
 
+                // Use reduced HTL for retries instead of resetting to max.
+                // Retries target peers at a similar distance, so full-depth
+                // traversal wastes network resources and causes retry storms (#3570).
+                let retry_htl = max_hops_to_live.min(data.current_hop.max(3));
+
                 self.state = Some(GetState::AwaitingResponse(data));
 
                 let msg = GetMsg::Request {
                     id: self.id,
                     instance_id,
                     fetch_contract,
-                    htl: max_hops_to_live,
+                    htl: retry_htl,
                     visited,
                 };
 
@@ -4467,7 +4479,12 @@ mod tests {
                 assert_eq!(deser_id, id);
                 assert_eq!(deser_iid, instance_id);
             }
-            other => panic!("Expected ForwardingAck, got {other}"),
+            other @ GetMsg::Request { .. }
+            | other @ GetMsg::Response { .. }
+            | other @ GetMsg::ResponseStreaming { .. }
+            | other @ GetMsg::ResponseStreamingAck { .. } => {
+                panic!("Expected ForwardingAck, got {other}")
+            }
         }
     }
 
@@ -4574,7 +4591,7 @@ mod tests {
         let base_ms = 1_700_000_000_000;
         GlobalSimulationTime::set_time_ms(base_ms);
 
-        let mut op = make_awaiting_op(vec![make_peer(5001), make_peer(5002)], &[]);
+        let op = make_awaiting_op(vec![make_peer(5001), make_peer(5002)], &[]);
         assert_eq!(op.speculative_paths, 0);
         assert!(!op.ack_received);
 

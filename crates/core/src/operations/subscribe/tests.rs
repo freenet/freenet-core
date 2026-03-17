@@ -2094,6 +2094,10 @@ fn subscribe_forwarding_ack_serde_roundtrip() {
             assert_eq!(deser_id, id);
             assert_eq!(deser_iid, instance_id);
         }
-        other => panic!("Expected ForwardingAck, got {other}"),
+        other @ SubscribeMsg::Request { .. }
+        | other @ SubscribeMsg::Response { .. }
+        | other @ SubscribeMsg::Unsubscribe { .. } => {
+            panic!("Expected ForwardingAck, got {other}")
+        }
     }
 }
