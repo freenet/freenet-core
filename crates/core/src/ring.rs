@@ -1291,11 +1291,8 @@ impl Ring {
         if let Some(own_loc) = self.connection_manager.own_location().location() {
             crate::node::network_status::set_own_location(own_loc.as_f64());
         }
-        // Note: ConnectEvent::Connected telemetry is emitted by the CONNECT
-        // operation state machine (tracing.rs) with proper transaction ID and
-        // elapsed_ms. We intentionally do NOT emit a duplicate event here —
-        // the previous emission at this site used Transaction::NULL and caused
-        // massive telemetry duplication (see #3578).
+        // ConnectEvent::Connected telemetry is emitted by the CONNECT state
+        // machine with proper transaction context; not duplicated here (#3578).
         self.refresh_density_request_cache();
 
         let is_ready = self.connection_manager.is_self_ready();
@@ -1781,17 +1778,16 @@ impl Ring {
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
         let mut zero_connections_since: Option<Instant> = None;
 
-        // Adaptive fast-tick backoff: when below min_connections, start at
-        // FAST_CHECK_TICK_DURATION (5s) but increase the interval when no
-        // progress is being made (connection count not increasing). This
-        // prevents peers that can't reach min_connections from hammering
-        // the network with CONNECTs every 5 seconds indefinitely (#3578).
-        let mut last_connection_count_for_backoff: usize = 0;
-        let mut fast_tick_no_progress_count: u32 = 0;
-        /// After this many consecutive no-progress ticks, start doubling
-        /// the fast-tick interval.
+        // Adaptive fast-tick backoff: increase the fast-tick interval when
+        // connection count stops growing, to avoid hammering the network
+        // with CONNECTs indefinitely (#3578).
+        let mut last_conn_count: usize = 0;
+        let mut no_progress_ticks: u32 = 0;
+        // After this many consecutive no-progress ticks, start doubling
+        // the fast-tick interval.
         const FAST_TICK_BACKOFF_THRESHOLD: u32 = 6; // 30s at 5s/tick
-        /// Maximum multiplier for the fast-tick backoff (caps at normal tick rate).
+
+        // Maximum fast-tick multiplier (caps at normal tick rate).
         #[cfg(not(test))]
         const MAX_FAST_TICK_MULTIPLIER: u32 = 12; // 5s * 12 = 60s = CHECK_TICK_DURATION
         #[cfg(test)]
@@ -2292,21 +2288,19 @@ impl Ring {
             let needs_fast_tick = current_connections < self.connection_manager.min_connections;
 
             if needs_fast_tick {
-                // Adaptive backoff: track whether we're making progress.
-                // If connection count increased since last tick, reset backoff.
-                // Otherwise, increment no-progress counter and slow down.
-                if current_connections > last_connection_count_for_backoff {
-                    fast_tick_no_progress_count = 0;
+                // Adaptive backoff: reset on progress, otherwise slow down.
+                if current_connections > last_conn_count {
+                    no_progress_ticks = 0;
                 } else {
-                    fast_tick_no_progress_count = fast_tick_no_progress_count.saturating_add(1);
+                    no_progress_ticks = no_progress_ticks.saturating_add(1);
                 }
-                last_connection_count_for_backoff = current_connections;
+                last_conn_count = current_connections;
 
-                let multiplier = if fast_tick_no_progress_count <= FAST_TICK_BACKOFF_THRESHOLD {
+                let multiplier = if no_progress_ticks <= FAST_TICK_BACKOFF_THRESHOLD {
                     1u32
                 } else {
                     // Exponential backoff: 2^(excess ticks), capped
-                    let excess = fast_tick_no_progress_count - FAST_TICK_BACKOFF_THRESHOLD;
+                    let excess = no_progress_ticks - FAST_TICK_BACKOFF_THRESHOLD;
                     2u32.saturating_pow(excess).min(MAX_FAST_TICK_MULTIPLIER)
                 };
                 let adaptive_duration = FAST_CHECK_TICK_DURATION * multiplier;
@@ -2315,7 +2309,7 @@ impl Ring {
                     tracing::debug!(
                         current_connections,
                         min_connections = self.connection_manager.min_connections,
-                        no_progress_ticks = fast_tick_no_progress_count,
+                        no_progress_ticks,
                         tick_interval_secs = adaptive_duration.as_secs(),
                         "Fast-tick backed off due to no connection progress"
                     );
@@ -2331,10 +2325,9 @@ impl Ring {
                   _ = tokio::time::sleep(adaptive_duration) => {},
                 }
             } else {
-                // Transitioned to steady-state: reset fast-tick backoff state
-                // so we start fresh if we drop below min_connections again.
-                fast_tick_no_progress_count = 0;
-                last_connection_count_for_backoff = current_connections;
+                // Reached min_connections: reset backoff for next time.
+                no_progress_ticks = 0;
+                last_conn_count = current_connections;
 
                 // Reset the interval on transition from fast to normal tick so
                 // accumulated missed ticks don't cause an immediate burst.
