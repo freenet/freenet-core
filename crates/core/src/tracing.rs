@@ -524,67 +524,6 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
-    /// Create a Put broadcast emitted event.
-    /// Note: PUT operations don't currently use broadcasting (Update handles that),
-    /// but this helper exists for API completeness.
-    #[allow(dead_code)]
-    pub fn put_broadcast_emitted(
-        tx: &'a Transaction,
-        ring: &'a Ring,
-        key: ContractKey,
-        value: WrappedState,
-        broadcast_to: Vec<PeerKeyLocation>,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let own_loc = ring.connection_manager.own_location();
-        let broadcasted_to = broadcast_to.len();
-        let state_hash = Some(state_hash_short(&value));
-        Some(NetEventLog {
-            tx,
-            peer_id,
-            kind: EventKind::Put(PutEvent::BroadcastEmitted {
-                id: *tx,
-                upstream: own_loc.clone(),
-                broadcast_to,
-                broadcasted_to,
-                key,
-                value,
-                sender: own_loc,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                state_hash,
-            }),
-        })
-    }
-
-    /// Create a Put broadcast received event.
-    /// Note: PUT operations don't currently use broadcasting (Update handles that),
-    /// but this helper exists for API completeness.
-    #[allow(dead_code)]
-    pub fn put_broadcast_received(
-        tx: &'a Transaction,
-        ring: &'a Ring,
-        key: ContractKey,
-        requester: PeerKeyLocation,
-        value: WrappedState,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let own_loc = ring.connection_manager.own_location();
-        let state_hash = Some(state_hash_short(&value));
-        Some(NetEventLog {
-            tx,
-            peer_id,
-            kind: EventKind::Put(PutEvent::BroadcastReceived {
-                id: *tx,
-                key,
-                requester,
-                value,
-                target: own_loc,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                state_hash,
-            }),
-        })
-    }
-
     // ==================== GET Operation Helpers ====================
 
     /// Create a Get request event.
@@ -871,55 +810,6 @@ impl<'a> NetEventLog<'a> {
                 skipped_summary_match,
                 targets_sent,
                 send_failed,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
-        })
-    }
-
-    /// Create a Get response sent event.
-    ///
-    /// Emitted when a relay peer sends a GET response (Found or NotFound) back upstream.
-    /// This provides sender-side visibility for tracing how results propagate.
-    pub fn get_response_sent(
-        tx: &'a Transaction,
-        ring: &'a Ring,
-        to: PeerKeyLocation,
-        key: Option<ContractKey>,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let own_loc = ring.connection_manager.own_location();
-        Some(NetEventLog {
-            tx,
-            peer_id,
-            kind: EventKind::Get(GetEvent::ResponseSent {
-                id: *tx,
-                from: own_loc,
-                to,
-                key,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
-        })
-    }
-
-    /// Create a Subscribe response sent event.
-    ///
-    /// Emitted when a relay peer sends a subscribe response back upstream.
-    pub fn subscribe_response_sent(
-        tx: &'a Transaction,
-        ring: &'a Ring,
-        to: PeerKeyLocation,
-        key: Option<ContractKey>,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let own_loc = ring.connection_manager.own_location();
-        Some(NetEventLog {
-            tx,
-            peer_id,
-            kind: EventKind::Subscribe(SubscribeEvent::ResponseSent {
-                id: *tx,
-                from: own_loc,
-                to,
-                key,
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
         })

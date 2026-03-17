@@ -1200,7 +1200,7 @@ impl Operation for GetOp {
                             &id,
                             &op_manager.ring,
                             instance_id,
-                            Some(op_manager.ring.max_hops_to_live),
+                            Some(op_manager.ring.max_hops_to_live.saturating_sub(htl)),
                         ) {
                             op_manager.ring.register_events(Either::Left(event)).await;
                         }
@@ -1345,24 +1345,8 @@ impl Operation for GetOp {
                                 }
                             }
 
-                            // Emit telemetry: sending GET response upstream (covers both relay arms below)
-                            if let Some(upstream_addr) = self.upstream_addr {
-                                let to = op_manager
-                                    .ring
-                                    .connection_manager
-                                    .get_peer_by_addr(upstream_addr)
-                                    .unwrap_or_else(|| {
-                                        op_manager.ring.connection_manager.own_location()
-                                    });
-                                if let Some(event) = NetEventLog::get_response_sent(
-                                    &id,
-                                    &op_manager.ring,
-                                    to,
-                                    Some(key),
-                                ) {
-                                    op_manager.ring.register_events(Either::Left(event)).await;
-                                }
-                            }
+                            // Note: ResponseSent telemetry is emitted by from_outbound_msg()
+                            // when the message is actually sent, avoiding duplicate events.
 
                             // Check if this is a forwarded request or a local request
                             // Use upstream_addr (the actual socket address) not requester (PeerKeyLocation lookup)

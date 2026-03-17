@@ -1585,22 +1585,7 @@ impl Operation for SubscribeOp {
                                 .await;
 
                                 tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
-                                // Emit telemetry: relay forwarding subscribe response upstream
-                                let to = op_manager
-                                    .ring
-                                    .connection_manager
-                                    .get_peer_by_addr(requester_addr)
-                                    .unwrap_or_else(|| {
-                                        op_manager.ring.connection_manager.own_location()
-                                    });
-                                if let Some(event) = NetEventLog::subscribe_response_sent(
-                                    msg_id,
-                                    &op_manager.ring,
-                                    to,
-                                    Some(*key),
-                                ) {
-                                    op_manager.ring.register_events(Either::Left(event)).await;
-                                }
+                                // Note: ResponseSent telemetry is emitted by from_outbound_msg()
                                 Ok(OperationResult::SendAndComplete {
                                     msg: NetMessage::from(SubscribeMsg::Response {
                                         id: *msg_id,
@@ -1947,14 +1932,19 @@ impl Operation for SubscribeOp {
                                         );
                                     }
 
-                                    // Emit telemetry for subscription not found
-                                    if let Some(event) = NetEventLog::subscribe_not_found(
-                                        msg_id,
-                                        &op_manager.ring,
-                                        *instance_id,
-                                        None, // hop_count not tracked in subscribe
-                                    ) {
-                                        op_manager.ring.register_events(Either::Left(event)).await;
+                                    // Emit telemetry for subscription not found (relay nodes only)
+                                    if self.requester_addr.is_some() {
+                                        if let Some(event) = NetEventLog::subscribe_not_found(
+                                            msg_id,
+                                            &op_manager.ring,
+                                            *instance_id,
+                                            None, // hop_count not tracked in subscribe
+                                        ) {
+                                            op_manager
+                                                .ring
+                                                .register_events(Either::Left(event))
+                                                .await;
+                                        }
                                     }
 
                                     // Return op in Failed state - to_host_result() will return error

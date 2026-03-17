@@ -1742,4 +1742,64 @@ mod tests {
         );
         // No panic = success
     }
+
+    #[test]
+    fn test_event_kind_to_json_connect_rejected() {
+        use crate::ring::Location;
+        use crate::tracing::ConnectEvent;
+
+        let loc = Location::new(0.42);
+        let event = EventKind::Connect(ConnectEvent::Rejected {
+            desired_location: loc,
+            reason: "ring full".to_string(),
+        });
+
+        // Verify event_kind_to_string
+        assert_eq!(event_kind_to_string(&event), "connect_rejected");
+
+        // Verify JSON structure
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["type"], "rejected");
+        assert!((json["desired_location"].as_f64().unwrap() - 0.42).abs() < 1e-6);
+        assert_eq!(json["reason"], "ring full");
+    }
+
+    #[test]
+    fn test_event_kind_to_json_update_failure() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{OperationFailure, UpdateEvent};
+        use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
+
+        let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
+        let requester = PeerKeyLocation::random();
+        let target = PeerKeyLocation::random();
+        let code = ContractCode::from(vec![10, 20, 30]);
+        let params = Parameters::from(vec![40, 50, 60]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+
+        let event = EventKind::Update(UpdateEvent::UpdateFailure {
+            id: tx,
+            requester: requester.clone(),
+            target: target.clone(),
+            key,
+            reason: OperationFailure::HtlExhausted,
+            elapsed_ms: 1234,
+            timestamp: 99999,
+        });
+
+        // Verify event_kind_to_string
+        assert_eq!(event_kind_to_string(&event), "update_failure");
+
+        // Verify JSON structure
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["type"], "update_failure");
+        assert_eq!(json["id"], tx.to_string());
+        assert_eq!(json["requester"], requester.to_string());
+        assert_eq!(json["target"], target.to_string());
+        assert!(json["key"].is_string());
+        assert_eq!(json["reason"], "htl_exhausted");
+        assert_eq!(json["elapsed_ms"], 1234);
+        assert_eq!(json["timestamp"], 99999);
+    }
 }
