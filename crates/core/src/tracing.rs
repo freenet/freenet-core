@@ -2640,6 +2640,61 @@ impl EventKind {
         }
     }
 
+    /// Returns the outcome of a GET operation event.
+    ///
+    /// Returns `Some(true)` for `GetSuccess`, `Some(false)` for `GetNotFound` or `GetFailure`,
+    /// `None` for all other events (including GET requests and responses).
+    pub fn get_outcome(&self) -> Option<bool> {
+        match self {
+            EventKind::Get(GetEvent::GetSuccess { .. }) => Some(true),
+            EventKind::Get(GetEvent::GetNotFound { .. } | GetEvent::GetFailure { .. }) => {
+                Some(false)
+            }
+            EventKind::Connect(_)
+            | EventKind::Put(_)
+            | EventKind::Get(_)
+            | EventKind::Subscribe(_)
+            | EventKind::Route(_)
+            | EventKind::Update(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_)
+            | EventKind::RouterSnapshot(_) => None,
+        }
+    }
+
+    /// Returns the elapsed time in milliseconds for a completed GET operation.
+    ///
+    /// Returns `Some(ms)` for `GetSuccess`, `GetNotFound`, or `GetFailure`,
+    /// `None` for all other events.
+    pub fn get_elapsed_ms(&self) -> Option<u64> {
+        match self {
+            EventKind::Get(GetEvent::GetSuccess { elapsed_ms, .. })
+            | EventKind::Get(GetEvent::GetNotFound { elapsed_ms, .. })
+            | EventKind::Get(GetEvent::GetFailure { elapsed_ms, .. }) => Some(*elapsed_ms),
+            EventKind::Connect(_)
+            | EventKind::Put(_)
+            | EventKind::Get(_)
+            | EventKind::Subscribe(_)
+            | EventKind::Route(_)
+            | EventKind::Update(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_)
+            | EventKind::RouterSnapshot(_) => None,
+        }
+    }
+
     /// Returns whether this is a subscribe outcome event (success or not-found).
     ///
     /// Returns `Some(true)` for `SubscribeSuccess`, `Some(false)` for `SubscribeNotFound`,
