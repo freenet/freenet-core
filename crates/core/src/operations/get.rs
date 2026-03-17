@@ -4720,28 +4720,36 @@ mod tests {
     /// Returns true if the op would be selected as a retry candidate.
     fn gc_would_retry(op: &GetOp, retry_count: usize) -> bool {
         const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        const PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
         const MAX_SPECULATIVE_PATHS: u8 = 2;
 
         // Must be originator
         if !op.is_client_initiated() {
             return false;
         }
-        // ACK received → trust chain, don't retry
-        if op.ack_received {
-            return false;
-        }
         // Capped speculative paths
         if op.speculative_paths >= MAX_SPECULATIVE_PATHS {
             return false;
         }
-        // Check elapsed vs threshold (without jitter for deterministic testing)
         let elapsed = op.id.elapsed();
+
+        if op.ack_received {
+            // ACK received — trust chain for PROGRESS_TIMEOUT, then re-enable (#3570)
+            if elapsed <= PROGRESS_TIMEOUT {
+                return false;
+            }
+            // Chain stalled past PROGRESS_TIMEOUT — eligible for retry
+            let base = PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32);
+            return elapsed > base;
+        }
+
+        // No ACK — check against ACK_TIMEOUT (without jitter for deterministic testing)
         let base = ACK_TIMEOUT * (retry_count as u32 + 1);
         elapsed > base
     }
 
     #[test]
-    fn ack_received_prevents_gc_retry() {
+    fn ack_received_prevents_gc_retry_within_progress_timeout() {
         use crate::config::GlobalSimulationTime;
 
         let base_ms = 1_700_000_000_000;
@@ -4750,12 +4758,31 @@ mod tests {
         let mut op = make_awaiting_op(vec![make_peer(5001)], &[]);
         op.ack_received = true;
 
-        // Advance time well past ACK_TIMEOUT (3s)
+        // Advance time past ACK_TIMEOUT (3s) but within PROGRESS_TIMEOUT (20s)
         GlobalSimulationTime::set_time_ms(base_ms + 10_000);
 
         assert!(
             !gc_would_retry(&op, 0),
-            "Op with ack_received should NOT be retried by GC"
+            "Op with ack_received should NOT be retried within PROGRESS_TIMEOUT"
+        );
+    }
+
+    #[test]
+    fn ack_received_allows_retry_after_progress_timeout() {
+        use crate::config::GlobalSimulationTime;
+
+        let base_ms = 1_700_000_000_000;
+        GlobalSimulationTime::set_time_ms(base_ms);
+
+        let mut op = make_awaiting_op(vec![make_peer(5001)], &[]);
+        op.ack_received = true;
+
+        // Advance time past PROGRESS_TIMEOUT (20s) + ACK_TIMEOUT (3s) for jitter headroom
+        GlobalSimulationTime::set_time_ms(base_ms + 25_000);
+
+        assert!(
+            gc_would_retry(&op, 0),
+            "Op with ack_received SHOULD be retried after PROGRESS_TIMEOUT (#3570)"
         );
     }
 

@@ -1507,13 +1507,24 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // When a relay forwards a GET request, it sends a ForwardingAck back
                 // to its upstream within milliseconds. If no ACK arrives within 3s,
                 // the downstream peer is likely dead — launch a speculative retry on
-                // a different path (same tx ID). If an ACK has been received, the
-                // chain is alive — trust it and wait for OPERATION_TTL (60s).
+                // a different path (same tx ID).
+                //
+                // If an ACK has been received, the chain is alive — trust it for
+                // PROGRESS_TIMEOUT (20s). If no response arrives within that window,
+                // the chain has stalled and we re-enable speculative retry (#3570).
+                // Without this, a single ACK permanently disables retry, causing
+                // the originator to wait the full OPERATION_TTL (60s) with no recovery.
                 //
                 // Only the originator speculates (max 2 parallel paths). Relay peers
                 // just forward once, so network overhead is bounded.
                 const ACK_TIMEOUT: Duration = Duration::from_secs(3);
                 const MAX_SPECULATIVE_PATHS: u8 = 2;
+                /// Time to wait after ForwardingAck before re-enabling retry.
+                /// If a relay ACKed but no response arrives within this window,
+                /// the downstream chain has likely stalled. 20s balances giving
+                /// slow multi-hop chains time to complete vs. not wasting the
+                /// full 60s OPERATION_TTL on dead chains.
+                const PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
                 {
                     // Clean up entries for completed operations
                     get_retried.retain(|tx, _| ops.get.contains_key(tx));
@@ -1528,21 +1539,38 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             continue;
                         }
 
-                        // If ACK received, the downstream chain is alive — don't retry.
-                        // Wait for OPERATION_TTL to expire naturally.
-                        if get_op.ack_received {
-                            continue;
-                        }
-
                         // Cap speculative paths to bound network overhead
                         if get_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
                             continue;
                         }
 
-                        // No ACK after ACK_TIMEOUT — speculative retry with ±20% jitter
                         let elapsed = tx.elapsed();
+
+                        if get_op.ack_received {
+                            // ACK received — the chain was alive when the relay forwarded.
+                            // Trust it for PROGRESS_TIMEOUT, then re-enable retry if no
+                            // response has arrived (#3570: ForwardingAck retry-disable fix).
+                            if elapsed <= PROGRESS_TIMEOUT {
+                                continue;
+                            }
+                            // Chain has stalled past PROGRESS_TIMEOUT — fall through to retry.
+                            tracing::info!(
+                                %tx,
+                                elapsed_ms = elapsed.as_millis(),
+                                "GET chain stalled after ForwardingAck — re-enabling speculative retry"
+                            );
+                        }
+
+                        // No ACK after ACK_TIMEOUT, or ACK received but chain stalled
+                        // past PROGRESS_TIMEOUT — speculative retry with ±20% jitter
                         let retry_count = get_retried.get(&tx).copied().unwrap_or(0);
-                        let base = ACK_TIMEOUT * (retry_count as u32 + 1);
+                        let base = if get_op.ack_received {
+                            // For stalled-after-ACK, use PROGRESS_TIMEOUT as the base
+                            // instead of ACK_TIMEOUT to avoid immediate rapid retries
+                            PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32)
+                        } else {
+                            ACK_TIMEOUT * (retry_count as u32 + 1)
+                        };
                         // Only consume GlobalRng when elapsed exceeds 80% of base
                         // (minimum possible jittered threshold). This avoids shifting
                         // the global RNG state on every GC tick for ops that are
