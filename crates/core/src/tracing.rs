@@ -524,67 +524,6 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
-    /// Create a Put broadcast emitted event.
-    /// Note: PUT operations don't currently use broadcasting (Update handles that),
-    /// but this helper exists for API completeness.
-    #[allow(dead_code)]
-    pub fn put_broadcast_emitted(
-        tx: &'a Transaction,
-        ring: &'a Ring,
-        key: ContractKey,
-        value: WrappedState,
-        broadcast_to: Vec<PeerKeyLocation>,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let own_loc = ring.connection_manager.own_location();
-        let broadcasted_to = broadcast_to.len();
-        let state_hash = Some(state_hash_short(&value));
-        Some(NetEventLog {
-            tx,
-            peer_id,
-            kind: EventKind::Put(PutEvent::BroadcastEmitted {
-                id: *tx,
-                upstream: own_loc.clone(),
-                broadcast_to,
-                broadcasted_to,
-                key,
-                value,
-                sender: own_loc,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                state_hash,
-            }),
-        })
-    }
-
-    /// Create a Put broadcast received event.
-    /// Note: PUT operations don't currently use broadcasting (Update handles that),
-    /// but this helper exists for API completeness.
-    #[allow(dead_code)]
-    pub fn put_broadcast_received(
-        tx: &'a Transaction,
-        ring: &'a Ring,
-        key: ContractKey,
-        requester: PeerKeyLocation,
-        value: WrappedState,
-    ) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let own_loc = ring.connection_manager.own_location();
-        let state_hash = Some(state_hash_short(&value));
-        Some(NetEventLog {
-            tx,
-            peer_id,
-            kind: EventKind::Put(PutEvent::BroadcastReceived {
-                id: *tx,
-                key,
-                requester,
-                value,
-                target: own_loc,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                state_hash,
-            }),
-        })
-    }
-
     // ==================== GET Operation Helpers ====================
 
     /// Create a Get request event.
@@ -872,6 +811,50 @@ impl<'a> NetEventLog<'a> {
                 targets_sent,
                 send_failed,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create an Update failure event.
+    pub fn update_failure(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        reason: OperationFailure,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::UpdateFailure {
+                id: *tx,
+                requester: own_loc.clone(),
+                target: own_loc,
+                key,
+                reason,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a Connect rejected event.
+    ///
+    /// Emitted when a peer sends a Rejected message upstream for a connect request.
+    pub fn connect_rejected(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        desired_location: Location,
+        reason: &str,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Connect(ConnectEvent::Rejected {
+                desired_location,
+                reason: reason.to_string(),
             }),
         })
     }
@@ -3008,6 +2991,13 @@ pub(crate) enum ConnectEvent {
         /// Time elapsed since we sent the original request (milliseconds).
         elapsed_ms: u64,
     },
+    /// A ConnectRequest was rejected (sent back to upstream).
+    Rejected {
+        /// The target ring location that was being requested.
+        desired_location: Location,
+        /// Reason for rejection.
+        reason: String,
+    },
 }
 
 /// Reason for operation failure.
@@ -3238,6 +3228,18 @@ pub(crate) enum UpdateEvent {
         /// Short hash of the broadcast state (first 4 bytes of Blake3, 8 hex chars).
         state_hash: Option<String>,
     },
+    /// Update operation failed.
+    UpdateFailure {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        target: PeerKeyLocation,
+        key: ContractKey,
+        /// Reason for the failure.
+        reason: OperationFailure,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
     /// Emitted after broadcasting completes with delta sync statistics.
     /// This provides telemetry for monitoring delta sync effectiveness.
     BroadcastComplete {
@@ -3315,6 +3317,7 @@ impl UpdateEvent {
             | UpdateEvent::BroadcastComplete { key, .. }
             | UpdateEvent::BroadcastReceived { key, .. }
             | UpdateEvent::BroadcastApplied { key, .. }
+            | UpdateEvent::UpdateFailure { key, .. }
             | UpdateEvent::BroadcastDeliverySummary { key, .. } => *key,
         }
     }
@@ -3331,6 +3334,7 @@ impl UpdateEvent {
             UpdateEvent::BroadcastEmitted { state_hash, .. }
             | UpdateEvent::BroadcastReceived { state_hash, .. } => state_hash.as_deref(),
             UpdateEvent::Request { .. }
+            | UpdateEvent::UpdateFailure { .. }
             | UpdateEvent::BroadcastComplete { .. }
             | UpdateEvent::BroadcastDeliverySummary { .. } => None,
         }
@@ -3354,6 +3358,7 @@ impl UpdateEvent {
                 state_hash_after, ..
             } => state_hash_after.as_deref(),
             UpdateEvent::Request { .. }
+            | UpdateEvent::UpdateFailure { .. }
             | UpdateEvent::BroadcastEmitted { .. }
             | UpdateEvent::BroadcastComplete { .. }
             | UpdateEvent::BroadcastReceived { .. }

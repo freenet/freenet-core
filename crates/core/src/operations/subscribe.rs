@@ -946,6 +946,12 @@ impl SubscribeOp {
                     phase = "not_found",
                     "Subscribe aborted (retries exhausted) - sending NotFound upstream"
                 );
+                // Emit telemetry: relay returning NotFound after abort
+                if let Some(event) =
+                    NetEventLog::subscribe_not_found(&tx_id, &op_manager.ring, instance_id, None)
+                {
+                    op_manager.ring.register_events(Either::Left(event)).await;
+                }
 
                 let response_op = SubscribeOp {
                     id: tx_id,
@@ -1340,6 +1346,17 @@ impl Operation for SubscribeOp {
                     // Contract still not found - try to forward
                     if *htl == 0 {
                         tracing::warn!(tx = %id, contract = %instance_id, htl = 0, phase = "not_found", "Subscribe request exhausted HTL");
+                        // Emit telemetry: relay returning NotFound due to HTL exhaustion
+                        if self.requester_addr.is_some() {
+                            if let Some(event) = NetEventLog::subscribe_not_found(
+                                id,
+                                &op_manager.ring,
+                                *instance_id,
+                                Some(op_manager.ring.max_hops_to_live),
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+                        }
                         return Self::not_found_result(
                             *id,
                             *instance_id,
@@ -1365,6 +1382,17 @@ impl Operation for SubscribeOp {
 
                     if candidates.is_empty() {
                         tracing::warn!(tx = %id, contract = %instance_id, phase = "not_found", "No closer peers to forward subscribe request");
+                        // Emit telemetry: relay returning NotFound (no forwarding targets)
+                        if self.requester_addr.is_some() {
+                            if let Some(event) = NetEventLog::subscribe_not_found(
+                                id,
+                                &op_manager.ring,
+                                *instance_id,
+                                None,
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+                        }
                         return Self::not_found_result(
                             *id,
                             *instance_id,
@@ -1400,6 +1428,17 @@ impl Operation for SubscribeOp {
                     tried_peers.insert(next_addr);
 
                     tracing::debug!(tx = %id, %instance_id, next = %next_addr, alternatives = candidates.len(), is_renewal, "Forwarding subscribe request");
+
+                    // Emit telemetry: relay forwarding subscribe request
+                    if let Some(event) = NetEventLog::subscribe_request(
+                        id,
+                        &op_manager.ring,
+                        *instance_id,
+                        next_hop.clone(),
+                        new_htl,
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
 
                     // Send ForwardingAck to requester peer before forwarding.
                     // This tells the requester "I'm working on it" so the GC task
@@ -1546,6 +1585,7 @@ impl Operation for SubscribeOp {
                                 .await;
 
                                 tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
+                                // Note: ResponseSent telemetry is emitted by from_outbound_msg()
                                 Ok(OperationResult::SendAndComplete {
                                     msg: NetMessage::from(SubscribeMsg::Response {
                                         id: *msg_id,
@@ -1892,14 +1932,19 @@ impl Operation for SubscribeOp {
                                         );
                                     }
 
-                                    // Emit telemetry for subscription not found
-                                    if let Some(event) = NetEventLog::subscribe_not_found(
-                                        msg_id,
-                                        &op_manager.ring,
-                                        *instance_id,
-                                        None, // hop_count not tracked in subscribe
-                                    ) {
-                                        op_manager.ring.register_events(Either::Left(event)).await;
+                                    // Emit telemetry for subscription not found (relay nodes only)
+                                    if self.requester_addr.is_some() {
+                                        if let Some(event) = NetEventLog::subscribe_not_found(
+                                            msg_id,
+                                            &op_manager.ring,
+                                            *instance_id,
+                                            None, // hop_count not tracked in subscribe
+                                        ) {
+                                            op_manager
+                                                .ring
+                                                .register_events(Either::Left(event))
+                                                .await;
+                                        }
                                     }
 
                                     // Return op in Failed state - to_host_result() will return error

@@ -846,6 +846,13 @@ impl GetOp {
                     phase = "not_found",
                     "GET: Connection aborted, no peers available - sending NotFound to upstream"
                 );
+                // Emit telemetry: relay returning NotFound after abort
+                let hop_count = Some(op_manager.ring.max_hops_to_live.saturating_sub(current_hop));
+                if let Some(event) =
+                    NetEventLog::get_not_found(&self.id, &op_manager.ring, instance_id, hop_count)
+                {
+                    op_manager.ring.register_events(Either::Left(event)).await;
+                }
 
                 let response_op = GetOp {
                     id: self.id,
@@ -1188,6 +1195,15 @@ impl Operation for GetOp {
                             phase = "not_found",
                             "GET Request exhausted HTL - sending NotFound response"
                         );
+                        // Emit telemetry: relay returning NotFound due to HTL exhaustion
+                        if let Some(event) = NetEventLog::get_not_found(
+                            &id,
+                            &op_manager.ring,
+                            instance_id,
+                            Some(op_manager.ring.max_hops_to_live.saturating_sub(htl)),
+                        ) {
+                            op_manager.ring.register_events(Either::Left(event)).await;
+                        }
                         return build_op_result(GetOpResult {
                             id,
                             state: None,
@@ -1328,6 +1344,9 @@ impl Operation for GetOp {
                                     );
                                 }
                             }
+
+                            // Note: ResponseSent telemetry is emitted by from_outbound_msg()
+                            // when the message is actually sent, avoiding duplicate events.
 
                             // Check if this is a forwarded request or a local request
                             // Use upstream_addr (the actual socket address) not requester (PeerKeyLocation lookup)
@@ -2948,6 +2967,14 @@ async fn try_forward_or_return(
             "Forwarding get request to {}",
             target
         );
+
+        // Emit telemetry: relay is forwarding GET to next hop
+        if let Some(event) =
+            NetEventLog::get_request(&id, &op_manager.ring, instance_id, target.clone(), new_htl)
+        {
+            op_manager.ring.register_events(Either::Left(event)).await;
+        }
+
         let mut tried_peers = HashSet::new();
         if let Some(addr) = target.socket_addr() {
             tried_peers.insert(addr);
@@ -3013,6 +3040,12 @@ async fn try_forward_or_return(
                 phase = "not_found",
                 "No peers to forward get request to, returning NotFound to upstream"
             );
+            // Emit telemetry: relay returning NotFound (no forwarding targets)
+            if let Some(event) =
+                NetEventLog::get_not_found(&id, &op_manager.ring, instance_id, None)
+            {
+                op_manager.ring.register_events(Either::Left(event)).await;
+            }
             build_op_result(GetOpResult {
                 id,
                 state: None,

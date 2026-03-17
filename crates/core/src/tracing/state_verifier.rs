@@ -300,6 +300,7 @@ impl StateVerifier {
                     }
                     UpdateEvent::Request { .. }
                     | UpdateEvent::UpdateSuccess { .. }
+                    | UpdateEvent::UpdateFailure { .. }
                     | UpdateEvent::BroadcastComplete { .. }
                     | UpdateEvent::BroadcastDeliverySummary { .. } => {}
                 },
