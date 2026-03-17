@@ -33,7 +33,7 @@ const MAX_RETRIES: usize = 10;
 
 /// Minimum HTL for speculative retries.
 ///
-/// Retries use a reduced HTL (divided by attempt count) to avoid full-depth
+/// Retries use a reduced HTL (capped at current_hop) to avoid full-depth
 /// traversal storms. This floor ensures retries still reach peers 2-3 hops
 /// away, which is the minimum useful search depth in any topology.
 /// Matches GET operation's MIN_RETRY_HTL; change both together.
@@ -662,8 +662,7 @@ impl SubscribeOp {
         match self.state {
             SubscribeState::AwaitingResponse(ref mut data) => {
                 // If local alternatives exhausted, inject fallback peers we haven't tried.
-                // Filter through BOTH tried_peers (this hop) AND visited bloom filter
-                // (all hops) to avoid retry storms cycling through the same peers (#3570).
+                // Filter through both tried_peers and visited bloom filter (#3570).
                 if data.alternatives.is_empty() && !fallback_peers.is_empty() {
                     for peer in fallback_peers {
                         if let Some(addr) = peer.socket_addr() {
@@ -712,8 +711,7 @@ impl SubscribeOp {
                     }
                 };
                 data.tried_peers.insert(addr);
-                // Mark in bloom filter so downstream peers won't forward back,
-                // and future retries won't select this peer again (#3570).
+                // Mark in bloom filter so future retries skip this peer (#3570).
                 data.visited.mark_visited(addr);
                 data.next_hop = Some(addr);
                 data.attempts_at_hop += 1;
@@ -733,10 +731,7 @@ impl SubscribeOp {
                     contract_location: Location::from(&instance_id),
                 });
 
-                // Reduce HTL on each retry to avoid full-depth traversal storms (#3570).
-                // Divide HTL by attempts_at_hop, floored at MIN_RETRY_HTL and capped
-                // at max_hops_to_live. This limits the blast radius of retries while
-                // still allowing the request to reach nearby contract holders.
+                // Reduce HTL on each retry, floored at MIN_RETRY_HTL (#3570).
                 let retry_htl = (max_hops_to_live / (data.attempts_at_hop.max(1)))
                     .max(MIN_RETRY_HTL)
                     .min(max_hops_to_live);

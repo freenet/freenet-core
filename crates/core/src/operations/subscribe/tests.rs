@@ -1803,30 +1803,26 @@ fn completed_subscribe_reports_success() {
 
 // ── Subscribe retry tests ──────────────────────────────────────────────
 
-/// Test that `retry_with_next_alternative` picks the next untried peer.
-#[test]
-fn test_retry_with_next_alternative_picks_next_peer() {
-    let instance_id = ContractInstanceId::new([50u8; 32]);
+/// Build a SubscribeOp in AwaitingResponse state for retry tests.
+/// Mirrors GET's `make_awaiting_op` helper.
+fn make_retry_op(alternatives: Vec<PeerKeyLocation>, tried: &[PeerKeyLocation]) -> SubscribeOp {
     let tx_id = Transaction::new::<SubscribeMsg>();
-
-    let peer1 = random_peer();
-    let peer2 = random_peer();
-    let peer3 = random_peer();
-
-    let peer1_addr = peer1.socket_addr().unwrap();
-
-    let mut tried = HashSet::new();
-    tried.insert(peer1_addr);
-
-    let op = SubscribeOp {
+    let instance_id = ContractInstanceId::new([50u8; 32]);
+    let mut tried_peers = HashSet::new();
+    for p in tried {
+        if let Some(addr) = p.socket_addr() {
+            tried_peers.insert(addr);
+        }
+    }
+    SubscribeOp {
         id: tx_id,
         state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            next_hop: Some(peer1_addr),
+            next_hop: tried.first().and_then(|p| p.socket_addr()),
             instance_id,
             retries: 0,
             current_hop: 10,
-            tried_peers: tried,
-            alternatives: vec![peer2.clone(), peer3.clone()],
+            tried_peers,
+            alternatives,
             attempts_at_hop: 1,
             visited: crate::operations::VisitedPeers::new(&tx_id),
         }),
@@ -1836,8 +1832,33 @@ fn test_retry_with_next_alternative_picks_next_peer() {
         stats: None,
         ack_received: false,
         speculative_paths: 0,
-    };
+    }
+}
 
+/// Extract HTL from a SubscribeMsg::Request, panicking on other variants.
+fn extract_request_htl(msg: &SubscribeMsg) -> usize {
+    match msg {
+        SubscribeMsg::Request { htl, .. } => *htl,
+        other => panic!("Expected Request, got {other:?}"),
+    }
+}
+
+/// Extract the AwaitingResponseData from a SubscribeOp, panicking if in wrong state.
+fn extract_awaiting_data(op: &SubscribeOp) -> &super::AwaitingResponseData {
+    match &op.state {
+        SubscribeState::AwaitingResponse(data) => data,
+        other => panic!("Expected AwaitingResponse, got {other:?}"),
+    }
+}
+
+/// Test that `retry_with_next_alternative` picks the next untried peer.
+#[test]
+fn test_retry_with_next_alternative_picks_next_peer() {
+    let peer1 = random_peer();
+    let peer2 = random_peer();
+    let peer3 = random_peer();
+
+    let op = make_retry_op(vec![peer2.clone(), peer3.clone()], &[peer1]);
     assert!(op.is_originator(), "No requester_addr means originator");
 
     let (new_op, msg) = op
@@ -1845,63 +1866,18 @@ fn test_retry_with_next_alternative_picks_next_peer() {
         .map_err(|_| "retry should succeed with alternatives available")
         .unwrap();
 
-    // Should have picked peer2 (first in alternatives)
-    match &msg {
-        SubscribeMsg::Request {
-            id,
-            instance_id: iid,
-            htl,
-            ..
-        } => {
-            assert_eq!(*id, tx_id);
-            assert_eq!(*iid, instance_id);
-            // attempts_at_hop was 1, incremented to 2 before HTL calc: 10/2 = 5
-            assert_eq!(*htl, 5);
-        }
-        SubscribeMsg::Response { .. }
-        | SubscribeMsg::Unsubscribe { .. }
-        | SubscribeMsg::ForwardingAck { .. } => {
-            panic!("Expected Request message")
-        }
-    }
+    // attempts_at_hop was 1, incremented to 2 before HTL calc: 10/2 = 5
+    assert_eq!(extract_request_htl(&msg), 5);
 
-    // peer2 should now be in tried_peers
-    if let SubscribeState::AwaitingResponse(data) = &new_op.state {
-        assert!(data.tried_peers.contains(&peer2.socket_addr().unwrap()));
-        assert_eq!(data.alternatives.len(), 1, "peer3 should remain");
-    } else {
-        panic!("Expected AwaitingResponse state");
-    }
+    let data = extract_awaiting_data(&new_op);
+    assert!(data.tried_peers.contains(&peer2.socket_addr().unwrap()));
+    assert_eq!(data.alternatives.len(), 1, "peer3 should remain");
 }
 
 /// Test that `retry_with_next_alternative` returns Err when no alternatives remain.
 #[test]
 fn test_retry_with_no_alternatives_returns_err() {
-    let instance_id = ContractInstanceId::new([51u8; 32]);
-    let tx_id = Transaction::new::<SubscribeMsg>();
-    let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            next_hop: Some(peer_addr),
-            instance_id,
-            retries: 0,
-            current_hop: 10,
-            tried_peers: HashSet::new(),
-            alternatives: vec![], // No alternatives
-            attempts_at_hop: 1,
-            visited: crate::operations::VisitedPeers::new(&tx_id),
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-
-    // No alternatives and no fallback peers
+    let op = make_retry_op(vec![], &[]);
     let result = op.retry_with_next_alternative(10, &[]);
     assert!(result.is_err(), "Should fail when no alternatives remain");
 }
@@ -1909,82 +1885,28 @@ fn test_retry_with_no_alternatives_returns_err() {
 /// Test that `retry_with_next_alternative` uses fallback peers when alternatives are exhausted.
 #[test]
 fn test_retry_uses_fallback_peers() {
-    let instance_id = ContractInstanceId::new([52u8; 32]);
-    let tx_id = Transaction::new::<SubscribeMsg>();
-    let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-
     let fallback_peer = random_peer();
+    let op = make_retry_op(vec![], &[]);
 
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            next_hop: Some(peer_addr),
-            instance_id,
-            retries: 0,
-            current_hop: 10,
-            tried_peers: HashSet::new(),
-            alternatives: vec![], // No local alternatives
-            attempts_at_hop: 1,
-            visited: crate::operations::VisitedPeers::new(&tx_id),
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-
-    // Pass fallback peers — should pick from those
     let (new_op, _msg) = op
         .retry_with_next_alternative(10, std::slice::from_ref(&fallback_peer))
         .map_err(|_| "retry should succeed with fallback peers")
         .unwrap();
 
-    if let SubscribeState::AwaitingResponse(data) = &new_op.state {
-        assert!(
-            data.tried_peers
-                .contains(&fallback_peer.socket_addr().unwrap()),
-            "Fallback peer should be marked as tried"
-        );
-    } else {
-        panic!("Expected AwaitingResponse state");
-    }
+    let data = extract_awaiting_data(&new_op);
+    assert!(
+        data.tried_peers
+            .contains(&fallback_peer.socket_addr().unwrap()),
+        "Fallback peer should be marked as tried"
+    );
 }
 
 /// Test that `retry_with_next_alternative` skips already-tried fallback peers.
 #[test]
 fn test_retry_skips_tried_fallback_peers() {
-    let instance_id = ContractInstanceId::new([53u8; 32]);
-    let tx_id = Transaction::new::<SubscribeMsg>();
-
     let tried_peer = random_peer();
-    let tried_addr = tried_peer.socket_addr().unwrap();
+    let op = make_retry_op(vec![], &[tried_peer.clone()]);
 
-    let mut tried = HashSet::new();
-    tried.insert(tried_addr);
-
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            next_hop: Some(tried_addr),
-            instance_id,
-            retries: 0,
-            current_hop: 10,
-            tried_peers: tried,
-            alternatives: vec![],
-            attempts_at_hop: 1,
-            visited: crate::operations::VisitedPeers::new(&tx_id),
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-
-    // Fallback peer was already tried — should return Err
     let result = op.retry_with_next_alternative(10, &[tried_peer]);
     assert!(
         result.is_err(),
@@ -1994,101 +1916,35 @@ fn test_retry_skips_tried_fallback_peers() {
 
 /// Verify that retry HTL decreases with each attempt (#3570).
 ///
-/// The formula divides max_hops_to_live by attempts_at_hop, creating
-/// progressively shorter retry chains instead of full-depth traversals.
+/// Formula: max_hops_to_live / attempts_at_hop, floored at MIN_RETRY_HTL.
 #[test]
 fn test_retry_htl_decreases_with_attempts() {
-    let instance_id = ContractInstanceId::new([60u8; 32]);
-    let tx_id = Transaction::new::<SubscribeMsg>();
+    let op = make_retry_op(vec![random_peer(), random_peer(), random_peer()], &[]);
 
-    let peer1 = random_peer();
-    let peer2 = random_peer();
-    let peer3 = random_peer();
-
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            next_hop: None,
-            instance_id,
-            retries: 0,
-            current_hop: 10,
-            tried_peers: HashSet::new(),
-            alternatives: vec![peer1, peer2, peer3],
-            attempts_at_hop: 1,
-            visited: crate::operations::VisitedPeers::new(&tx_id),
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-
-    // First retry: attempts_at_hop becomes 2 → 10/2 = 5
+    // First retry: attempts_at_hop becomes 2 -> 10/2 = 5
     let (op, msg) = op
         .retry_with_next_alternative(10, &[])
         .unwrap_or_else(|_| panic!("retry 1 failed"));
-    match &msg {
-        SubscribeMsg::Request { htl, .. } => {
-            assert_eq!(
-                *htl, 5,
-                "First retry: 10/2=5 (attempts_at_hop incremented to 2)"
-            );
-        }
-        SubscribeMsg::Response { .. }
-        | SubscribeMsg::Unsubscribe { .. }
-        | SubscribeMsg::ForwardingAck { .. } => {
-            panic!("Expected Request, got {msg:?}")
-        }
-    }
+    assert_eq!(extract_request_htl(&msg), 5);
 
-    // Second retry: attempts_at_hop becomes 3 → 10/3 = 3
+    // Second retry: attempts_at_hop becomes 3 -> 10/3 = 3 = MIN_RETRY_HTL
     let (op, msg) = op
         .retry_with_next_alternative(10, &[])
         .unwrap_or_else(|_| panic!("retry 2 failed"));
-    match &msg {
-        SubscribeMsg::Request { htl, .. } => {
-            assert_eq!(
-                *htl,
-                super::MIN_RETRY_HTL,
-                "Second retry: 10/3=3 (clamped to MIN_RETRY_HTL)"
-            );
-        }
-        SubscribeMsg::Response { .. }
-        | SubscribeMsg::Unsubscribe { .. }
-        | SubscribeMsg::ForwardingAck { .. } => {
-            panic!("Expected Request, got {msg:?}")
-        }
-    }
+    assert_eq!(extract_request_htl(&msg), super::MIN_RETRY_HTL);
 
-    // Third retry: attempts_at_hop becomes 4 → 10/4 = 2 → clamped to MIN_RETRY_HTL=3
+    // Third retry: attempts_at_hop becomes 4 -> 10/4 = 2, clamped to MIN_RETRY_HTL
     let (_op, msg) = op
         .retry_with_next_alternative(10, &[])
         .unwrap_or_else(|_| panic!("retry 3 failed"));
-    match &msg {
-        SubscribeMsg::Request { htl, .. } => {
-            assert_eq!(
-                *htl,
-                super::MIN_RETRY_HTL,
-                "Third retry: 10/4=2 → clamped to MIN_RETRY_HTL"
-            );
-        }
-        SubscribeMsg::Response { .. }
-        | SubscribeMsg::Unsubscribe { .. }
-        | SubscribeMsg::ForwardingAck { .. } => {
-            panic!("Expected Request, got {msg:?}")
-        }
-    }
+    assert_eq!(extract_request_htl(&msg), super::MIN_RETRY_HTL);
 }
 
-/// Verify that MIN_RETRY_HTL floor is applied even with many attempts.
+/// Verify that MIN_RETRY_HTL floor is applied even with many prior attempts.
 #[test]
 fn test_retry_htl_floor_at_min() {
-    let instance_id = ContractInstanceId::new([61u8; 32]);
     let tx_id = Transaction::new::<SubscribeMsg>();
-    let alt = random_peer();
-
+    let instance_id = ContractInstanceId::new([61u8; 32]);
     let op = SubscribeOp {
         id: tx_id,
         state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
@@ -2097,8 +1953,8 @@ fn test_retry_htl_floor_at_min() {
             retries: 0,
             current_hop: 10,
             tried_peers: HashSet::new(),
-            alternatives: vec![alt],
-            attempts_at_hop: 20, // Many prior attempts
+            alternatives: vec![random_peer()],
+            attempts_at_hop: 20,
             visited: crate::operations::VisitedPeers::new(&tx_id),
         }),
         requester_addr: None,
@@ -2112,35 +1968,20 @@ fn test_retry_htl_floor_at_min() {
     let (_op, msg) = op
         .retry_with_next_alternative(10, &[])
         .unwrap_or_else(|_| panic!("retry failed"));
-    match &msg {
-        SubscribeMsg::Request { htl, .. } => {
-            assert!(
-                *htl >= super::MIN_RETRY_HTL,
-                "HTL {} should not fall below MIN_RETRY_HTL {}",
-                htl,
-                super::MIN_RETRY_HTL
-            );
-        }
-        SubscribeMsg::Response { .. }
-        | SubscribeMsg::Unsubscribe { .. }
-        | SubscribeMsg::ForwardingAck { .. } => {
-            panic!("Expected Request, got {msg:?}")
-        }
-    }
+    assert!(
+        extract_request_htl(&msg) >= super::MIN_RETRY_HTL,
+        "HTL should not fall below MIN_RETRY_HTL"
+    );
 }
 
 /// Verify that bloom-filter-visited peers are excluded from fallback injection (#3570).
 #[test]
 fn test_retry_fallback_skips_bloom_visited() {
-    let instance_id = ContractInstanceId::new([62u8; 32]);
-    let tx_id = Transaction::new::<SubscribeMsg>();
-
     let visited_peer = random_peer();
     let fresh_peer = random_peer();
-
     let visited_addr = visited_peer.socket_addr().unwrap();
 
-    // Mark visited_peer in the bloom filter but NOT in tried_peers
+    let tx_id = Transaction::new::<SubscribeMsg>();
     let mut visited = crate::operations::VisitedPeers::new(&tx_id);
     visited.mark_visited(visited_addr);
 
@@ -2148,11 +1989,11 @@ fn test_retry_fallback_skips_bloom_visited() {
         id: tx_id,
         state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
             next_hop: None,
-            instance_id,
+            instance_id: ContractInstanceId::new([62u8; 32]),
             retries: 0,
             current_hop: 10,
             tried_peers: HashSet::new(),
-            alternatives: vec![], // No local alternatives
+            alternatives: vec![],
             attempts_at_hop: 1,
             visited,
         }),
@@ -2164,64 +2005,34 @@ fn test_retry_fallback_skips_bloom_visited() {
         speculative_paths: 0,
     };
 
-    let result = op.retry_with_next_alternative(10, &[visited_peer, fresh_peer.clone()]);
-    assert!(
-        result.is_ok(),
-        "Should find fresh_peer despite visited_peer in bloom"
-    );
+    let (new_op, _msg) = op
+        .retry_with_next_alternative(10, &[visited_peer, fresh_peer])
+        .unwrap_or_else(|_| panic!("retry failed"));
 
-    let (new_op, _msg) = result.unwrap_or_else(|_| panic!("retry failed"));
-    if let SubscribeState::AwaitingResponse(data) = &new_op.state {
-        assert_eq!(
-            data.alternatives.len(),
-            0,
-            "Only fresh_peer should be injected (visited_peer filtered by bloom)"
-        );
-    } else {
-        panic!("Expected AwaitingResponse state");
-    }
+    let data = extract_awaiting_data(&new_op);
+    assert_eq!(
+        data.alternatives.len(),
+        0,
+        "Only fresh_peer should be injected (visited_peer filtered by bloom)"
+    );
 }
 
 /// Verify that retry targets are marked in the bloom filter (#3570).
 #[test]
 fn test_retry_marks_target_in_bloom_filter() {
-    let instance_id = ContractInstanceId::new([63u8; 32]);
-    let tx_id = Transaction::new::<SubscribeMsg>();
-
     let alt = random_peer();
     let alt_addr = alt.socket_addr().unwrap();
-
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            next_hop: None,
-            instance_id,
-            retries: 0,
-            current_hop: 10,
-            tried_peers: HashSet::new(),
-            alternatives: vec![alt],
-            attempts_at_hop: 1,
-            visited: crate::operations::VisitedPeers::new(&tx_id),
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
+    let op = make_retry_op(vec![alt], &[]);
 
     let (new_op, _msg) = op
         .retry_with_next_alternative(10, &[])
         .unwrap_or_else(|_| panic!("retry failed"));
-    if let SubscribeState::AwaitingResponse(data) = &new_op.state {
-        assert!(
-            data.visited.probably_visited(alt_addr),
-            "Retry target should be marked in bloom filter"
-        );
-    } else {
-        panic!("Expected AwaitingResponse state");
-    }
+
+    let data = extract_awaiting_data(&new_op);
+    assert!(
+        data.visited.probably_visited(alt_addr),
+        "Retry target should be marked in bloom filter"
+    );
 }
 
 /// Test that non-originator subscribe ops are correctly identified.
