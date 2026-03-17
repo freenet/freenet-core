@@ -1974,6 +1974,25 @@ fn test_retry_htl_floor_at_min() {
     );
 }
 
+/// Verify that HTL never exceeds max_hops_to_live, even when MIN_RETRY_HTL is higher.
+///
+/// When max_hops_to_live=2 (< MIN_RETRY_HTL=3), the .min(max_hops_to_live) clamp
+/// must prevent the retry from exceeding the network's configured maximum.
+#[test]
+fn test_retry_htl_capped_at_max_hops() {
+    let alt = random_peer();
+    let op = make_retry_op(vec![alt], &[]);
+
+    let (_op, msg) = op
+        .retry_with_next_alternative(2, &[])
+        .unwrap_or_else(|_| panic!("retry failed"));
+    assert_eq!(
+        extract_request_htl(&msg),
+        2,
+        "HTL must not exceed max_hops_to_live even when MIN_RETRY_HTL is higher"
+    );
+}
+
 /// Verify that bloom-filter-visited peers are excluded from fallback injection (#3570).
 #[test]
 fn test_retry_fallback_skips_bloom_visited() {
