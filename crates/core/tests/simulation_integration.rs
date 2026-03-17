@@ -7852,3 +7852,191 @@ fn test_get_reliability_with_latency() {
         NUM_NODES
     );
 }
+
+/// GET reliability under node churn (nodes randomly crashing and restarting).
+///
+/// Uses the direct runner with ChurnConfig to simulate realistic network dynamics:
+/// - 100 nodes + 3 gateways
+/// - 10% crash probability per tick, 3s recovery, max 5 simultaneous crashes
+/// - 50-200ms latency + 5% message loss
+/// - 300 random operations (PUTs, GETs, SUBSCRIBEs, UPDATEs)
+///
+/// Measures GET success rate under these conditions to see if churn degrades
+/// reliability beyond what static routing exhaustion causes.
+#[test_log::test]
+fn test_get_reliability_with_churn() {
+    use freenet::dev_tool::ChurnConfig;
+    use freenet::simulation::FaultConfig;
+
+    const SEED: u64 = 0x3570_D1A6_0003;
+    const NETWORK_NAME: &str = "get-reliability-churn";
+    const NUM_NODES: usize = 100;
+    const NUM_GATEWAYS: usize = 3;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            NUM_GATEWAYS,
+            NUM_NODES,
+            10, // ring_max_htl
+            7,  // rnd_if_htl_above
+            12, // max_connections
+            4,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Add realistic network delays
+    sim.with_fault_injection(
+        FaultConfig::builder()
+            .latency_range(Duration::from_millis(50)..Duration::from_millis(200))
+            .message_loss_rate(0.05)
+            .build(),
+    );
+
+    // Add node churn: 10% crash rate, 3s recovery, max 5 simultaneous crashes
+    sim.with_churn(ChurnConfig {
+        crash_probability: 0.10,
+        tick_interval: Duration::from_secs(5),
+        recovery_delay: Duration::from_secs(3),
+        max_simultaneous_crashes: Some(5),
+        permanent_crash_rate: 0.02, // 2% of crashes are permanent
+        warmup_delay: Duration::from_secs(10),
+    });
+
+    drop(rt);
+
+    // Run with random operations — direct runner handles churn
+    let direct_result = sim.run_simulation_direct::<rand::rngs::SmallRng>(
+        SEED,
+        15,  // max_contract_num
+        300, // iterations — enough to generate many GETs
+        Duration::from_millis(500),
+    );
+
+    if let Err(e) = &direct_result {
+        tracing::warn!("Direct simulation completed with error (may be expected under churn): {e}");
+    }
+
+    // Analyze GET outcomes from event logs
+    let rt = create_runtime();
+    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mut successes = 0u64;
+        let mut not_found = 0u64;
+        let mut failures = 0u64;
+        let mut timeouts = 0u64;
+        let mut elapsed_list = Vec::new();
+
+        for log in logs.iter() {
+            match log.kind.get_outcome() {
+                Some(true) => {
+                    successes += 1;
+                    if let Some(ms) = log.kind.get_elapsed_ms() {
+                        elapsed_list.push(ms);
+                    }
+                }
+                Some(false) => {
+                    if let Some(ms) = log.kind.get_elapsed_ms() {
+                        if ms >= 55_000 {
+                            timeouts += 1;
+                        } else {
+                            not_found += 1;
+                        }
+                    } else {
+                        failures += 1;
+                    }
+                }
+                None => {}
+            }
+        }
+        (successes, not_found, failures, timeouts, elapsed_list)
+    });
+
+    let total_outcomes = successes + not_found + failures + timeouts;
+
+    let mut sorted_latencies = elapsed_ms_list.clone();
+    sorted_latencies.sort();
+
+    let p50 = sorted_latencies
+        .get(sorted_latencies.len() / 2)
+        .copied()
+        .unwrap_or(0);
+    let p90 = sorted_latencies
+        .get(sorted_latencies.len() * 9 / 10)
+        .copied()
+        .unwrap_or(0);
+    let p99 = sorted_latencies
+        .get(sorted_latencies.len() * 99 / 100)
+        .copied()
+        .unwrap_or(0);
+    let max_latency = sorted_latencies.last().copied().unwrap_or(0);
+
+    let success_rate = if total_outcomes > 0 {
+        successes as f64 / total_outcomes as f64
+    } else {
+        0.0
+    };
+
+    tracing::info!("=== GET Reliability with Churn (#3570) ===");
+    tracing::info!(
+        "Network: {} gateways + {} nodes, latency=50-200ms, loss=5%, churn=10%/5s",
+        NUM_GATEWAYS,
+        NUM_NODES
+    );
+    tracing::info!(
+        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        total_outcomes,
+        successes,
+        not_found,
+        failures,
+        timeouts
+    );
+    tracing::info!(
+        "GET success rate: {:.1}% ({}/{})",
+        success_rate * 100.0,
+        successes,
+        total_outcomes
+    );
+    tracing::info!(
+        "Latency (successful GETs): p50={}ms, p90={}ms, p99={}ms, max={}ms",
+        p50,
+        p90,
+        p99,
+        max_latency
+    );
+
+    // Compare with previous variants
+    tracing::info!(
+        "=== Comparison ===\n\
+         Baseline (no latency):         88.3% success, p90=754ms\n\
+         With latency (50-200ms, 5%):   81.9% success, p90=1833ms\n\
+         With churn + latency:          {:.1}% success, p90={}ms",
+        success_rate * 100.0,
+        p90
+    );
+
+    // Soft assertion — diagnostic test
+    if total_outcomes >= 10 {
+        tracing::info!(
+            "test_get_reliability_with_churn DONE: {:.1}% GET success rate \
+             ({} outcomes from 300 random operations under churn)",
+            success_rate * 100.0,
+            total_outcomes
+        );
+    } else {
+        tracing::warn!(
+            "test_get_reliability_with_churn: only {} GET outcomes — \
+             random event generation may not have produced enough GETs",
+            total_outcomes
+        );
+    }
+}
