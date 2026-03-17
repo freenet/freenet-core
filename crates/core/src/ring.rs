@@ -1787,11 +1787,10 @@ impl Ring {
         // the fast-tick interval.
         const FAST_TICK_BACKOFF_THRESHOLD: u32 = 6; // 30s at 5s/tick
 
-        // Maximum fast-tick multiplier (caps at normal tick rate).
-        #[cfg(not(test))]
-        const MAX_FAST_TICK_MULTIPLIER: u32 = 12; // 5s * 12 = 60s = CHECK_TICK_DURATION
-        #[cfg(test)]
-        const MAX_FAST_TICK_MULTIPLIER: u32 = 4; // Faster convergence in tests
+        // Maximum fast-tick multiplier: caps backoff at the normal tick rate.
+        // Derived from tick ratio so invariant holds in both prod and test cfg.
+        const MAX_FAST_TICK_MULTIPLIER: u32 =
+            (CHECK_TICK_DURATION.as_secs() / FAST_CHECK_TICK_DURATION.as_secs()) as u32;
 
         // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
         // which advances during suspend (unlike std/tokio Instant which use CLOCK_MONOTONIC).
@@ -2288,8 +2287,10 @@ impl Ring {
             let needs_fast_tick = current_connections < self.connection_manager.min_connections;
 
             if needs_fast_tick {
-                // Adaptive backoff: reset on progress, otherwise slow down.
-                if current_connections > last_conn_count {
+                // Adaptive backoff: reset on any connection count change
+                // (gain OR loss), otherwise slow down. A loss means topology
+                // changed and we should re-enter aggressive mode.
+                if current_connections != last_conn_count {
                     no_progress_ticks = 0;
                 } else {
                     no_progress_ticks = no_progress_ticks.saturating_add(1);
@@ -2299,11 +2300,14 @@ impl Ring {
                 let multiplier = if no_progress_ticks <= FAST_TICK_BACKOFF_THRESHOLD {
                     1u32
                 } else {
-                    // Exponential backoff: 2^(excess ticks), capped
                     let excess = no_progress_ticks - FAST_TICK_BACKOFF_THRESHOLD;
                     2u32.saturating_pow(excess).min(MAX_FAST_TICK_MULTIPLIER)
                 };
-                let adaptive_duration = FAST_CHECK_TICK_DURATION * multiplier;
+                // Apply ±20% jitter to prevent synchronized CONNECT bursts
+                // across peers that bootstrapped simultaneously.
+                let jitter: f64 = crate::config::GlobalRng::random_range(0.8..=1.2);
+                let adaptive_duration =
+                    FAST_CHECK_TICK_DURATION.mul_f64(multiplier as f64 * jitter);
 
                 if multiplier > 1 {
                     tracing::debug!(
