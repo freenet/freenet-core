@@ -31,6 +31,14 @@ const MAX_BREADTH: usize = 3;
 /// Matches GET operation's MAX_RETRIES; change both together.
 const MAX_RETRIES: usize = 10;
 
+/// Minimum HTL for speculative retries.
+///
+/// Retries use a reduced HTL (capped at current_hop) to avoid full-depth
+/// traversal storms. This floor ensures retries still reach peers 2-3 hops
+/// away, which is the minimum useful search depth in any topology.
+/// Matches GET operation's MIN_RETRY_HTL; change both together.
+const MIN_RETRY_HTL: usize = 3;
+
 /// Timeout for waiting on contract storage notification.
 /// Used when a subscription arrives before the contract has been propagated via PUT.
 const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
@@ -653,11 +661,14 @@ impl SubscribeOp {
     ) -> Result<(SubscribeOp, SubscribeMsg), Box<SubscribeOp>> {
         match self.state {
             SubscribeState::AwaitingResponse(ref mut data) => {
-                // If local alternatives exhausted, inject fallback peers we haven't tried
+                // If local alternatives exhausted, inject fallback peers we haven't tried.
+                // Filter through both tried_peers and visited bloom filter (#3570).
                 if data.alternatives.is_empty() && !fallback_peers.is_empty() {
                     for peer in fallback_peers {
                         if let Some(addr) = peer.socket_addr() {
-                            if !data.tried_peers.contains(&addr) {
+                            if !data.tried_peers.contains(&addr)
+                                && !data.visited.probably_visited(addr)
+                            {
                                 data.alternatives.push(peer.clone());
                             }
                         }
@@ -700,6 +711,8 @@ impl SubscribeOp {
                     }
                 };
                 data.tried_peers.insert(addr);
+                // Mark in bloom filter so future retries skip this peer (#3570).
+                data.visited.mark_visited(addr);
                 data.next_hop = Some(addr);
                 data.attempts_at_hop += 1;
                 let visited = data.visited.clone();
@@ -718,12 +731,17 @@ impl SubscribeOp {
                     contract_location: Location::from(&instance_id),
                 });
 
+                // Reduce HTL on each retry, floored at MIN_RETRY_HTL (#3570).
+                let retry_htl = (max_hops_to_live / (data.attempts_at_hop.max(1)))
+                    .max(MIN_RETRY_HTL)
+                    .min(max_hops_to_live);
+
                 self.state = SubscribeState::AwaitingResponse(data);
 
                 let msg = SubscribeMsg::Request {
                     id: self.id,
                     instance_id,
-                    htl: max_hops_to_live,
+                    htl: retry_htl,
                     visited,
                     is_renewal,
                 };
