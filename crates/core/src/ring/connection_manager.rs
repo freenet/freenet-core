@@ -510,19 +510,16 @@ impl ConnectionManager {
         }
 
         if self.location_for_peer.read().get(&addr).is_some() {
-            // We've already accepted this peer (pending or active); treat as a no-op
-            // acceptance. Rejecting here would trigger uphill routing, which at scale
-            // (500+ nodes) causes cascading CONNECT amplification: most nearby peers
-            // are already connected, so uphill routing floods the network with pointless
-            // traffic, overwhelming the transport layer and stalling the test.
-            // Gap-based targeting in sample_targets() already handles connection diversity
-            // by choosing ring locations with the largest neighbor gaps.
+            // Already connected or pending with this peer. Reject so the CONNECT
+            // routes uphill to discover new, unconnected peers. Without this,
+            // gap-based targeting repeatedly terminates at the same already-connected
+            // peer, preventing connection growth beyond the initial neighborhood.
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
-                "Peer already pending/connected; acknowledging acceptance"
+                "Peer already pending/connected; rejecting to route uphill for diversity"
             );
-            return true;
+            return false;
         }
 
         {

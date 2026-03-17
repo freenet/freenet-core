@@ -651,10 +651,16 @@ impl RelayState {
                 "connect: acceptance issued at terminus (acceptor addr will be filled by relay)"
             );
         } else if is_terminus && !self.accepted_locally && self.forwarded_to.is_none() {
-            // At terminus but should_accept() returned false (e.g., at capacity).
-            // Route uphill (away from target) to give other peers a chance to accept.
-            // This prevents requests from being silently dropped when the closest peer can't accept.
-            if self.request.ttl > 0 {
+            // At terminus but should_accept() returned false (e.g., already connected
+            // or at capacity). Route uphill to give other peers a chance to accept.
+            //
+            // Uphill routing burns half the remaining TTL per hop to prevent
+            // amplification cascades at scale. Without this, 500-node networks
+            // with high connectivity generate O(nodes × TTL) uphill messages per
+            // maintenance cycle, overwhelming the transport layer.
+            // With TTL=15 this allows ~4 uphill hops (15→8→4→2→1→reject).
+            // With TTL=4 this allows ~2 uphill hops (4→2→1→reject).
+            if self.request.ttl >= 2 {
                 let uphill_hop = ctx.select_uphill_hop(
                     self.request.desired_location,
                     &self.request.visited,
@@ -672,6 +678,10 @@ impl RelayState {
                         ring_distance_to_target = ?dist,
                         "connect: at terminus but cannot accept, routing uphill"
                     );
+                    // Halve TTL on uphill routing (on top of the -1 in forward_to_peer).
+                    // This limits uphill hops to O(log TTL) instead of O(TTL).
+                    let extra_burn = self.request.ttl / 2;
+                    self.request.ttl = self.request.ttl.saturating_sub(extra_burn);
                     actions.forward =
                         Some(self.forward_to_peer(ctx, uphill_peer, forward_attempts, now));
                 } else {
