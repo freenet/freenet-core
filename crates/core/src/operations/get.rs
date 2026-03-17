@@ -2354,18 +2354,55 @@ impl Operation for GetOp {
                             }
                         }
                         new_state = None;
-                        return_msg = Some(GetMsg::Response {
-                            id,
-                            instance_id: *key.id(),
-                            result: GetMsgResult::Found {
-                                key,
-                                value: StoreResponse {
-                                    state: Some(value.clone()),
-                                    contract: contract.clone(),
+                        // Check if the response payload exceeds the streaming
+                        // threshold.  When it does, convert to ResponseStreaming
+                        // so that upstream relays can use pipe_stream instead of
+                        // serial store-and-forward (which adds 10-50 s per hop
+                        // for large contracts like the River UI at ~814 KB).
+                        let store_response = StoreResponse {
+                            state: Some(value.clone()),
+                            contract: contract.clone(),
+                        };
+                        let includes_contract = store_response.contract.is_some();
+                        let payload = GetStreamingPayload {
+                            key,
+                            value: store_response,
+                        };
+                        let payload_bytes = bincode::serialize(&payload).map_err(|e| {
+                            OpError::NotificationChannelError(format!(
+                                "Failed to serialize streaming payload: {e}"
+                            ))
+                        })?;
+                        let payload_size = payload_bytes.len();
+                        if should_use_streaming(op_manager.streaming_threshold, payload_size) {
+                            let sid = StreamId::next_operations();
+                            tracing::info!(
+                                tx = %id,
+                                stream_id = %sid,
+                                payload_size,
+                                phase = "relay_streaming_forward",
+                                "Relay converting non-streaming GET response to streaming for upstream"
+                            );
+                            return_msg = Some(GetMsg::ResponseStreaming {
+                                id,
+                                instance_id: *payload.key.id(),
+                                stream_id: sid,
+                                key: payload.key,
+                                total_size: payload_size as u64,
+                                includes_contract,
+                            });
+                            stream_data = Some((sid, bytes::Bytes::from(payload_bytes)));
+                        } else {
+                            return_msg = Some(GetMsg::Response {
+                                id,
+                                instance_id: *payload.key.id(),
+                                result: GetMsgResult::Found {
+                                    key: payload.key,
+                                    value: payload.value,
                                 },
-                            },
-                        });
-                        tracing::debug!(tx = %id, %key, upstream = ?self.upstream_addr, "Returning contract to upstream");
+                            });
+                        }
+                        tracing::debug!(tx = %id, upstream = ?self.upstream_addr, "Returning contract to upstream");
                         result = Some(GetResult {
                             key,
                             state: value.clone(),
