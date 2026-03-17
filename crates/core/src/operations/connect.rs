@@ -654,12 +654,14 @@ impl RelayState {
             // At terminus but should_accept() returned false (e.g., already connected
             // or at capacity). Route uphill to give other peers a chance to accept.
             //
-            // Uphill routing burns half the remaining TTL per hop to prevent
+            // Uphill routing halves the forwarded TTL per hop to prevent
             // amplification cascades at scale. Without this, 500-node networks
             // with high connectivity generate O(nodes × TTL) uphill messages per
             // maintenance cycle, overwhelming the transport layer.
-            // With TTL=15 this allows ~4 uphill hops (15→8→4→2→1→reject).
-            // With TTL=4 this allows ~2 uphill hops (4→2→1→reject).
+            // The burn applies only to the outgoing message (not self.request),
+            // so retries after rejection still have enough TTL.
+            // With TTL=15: forwarded as 7→3→1→reject (~3 uphill hops).
+            // With TTL=4: forwarded as 1→reject (~1 uphill hop).
             if self.request.ttl >= 2 {
                 let uphill_hop = ctx.select_uphill_hop(
                     self.request.desired_location,
@@ -678,12 +680,16 @@ impl RelayState {
                         ring_distance_to_target = ?dist,
                         "connect: at terminus but cannot accept, routing uphill"
                     );
-                    // Halve TTL on uphill routing (on top of the -1 in forward_to_peer).
-                    // This limits uphill hops to O(log TTL) instead of O(TTL).
-                    let extra_burn = self.request.ttl / 2;
-                    self.request.ttl = self.request.ttl.saturating_sub(extra_burn);
-                    actions.forward =
-                        Some(self.forward_to_peer(ctx, uphill_peer, forward_attempts, now));
+                    // Halve TTL on the forwarded request to limit uphill hops to
+                    // O(log TTL) instead of O(TTL). The burn is applied only to the
+                    // outgoing message, NOT to self.request.ttl, so that if this
+                    // uphill attempt is rejected and we retry with a different peer,
+                    // the retry still has enough TTL to proceed.
+                    let (peer, mut fwd_req) =
+                        self.forward_to_peer(ctx, uphill_peer, forward_attempts, now);
+                    let extra_burn = fwd_req.ttl / 2;
+                    fwd_req.ttl = fwd_req.ttl.saturating_sub(extra_burn);
+                    actions.forward = Some((peer, fwd_req));
                 } else {
                     tracing::info!(
                         target = %self.request.desired_location,
@@ -3755,8 +3761,8 @@ mod tests {
             .expect("should route uphill when at terminus but cannot accept");
         assert_eq!(forward_to.pub_key(), uphill_peer.pub_key());
         assert_eq!(
-            request.ttl, 2,
-            "TTL should be decremented for uphill forward"
+            request.ttl, 1,
+            "TTL should be decremented (-1) then halved for uphill forward: (3-1)/2 = 1"
         );
 
         // forwarded_to should be set
