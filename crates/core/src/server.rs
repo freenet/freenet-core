@@ -12,6 +12,7 @@ pub(crate) mod errors;
 mod home_page;
 pub(crate) mod path_handlers;
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +25,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 
-use axum::response::IntoResponse;
+use axum::{response::IntoResponse, Extension};
 use client_api::HttpClientApi;
 use tower_http::trace::TraceLayer;
 
@@ -364,6 +365,83 @@ pub(crate) async fn serve_client_api_in(
     serve_client_api_in_impl(config, None).await
 }
 
+/// Hostnames and IPs accepted in the HTTP `Host` header for WebSocket connections.
+pub(crate) type AllowedHosts = Arc<HashSet<String>>;
+
+/// Builds the allowlist of hostnames/IPs for WebSocket `Host` header validation.
+///
+/// Each entry is stored with and without the port suffix so both
+/// `Host: myhost` and `Host: myhost:7509` are accepted.
+fn build_allowed_hosts(
+    bind_addr: IpAddr,
+    port: u16,
+    extra_allowed_hosts: &[String],
+) -> HashSet<String> {
+    let mut hosts = HostAllowlistBuilder::new(port);
+
+    hosts.add_localhost();
+    hosts.add_machine_hostname();
+
+    if !bind_addr.is_unspecified() {
+        hosts.add(&bind_addr.to_string());
+    }
+
+    for host in extra_allowed_hosts {
+        hosts.add(host);
+    }
+
+    hosts.build()
+}
+
+struct HostAllowlistBuilder {
+    hosts: HashSet<String>,
+    port: u16,
+}
+
+impl HostAllowlistBuilder {
+    fn new(port: u16) -> Self {
+        Self {
+            hosts: HashSet::new(),
+            port,
+        }
+    }
+
+    fn add(&mut self, host: &str) {
+        let host_lower = host.to_lowercase();
+        self.hosts.insert(format!("{host_lower}:{}", self.port));
+        self.hosts.insert(host_lower);
+    }
+
+    fn add_localhost(&mut self) {
+        self.add("localhost");
+        self.add("127.0.0.1");
+        self.add("[::1]");
+    }
+
+    fn add_machine_hostname(&mut self) {
+        let Ok(name) = hostname::get() else { return };
+        let Some(name_str) = name.to_str() else {
+            return;
+        };
+
+        self.add(name_str);
+        self.resolve_hostname_ips(name_str);
+    }
+
+    fn resolve_hostname_ips(&mut self, hostname: &str) {
+        let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(hostname, self.port)) else {
+            return;
+        };
+        for addr in addrs {
+            self.add(&addr.ip().to_string());
+        }
+    }
+
+    fn build(self) -> HashSet<String> {
+        self.hosts
+    }
+}
+
 async fn serve_client_api_in_impl(
     config: WebsocketApiConfig,
     pre_bound: Option<std::net::TcpListener>,
@@ -386,18 +464,25 @@ async fn serve_client_api_in_impl(
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts);
 
+    let allowed_hosts: AllowedHosts = Arc::new(build_allowed_hosts(
+        config.address,
+        config.port,
+        &config.allowed_hosts,
+    ));
+    tracing::info!(?allowed_hosts, "WebSocket Host header allowlist built");
+
     // When bound to a non-loopback address, reject connections from non-private
     // source IPs. This is sufficient security: only LAN clients can connect.
-    // We intentionally do NOT filter on Host headers because users access their
-    // nodes via local hostnames, mDNS names, and Docker container names that
-    // we cannot enumerate.
     let needs_lan_filter = !config.address.is_loopback();
     let router = if needs_lan_filter {
         ws_router
+            .layer(Extension(allowed_hosts))
             .layer(axum::middleware::from_fn(private_network_filter))
             .layer(TraceLayer::new_for_http())
     } else {
-        ws_router.layer(TraceLayer::new_for_http())
+        ws_router
+            .layer(Extension(allowed_hosts))
+            .layer(TraceLayer::new_for_http())
     };
 
     serve_with_listener(ws_socket, router, pre_bound).await?;
@@ -550,5 +635,53 @@ mod tests {
         assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
             0x2607, 0xf8b0, 0, 0, 0, 0, 0, 1
         ))));
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_always_includes_localhost() {
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509, &[]);
+        assert!(hosts.contains("localhost"));
+        assert!(hosts.contains("localhost:7509"));
+        assert!(hosts.contains("127.0.0.1"));
+        assert!(hosts.contains("127.0.0.1:7509"));
+        assert!(hosts.contains("[::1]"));
+        assert!(hosts.contains("[::1]:7509"));
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_includes_machine_hostname() {
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509, &[]);
+        if let Ok(name) = hostname::get() {
+            if let Some(name_str) = name.to_str() {
+                assert!(hosts.contains(&name_str.to_lowercase()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_custom_hostname() {
+        let hosts = build_allowed_hosts(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            7509,
+            &["mynode.example.com".to_string()],
+        );
+        assert!(hosts.contains("mynode.example.com"));
+        assert!(hosts.contains("mynode.example.com:7509"));
+        assert!(hosts.contains("localhost"));
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_specific_bind_addr() {
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 7509, &[]);
+        assert!(hosts.contains("192.168.1.50"));
+        assert!(hosts.contains("192.168.1.50:7509"));
+        assert!(hosts.contains("localhost"));
+    }
+
+    #[test]
+    fn test_build_allowed_hosts_excludes_unspecified() {
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509, &[]);
+        assert!(!hosts.contains("0.0.0.0"));
+        assert!(!hosts.contains("0.0.0.0:7509"));
     }
 }

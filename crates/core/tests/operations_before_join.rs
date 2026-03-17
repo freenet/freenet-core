@@ -94,6 +94,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
             ws_api_port: Some(gateway_ws_port),
             token_ttl_seconds: None,
             token_cleanup_interval_seconds: None,
+            allowed_host: None,
         },
         network_api: freenet::config::NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -150,6 +151,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
             ws_api_port: Some(peer_ws_port),
             token_ttl_seconds: None,
             token_cleanup_interval_seconds: None,
+            allowed_host: None,
         },
         network_api: freenet::config::NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -193,7 +195,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
     let (start_gateway_tx, start_gateway_rx) = tokio::sync::oneshot::channel::<()>();
 
     let peer_cfg = peer_config.build().await?;
-    let peer_ws_server = serve_client_api(peer_cfg.ws_api).await?;
+    let peer_ws_server = serve_client_api(peer_cfg.ws_api.clone()).await?;
     let peer_node = NodeConfig::new(peer_cfg.clone())
         .await?
         .build(peer_ws_server)

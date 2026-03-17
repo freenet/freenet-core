@@ -278,6 +278,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             ws_api_port: Some(ws_port),
                             token_ttl_seconds: None,
                             token_cleanup_interval_seconds: None,
+                            allowed_host: None,
                         },
                         network_api: freenet::config::NetworkArgs {
                             // Use varied IP for public_address (affects location calculation)
@@ -416,6 +417,7 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             ws_api_port: Some(ws_port),
                             token_ttl_seconds: None,
                             token_cleanup_interval_seconds: None,
+                            allowed_host: None,
                         },
                         network_api: freenet::config::NetworkArgs {
                             // Use varied IP for public_address (affects location calculation)

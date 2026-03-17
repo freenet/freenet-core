@@ -346,6 +346,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
             ws_api_port: Some(gateway_ws_port),
             token_ttl_seconds: None,
             token_cleanup_interval_seconds: None,
+            allowed_host: None,
         },
         network_api: freenet::config::NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -403,6 +404,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
             ws_api_port: Some(peer_ws_port),
             token_ttl_seconds: None,
             token_cleanup_interval_seconds: None,
+            allowed_host: None,
         },
         network_api: freenet::config::NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
