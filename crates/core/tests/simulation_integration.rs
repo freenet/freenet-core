@@ -7362,9 +7362,8 @@ async fn test_connection_growth_plateau_diagnostic() {
 /// A soft assertion ensures GET success rate doesn't fall below 50% (catastrophic).
 ///
 /// Uses `run_controlled_simulation` for deterministic reproduction.
-// Long-running diagnostic test (~2min). Run with:
-// cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration -- --ignored test_get_reliability_diagnostic
-#[ignore]
+// Long-running diagnostic test (~2min). Runs in nightly CI.
+#[cfg(feature = "nightly_tests")]
 #[test_log::test]
 fn test_get_reliability_diagnostic() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
@@ -7677,9 +7676,8 @@ fn test_get_reliability_diagnostic() {
 /// The latency means multi-hop GETs accumulate realistic delays (e.g., 5 hops × 100ms avg
 /// = 500ms per hop chain), which triggers the ACK_TIMEOUT (3s) and OPERATION_TTL (60s)
 /// timing windows that are invisible in zero-latency simulations.
-// Long-running diagnostic test (~3min). Run with:
-// cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration -- --ignored test_get_reliability_with_latency
-#[ignore]
+// Long-running diagnostic test (~3min). Runs in nightly CI.
+#[cfg(feature = "nightly_tests")]
 #[test_log::test]
 fn test_get_reliability_with_latency() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
@@ -7933,9 +7931,8 @@ fn test_get_reliability_with_latency() {
 ///
 /// Measures GET success rate under these conditions to see if churn degrades
 /// reliability beyond what static routing exhaustion causes.
-// Long-running diagnostic test (~4min). Run with:
-// cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration -- --ignored test_get_reliability_with_churn
-#[ignore]
+// Long-running diagnostic test (~4min). Runs in nightly CI.
+#[cfg(feature = "nightly_tests")]
 #[test_log::test]
 fn test_get_reliability_with_churn() {
     use freenet::dev_tool::ChurnConfig;
