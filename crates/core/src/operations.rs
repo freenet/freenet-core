@@ -255,15 +255,29 @@ where
         }
 
         // ── Has message, no state → send final response and complete ───
+        // Complete AFTER send to avoid response-lost: if send fails (peer
+        // disconnected), the op stays in under_progress for GC retry (#3590).
         Ok(OperationResult::SendAndComplete {
             msg,
             next_hop,
             stream_data,
         }) => {
-            op_manager.completed(tx_id);
             if let Some(target) = next_hop {
                 tracing::debug!(%tx_id, ?target, "sending back message to target");
-                send_with_stream(network_bridge, target, msg, stream_data).await?;
+                match send_with_stream(network_bridge, target, msg, stream_data).await {
+                    Ok(()) => {
+                        op_manager.completed(tx_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %tx_id, %target, error = %e,
+                            "Response send failed — keeping op for GC retry"
+                        );
+                        return Err(e);
+                    }
+                }
+            } else {
+                op_manager.completed(tx_id);
             }
         }
     }
