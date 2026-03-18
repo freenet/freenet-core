@@ -1839,7 +1839,11 @@ fn make_retry_op(alternatives: Vec<PeerKeyLocation>, tried: &[PeerKeyLocation]) 
 fn extract_request_htl(msg: &SubscribeMsg) -> usize {
     match msg {
         SubscribeMsg::Request { htl, .. } => *htl,
-        other => panic!("Expected Request, got {other:?}"),
+        other @ SubscribeMsg::Response { .. }
+        | other @ SubscribeMsg::Unsubscribe { .. }
+        | other @ SubscribeMsg::ForwardingAck { .. } => {
+            panic!("Expected Request, got {other:?}")
+        }
     }
 }
 
@@ -1847,7 +1851,11 @@ fn extract_request_htl(msg: &SubscribeMsg) -> usize {
 fn extract_awaiting_data(op: &SubscribeOp) -> &super::AwaitingResponseData {
     match &op.state {
         SubscribeState::AwaitingResponse(data) => data,
-        other => panic!("Expected AwaitingResponse, got {other:?}"),
+        other @ SubscribeState::PrepareRequest(_)
+        | other @ SubscribeState::Completed(_)
+        | other @ SubscribeState::Failed => {
+            panic!("Expected AwaitingResponse, got {other:?}")
+        }
     }
 }
 
@@ -1905,7 +1913,7 @@ fn test_retry_uses_fallback_peers() {
 #[test]
 fn test_retry_skips_tried_fallback_peers() {
     let tried_peer = random_peer();
-    let op = make_retry_op(vec![], &[tried_peer.clone()]);
+    let op = make_retry_op(vec![], std::slice::from_ref(&tried_peer));
 
     let result = op.retry_with_next_alternative(10, &[tried_peer]);
     assert!(

@@ -269,13 +269,16 @@ where
                         op_manager.completed(tx_id);
                     }
                     Err(e) => {
-                        // Return directly (bypasses the Aborted-sending error
-                        // handler at the top of this function intentionally —
-                        // we want the op to stay alive in under_progress for
-                        // GC retry, not be aborted).
+                        // Return directly — bypasses the Aborted-sending error
+                        // handler at the top of this function intentionally.
+                        // For relay nodes: the op state was already consumed by
+                        // process_message, so the tx sits in under_progress until
+                        // the 5× TTL cutoff cleans it up. The originator recovers
+                        // independently via its own speculative retry (ACK_TIMEOUT
+                        // or PROGRESS_TIMEOUT in the GC task).
                         tracing::warn!(
                             %tx_id, %target, error = %e,
-                            "Response send failed — keeping op for GC retry"
+                            "Response send failed — originator will retry via speculative path"
                         );
                         return Err(e);
                     }
