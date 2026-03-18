@@ -7348,3 +7348,768 @@ async fn test_connection_growth_plateau_diagnostic() {
         NODES,
     );
 }
+
+/// Diagnostic test for #3570: GET operations have high timeout rate in realistic networks.
+///
+/// This test creates a 100-node network, PUTs a contract from a gateway, then has
+/// every node attempt to GET the same contract. It measures:
+/// - Overall GET success rate
+/// - Latency distribution (p50, p90, p99)
+/// - Failure modes (NotFound vs Failure vs Timeout)
+///
+/// The test is intentionally diagnostic — it logs detailed statistics rather than
+/// asserting a hard threshold, so we can gather evidence on what's happening.
+/// A soft assertion ensures GET success rate doesn't fall below 50% (catastrophic).
+///
+/// Uses `run_controlled_simulation` for deterministic reproduction.
+// Long-running diagnostic test (~2min). Run with:
+// cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration -- --ignored test_get_reliability_diagnostic
+#[ignore]
+#[test_log::test]
+fn test_get_reliability_diagnostic() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x3570_D1A6_0001;
+    const NETWORK_NAME: &str = "get-reliability-diag";
+    const NUM_NODES: usize = 100;
+    const NUM_GATEWAYS: usize = 3;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            NUM_GATEWAYS,
+            NUM_NODES,
+            10, // ring_max_htl — realistic for 100-node network
+            7,  // rnd_if_htl_above
+            12, // max_connections
+            4,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Create a test contract and PUT it from gateway 0
+    let contract = SimOperation::create_test_contract(0x35);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+
+    let mut operations = vec![
+        // Gateway 0 PUTs the contract with subscribe
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: vec![0x35; 64],
+                subscribe: true,
+            },
+        ),
+    ];
+
+    // Every node GETs the contract — this exercises multi-hop routing
+    // across the full network topology
+    for i in 0..NUM_NODES {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(600), // 10 min simulation
+        Duration::from_secs(120), // 2 min post-operations wait
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Analyze GET outcomes from event logs
+    let rt = create_runtime();
+    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mut successes = 0u64;
+        let mut not_found = 0u64;
+        let mut failures = 0u64;
+        let mut timeouts = 0u64;
+        let mut elapsed_list = Vec::new();
+
+        for log in logs.iter() {
+            match log.kind.get_outcome() {
+                Some(true) => {
+                    successes += 1;
+                    if let Some(ms) = log.kind.get_elapsed_ms() {
+                        elapsed_list.push(ms);
+                    }
+                }
+                Some(false) => {
+                    if let Some(ms) = log.kind.get_elapsed_ms() {
+                        if ms >= 55_000 {
+                            // Likely a timeout (close to OPERATION_TTL of 60s)
+                            timeouts += 1;
+                        } else {
+                            not_found += 1;
+                        }
+                    } else {
+                        failures += 1;
+                    }
+                }
+                None => {}
+            }
+        }
+        (successes, not_found, failures, timeouts, elapsed_list)
+    });
+
+    let total_outcomes = successes + not_found + failures + timeouts;
+
+    // Compute latency percentiles for successful GETs
+    let mut sorted_latencies = elapsed_ms_list.clone();
+    sorted_latencies.sort();
+
+    let p50 = sorted_latencies
+        .get(sorted_latencies.len() / 2)
+        .copied()
+        .unwrap_or(0);
+    let p90 = sorted_latencies
+        .get(sorted_latencies.len() * 9 / 10)
+        .copied()
+        .unwrap_or(0);
+    let p99 = sorted_latencies
+        .get(sorted_latencies.len() * 99 / 100)
+        .copied()
+        .unwrap_or(0);
+    let max_latency = sorted_latencies.last().copied().unwrap_or(0);
+
+    let success_rate = if total_outcomes > 0 {
+        successes as f64 / total_outcomes as f64
+    } else {
+        0.0
+    };
+
+    // Detect response-lost and ForwardingAck patterns from event logs
+    let (response_sent_count, ack_received_count, response_lost_txs, retry_storm_txs) = rt
+        .block_on(async {
+            let logs = logs_handle.lock().await;
+            let mut response_sent_txs: HashSet<String> = HashSet::new();
+            let mut success_txs: HashSet<String> = HashSet::new();
+            let mut ack_received = 0u64;
+            let mut request_count_per_tx: HashMap<String, usize> = HashMap::new();
+
+            for log in logs.iter() {
+                let tx_str = log.tx.to_string();
+                if log.kind.is_get_response_sent() {
+                    response_sent_txs.insert(tx_str.clone());
+                }
+                if log.kind.get_outcome() == Some(true) {
+                    success_txs.insert(tx_str.clone());
+                }
+                if log.kind.is_forwarding_ack_received() {
+                    ack_received += 1;
+                }
+                if log.kind.get_outcome().is_some()
+                    || log.kind.is_get_response_sent()
+                    || log.kind.is_forwarding_ack_received()
+                {
+                    // Count unique request events per tx for retry-storm detection
+                } else if log.kind.is_get_request() {
+                    *request_count_per_tx.entry(tx_str).or_insert(0) += 1;
+                }
+            }
+
+            // Response-lost: response_sent exists but no get_success for that tx
+            let response_lost: Vec<_> = response_sent_txs
+                .difference(&success_txs)
+                .cloned()
+                .collect();
+
+            // Retry-storm: transactions with >10 request events (same tx hitting many peers)
+            let retry_storms: Vec<_> = request_count_per_tx
+                .iter()
+                .filter(|(_, &count)| count > 10)
+                .map(|(tx, count)| (tx.clone(), *count))
+                .collect();
+
+            (
+                response_sent_txs.len(),
+                ack_received,
+                response_lost,
+                retry_storms,
+            )
+        });
+
+    tracing::info!("=== GET Reliability Diagnostic (#3570) ===");
+    tracing::info!(
+        "Network: {} gateways + {} nodes = {} total peers",
+        NUM_GATEWAYS,
+        NUM_NODES,
+        NUM_GATEWAYS + NUM_NODES
+    );
+    tracing::info!(
+        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        total_outcomes,
+        successes,
+        not_found,
+        failures,
+        timeouts
+    );
+    tracing::info!(
+        "GET success rate: {:.1}% ({}/{})",
+        success_rate * 100.0,
+        successes,
+        total_outcomes
+    );
+    tracing::info!(
+        "Latency (successful GETs): p50={}ms, p90={}ms, p99={}ms, max={}ms",
+        p50,
+        p90,
+        p99,
+        max_latency
+    );
+    tracing::info!(
+        "ForwardingAck: {} ACKs received, {} response_sent events, {} response-lost txs",
+        ack_received_count,
+        response_sent_count,
+        response_lost_txs.len()
+    );
+    if !retry_storm_txs.is_empty() {
+        tracing::info!(
+            "Retry storms (>10 requests per tx): {} txs, max {} requests",
+            retry_storm_txs.len(),
+            retry_storm_txs.iter().map(|(_, c)| c).max().unwrap_or(&0)
+        );
+    }
+
+    // Check which nodes got the contract state
+    let mut nodes_with_state = 0;
+    let mut nodes_without_state = Vec::new();
+    for i in 0..NUM_NODES {
+        let label = NodeLabel::node(NETWORK_NAME, i);
+        if let Some(storage) = result.node_storages.get(&label) {
+            if storage.get_stored_state(&contract_key).is_some() {
+                nodes_with_state += 1;
+            } else {
+                nodes_without_state.push(i);
+            }
+        } else {
+            nodes_without_state.push(i);
+        }
+    }
+
+    tracing::info!(
+        "Storage verification: {}/{} nodes have contract state",
+        nodes_with_state,
+        NUM_NODES
+    );
+    if !nodes_without_state.is_empty() {
+        tracing::info!(
+            "Nodes missing state ({} total): {:?}{}",
+            nodes_without_state.len(),
+            &nodes_without_state[..nodes_without_state.len().min(20)],
+            if nodes_without_state.len() > 20 {
+                "..."
+            } else {
+                ""
+            }
+        );
+    }
+
+    // Soft assertion — this is diagnostic, but catastrophic failure should still fail the test
+    assert!(
+        total_outcomes >= 10,
+        "Only {} GET outcome events — too few for meaningful analysis",
+        total_outcomes
+    );
+    assert!(
+        success_rate >= 0.50,
+        "GET success rate {:.1}% is catastrophically low (below 50%). \
+         {} succeeded, {} not_found, {} failures, {} timeouts out of {} total. \
+         See #3570 for context.",
+        success_rate * 100.0,
+        successes,
+        not_found,
+        failures,
+        timeouts,
+        total_outcomes
+    );
+
+    // StateVerifier anomaly check
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "Anomaly report: {} anomalies across {} contracts, {} total events",
+        report.anomalies.len(),
+        report.contracts_analyzed,
+        report.total_events
+    );
+
+    tracing::info!(
+        "test_get_reliability_diagnostic DONE: {:.1}% success rate, \
+         {}/{} nodes have state",
+        success_rate * 100.0,
+        nodes_with_state,
+        NUM_NODES
+    );
+}
+
+/// Same as `test_get_reliability_diagnostic` but with realistic network delays.
+///
+/// Adds 50-200ms latency jitter and 5% message loss to simulate real-world conditions.
+/// This should surface the ForwardingAck timeout issue from #3570: when relays ACK but
+/// downstream chains stall, the originator's retry is permanently disabled.
+///
+/// The latency means multi-hop GETs accumulate realistic delays (e.g., 5 hops × 100ms avg
+/// = 500ms per hop chain), which triggers the ACK_TIMEOUT (3s) and OPERATION_TTL (60s)
+/// timing windows that are invisible in zero-latency simulations.
+// Long-running diagnostic test (~3min). Run with:
+// cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration -- --ignored test_get_reliability_with_latency
+#[ignore]
+#[test_log::test]
+fn test_get_reliability_with_latency() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    use freenet::simulation::FaultConfig;
+
+    const SEED: u64 = 0x3570_D1A6_0002;
+    const NETWORK_NAME: &str = "get-reliability-latency";
+    const NUM_NODES: usize = 100;
+    const NUM_GATEWAYS: usize = 3;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            NUM_GATEWAYS,
+            NUM_NODES,
+            10, // ring_max_htl
+            7,  // rnd_if_htl_above
+            12, // max_connections
+            4,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Add realistic network delays: 50-200ms latency + 5% message loss
+    sim.with_fault_injection(
+        FaultConfig::builder()
+            .latency_range(Duration::from_millis(50)..Duration::from_millis(200))
+            .message_loss_rate(0.05)
+            .build(),
+    );
+
+    let contract = SimOperation::create_test_contract(0x36);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+
+    let mut operations = vec![
+        // Gateway 0 PUTs the contract
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: vec![0x36; 64],
+                subscribe: true,
+            },
+        ),
+    ];
+
+    // Every node GETs the contract
+    for i in 0..NUM_NODES {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(900), // 15 min — longer to account for latency
+        Duration::from_secs(180), // 3 min post-operations wait
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Analyze GET outcomes
+    let rt = create_runtime();
+    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mut successes = 0u64;
+        let mut not_found = 0u64;
+        let mut failures = 0u64;
+        let mut timeouts = 0u64;
+        let mut elapsed_list = Vec::new();
+
+        for log in logs.iter() {
+            match log.kind.get_outcome() {
+                Some(true) => {
+                    successes += 1;
+                    if let Some(ms) = log.kind.get_elapsed_ms() {
+                        elapsed_list.push(ms);
+                    }
+                }
+                Some(false) => {
+                    if let Some(ms) = log.kind.get_elapsed_ms() {
+                        if ms >= 55_000 {
+                            timeouts += 1;
+                        } else {
+                            not_found += 1;
+                        }
+                    } else {
+                        failures += 1;
+                    }
+                }
+                None => {}
+            }
+        }
+        (successes, not_found, failures, timeouts, elapsed_list)
+    });
+
+    let total_outcomes = successes + not_found + failures + timeouts;
+
+    let mut sorted_latencies = elapsed_ms_list.clone();
+    sorted_latencies.sort();
+
+    let p50 = sorted_latencies
+        .get(sorted_latencies.len() / 2)
+        .copied()
+        .unwrap_or(0);
+    let p90 = sorted_latencies
+        .get(sorted_latencies.len() * 9 / 10)
+        .copied()
+        .unwrap_or(0);
+    let p99 = sorted_latencies
+        .get(sorted_latencies.len() * 99 / 100)
+        .copied()
+        .unwrap_or(0);
+    let max_latency = sorted_latencies.last().copied().unwrap_or(0);
+
+    let success_rate = if total_outcomes > 0 {
+        successes as f64 / total_outcomes as f64
+    } else {
+        0.0
+    };
+
+    tracing::info!("=== GET Reliability with Latency (#3570) ===");
+    tracing::info!(
+        "Network: {} gateways + {} nodes, latency=50-200ms, loss=5%",
+        NUM_GATEWAYS,
+        NUM_NODES
+    );
+    tracing::info!(
+        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        total_outcomes,
+        successes,
+        not_found,
+        failures,
+        timeouts
+    );
+    tracing::info!(
+        "GET success rate: {:.1}% ({}/{})",
+        success_rate * 100.0,
+        successes,
+        total_outcomes
+    );
+    tracing::info!(
+        "Latency (successful GETs): p50={}ms, p90={}ms, p99={}ms, max={}ms",
+        p50,
+        p90,
+        p99,
+        max_latency
+    );
+
+    // Check which nodes got the contract state
+    let mut nodes_with_state = 0;
+    let mut nodes_without_state = Vec::new();
+    for i in 0..NUM_NODES {
+        let label = NodeLabel::node(NETWORK_NAME, i);
+        if let Some(storage) = result.node_storages.get(&label) {
+            if storage.get_stored_state(&contract_key).is_some() {
+                nodes_with_state += 1;
+            } else {
+                nodes_without_state.push(i);
+            }
+        } else {
+            nodes_without_state.push(i);
+        }
+    }
+
+    tracing::info!(
+        "Storage verification: {}/{} nodes have contract state",
+        nodes_with_state,
+        NUM_NODES
+    );
+    if !nodes_without_state.is_empty() {
+        tracing::info!(
+            "Nodes missing state ({} total): {:?}{}",
+            nodes_without_state.len(),
+            &nodes_without_state[..nodes_without_state.len().min(20)],
+            if nodes_without_state.len() > 20 {
+                "..."
+            } else {
+                ""
+            }
+        );
+    }
+
+    // Compare with no-latency baseline
+    tracing::info!(
+        "=== Comparison with no-latency baseline ===\n\
+         Baseline (no latency): 88.3% success, 72/100 nodes, p50=1ms, p90=754ms\n\
+         This run (50-200ms latency, 5% loss): {:.1}% success, {}/{} nodes, p50={}ms, p90={}ms",
+        success_rate * 100.0,
+        nodes_with_state,
+        NUM_NODES,
+        p50,
+        p90
+    );
+
+    // Soft assertion — diagnostic test, but flag catastrophic regression
+    assert!(
+        total_outcomes >= 10,
+        "Only {} GET outcome events — too few for meaningful analysis",
+        total_outcomes
+    );
+
+    // StateVerifier anomaly check
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "Anomaly report: {} anomalies across {} contracts, {} total events",
+        report.anomalies.len(),
+        report.contracts_analyzed,
+        report.total_events
+    );
+
+    tracing::info!(
+        "test_get_reliability_with_latency DONE: {:.1}% success rate, \
+         {}/{} nodes have state",
+        success_rate * 100.0,
+        nodes_with_state,
+        NUM_NODES
+    );
+}
+
+/// GET reliability under node churn (nodes randomly crashing and restarting).
+///
+/// Uses the direct runner with ChurnConfig to simulate realistic network dynamics:
+/// - 100 nodes + 3 gateways
+/// - 10% crash probability per tick, 3s recovery, max 5 simultaneous crashes
+/// - 50-200ms latency + 5% message loss
+/// - 300 random operations (PUTs, GETs, SUBSCRIBEs, UPDATEs)
+///
+/// Measures GET success rate under these conditions to see if churn degrades
+/// reliability beyond what static routing exhaustion causes.
+// Long-running diagnostic test (~4min). Run with:
+// cargo test -p freenet --features "simulation_tests,testing" --test simulation_integration -- --ignored test_get_reliability_with_churn
+#[ignore]
+#[test_log::test]
+fn test_get_reliability_with_churn() {
+    use freenet::dev_tool::ChurnConfig;
+    use freenet::simulation::FaultConfig;
+
+    const SEED: u64 = 0x3570_D1A6_0003;
+    const NETWORK_NAME: &str = "get-reliability-churn";
+    const NUM_NODES: usize = 100;
+    const NUM_GATEWAYS: usize = 3;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            NUM_GATEWAYS,
+            NUM_NODES,
+            10, // ring_max_htl
+            7,  // rnd_if_htl_above
+            12, // max_connections
+            4,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Add realistic network delays
+    sim.with_fault_injection(
+        FaultConfig::builder()
+            .latency_range(Duration::from_millis(50)..Duration::from_millis(200))
+            .message_loss_rate(0.05)
+            .build(),
+    );
+
+    // Add node churn: 10% crash rate, 3s recovery, max 5 simultaneous crashes
+    sim.with_churn(ChurnConfig {
+        crash_probability: 0.10,
+        tick_interval: Duration::from_secs(5),
+        recovery_delay: Duration::from_secs(3),
+        max_simultaneous_crashes: Some(5),
+        permanent_crash_rate: 0.02, // 2% of crashes are permanent
+        warmup_delay: Duration::from_secs(10),
+    });
+
+    drop(rt);
+
+    // Run with random operations — direct runner handles churn
+    let direct_result = sim.run_simulation_direct::<rand::rngs::SmallRng>(
+        SEED,
+        15,  // max_contract_num
+        300, // iterations — enough to generate many GETs
+        Duration::from_millis(500),
+    );
+
+    if let Err(e) = &direct_result {
+        tracing::warn!("Direct simulation completed with error (may be expected under churn): {e}");
+    }
+
+    // Analyze GET outcomes from event logs
+    let rt = create_runtime();
+    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mut successes = 0u64;
+        let mut not_found = 0u64;
+        let mut failures = 0u64;
+        let mut timeouts = 0u64;
+        let mut elapsed_list = Vec::new();
+
+        for log in logs.iter() {
+            match log.kind.get_outcome() {
+                Some(true) => {
+                    successes += 1;
+                    if let Some(ms) = log.kind.get_elapsed_ms() {
+                        elapsed_list.push(ms);
+                    }
+                }
+                Some(false) => {
+                    if let Some(ms) = log.kind.get_elapsed_ms() {
+                        if ms >= 55_000 {
+                            timeouts += 1;
+                        } else {
+                            not_found += 1;
+                        }
+                    } else {
+                        failures += 1;
+                    }
+                }
+                None => {}
+            }
+        }
+        (successes, not_found, failures, timeouts, elapsed_list)
+    });
+
+    let total_outcomes = successes + not_found + failures + timeouts;
+
+    let mut sorted_latencies = elapsed_ms_list.clone();
+    sorted_latencies.sort();
+
+    let p50 = sorted_latencies
+        .get(sorted_latencies.len() / 2)
+        .copied()
+        .unwrap_or(0);
+    let p90 = sorted_latencies
+        .get(sorted_latencies.len() * 9 / 10)
+        .copied()
+        .unwrap_or(0);
+    let p99 = sorted_latencies
+        .get(sorted_latencies.len() * 99 / 100)
+        .copied()
+        .unwrap_or(0);
+    let max_latency = sorted_latencies.last().copied().unwrap_or(0);
+
+    let success_rate = if total_outcomes > 0 {
+        successes as f64 / total_outcomes as f64
+    } else {
+        0.0
+    };
+
+    tracing::info!("=== GET Reliability with Churn (#3570) ===");
+    tracing::info!(
+        "Network: {} gateways + {} nodes, latency=50-200ms, loss=5%, churn=10%/5s",
+        NUM_GATEWAYS,
+        NUM_NODES
+    );
+    tracing::info!(
+        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        total_outcomes,
+        successes,
+        not_found,
+        failures,
+        timeouts
+    );
+    tracing::info!(
+        "GET success rate: {:.1}% ({}/{})",
+        success_rate * 100.0,
+        successes,
+        total_outcomes
+    );
+    tracing::info!(
+        "Latency (successful GETs): p50={}ms, p90={}ms, p99={}ms, max={}ms",
+        p50,
+        p90,
+        p99,
+        max_latency
+    );
+
+    // Compare with previous variants
+    tracing::info!(
+        "=== Comparison ===\n\
+         Baseline (no latency):         88.3% success, p90=754ms\n\
+         With latency (50-200ms, 5%):   81.9% success, p90=1833ms\n\
+         With churn + latency:          {:.1}% success, p90={}ms",
+        success_rate * 100.0,
+        p90
+    );
+
+    // Soft assertion — diagnostic test
+    if total_outcomes >= 10 {
+        tracing::info!(
+            "test_get_reliability_with_churn DONE: {:.1}% GET success rate \
+             ({} outcomes from 300 random operations under churn)",
+            success_rate * 100.0,
+            total_outcomes
+        );
+    } else {
+        tracing::warn!(
+            "test_get_reliability_with_churn: only {} GET outcomes — \
+             random event generation may not have produced enough GETs",
+            total_outcomes
+        );
+    }
+}

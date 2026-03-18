@@ -575,6 +575,49 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create a ForwardingAck sent event.
+    pub fn get_forwarding_ack_sent(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        to: PeerKeyLocation,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::ForwardingAckSent {
+                id: *tx,
+                from: own_loc,
+                to,
+                instance_id,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
+    /// Create a ForwardingAck received event.
+    pub fn get_forwarding_ack_received(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::ForwardingAckReceived {
+                id: *tx,
+                receiver: own_loc,
+                instance_id,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
     // ==================== SUBSCRIBE Operation Helpers ====================
 
     /// Create a Subscribe request event.
@@ -2640,6 +2683,76 @@ impl EventKind {
         }
     }
 
+    /// Returns the outcome of a GET operation event.
+    ///
+    /// Returns `Some(true)` for `GetSuccess`, `Some(false)` for `GetNotFound` or `GetFailure`,
+    /// `None` for all other events (including GET requests and responses).
+    pub fn get_outcome(&self) -> Option<bool> {
+        match self {
+            EventKind::Get(GetEvent::GetSuccess { .. }) => Some(true),
+            EventKind::Get(GetEvent::GetNotFound { .. } | GetEvent::GetFailure { .. }) => {
+                Some(false)
+            }
+            EventKind::Connect(_)
+            | EventKind::Put(_)
+            | EventKind::Get(_)
+            | EventKind::Subscribe(_)
+            | EventKind::Route(_)
+            | EventKind::Update(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_)
+            | EventKind::RouterSnapshot(_) => None,
+        }
+    }
+
+    /// Returns the elapsed time in milliseconds for a completed GET operation.
+    ///
+    /// Returns `Some(ms)` for `GetSuccess`, `GetNotFound`, or `GetFailure`,
+    /// `None` for all other events.
+    pub fn get_elapsed_ms(&self) -> Option<u64> {
+        match self {
+            EventKind::Get(GetEvent::GetSuccess { elapsed_ms, .. })
+            | EventKind::Get(GetEvent::GetNotFound { elapsed_ms, .. })
+            | EventKind::Get(GetEvent::GetFailure { elapsed_ms, .. }) => Some(*elapsed_ms),
+            EventKind::Connect(_)
+            | EventKind::Put(_)
+            | EventKind::Get(_)
+            | EventKind::Subscribe(_)
+            | EventKind::Route(_)
+            | EventKind::Update(_)
+            | EventKind::Transfer(_)
+            | EventKind::Lifecycle(_)
+            | EventKind::Ignored
+            | EventKind::Disconnected { .. }
+            | EventKind::Timeout { .. }
+            | EventKind::TransportSnapshot(_)
+            | EventKind::InterestSync(_)
+            | EventKind::RoutingDecision(_)
+            | EventKind::RouterSnapshot(_) => None,
+        }
+    }
+
+    /// Returns `true` if this is a ForwardingAck received event.
+    pub fn is_forwarding_ack_received(&self) -> bool {
+        matches!(self, EventKind::Get(GetEvent::ForwardingAckReceived { .. }))
+    }
+
+    /// Returns `true` if this is a GET response sent event (contract found and response dispatched).
+    pub fn is_get_response_sent(&self) -> bool {
+        matches!(self, EventKind::Get(GetEvent::ResponseSent { .. }))
+    }
+
+    /// Returns `true` if this is a GET request event.
+    pub fn is_get_request(&self) -> bool {
+        matches!(self, EventKind::Get(GetEvent::Request { .. }))
+    }
+
     /// Returns whether this is a subscribe outcome event (success or not-found).
     ///
     /// Returns `Some(true)` for `SubscribeSuccess`, `Some(false)` for `SubscribeNotFound`,
@@ -3421,6 +3534,34 @@ pub(crate) enum GetEvent {
         key: Option<ContractKey>,
         timestamp: u64,
     },
+    /// A relay peer sent a ForwardingAck to its upstream peer.
+    ///
+    /// Emitted when a relay peer forwards a GET request deeper and ACKs the upstream
+    /// to signal "I'm working on it". This prevents the upstream's GC task from treating
+    /// the relay as dead — but also disables speculative retry (#3570).
+    ForwardingAckSent {
+        id: Transaction,
+        /// The relay peer sending the ACK.
+        from: PeerKeyLocation,
+        /// The upstream peer receiving the ACK.
+        to: PeerKeyLocation,
+        instance_id: ContractInstanceId,
+        timestamp: u64,
+    },
+    /// An upstream peer received a ForwardingAck from a downstream relay.
+    ///
+    /// When received, `ack_received` is set to `true`, which prevents the GC task
+    /// from launching speculative retries. If the downstream chain then stalls,
+    /// the originator waits the full OPERATION_TTL with no recovery (#3570).
+    ForwardingAckReceived {
+        id: Transaction,
+        /// The peer that received the ACK (originator or intermediate relay).
+        receiver: PeerKeyLocation,
+        instance_id: ContractInstanceId,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
 }
 
 impl GetEvent {
@@ -3432,7 +3573,9 @@ impl GetEvent {
             GetEvent::ResponseSent { key, .. } => *key,
             GetEvent::Request { .. }
             | GetEvent::GetNotFound { .. }
-            | GetEvent::GetFailure { .. } => None,
+            | GetEvent::GetFailure { .. }
+            | GetEvent::ForwardingAckSent { .. }
+            | GetEvent::ForwardingAckReceived { .. } => None,
         }
     }
 }
