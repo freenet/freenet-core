@@ -1039,10 +1039,9 @@ impl GetOp {
                 let visited = data.visited.clone();
 
                 // Reduce HTL on each retry to avoid full-depth traversal storms (#3570).
-                // At the originator, current_hop == max_hops_to_live, so we can't use
-                // current_hop alone. Instead, halve the HTL for each retry attempt,
-                // floored at MIN_RETRY_HTL. This limits the blast radius of retries
-                // while still allowing the request to reach nearby contract holders.
+                // Halve the HTL for each retry attempt, floored at MIN_RETRY_HTL.
+                // This limits the blast radius of retries while still allowing the
+                // request to reach nearby contract holders.
                 let retry_htl = (max_hops_to_live / (data.attempts_at_hop.max(1)))
                     .max(MIN_RETRY_HTL)
                     .min(max_hops_to_live);

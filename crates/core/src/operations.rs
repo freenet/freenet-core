@@ -269,6 +269,10 @@ where
                         op_manager.completed(tx_id);
                     }
                     Err(e) => {
+                        // Return directly (bypasses the Aborted-sending error
+                        // handler at the top of this function intentionally —
+                        // we want the op to stay alive in under_progress for
+                        // GC retry, not be aborted).
                         tracing::warn!(
                             %tx_id, %target, error = %e,
                             "Response send failed — keeping op for GC retry"
