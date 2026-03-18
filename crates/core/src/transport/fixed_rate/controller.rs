@@ -1,6 +1,12 @@
 //! Fixed-rate congestion controller implementation.
+//!
+//! Maintains a constant transmission rate with a loss-pause mechanism:
+//! when packet loss or retransmission timeout is detected, the cwnd is
+//! temporarily capped at the current flightsize. This prevents new data
+//! from competing with retransmissions, breaking the congestion cascade
+//! that causes stream stalls. The cap is released after a successful ACK.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::simulation::{RealTime, TimeSource};
@@ -48,11 +54,15 @@ impl FixedRateConfig {
 
 /// Fixed-rate congestion controller.
 ///
-/// Maintains a constant transmission rate regardless of network feedback.
-/// The cwnd is set to a very large value so cwnd-based flow control never
-/// blocks; all rate limiting happens via the token bucket.
+/// Maintains a constant transmission rate with a loss-pause mechanism.
+/// When loss or timeout is detected, the cwnd is temporarily capped at
+/// the current flightsize, preventing new data from being sent until
+/// ACKs reduce the flightsize. This gives retransmissions room to
+/// succeed without competing with new data.
 ///
-/// Thread-safe via atomic operations for flightsize tracking.
+/// The pause is automatically released on the next successful ACK.
+///
+/// Thread-safe via atomic operations for flightsize and pause tracking.
 pub struct FixedRateController<T: TimeSource = RealTime> {
     /// Configured rate in bytes/sec.
     rate: usize,
@@ -60,6 +70,10 @@ pub struct FixedRateController<T: TimeSource = RealTime> {
     /// Current bytes in flight (sent but not yet ACKed).
     /// Uses saturating arithmetic to handle edge cases.
     flightsize: AtomicUsize,
+
+    /// When true, cwnd is capped at flightsize instead of usize::MAX/2.
+    /// Set on loss/timeout, cleared on successful ACK.
+    loss_pause: AtomicBool,
 
     /// Time source (for interface compatibility, not actually used).
     #[allow(dead_code)]
@@ -79,6 +93,7 @@ impl<T: TimeSource> FixedRateController<T> {
         Self {
             rate: config.rate_bytes_per_sec,
             flightsize: AtomicUsize::new(0),
+            loss_pause: AtomicBool::new(false),
             time_source,
         }
     }
@@ -90,12 +105,16 @@ impl<T: TimeSource> FixedRateController<T> {
 
     /// Called when an ACK is received with RTT sample.
     /// The RTT is ignored since we don't adapt to network conditions.
+    /// Clears the loss pause so new data can resume flowing.
     pub fn on_ack(&self, _rtt_sample: Duration, bytes_acked: usize) {
         self.on_ack_without_rtt(bytes_acked);
     }
 
     /// Called when an ACK is received for a retransmitted packet.
+    /// Clears the loss pause so new data can resume flowing.
     pub fn on_ack_without_rtt(&self, bytes_acked: usize) {
+        // Clear the loss pause — an ACK means the path is working again.
+        self.loss_pause.store(false, Ordering::Release);
         // Saturating subtraction to handle edge cases
         self.flightsize
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -105,23 +124,36 @@ impl<T: TimeSource> FixedRateController<T> {
     }
 
     /// Called when packet loss is detected.
-    /// Ignored - we don't adapt to loss.
+    /// Activates the loss pause: cwnd is capped at current flightsize
+    /// until the next successful ACK, preventing new data from competing
+    /// with retransmissions.
     pub fn on_loss(&self) {
-        // No-op: fixed rate doesn't respond to loss
+        self.loss_pause.store(true, Ordering::Release);
     }
 
     /// Called when a retransmission timeout occurs.
-    /// Ignored - we don't adapt to timeouts.
+    /// Activates the loss pause (same as on_loss).
     pub fn on_timeout(&self) {
-        // No-op: fixed rate doesn't respond to timeouts
+        self.loss_pause.store(true, Ordering::Release);
     }
 
-    /// Returns a very large cwnd so cwnd-based flow control never blocks.
-    /// All rate limiting is done by the token bucket.
+    /// Returns the effective congestion window.
+    ///
+    /// Normally returns a very large value so cwnd never blocks (all rate
+    /// limiting is done by the token bucket). When loss_pause is active,
+    /// returns the current flightsize — this prevents any new data from
+    /// being sent until ACKs reduce the flightsize, giving retransmissions
+    /// exclusive access to the link.
     pub fn current_cwnd(&self) -> usize {
-        // Use a large but not overflow-prone value
-        // This ensures flightsize + packet_size <= cwnd is always true
-        usize::MAX / 2
+        if self.loss_pause.load(Ordering::Acquire) {
+            // Cap at current flightsize: no new data until ACKs arrive.
+            // Add a small margin (one packet) so the cwnd check
+            // `flightsize + packet_size <= cwnd` can pass once an ACK
+            // frees some space.
+            self.flightsize.load(Ordering::Relaxed)
+        } else {
+            usize::MAX / 2
+        }
     }
 
     /// Returns the configured fixed rate.
@@ -231,21 +263,28 @@ mod tests {
     }
 
     #[test]
-    fn test_ignores_loss_and_timeout() {
+    fn test_loss_pause_caps_cwnd() {
         let controller = FixedRateController::new(FixedRateConfig::default());
 
         controller.on_send(1000);
         let flightsize_before = controller.flightsize();
 
-        // Loss and timeout should not affect flightsize
+        // Before loss: cwnd is large
+        assert!(controller.current_cwnd() > 1_000_000_000);
+
+        // Loss activates pause: cwnd capped at flightsize
         controller.on_loss();
         assert_eq!(controller.flightsize(), flightsize_before);
+        assert_eq!(controller.current_cwnd(), flightsize_before);
 
+        // Timeout also activates pause
         controller.on_timeout();
-        assert_eq!(controller.flightsize(), flightsize_before);
+        assert_eq!(controller.current_cwnd(), flightsize_before);
 
-        // cwnd should remain large
+        // ACK clears the pause and restores large cwnd
+        controller.on_ack(Duration::from_millis(50), 500);
         assert!(controller.current_cwnd() > 1_000_000_000);
+        assert_eq!(controller.flightsize(), 500); // 1000 - 500
     }
 
     #[test]
