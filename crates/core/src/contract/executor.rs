@@ -237,11 +237,16 @@ impl ExecutorError {
     /// Returns true if this error indicates the contract's WASM merge function
     /// ran and rejected the update (e.g., stale version). This means the contract
     /// code IS present locally — no auto-fetch is needed.
+    ///
+    /// Only matches errors created via `StdContractError::update_exec_error()`
+    /// (cause starts with "execution error:"), NOT other `Update` variants like
+    /// "missing contract parameters" where auto-fetch IS appropriate.
     pub fn is_contract_exec_rejection(&self) -> bool {
         match &self.inner {
             Either::Left(req_err) => matches!(
                 req_err.as_ref(),
-                RequestError::ContractError(StdContractError::Update { .. })
+                RequestError::ContractError(StdContractError::Update { cause, .. })
+                    if cause.starts_with("execution error")
             ),
             Either::Right(_) => false,
         }
@@ -1220,11 +1225,25 @@ mod tests {
         }
 
         #[test]
+        fn test_contract_exec_rejection_false_for_missing_parameters() {
+            // This is the "missing contract parameters" case from runtime.rs:2681
+            // where auto-fetch IS needed — must return false.
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::Update {
+                key,
+                cause: "missing contract parameters".into(),
+            });
+            assert!(
+                !err.is_contract_exec_rejection(),
+                "Missing parameters errors should NOT be recognized as exec rejections"
+            );
+        }
+
+        #[test]
         fn test_contract_exec_rejection_false_for_missing_contract() {
             let key = test_fixtures::make_contract_key();
-            let err = ExecutorError::request(StdContractError::MissingContract {
-                key: (*key.id()),
-            });
+            let err =
+                ExecutorError::request(StdContractError::MissingContract { key: (*key.id()) });
             assert!(
                 !err.is_contract_exec_rejection(),
                 "MissingContract errors should NOT be recognized as exec rejections"
