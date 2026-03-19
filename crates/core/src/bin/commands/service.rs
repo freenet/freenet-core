@@ -1286,6 +1286,9 @@ mod tests {
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
         assert!(service_content.contains("SuccessExitStatus=42"));
 
+        // Verify exit code 43 prevents restart (another instance already running)
+        assert!(service_content.contains("RestartPreventExitStatus=43"));
+
         // Verify graceful shutdown timeout is set
         assert!(service_content.contains("TimeoutStopSec=15"));
 
@@ -1328,6 +1331,9 @@ mod tests {
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
         assert!(service_content.contains("SuccessExitStatus=42"));
+
+        // Verify exit code 43 prevents restart (another instance already running)
+        assert!(service_content.contains("RestartPreventExitStatus=43"));
     }
 
     #[test]
