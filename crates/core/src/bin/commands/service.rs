@@ -184,6 +184,11 @@ fn remove_if_exists(label: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Public wrapper for use by the `uninstall` command.
+pub fn purge_data(system_mode: bool) -> Result<()> {
+    purge_data_dirs(system_mode)
+}
+
 /// Remove Freenet data, config, cache, and log directories.
 ///
 /// When `system_mode` is true on Linux, resolves directories for the service

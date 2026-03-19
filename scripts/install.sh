@@ -437,6 +437,9 @@ main() {
     echo ""
     echo "Once running, open http://127.0.0.1:7509/ to view your Freenet dashboard."
     echo ""
+    echo "To uninstall Freenet completely:"
+    echo "  freenet uninstall"
+    echo ""
     echo "For more information, visit: https://freenet.org"
 }
 
