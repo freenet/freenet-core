@@ -433,24 +433,15 @@ async fn run_network_node_with_signals(
     result
 }
 
-/// Log a warning if another freenet process is already listening on the WS API port.
-///
 /// Exit code when another freenet instance is already running.
 /// Listed in RestartPreventExitStatus and SuccessExitStatus in the systemd
 /// service file so systemd does not restart and does not count it as a failure.
 const EXIT_CODE_ALREADY_RUNNING: i32 = 43;
 
 /// Error returned when another freenet process already occupies the WS API port.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("another freenet instance is already running")]
 struct AlreadyRunningError;
-
-impl std::fmt::Display for AlreadyRunningError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("another freenet instance is already running")
-    }
-}
-
-impl std::error::Error for AlreadyRunningError {}
 
 fn check_for_existing_process(config: &Config) -> anyhow::Result<()> {
     use std::net::{SocketAddr, TcpStream};
