@@ -150,7 +150,7 @@ impl ServiceCommand {
 /// - `--purge` → true
 /// - `--keep-data` → false
 /// - Neither → prompt interactively (defaults to false if stdin is not a TTY)
-fn should_purge(purge: bool, keep_data: bool) -> Result<bool> {
+pub fn should_purge(purge: bool, keep_data: bool) -> Result<bool> {
     if purge {
         return Ok(true);
     }
@@ -182,6 +182,11 @@ fn remove_if_exists(label: &str, path: &Path) -> Result<()> {
             .with_context(|| format!("Failed to remove {label} directory: {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Public wrapper for use by the `uninstall` command.
+pub fn purge_data(system_mode: bool) -> Result<()> {
+    purge_data_dirs(system_mode)
 }
 
 /// Remove Freenet data, config, cache, and log directories.
@@ -586,19 +591,14 @@ WantedBy=multi-user.target
     )
 }
 
+/// Stop, disable, and remove the Freenet service file. Does not purge data.
+/// Returns true if a service was found and removed.
 #[cfg(target_os = "linux")]
-fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
+pub fn stop_and_remove_service(system: bool) -> Result<bool> {
     use std::fs;
 
     let system_mode = use_system_mode(system);
 
-    // Stop the service if running (best-effort, may already be stopped)
-    let _stop = systemctl(system_mode, &["stop", "freenet"]);
-
-    // Disable the service (best-effort, may already be disabled)
-    let _disable = systemctl(system_mode, &["disable", "freenet"]);
-
-    // Remove the service file
     let service_path = if system_mode {
         std::path::PathBuf::from(SYSTEM_SERVICE_PATH)
     } else {
@@ -607,16 +607,32 @@ fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
             .join(".config/systemd/user/freenet.service")
     };
 
-    if service_path.exists() {
-        fs::remove_file(&service_path).context("Failed to remove service file")?;
+    if !service_path.exists() {
+        return Ok(false);
     }
+
+    // Stop the service if running (best-effort, may already be stopped)
+    let _stop = systemctl(system_mode, &["stop", "freenet"]);
+
+    // Disable the service (best-effort, may already be disabled)
+    let _disable = systemctl(system_mode, &["disable", "freenet"]);
+
+    fs::remove_file(&service_path).context("Failed to remove service file")?;
 
     // Reload systemd (best-effort, failure is non-fatal during uninstall)
     drop(systemctl(system_mode, &["daemon-reload"]));
 
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
+    stop_and_remove_service(system)?;
+
     println!("Freenet service uninstalled.");
 
     if should_purge(purge, keep_data)? {
+        let system_mode = use_system_mode(system);
         purge_data_dirs(system_mode)?;
         println!("All Freenet data, config, and logs removed.");
     }
@@ -875,32 +891,41 @@ fn check_no_system_flag(system: bool) -> Result<()> {
     Ok(())
 }
 
+/// Stop and remove the Freenet launchd agent. Does not purge data.
+/// Returns true if a service was found and removed.
 #[cfg(target_os = "macos")]
-fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
+pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
     use std::fs;
-
-    check_no_system_flag(system)?;
 
     let plist_path = dirs::home_dir()
         .context("Failed to get home directory")?
         .join("Library/LaunchAgents/org.freenet.node.plist");
 
-    let plist_path_str = plist_path
-        .to_str()
-        .context("Plist path contains invalid UTF-8")?;
+    if !plist_path.exists() {
+        return Ok(false);
+    }
 
-    // Unload the service if loaded (ignore errors as it may not be loaded)
-    let unload_status = std::process::Command::new("launchctl")
-        .args(["unload", plist_path_str])
-        .status();
-    if let Err(e) = unload_status {
-        eprintln!("Warning: Failed to unload service: {}", e);
+    if let Some(plist_path_str) = plist_path.to_str() {
+        // Unload the service if loaded (ignore errors as it may not be loaded)
+        let unload_status = std::process::Command::new("launchctl")
+            .args(["unload", plist_path_str])
+            .status();
+        if let Err(e) = unload_status {
+            eprintln!("Warning: Failed to unload service: {}", e);
+        }
     }
 
     // Remove the plist file
-    if plist_path.exists() {
-        fs::remove_file(&plist_path).context("Failed to remove plist file")?;
-    }
+    fs::remove_file(&plist_path).context("Failed to remove plist file")?;
+
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
+    check_no_system_flag(system)?;
+
+    stop_and_remove_service(system)?;
 
     println!("Freenet service uninstalled.");
 
@@ -1095,9 +1120,19 @@ fn check_no_system_flag_windows(system: bool) -> Result<()> {
     Ok(())
 }
 
+/// Stop and remove the Freenet scheduled task. Does not purge data.
+/// Returns true if a task was found and removed.
 #[cfg(target_os = "windows")]
-fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
-    check_no_system_flag_windows(system)?;
+pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
+    // Check if task exists
+    let query = std::process::Command::new("schtasks")
+        .args(["/query", "/tn", "Freenet"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !query.map(|s| s.success()).unwrap_or(false) {
+        return Ok(false);
+    }
 
     // Stop if running
     let _ = std::process::Command::new("schtasks")
@@ -1111,8 +1146,17 @@ fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
         .context("Failed to delete scheduled task")?;
 
     if !status.success() {
-        anyhow::bail!("Failed to delete scheduled task. It may not exist or you may need Administrator privileges.");
+        anyhow::bail!("Failed to delete scheduled task. You may need Administrator privileges.");
     }
+
+    Ok(true)
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
+    check_no_system_flag_windows(system)?;
+
+    stop_and_remove_service(system)?;
 
     println!("Freenet scheduled task uninstalled.");
 
@@ -1205,6 +1249,11 @@ fn service_logs(_error_only: bool) -> Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn install_service(_system: bool) -> Result<()> {
     anyhow::bail!("Service installation is not supported on this platform")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
+    Ok(false)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
