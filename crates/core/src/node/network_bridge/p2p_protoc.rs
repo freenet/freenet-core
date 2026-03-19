@@ -415,9 +415,13 @@ struct ConnectionEntry {
 }
 
 /// Check whether a transport connection is a zombie: old enough but not
-/// promoted to ring and not pending reservation.
+/// promoted to ring, not pending reservation, and not a gateway.
 ///
-/// Two thresholds:
+/// Gateway connections are exempt below a 1-hour absolute cap because they
+/// are intentionally transient (never promoted to ring) but actively needed
+/// for routing (#3595).
+///
+/// Two thresholds for non-gateway connections:
 /// Zombie thresholds are derived from `transient_ttl` (configurable, default 30s):
 ///
 /// - `zombie_threshold` = `transient_ttl * 3`: catches connections with no pending
@@ -446,7 +450,11 @@ fn is_zombie(
     // but the node needs them for routing. Without this exemption, gateways
     // enter a zombie→prune→reconnect→zombie death spiral that breaks all
     // streaming transfers (#3595).
-    if is_gateway {
+    //
+    // The exemption is time-bounded: truly dead gateway connections (no
+    // traffic for 1 hour) are still cleaned up. The transport-level idle
+    // timeout is the primary backstop, but this ensures no permanent leaks.
+    if is_gateway && created_at_elapsed < Duration::from_secs(3600) {
         return false;
     }
     if created_at_elapsed > zombie_threshold && !has_pending {
@@ -5407,12 +5415,19 @@ mod tests {
 
     #[test]
     fn test_zombie_detection_ignores_gateway_connections() {
-        // Gateway connections are intentionally transient and should never be
-        // classified as zombies, even past the absolute threshold (#3595).
-        let elapsed = Duration::from_secs(400); // Well past absolute threshold (180s)
+        // Gateway connections are intentionally transient and should not be
+        // classified as zombies within the 1-hour gateway exemption (#3595).
+        let elapsed = Duration::from_secs(400); // Well past normal absolute threshold (180s)
         assert!(
             !super::is_zombie(elapsed, false, false, true, TEST_TRANSIENT_TTL),
-            "Gateway connection should never be zombie"
+            "Gateway connection should not be zombie within exemption window"
+        );
+
+        // But truly stale gateway connections (>1 hour) ARE cleaned up.
+        let stale = Duration::from_secs(3601);
+        assert!(
+            super::is_zombie(stale, false, false, true, TEST_TRANSIENT_TTL),
+            "Gateway connection past 1-hour cap should be zombie"
         );
     }
 
