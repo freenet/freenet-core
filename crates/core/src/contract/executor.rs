@@ -234,6 +234,19 @@ impl ExecutorError {
         matches!(self.inner, Either::Left(_))
     }
 
+    /// Returns true if this error indicates the contract's WASM merge function
+    /// ran and rejected the update (e.g., stale version). This means the contract
+    /// code IS present locally — no auto-fetch is needed.
+    pub fn is_contract_exec_rejection(&self) -> bool {
+        match &self.inner {
+            Either::Left(req_err) => matches!(
+                req_err.as_ref(),
+                RequestError::ContractError(StdContractError::Update { .. })
+            ),
+            Either::Right(_) => false,
+        }
+    }
+
     pub fn is_fatal(&self) -> bool {
         self.fatal
     }
@@ -1191,6 +1204,40 @@ mod tests {
         fn test_unwrap_request_panics_for_other_error() {
             let err = ExecutorError::other(anyhow::anyhow!("not a request"));
             let _unwrapped = err.unwrap_request(); // Should panic
+        }
+
+        #[test]
+        fn test_contract_exec_rejection_for_update_error() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                "New state version 100 must be higher than current version 100",
+            ));
+            assert!(
+                err.is_contract_exec_rejection(),
+                "Update exec errors should be recognized as contract exec rejections"
+            );
+        }
+
+        #[test]
+        fn test_contract_exec_rejection_false_for_missing_contract() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::MissingContract {
+                key: (*key.id()),
+            });
+            assert!(
+                !err.is_contract_exec_rejection(),
+                "MissingContract errors should NOT be recognized as exec rejections"
+            );
+        }
+
+        #[test]
+        fn test_contract_exec_rejection_false_for_other_error() {
+            let err = ExecutorError::other(anyhow::anyhow!("some other error"));
+            assert!(
+                !err.is_contract_exec_rejection(),
+                "Non-request errors should NOT be recognized as exec rejections"
+            );
         }
 
         #[test]
