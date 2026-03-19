@@ -415,9 +415,13 @@ struct ConnectionEntry {
 }
 
 /// Check whether a transport connection is a zombie: old enough but not
-/// promoted to ring and not pending reservation.
+/// promoted to ring, not pending reservation, and not a gateway.
 ///
-/// Two thresholds:
+/// Gateway connections are exempt below a 1-hour absolute cap because they
+/// are intentionally transient (never promoted to ring) but actively needed
+/// for routing (#3595).
+///
+/// Two thresholds for non-gateway connections:
 /// Zombie thresholds are derived from `transient_ttl` (configurable, default 30s):
 ///
 /// - `zombie_threshold` = `transient_ttl * 3`: catches connections with no pending
@@ -433,12 +437,29 @@ fn is_zombie(
     created_at_elapsed: Duration,
     in_ring: bool,
     has_pending: bool,
+    is_gateway: bool,
     transient_ttl: Duration,
 ) -> bool {
     let zombie_threshold = transient_ttl * 3;
     let absolute_zombie_threshold = transient_ttl * 6;
 
     if in_ring {
+        return false;
+    }
+    // Gateway transient connections are intentionally not promoted to ring,
+    // but the node needs them for routing. Without this exemption, gateways
+    // enter a zombie→prune→reconnect→zombie death spiral that breaks all
+    // streaming transfers (#3595).
+    //
+    // The exemption is time-bounded: truly dead gateway connections (no
+    // traffic for 1 hour) are still cleaned up. The transport-level idle
+    // timeout is the primary backstop, but this ensures no permanent leaks.
+    /// Gateway connections get a generous exemption window (1 hour) because they
+    /// are intentionally transient but needed for routing. The transport-level
+    /// idle timeout (120s keepalive) is the primary cleanup mechanism for dead
+    /// gateways; this threshold is the safety net.
+    const GATEWAY_ZOMBIE_EXEMPTION: Duration = Duration::from_secs(3600);
+    if is_gateway && created_at_elapsed < GATEWAY_ZOMBIE_EXEMPTION {
         return false;
     }
     if created_at_elapsed > zombie_threshold && !has_pending {
@@ -909,6 +930,10 @@ impl P2pConnManager {
                     .connections
                     .iter()
                     .filter(|(addr, entry)| {
+                        let is_gateway = ctx
+                            .gateways
+                            .iter()
+                            .any(|gw| gw.socket_addr() == Some(**addr));
                         is_zombie(
                             entry.created_at.elapsed(),
                             op_manager.ring.connection_manager.is_in_ring(**addr),
@@ -916,6 +941,7 @@ impl P2pConnManager {
                                 .ring
                                 .connection_manager
                                 .has_connection_or_pending(**addr),
+                            is_gateway,
                             transient_ttl,
                         )
                     })
@@ -5312,7 +5338,7 @@ mod tests {
         // Connection younger than zombie threshold (90s) should never be a zombie
         let elapsed = Duration::from_secs(60);
         assert!(
-            !super::is_zombie(elapsed, false, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(elapsed, false, false, false, TEST_TRANSIENT_TTL),
             "Young connection should not be zombie"
         );
     }
@@ -5322,7 +5348,7 @@ mod tests {
         // In-ring connection should never be a zombie regardless of age
         let elapsed = Duration::from_secs(400);
         assert!(
-            !super::is_zombie(elapsed, true, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(elapsed, true, false, false, TEST_TRANSIENT_TTL),
             "Ring connection should not be zombie"
         );
     }
@@ -5332,7 +5358,7 @@ mod tests {
         // Old connection that isn't in ring, no pending → zombie
         let elapsed = Duration::from_secs(91); // > 90s
         assert!(
-            super::is_zombie(elapsed, false, false, TEST_TRANSIENT_TTL),
+            super::is_zombie(elapsed, false, false, false, TEST_TRANSIENT_TTL),
             "Old unpromoted connection should be zombie"
         );
     }
@@ -5342,7 +5368,7 @@ mod tests {
         // Old connection not in ring, but has pending reservation → not zombie (under absolute)
         let elapsed = Duration::from_secs(120); // > 90s but < 180s
         assert!(
-            !super::is_zombie(elapsed, false, true, TEST_TRANSIENT_TTL),
+            !super::is_zombie(elapsed, false, true, false, TEST_TRANSIENT_TTL),
             "Connection with pending reservation below absolute threshold should not be zombie"
         );
     }
@@ -5353,7 +5379,7 @@ mod tests {
         // The absolute threshold (180s) overrides has_pending
         let elapsed = Duration::from_secs(181);
         assert!(
-            super::is_zombie(elapsed, false, true, TEST_TRANSIENT_TTL),
+            super::is_zombie(elapsed, false, true, false, TEST_TRANSIENT_TTL),
             "Absolute threshold should override has_pending"
         );
     }
@@ -5363,7 +5389,7 @@ mod tests {
         // Connection 181s old, in_ring=true → NOT zombie
         let elapsed = Duration::from_secs(181);
         assert!(
-            !super::is_zombie(elapsed, true, true, TEST_TRANSIENT_TTL),
+            !super::is_zombie(elapsed, true, true, false, TEST_TRANSIENT_TTL),
             "Ring connection should never be zombie even past absolute threshold"
         );
     }
@@ -5373,6 +5399,7 @@ mod tests {
         // Exactly 90s, no pending, not in ring → NOT zombie (uses > not >=)
         assert!(!super::is_zombie(
             Duration::from_secs(90),
+            false,
             false,
             false,
             TEST_TRANSIENT_TTL
@@ -5386,8 +5413,27 @@ mod tests {
             Duration::from_secs(180),
             false,
             true,
+            false,
             TEST_TRANSIENT_TTL
         ));
+    }
+
+    #[test]
+    fn test_zombie_detection_ignores_gateway_connections() {
+        // Gateway connections are intentionally transient and should not be
+        // classified as zombies within the 1-hour gateway exemption (#3595).
+        let elapsed = Duration::from_secs(400); // Well past normal absolute threshold (180s)
+        assert!(
+            !super::is_zombie(elapsed, false, false, true, TEST_TRANSIENT_TTL),
+            "Gateway connection should not be zombie within exemption window"
+        );
+
+        // But truly stale gateway connections (>1 hour) ARE cleaned up.
+        let stale = Duration::from_secs(3601);
+        assert!(
+            super::is_zombie(stale, false, false, true, TEST_TRANSIENT_TTL),
+            "Gateway connection past 1-hour cap should be zombie"
+        );
     }
 
     #[test]
@@ -5400,11 +5446,13 @@ mod tests {
             Duration::from_secs(200),
             false,
             false,
+            false,
             large_ttl
         ));
         // 400s: zombie without pending (> 360s)
         assert!(super::is_zombie(
             Duration::from_secs(400),
+            false,
             false,
             false,
             large_ttl
@@ -5414,6 +5462,7 @@ mod tests {
             Duration::from_secs(400),
             false,
             true,
+            false,
             large_ttl
         ));
         // 721s: zombie even with pending (> 720s)
@@ -5421,6 +5470,7 @@ mod tests {
             Duration::from_secs(721),
             false,
             true,
+            false,
             large_ttl
         ));
     }
