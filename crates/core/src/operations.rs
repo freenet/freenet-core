@@ -485,6 +485,13 @@ impl OpError {
             trace: StdTrace::force_capture(),
         }
     }
+
+    /// Returns true if this error indicates a contract's WASM merge function
+    /// ran and rejected the update. When true, the contract code is present
+    /// locally and auto-fetching would be unnecessary.
+    pub fn is_contract_exec_rejection(&self) -> bool {
+        matches!(self, Self::ExecutorError(e) if e.is_contract_exec_rejection())
+    }
 }
 
 impl<T> From<SendError<T>> for OpError {

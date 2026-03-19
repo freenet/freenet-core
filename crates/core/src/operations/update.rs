@@ -743,9 +743,11 @@ impl Operation for UpdateOp {
                                 {
                                     tracing::warn!(tx = %id, error = %e, "failed to send ResyncRequest");
                                 }
-                            } else {
+                            } else if !err.is_contract_exec_rejection() {
                                 // Full state update failed (not delta) — likely missing
                                 // contract parameters. Trigger a self-healing GET.
+                                // Skip if the merge function ran and rejected the update
+                                // (e.g., stale version) — the contract code is present.
                                 op_manager.try_auto_fetch_contract(key, sender_addr);
                             }
                             return Err(err);
@@ -1303,9 +1305,13 @@ impl Operation for UpdateOp {
                                 error = %err,
                                 "BroadcastToStreaming update skipped — contract not ready locally"
                             );
-                            // Self-heal: trigger a background GET to fetch the missing
-                            // contract code and parameters from the network.
-                            op_manager.try_auto_fetch_contract(key, sender_addr);
+                            if !err.is_contract_exec_rejection() {
+                                // Self-heal: trigger a background GET to fetch the missing
+                                // contract code and parameters from the network.
+                                // Skip if the merge function ran and rejected the update
+                                // (e.g., stale version) — the contract code is present.
+                                op_manager.try_auto_fetch_contract(key, sender_addr);
+                            }
                         }
                     }
 
