@@ -1541,37 +1541,68 @@ async fn process_open_request(
                         // Without WASM, the node can't validate or apply updates,
                         // leading to a "subscribed but can't update" state.
                         // Clients must PUT or GET (with return_contract_code=true) first.
-                        let has_contract = op_manager
+                        //
+                        // Note: This only guards explicit ContractRequest::Subscribe.
+                        // GET+subscribe=true and PUT+subscribe=true bypass this check
+                        // because those operations inherently fetch/provide the WASM.
+                        match op_manager
                             .notify_contract_handler(
                                 crate::contract::ContractHandlerEvent::GetQuery {
                                     instance_id: key,
                                     return_contract_code: true,
                                 },
                             )
-                            .await;
-                        let has_wasm = matches!(
-                            has_contract,
+                            .await
+                        {
                             Ok(crate::contract::ContractHandlerEvent::GetResponse {
-                                response: Ok(crate::contract::StoreResponse {
-                                    state: Some(_),
-                                    contract: Some(_),
-                                }),
+                                response:
+                                    Ok(crate::contract::StoreResponse {
+                                        state: Some(_),
+                                        contract: Some(_),
+                                    }),
                                 ..
-                            })
-                        );
-                        if !has_wasm {
-                            tracing::warn!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                contract = %key,
-                                "Rejecting SUBSCRIBE: contract WASM not cached locally. \
-                                 PUT the contract or GET with return_contract_code=true first."
-                            );
-                            return Err(Error::Node(format!(
-                                "Cannot subscribe to contract {key}: contract WASM/parameters \
-                                 not cached locally. PUT the contract or GET with \
-                                 return_contract_code=true before subscribing."
-                            )));
+                            }) => {
+                                // Contract WASM and state are cached locally, proceed
+                            }
+                            Ok(crate::contract::ContractHandlerEvent::GetResponse { .. }) => {
+                                tracing::warn!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    "Rejecting SUBSCRIBE: contract WASM not cached locally. \
+                                     PUT the contract or GET with return_contract_code=true first."
+                                );
+                                return Err(Error::Node(format!(
+                                    "Cannot subscribe to contract {key}: contract WASM/parameters \
+                                     not cached locally. PUT the contract or GET with \
+                                     return_contract_code=true before subscribing."
+                                )));
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    error = %err,
+                                    "Contract handler error while checking WASM for SUBSCRIBE"
+                                );
+                                return Err(Error::Node(format!(
+                                    "Cannot subscribe to contract {key}: \
+                                     failed to query contract store: {err}"
+                                )));
+                            }
+                            Ok(unexpected) => {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    "Unexpected contract handler response for SUBSCRIBE WASM check: {unexpected:?}"
+                                );
+                                return Err(Error::Node(format!(
+                                    "Cannot subscribe to contract {key}: \
+                                     unexpected contract handler response"
+                                )));
+                            }
                         }
 
                         let Some(subscriber_listener) = subscription_listener else {
