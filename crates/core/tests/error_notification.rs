@@ -309,6 +309,86 @@ async fn test_subscribe_failure_notifies_client(ctx: &mut TestContext) -> TestRe
     Ok(())
 }
 
+/// Subscribe without prior PUT is rejected immediately with a descriptive error.
+///
+/// When a client subscribes to a contract that hasn't been PUT or GET'd (with
+/// return_contract_code=true), the node lacks the WASM needed to validate updates.
+/// The Subscribe must be rejected fast (not after a network timeout).
+///
+/// Regression test for #3601.
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway"],
+    timeout_secs = 60,
+    startup_wait_secs = 15,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_subscribe_without_wasm_rejected(ctx: &mut TestContext) -> TestResult {
+    let gateway = ctx.gateway()?;
+    let (ws_stream, _) = connect_async(&gateway.ws_url()).await?;
+    let mut client = WebApi::start(ws_stream);
+
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = load_contract(TEST_CONTRACT, vec![42u8; 32].into())?;
+
+    // Subscribe WITHOUT prior PUT — should be rejected quickly
+    make_subscribe(&mut client, contract.key()).await?;
+
+    let start = tokio::time::Instant::now();
+    let mut got_rejection = false;
+
+    // The rejection should arrive fast (seconds, not minutes)
+    while start.elapsed() < Duration::from_secs(15) {
+        match timeout(Duration::from_secs(5), client.recv()).await {
+            Ok(Err(e)) => {
+                let err_str = format!("{e}");
+                if err_str.contains("WASM") || err_str.contains("not cached locally") {
+                    got_rejection = true;
+                    info!("Got expected WASM rejection error: {err_str}");
+                    break;
+                } else {
+                    // Any error counts as rejection (handler error, etc.)
+                    got_rejection = true;
+                    info!("Got error (not WASM-specific): {err_str}");
+                    break;
+                }
+            }
+            Ok(Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::SubscribeResponse {
+                    subscribed: false,
+                    ..
+                },
+            ))) => {
+                got_rejection = true;
+                info!("Got SubscribeResponse with subscribed=false");
+                break;
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!("Skipping unrelated response: {other}");
+            }
+            Err(_) => break, // timeout
+        }
+    }
+
+    assert!(
+        got_rejection,
+        "Subscribe without prior PUT should be rejected, but no error received within 15s"
+    );
+    // Verify it was fast (not a network timeout)
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "Rejection took too long ({:?}), should be immediate",
+        start.elapsed()
+    );
+
+    client
+        .send(ClientRequest::Disconnect { cause: None })
+        .await?;
+
+    Ok(())
+}
+
 /// Test that errors are delivered when a peer connection drops
 ///
 /// This test verifies that when a connection to a peer is lost during an operation,
