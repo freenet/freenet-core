@@ -86,8 +86,9 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
     // Check if another freenet process is already using the WS API port.
-    // This gives a clear error message instead of a generic "address in use".
-    check_for_existing_process(&config);
+    // If so, bail out immediately instead of proceeding to bind and fail.
+    // This prevents systemd restart loops when another instance is running.
+    check_for_existing_process(&config)?;
 
     let clients = serve_client_api(config.ws_api.clone())
         .await
@@ -438,16 +439,29 @@ async fn run_network_node_with_signals(
 /// If another process is there, we warn loudly so the user knows why startup will fail.
 /// The actual binding still happens in `serve_client_api` where `SO_REUSEADDR` handles
 /// TIME_WAIT sockets and the error message handles truly conflicting processes.
-fn check_for_existing_process(config: &Config) {
+/// Exit code when another freenet instance is already running.
+/// Listed in SuccessExitStatus so systemd does not restart.
+const EXIT_CODE_ALREADY_RUNNING: i32 = 43;
+
+/// Error returned when another freenet process already occupies the WS API port.
+#[derive(Debug)]
+struct AlreadyRunningError;
+
+impl std::fmt::Display for AlreadyRunningError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another freenet instance is already running")
+    }
+}
+
+impl std::error::Error for AlreadyRunningError {}
+
+fn check_for_existing_process(config: &Config) -> anyhow::Result<()> {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 
     let addr = SocketAddr::from((config.ws_api.address, config.ws_api.port));
     if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
         let pid = find_process_on_port(config.ws_api.port);
-        // Log as warn, not error — this is advisory. The bind call in
-        // serve_client_api() is the authoritative check and will produce
-        // the actual error if the port is still occupied.
         if let Some(pid) = pid {
             tracing::warn!(
                 port = config.ws_api.port,
@@ -466,7 +480,9 @@ fn check_for_existing_process(config: &Config) {
                 config.ws_api.port
             );
         }
+        return Err(AlreadyRunningError.into());
     }
+    Ok(())
 }
 
 /// Try to find the PID of the process listening on the given port.
@@ -634,6 +650,15 @@ fn main() {
             if e.downcast_ref::<UpdateNeededError>().is_some() {
                 eprintln!("Update needed, exiting for service wrapper to handle update...");
                 std::process::exit(EXIT_CODE_UPDATE_NEEDED);
+            }
+            // Another instance is already running — exit cleanly so systemd
+            // does not enter a restart loop.
+            if e.downcast_ref::<AlreadyRunningError>().is_some() {
+                eprintln!(
+                    "Another freenet instance is already running. \
+                     Exiting without error to avoid restart loop."
+                );
+                std::process::exit(EXIT_CODE_ALREADY_RUNNING);
             }
             eprintln!("Error: {e:?}");
             std::process::exit(1);

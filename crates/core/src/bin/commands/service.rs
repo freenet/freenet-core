@@ -500,6 +500,9 @@ ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet |
 # Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
 # exhaust the burst limit and permanently kill the service.
 SuccessExitStatus=42
+# Exit code 43 = another instance is already running on the port.
+# Do NOT restart — the existing instance is healthy.
+RestartPreventExitStatus=43
 
 # Logging - write to files for systems without active user journald
 # (headless servers, systems without lingering enabled, etc.)
@@ -562,6 +565,9 @@ ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet |
 # Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
 # exhaust the burst limit and permanently kill the service.
 SuccessExitStatus=42
+# Exit code 43 = another instance is already running on the port.
+# Do NOT restart — the existing instance is healthy.
+RestartPreventExitStatus=43
 
 # Logging - write to files for systems without active user journald
 StandardOutput=append:{log_dir}/freenet.log
