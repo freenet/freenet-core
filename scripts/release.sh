@@ -1269,7 +1269,7 @@ announce_to_river() {
 
     # River Official room details
     # Room Owner VK is also the room ID for riverctl
-    local ROOM_OWNER_VK="69Ht4YjZsT884MndR2uWhQYe1wb9b2x77HRq7Dgq7wYE"
+    local ROOM_OWNER_VK="4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4"
     local SIGNING_KEY_FILE="$HOME/.config/freenet-river-official/room_owner_signing_key.bin"
     local ROOMS_JSON="$HOME/.local/share/river/rooms.json"
 
