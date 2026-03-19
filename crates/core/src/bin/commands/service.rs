@@ -499,7 +499,7 @@ ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet |
 # Treat exit code 42 as success so it doesn't count against StartLimitBurst.
 # Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
 # exhaust the burst limit and permanently kill the service.
-SuccessExitStatus=42
+SuccessExitStatus=42 43
 # Exit code 43 = another instance is already running on the port.
 # Do NOT restart — the existing instance is healthy.
 RestartPreventExitStatus=43
@@ -564,7 +564,7 @@ ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet |
 # Treat exit code 42 as success so it doesn't count against StartLimitBurst.
 # Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
 # exhaust the burst limit and permanently kill the service.
-SuccessExitStatus=42
+SuccessExitStatus=42 43
 # Exit code 43 = another instance is already running on the port.
 # Do NOT restart — the existing instance is healthy.
 RestartPreventExitStatus=43
@@ -795,6 +795,9 @@ while true; do
             [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
         fi
         continue
+    elif [ $EXIT_CODE -eq 43 ]; then
+        echo "$(date): Another instance is already running, exiting cleanly" >> "$LOG"
+        exit 0
     elif [ $EXIT_CODE -eq 0 ]; then
         echo "$(date): Normal shutdown" >> "$LOG"
         exit 0
@@ -1284,7 +1287,7 @@ mod tests {
         assert!(service_content.contains("ExecStopPost="));
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
-        assert!(service_content.contains("SuccessExitStatus=42"));
+        assert!(service_content.contains("SuccessExitStatus=42 43"));
 
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
@@ -1330,7 +1333,7 @@ mod tests {
         assert!(service_content.contains("ExecStopPost="));
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
-        assert!(service_content.contains("SuccessExitStatus=42"));
+        assert!(service_content.contains("SuccessExitStatus=42 43"));
 
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));

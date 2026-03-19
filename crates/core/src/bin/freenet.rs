@@ -435,12 +435,9 @@ async fn run_network_node_with_signals(
 
 /// Log a warning if another freenet process is already listening on the WS API port.
 ///
-/// This is a best-effort check — it tries to connect to the port before we bind it.
-/// If another process is there, we warn loudly so the user knows why startup will fail.
-/// The actual binding still happens in `serve_client_api` where `SO_REUSEADDR` handles
-/// TIME_WAIT sockets and the error message handles truly conflicting processes.
 /// Exit code when another freenet instance is already running.
-/// Listed in SuccessExitStatus so systemd does not restart.
+/// Listed in RestartPreventExitStatus and SuccessExitStatus in the systemd
+/// service file so systemd does not restart and does not count it as a failure.
 const EXIT_CODE_ALREADY_RUNNING: i32 = 43;
 
 /// Error returned when another freenet process already occupies the WS API port.

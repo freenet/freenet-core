@@ -715,8 +715,13 @@ fn update_service_file(
 ) -> Result<()> {
     let content = fs::read_to_string(service_path).context("Failed to read service file")?;
 
-    // Check if the auto-update hook and SuccessExitStatus are present
-    if content.contains("ExecStopPost=") && content.contains("SuccessExitStatus=42") {
+    // Check if the service file has all required directives.
+    // RestartPreventExitStatus=43 prevents restart loops when another instance
+    // is already running (added in 0.2.5).
+    if content.contains("ExecStopPost=")
+        && content.contains("SuccessExitStatus=42")
+        && content.contains("RestartPreventExitStatus=43")
+    {
         return Ok(()); // Already up to date
     }
 
