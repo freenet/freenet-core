@@ -454,7 +454,12 @@ fn is_zombie(
     // The exemption is time-bounded: truly dead gateway connections (no
     // traffic for 1 hour) are still cleaned up. The transport-level idle
     // timeout is the primary backstop, but this ensures no permanent leaks.
-    if is_gateway && created_at_elapsed < Duration::from_secs(3600) {
+    /// Gateway connections get a generous exemption window (1 hour) because they
+    /// are intentionally transient but needed for routing. The transport-level
+    /// idle timeout (120s keepalive) is the primary cleanup mechanism for dead
+    /// gateways; this threshold is the safety net.
+    const GATEWAY_ZOMBIE_EXEMPTION: Duration = Duration::from_secs(3600);
+    if is_gateway && created_at_elapsed < GATEWAY_ZOMBIE_EXEMPTION {
         return false;
     }
     if created_at_elapsed > zombie_threshold && !has_pending {
