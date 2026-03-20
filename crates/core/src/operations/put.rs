@@ -336,14 +336,40 @@ impl Operation for PutOp {
                     // Step 1: Store contract locally (all nodes cache)
                     // put_contract returns (merged_value, state_changed) where state_changed
                     // is true if the stored state actually changed (old != new).
-                    let (merged_value, _state_changed) = put_contract(
+                    let (merged_value, _state_changed) = match put_contract(
                         op_manager,
                         key,
                         value.clone(),
                         related_contracts.clone(),
                         contract,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            // Emit put_failure telemetry so we can diagnose
+                            // why PUTs fail on the network. Without this event,
+                            // put_contract errors are invisible in telemetry.
+                            tracing::error!(
+                                tx = %id,
+                                contract = %key,
+                                error = %err,
+                                htl,
+                                is_originator,
+                                "put_contract failed"
+                            );
+                            if let Some(event) = NetEventLog::put_failure(
+                                &id,
+                                &op_manager.ring,
+                                key,
+                                OperationFailure::ContractError(err.to_string()),
+                                None,
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+                            return Err(err);
+                        }
+                    };
 
                     // Mark as hosting if not already
                     if !was_hosting {
@@ -903,14 +929,37 @@ impl Operation for PutOp {
 
                     // Step 4: Store contract locally (same as regular Request)
                     let was_hosting = op_manager.ring.is_hosting_contract(&key);
-                    let (merged_value, _state_changed) = put_contract(
+                    let (merged_value, _state_changed) = match put_contract(
                         op_manager,
                         key,
                         value.clone(),
                         related_contracts.clone(),
                         contract,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            tracing::error!(
+                                tx = %id,
+                                contract = %key,
+                                error = %err,
+                                htl,
+                                is_originator,
+                                "put_contract failed (streaming path)"
+                            );
+                            if let Some(event) = NetEventLog::put_failure(
+                                &id,
+                                &op_manager.ring,
+                                key,
+                                OperationFailure::ContractError(err.to_string()),
+                                None,
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+                            return Err(err);
+                        }
+                    };
 
                     // Mark as hosting if not already
                     if !was_hosting {
