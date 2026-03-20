@@ -141,8 +141,9 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 );
             }
 
-            if time_source.now().saturating_sub(cwnd_wait_start) >= CWND_WAIT_TIMEOUT {
-                let elapsed = time_source.now().saturating_sub(start_time);
+            let now = time_source.now();
+            if now.saturating_sub(cwnd_wait_start) >= CWND_WAIT_TIMEOUT {
+                let elapsed = now.saturating_sub(start_time);
                 tracing::warn!(
                     stream_id = %stream_id.0,
                     destination = %destination_addr,
@@ -493,8 +494,9 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 );
             }
 
-            if time_source.now().saturating_sub(cwnd_wait_start) >= CWND_WAIT_TIMEOUT {
-                let elapsed = time_source.now().saturating_sub(start_time);
+            let now = time_source.now();
+            if now.saturating_sub(cwnd_wait_start) >= CWND_WAIT_TIMEOUT {
+                let elapsed = now.saturating_sub(start_time);
                 tracing::warn!(
                     stream_id = %outbound_stream_id.0,
                     destination = %destination_addr,
