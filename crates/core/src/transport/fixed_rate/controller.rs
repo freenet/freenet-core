@@ -155,16 +155,9 @@ impl<T: TimeSource> FixedRateController<T> {
     /// exclusive access to the link.
     pub fn current_cwnd(&self) -> usize {
         if self.loss_pause.load(Ordering::Acquire) {
-            // Cap at current flightsize so no new data competes with retransmissions.
-            //
-            // Both `flightsize()` and `current_cwnd()` read the same AtomicUsize,
-            // so without a margin the cwnd check `flightsize + packet_size <= cwnd`
-            // would NEVER pass (X + positive <= X is always false). The margin
-            // allows exactly one packet through once an ACK reduces flightsize,
-            // enabling flow restart without waiting for loss_pause to clear.
-            //
-            // This is safe because the token bucket still enforces rate limiting,
-            // and sending one packet helps elicit the ACK that clears loss_pause.
+            // Cap at flightsize + margin. See LOSS_PAUSE_CWND_MARGIN for why
+            // the margin is needed (without it, cwnd == flightsize and no
+            // packet can ever pass the send check).
             self.flightsize
                 .load(Ordering::Relaxed)
                 .saturating_add(LOSS_PAUSE_CWND_MARGIN)

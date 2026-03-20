@@ -38,14 +38,8 @@ const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
 /// Maximum time to wait for congestion window space before aborting a stream transfer.
 ///
-/// When the FixedRateController's loss_pause is active and retransmission ACKs aren't
-/// arriving (dead or severely degraded connection), the cwnd wait loop would block
-/// indefinitely. This timeout ensures the sender gives up before the receiver's
-/// STREAM_INACTIVITY_TIMEOUT (30s) fires, producing a clear error instead of a
-/// mysterious "fragments stopped arriving" on the other end.
-///
-/// Set to 20s (< 30s inactivity timeout) so the sender fails first with a diagnostic
-/// message, rather than having the receiver time out with no explanation.
+/// Set to 20s, below the receiver's STREAM_INACTIVITY_TIMEOUT (30s), so the sender
+/// fails first with a diagnostic message rather than the receiver timing out silently.
 const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 // TODO: unit test
@@ -125,11 +119,6 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // In production, PeerConnection is always used in a bidirectional select! loop
         // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
         // always being polled. Tests must follow the same pattern.
-        //
-        // TIMEOUT: If cwnd space is not available within CWND_WAIT_TIMEOUT, we abort
-        // the transfer. This prevents indefinite hangs when the outbound connection
-        // degrades (e.g., NAT rebinding, sustained packet loss causing FixedRate
-        // loss_pause with exponential RTO backoff exceeding the timeout).
         let cwnd_wait_start = time_source.now();
         let mut cwnd_wait_iterations = 0;
         loop {
@@ -152,10 +141,6 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 );
             }
 
-            // Check for cwnd wait timeout. This fires when loss_pause blocks all
-            // new data and retransmission ACKs never arrive (dead connection).
-            // Use the same timeout as stream inactivity so the sender gives up
-            // before the receiver's assembly timeout fires.
             if time_source.now().saturating_sub(cwnd_wait_start) >= CWND_WAIT_TIMEOUT {
                 let elapsed = time_source.now().saturating_sub(start_time);
                 tracing::warn!(
@@ -486,8 +471,6 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         // In production, PeerConnection is always used in a bidirectional select! loop
         // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
         // always being polled. Tests must follow the same pattern.
-        //
-        // TIMEOUT: Same as send_stream — prevents indefinite hangs on dead connections.
         let cwnd_wait_start = time_source.now();
         let mut cwnd_wait_iterations = 0;
         loop {
@@ -509,7 +492,6 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 );
             }
 
-            // Check for cwnd wait timeout
             if time_source.now().saturating_sub(cwnd_wait_start) >= CWND_WAIT_TIMEOUT {
                 let elapsed = time_source.now().saturating_sub(start_time);
                 tracing::warn!(
