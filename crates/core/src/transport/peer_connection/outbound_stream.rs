@@ -36,6 +36,18 @@ pub(crate) type SerializedStream = Bytes;
 /// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
+/// Maximum time to wait for congestion window space before aborting a stream transfer.
+///
+/// When the FixedRateController's loss_pause is active and retransmission ACKs aren't
+/// arriving (dead or severely degraded connection), the cwnd wait loop would block
+/// indefinitely. This timeout ensures the sender gives up before the receiver's
+/// STREAM_INACTIVITY_TIMEOUT (30s) fires, producing a clear error instead of a
+/// mysterious "fragments stopped arriving" on the other end.
+///
+/// Set to 20s (< 30s inactivity timeout) so the sender fails first with a diagnostic
+/// message, rather than having the receiver time out with no explanation.
+const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+
 // TODO: unit test
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
 /// piped streams which start forwarding before the stream has been received.
@@ -113,6 +125,12 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // In production, PeerConnection is always used in a bidirectional select! loop
         // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
         // always being polled. Tests must follow the same pattern.
+        //
+        // TIMEOUT: If cwnd space is not available within CWND_WAIT_TIMEOUT, we abort
+        // the transfer. This prevents indefinite hangs when the outbound connection
+        // degrades (e.g., NAT rebinding, sustained packet loss causing FixedRate
+        // loss_pause with exponential RTO backoff exceeding the timeout).
+        let cwnd_wait_start = time_source.now();
         let mut cwnd_wait_iterations = 0;
         loop {
             let flightsize = congestion_controller.flightsize();
@@ -132,6 +150,41 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                     packet_size,
                     "Waiting for cwnd space (ensure recv() is being called to process ACKs)"
                 );
+            }
+
+            // Check for cwnd wait timeout. This fires when loss_pause blocks all
+            // new data and retransmission ACKs never arrive (dead connection).
+            // Use the same timeout as stream inactivity so the sender gives up
+            // before the receiver's assembly timeout fires.
+            if time_source.now().saturating_sub(cwnd_wait_start) >= CWND_WAIT_TIMEOUT {
+                let elapsed = time_source.now().saturating_sub(start_time);
+                tracing::warn!(
+                    stream_id = %stream_id.0,
+                    destination = %destination_addr,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    fragment = next_fragment_number,
+                    total_packets,
+                    elapsed_ms = elapsed.as_millis(),
+                    "cwnd wait timed out — outbound connection likely dead"
+                );
+                emit_transfer_failed(
+                    stream_id.0 as u64,
+                    destination_addr,
+                    (sent_so_far * MAX_DATA_SIZE) as u64,
+                    format!(
+                        "cwnd wait timed out after {}s (flightsize={}, cwnd={})",
+                        CWND_WAIT_TIMEOUT.as_secs(),
+                        flightsize,
+                        cwnd,
+                    ),
+                    elapsed.as_millis() as u64,
+                    TransferDirection::Send,
+                );
+                if let Some(tx) = completion_tx {
+                    let _ignored = tx.send(());
+                }
+                return Err(TransportError::ConnectionClosed(destination_addr));
             }
 
             // Exponential backoff to balance responsiveness and CPU usage
@@ -433,6 +486,9 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         // In production, PeerConnection is always used in a bidirectional select! loop
         // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
         // always being polled. Tests must follow the same pattern.
+        //
+        // TIMEOUT: Same as send_stream — prevents indefinite hangs on dead connections.
+        let cwnd_wait_start = time_source.now();
         let mut cwnd_wait_iterations = 0;
         loop {
             let flightsize = congestion_controller.flightsize();
@@ -451,6 +507,36 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                     cwnd_kb = cwnd / 1024,
                     "Waiting for cwnd space in pipe_stream"
                 );
+            }
+
+            // Check for cwnd wait timeout
+            if time_source.now().saturating_sub(cwnd_wait_start) >= CWND_WAIT_TIMEOUT {
+                let elapsed = time_source.now().saturating_sub(start_time);
+                tracing::warn!(
+                    stream_id = %outbound_stream_id.0,
+                    destination = %destination_addr,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    fragment_number,
+                    sent_so_far,
+                    total_bytes,
+                    elapsed_ms = elapsed.as_millis(),
+                    "pipe_stream cwnd wait timed out — outbound connection likely dead"
+                );
+                emit_transfer_failed(
+                    outbound_stream_id.0 as u64,
+                    destination_addr,
+                    sent_so_far,
+                    format!(
+                        "cwnd wait timed out after {}s in pipe (flightsize={}, cwnd={})",
+                        CWND_WAIT_TIMEOUT.as_secs(),
+                        flightsize,
+                        cwnd,
+                    ),
+                    elapsed.as_millis() as u64,
+                    TransferDirection::Send,
+                );
+                return Err(TransportError::ConnectionClosed(destination_addr));
             }
 
             if cwnd_wait_iterations <= 10 {

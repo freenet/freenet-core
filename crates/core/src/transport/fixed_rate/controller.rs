@@ -11,6 +11,15 @@ use std::time::Duration;
 
 use crate::simulation::{RealTime, TimeSource};
 
+/// Margin added to flightsize when returning cwnd during loss_pause.
+///
+/// Without this margin, `current_cwnd() == flightsize()` always (both read the
+/// same AtomicUsize), making the send loop check `flightsize + packet_size <= cwnd`
+/// permanently false. One standard UDP packet worth of margin allows a single
+/// new packet to be sent when an ACK frees space, which in turn elicits the ACK
+/// that clears loss_pause entirely.
+const LOSS_PAUSE_CWND_MARGIN: usize = 1500;
+
 /// Default rate: 10 Mbps in bytes/sec (10 * 1_000_000 / 8)
 ///
 /// This rate is chosen to:
@@ -146,11 +155,19 @@ impl<T: TimeSource> FixedRateController<T> {
     /// exclusive access to the link.
     pub fn current_cwnd(&self) -> usize {
         if self.loss_pause.load(Ordering::Acquire) {
-            // Cap at current flightsize: no new data until ACKs arrive.
-            // Add a small margin (one packet) so the cwnd check
-            // `flightsize + packet_size <= cwnd` can pass once an ACK
-            // frees some space.
-            self.flightsize.load(Ordering::Relaxed)
+            // Cap at current flightsize so no new data competes with retransmissions.
+            //
+            // Both `flightsize()` and `current_cwnd()` read the same AtomicUsize,
+            // so without a margin the cwnd check `flightsize + packet_size <= cwnd`
+            // would NEVER pass (X + positive <= X is always false). The margin
+            // allows exactly one packet through once an ACK reduces flightsize,
+            // enabling flow restart without waiting for loss_pause to clear.
+            //
+            // This is safe because the token bucket still enforces rate limiting,
+            // and sending one packet helps elicit the ACK that clears loss_pause.
+            self.flightsize
+                .load(Ordering::Relaxed)
+                .saturating_add(LOSS_PAUSE_CWND_MARGIN)
         } else {
             usize::MAX / 2
         }
@@ -272,19 +289,53 @@ mod tests {
         // Before loss: cwnd is large
         assert!(controller.current_cwnd() > 1_000_000_000);
 
-        // Loss activates pause: cwnd capped at flightsize
+        // Loss activates pause: cwnd capped at flightsize + margin
         controller.on_loss();
         assert_eq!(controller.flightsize(), flightsize_before);
-        assert_eq!(controller.current_cwnd(), flightsize_before);
+        assert_eq!(
+            controller.current_cwnd(),
+            flightsize_before + LOSS_PAUSE_CWND_MARGIN
+        );
 
         // Timeout also activates pause
         controller.on_timeout();
-        assert_eq!(controller.current_cwnd(), flightsize_before);
+        assert_eq!(
+            controller.current_cwnd(),
+            flightsize_before + LOSS_PAUSE_CWND_MARGIN
+        );
 
         // ACK clears the pause and restores large cwnd
         controller.on_ack(Duration::from_millis(50), 500);
         assert!(controller.current_cwnd() > 1_000_000_000);
         assert_eq!(controller.flightsize(), 500); // 1000 - 500
+    }
+
+    #[test]
+    fn test_loss_pause_margin_allows_one_packet() {
+        let controller = FixedRateController::new(FixedRateConfig::default());
+
+        controller.on_send(5000);
+        controller.on_loss();
+
+        // The cwnd check: flightsize + packet_size <= cwnd
+        // With margin: 5000 + packet_size <= 5000 + 1500
+        // A standard fragment (~1422 bytes) should fit
+        let flightsize = controller.flightsize();
+        let cwnd = controller.current_cwnd();
+        let packet_size = 1422; // Standard fragment payload
+        assert!(
+            flightsize + packet_size <= cwnd,
+            "One standard fragment should pass cwnd check during loss_pause: {} + {} <= {}",
+            flightsize,
+            packet_size,
+            cwnd
+        );
+
+        // But two packets should NOT fit (prevents burst during pause)
+        assert!(
+            flightsize + packet_size * 2 > cwnd,
+            "Two fragments should NOT pass cwnd check during loss_pause"
+        );
     }
 
     #[test]
