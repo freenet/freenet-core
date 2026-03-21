@@ -3,8 +3,10 @@
 //! Contract web apps are served inside sandboxed iframes to provide origin isolation.
 //! The local API server returns a "shell" page that holds the auth token and
 //! proxies WebSocket connections via postMessage, while the contract runs in an
-//! `<iframe sandbox="allow-scripts allow-forms">` with an opaque origin that cannot
-//! access other contracts' data.
+//! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox">`
+//! with an opaque origin that cannot access other contracts' data.
+//! `allow-popups-to-escape-sandbox` lets external links open normally; sandbox content
+//! is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
 
 use std::path::{Path, PathBuf};
 

@@ -158,6 +158,20 @@ async fn web_home(
         .unwrap_or(false);
 
     if is_sandbox {
+        // Block top-level navigation to sandbox URLs. With allow-popups-to-escape-sandbox
+        // on the iframe, a malicious contract could window.open() its own URL to escape
+        // the sandbox and gain same-origin access to the API. Sec-Fetch-Dest: iframe
+        // is set by the browser automatically and cannot be spoofed by scripts.
+        let fetch_dest = req_headers
+            .get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if fetch_dest == "document" {
+            // Top-level navigation to a sandbox URL — redirect to the shell page instead
+            let shell_url = format!("/{}/contract/web/{key}/", api_version.prefix());
+            return Ok(axum::response::Redirect::to(&shell_url).into_response());
+        }
+
         // Serve sandbox content (contract HTML + WS shim) inside the iframe.
         // No auth token or cookie — the shell page handles auth via postMessage.
         let contract_response = path_handlers::serve_sandbox_content(key, api_version).await?;
