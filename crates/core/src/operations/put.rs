@@ -205,6 +205,13 @@ impl PutOp {
                     .min(max_hops_to_live);
 
                 let payload = data.retry_payload.as_ref().unwrap();
+                // The skip_list in PutMsg::Request is a HashSet<SocketAddr>, which is
+                // more limited than GET's VisitedPeers bloom filter. We include all
+                // tried_peers so relay nodes won't route back to peers the originator
+                // already attempted. The `visited` bloom filter provides the primary
+                // defense at the originator (preventing re-selection of the same peers
+                // in `closest_to_location`), but it can't be serialized into the
+                // skip_list since bloom filters aren't convertible to address sets.
                 let skip_list = data.tried_peers.clone();
 
                 // Retry always uses non-streaming PutMsg::Request, even if the
@@ -232,12 +239,30 @@ impl PutOp {
         }
     }
 
-    /// Handle aborted connections by failing the operation immediately.
+    /// Handle aborted connections.
     ///
-    /// When the connection drops, we notify the client of the failure.
+    /// If speculative retry paths are in flight, the abort of the original path
+    /// is non-terminal — we log and return Ok, letting the speculative path
+    /// deliver the result (or the GC task will timeout if all paths fail).
+    ///
+    /// If no speculative paths remain, we fail immediately and notify the client.
     /// Retry with alternative peers is handled by the GC task's speculative
     /// retry mechanism (see `retry_with_next_alternative`).
     pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
+        if self.speculative_paths > 0 {
+            tracing::warn!(
+                tx = %self.id,
+                speculative_paths = self.speculative_paths,
+                "Put operation original path aborted, but {} speculative path(s) still active — \
+                 not failing the operation",
+                self.speculative_paths
+            );
+            // Mark completed so GC doesn't re-process this operation entry,
+            // but don't notify the client — the speculative path will do that.
+            op_manager.completed(self.id);
+            return Ok(());
+        }
+
         tracing::warn!(
             tx = %self.id,
             "Put operation aborted due to connection failure"
@@ -651,6 +676,13 @@ impl Operation for PutOp {
                         // Send ForwardingAck upstream before forwarding (fire-and-forget).
                         // Tells the upstream "I received the data, processing it" so the
                         // GC task can distinguish dead peers from slow multi-hop chains.
+                        //
+                        // The ACK is sent before the actual forward (SendAndContinue) completes
+                        // because the forward happens outside process_message. This is intentional
+                        // and matches GET's pattern (get.rs ForwardingAck). The ACK is advisory
+                        // ("I'm processing this request") not a delivery guarantee ("I successfully
+                        // forwarded it"). If the forward subsequently fails, the GC task's timeout
+                        // will catch it.
                         if let Some(upstream) = upstream_addr {
                             let ack = NetMessage::from(PutMsg::ForwardingAck {
                                 id,
