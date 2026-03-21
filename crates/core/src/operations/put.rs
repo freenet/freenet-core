@@ -18,12 +18,6 @@ use super::{
     OperationResult, VisitedPeers,
 };
 
-/// Maximum number of retry rounds when all alternatives at the current hop are exhausted.
-const MAX_RETRIES: usize = 10;
-
-/// Maximum number of alternative peers to try at each hop level before re-routing.
-const DEFAULT_MAX_BREADTH: usize = 3;
-
 /// Minimum HTL to use when retrying — prevents retries from being too shallow.
 const MIN_RETRY_HTL: usize = 3;
 use crate::node::IsOperationCompleted;
@@ -232,8 +226,8 @@ impl PutOp {
                 self.state = Some(PutState::AwaitingResponse(data));
                 Ok((self, msg))
             }
-            other => {
-                self.state = Some(other);
+            state @ (PutState::PrepareRequest(_) | PutState::Finished(_)) => {
+                self.state = Some(state);
                 Err(Box::new(self))
             }
         }
@@ -583,11 +577,7 @@ impl Operation for PutOp {
 
                         // Clone merged_value before it's moved into the streaming payload,
                         // so the originator can retain it for retry.
-                        let merged_value_for_retry = if is_originator {
-                            Some(merged_value.clone())
-                        } else {
-                            None
-                        };
+                        let merged_value_for_retry = is_originator.then(|| merged_value.clone());
 
                         // Check if we should use streaming for the forward
                         let payload = PutStreamingPayload {
@@ -645,7 +635,7 @@ impl Operation for PutOp {
                             next_hop: Some(next_addr),
                             current_htl: htl,
                             contract_key: key,
-                            retries: 0,
+
                             tried_peers: {
                                 let mut s = HashSet::new();
                                 s.insert(next_addr);
@@ -657,15 +647,11 @@ impl Operation for PutOp {
                             // Originator retains merged payload for retry; relay peers don't need it.
                             // Uses merged_value (post put_contract) not the original input value,
                             // so retries propagate the same state as the primary path.
-                            retry_payload: if let Some(val) = merged_value_for_retry {
-                                Some(PutRetryPayload {
-                                    contract: contract.clone(),
-                                    related_contracts: related_contracts.clone(),
-                                    value: val,
-                                })
-                            } else {
-                                None
-                            },
+                            retry_payload: merged_value_for_retry.map(|val| PutRetryPayload {
+                                contract: contract.clone(),
+                                related_contracts: related_contracts.clone(),
+                                value: val,
+                            }),
                         }));
 
                         stats = Some(PutStats {
@@ -1189,7 +1175,7 @@ impl Operation for PutOp {
                             next_hop: Some(next_addr),
                             current_htl: htl,
                             contract_key: key,
-                            retries: 0,
+
                             tried_peers: {
                                 let mut s = HashSet::new();
                                 s.insert(next_addr);
@@ -1262,7 +1248,7 @@ impl Operation for PutOp {
                             next_hop: Some(next_addr),
                             current_htl: htl,
                             contract_key: key,
-                            retries: 0,
+
                             tried_peers: {
                                 let mut s = HashSet::new();
                                 s.insert(next_addr);
@@ -1643,7 +1629,7 @@ impl PrepareRequestData {
             next_hop,
             current_htl: self.htl,
             contract_key,
-            retries: 0,
+
             tried_peers,
             alternatives,
             attempts_at_hop: 1,
@@ -1666,8 +1652,6 @@ pub struct AwaitingResponseData {
     pub current_htl: usize,
     /// Contract key for retry routing.
     pub contract_key: ContractKey,
-    /// Number of retry rounds completed (up to MAX_RETRIES).
-    pub retries: usize,
     /// Peers already tried at this hop level.
     pub tried_peers: HashSet<std::net::SocketAddr>,
     /// Fallback peers at the current hop, ranked by proximity.
@@ -1712,6 +1696,7 @@ pub struct FinishedData {
 /// - Originator: PrepareRequest → AwaitingResponse → Finished
 /// - Forwarder: ReceivedRequest → stores → sends Response → done
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum PutState {
     /// Local originator preparing to send initial request.
     PrepareRequest(PrepareRequestData),
@@ -1777,7 +1762,7 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
             next_hop: None,
             current_htl: htl,
             contract_key: key,
-            retries: 0,
+
             tried_peers: HashSet::new(),
             alternatives: vec![],
             attempts_at_hop: 1,
@@ -2058,7 +2043,7 @@ mod tests {
             next_hop: None,
             current_htl: 10,
             contract_key: make_contract_key(0),
-            retries: 0,
+
             tried_peers: HashSet::new(),
             alternatives: vec![],
             attempts_at_hop: 1,
@@ -2100,7 +2085,7 @@ mod tests {
             next_hop: None,
             current_htl: 10,
             contract_key: make_contract_key(0),
-            retries: 0,
+
             tried_peers: HashSet::new(),
             alternatives: vec![],
             attempts_at_hop: 1,
@@ -2144,7 +2129,7 @@ mod tests {
             next_hop: None,
             current_htl: 10,
             contract_key: make_contract_key(0),
-            retries: 0,
+
             tried_peers: HashSet::new(),
             alternatives: vec![],
             attempts_at_hop: 1,
@@ -2301,7 +2286,7 @@ mod tests {
                 next_hop: None,
                 current_htl: 10,
                 contract_key: make_contract_key(0),
-                retries: 0,
+
                 tried_peers: HashSet::new(),
                 alternatives: vec![],
                 attempts_at_hop: 1,
@@ -2343,7 +2328,7 @@ mod tests {
             next_hop: None,
             current_htl: 10,
             contract_key: make_contract_key(0),
-            retries: 0,
+
             tried_peers: HashSet::new(),
             alternatives: vec![],
             attempts_at_hop: 1,
@@ -2464,7 +2449,7 @@ mod tests {
             next_hop: None,
             current_htl: 9,
             contract_key: make_contract_key(0),
-            retries: 0,
+
             tried_peers: HashSet::new(),
             alternatives: vec![],
             attempts_at_hop: 1,
@@ -2566,7 +2551,7 @@ mod tests {
                 next_hop: None,
                 current_htl: 7,
                 contract_key: make_contract_key(0),
-                retries: 0,
+
                 tried_peers,
                 alternatives,
                 attempts_at_hop: 1,
