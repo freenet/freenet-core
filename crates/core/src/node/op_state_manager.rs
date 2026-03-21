@@ -1722,9 +1722,11 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 processing = MAX_SUBSCRIBE_RETRIES_PER_TICK,
                                 "Capping subscribe retries per tick"
                             );
-                            // Shuffle to prevent DashMap iteration order from starving
-                            // some candidates when we can only process a subset per tick.
-                            crate::config::GlobalRng::shuffle(&mut retry_candidates);
+                            // Sort by age (oldest first) to guarantee fairness:
+                            // shuffle would cause probabilistic starvation when
+                            // candidates consistently exceed the per-tick cap.
+                            retry_candidates
+                                .sort_by(|a, b| b.elapsed().cmp(&a.elapsed()));
                         }
 
                         for tx in retry_candidates.into_iter().take(MAX_SUBSCRIBE_RETRIES_PER_TICK) {
