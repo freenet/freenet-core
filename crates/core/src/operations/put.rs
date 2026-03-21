@@ -363,7 +363,7 @@ impl Operation for PutOp {
                                 &op_manager.ring,
                                 key,
                                 OperationFailure::ContractError(err.to_string()),
-                                None,
+                                Some(op_manager.ring.max_hops_to_live.saturating_sub(htl)),
                             ) {
                                 op_manager.ring.register_events(Either::Left(event)).await;
                             }
@@ -953,7 +953,7 @@ impl Operation for PutOp {
                                 &op_manager.ring,
                                 key,
                                 OperationFailure::ContractError(err.to_string()),
-                                None,
+                                Some(op_manager.ring.max_hops_to_live.saturating_sub(htl)),
                             ) {
                                 op_manager.ring.register_events(Either::Left(event)).await;
                             }
