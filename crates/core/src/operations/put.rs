@@ -15,8 +15,17 @@ use freenet_stdlib::{
 
 use super::{
     put, should_use_streaming, OpEnum, OpError, OpInitialization, OpOutcome, Operation,
-    OperationResult,
+    OperationResult, VisitedPeers,
 };
+
+/// Maximum number of retry rounds when all alternatives at the current hop are exhausted.
+const MAX_RETRIES: usize = 10;
+
+/// Maximum number of alternative peers to try at each hop level before re-routing.
+const DEFAULT_MAX_BREADTH: usize = 3;
+
+/// Minimum HTL to use when retrying — prevents retries from being too shallow.
+const MIN_RETRY_HTL: usize = 3;
 use crate::node::IsOperationCompleted;
 use crate::transport::peer_connection::StreamId;
 use crate::{
@@ -43,6 +52,12 @@ pub(crate) struct PutOp {
     upstream_addr: Option<std::net::SocketAddr>,
     /// Routing stats for reporting outcomes to the router.
     stats: Option<PutStats>,
+    /// True when a downstream relay has acknowledged forwarding this request.
+    /// Used by the GC task to distinguish "peer is dead" from "peer is working on it".
+    pub(crate) ack_received: bool,
+    /// Number of speculative parallel paths launched by the originator's GC task.
+    /// Capped at MAX_SPECULATIVE_PATHS to bound network overhead.
+    pub(crate) speculative_paths: u8,
 }
 
 impl PutOp {
@@ -112,6 +127,106 @@ impl PutOp {
         match &self.state {
             Some(PutState::AwaitingResponse(data)) => Some(data.current_htl),
             _ => None,
+        }
+    }
+
+    /// Try the next alternative peer for a timed-out PUT operation.
+    ///
+    /// Returns `Ok((new_op, msg))` with the re-routed operation and message to send,
+    /// or `Err(self)` if no alternatives remain.
+    /// Try the next alternative peer for a timed-out PUT operation.
+    ///
+    /// Returns `Ok((new_op, msg))` with the re-routed operation and message to send,
+    /// or `Err(self)` if no alternatives remain or no retry payload is available.
+    ///
+    /// Follows the same pattern as `GetOp::retry_with_next_alternative`:
+    /// 1. Inject fallback peers if local alternatives exhausted
+    /// 2. Pick next alternative, mark in tried_peers + bloom filter
+    /// 3. Reduce HTL on each retry to limit blast radius
+    /// 4. Build a new PutMsg::Request from the retained payload
+    pub(crate) fn retry_with_next_alternative(
+        mut self,
+        max_hops_to_live: usize,
+        fallback_peers: &[PeerKeyLocation],
+    ) -> Result<(PutOp, PutMsg), Box<PutOp>> {
+        let state = match self.state.take() {
+            Some(s) => s,
+            None => return Err(Box::new(self)),
+        };
+        match state {
+            PutState::AwaitingResponse(mut data) => {
+                // Can't retry without the contract data
+                if data.retry_payload.is_none() {
+                    self.state = Some(PutState::AwaitingResponse(data));
+                    return Err(Box::new(self));
+                }
+
+                // If local alternatives exhausted, inject fallback peers we haven't tried.
+                if data.alternatives.is_empty() && !fallback_peers.is_empty() {
+                    for peer in fallback_peers {
+                        if let Some(addr) = peer.socket_addr() {
+                            if !data.tried_peers.contains(&addr)
+                                && !data.visited.probably_visited(addr)
+                            {
+                                data.alternatives.push(peer.clone());
+                            }
+                        }
+                    }
+                    if !data.alternatives.is_empty() {
+                        tracing::info!(
+                            tx = %self.id,
+                            contract = %data.contract_key,
+                            new_candidates = data.alternatives.len(),
+                            "PUT broadening search to all connected peers (DBF fallback)"
+                        );
+                    }
+                }
+
+                if data.alternatives.is_empty() {
+                    self.state = Some(PutState::AwaitingResponse(data));
+                    return Err(Box::new(self));
+                }
+
+                let next_target = data.alternatives.remove(0);
+                let contract_key = data.contract_key;
+                if let Some(addr) = next_target.socket_addr() {
+                    data.tried_peers.insert(addr);
+                    data.visited.mark_visited(addr);
+                }
+                tracing::info!(
+                    tx = %self.id,
+                    contract = %contract_key,
+                    target = %next_target,
+                    remaining_alternatives = data.alternatives.len(),
+                    "PUT retrying with alternative peer after timeout"
+                );
+                data.next_hop = next_target.socket_addr();
+                data.attempts_at_hop += 1;
+
+                // Reduce HTL on each retry to avoid full-depth traversal storms.
+                let retry_htl = (max_hops_to_live / (data.attempts_at_hop.max(1)))
+                    .max(MIN_RETRY_HTL)
+                    .min(max_hops_to_live);
+
+                let payload = data.retry_payload.as_ref().unwrap();
+                let skip_list = data.tried_peers.clone();
+
+                let msg = PutMsg::Request {
+                    id: self.id,
+                    contract: payload.contract.clone(),
+                    related_contracts: payload.related_contracts.clone(),
+                    value: payload.value.clone(),
+                    htl: retry_htl,
+                    skip_list,
+                };
+
+                self.state = Some(PutState::AwaitingResponse(data));
+                Ok((self, msg))
+            }
+            other => {
+                self.state = Some(other);
+                Err(Box::new(self))
+            }
         }
     }
 
@@ -255,6 +370,8 @@ impl Operation for PutOp {
                         id: tx,
                         upstream_addr: source_addr, // Remember who to send response to
                         stats: None,
+                        ack_received: false,
+                        speculative_paths: 0,
                     },
                     source_addr,
                 })
@@ -489,12 +606,44 @@ impl Operation for PutOp {
                             blocking_subscribe,
                             next_hop: Some(next_addr),
                             current_htl: htl,
+                            contract_key: key,
+                            retries: 0,
+                            tried_peers: {
+                                let mut s = HashSet::new();
+                                s.insert(next_addr);
+                                s
+                            },
+                            alternatives: vec![],
+                            attempts_at_hop: 1,
+                            visited: VisitedPeers::default(),
+                            // Originator retains payload for retry; relay peers don't need it
+                            retry_payload: if is_originator {
+                                Some(PutRetryPayload {
+                                    contract: contract.clone(),
+                                    related_contracts: related_contracts.clone(),
+                                    value: value.clone(),
+                                })
+                            } else {
+                                None
+                            },
                         }));
 
                         stats = Some(PutStats {
                             target_peer: PeerKeyLocation::from(next_peer.clone()),
                             contract_location: Location::from(&key),
                         });
+
+                        // Send ForwardingAck upstream before forwarding (fire-and-forget).
+                        // Tells the upstream "I received the data, processing it" so the
+                        // GC task can distinguish dead peers from slow multi-hop chains.
+                        if let Some(upstream) = upstream_addr {
+                            let ack = NetMessage::from(PutMsg::ForwardingAck {
+                                id,
+                                contract_key: key,
+                            });
+                            drop(conn_manager.send(upstream, ack).await);
+                        }
+
                         Ok(OperationResult::SendAndContinue {
                             msg: NetMessage::from(forward_msg),
                             next_hop: Some(next_addr),
@@ -503,6 +652,8 @@ impl Operation for PutOp {
                                 state: new_state,
                                 upstream_addr,
                                 stats,
+                                ack_received: false,
+                                speculative_paths: 0,
                             }),
                             stream_data,
                         })
@@ -550,6 +701,8 @@ impl Operation for PutOp {
                                 state: Some(PutState::Finished(FinishedData { key })),
                                 upstream_addr: None,
                                 stats,
+                                ack_received: false,
+                                speculative_paths: 0,
                             })))
                         } else {
                             // Non-originator target peer - emit put_success for convergence checking
@@ -639,6 +792,8 @@ impl Operation for PutOp {
                             state: Some(PutState::Finished(FinishedData { key: *key })),
                             upstream_addr: None,
                             stats,
+                            ack_received: false,
+                            speculative_paths: 0,
                         })))
                     } else {
                         // Forward response to our upstream
@@ -716,6 +871,8 @@ impl Operation for PutOp {
                                             state: self.state,
                                             upstream_addr,
                                             stats,
+                                            ack_received: false,
+                                            speculative_paths: 0,
                                         }),
                                     )
                                     .await
@@ -742,6 +899,8 @@ impl Operation for PutOp {
                                             state: self.state,
                                             upstream_addr,
                                             stats,
+                                            ack_received: false,
+                                            speculative_paths: 0,
                                         }),
                                     )
                                     .await
@@ -819,6 +978,15 @@ impl Operation for PutOp {
                                     None
                                 }
                             };
+                            // Send ForwardingAck upstream before piping (fire-and-forget).
+                            if let Some(upstream) = upstream_addr {
+                                let ack = NetMessage::from(PutMsg::ForwardingAck {
+                                    id,
+                                    contract_key: *contract_key,
+                                });
+                                drop(conn_manager.send(upstream, ack).await);
+                            }
+
                             conn_manager.send(next_addr, pipe_metadata_net).await?;
 
                             // Start piping (runs asynchronously in background)
@@ -970,6 +1138,17 @@ impl Operation for PutOp {
                             blocking_subscribe: false,
                             next_hop: Some(next_addr),
                             current_htl: htl,
+                            contract_key: key,
+                            retries: 0,
+                            tried_peers: {
+                                let mut s = HashSet::new();
+                                s.insert(next_addr);
+                                s
+                            },
+                            alternatives: vec![],
+                            attempts_at_hop: 1,
+                            visited: VisitedPeers::default(),
+                            retry_payload: None,
                         }));
 
                         stats = Some(PutStats {
@@ -987,6 +1166,8 @@ impl Operation for PutOp {
                             state: new_state,
                             upstream_addr,
                             stats,
+                            ack_received: false,
+                            speculative_paths: 0,
                         })))
                     } else if let Some(next_peer) = next_peer_known {
                         // Next hop exists but piping didn't start (streaming not appropriate for size)
@@ -1030,12 +1211,33 @@ impl Operation for PutOp {
                             blocking_subscribe: false,
                             next_hop: Some(next_addr),
                             current_htl: htl,
+                            contract_key: key,
+                            retries: 0,
+                            tried_peers: {
+                                let mut s = HashSet::new();
+                                s.insert(next_addr);
+                                s
+                            },
+                            alternatives: vec![],
+                            attempts_at_hop: 1,
+                            visited: VisitedPeers::default(),
+                            retry_payload: None,
                         }));
 
                         stats = Some(PutStats {
                             target_peer: PeerKeyLocation::from(next_peer.clone()),
                             contract_location: Location::from(&key),
                         });
+
+                        // Send ForwardingAck upstream before forwarding (fire-and-forget).
+                        if let Some(upstream) = upstream_addr {
+                            let ack = NetMessage::from(PutMsg::ForwardingAck {
+                                id,
+                                contract_key: key,
+                            });
+                            drop(conn_manager.send(upstream, ack).await);
+                        }
+
                         Ok(OperationResult::SendAndContinue {
                             msg: NetMessage::from(forward_msg),
                             next_hop: Some(next_addr),
@@ -1044,6 +1246,8 @@ impl Operation for PutOp {
                                 state: new_state,
                                 upstream_addr,
                                 stats,
+                                ack_received: false,
+                                speculative_paths: 0,
                             }),
                             stream_data: None,
                         })
@@ -1087,6 +1291,8 @@ impl Operation for PutOp {
                                 state: Some(PutState::Finished(FinishedData { key })),
                                 upstream_addr: None,
                                 stats,
+                                ack_received: false,
+                                speculative_paths: 0,
                             })))
                         } else {
                             // Send ResponseStreaming back to upstream
@@ -1178,6 +1384,8 @@ impl Operation for PutOp {
                             state: Some(PutState::Finished(FinishedData { key: *key })),
                             upstream_addr: None,
                             stats,
+                            ack_received: false,
+                            speculative_paths: 0,
                         })))
                     } else {
                         // Forward response to upstream
@@ -1201,6 +1409,26 @@ impl Operation for PutOp {
                             stream_data: None,
                         })
                     }
+                }
+
+                PutMsg::ForwardingAck { id, contract_key } => {
+                    // A downstream relay acknowledged forwarding our PUT request.
+                    // Mark the operation so the GC task knows the peer is alive.
+                    tracing::debug!(
+                        tx = %id,
+                        contract = %contract_key,
+                        phase = "ack",
+                        "Received ForwardingAck from downstream"
+                    );
+                    // Continue waiting for the actual Response
+                    Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
+                        id: *id,
+                        state: self.state,
+                        upstream_addr,
+                        stats,
+                        ack_received: true,
+                        speculative_paths: self.speculative_paths,
+                    })))
                 }
             }
         })
@@ -1273,6 +1501,8 @@ pub(crate) fn start_op(
         state,
         upstream_addr: None, // Local operation, no upstream peer
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     }
 }
 
@@ -1304,6 +1534,8 @@ pub(crate) fn start_op_with_id(
         state,
         upstream_addr: None, // Local operation, no upstream peer
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     }
 }
 
@@ -1347,12 +1579,26 @@ impl PrepareRequestData {
     pub fn into_awaiting_response(
         self,
         next_hop: Option<std::net::SocketAddr>,
+        contract_key: ContractKey,
+        alternatives: Vec<PeerKeyLocation>,
+        visited: VisitedPeers,
     ) -> AwaitingResponseData {
+        let mut tried_peers = HashSet::new();
+        if let Some(addr) = next_hop {
+            tried_peers.insert(addr);
+        }
         AwaitingResponseData {
             subscribe: self.subscribe,
             blocking_subscribe: self.blocking_subscribe,
             next_hop,
             current_htl: self.htl,
+            contract_key,
+            retries: 0,
+            tried_peers,
+            alternatives,
+            attempts_at_hop: 1,
+            visited,
+            retry_payload: None,
         }
     }
 }
@@ -1368,6 +1614,29 @@ pub struct AwaitingResponseData {
     pub next_hop: Option<std::net::SocketAddr>,
     /// Current HTL (remaining hops) for hop_count calculation.
     pub current_htl: usize,
+    /// Contract key for retry routing.
+    pub contract_key: ContractKey,
+    /// Number of retry rounds completed (up to MAX_RETRIES).
+    pub retries: usize,
+    /// Peers already tried at this hop level.
+    pub tried_peers: HashSet<std::net::SocketAddr>,
+    /// Fallback peers at the current hop, ranked by proximity.
+    pub alternatives: Vec<PeerKeyLocation>,
+    /// How many peers have been tried at this hop (for HTL reduction on retry).
+    pub attempts_at_hop: usize,
+    /// Bloom filter tracking peers visited across all hops (prevents re-routing).
+    pub visited: VisitedPeers,
+    /// Retained contract data for retry (originator only).
+    /// None for relay peers since they don't need to retry with the full payload.
+    pub retry_payload: Option<PutRetryPayload>,
+}
+
+/// Contract data retained by the originator for retry.
+#[derive(Debug, Clone)]
+pub struct PutRetryPayload {
+    pub contract: ContractContainer,
+    pub related_contracts: RelatedContracts<'static>,
+    pub value: WrappedState,
 }
 
 impl AwaitingResponseData {
@@ -1457,9 +1726,18 @@ pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result
             blocking_subscribe,
             next_hop: None,
             current_htl: htl,
+            contract_key: key,
+            retries: 0,
+            tried_peers: HashSet::new(),
+            alternatives: vec![],
+            attempts_at_hop: 1,
+            visited: VisitedPeers::default(),
+            retry_payload: None,
         })),
         upstream_addr: None,
         stats: None,
+        ack_received: false,
+        speculative_paths: 0,
     };
 
     // Send through the operation processing pipeline
@@ -1599,6 +1877,15 @@ mod messages {
             /// Whether the receiving node should continue forwarding to other peers
             continue_forwarding: bool,
         },
+
+        /// Lightweight ACK sent by a relay peer back to its upstream when it forwards
+        /// a PUT request to the next hop. Tells the upstream "I received the data and
+        /// am processing it" so the GC task can distinguish dead peers from slow
+        /// multi-hop chains. Fire-and-forget — no response expected.
+        ForwardingAck {
+            id: Transaction,
+            contract_key: ContractKey,
+        },
     }
 
     impl InnerMessage for PutMsg {
@@ -1607,7 +1894,8 @@ mod messages {
                 Self::Request { id, .. }
                 | Self::Response { id, .. }
                 | Self::RequestStreaming { id, .. }
-                | Self::ResponseStreaming { id, .. } => id,
+                | Self::ResponseStreaming { id, .. }
+                | Self::ForwardingAck { id, .. } => id,
             }
         }
 
@@ -1619,6 +1907,9 @@ mod messages {
                     Some(Location::from(contract_key.id()))
                 }
                 Self::ResponseStreaming { key, .. } => Some(Location::from(key.id())),
+                Self::ForwardingAck { contract_key, .. } => {
+                    Some(Location::from(contract_key.id()))
+                }
             }
         }
     }
@@ -1665,6 +1956,13 @@ mod messages {
                         id, key, continue_forwarding
                     )
                 }
+                Self::ForwardingAck { id, contract_key } => {
+                    write!(
+                        f,
+                        "PutForwardingAck(id: {}, key: {})",
+                        id, contract_key
+                    )
+                }
             }
         }
     }
@@ -1682,6 +1980,8 @@ mod tests {
             state,
             upstream_addr: None,
             stats: None,
+            ack_received: false,
+            speculative_paths: 0,
         }
     }
 
@@ -1713,6 +2013,13 @@ mod tests {
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
+            contract_key: make_contract_key(0),
+            retries: 0,
+            tried_peers: HashSet::new(),
+            alternatives: vec![],
+            attempts_at_hop: 1,
+            visited: VisitedPeers::default(),
+            retry_payload: None,
         })));
         assert!(
             !op.finalized(),
@@ -1748,6 +2055,13 @@ mod tests {
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
+            contract_key: make_contract_key(0),
+            retries: 0,
+            tried_peers: HashSet::new(),
+            alternatives: vec![],
+            attempts_at_hop: 1,
+            visited: VisitedPeers::default(),
+            retry_payload: None,
         })));
         let result = op.to_host_result();
         assert!(
@@ -1785,6 +2099,13 @@ mod tests {
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
+            contract_key: make_contract_key(0),
+            retries: 0,
+            tried_peers: HashSet::new(),
+            alternatives: vec![],
+            attempts_at_hop: 1,
+            visited: VisitedPeers::default(),
+            retry_payload: None,
         })));
         assert!(
             !op.is_completed(),
@@ -1884,6 +2205,8 @@ mod tests {
                 target_peer: target_peer.clone(),
                 contract_location,
             }),
+            ack_received: false,
+            speculative_paths: 0,
         };
         match op.outcome() {
             OpOutcome::ContractOpSuccessUntimed {
@@ -1913,6 +2236,8 @@ mod tests {
             })),
             upstream_addr: None,
             stats: None,
+            ack_received: false,
+            speculative_paths: 0,
         };
         assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
     }
@@ -1931,12 +2256,21 @@ mod tests {
                 blocking_subscribe: false,
                 next_hop: None,
                 current_htl: 10,
+                contract_key: make_contract_key(0),
+                retries: 0,
+                tried_peers: HashSet::new(),
+                alternatives: vec![],
+                attempts_at_hop: 1,
+                visited: VisitedPeers::default(),
+                retry_payload: None,
             })),
             upstream_addr: None,
             stats: Some(PutStats {
                 target_peer: target_peer.clone(),
                 contract_location,
             }),
+            ack_received: false,
+            speculative_paths: 0,
         };
         match op.outcome() {
             OpOutcome::ContractOpFailure {
@@ -1964,6 +2298,13 @@ mod tests {
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 10,
+            contract_key: make_contract_key(0),
+            retries: 0,
+            tried_peers: HashSet::new(),
+            alternatives: vec![],
+            attempts_at_hop: 1,
+            visited: VisitedPeers::default(),
+            retry_payload: None,
         })));
         assert!(matches!(op.outcome(), OpOutcome::Incomplete));
     }
@@ -1982,6 +2323,8 @@ mod tests {
                 target_peer: target_peer.clone(),
                 contract_location,
             }),
+            ack_received: false,
+            speculative_paths: 0,
         };
         let info = op.failure_routing_info().expect("should have routing info");
         assert_eq!(info.0, target_peer);
@@ -2060,6 +2403,8 @@ mod tests {
             })),
             upstream_addr: None,
             stats: None,
+            ack_received: false,
+            speculative_paths: 0,
         };
         assert!(matches!(op.outcome(), OpOutcome::Incomplete));
         assert!(op.failure_routing_info().is_none());
@@ -2074,6 +2419,13 @@ mod tests {
             blocking_subscribe: false,
             next_hop: None,
             current_htl: 9,
+            contract_key: make_contract_key(0),
+            retries: 0,
+            tried_peers: HashSet::new(),
+            alternatives: vec![],
+            attempts_at_hop: 1,
+            visited: VisitedPeers::default(),
+            retry_payload: None,
         }));
         // Not finalized yet, but has stats → failure
         match op.outcome() {
@@ -2119,6 +2471,8 @@ mod tests {
             state: None,
             upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
             stats: None,
+            ack_received: false,
+            speculative_paths: 0,
         };
         // state=None → finalized, stats=None → Irrelevant
         assert!(op.finalized());
@@ -2138,6 +2492,8 @@ mod tests {
             state: None,
             upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
             stats: None,
+            ack_received: false,
+            speculative_paths: 0,
         };
         assert!(!op.is_client_initiated());
     }
