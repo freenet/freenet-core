@@ -3997,7 +3997,9 @@ pub mod mock_transport {
     /// Uses a simple connection pattern for reliability.
     ///
     /// The max short message size is MAX_DATA_SIZE - SymmetricMessage::short_message_overhead().
-    /// We test with a 1400-byte payload to verify short message handling near the boundary.
+    /// We test with a payload just under MAX_DATA_SIZE to verify short message handling
+    /// near the boundary. The payload must fit in MAX_DATA_SIZE minus serialization and
+    /// SymmetricMessage overhead.
     #[tokio::test]
     async fn simulate_send_max_short_message() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
@@ -4006,9 +4008,10 @@ pub mod mock_transport {
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer(Default::default(), channels).await?;
 
-        // Use a large payload that will be sent as a short message
-        // Vec<u8> of 1400 bytes should be well within short message limits
-        let test_data: Vec<u8> = (0..1400).map(|i| (i % 256) as u8).collect();
+        // Use a large payload that will be sent as a short message.
+        // Must be small enough that bincode serialization + SymmetricMessage overhead
+        // fits within MAX_DATA_SIZE (currently 1171 bytes).
+        let test_data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         let expected_len = test_data.len();
 
         let peer_a = GlobalExecutor::spawn(async move {

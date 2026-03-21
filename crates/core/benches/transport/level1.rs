@@ -25,7 +25,7 @@ pub fn bench_channel_throughput(c: &mut Criterion) {
     // Test various buffer sizes
     for buffer_size in [1, 10, 100, 1000] {
         // Pre-create packet data outside the benchmark loop
-        let packet: Arc<[u8]> = vec![0u8; 1492].into();
+        let packet: Arc<[u8]> = vec![0u8; 1200].into();
 
         group.bench_with_input(
             BenchmarkId::new("buffer", buffer_size),

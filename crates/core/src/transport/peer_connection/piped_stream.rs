@@ -920,7 +920,7 @@ mod tests {
         let time_source = VirtualTime::new();
         let stream = Arc::new(PipedStream::new_with_time_source(
             make_stream_id(),
-            14000, // ~10 fragments
+            14000, // ~13 fragments at current payload size
             1,
             PipedStreamConfig::default(),
             time_source.clone(),
