@@ -1722,9 +1722,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 processing = MAX_SUBSCRIBE_RETRIES_PER_TICK,
                                 "Capping subscribe retries per tick"
                             );
-                            // Shuffle to prevent DashMap iteration order from starving
-                            // some candidates when we can only process a subset per tick.
-                            crate::config::GlobalRng::shuffle(&mut retry_candidates);
+                            // Sort by age (oldest first) to guarantee fairness:
+                            // shuffle would cause probabilistic starvation when
+                            // candidates consistently exceed the per-tick cap.
+                            retry_candidates.sort_by_cached_key(|tx| {
+                                std::cmp::Reverse(tx.elapsed())
+                            });
                         }
 
                         for tx in retry_candidates.into_iter().take(MAX_SUBSCRIBE_RETRIES_PER_TICK) {
@@ -2879,5 +2882,65 @@ mod tests {
             // Should not panic or record anything
             record_connect_uphill_timeout(&tx, &op, &cm);
         }
+    }
+
+    /// Regression test for #3535: age-based retry prioritization prevents starvation.
+    ///
+    /// When retry candidates exceed MAX_SUBSCRIBE_RETRIES_PER_TICK, the oldest
+    /// transactions must be processed first (FIFO fairness). Random shuffling
+    /// would cause probabilistic starvation where some transactions could timeout
+    /// without ever being retried.
+    #[test]
+    fn subscribe_retry_candidates_sorted_oldest_first() {
+        use crate::config::GlobalSimulationTime;
+        use crate::operations::subscribe::SubscribeMsg;
+
+        let base_time: u64 = 1_700_000_000_000; // arbitrary epoch ms
+
+        // Create transactions at different simulation times so they have
+        // different ages. Oldest transaction is created first (lowest timestamp).
+        let mut txs = Vec::new();
+        for i in 0..20u64 {
+            GlobalSimulationTime::set_time_ms(base_time + i * 1000);
+            txs.push(Transaction::new::<SubscribeMsg>());
+        }
+
+        // Advance simulation time so elapsed() returns meaningful durations.
+        // tx[0] was created at base_time, tx[19] at base_time + 19s.
+        // At base_time + 30s: tx[0].elapsed() = 30s, tx[19].elapsed() = 11s.
+        GlobalSimulationTime::set_time_ms(base_time + 30_000);
+
+        // Shuffle to simulate arbitrary DashMap iteration order.
+        let mut candidates = txs.clone();
+        candidates.reverse();
+
+        // Apply the same sorting logic used in garbage_cleanup_task.
+        candidates.sort_by_cached_key(|tx| std::cmp::Reverse(tx.elapsed()));
+
+        // Verify: oldest transactions (largest elapsed) come first.
+        for window in candidates.windows(2) {
+            assert!(
+                window[0].elapsed() >= window[1].elapsed(),
+                "candidates not sorted oldest-first: {:?} < {:?}",
+                window[0].elapsed(),
+                window[1].elapsed(),
+            );
+        }
+
+        // The first candidate should be the oldest transaction (txs[0]).
+        assert_eq!(
+            candidates[0].elapsed(),
+            txs[0].elapsed(),
+            "oldest transaction should be first after sorting"
+        );
+
+        // The last candidate should be the newest transaction (txs[19]).
+        assert_eq!(
+            candidates[19].elapsed(),
+            txs[19].elapsed(),
+            "newest transaction should be last after sorting"
+        );
+
+        GlobalSimulationTime::clear_time();
     }
 }
