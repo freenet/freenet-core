@@ -133,10 +133,6 @@ impl PutOp {
     /// Try the next alternative peer for a timed-out PUT operation.
     ///
     /// Returns `Ok((new_op, msg))` with the re-routed operation and message to send,
-    /// or `Err(self)` if no alternatives remain.
-    /// Try the next alternative peer for a timed-out PUT operation.
-    ///
-    /// Returns `Ok((new_op, msg))` with the re-routed operation and message to send,
     /// or `Err(self)` if no alternatives remain or no retry payload is available.
     ///
     /// Follows the same pattern as `GetOp::retry_with_next_alternative`:
@@ -232,8 +228,9 @@ impl PutOp {
 
     /// Handle aborted connections by failing the operation immediately.
     ///
-    /// PUT operations don't have alternative routes to try. When the connection
-    /// drops, we notify the client of the failure so they can retry.
+    /// When the connection drops, we notify the client of the failure.
+    /// Retry with alternative peers is handled by the GC task's speculative
+    /// retry mechanism (see `retry_with_next_alternative`).
     pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
         tracing::warn!(
             tx = %self.id,
@@ -346,7 +343,9 @@ impl Operation for PutOp {
                 // cleaned up due to timeout and we should not create a new operation
                 if matches!(
                     msg,
-                    PutMsg::Response { .. } | PutMsg::ResponseStreaming { .. }
+                    PutMsg::Response { .. }
+                        | PutMsg::ResponseStreaming { .. }
+                        | PutMsg::ForwardingAck { .. }
                 ) {
                     tracing::debug!(
                         tx = %tx,
@@ -2490,5 +2489,214 @@ mod tests {
             speculative_paths: 0,
         };
         assert!(!op.is_client_initiated());
+    }
+
+    // === Tests for retry_with_next_alternative ===
+
+    use crate::operations::test_utils::make_peer;
+
+    fn make_awaiting_put_op(
+        alternatives: Vec<PeerKeyLocation>,
+        tried: &[PeerKeyLocation],
+        retry_payload: Option<PutRetryPayload>,
+    ) -> PutOp {
+        let id = Transaction::new::<PutMsg>();
+        let mut tried_peers = HashSet::new();
+        for p in tried {
+            if let Some(addr) = p.socket_addr() {
+                tried_peers.insert(addr);
+            }
+        }
+        PutOp {
+            id,
+            state: Some(PutState::AwaitingResponse(AwaitingResponseData {
+                subscribe: false,
+                blocking_subscribe: false,
+                next_hop: None,
+                current_htl: 7,
+                contract_key: make_contract_key(0),
+                retries: 0,
+                tried_peers,
+                alternatives,
+                attempts_at_hop: 1,
+                visited: VisitedPeers::default(),
+                retry_payload,
+            })),
+            upstream_addr: None,
+            stats: None,
+            ack_received: false,
+            speculative_paths: 0,
+        }
+    }
+
+    fn make_retry_payload() -> PutRetryPayload {
+        PutRetryPayload {
+            contract: make_test_contract(&[1u8]),
+            related_contracts: RelatedContracts::default(),
+            value: WrappedState::new(vec![42u8]),
+        }
+    }
+
+    #[test]
+    fn test_retry_with_next_alternative_uses_local_alternatives() {
+        let alt1 = make_peer(5001);
+        let alt2 = make_peer(5002);
+        let op = make_awaiting_put_op(vec![alt1.clone(), alt2], &[], Some(make_retry_payload()));
+
+        let result = op.retry_with_next_alternative(10, &[]);
+        assert!(result.is_ok(), "Should succeed with local alternatives");
+
+        let (new_op, msg) = match result {
+            Ok(v) => v,
+            Err(_) => panic!("Should succeed with local alternatives"),
+        };
+        match &msg {
+            PutMsg::Request { htl, .. } => {
+                assert!(*htl <= 10);
+            }
+            other => panic!("Expected PutMsg::Request, got {other}"),
+        }
+        if let Some(PutState::AwaitingResponse(data)) = &new_op.state {
+            assert_eq!(data.alternatives.len(), 1);
+            assert!(data.tried_peers.contains(&alt1.socket_addr().unwrap()));
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    #[test]
+    fn test_retry_with_next_alternative_no_alternatives_returns_err() {
+        let op = make_awaiting_put_op(vec![], &[], Some(make_retry_payload()));
+
+        let result = op.retry_with_next_alternative(10, &[]);
+        assert!(
+            result.is_err(),
+            "Should fail with no alternatives and no fallback"
+        );
+    }
+
+    #[test]
+    fn test_retry_with_next_alternative_no_retry_payload_returns_err() {
+        let alt = make_peer(5010);
+        let op = make_awaiting_put_op(vec![alt], &[], None);
+
+        let result = op.retry_with_next_alternative(10, &[]);
+        assert!(
+            result.is_err(),
+            "Should fail without retry payload (relay peer)"
+        );
+
+        // Verify state is preserved
+        let returned = match result {
+            Err(op) => op,
+            Ok(_) => panic!("Expected Err"),
+        };
+        assert!(matches!(
+            &returned.state,
+            Some(PutState::AwaitingResponse(_))
+        ));
+    }
+
+    #[test]
+    fn test_retry_with_next_alternative_dbf_fallback() {
+        let fallback1 = make_peer(5020);
+        let fallback2 = make_peer(5021);
+        let op = make_awaiting_put_op(vec![], &[], Some(make_retry_payload()));
+
+        let result = op.retry_with_next_alternative(10, &[fallback1.clone(), fallback2]);
+        assert!(result.is_ok(), "Should succeed with DBF fallback peers");
+
+        let (new_op, _msg) = match result {
+            Ok(v) => v,
+            Err(_) => panic!("Should succeed with DBF fallback"),
+        };
+        if let Some(PutState::AwaitingResponse(data)) = &new_op.state {
+            assert_eq!(data.alternatives.len(), 1);
+            assert!(data.tried_peers.contains(&fallback1.socket_addr().unwrap()));
+        } else {
+            panic!("Expected AwaitingResponse state");
+        }
+    }
+
+    #[test]
+    fn test_retry_with_next_alternative_htl_reduction() {
+        let alt1 = make_peer(5030);
+        let alt2 = make_peer(5031);
+        let alt3 = make_peer(5032);
+        let op = make_awaiting_put_op(vec![alt1, alt2, alt3], &[], Some(make_retry_payload()));
+
+        // attempts_at_hop starts at 1, retry increments to 2 → 10/2 = 5
+        let (op, msg) = match op.retry_with_next_alternative(10, &[]) {
+            Ok(v) => v,
+            Err(_) => panic!("retry 1 failed"),
+        };
+        match &msg {
+            PutMsg::Request { htl, .. } => {
+                assert_eq!(*htl, 5, "First retry: 10/2=5");
+            }
+            other => panic!("Expected Request, got {other}"),
+        }
+
+        // attempts_at_hop becomes 3 → 10/3 = 3 (MIN_RETRY_HTL)
+        let (op, msg) = match op.retry_with_next_alternative(10, &[]) {
+            Ok(v) => v,
+            Err(_) => panic!("retry 2 failed"),
+        };
+        match &msg {
+            PutMsg::Request { htl, .. } => {
+                assert_eq!(*htl, MIN_RETRY_HTL, "Second retry: 10/3=3");
+            }
+            other => panic!("Expected Request, got {other}"),
+        }
+
+        // attempts_at_hop becomes 4 → 10/4 = 2 → clamped to MIN_RETRY_HTL=3
+        let (_op, msg) = match op.retry_with_next_alternative(10, &[]) {
+            Ok(v) => v,
+            Err(_) => panic!("retry 3 failed"),
+        };
+        match &msg {
+            PutMsg::Request { htl, .. } => {
+                assert_eq!(*htl, MIN_RETRY_HTL, "Third retry: clamped to MIN_RETRY_HTL");
+            }
+            other => panic!("Expected Request, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_retry_with_next_alternative_wrong_state_returns_err() {
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: Some(PutState::Finished(FinishedData {
+                key: make_contract_key(1),
+            })),
+            upstream_addr: None,
+            stats: None,
+            ack_received: false,
+            speculative_paths: 0,
+        };
+
+        let result = op.retry_with_next_alternative(10, &[]);
+        assert!(result.is_err(), "Finished state should return Err");
+    }
+
+    #[test]
+    fn test_forwarding_ack_serde_roundtrip() {
+        let tx = Transaction::new::<PutMsg>();
+        let key = make_contract_key(42);
+        let msg = PutMsg::ForwardingAck {
+            id: tx,
+            contract_key: key,
+        };
+
+        let serialized = bincode::serialize(&msg).expect("serialize");
+        let deserialized: PutMsg = bincode::deserialize(&serialized).expect("deserialize");
+
+        match deserialized {
+            PutMsg::ForwardingAck { id, contract_key } => {
+                assert_eq!(id, tx);
+                assert_eq!(contract_key, key);
+            }
+            other => panic!("Expected ForwardingAck, got {other}"),
+        }
     }
 }
