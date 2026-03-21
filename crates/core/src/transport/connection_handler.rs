@@ -33,7 +33,9 @@ use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
-    packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
+    packet_data::{
+        PacketData, SymmetricAES, MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE,
+    },
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
@@ -1160,7 +1162,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             bind_addr = %self.this_addr,
             "Listening for packets"
         );
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; RECV_BUF_SIZE];
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
         let mut outdated_peer: HashMap<SocketAddr, u64> = HashMap::new();
@@ -1175,7 +1177,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             if let Some(time_nanos) = outdated_peer.get(&remote_addr) {
                                 let now_nanos = self.time_source.now_nanos();
                                 if now_nanos.saturating_sub(*time_nanos) < OUTDATED_PEER_EXPIRY.as_nanos() as u64 {
-                                    let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
+                                    let packet_data = PacketData::<_, RECV_BUF_SIZE>::from_buf(&buf[..size]);
                                     if packet_data.is_intro_packet() {
                                         if self.connections.is_rate_limited(&remote_addr) {
                                             continue;

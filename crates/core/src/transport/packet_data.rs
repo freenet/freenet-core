@@ -12,8 +12,28 @@ use crate::transport::crypto::{
 use super::crypto::TransportSecretKey;
 use super::TransportError;
 
-/// The maximum size of a received UDP packet, MTU typically is 1500
-pub(in crate::transport) const MAX_PACKET_SIZE: usize = 1500 - UDP_HEADER_SIZE;
+const ETHERNET_MTU: usize = 1500;
+
+/// Maximum UDP payload size that avoids IP-level fragmentation across internet paths.
+///
+/// Previous calculation was `1500 - 8 = 1492` which only subtracted the UDP header,
+/// forgetting the 20-byte IPv4 header. This caused every packet to be 1520 bytes at
+/// the IP level — 20 bytes over the 1500-byte Ethernet MTU — guaranteeing IP
+/// fragmentation on every single packet. IP fragmentation of UDP is especially harmful
+/// because: (1) both fragments must arrive or the whole packet is lost, effectively
+/// doubling loss rate, and (2) many NAT devices and firewalls drop fragmented UDP.
+///
+/// We use 1200 bytes, the same value chosen by QUIC (RFC 9000) after extensive internet
+/// path measurement. This safely avoids fragmentation across virtually all network
+/// paths including PPPoE (MTU 1492), VPN tunnels (~1400), mobile networks, and IPv6
+/// (minimum MTU 1280). While standard Ethernet could support 1472 bytes, real-world
+/// internet paths frequently have lower MTUs due to encapsulation overhead.
+pub(in crate::transport) const MAX_PACKET_SIZE: usize = 1200;
+
+/// Maximum receive buffer size. Larger than MAX_PACKET_SIZE to handle packets from
+/// peers running older versions that sent 1492-byte UDP payloads (before the MTU
+/// calculation was corrected).
+pub(in crate::transport) const MAX_RECV_PACKET_SIZE: usize = ETHERNET_MTU;
 
 // These are the same as the AES-GCM 128 constants, but extracting them from Aes128Gcm
 // as consts was awkward.
@@ -23,7 +43,6 @@ const TAG_SIZE: usize = 16;
 /// Maximum plaintext data size that can be encrypted into a symmetric packet.
 /// Accounts for packet type (1) + nonce (12) + tag (16) overhead.
 pub(super) const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - PACKET_TYPE_SIZE - NONCE_SIZE - TAG_SIZE;
-const UDP_HEADER_SIZE: usize = 8;
 
 const NONCE_BLOCK: u64 = 1_000_000;
 
@@ -86,7 +105,7 @@ fn generate_nonce() -> [u8; NONCE_SIZE] {
 struct AssertSize<const N: usize>;
 
 impl<const N: usize> AssertSize<N> {
-    const OK: () = assert!(N <= MAX_PACKET_SIZE);
+    const OK: () = assert!(N <= MAX_RECV_PACKET_SIZE);
 }
 
 // trying to bypass limitations with const generic checks on where clauses
@@ -96,7 +115,7 @@ const fn _check_valid_size<const N: usize>() {
 }
 
 #[derive(Clone)]
-pub(crate) struct PacketData<DT: Encryption, const N: usize = MAX_PACKET_SIZE> {
+pub(crate) struct PacketData<DT: Encryption, const N: usize = MAX_RECV_PACKET_SIZE> {
     data: [u8; N],
     pub size: usize,
     data_type: PhantomData<DT>,

@@ -566,10 +566,11 @@ mod tests {
     fn test_in_order_forwarding() {
         let stream = PipedStream::new(
             make_stream_id(),
-            4000, // ~3 fragments at ~1400 bytes each
+            3000, // 3 fragments
             1,
             PipedStreamConfig::default(),
         );
+        assert_eq!(stream.total_fragments(), 3);
 
         // Push fragment 1
         let result = stream
@@ -600,7 +601,8 @@ mod tests {
 
     #[test]
     fn test_out_of_order_buffering() {
-        let stream = PipedStream::new(make_stream_id(), 4000, 1, PipedStreamConfig::default());
+        let stream = PipedStream::new(make_stream_id(), 3000, 1, PipedStreamConfig::default());
+        assert_eq!(stream.total_fragments(), 3);
 
         // Push fragment 3 first (out of order)
         let result = stream
@@ -786,9 +788,8 @@ mod tests {
 
     #[test]
     fn test_partial_cascade() {
-        // Use 8500 bytes which results in 6 fragments at ~1424 bytes/fragment
-        // ceil(8500 / 1424) = 6 fragments
-        let stream = PipedStream::new(make_stream_id(), 8500, 1, PipedStreamConfig::default());
+        // 6 fragments at ~1131 bytes/fragment: ceil(6500/1131) = 6
+        let stream = PipedStream::new(make_stream_id(), 6500, 1, PipedStreamConfig::default());
         assert_eq!(stream.total_fragments(), 6);
 
         // Buffer fragments 3, 5, 6 (gap at 4)
