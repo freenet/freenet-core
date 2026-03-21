@@ -147,9 +147,13 @@ impl<T: TimeSource> FixedRateController<T> {
     pub fn current_cwnd(&self) -> usize {
         if self.loss_pause.load(Ordering::Acquire) {
             // Cap at current flightsize: no new data until ACKs arrive.
-            // Add a small margin (one packet) so the cwnd check
-            // `flightsize + packet_size <= cwnd` can pass once an ACK
-            // frees some space.
+            // Both flightsize() and current_cwnd() read the same AtomicUsize,
+            // so this makes the send check `flightsize + packet_size <= cwnd`
+            // permanently false while loss_pause is active. This is intentional:
+            // loss_pause is cleared by on_ack(), at which point current_cwnd()
+            // returns usize::MAX/2 and sends resume immediately.
+            // The CWND_WAIT_TIMEOUT in send_stream/pipe_stream catches dead
+            // connections where ACKs never arrive.
             self.flightsize.load(Ordering::Relaxed)
         } else {
             usize::MAX / 2
@@ -272,7 +276,7 @@ mod tests {
         // Before loss: cwnd is large
         assert!(controller.current_cwnd() > 1_000_000_000);
 
-        // Loss activates pause: cwnd capped at flightsize
+        // Loss activates pause: cwnd capped at flightsize (blocks all new sends)
         controller.on_loss();
         assert_eq!(controller.flightsize(), flightsize_before);
         assert_eq!(controller.current_cwnd(), flightsize_before);
