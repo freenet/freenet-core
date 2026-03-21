@@ -344,7 +344,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -874,10 +874,12 @@ mod tests {
             html.contains("__freenet_shell__"),
             "bridge JS must handle shell-level messages (title/favicon)"
         );
-        // Security: allow-popups-to-escape-sandbox must NOT be present
+        // allow-popups-to-escape-sandbox must be present so that links opened
+        // from within the sandbox behave as normal browser tabs (without inheriting
+        // the sandbox's null origin, which breaks CORS on the target site). See #3613.
         assert!(
-            !html.contains("allow-popups-to-escape-sandbox"),
-            "allow-popups-to-escape-sandbox must not be set (security)"
+            html.contains("allow-popups-to-escape-sandbox"),
+            "allow-popups-to-escape-sandbox must be set so external links work (#3613)"
         );
     }
 
