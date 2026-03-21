@@ -207,6 +207,12 @@ impl PutOp {
                 let payload = data.retry_payload.as_ref().unwrap();
                 let skip_list = data.tried_peers.clone();
 
+                // Retry always uses non-streaming PutMsg::Request, even if the
+                // original was streamed. The transport layer fragments large messages
+                // into UDP packets regardless, so there's no message size limit.
+                // Streaming is an optimization (avoids holding the full payload in
+                // memory at relay hops), but for originator retry the payload is
+                // already in memory in retry_payload.
                 let msg = PutMsg::Request {
                     id: self.id,
                     contract: payload.contract.clone(),
@@ -550,6 +556,14 @@ impl Operation for PutOp {
 
                         let new_htl = htl.saturating_sub(1);
 
+                        // Clone merged_value before it's moved into the streaming payload,
+                        // so the originator can retain it for retry.
+                        let merged_value_for_retry = if is_originator {
+                            Some(merged_value.clone())
+                        } else {
+                            None
+                        };
+
                         // Check if we should use streaming for the forward
                         let payload = PutStreamingPayload {
                             contract: contract.clone(),
@@ -615,12 +629,14 @@ impl Operation for PutOp {
                             alternatives: vec![],
                             attempts_at_hop: 1,
                             visited: VisitedPeers::default(),
-                            // Originator retains payload for retry; relay peers don't need it
-                            retry_payload: if is_originator {
+                            // Originator retains merged payload for retry; relay peers don't need it.
+                            // Uses merged_value (post put_contract) not the original input value,
+                            // so retries propagate the same state as the primary path.
+                            retry_payload: if let Some(val) = merged_value_for_retry {
                                 Some(PutRetryPayload {
                                     contract: contract.clone(),
                                     related_contracts: related_contracts.clone(),
-                                    value: value.clone(),
+                                    value: val,
                                 })
                             } else {
                                 None
@@ -977,15 +993,6 @@ impl Operation for PutOp {
                                     None
                                 }
                             };
-                            // Send ForwardingAck upstream before piping (fire-and-forget).
-                            if let Some(upstream) = upstream_addr {
-                                let ack = NetMessage::from(PutMsg::ForwardingAck {
-                                    id,
-                                    contract_key: *contract_key,
-                                });
-                                drop(conn_manager.send(upstream, ack).await);
-                            }
-
                             conn_manager.send(next_addr, pipe_metadata_net).await?;
 
                             // Start piping (runs asynchronously in background)
@@ -997,6 +1004,18 @@ impl Operation for PutOp {
                                     embedded_metadata,
                                 )
                                 .await?;
+
+                            // Send ForwardingAck upstream AFTER downstream handoff succeeds.
+                            // If the downstream send failed (returned Err above), we don't
+                            // ACK — so the upstream's GC task will retry after ACK_TIMEOUT
+                            // instead of waiting PROGRESS_TIMEOUT for a stalled chain.
+                            if let Some(upstream) = upstream_addr {
+                                let ack = NetMessage::from(PutMsg::ForwardingAck {
+                                    id,
+                                    contract_key: *contract_key,
+                                });
+                                drop(conn_manager.send(upstream, ack).await);
+                            }
 
                             if let Some(event) = NetEventLog::put_request(
                                 &id,
