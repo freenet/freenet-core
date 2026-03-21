@@ -1907,9 +1907,7 @@ mod messages {
                     Some(Location::from(contract_key.id()))
                 }
                 Self::ResponseStreaming { key, .. } => Some(Location::from(key.id())),
-                Self::ForwardingAck { contract_key, .. } => {
-                    Some(Location::from(contract_key.id()))
-                }
+                Self::ForwardingAck { contract_key, .. } => Some(Location::from(contract_key.id())),
             }
         }
     }
@@ -1957,11 +1955,7 @@ mod messages {
                     )
                 }
                 Self::ForwardingAck { id, contract_key } => {
-                    write!(
-                        f,
-                        "PutForwardingAck(id: {}, key: {})",
-                        id, contract_key
-                    )
+                    write!(f, "PutForwardingAck(id: {}, key: {})", id, contract_key)
                 }
             }
         }
