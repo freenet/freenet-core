@@ -368,7 +368,11 @@ impl From<&KnownPeerKeyLocation> for PeerKeyLocation {
 
 impl Ord for KnownPeerKeyLocation {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.addr.cmp(&other.addr)
+        // Use addr as primary key (ring topology is address-based),
+        // then pub_key as tiebreaker to stay consistent with derived PartialEq/Hash.
+        self.addr
+            .cmp(&other.addr)
+            .then_with(|| self.pub_key.cmp(&other.pub_key))
     }
 }
 
@@ -425,8 +429,8 @@ impl KnownPeerKeyLocation {
     }
 
     #[cfg(test)]
-    pub fn to_bytes(self) -> Vec<u8> {
-        bincode::serialize(&self).unwrap()
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).unwrap()
     }
 }
 

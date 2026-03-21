@@ -264,34 +264,6 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
-
-    pub fn connected(ring: &'a Ring, peer: PeerId, _location: Location) -> Option<Self> {
-        let peer_id = Self::get_own_peer_id(ring)?;
-        let connected = peer.as_peer_key_location();
-        let connection_count = ring.connection_manager.connection_count();
-        let is_gateway = ring.connection_manager.is_gateway();
-        // Note: location is computed from address, so we don't need to set it separately
-        Some(NetEventLog {
-            tx: Transaction::NULL,
-            peer_id,
-            kind: EventKind::Connect(ConnectEvent::Connected {
-                this: ring.connection_manager.own_location(),
-                connected,
-                // None since we don't have transaction timing for this path
-                elapsed_ms: None,
-                connection_type: if is_gateway {
-                    ConnectionType::Gateway
-                } else {
-                    ConnectionType::Direct
-                },
-                latency_ms: None, // RTT not available at this layer
-                this_peer_connection_count: connection_count,
-                initiated_by: None, // Not available in this context
-            }),
-        })
-    }
-
-
     /// Create a disconnected event with full context.
     ///
     /// # Arguments

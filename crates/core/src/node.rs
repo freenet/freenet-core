@@ -2344,7 +2344,7 @@ mod tests {
     #[test]
     fn test_peer_id_serialization() {
         let peer = PeerId::random();
-        let bytes = peer.clone().to_bytes();
+        let bytes = peer.to_bytes();
         assert!(!bytes.is_empty());
 
         // Should be deserializable
