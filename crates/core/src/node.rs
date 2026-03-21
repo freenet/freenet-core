@@ -2265,6 +2265,25 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Superseded: Old addr-only equality (same_addr_different_keys → equal) was replaced
+    // with full-field equality (addr + pub_key) in #3616. Kept as historical documentation
+    // of the old behavior.
+    #[ignore]
+    #[rstest]
+    #[case::same_addr_different_keys(8080, 8080, true)]
+    #[case::different_addr_same_key(8080, 8081, false)]
+    fn test_peer_id_equality(#[case] port1: u16, #[case] port2: u16, #[case] expected_equal: bool) {
+        let keypair1 = TransportKeypair::new();
+        let keypair2 = TransportKeypair::new();
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port1);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port2);
+        // Old behavior: PeerId equality was addr-only, so same_addr_different_keys was true.
+        // New behavior: equality uses full fields, so same_addr_different_keys is false.
+        let peer1 = PeerId::new(keypair1.public().clone(), addr1);
+        let peer2 = PeerId::new(keypair2.public().clone(), addr2);
+        assert_eq!(peer1 == peer2, expected_equal);
+    }
+
     // PeerId (KnownPeerKeyLocation) equality tests
     // PeerId now uses full-field equality (both addr and pub_key), matching identity semantics.
     #[test]
