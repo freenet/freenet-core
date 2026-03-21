@@ -279,7 +279,7 @@ impl NetworkBridge for P2pBridge {
                         .get_connection_duration_ms(peer_addr);
                     if let Some(event) = NetEventLog::disconnected_with_context(
                         &self.op_manager.ring,
-                        &PeerId::new(known_loc.socket_addr(), peer_loc.pub_key().clone()),
+                        &PeerId::new(peer_loc.pub_key().clone(), known_loc.socket_addr()),
                         DisconnectReason::RemoteDropped,
                         connection_duration_ms,
                         None, // bytes_sent not tracked yet
@@ -1467,8 +1467,8 @@ impl P2pConnManager {
                                             .op_manager
                                             .ring
                                             .prune_connection(PeerId::new(
-                                                peer_addr,
                                                 peer.pub_key().clone(),
+                                                peer_addr,
                                             ))
                                             .await;
 
@@ -2220,7 +2220,7 @@ impl P2pConnManager {
             .bridge
             .op_manager
             .ring
-            .prune_connection(PeerId::new(peer_addr, peer.pub_key().clone()))
+            .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
             .await;
 
         // Handle orphaned transactions immediately (retry via alternate routes)
@@ -2318,7 +2318,7 @@ impl P2pConnManager {
             .bridge
             .op_manager
             .ring
-            .prune_connection(PeerId::new(peer_addr, peer.pub_key().clone()))
+            .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
             .await;
 
         // Handle orphaned transactions
@@ -2669,7 +2669,7 @@ impl P2pConnManager {
                     .bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
+                    .add_connection(loc, PeerId::new(peer.pub_key().clone(), peer_addr), true)
                     .await;
                 tracing::info!(
                     tx = %tx,
@@ -3295,7 +3295,7 @@ impl P2pConnManager {
                     .bridge
                     .op_manager
                     .ring
-                    .prune_connection(PeerId::new(peer_addr, old_peer.pub_key().clone()))
+                    .prune_connection(PeerId::new(old_peer.pub_key().clone(), peer_addr))
                     .await;
                 self.bridge
                     .handle_orphaned_transactions(
@@ -3500,7 +3500,7 @@ impl P2pConnManager {
                     .bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, PeerId::new(peer_addr, peer.pub_key().clone()), true)
+                    .add_connection(loc, PeerId::new(peer.pub_key().clone(), peer_addr), true)
                     .await;
                 let pkl = crate::ring::PeerKeyLocation::new(peer.pub_key().clone(), peer_addr);
                 crate::node::network_status::record_peer_connected(
@@ -3622,30 +3622,33 @@ impl P2pConnManager {
                         if sender_addr.map(|a| a == remote_addr).unwrap_or(false)
                             || sender_addr.map(|a| a.ip().is_unspecified()).unwrap_or(true)
                         {
-                            let mut new_peer_id = PeerId::new(
-                                sender_addr.unwrap_or(remote_addr),
-                                sender_peer.pub_key().clone(),
-                            );
-                            if new_peer_id.addr.ip().is_unspecified() {
-                                new_peer_id.addr = remote_addr;
-                                if let Some(sender_mut) =
-                                    extract_sender_from_message_mut(&mut inbound.msg)
-                                {
-                                    if sender_mut
-                                        .socket_addr()
-                                        .map(|a| a.ip().is_unspecified())
-                                        .unwrap_or(true)
+                            let resolved_addr = {
+                                let raw_addr = sender_addr.unwrap_or(remote_addr);
+                                if raw_addr.ip().is_unspecified() {
+                                    if let Some(sender_mut) =
+                                        extract_sender_from_message_mut(&mut inbound.msg)
                                     {
-                                        sender_mut.set_addr(remote_addr);
+                                        if sender_mut
+                                            .socket_addr()
+                                            .map(|a| a.ip().is_unspecified())
+                                            .unwrap_or(true)
+                                        {
+                                            sender_mut.set_addr(remote_addr);
+                                        }
                                     }
+                                    remote_addr
+                                } else {
+                                    raw_addr
                                 }
-                            }
+                            };
+                            let new_peer_id =
+                                PeerId::new(sender_peer.pub_key().clone(), resolved_addr);
                             // Check if we have a connection but with a different pub_key
                             if let Some(entry) = self.connections.get(&remote_addr) {
                                 // If we don't have the pub_key stored yet or it differs from the new one, update it
                                 let should_update = match &entry.pub_key {
                                     None => true,
-                                    Some(old_pub_key) => old_pub_key != &new_peer_id.pub_key,
+                                    Some(old_pub_key) => old_pub_key != new_peer_id.pub_key(),
                                 };
                                 if should_update {
                                     let old_pub_key = entry.pub_key.clone();
@@ -3653,7 +3656,7 @@ impl P2pConnManager {
                                     tracing::info!(
                                         remote = %remote_addr,
                                         old_pub_key = ?old_pub_key,
-                                        new_pub_key = %&new_peer_id.pub_key,
+                                        new_pub_key = %new_peer_id.pub_key(),
                                         is_first_identity,
                                         "Updating peer identity after inbound message"
                                     );
@@ -3661,7 +3664,7 @@ impl P2pConnManager {
                                     if let Some(old_key) = old_pub_key {
                                         self.addr_by_pub_key.remove(&old_key);
                                         // Update ring with old PeerId -> new PeerId
-                                        let old_peer_id = PeerId::new(remote_addr, old_key);
+                                        let old_peer_id = PeerId::new(old_key, remote_addr);
                                         self.bridge.op_manager.ring.update_connection_identity(
                                             &old_peer_id,
                                             new_peer_id.clone(),
@@ -3669,11 +3672,11 @@ impl P2pConnManager {
                                     }
                                     // Update the entry's pub_key
                                     if let Some(entry) = self.connections.get_mut(&remote_addr) {
-                                        entry.pub_key = Some(new_peer_id.pub_key.clone());
+                                        entry.pub_key = Some(new_peer_id.pub_key().clone());
                                     }
                                     // Add new reverse lookup
                                     self.addr_by_pub_key
-                                        .insert(new_peer_id.pub_key.clone().clone(), remote_addr);
+                                        .insert(new_peer_id.pub_key().clone(), remote_addr);
                                     // Note: We do NOT automatically promote to ring here.
                                     // Transient connections are promoted only when the Connect
                                     // operation explicitly accepts via NodeEvent::ConnectPeer,
@@ -3738,7 +3741,7 @@ impl P2pConnManager {
                         .bridge
                         .op_manager
                         .ring
-                        .prune_connection(PeerId::new(remote_addr, peer.pub_key().clone()))
+                        .prune_connection(PeerId::new(peer.pub_key().clone(), remote_addr))
                         .await;
 
                     // Handle orphaned transactions immediately (retry via alternate routes)

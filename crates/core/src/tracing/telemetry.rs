@@ -738,8 +738,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             serde_json::json!({
                 "type": "disconnected",
                 "from": from.to_string(),
-                "from_peer_id": from.pub_key.to_string(),
-                "from_peer_addr": from.addr.to_string(),
+                "from_peer_id": from.pub_key().to_string(),
+                "from_peer_addr": from.socket_addr().to_string(),
                 "reason": reason.to_string(),
                 "connection_duration_ms": connection_duration_ms,
                 "bytes_sent": bytes_sent,

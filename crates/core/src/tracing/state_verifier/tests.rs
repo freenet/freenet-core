@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 fn make_peer_id(port: u16) -> PeerId {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let key = TransportPublicKey::from_bytes([port as u8; 32]);
-    PeerId::new(addr, key)
+    PeerId::new(key, addr)
 }
 
 fn make_peer_key_location(port: u16) -> PeerKeyLocation {

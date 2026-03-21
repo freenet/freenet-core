@@ -486,7 +486,7 @@ impl TestResult {
                         tracing::debug!(
                             "  {} @ {}: {} -> {}",
                             log.tx,
-                            log.peer_id.addr,
+                            log.peer_id.socket_addr(),
                             variant,
                             &state_hash[..16]
                         );
@@ -501,7 +501,12 @@ impl TestResult {
                 if contract_key.as_ref() == Some(&diverged.contract_key) {
                     let variant = log.kind.variant_name();
                     if variant.contains("Subscribe") {
-                        tracing::debug!("  {} @ {}: {}", log.tx, log.peer_id.addr, variant);
+                        tracing::debug!(
+                            "  {} @ {}: {}",
+                            log.tx,
+                            log.peer_id.socket_addr(),
+                            variant
+                        );
                     }
                 }
             }
@@ -555,7 +560,7 @@ impl TestResult {
                     contracts_with_puts.insert(key_str.clone());
 
                     // Track peer and state for this PUT
-                    let peer_addr = format!("{}", log.peer_id.addr);
+                    let peer_addr = format!("{}", log.peer_id.socket_addr());
                     let state_hash = log
                         .kind
                         .state_hash()
@@ -3238,7 +3243,7 @@ fn test_subscription_broadcast_propagation() {
                 if let Some(key) = log.kind.contract_key() {
                     if format!("{:?}", key) == contract_key_str {
                         if let Some(hash) = log.kind.stored_state_hash() {
-                            states.insert(log.peer_id.addr, hash.to_string());
+                            states.insert(log.peer_id.socket_addr(), hash.to_string());
                         }
                     }
                 }
@@ -3388,7 +3393,7 @@ fn test_subscription_relay_propagation() {
                 if let Some(key) = log.kind.contract_key() {
                     if format!("{:?}", key) == contract_key_str {
                         if let Some(hash) = log.kind.stored_state_hash() {
-                            states.insert(log.peer_id.addr, hash.to_string());
+                            states.insert(log.peer_id.socket_addr(), hash.to_string());
                         }
                     }
                 }
@@ -4177,7 +4182,7 @@ fn test_direct_runner_determinism() {
 
                     EventKey {
                         tx: log.tx,
-                        peer_addr: log.peer_id.addr,
+                        peer_addr: log.peer_id.socket_addr(),
                         event_kind_name,
                         contract_key,
                         state_hash,
@@ -4547,7 +4552,9 @@ fn test_router_accumulates_feedback_events() {
         // Group by peer to see distribution
         let mut by_peer: HashMap<String, usize> = HashMap::new();
         for log in logs.iter().filter(|l| l.kind.variant_name() == "Route") {
-            *by_peer.entry(format!("{}", log.peer_id.addr)).or_default() += 1;
+            *by_peer
+                .entry(format!("{}", log.peer_id.socket_addr()))
+                .or_default() += 1;
         }
         (route_count, by_peer)
     });
@@ -4669,7 +4676,9 @@ fn test_router_prediction_threshold_activation() {
             .count();
         let mut by_peer: HashMap<String, usize> = HashMap::new();
         for log in logs.iter().filter(|l| l.kind.variant_name() == "Route") {
-            *by_peer.entry(format!("{}", log.peer_id.addr)).or_default() += 1;
+            *by_peer
+                .entry(format!("{}", log.peer_id.socket_addr()))
+                .or_default() += 1;
         }
         (route_count, by_peer)
     });
@@ -4846,7 +4855,7 @@ fn verify_contract_propagation(
             if let Some(key) = log.kind.contract_key() {
                 if format!("{:?}", key) == contract_key_str {
                     if let Some(hash) = log.kind.stored_state_hash() {
-                        states.insert(log.peer_id.addr, hash.to_string());
+                        states.insert(log.peer_id.socket_addr(), hash.to_string());
                     }
                 }
             }
