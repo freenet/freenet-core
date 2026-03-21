@@ -3,8 +3,10 @@
 //! Contract web apps are served inside sandboxed iframes to provide origin isolation.
 //! The local API server returns a "shell" page that holds the auth token and
 //! proxies WebSocket connections via postMessage, while the contract runs in an
-//! `<iframe sandbox="allow-scripts allow-forms">` with an opaque origin that cannot
-//! access other contracts' data.
+//! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox">`
+//! with an opaque origin that cannot access other contracts' data.
+//! `allow-popups-to-escape-sandbox` lets external links open normally; sandbox content
+//! is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
 
 use std::path::{Path, PathBuf};
 
@@ -344,7 +346,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -874,10 +876,12 @@ mod tests {
             html.contains("__freenet_shell__"),
             "bridge JS must handle shell-level messages (title/favicon)"
         );
-        // Security: allow-popups-to-escape-sandbox must NOT be present
+        // allow-popups-to-escape-sandbox must be present so that links opened
+        // from within the sandbox behave as normal browser tabs (without inheriting
+        // the sandbox's null origin, which breaks CORS on the target site). See #3613.
         assert!(
-            !html.contains("allow-popups-to-escape-sandbox"),
-            "allow-popups-to-escape-sandbox must not be set (security)"
+            html.contains("allow-popups-to-escape-sandbox"),
+            "allow-popups-to-escape-sandbox must be set so external links work (#3613)"
         );
     }
 
