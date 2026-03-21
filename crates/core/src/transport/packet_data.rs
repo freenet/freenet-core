@@ -35,6 +35,10 @@ pub(in crate::transport) const MAX_PACKET_SIZE: usize = 1200;
 /// calculation was corrected).
 pub(in crate::transport) const MAX_RECV_PACKET_SIZE: usize = ETHERNET_MTU;
 
+// Compile-time safety: ensure packets never exceed Ethernet MTU at the IP level.
+// IPv4 header (20) + UDP header (8) + payload must fit in 1500 bytes.
+const _: () = assert!(MAX_PACKET_SIZE + 20 + 8 <= ETHERNET_MTU);
+
 // These are the same as the AES-GCM 128 constants, but extracting them from Aes128Gcm
 // as consts was awkward.
 const NONCE_SIZE: usize = 12;
@@ -573,5 +577,47 @@ mod packet_type_discrimination_tests {
             "PACKET_TYPE_SYMMETRIC should be 0x02"
         );
         assert_eq!(PACKET_TYPE_SIZE, 1, "PACKET_TYPE_SIZE should be 1 byte");
+    }
+
+    #[test]
+    fn test_max_packet_size_avoids_ip_fragmentation() {
+        // Verify the MTU invariant: UDP payload + headers must not exceed
+        // the IPv6 minimum MTU (1280), which is the most restrictive common path.
+        const UDP_HEADER: usize = 8;
+        const IPV4_HEADER: usize = 20;
+        assert!(
+            MAX_PACKET_SIZE + UDP_HEADER + IPV4_HEADER <= 1280,
+            "MAX_PACKET_SIZE {} would cause IP fragmentation on IPv6 minimum MTU paths \
+             (total {} > 1280)",
+            MAX_PACKET_SIZE,
+            MAX_PACKET_SIZE + UDP_HEADER + IPV4_HEADER,
+        );
+    }
+
+    #[test]
+    fn test_recv_buffer_handles_old_peer_packets() {
+        // Old peers sent 1492-byte UDP payloads (1500 - 8, missing IPv4 header).
+        // Verify that MAX_RECV_PACKET_SIZE can hold these and that PacketData
+        // can be constructed at the receive buffer size.
+        const OLD_MAX_PACKET_SIZE: usize = 1492;
+        assert!(
+            OLD_MAX_PACKET_SIZE <= MAX_RECV_PACKET_SIZE,
+            "Receive buffer ({}) must accommodate old peer packets ({})",
+            MAX_RECV_PACKET_SIZE,
+            OLD_MAX_PACKET_SIZE,
+        );
+
+        // Verify PacketData can be constructed from old-size received data.
+        // In production, recv_from fills a [0u8; MAX_RECV_PACKET_SIZE] buffer,
+        // then PacketData::from_buf(&buf[..size]) creates the packet.
+        let fake_received = vec![0xAB; OLD_MAX_PACKET_SIZE];
+        let packet =
+            PacketData::<UnknownEncryption, MAX_RECV_PACKET_SIZE>::from_buf(&fake_received);
+        assert_eq!(packet.size, OLD_MAX_PACKET_SIZE);
+
+        // Verify the receive buffer is large enough for the OS recv_from call
+        let mut recv_buf = [0u8; MAX_RECV_PACKET_SIZE];
+        assert!(recv_buf.len() >= OLD_MAX_PACKET_SIZE);
+        recv_buf[..OLD_MAX_PACKET_SIZE].copy_from_slice(&fake_received);
     }
 }
