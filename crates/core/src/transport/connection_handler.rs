@@ -33,7 +33,9 @@ use super::{
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
-    packet_data::{PacketData, SymmetricAES, MAX_PACKET_SIZE},
+    packet_data::{
+        PacketData, SymmetricAES, MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE,
+    },
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
@@ -1160,7 +1162,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             bind_addr = %self.this_addr,
             "Listening for packets"
         );
-        let mut buf = [0u8; MAX_PACKET_SIZE];
+        let mut buf = [0u8; RECV_BUF_SIZE];
         let mut connection_tasks = FuturesUnordered::new();
         let mut gw_connection_tasks = FuturesUnordered::new();
         let mut outdated_peer: HashMap<SocketAddr, u64> = HashMap::new();
@@ -1175,7 +1177,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             if let Some(time_nanos) = outdated_peer.get(&remote_addr) {
                                 let now_nanos = self.time_source.now_nanos();
                                 if now_nanos.saturating_sub(*time_nanos) < OUTDATED_PEER_EXPIRY.as_nanos() as u64 {
-                                    let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&buf[..size]);
+                                    let packet_data = PacketData::<_, RECV_BUF_SIZE>::from_buf(&buf[..size]);
                                     if packet_data.is_intro_packet() {
                                         if self.connections.is_rate_limited(&remote_addr) {
                                             continue;
@@ -3995,7 +3997,9 @@ pub mod mock_transport {
     /// Uses a simple connection pattern for reliability.
     ///
     /// The max short message size is MAX_DATA_SIZE - SymmetricMessage::short_message_overhead().
-    /// We test with a 1400-byte payload to verify short message handling near the boundary.
+    /// We test with a payload just under MAX_DATA_SIZE to verify short message handling
+    /// near the boundary. The payload must fit in MAX_DATA_SIZE minus serialization and
+    /// SymmetricMessage overhead.
     #[tokio::test]
     async fn simulate_send_max_short_message() -> anyhow::Result<()> {
         let channels = Arc::new(DashMap::new());
@@ -4004,9 +4008,10 @@ pub mod mock_transport {
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer(Default::default(), channels).await?;
 
-        // Use a large payload that will be sent as a short message
-        // Vec<u8> of 1400 bytes should be well within short message limits
-        let test_data: Vec<u8> = (0..1400).map(|i| (i % 256) as u8).collect();
+        // Use a large payload that will be sent as a short message.
+        // Must be small enough that bincode serialization + SymmetricMessage overhead
+        // fits within MAX_DATA_SIZE (currently 1171 bytes).
+        let test_data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         let expected_len = test_data.len();
 
         let peer_a = GlobalExecutor::spawn(async move {

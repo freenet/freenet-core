@@ -12,8 +12,32 @@ use crate::transport::crypto::{
 use super::crypto::TransportSecretKey;
 use super::TransportError;
 
-/// The maximum size of a received UDP packet, MTU typically is 1500
-pub(in crate::transport) const MAX_PACKET_SIZE: usize = 1500 - UDP_HEADER_SIZE;
+const ETHERNET_MTU: usize = 1500;
+
+/// Maximum UDP payload size that avoids IP-level fragmentation across internet paths.
+///
+/// Previous calculation was `1500 - 8 = 1492` which only subtracted the UDP header,
+/// forgetting the 20-byte IPv4 header. This caused every packet to be 1520 bytes at
+/// the IP level — 20 bytes over the 1500-byte Ethernet MTU — guaranteeing IP
+/// fragmentation on every single packet. IP fragmentation of UDP is especially harmful
+/// because: (1) both fragments must arrive or the whole packet is lost, effectively
+/// doubling loss rate, and (2) many NAT devices and firewalls drop fragmented UDP.
+///
+/// We use 1200 bytes, the same value chosen by QUIC (RFC 9000) after extensive internet
+/// path measurement. This safely avoids fragmentation across virtually all network
+/// paths including PPPoE (MTU 1492), VPN tunnels (~1400), mobile networks, and IPv6
+/// (minimum MTU 1280). While standard Ethernet could support 1472 bytes, real-world
+/// internet paths frequently have lower MTUs due to encapsulation overhead.
+pub(in crate::transport) const MAX_PACKET_SIZE: usize = 1200;
+
+/// Maximum receive buffer size. Larger than MAX_PACKET_SIZE to handle packets from
+/// peers running older versions that sent 1492-byte UDP payloads (before the MTU
+/// calculation was corrected).
+pub(in crate::transport) const MAX_RECV_PACKET_SIZE: usize = ETHERNET_MTU;
+
+// Compile-time safety: ensure packets never exceed Ethernet MTU at the IP level.
+// IPv4 header (20) + UDP header (8) + payload must fit in 1500 bytes.
+const _: () = assert!(MAX_PACKET_SIZE + 20 + 8 <= ETHERNET_MTU);
 
 // These are the same as the AES-GCM 128 constants, but extracting them from Aes128Gcm
 // as consts was awkward.
@@ -23,7 +47,6 @@ const TAG_SIZE: usize = 16;
 /// Maximum plaintext data size that can be encrypted into a symmetric packet.
 /// Accounts for packet type (1) + nonce (12) + tag (16) overhead.
 pub(super) const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - PACKET_TYPE_SIZE - NONCE_SIZE - TAG_SIZE;
-const UDP_HEADER_SIZE: usize = 8;
 
 const NONCE_BLOCK: u64 = 1_000_000;
 
@@ -86,7 +109,7 @@ fn generate_nonce() -> [u8; NONCE_SIZE] {
 struct AssertSize<const N: usize>;
 
 impl<const N: usize> AssertSize<N> {
-    const OK: () = assert!(N <= MAX_PACKET_SIZE);
+    const OK: () = assert!(N <= MAX_RECV_PACKET_SIZE);
 }
 
 // trying to bypass limitations with const generic checks on where clauses
@@ -96,7 +119,7 @@ const fn _check_valid_size<const N: usize>() {
 }
 
 #[derive(Clone)]
-pub(crate) struct PacketData<DT: Encryption, const N: usize = MAX_PACKET_SIZE> {
+pub(crate) struct PacketData<DT: Encryption, const N: usize = MAX_RECV_PACKET_SIZE> {
     data: [u8; N],
     pub size: usize,
     data_type: PhantomData<DT>,
@@ -554,5 +577,47 @@ mod packet_type_discrimination_tests {
             "PACKET_TYPE_SYMMETRIC should be 0x02"
         );
         assert_eq!(PACKET_TYPE_SIZE, 1, "PACKET_TYPE_SIZE should be 1 byte");
+    }
+
+    #[test]
+    fn test_max_packet_size_avoids_ip_fragmentation() {
+        // Verify the MTU invariant: UDP payload + headers must not exceed
+        // the IPv6 minimum MTU (1280), which is the most restrictive common path.
+        const UDP_HEADER: usize = 8;
+        const IPV4_HEADER: usize = 20;
+        assert!(
+            MAX_PACKET_SIZE + UDP_HEADER + IPV4_HEADER <= 1280,
+            "MAX_PACKET_SIZE {} would cause IP fragmentation on IPv6 minimum MTU paths \
+             (total {} > 1280)",
+            MAX_PACKET_SIZE,
+            MAX_PACKET_SIZE + UDP_HEADER + IPV4_HEADER,
+        );
+    }
+
+    #[test]
+    fn test_recv_buffer_handles_old_peer_packets() {
+        // Old peers sent 1492-byte UDP payloads (1500 - 8, missing IPv4 header).
+        // Verify that MAX_RECV_PACKET_SIZE can hold these and that PacketData
+        // can be constructed at the receive buffer size.
+        const OLD_MAX_PACKET_SIZE: usize = 1492;
+        assert!(
+            OLD_MAX_PACKET_SIZE <= MAX_RECV_PACKET_SIZE,
+            "Receive buffer ({}) must accommodate old peer packets ({})",
+            MAX_RECV_PACKET_SIZE,
+            OLD_MAX_PACKET_SIZE,
+        );
+
+        // Verify PacketData can be constructed from old-size received data.
+        // In production, recv_from fills a [0u8; MAX_RECV_PACKET_SIZE] buffer,
+        // then PacketData::from_buf(&buf[..size]) creates the packet.
+        let fake_received = vec![0xAB; OLD_MAX_PACKET_SIZE];
+        let packet =
+            PacketData::<UnknownEncryption, MAX_RECV_PACKET_SIZE>::from_buf(&fake_received);
+        assert_eq!(packet.size, OLD_MAX_PACKET_SIZE);
+
+        // Verify the receive buffer is large enough for the OS recv_from call
+        let mut recv_buf = [0u8; MAX_RECV_PACKET_SIZE];
+        assert!(recv_buf.len() >= OLD_MAX_PACKET_SIZE);
+        recv_buf[..OLD_MAX_PACKET_SIZE].copy_from_slice(&fake_received);
     }
 }

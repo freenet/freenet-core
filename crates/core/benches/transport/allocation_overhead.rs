@@ -9,11 +9,11 @@ use criterion::{BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 use std::sync::Arc;
 
-/// Maximum packet data size (same as transport layer)
-const MAX_PACKET_SIZE: usize = 1492;
+/// Maximum packet data size (same as transport layer MAX_PACKET_SIZE)
+const MAX_PACKET_SIZE: usize = 1200;
 
 /// Fragment size for stream tests (same as MAX_DATA_SIZE - overhead)
-const FRAGMENT_SIZE: usize = 1420;
+const FRAGMENT_SIZE: usize = 1130;
 
 /// Benchmark Arc<[u8]> vs Box<[u8]> creation from a buffer
 ///
