@@ -1,16 +1,19 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use byteorder::ByteOrder;
 use tokio::{
     fs::{File, OpenOptions},
     io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, BufReader, Error},
+    sync::Mutex,
 };
-
-use std::path::{Path, PathBuf};
-
-use tokio::sync::Mutex;
 
 use super::{EventKind, NetLogMessage, RouteEvent, NEW_RECORDS_TS};
 
 static FILE_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Log the incompatible-format warning only once per process lifetime.
+static LOGGED_COMPAT_WARNING: AtomicBool = AtomicBool::new(false);
 
 const RECORD_LENGTH: usize = core::mem::size_of::<u32>();
 const EVENT_KIND_LENGTH: usize = 1;
@@ -406,17 +409,32 @@ impl LogFile {
 
         let deserialized_records = tokio::task::spawn_blocking(move || {
             let mut filtered = vec![];
+            let mut skipped = 0usize;
             for buf in records {
-                let record: NetLogMessage = bincode::deserialize(&buf).inspect_err(|_| {
-                    tracing::error!(?buf, "deserialization error");
-                })?;
-                // tracing::info!(?record);
+                let record: NetLogMessage = match bincode::deserialize(&buf) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Skip records from older versions with incompatible
+                        // serialization format (e.g. PeerId field order change
+                        // in v0.2.9). The event log is only used for router
+                        // model training, so skipping stale records is safe.
+                        skipped += 1;
+                        continue;
+                    }
+                };
                 if let EventKind::Route(outcome) = record.kind {
                     let record_ts = record.datetime.timestamp();
                     if record_ts >= new_records_ts {
                         filtered.push(outcome);
                     }
                 }
+            }
+            if skipped > 0 && !LOGGED_COMPAT_WARNING.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    skipped,
+                    "skipped event log records with incompatible serialization format \
+                     (from a previous version); this warning will not repeat"
+                );
             }
             Ok::<_, anyhow::Error>(filtered)
         })
