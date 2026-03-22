@@ -560,9 +560,13 @@ impl Operation for PutOp {
 
                     // For originator PUTs, respond to client immediately after local
                     // upsert. Network propagation continues asynchronously via forwarding.
+                    //
                     // Uses raw try_send (not send_client_result) because the operation must
-                    // remain in the state map for routing — matches UPDATE's pattern in
-                    // request_update(). SessionActor deduplicates if a late completion arrives.
+                    // remain in the state map for routing. When the operation eventually
+                    // completes (via PutMsg::Response or no-next-hop), report_result will
+                    // send a second PutResponse through send_client_result. This duplicate
+                    // is safe: SessionActor.client_transactions is consumed on first
+                    // delivery, so the second send finds no recipients and is a no-op.
                     if is_originator {
                         let result_op = PutOp {
                             id,
