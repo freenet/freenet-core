@@ -2536,16 +2536,25 @@ impl Executor<Runtime> {
                 ) {
                     Ok(values) => Ok(DelegateResponse { key, values }),
                     Err(err) => {
-                        tracing::error!(
-                            delegate_key = %key,
-                            error = %err,
-                            phase = "execution_failed",
-                            "Failed executing delegate"
-                        );
-                        Err(ExecutorError::execution(
-                            err,
-                            Some(InnerOpError::Delegate(key)),
-                        ))
+                        let key_display = key.to_string();
+                        let exec_err =
+                            ExecutorError::execution(err, Some(InnerOpError::Delegate(key)));
+                        // Downgrade "not found" to warn — expected during legacy
+                        // migration probes when old delegate WASM isn't on this node
+                        if exec_err.is_missing_delegate() {
+                            tracing::warn!(
+                                delegate_key = %key_display,
+                                "Delegate not found in store (expected for migration probes)"
+                            );
+                        } else {
+                            tracing::error!(
+                                delegate_key = %key_display,
+                                error = %exec_err,
+                                phase = "execution_failed",
+                                "Failed executing delegate"
+                            );
+                        }
+                        Err(exec_err)
                     }
                 }
             }
