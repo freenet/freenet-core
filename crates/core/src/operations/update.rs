@@ -540,7 +540,11 @@ impl Operation for UpdateOp {
                                         value: value.clone(),
                                     });
                                 }
-                                new_state = None;
+                                // Keep op alive in ReceivedRequest state so the GC
+                                // task can detect timeouts and report failures.
+                                // Without a persisted state, SendAndComplete
+                                // would discard the op (and its stats) immediately.
+                                new_state = Some(UpdateState::ReceivedRequest);
                                 // Track where to forward this message
                                 forward_hop = Some(forward_addr);
 
