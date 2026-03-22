@@ -193,6 +193,12 @@ impl PutOp {
                 data.next_hop = next_target.socket_addr();
                 data.attempts_at_hop += 1;
 
+                // Update stats to point to the new target so timeouts/failures
+                // are reported against the correct peer (#3527).
+                if let Some(ref mut s) = self.stats {
+                    s.target_peer = next_target.clone();
+                }
+
                 // Reduce HTL on each retry to avoid full-depth traversal storms.
                 let retry_htl = (max_hops_to_live / (data.attempts_at_hop.max(1)))
                     .max(MIN_RETRY_HTL)
@@ -2783,5 +2789,128 @@ mod tests {
             }
             other => panic!("Expected ForwardingAck, got {other}"),
         }
+    }
+
+    // ── Intermediate node stats tracking tests (#3527) ─────────────────────
+
+    /// Non-finalized PUT with stats reports ContractOpFailure on timeout.
+    #[test]
+    fn test_put_failure_outcome_with_stats() {
+        let target = make_peer(9001);
+        let contract_key = make_contract_key(42);
+        let contract_location = Location::from(&contract_key);
+
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: Some(PutState::AwaitingResponse(AwaitingResponseData {
+                subscribe: false,
+                blocking_subscribe: false,
+                current_htl: 10,
+                contract_key,
+                next_hop: target.socket_addr(),
+                alternatives: vec![],
+                tried_peers: HashSet::new(),
+                attempts_at_hop: 1,
+                visited: VisitedPeers::default(),
+                retry_payload: None,
+            })),
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+            stats: Some(PutStats {
+                target_peer: target.clone(),
+                contract_location,
+            }),
+            ack_received: false,
+            speculative_paths: 0,
+        };
+
+        assert!(!op.finalized());
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(target_peer, &target);
+                assert_eq!(loc, contract_location);
+            }
+            other => panic!("Expected ContractOpFailure, got {:?}", other),
+        }
+    }
+
+    /// Non-finalized PUT without stats reports Incomplete.
+    #[test]
+    fn test_put_failure_outcome_without_stats() {
+        let contract_key = make_contract_key(42);
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: Some(PutState::AwaitingResponse(AwaitingResponseData {
+                subscribe: false,
+                blocking_subscribe: false,
+                current_htl: 10,
+                contract_key,
+                next_hop: None,
+                alternatives: vec![],
+                tried_peers: HashSet::new(),
+                attempts_at_hop: 1,
+                visited: VisitedPeers::default(),
+                retry_payload: None,
+            })),
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+            stats: None,
+            ack_received: false,
+            speculative_paths: 0,
+        };
+
+        assert!(!op.finalized());
+        assert!(
+            matches!(op.outcome(), OpOutcome::Incomplete),
+            "PUT without stats should return Incomplete"
+        );
+    }
+
+    /// retry_with_next_alternative updates stats.target_peer to the new target.
+    #[test]
+    fn test_put_retry_updates_stats_target() {
+        let original_target = make_peer(9001);
+        let alternative = make_peer(9002);
+        let contract_key = make_contract_key(42);
+        let contract_location = Location::from(&contract_key);
+
+        let op = PutOp {
+            id: Transaction::new::<PutMsg>(),
+            state: Some(PutState::AwaitingResponse(AwaitingResponseData {
+                subscribe: false,
+                blocking_subscribe: false,
+                current_htl: 10,
+                contract_key,
+                next_hop: original_target.socket_addr(),
+                alternatives: vec![alternative.clone()],
+                tried_peers: HashSet::new(),
+                attempts_at_hop: 1,
+                visited: VisitedPeers::default(),
+                retry_payload: Some(PutRetryPayload {
+                    contract: make_test_contract(&[0u8]),
+                    related_contracts: RelatedContracts::new(),
+                    value: WrappedState::new(vec![1, 2, 3]),
+                }),
+            })),
+            upstream_addr: None,
+            stats: Some(PutStats {
+                target_peer: original_target,
+                contract_location,
+            }),
+            ack_received: false,
+            speculative_paths: 0,
+        };
+
+        let (new_op, _msg) = match op.retry_with_next_alternative(10, &[]) {
+            Ok(result) => result,
+            Err(_) => panic!("retry should succeed with available alternative"),
+        };
+        let stats = new_op.stats.expect("stats should be present after retry");
+        assert_eq!(
+            stats.target_peer.socket_addr(),
+            alternative.socket_addr(),
+            "Stats target_peer should be updated to the alternative peer"
+        );
     }
 }

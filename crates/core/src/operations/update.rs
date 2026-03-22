@@ -336,7 +336,7 @@ impl Operation for UpdateOp {
         Box::pin(async move {
             let return_msg;
             let new_state;
-            let stats = self.stats;
+            let mut stats = self.stats;
             // Track the next hop when forwarding RequestUpdate to another peer
             let mut forward_hop: Option<SocketAddr> = None;
             let mut stream_data: Option<(StreamId, bytes::Bytes)> = None;
@@ -540,9 +540,20 @@ impl Operation for UpdateOp {
                                         value: value.clone(),
                                     });
                                 }
-                                new_state = None;
+                                // Keep op alive in ReceivedRequest state so the GC
+                                // task can detect timeouts and report failures.
+                                // Without a persisted state, SendAndComplete
+                                // would discard the op (and its stats) immediately.
+                                new_state = Some(UpdateState::ReceivedRequest);
                                 // Track where to forward this message
                                 forward_hop = Some(forward_addr);
+
+                                // Track the forward target so timeouts report to
+                                // PeerHealthTracker and the failure estimator (#3527).
+                                stats = Some(UpdateStats {
+                                    target: Some(forward_target),
+                                    contract_location: Some(Location::from(key)),
+                                });
                             } else {
                                 // No peers available and we don't have the contract - log error
                                 let candidates = op_manager
@@ -2713,5 +2724,67 @@ mod tests {
             }),
         );
         assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
+    }
+
+    // ── Intermediate node stats tracking tests (#3527) ─────────────────────
+
+    use crate::operations::test_utils::make_peer;
+
+    /// Non-finalized UPDATE with stats reports ContractOpFailure on timeout.
+    #[test]
+    fn test_update_failure_outcome_with_stats() {
+        let target = make_peer(9001);
+        let contract_location = Location::from(&make_contract_key(42));
+
+        let op = make_update_op(
+            Some(UpdateState::ReceivedRequest),
+            Some(UpdateStats {
+                target: Some(target.clone()),
+                contract_location: Some(contract_location),
+            }),
+        );
+
+        assert!(!op.finalized());
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(target_peer, &target);
+                assert_eq!(loc, contract_location);
+            }
+            other => panic!("Expected ContractOpFailure, got {other:?}"),
+        }
+    }
+
+    /// Non-finalized UPDATE without stats reports Incomplete.
+    #[test]
+    fn test_update_failure_outcome_without_stats() {
+        let op = make_update_op(Some(UpdateState::ReceivedRequest), None);
+
+        assert!(!op.finalized());
+        assert!(
+            matches!(op.outcome(), OpOutcome::Incomplete),
+            "UPDATE without stats should return Incomplete"
+        );
+    }
+
+    /// failure_routing_info() returns correct peer and location from stats.
+    #[test]
+    fn test_update_failure_routing_info() {
+        let target = make_peer(9002);
+        let contract_location = Location::from(&make_contract_key(42));
+
+        let op = make_update_op(
+            Some(UpdateState::ReceivedRequest),
+            Some(UpdateStats {
+                target: Some(target.clone()),
+                contract_location: Some(contract_location),
+            }),
+        );
+
+        let (peer, loc) = op.failure_routing_info().expect("should have routing info");
+        assert_eq!(peer, target);
+        assert_eq!(loc, contract_location);
     }
 }
