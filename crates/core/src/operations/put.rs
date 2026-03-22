@@ -558,6 +558,41 @@ impl Operation for PutOp {
                     // Network peer notification is now automatic via BroadcastStateChange
                     // event emitted by the executor when state changes. No manual triggering needed.
 
+                    // For client-initiated PUTs (originator), send PutResponse immediately
+                    // after local upsert succeeds. The client doesn't need to wait for
+                    // remote peer acknowledgment — the local state is authoritative.
+                    // Network propagation continues asynchronously via forwarding + broadcast.
+                    // This matches UPDATE's fire-and-forget pattern (update.rs:2073-2094).
+                    if is_originator {
+                        let put_result_op = PutOp {
+                            id,
+                            state: Some(PutState::Finished(FinishedData { key })),
+                            upstream_addr: None,
+                            stats: None,
+                            ack_received: false,
+                            speculative_paths: 0,
+                        };
+                        let host_result = put_result_op.to_host_result();
+                        // Use try_send to avoid blocking (see channel-safety.md).
+                        if let Err(error) = op_manager.result_router_tx.try_send((id, host_result))
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                error = %error,
+                                phase = "error",
+                                "Failed to send early PutResponse to client (channel full or closed)"
+                            );
+                        } else {
+                            tracing::info!(
+                                tx = %id,
+                                contract = %key,
+                                phase = "client_response",
+                                "Sent early PutResponse to client after local upsert; \
+                                 network propagation continues asynchronously"
+                            );
+                        }
+                    }
+
                     // Step 2: Determine if we should forward or respond
                     // Build skip list: include sender (upstream) and already-tried peers
                     let mut new_skip_list = skip_list.clone();
