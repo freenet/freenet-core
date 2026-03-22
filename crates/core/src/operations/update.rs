@@ -2726,22 +2726,19 @@ mod tests {
 
     use crate::operations::test_utils::make_peer;
 
-    /// An intermediate UPDATE forward with stats reports ContractOpFailure
-    /// on timeout, feeding PeerHealthTracker and the failure estimator.
+    /// Non-finalized UPDATE with stats reports ContractOpFailure on timeout.
     #[test]
     fn test_update_failure_outcome_with_stats() {
         let target = make_peer(9001);
         let contract_location = Location::from(&make_contract_key(42));
 
-        let op = UpdateOp {
-            id: Transaction::new::<UpdateMsg>(),
-            state: Some(UpdateState::ReceivedRequest),
-            stats: Some(UpdateStats {
+        let op = make_update_op(
+            Some(UpdateState::ReceivedRequest),
+            Some(UpdateStats {
                 target: Some(target.clone()),
                 contract_location: Some(contract_location),
             }),
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-        };
+        );
 
         assert!(!op.finalized());
         match op.outcome() {
@@ -2756,15 +2753,10 @@ mod tests {
         }
     }
 
-    /// An UPDATE without stats reports Incomplete — invisible to health tracking.
+    /// Non-finalized UPDATE without stats reports Incomplete.
     #[test]
     fn test_update_failure_outcome_without_stats() {
-        let op = UpdateOp {
-            id: Transaction::new::<UpdateMsg>(),
-            state: Some(UpdateState::ReceivedRequest),
-            stats: None,
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-        };
+        let op = make_update_op(Some(UpdateState::ReceivedRequest), None);
 
         assert!(!op.finalized());
         assert!(
@@ -2773,22 +2765,19 @@ mod tests {
         );
     }
 
-    /// failure_routing_info() returns correct peer and location when stats
-    /// are present.
+    /// failure_routing_info() returns correct peer and location from stats.
     #[test]
     fn test_update_failure_routing_info() {
         let target = make_peer(9002);
         let contract_location = Location::from(&make_contract_key(42));
 
-        let op = UpdateOp {
-            id: Transaction::new::<UpdateMsg>(),
-            state: Some(UpdateState::ReceivedRequest),
-            stats: Some(UpdateStats {
+        let op = make_update_op(
+            Some(UpdateState::ReceivedRequest),
+            Some(UpdateStats {
                 target: Some(target.clone()),
                 contract_location: Some(contract_location),
             }),
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-        };
+        );
 
         let (peer, loc) = op.failure_routing_info().expect("should have routing info");
         assert_eq!(peer, target);

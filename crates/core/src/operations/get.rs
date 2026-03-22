@@ -4905,29 +4905,35 @@ mod tests {
 
     use crate::ring::Location;
 
-    /// An intermediate GET forward with stats reports ContractOpFailure on
-    /// timeout, feeding PeerHealthTracker and the failure estimator.
-    #[test]
-    fn test_get_failure_outcome_with_stats() {
-        let target = make_peer(9001);
-        let contract_location = Location::random();
-
-        let op = GetOp {
+    fn make_get_op_with_stats(stats: Option<Box<GetStats>>) -> GetOp {
+        GetOp {
             id: Transaction::new::<GetMsg>(),
             state: Some(GetState::ReceivedRequest),
             result: None,
-            stats: Some(Box::new(GetStats {
-                next_peer: Some(target.clone()),
-                contract_location,
-                first_response_time: None,
-                transfer_time: None,
-            })),
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+            stats,
+            upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
-        };
+        }
+    }
+
+    fn make_get_stats(target: PeerKeyLocation, contract_location: Location) -> Option<Box<GetStats>> {
+        Some(Box::new(GetStats {
+            next_peer: Some(target),
+            contract_location,
+            first_response_time: None,
+            transfer_time: None,
+        }))
+    }
+
+    /// Non-finalized GET with stats reports ContractOpFailure on timeout.
+    #[test]
+    fn test_get_failure_outcome_with_stats() {
+        let target = make_peer(9001);
+        let contract_location = Location::random();
+        let op = make_get_op_with_stats(make_get_stats(target.clone(), contract_location));
 
         match op.outcome() {
             OpOutcome::ContractOpFailure {
@@ -4941,51 +4947,22 @@ mod tests {
         }
     }
 
-    /// A GET without stats reports Incomplete — invisible to health tracking.
-    /// This confirms the pre-fix blind spot for intermediate nodes.
+    /// Non-finalized GET without stats reports Incomplete.
     #[test]
     fn test_get_failure_outcome_without_stats() {
-        let op = GetOp {
-            id: Transaction::new::<GetMsg>(),
-            state: Some(GetState::ReceivedRequest),
-            result: None,
-            stats: None,
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-            local_fallback: None,
-            auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
-        };
-
+        let op = make_get_op_with_stats(None);
         assert!(
             matches!(op.outcome(), OpOutcome::Incomplete),
             "GET without stats should return Incomplete"
         );
     }
 
-    /// failure_routing_info() returns correct peer and location when stats
-    /// are present.
+    /// failure_routing_info() returns correct peer and location from stats.
     #[test]
     fn test_get_failure_routing_info() {
         let target = make_peer(9002);
         let contract_location = Location::random();
-
-        let op = GetOp {
-            id: Transaction::new::<GetMsg>(),
-            state: Some(GetState::ReceivedRequest),
-            result: None,
-            stats: Some(Box::new(GetStats {
-                next_peer: Some(target.clone()),
-                contract_location,
-                first_response_time: None,
-                transfer_time: None,
-            })),
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-            local_fallback: None,
-            auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
-        };
+        let op = make_get_op_with_stats(make_get_stats(target.clone(), contract_location));
 
         let (peer, loc) = op.failure_routing_info().expect("should have routing info");
         assert_eq!(peer, target);

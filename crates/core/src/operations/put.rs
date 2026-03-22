@@ -2793,8 +2793,7 @@ mod tests {
 
     // ── Intermediate node stats tracking tests (#3527) ─────────────────────
 
-    /// A PUT with stats but not finalized reports ContractOpFailure,
-    /// feeding PeerHealthTracker and the failure estimator.
+    /// Non-finalized PUT with stats reports ContractOpFailure on timeout.
     #[test]
     fn test_put_failure_outcome_with_stats() {
         let target = make_peer(9001);
@@ -2837,7 +2836,7 @@ mod tests {
         }
     }
 
-    /// A PUT without stats reports Incomplete — invisible to health tracking.
+    /// Non-finalized PUT without stats reports Incomplete.
     #[test]
     fn test_put_failure_outcome_without_stats() {
         let contract_key = make_contract_key(42);
