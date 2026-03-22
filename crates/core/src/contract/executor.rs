@@ -256,6 +256,19 @@ impl ExecutorError {
         self.fatal
     }
 
+    /// Returns true if the error is due to a missing delegate (not found in store).
+    /// This is expected during legacy migration probes and should be logged at
+    /// warn level rather than error.
+    pub fn is_missing_delegate(&self) -> bool {
+        matches!(
+            &self.inner,
+            Either::Left(err) if matches!(
+                err.as_ref(),
+                RequestError::DelegateError(StdDelegateError::Missing(_))
+            )
+        )
+    }
+
     pub fn unwrap_request(self) -> RequestError {
         match self.inner {
             Either::Left(err) => *err,

@@ -115,12 +115,21 @@ where
                 return accumulated_messages;
             }
             Err(err) => {
-                tracing::error!(
-                    delegate_key = %delegate_key,
-                    error = %err,
-                    phase = "execution_failed",
-                    "Failed executing delegate request"
-                );
+                // Downgrade "not found" to warn — expected during legacy
+                // migration probes when old delegate WASM isn't on this node
+                if err.is_missing_delegate() {
+                    tracing::warn!(
+                        delegate_key = %delegate_key,
+                        "Delegate not found in store (expected for migration probes)"
+                    );
+                } else {
+                    tracing::error!(
+                        delegate_key = %delegate_key,
+                        error = %err,
+                        phase = "execution_failed",
+                        "Failed executing delegate request"
+                    );
+                }
                 // Return whatever we accumulated so far
                 return accumulated_messages;
             }
