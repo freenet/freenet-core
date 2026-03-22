@@ -2791,7 +2791,7 @@ mod tests {
         use super::super::record_connect_uphill_timeout;
         use crate::message::Transaction;
         use crate::operations::connect::{
-            ConnectMsg, ConnectOp, ConnectRequest, ConnectState, RelayState,
+            ConnectMsg, ConnectOp, ConnectRequest, ConnectState, RelayState, DEFAULT_UPHILL_BUDGET,
         };
         use crate::operations::VisitedPeers;
         use crate::ring::{ConnectionManager, Location, PeerKeyLocation};
@@ -2815,6 +2815,7 @@ mod tests {
                     joiner: make_peer(5002),
                     ttl: 5,
                     visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
+                    uphill_budget: DEFAULT_UPHILL_BUDGET,
                 },
                 forwarded_to,
                 forwarded_at: Some(tokio::time::Instant::now()),

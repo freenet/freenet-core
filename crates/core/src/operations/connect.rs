@@ -227,8 +227,8 @@ impl fmt::Display for ConnectMsg {
         match self {
             ConnectMsg::Request { payload, .. } => write!(
                 f,
-                "ConnectRequest {{ desired: {}, ttl: {}, joiner: {} }}",
-                payload.desired_location, payload.ttl, payload.joiner
+                "ConnectRequest {{ desired: {}, ttl: {}, uphill: {}, joiner: {} }}",
+                payload.desired_location, payload.ttl, payload.uphill_budget, payload.joiner
             ),
             ConnectMsg::Response { payload, .. } => {
                 write!(f, "ConnectResponse {{ acceptor: {} }}", payload.acceptor,)
@@ -254,6 +254,17 @@ impl fmt::Display for ConnectMsg {
     }
 }
 
+/// Maximum number of uphill routing hops per CONNECT transaction.
+///
+/// Uphill routing occurs when a terminus peer cannot accept a connection
+/// (already connected, at capacity, NAT failure) and forwards the request
+/// away from the target to give other peers a chance.
+///
+/// This budget bounds amplification to O(UPHILL_BUDGET) messages per transaction,
+/// independent of TTL. With ~84% NAT hole-punch failure rate in production,
+/// 8 candidates give P(at least one success) ≈ 1 - 0.84^8 ≈ 72%.
+pub(crate) const DEFAULT_UPHILL_BUDGET: u8 = 8;
+
 /// Two-message request payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ConnectRequest {
@@ -270,6 +281,15 @@ pub(crate) struct ConnectRequest {
     /// Uses transaction-specific hashing for privacy (same peer hashes differently
     /// in different transactions, preventing topology inference).
     pub visited: VisitedPeers,
+    /// Remaining uphill routing budget. Decremented only when routing away
+    /// from the target (uphill hops). Normal toward-target hops use only TTL.
+    /// Bounds amplification to O(uphill_budget) per transaction regardless of TTL.
+    #[serde(default = "default_uphill_budget")]
+    pub uphill_budget: u8,
+}
+
+fn default_uphill_budget() -> u8 {
+    DEFAULT_UPHILL_BUDGET
 }
 
 /// Acceptance payload returned by candidates.
@@ -654,15 +674,15 @@ impl RelayState {
             // At terminus but should_accept() returned false (e.g., already connected
             // or at capacity). Route uphill to give other peers a chance to accept.
             //
-            // Uphill routing halves the forwarded TTL per hop to prevent
-            // amplification cascades at scale. Without this, 500-node networks
-            // with high connectivity generate O(nodes × TTL) uphill messages per
-            // maintenance cycle, overwhelming the transport layer.
-            // The burn applies only to the outgoing message (not self.request),
-            // so retries after rejection still have enough TTL.
-            // With TTL=15: forwarded as 7→3→1→reject (~3 uphill hops).
-            // With TTL=4: forwarded as 1→reject (~1 uphill hop).
-            if self.request.ttl >= 2 {
+            // Amplification is bounded by uphill_budget (separate from TTL).
+            // Each uphill hop decrements uphill_budget by 1 but only decrements
+            // TTL by the normal -1 (no extra burn). This separates the two concerns:
+            // - TTL controls network reach (how far a CONNECT can travel)
+            // - uphill_budget controls amplification (how many uphill retries)
+            //
+            // With DEFAULT_UPHILL_BUDGET=8 and ~84% NAT failure rate, peers get
+            // enough candidates for ~72% chance of finding a reachable acceptor.
+            if self.request.uphill_budget > 0 && self.request.ttl >= 2 {
                 let uphill_hop = ctx.select_uphill_hop(
                     self.request.desired_location,
                     &self.request.visited,
@@ -675,25 +695,25 @@ impl RelayState {
                     tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
+                        uphill_budget = self.request.uphill_budget,
                         uphill_peer = %uphill_peer.pub_key(),
                         uphill_loc = ?uphill_peer.location(),
                         ring_distance_to_target = ?dist,
                         "connect: at terminus but cannot accept, routing uphill"
                     );
-                    // Halve TTL on the forwarded request to limit uphill hops to
-                    // O(log TTL) instead of O(TTL). The burn is applied only to the
-                    // outgoing message, NOT to self.request.ttl, so that if this
-                    // uphill attempt is rejected and we retry with a different peer,
-                    // the retry still has enough TTL to proceed.
+                    // Decrement uphill_budget on both the forwarded request AND
+                    // self.request, so retries from the same relay also consume budget.
+                    // TTL is decremented normally (-1) by forward_to_peer — no extra burn.
                     let (peer, mut fwd_req) =
                         self.forward_to_peer(ctx, uphill_peer, forward_attempts, now);
-                    let extra_burn = fwd_req.ttl / 2;
-                    fwd_req.ttl = fwd_req.ttl.saturating_sub(extra_burn);
+                    fwd_req.uphill_budget = fwd_req.uphill_budget.saturating_sub(1);
+                    self.request.uphill_budget = self.request.uphill_budget.saturating_sub(1);
                     actions.forward = Some((peer, fwd_req));
                 } else {
                     tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
+                        uphill_budget = self.request.uphill_budget,
                         visited = ?self.request.visited,
                         "connect: at terminus, cannot accept, no uphill peers available — rejecting"
                     );
@@ -703,8 +723,9 @@ impl RelayState {
                 tracing::info!(
                     target = %self.request.desired_location,
                     ttl = self.request.ttl,
+                    uphill_budget = self.request.uphill_budget,
                     visited = ?self.request.visited,
-                    "connect: at terminus, cannot accept, TTL exhausted — rejecting"
+                    "connect: at terminus, cannot accept, uphill budget or TTL exhausted — rejecting"
                 );
                 actions.rejected = true;
             }
@@ -1197,6 +1218,7 @@ impl ConnectOp {
             joiner,
             ttl,
             visited,
+            uphill_budget: DEFAULT_UPHILL_BUDGET,
         };
 
         let op = ConnectOp::new_joiner(
@@ -2904,6 +2926,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -2955,6 +2978,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3003,6 +3027,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 2,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3049,6 +3074,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3117,6 +3143,7 @@ mod tests {
                 joiner: joiner_with_unknown_addr.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3187,6 +3214,7 @@ mod tests {
                 joiner: joiner_with_known_addr.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3294,6 +3322,7 @@ mod tests {
             joiner: joiner.clone(),
             ttl: 3,
             visited,
+            uphill_budget: DEFAULT_UPHILL_BUDGET,
         };
 
         let mut relay_op = ConnectOp::new_relay(
@@ -3378,6 +3407,7 @@ mod tests {
                 joiner: joiner_with_observed_addr.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3466,6 +3496,7 @@ mod tests {
             joiner: joiner.clone(),
             ttl: 3,
             visited,
+            uphill_budget: DEFAULT_UPHILL_BUDGET,
         };
 
         let mut relay_op = ConnectOp::new_relay(
@@ -3531,6 +3562,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3612,6 +3644,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3660,6 +3693,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3723,6 +3757,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3761,8 +3796,13 @@ mod tests {
             .expect("should route uphill when at terminus but cannot accept");
         assert_eq!(forward_to.pub_key(), uphill_peer.pub_key());
         assert_eq!(
-            request.ttl, 1,
-            "TTL should be decremented (-1) then halved for uphill forward: (3-1)/2 = 1"
+            request.ttl, 2,
+            "TTL should be decremented by 1 only (no extra burn): 3 - 1 = 2"
+        );
+        assert_eq!(
+            request.uphill_budget,
+            DEFAULT_UPHILL_BUDGET - 1,
+            "uphill_budget should be decremented by 1 on uphill forward"
         );
 
         // forwarded_to should be set
@@ -3785,6 +3825,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3838,6 +3879,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3875,6 +3917,56 @@ mod tests {
             actions.forward.is_none(),
             "should not forward uphill when TTL is exhausted"
         );
+    }
+
+    #[test]
+    fn no_uphill_routing_when_budget_exhausted() {
+        let self_loc = make_peer(4750);
+        let joiner = make_peer(5750);
+        let uphill_peer = make_peer(6750);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 5, // TTL is fine
+                visited: VisitedPeers::default(),
+                uphill_budget: 0, // Budget exhausted
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .next_hop(None)
+            .uphill_hop(Some(uphill_peer));
+
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
+
+        assert!(
+            actions.accept_response.is_none(),
+            "should not accept when should_accept() returns false"
+        );
+        assert!(
+            actions.forward.is_none(),
+            "should not forward uphill when budget is exhausted"
+        );
+        assert!(actions.rejected, "should reject when budget is exhausted");
     }
 
     // NOTE: A test for joiner_known = None was considered, but this edge case cannot
@@ -4043,6 +4135,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4082,6 +4175,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4120,6 +4214,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4168,6 +4263,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4232,6 +4328,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4536,6 +4633,7 @@ mod tests {
                 joiner: make_peer(5002),
                 ttl: 5,
                 visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: Some(relay_peer),
             forwarded_at: Some(Instant::now()),
