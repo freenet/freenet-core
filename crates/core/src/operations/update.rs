@@ -336,7 +336,7 @@ impl Operation for UpdateOp {
         Box::pin(async move {
             let return_msg;
             let new_state;
-            let stats = self.stats;
+            let mut stats = self.stats;
             // Track the next hop when forwarding RequestUpdate to another peer
             let mut forward_hop: Option<SocketAddr> = None;
             let mut stream_data: Option<(StreamId, bytes::Bytes)> = None;
@@ -543,6 +543,13 @@ impl Operation for UpdateOp {
                                 new_state = None;
                                 // Track where to forward this message
                                 forward_hop = Some(forward_addr);
+
+                                // Track the forward target so timeouts report to
+                                // PeerHealthTracker and the failure estimator (#3527).
+                                stats = Some(UpdateStats {
+                                    target: Some(forward_target),
+                                    contract_location: Some(Location::from(key)),
+                                });
                             } else {
                                 // No peers available and we don't have the contract - log error
                                 let candidates = op_manager
@@ -2713,5 +2720,78 @@ mod tests {
             }),
         );
         assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
+    }
+
+    // ── Intermediate node stats tracking tests (#3527) ─────────────────────
+
+    use crate::operations::test_utils::make_peer;
+
+    /// An intermediate UPDATE forward with stats reports ContractOpFailure
+    /// on timeout, feeding PeerHealthTracker and the failure estimator.
+    #[test]
+    fn test_update_failure_outcome_with_stats() {
+        let target = make_peer(9001);
+        let contract_location = Location::from(&make_contract_key(42));
+
+        let op = UpdateOp {
+            id: Transaction::new::<UpdateMsg>(),
+            state: Some(UpdateState::ReceivedRequest),
+            stats: Some(UpdateStats {
+                target: Some(target.clone()),
+                contract_location: Some(contract_location),
+            }),
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+        };
+
+        assert!(!op.finalized());
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(target_peer, &target);
+                assert_eq!(loc, contract_location);
+            }
+            other => panic!("Expected ContractOpFailure, got {other:?}"),
+        }
+    }
+
+    /// An UPDATE without stats reports Incomplete — invisible to health tracking.
+    #[test]
+    fn test_update_failure_outcome_without_stats() {
+        let op = UpdateOp {
+            id: Transaction::new::<UpdateMsg>(),
+            state: Some(UpdateState::ReceivedRequest),
+            stats: None,
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+        };
+
+        assert!(!op.finalized());
+        assert!(
+            matches!(op.outcome(), OpOutcome::Incomplete),
+            "UPDATE without stats should return Incomplete"
+        );
+    }
+
+    /// failure_routing_info() returns correct peer and location when stats
+    /// are present.
+    #[test]
+    fn test_update_failure_routing_info() {
+        let target = make_peer(9002);
+        let contract_location = Location::from(&make_contract_key(42));
+
+        let op = UpdateOp {
+            id: Transaction::new::<UpdateMsg>(),
+            state: Some(UpdateState::ReceivedRequest),
+            stats: Some(UpdateStats {
+                target: Some(target.clone()),
+                contract_location: Some(contract_location),
+            }),
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+        };
+
+        let (peer, loc) = op.failure_routing_info().expect("should have routing info");
+        assert_eq!(peer, target);
+        assert_eq!(loc, contract_location);
     }
 }

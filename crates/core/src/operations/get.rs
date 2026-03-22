@@ -1034,6 +1034,11 @@ impl GetOp {
                     remaining_alternatives = data.alternatives.len(),
                     "GET retrying with alternative peer after timeout"
                 );
+                // Update stats to point to the new target so timeouts/failures
+                // are reported against the correct peer (#3527).
+                if let Some(ref mut s) = self.stats {
+                    s.next_peer = Some(next_target.clone());
+                }
                 data.next_hop = next_target;
                 data.attempts_at_hop += 1;
                 let visited = data.visited.clone();
@@ -3098,7 +3103,12 @@ async fn try_forward_or_return(
                 visited: new_visited,
             }),
             result: None,
-            stats,
+            // Track the forward target so timeouts report to
+            // PeerHealthTracker and the failure estimator (#3527).
+            stats: stats.map(|mut s| {
+                s.next_peer = Some(target.clone());
+                s
+            }),
             upstream_addr,
             stream_data: None,
             local_fallback,
@@ -4889,5 +4899,96 @@ mod tests {
             !gc_would_retry(&new_op, 1),
             "Op with ACK on new path should NOT be retried"
         );
+    }
+
+    // ── Intermediate node stats tracking tests (#3527) ─────────────────────
+
+    use crate::ring::Location;
+
+    /// An intermediate GET forward with stats reports ContractOpFailure on
+    /// timeout, feeding PeerHealthTracker and the failure estimator.
+    #[test]
+    fn test_get_failure_outcome_with_stats() {
+        let target = make_peer(9001);
+        let contract_location = Location::random();
+
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: Some(GetState::ReceivedRequest),
+            result: None,
+            stats: Some(Box::new(GetStats {
+                next_peer: Some(target.clone()),
+                contract_location,
+                first_response_time: None,
+                transfer_time: None,
+            })),
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+            local_fallback: None,
+            auto_fetch: false,
+            ack_received: false,
+            speculative_paths: 0,
+        };
+
+        match op.outcome() {
+            OpOutcome::ContractOpFailure {
+                target_peer,
+                contract_location: loc,
+            } => {
+                assert_eq!(target_peer, &target);
+                assert_eq!(loc, contract_location);
+            }
+            other => panic!("Expected ContractOpFailure, got {other:?}"),
+        }
+    }
+
+    /// A GET without stats reports Incomplete — invisible to health tracking.
+    /// This confirms the pre-fix blind spot for intermediate nodes.
+    #[test]
+    fn test_get_failure_outcome_without_stats() {
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: Some(GetState::ReceivedRequest),
+            result: None,
+            stats: None,
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+            local_fallback: None,
+            auto_fetch: false,
+            ack_received: false,
+            speculative_paths: 0,
+        };
+
+        assert!(
+            matches!(op.outcome(), OpOutcome::Incomplete),
+            "GET without stats should return Incomplete"
+        );
+    }
+
+    /// failure_routing_info() returns correct peer and location when stats
+    /// are present.
+    #[test]
+    fn test_get_failure_routing_info() {
+        let target = make_peer(9002);
+        let contract_location = Location::random();
+
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: Some(GetState::ReceivedRequest),
+            result: None,
+            stats: Some(Box::new(GetStats {
+                next_peer: Some(target.clone()),
+                contract_location,
+                first_response_time: None,
+                transfer_time: None,
+            })),
+            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
+            local_fallback: None,
+            auto_fetch: false,
+            ack_received: false,
+            speculative_paths: 0,
+        };
+
+        let (peer, loc) = op.failure_routing_info().expect("should have routing info");
+        assert_eq!(peer, target);
+        assert_eq!(loc, contract_location);
     }
 }
