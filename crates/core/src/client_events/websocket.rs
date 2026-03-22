@@ -408,6 +408,8 @@ impl headers::Header for EncodingProtocolExt {
 struct ConnectionInfo {
     auth_token: Option<AuthToken>,
     encoding_protocol: Option<EncodingProtocol>,
+    /// Accepted for backward compatibility but ignored — streaming is always enabled.
+    #[allow(dead_code)]
     streaming: Option<bool>,
 }
 
@@ -415,7 +417,7 @@ async fn connection_info(
     Query(ConnectionInfo {
         auth_token: auth_token_q,
         encoding_protocol,
-        streaming,
+        streaming: _,
     }): Query<ConnectionInfo>,
     Extension(allowed_hosts): Extension<crate::server::AllowedHosts>,
     mut req: axum::extract::Request,
@@ -509,7 +511,8 @@ async fn connection_info(
     );
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
-    req.extensions_mut().insert(streaming.unwrap_or(false));
+    // `streaming` query parameter is accepted but ignored — streaming is now
+    // always enabled for payloads exceeding CHUNK_THRESHOLD (512 KiB).
 
     next.run(req).await
 }
@@ -518,7 +521,6 @@ async fn websocket_commands(
     ws: WebSocketUpgrade,
     Extension(auth_token): Extension<Option<AuthToken>>,
     Extension(encoding_protoc): Extension<EncodingProtocol>,
-    Extension(streaming): Extension<bool>,
     Extension(rs): Extension<WebSocketRequest>,
     Extension(origin_contracts): Extension<OriginContractMap>,
     Extension(api_version): Extension<ApiVersion>,
@@ -581,7 +583,6 @@ async fn websocket_commands(
             auth_and_instance,
             token_is_invalid,
             encoding_protoc,
-            streaming,
             api_version,
             ws,
         )
@@ -632,7 +633,6 @@ async fn websocket_interface(
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
     token_is_invalid: bool,
     encoding_protoc: EncodingProtocol,
-    streaming: bool,
     api_version: ApiVersion,
     ws: WebSocket,
 ) -> anyhow::Result<()> {
@@ -647,7 +647,6 @@ async fn websocket_interface(
     // capped at MAX_CONCURRENT_STREAMS (8).
     let mut conn_state = ConnectionState {
         encoding_protoc,
-        streaming,
         reassembly: freenet_stdlib::client_api::streaming::ReassemblyBuffer::new(),
         next_stream_id: 0,
     };
@@ -872,7 +871,7 @@ fn prepare_response_messages(
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
     use freenet_stdlib::client_api::streaming::{chunk_response, CHUNK_THRESHOLD};
 
-    if conn_state.streaming && payload.len() > CHUNK_THRESHOLD {
+    if payload.len() > CHUNK_THRESHOLD {
         let stream_id = conn_state.next_stream_id;
         conn_state.next_stream_id = conn_state.next_stream_id.wrapping_add(1);
 
@@ -916,7 +915,7 @@ async fn send_response_message(
 ) -> Result<(), axum::Error> {
     use freenet_stdlib::client_api::streaming::{chunk_response, CHUNK_THRESHOLD};
 
-    if conn_state.streaming && serialized.len() > CHUNK_THRESHOLD {
+    if serialized.len() > CHUNK_THRESHOLD {
         let stream_id = conn_state.next_stream_id;
         conn_state.next_stream_id = conn_state.next_stream_id.wrapping_add(1);
 
@@ -990,12 +989,11 @@ struct NewSubscription {
 
 struct ConnectionState {
     encoding_protoc: EncodingProtocol,
-    streaming: bool,
     reassembly: freenet_stdlib::client_api::streaming::ReassemblyBuffer,
     next_stream_id: u32,
 }
 
-/// Extract `StreamContent` metadata from a host response for streaming clients.
+/// Extract `StreamContent` metadata from a host response for `StreamHeader`.
 /// Returns `Some` for response types where incremental consumption is useful
 /// (currently `GetResponse`), `None` for all others.
 fn extract_stream_content(
@@ -1071,9 +1069,8 @@ async fn process_client_request(
 
     // Handle StreamChunk: reassemble chunked requests from any client.
     // freenet-stdlib 0.2.2+ automatically chunks large ClientRequest messages
-    // (>512 KiB) regardless of the streaming query parameter, so the server
-    // must always reassemble them. The `streaming` flag only controls whether
-    // the server *sends* chunked responses, not whether it accepts them.
+    // (>512 KiB), and the server always reassembles them. Both directions
+    // (client→server and server→client) chunk transparently above the threshold.
     let req = if let ClientRequest::StreamChunk {
         stream_id,
         index,
@@ -1543,10 +1540,9 @@ mod tests {
         chunk_request, ReassemblyBuffer, CHUNK_SIZE, CHUNK_THRESHOLD,
     };
 
-    fn test_conn_state(streaming: bool, encoding: EncodingProtocol) -> ConnectionState {
+    fn test_conn_state(encoding: EncodingProtocol) -> ConnectionState {
         ConnectionState {
             encoding_protoc: encoding,
-            streaming,
             reassembly: ReassemblyBuffer::new(),
             next_stream_id: 0,
         }
@@ -1826,25 +1822,44 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn no_streaming_sends_single_message() {
+    fn above_threshold_always_chunked() {
+        // Streaming is always enabled — any payload above CHUNK_THRESHOLD
+        // must be chunked regardless of client request parameters.
         let payload = vec![0xAB; CHUNK_THRESHOLD + 100];
-        let mut conn = test_conn_state(false, EncodingProtocol::Native);
+        let mut conn = test_conn_state(EncodingProtocol::Native);
 
         let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
 
-        assert_eq!(
-            messages.len(),
-            1,
-            "non-streaming must send exactly one message"
+        assert!(
+            messages.len() > 1,
+            "payload above threshold must be chunked"
         );
-        assert_eq!(messages[0], payload, "payload must be sent as-is");
-        assert_eq!(conn.next_stream_id, 0, "stream_id must not advance");
+        assert_eq!(conn.next_stream_id, 1, "stream_id must advance");
+
+        // Verify round-trip reassembly
+        let mut buf = ReassemblyBuffer::new();
+        let mut result = None;
+        for msg_bytes in &messages {
+            let resp: Result<HostResponse, ClientError> = bincode::deserialize(msg_bytes).unwrap();
+            if let Ok(HostResponse::StreamChunk {
+                stream_id,
+                index,
+                total,
+                data,
+            }) = resp
+            {
+                if let Ok(Some(complete)) = buf.receive_chunk(stream_id, index, total, data) {
+                    result = Some(complete);
+                }
+            }
+        }
+        assert_eq!(&result.unwrap()[..], &payload[..]);
     }
 
     #[test]
     fn payload_at_threshold_not_chunked() {
         let payload = vec![0xCC; CHUNK_THRESHOLD];
-        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        let mut conn = test_conn_state(EncodingProtocol::Native);
 
         let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
         assert_eq!(
@@ -1858,7 +1873,7 @@ mod tests {
     #[test]
     fn payload_below_threshold_not_chunked() {
         let payload = vec![0xCC; CHUNK_THRESHOLD - 1];
-        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        let mut conn = test_conn_state(EncodingProtocol::Native);
 
         let messages = prepare_response_messages(payload, &mut conn, None).unwrap();
         assert_eq!(messages.len(), 1);
@@ -1867,7 +1882,7 @@ mod tests {
     #[test]
     fn payload_above_threshold_is_chunked_and_reassembles() {
         let payload = vec![0xCC; CHUNK_THRESHOLD + 1];
-        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        let mut conn = test_conn_state(EncodingProtocol::Native);
 
         let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
         assert!(messages.len() > 1, "must produce multiple chunks");
@@ -1898,7 +1913,7 @@ mod tests {
     #[test]
     fn flatbuffers_chunked_serialization_succeeds() {
         let payload = vec![0xDD; CHUNK_THRESHOLD + 100];
-        let mut conn = test_conn_state(true, EncodingProtocol::Flatbuffers);
+        let mut conn = test_conn_state(EncodingProtocol::Flatbuffers);
 
         let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
         assert!(
@@ -1923,13 +1938,13 @@ mod tests {
         // When stream_content is Some, Flatbuffers path should still NOT
         // produce a StreamHeader (it's Native-only).
         let payload = vec![0xDD; CHUNK_THRESHOLD + 100];
-        let mut conn = test_conn_state(true, EncodingProtocol::Flatbuffers);
+        let mut conn = test_conn_state(EncodingProtocol::Flatbuffers);
         let content = freenet_stdlib::client_api::StreamContent::Raw;
 
         let messages_with_content =
             prepare_response_messages(payload.clone(), &mut conn, Some(content)).unwrap();
 
-        let mut conn2 = test_conn_state(true, EncodingProtocol::Flatbuffers);
+        let mut conn2 = test_conn_state(EncodingProtocol::Flatbuffers);
         let messages_without_content =
             prepare_response_messages(payload, &mut conn2, None).unwrap();
 
@@ -2100,7 +2115,7 @@ mod tests {
     fn native_sends_stream_header_before_chunks() {
         let payload = vec![0xEE; CHUNK_THRESHOLD + 100];
         let payload_len = payload.len();
-        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        let mut conn = test_conn_state(EncodingProtocol::Native);
         let content = freenet_stdlib::client_api::StreamContent::Raw;
 
         let messages = prepare_response_messages(payload, &mut conn, Some(content)).unwrap();
@@ -2129,7 +2144,7 @@ mod tests {
     fn stream_id_advances_only_for_chunked_sends() {
         let large = vec![0xFF; CHUNK_THRESHOLD + 1];
         let small = vec![0x00; 100];
-        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        let mut conn = test_conn_state(EncodingProtocol::Native);
 
         assert_eq!(conn.next_stream_id, 0);
         prepare_response_messages(large.clone(), &mut conn, None).unwrap();
@@ -2176,18 +2191,17 @@ mod tests {
         );
     }
 
-    // --- Non-streaming client StreamChunk reassembly test ---
+    // --- Inbound StreamChunk reassembly test ---
 
     #[test]
-    fn non_streaming_reassembles_stream_chunks() {
-        // Even when streaming=false, the server must reassemble StreamChunks
-        // because freenet-stdlib 0.2.2+ always chunks large requests client-side.
+    fn server_reassembles_inbound_stream_chunks() {
+        // The server must reassemble inbound StreamChunks from clients because
+        // freenet-stdlib 0.2.2+ always chunks large requests client-side.
         let payload = vec![0xFF; CHUNK_SIZE * 3];
         let chunks = chunk_request(payload.clone(), 42);
         assert_eq!(chunks.len(), 3);
 
-        // Simulate reassembly with streaming=false
-        let mut conn = test_conn_state(false, EncodingProtocol::Native);
+        let mut conn = test_conn_state(EncodingProtocol::Native);
         let mut result = None;
         for chunk in &chunks {
             if let ClientRequest::StreamChunk {
@@ -2209,7 +2223,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             payload,
-            "non-streaming connection must still reassemble StreamChunks"
+            "server must reassemble inbound StreamChunks"
         );
     }
 
@@ -2222,7 +2236,7 @@ mod tests {
         // Full round-trip deserialization of HostResponse FBS is not available
         // server-side (FBS decoding is implemented on the client/browser side).
         let payload = vec![0xDD; CHUNK_THRESHOLD + 100];
-        let mut conn = test_conn_state(true, EncodingProtocol::Flatbuffers);
+        let mut conn = test_conn_state(EncodingProtocol::Flatbuffers);
 
         let messages = prepare_response_messages(payload.clone(), &mut conn, None).unwrap();
         assert!(
@@ -2255,7 +2269,7 @@ mod tests {
     #[test]
     fn stream_id_wraps_at_u32_max() {
         let large = vec![0xFF; CHUNK_THRESHOLD + 1];
-        let mut conn = test_conn_state(true, EncodingProtocol::Native);
+        let mut conn = test_conn_state(EncodingProtocol::Native);
         conn.next_stream_id = u32::MAX;
 
         let messages = prepare_response_messages(large, &mut conn, None).unwrap();
