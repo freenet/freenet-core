@@ -4352,3 +4352,92 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
 
     Ok(())
 }
+
+/// Verifies that a repeated GET succeeds when the peer already has the contract
+/// cached with identical state. Uses a contract with strict update_state() that
+/// rejects no-op updates, which would cause the GET to fail if the caching path
+/// attempted a redundant PutQuery instead of skipping it.
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 300,
+    startup_wait_secs = 30,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_repeated_get_with_unchanged_state_succeeds(ctx: &mut TestContext) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-update-nochange";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    #[derive(Serialize, Deserialize)]
+    struct SimpleState {
+        value: String,
+        counter: u64,
+    }
+
+    let initial_state = SimpleState {
+        value: "hello".to_string(),
+        counter: 1,
+    };
+    let initial_state_bytes = serde_json::to_vec(&initial_state)?;
+    let wrapped_state = WrappedState::from(initial_state_bytes);
+
+    let gateway = ctx.node("gateway")?;
+    let peer_a = ctx.node("peer-a")?;
+
+    let (stream_gw, _) = connect_async(&gateway.ws_url()).await?;
+    let mut client_gw = WebApi::start(stream_gw);
+
+    let (stream_a, _) = connect_async(&peer_a.ws_url()).await?;
+    let mut client_a = WebApi::start(stream_a);
+
+    // PUT contract on gateway
+    tracing::info!("Step 1: PUT contract on gateway");
+    send_put_with_retry(
+        &mut client_gw,
+        wrapped_state.clone(),
+        contract.clone(),
+        "PUT on gateway",
+        Some(contract_key),
+    )
+    .await?;
+
+    // First GET from peer-a: fetches from network and caches locally
+    tracing::info!("Step 2: First GET from peer-a");
+    let (_contract_returned, first_get_state) =
+        get_contract(&mut client_a, contract_key, &peer_a.temp_dir_path).await?;
+
+    let first_state: SimpleState = serde_json::from_slice(first_get_state.as_ref())?;
+    assert_eq!(first_state.value, "hello");
+    assert_eq!(first_state.counter, 1);
+
+    // Second GET from peer-a: local cache already has identical state
+    tracing::info!("Step 3: Second GET from peer-a (already cached)");
+    make_get(&mut client_a, contract_key, false, false).await?;
+
+    let resp = tokio::time::timeout(Duration::from_secs(60), client_a.recv()).await;
+    match resp {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key,
+            state,
+            ..
+        }))) => {
+            assert_eq!(key, contract_key);
+            let second_state: SimpleState = serde_json::from_slice(state.as_ref())?;
+            assert_eq!(second_state.value, "hello");
+            assert_eq!(second_state.counter, 1);
+        }
+        Ok(Ok(other)) => {
+            bail!("Unexpected response on second GET: {:?}", other);
+        }
+        Ok(Err(e)) => {
+            bail!("Error on second GET: {}", e);
+        }
+        Err(_) => {
+            bail!("Timeout on second GET — caching path likely rejected the redundant state");
+        }
+    }
+
+    Ok(())
+}
