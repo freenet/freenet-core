@@ -4919,7 +4919,10 @@ mod tests {
         }
     }
 
-    fn make_get_stats(target: PeerKeyLocation, contract_location: Location) -> Option<Box<GetStats>> {
+    fn make_get_stats(
+        target: PeerKeyLocation,
+        contract_location: Location,
+    ) -> Option<Box<GetStats>> {
         Some(Box::new(GetStats {
             next_peer: Some(target),
             contract_location,
