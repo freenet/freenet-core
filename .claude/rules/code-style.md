@@ -302,6 +302,6 @@ Is this implementation logic?
 
 ```
 1. Run: cargo fmt
-2. Run: cargo clippy --all-targets --all-features
-3. Fix all warnings (CI enforces this)
+2. Run: cargo clippy -- -D warnings
+3. Fix all warnings (CI uses -D warnings — any warning is a build failure)
 ```
