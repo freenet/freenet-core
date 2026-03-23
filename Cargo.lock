@@ -1830,8 +1830,7 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d26e5c6bee9ffa0e2683bc8b41a7bd9f1e57e7fd49ac4f6ae433e5a82e9006df"
+source = "git+https://github.com/freenet/freenet-stdlib?branch=feat/improve-state-copying#9c1c15237644ba1339ded813e08d510373cb4bd3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1918,8 +1917,7 @@ dependencies = [
 [[package]]
 name = "freenet-stdlib"
 version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb859b413234ca077e5a3855653cdeed3574470ac63eb2a9b5b7e9ccc3cbc1d1"
+source = "git+https://github.com/freenet/freenet-stdlib?branch=feat/improve-state-copying#9c1c15237644ba1339ded813e08d510373cb4bd3"
 dependencies = [
  "arbitrary",
  "bincode",

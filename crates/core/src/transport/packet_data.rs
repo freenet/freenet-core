@@ -585,13 +585,16 @@ mod packet_type_discrimination_tests {
         // the IPv6 minimum MTU (1280), which is the most restrictive common path.
         const UDP_HEADER: usize = 8;
         const IPV4_HEADER: usize = 20;
-        assert!(
-            MAX_PACKET_SIZE + UDP_HEADER + IPV4_HEADER <= 1280,
-            "MAX_PACKET_SIZE {} would cause IP fragmentation on IPv6 minimum MTU paths \
-             (total {} > 1280)",
-            MAX_PACKET_SIZE,
-            MAX_PACKET_SIZE + UDP_HEADER + IPV4_HEADER,
-        );
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                MAX_PACKET_SIZE + UDP_HEADER + IPV4_HEADER <= 1280,
+                "MAX_PACKET_SIZE {} would cause IP fragmentation on IPv6 minimum MTU paths \
+                 (total {} > 1280)",
+                MAX_PACKET_SIZE,
+                MAX_PACKET_SIZE + UDP_HEADER + IPV4_HEADER,
+            );
+        }
     }
 
     #[test]
@@ -600,12 +603,15 @@ mod packet_type_discrimination_tests {
         // Verify that MAX_RECV_PACKET_SIZE can hold these and that PacketData
         // can be constructed at the receive buffer size.
         const OLD_MAX_PACKET_SIZE: usize = 1492;
-        assert!(
-            OLD_MAX_PACKET_SIZE <= MAX_RECV_PACKET_SIZE,
-            "Receive buffer ({}) must accommodate old peer packets ({})",
-            MAX_RECV_PACKET_SIZE,
-            OLD_MAX_PACKET_SIZE,
-        );
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                OLD_MAX_PACKET_SIZE <= MAX_RECV_PACKET_SIZE,
+                "Receive buffer ({}) must accommodate old peer packets ({})",
+                MAX_RECV_PACKET_SIZE,
+                OLD_MAX_PACKET_SIZE,
+            );
+        }
 
         // Verify PacketData can be constructed from old-size received data.
         // In production, recv_from fills a [0u8; MAX_RECV_PACKET_SIZE] buffer,
