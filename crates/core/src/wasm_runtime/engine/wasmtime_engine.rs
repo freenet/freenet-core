@@ -392,6 +392,13 @@ impl WasmEngine for WasmtimeEngine {
 
         // Replace the Store when no instances are live and the arena has
         // accumulated enough dead allocations (see STORE_REFRESH_THRESHOLD).
+        //
+        // NOTE: This relies on all RunningInstance owners calling drop_running_instance()
+        // (which calls engine.drop_instance()). If a RunningInstance leaks without
+        // engine cleanup (see RunningInstance::Drop warning in runtime.rs), the orphaned
+        // entry in self.instances prevents is_empty() from ever being true, and this
+        // refresh never fires. The recover_store() path (timeout/panic) handles that
+        // case by clearing all instances unconditionally.
         if self.instances.is_empty() && self.lifetime_instances >= STORE_REFRESH_THRESHOLD {
             tracing::info!(
                 lifetime_instances = self.lifetime_instances,
@@ -1855,16 +1862,27 @@ mod tests {
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
-        // Create STORE_REFRESH_THRESHOLD instances but keep one alive
+        // First, burn through most of the threshold with create/drop cycles
+        // so we don't need hundreds of simultaneous live instances.
+        let burn = STORE_REFRESH_THRESHOLD - 3;
+        for i in 0..burn {
+            let handle = engine
+                .create_instance(&module, i as i64, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
+            engine.drop_instance(&handle);
+        }
+        assert_eq!(engine.lifetime_instances, burn);
+
+        // Now create 3 live instances to cross the threshold
         let mut handles = Vec::new();
-        for i in 0..STORE_REFRESH_THRESHOLD {
+        for i in burn..STORE_REFRESH_THRESHOLD {
             let handle = engine
                 .create_instance(&module, i as i64, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             handles.push(handle);
         }
 
-        // Drop all but the last
+        // Drop all but the last — threshold exceeded but one instance is still live
         for handle in &handles[..handles.len() - 1] {
             engine.drop_instance(handle);
         }
@@ -1881,6 +1899,63 @@ mod tests {
             engine.lifetime_instances, 0,
             "lifetime_instances should be 0 after all instances dropped"
         );
+    }
+
+    /// Verify that recover_store (error path) also resets lifetime_instances.
+    #[test]
+    fn test_recover_store_resets_lifetime_instances() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        // Create some instances to bump the counter
+        for i in 0..10 {
+            let handle = engine
+                .create_instance(&module, i, 1024)
+                .expect("should succeed");
+            engine.drop_instance(&handle);
+        }
+        assert_eq!(engine.lifetime_instances, 10);
+
+        // Simulate timeout/panic recovery
+        engine.recover_store();
+        assert_eq!(
+            engine.lifetime_instances, 0,
+            "recover_store should reset lifetime_instances via replace_store"
+        );
+
+        // Engine should still work after recovery
+        let handle = engine
+            .create_instance(&module, 999, 1024)
+            .expect("should create instance after recovery");
+        engine.drop_instance(&handle);
+    }
+
+    /// Verify that store refresh works correctly when fuel metering is enabled.
+    #[test]
+    fn test_store_refresh_with_metering_enabled() {
+        let mut config = RuntimeConfig::default();
+        config.enable_metering = true;
+        config.max_execution_seconds = 10.0;
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        // Create and drop enough instances to trigger refresh
+        for i in 0..STORE_REFRESH_THRESHOLD {
+            let handle = engine
+                .create_instance(&module, i as i64, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
+            engine.drop_instance(&handle);
+        }
+
+        assert_eq!(engine.lifetime_instances, 0, "refresh should have fired");
+
+        // Verify that instance creation and WASM execution still work after
+        // refresh — the replacement store must have fuel set correctly.
+        let handle = engine
+            .create_instance(&module, 999_999, 1024)
+            .expect("should create instance after metered refresh");
+        engine.drop_instance(&handle);
     }
 
     /// Verify store refresh works correctly on Linux by checking virtual memory maps.
