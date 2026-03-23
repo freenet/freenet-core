@@ -135,7 +135,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use wasmtime::{
@@ -183,6 +183,18 @@ const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// while avoiding overly frequent refreshes.
 const STORE_REFRESH_THRESHOLD: u64 = 500;
 
+/// Maximum age of a Store before forced refresh, even with live instances.
+///
+/// Safety net for the case where orphaned instances (leaked without engine
+/// cleanup) prevent `instances.is_empty()` from ever being true. After this
+/// duration, `drop_instance` will force a store replacement regardless of
+/// live instance count, logging a warning about the orphaned entries.
+///
+/// 4 hours is chosen to limit virtual memory accumulation to ~12K mappings
+/// (~3K instances/hr on a busy gateway) while being long enough that it
+/// should never fire under normal operation.
+const STORE_MAX_AGE: Duration = Duration::from_secs(4 * 3600);
+
 /// Wasmtime 27.x backend implementation.
 pub(crate) struct WasmtimeEngine {
     /// The wasmtime Engine (shared, Arc-wrapped internally).
@@ -204,6 +216,8 @@ pub(crate) struct WasmtimeEngine {
     /// Instances created in the current Store; reset on `replace_store`.
     /// See [`STORE_REFRESH_THRESHOLD`].
     lifetime_instances: u64,
+    /// When the current Store was created. Used by [`STORE_MAX_AGE`] fallback.
+    store_created_at: Instant,
 }
 
 /// Host state for wasmtime Store, implementing ResourceLimiter for memory limits.
@@ -305,6 +319,7 @@ impl WasmEngine for WasmtimeEngine {
             enabled_metering,
             max_fuel,
             lifetime_instances: 0,
+            store_created_at: Instant::now(),
         })
     }
 
@@ -390,19 +405,26 @@ impl WasmEngine for WasmtimeEngine {
         self.instances.remove(&handle.id);
         MEM_ADDR.remove(&handle.id);
 
-        // Replace the Store when no instances are live and the arena has
-        // accumulated enough dead allocations (see STORE_REFRESH_THRESHOLD).
-        //
-        // NOTE: This relies on all RunningInstance owners calling drop_running_instance()
-        // (which calls engine.drop_instance()). If a RunningInstance leaks without
-        // engine cleanup (see RunningInstance::Drop warning in runtime.rs), the orphaned
-        // entry in self.instances prevents is_empty() from ever being true, and this
-        // refresh never fires. The recover_store() path (timeout/panic) handles that
-        // case by clearing all instances unconditionally.
-        if self.instances.is_empty() && self.lifetime_instances >= STORE_REFRESH_THRESHOLD {
+        let threshold_exceeded = self.lifetime_instances >= STORE_REFRESH_THRESHOLD;
+        let store_expired = self.store_created_at.elapsed() >= STORE_MAX_AGE;
+
+        if self.instances.is_empty() && threshold_exceeded {
+            // Normal path: all instances dropped and threshold exceeded.
             tracing::info!(
                 lifetime_instances = self.lifetime_instances,
                 "Refreshing engine store to reclaim virtual memory"
+            );
+            self.replace_store();
+        } else if threshold_exceeded && store_expired {
+            // Safety net: orphaned instances (leaked without engine cleanup) are
+            // preventing is_empty() from being true. After STORE_MAX_AGE, force
+            // a refresh to bound virtual memory growth. The orphaned Instance
+            // handles become invalid but they were already leaked and unusable.
+            tracing::warn!(
+                lifetime_instances = self.lifetime_instances,
+                orphaned_instances = self.instances.len(),
+                store_age_secs = self.store_created_at.elapsed().as_secs(),
+                "Force-refreshing engine store — orphaned instances preventing normal refresh"
             );
             self.replace_store();
         }
@@ -743,6 +765,7 @@ impl WasmtimeEngine {
             enabled_metering,
             max_fuel,
             lifetime_instances: 0,
+            store_created_at: Instant::now(),
         })
     }
 
@@ -838,6 +861,7 @@ impl WasmtimeEngine {
         self.instances.clear();
         self.store = Some(store);
         self.lifetime_instances = 0;
+        self.store_created_at = Instant::now();
     }
 
     fn compute_max_fuel(config: &RuntimeConfig) -> u64 {
