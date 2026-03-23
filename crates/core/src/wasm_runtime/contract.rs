@@ -96,9 +96,9 @@ impl ContractRuntimeInterface for super::Runtime {
                 state_buf.ptr()
             };
             let related_buf_ptr = {
-                let serialized = bincode::serialize(related)?;
-                let mut related_buf = self.init_buf(&running.handle, &serialized)?;
-                related_buf.write(serialized)?;
+                let size = bincode::serialized_size(related)? as usize;
+                let mut related_buf = self.init_buf_with_capacity(&running.handle, size)?;
+                bincode::serialize_into(&mut related_buf, related)?;
                 related_buf.ptr()
             };
 
@@ -147,13 +147,13 @@ impl ContractRuntimeInterface for super::Runtime {
             };
             let state_buf_ptr = {
                 let mut state_buf = self.init_buf(&running.handle, state)?;
-                state_buf.write(state.clone())?;
+                state_buf.write(state)?;
                 state_buf.ptr()
             };
             let update_data_buf_ptr = {
-                let serialized = bincode::serialize(update_data)?;
-                let mut update_data_buf = self.init_buf(&running.handle, &serialized)?;
-                update_data_buf.write(serialized)?;
+                let size = bincode::serialized_size(update_data)? as usize;
+                let mut update_data_buf = self.init_buf_with_capacity(&running.handle, size)?;
+                bincode::serialize_into(&mut update_data_buf, update_data)?;
                 update_data_buf.ptr()
             };
 
@@ -200,7 +200,7 @@ impl ContractRuntimeInterface for super::Runtime {
             };
             let state_buf_ptr = {
                 let mut state_buf = self.init_buf(&running.handle, state)?;
-                state_buf.write(state.clone())?;
+                state_buf.write(state)?;
                 state_buf.ptr()
             };
 
@@ -247,7 +247,7 @@ impl ContractRuntimeInterface for super::Runtime {
             };
             let state_buf_ptr = {
                 let mut state_buf = self.init_buf(&running.handle, state)?;
-                state_buf.write(state.clone())?;
+                state_buf.write(state)?;
                 state_buf.ptr()
             };
             let summary_buf_ptr = {
