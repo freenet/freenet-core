@@ -88,7 +88,7 @@ rand = "0.9"
 # Observability
 opentelemetry = "0.31"
 opentelemetry-jaeger = "0.22"
-opentelemetry-otlp = "0.31.0"
+opentelemetry-otlp = "0.31.1"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 tracing = "0.1"
 tracing-appender = "0.2"
