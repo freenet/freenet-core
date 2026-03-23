@@ -395,54 +395,70 @@ impl TopologyManager {
         // (Codex review catch: don't churn connections under load).
         let mut suppress_swap = false;
 
-        let adjustment: anyhow::Result<TopologyAdjustment> =
-            if current_connections > self.limits.max_connections {
+        let adjustment: anyhow::Result<TopologyAdjustment> = if current_connections
+            > self.limits.max_connections
+        {
+            debug!(
+                current_connections,
+                max_connections = self.limits.max_connections,
+                "Above max connections, removing"
+            );
+            self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Slow);
+            Ok(self.select_connections_to_remove(
+                &resource_type,
+                at_time,
+                my_location,
+                neighbor_locations,
+            ))
+        } else if usage_proportion < increase_usage_if_below {
+            // Cap growth: low bandwidth above this threshold likely reflects low
+            // demand (few contract operations), not insufficient connections.
+            let low_usage_cap =
+                (self.limits.min_connections as f64 * LOW_USAGE_CONNECTION_GROWTH_FACTOR) as usize;
+            if current_connections >= low_usage_cap {
                 debug!(
                     current_connections,
-                    max_connections = self.limits.max_connections,
-                    "Above max connections, removing"
+                    low_usage_cap,
+                    "Resource usage low but at low-usage connection cap — not adding"
                 );
-                self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Slow);
+                Ok(TopologyAdjustment::NoChange)
+            } else {
+                debug!(
+                    resource_type = ?resource_type,
+                    usage_proportion = ?usage_proportion,
+                    current_connections,
+                    low_usage_cap,
+                    "Resource usage below threshold, adding connection"
+                );
+                self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Fast);
+                let locations = Self::sample_targets(my_location, neighbor_locations, 1);
+                Ok(TopologyAdjustment::AddConnections(locations))
+            }
+        } else if usage_proportion > decrease_usage_if_above {
+            if current_connections <= self.limits.min_connections {
+                debug!(
+                    current_connections,
+                    min_connections = self.limits.min_connections,
+                    "Resource usage high but at min_connections — not removing"
+                );
+                suppress_swap = true;
+                Ok(TopologyAdjustment::NoChange)
+            } else {
+                debug!(
+                    resource_type = ?resource_type,
+                    usage_proportion = ?usage_proportion,
+                    "Resource usage above threshold, removing connection"
+                );
                 Ok(self.select_connections_to_remove(
                     &resource_type,
                     at_time,
                     my_location,
                     neighbor_locations,
                 ))
-            } else if usage_proportion < increase_usage_if_below {
-                debug!(
-                    resource_type = ?resource_type,
-                    usage_proportion = ?usage_proportion,
-                    "Resource usage below threshold, adding connection"
-                );
-                self.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Fast);
-                let locations = Self::sample_targets(my_location, neighbor_locations, 1);
-                Ok(TopologyAdjustment::AddConnections(locations))
-            } else if usage_proportion > decrease_usage_if_above {
-                if current_connections <= self.limits.min_connections {
-                    debug!(
-                        current_connections,
-                        min_connections = self.limits.min_connections,
-                        "Resource usage high but at min_connections — not removing"
-                    );
-                    suppress_swap = true;
-                    Ok(TopologyAdjustment::NoChange)
-                } else {
-                    debug!(
-                        resource_type = ?resource_type,
-                        usage_proportion = ?usage_proportion,
-                        "Resource usage above threshold, removing connection"
-                    );
-                    Ok(self.select_connections_to_remove(
-                        &resource_type,
-                        at_time,
-                        my_location,
-                        neighbor_locations,
-                    ))
-                }
-            } else {
-                Ok(TopologyAdjustment::NoChange)
-            };
+            }
+        } else {
+            Ok(TopologyAdjustment::NoChange)
+        };
 
         // Enforce max-connections cap: if we're still over after the main logic,
         // use fallback removal (drop the least topologically important peer).
@@ -2221,6 +2237,63 @@ mod tests {
         assert_ne!(
             dropped, far_peer,
             "Should NOT drop the distant peer (topology-critical unique long-range link)"
+        );
+    }
+
+    /// Regression test for #3630: low bandwidth should not trigger connection
+    /// growth when the peer already has enough connections. In a low-activity
+    /// network, bandwidth is always below 50% regardless of connection count,
+    /// so the "add connections" heuristic fires every tick, generating ~90%
+    /// of all network traffic as wasted CONNECT operations.
+    #[test_log::test]
+    fn test_low_usage_cap_prevents_excessive_connects() {
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 10,
+        };
+        let mut resource_manager = TopologyManager::new(limits);
+        let peers = generate_random_peers(20);
+        // Very low bandwidth — below 50% threshold
+        let bw_usage_by_peer: Vec<usize> = vec![5; 20];
+        let report_time = Instant::now() - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        report_resource_usage(
+            &mut resource_manager,
+            &peers,
+            &bw_usage_by_peer,
+            report_time,
+        );
+        let requests_per_peer: Vec<usize> = vec![1; 20];
+        report_outbound_requests(&mut resource_manager, &peers, &requests_per_peer);
+
+        let mut neighbor_locations = BTreeMap::new();
+        for peer in &peers {
+            neighbor_locations.insert(peer.location().unwrap(), vec![]);
+        }
+
+        // At 15 connections (min=10, cap=20): below cap, should still add
+        let adjustment =
+            resource_manager.adjust_topology(&neighbor_locations, &None, Instant::now(), 15);
+        assert!(
+            matches!(adjustment, TopologyAdjustment::AddConnections(_)),
+            "Should add connections when below low-usage cap, got {adjustment:?}"
+        );
+
+        // At 20 connections (= cap = min*2): should NOT add
+        let adjustment =
+            resource_manager.adjust_topology(&neighbor_locations, &None, Instant::now(), 20);
+        assert!(
+            matches!(adjustment, TopologyAdjustment::NoChange),
+            "Should not add connections at low-usage cap, got {adjustment:?}"
+        );
+
+        // At 25 connections (above cap): should NOT add
+        let adjustment =
+            resource_manager.adjust_topology(&neighbor_locations, &None, Instant::now(), 25);
+        assert!(
+            matches!(adjustment, TopologyAdjustment::NoChange),
+            "Should not add connections above low-usage cap, got {adjustment:?}"
         );
     }
 }
