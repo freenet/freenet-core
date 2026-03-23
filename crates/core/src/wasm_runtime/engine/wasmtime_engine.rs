@@ -86,10 +86,8 @@
 //!
 //! Uses wasmtime's default on-demand allocation — each instance gets its own
 //! mmap'd virtual memory region (~4 GiB guard pages), allocated at instantiation.
-//! **Note:** wasmtime's Store uses arena allocation — dropping an Instance handle
-//! does NOT reclaim its virtual memory. Only dropping the Store frees all
-//! accumulated mappings. The Store is periodically refreshed via `refresh_store`
-//! after `STORE_REFRESH_THRESHOLD` instance creations to prevent unbounded growth.
+//! Instance memory is only freed when the Store itself is dropped; see
+//! `STORE_REFRESH_THRESHOLD` and `replace_store()` for periodic reclamation.
 //!
 //! ## Compact Code Generation (Cranelift)
 //!
@@ -203,8 +201,8 @@ pub(crate) struct WasmtimeEngine {
     enabled_metering: bool,
     /// Max fuel for each execution (computed from max_execution_seconds).
     max_fuel: u64,
-    /// Total instances created in the current Store. Reset on store refresh.
-    /// Used to trigger periodic Store refresh to reclaim leaked virtual memory.
+    /// Instances created in the current Store; reset on `replace_store`.
+    /// See [`STORE_REFRESH_THRESHOLD`].
     lifetime_instances: u64,
 }
 
@@ -254,12 +252,10 @@ impl ResourceLimiter for HostState {
 
     /// Disable wasmtime's per-Store instance limit.
     ///
-    /// Wasmtime's `Store` has a monotonic instance counter (only incremented in
-    /// `Store::check_new_instance`, never decremented) with a default limit of 10,000.
-    /// We override this because the Store is long-lived and accumulates instances
-    /// across heartbeat cycles. The Store is periodically refreshed via
-    /// `refresh_store()` after `STORE_REFRESH_THRESHOLD` instances to reclaim
-    /// the virtual memory that accumulates in the Store's arena.
+    /// Wasmtime's `Store` has a monotonic instance counter (never decremented)
+    /// with a default limit of 10,000. We disable it because the Store is
+    /// long-lived; virtual memory is reclaimed by periodic `replace_store()`
+    /// calls instead (see [`STORE_REFRESH_THRESHOLD`]).
     fn instances(&self) -> usize {
         usize::MAX
     }
@@ -394,12 +390,14 @@ impl WasmEngine for WasmtimeEngine {
         self.instances.remove(&handle.id);
         MEM_ADDR.remove(&handle.id);
 
-        // Refresh the Store when no instances are live and the arena has
-        // accumulated enough dead allocations. wasmtime's Store is an arena:
-        // dropping Instance handles does NOT reclaim their virtual memory
-        // (~4 GiB guard region each). Only dropping the Store frees them.
+        // Replace the Store when no instances are live and the arena has
+        // accumulated enough dead allocations (see STORE_REFRESH_THRESHOLD).
         if self.instances.is_empty() && self.lifetime_instances >= STORE_REFRESH_THRESHOLD {
-            self.refresh_store();
+            tracing::info!(
+                lifetime_instances = self.lifetime_instances,
+                "Refreshing engine store to reclaim virtual memory"
+            );
+            self.replace_store();
         }
     }
 
@@ -761,8 +759,8 @@ impl WasmtimeEngine {
         //
         // Use wasmtime's default on-demand allocation strategy. Each instance
         // gets its own mmap'd memory region, allocated at instantiation time.
-        // NOTE: The Store's arena does not reclaim memory when instances are
-        // dropped — only when the Store itself is dropped. See refresh_store().
+        // NOTE: Instance memory is only freed when the Store is dropped.
+        // See STORE_REFRESH_THRESHOLD and replace_store().
         //
         // Wasmtime memory management:
         // 1. Frees compiled code when modules are dropped
@@ -816,24 +814,12 @@ impl WasmtimeEngine {
         self.replace_store();
     }
 
-    /// Proactively replace the Store to reclaim accumulated virtual memory.
-    ///
-    /// wasmtime's Store uses arena allocation: each instance's ~4 GiB virtual
-    /// memory reservation persists until the Store is dropped, even after the
-    /// Instance handle is removed. This method drops the old Store (freeing all
-    /// accumulated mmaps) and creates a fresh one.
-    ///
-    /// Called automatically by `drop_instance` when `lifetime_instances` exceeds
-    /// `STORE_REFRESH_THRESHOLD` and no instances are live.
-    fn refresh_store(&mut self) {
-        tracing::info!(
-            lifetime_instances = self.lifetime_instances,
-            "Refreshing engine store to reclaim virtual memory"
-        );
-        self.replace_store();
-    }
-
     /// Replace the Store with a fresh one, resetting the instance counter.
+    ///
+    /// Drops the old Store (freeing all accumulated virtual memory mappings)
+    /// and creates a fresh one. Called by `drop_instance` when
+    /// `lifetime_instances >= STORE_REFRESH_THRESHOLD` and no instances are live,
+    /// and by `recover_store` after a timeout/panic.
     fn replace_store(&mut self) {
         let mut store = Store::new(&self.engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|state| state);
@@ -1901,7 +1887,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_store_refresh_reduces_vm_maps() {
-        /// Count memory mappings for the current process
         fn count_maps() -> usize {
             std::fs::read_to_string("/proc/self/maps")
                 .expect("Failed to read /proc/self/maps")
@@ -1915,9 +1900,8 @@ mod tests {
 
         let baseline_maps = count_maps();
 
-        // Create and drop instances WITHOUT triggering refresh (stay under threshold)
-        let batch = (STORE_REFRESH_THRESHOLD - 1).min(100);
-        for i in 0..batch {
+        // Create and drop instances just below the threshold (no refresh yet)
+        for i in 0..STORE_REFRESH_THRESHOLD - 1 {
             let handle = engine
                 .create_instance(&module, i as i64, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
@@ -1925,24 +1909,19 @@ mod tests {
         }
 
         let leaked_maps = count_maps();
-        // Each instance creates ~3-4 memory mappings that aren't freed
         assert!(
             leaked_maps > baseline_maps,
             "Dropping instances without store refresh should accumulate maps: \
              baseline={baseline_maps}, after={leaked_maps}"
         );
 
-        // Now create one more to hit the threshold and trigger refresh
-        // First pad up to threshold - 1 if we haven't already
-        for i in batch..STORE_REFRESH_THRESHOLD {
-            let handle = engine
-                .create_instance(&module, i as i64, 1024)
-                .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
-            engine.drop_instance(&handle);
-        }
+        // One more instance hits the threshold and triggers refresh
+        let handle = engine
+            .create_instance(&module, STORE_REFRESH_THRESHOLD as i64, 1024)
+            .expect("final instance should succeed");
+        engine.drop_instance(&handle);
 
         let after_refresh_maps = count_maps();
-        // After refresh, the leaked maps should be reclaimed
         assert!(
             after_refresh_maps < leaked_maps,
             "Store refresh should reduce memory maps: \
