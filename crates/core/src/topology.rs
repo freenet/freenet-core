@@ -413,8 +413,9 @@ impl TopologyManager {
         } else if usage_proportion < increase_usage_if_below {
             // Cap growth: low bandwidth above this threshold likely reflects low
             // demand (few contract operations), not insufficient connections.
-            let low_usage_cap =
-                (self.limits.min_connections as f64 * LOW_USAGE_CONNECTION_GROWTH_FACTOR) as usize;
+            let low_usage_cap = ((self.limits.min_connections as f64
+                * LOW_USAGE_CONNECTION_GROWTH_FACTOR) as usize)
+                .min(self.limits.max_connections);
             if current_connections >= low_usage_cap {
                 debug!(
                     current_connections,
