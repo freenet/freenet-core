@@ -311,9 +311,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef488e176c95a18617414d4861dfd205d92a114afb006572fe6dd3e1fd055d09"
+checksum = "7c3ac04f50790cc912697afa60d303a9d3efff2a70e5f787192b7cd053ae2fb9"
 dependencies = [
  "bincode",
  "blake3",
