@@ -347,17 +347,14 @@ impl Runtime {
     ) -> RuntimeResult<*mut BufferBuilder> {
         use super::native_api::{PendingContractData, CONTRACT_IO};
 
-        // Header: 4 bytes for total payload length
+        // Header: 4 bytes for total payload length (LE u32)
         let header_size = 4usize;
-        debug_assert!(
-            data.len() <= u32::MAX as usize,
-            "streaming buffer payload exceeds u32::MAX ({} bytes)",
-            data.len()
-        );
+        if data.len() > u32::MAX as usize {
+            return Err(super::ContractExecError::InvalidArrayLength(data.len()).into());
+        }
         let buf_cap = max_cap.min(data.len().saturating_add(header_size));
         let mut buf = self.init_buf_with_capacity(handle, buf_cap)?;
 
-        // Write total_len header (LE u32)
         let total_len = data.len() as u32;
         buf.write(total_len.to_le_bytes())?;
 

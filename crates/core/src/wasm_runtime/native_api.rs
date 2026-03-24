@@ -94,11 +94,13 @@ pub(super) fn fill_buffer_impl(instance_id: InstanceId, buf_ptr_offset: i64) -> 
         return 0; // EOF
     }
     let Some(info) = MEM_ADDR.get(&instance_id) else {
-        tracing::warn!(
-            instance_id,
-            "fill_buffer_impl: MEM_ADDR missing for instance — returning EOF (possible data truncation)"
+        // This is a programming error: refresh_mem_addr_from_caller should always
+        // populate MEM_ADDR before this callback runs. Returning 0 here would
+        // silently truncate contract state, so we panic to surface the bug.
+        panic!(
+            "fill_buffer_impl: MEM_ADDR missing for instance {instance_id} — \
+             this indicates a bug in the WASM runtime (memory info not refreshed)"
         );
-        return 0;
     };
     // SAFETY: `start_ptr` and `mem_size` come from the live wasmtime Caller's memory
     // export, refreshed by `refresh_mem_addr_from_caller` before this function is called.
