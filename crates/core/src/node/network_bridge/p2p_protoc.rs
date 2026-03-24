@@ -4261,6 +4261,23 @@ impl P2pConnManager {
                     .enqueue(key, target.clone(), new_state.clone())
                     .await;
             }
+            // Emit broadcast emitted telemetry (issue #3622)
+            // Best-effort: broadcasted_to = target count since actual delivery is async
+            let update_tx =
+                crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+            if let Some(log) = NetEventLog::update_broadcast_emitted(
+                &update_tx,
+                &op_manager.ring,
+                key,
+                target_result.targets.clone(),
+                target_result.targets.len(),
+                new_state.clone(),
+            ) {
+                self.bridge
+                    .log_register
+                    .register_events(Either::Left(log))
+                    .await;
+            }
         }
         #[cfg(feature = "simulation_tests")]
         {
@@ -4515,6 +4532,18 @@ impl P2pConnManager {
                     );
                 }
             }
+        }
+
+        // Emit broadcast emitted telemetry (issue #3622)
+        if let Some(log) = NetEventLog::update_broadcast_emitted(
+            &update_tx,
+            &op_manager.ring,
+            key,
+            target_result.targets.clone(),
+            send_success,
+            new_state,
+        ) {
+            bridge.log_register.register_events(Either::Left(log)).await;
         }
 
         // Emit broadcast delivery summary telemetry (issue #3046)

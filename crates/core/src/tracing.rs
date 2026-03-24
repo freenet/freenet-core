@@ -801,6 +801,38 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create an Update broadcast emitted event.
+    ///
+    /// Emitted when this node broadcasts a state update to subscribed peers,
+    /// capturing which peers were targeted and how many sends succeeded.
+    pub fn update_broadcast_emitted(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        broadcast_to: Vec<PeerKeyLocation>,
+        broadcasted_to: usize,
+        value: WrappedState,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        let state_hash = Some(state_hash_short(&value));
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastEmitted {
+                id: *tx,
+                upstream: own_loc.clone(),
+                broadcast_to,
+                broadcasted_to,
+                key,
+                value,
+                sender: own_loc,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                state_hash,
+            }),
+        })
+    }
+
     /// Create a broadcast delivery summary event with the full breakdown of
     /// why each potential target was or was not sent the broadcast (issue #3046).
     pub fn broadcast_delivery_summary(
