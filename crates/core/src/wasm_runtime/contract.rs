@@ -1,10 +1,14 @@
 use super::engine::{WasmEngine, WasmError};
+use super::native_api::CONTRACT_IO;
 use super::{ContractExecError, RuntimeResult};
 use freenet_stdlib::prelude::{
     CodeHash, ContractContainer, ContractInstanceId, ContractInterfaceResult, ContractKey,
     Parameters, RelatedContracts, StateDelta, StateSummary, UpdateData, UpdateModification,
     ValidateResult, WrappedState,
 };
+
+/// Maximum buffer size for streaming refill pattern.
+const STREAMING_BUF_CAP: usize = 64 * 1024; // 64KB
 
 pub(crate) trait ContractRuntimeInterface {
     /// Verify that the state is valid, given the parameters.
@@ -71,6 +75,28 @@ pub(crate) trait ContractRuntimeBridge:
 {
 }
 
+/// RAII guard that cleans up CONTRACT_IO entries for an instance on drop.
+/// Ensures cleanup runs even if the contract call panics.
+struct ContractIoGuard {
+    instance_id: i64,
+}
+
+impl ContractIoGuard {
+    fn new(instance_id: i64) -> Self {
+        Self { instance_id }
+    }
+}
+
+impl Drop for ContractIoGuard {
+    fn drop(&mut self) {
+        // Each contract call inserts at most 3 entries (one per buffer argument),
+        // so the total CONTRACT_IO size is bounded by concurrent contract calls.
+        // The retain scan is acceptable at this scale; if concurrency grows
+        // significantly, switch to a two-level map (instance_id → per-buffer map).
+        CONTRACT_IO.retain(|(id, _), _| *id != self.instance_id);
+    }
+}
+
 impl ContractRuntimeInterface for super::Runtime {
     fn validate_state(
         &mut self,
@@ -81,26 +107,30 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<ValidateResult> {
             let linear_mem = self.linear_mem(&running.handle)?;
 
-            let param_buf_ptr = {
-                let mut param_buf = self.init_buf(&running.handle, parameters)?;
-                param_buf.write(parameters)?;
-                param_buf.ptr()
-            };
-            let state_buf_ptr = {
-                let mut state_buf = self.init_buf(&running.handle, state)?;
-                state_buf.write(state)?;
-                state_buf.ptr()
-            };
-            let related_buf_ptr = {
-                let size = bincode::serialized_size(related)? as usize;
-                let mut related_buf = self.init_buf_with_capacity(&running.handle, size)?;
-                bincode::serialize_into(&mut related_buf, related)?;
-                related_buf.ptr()
-            };
+            let param_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                parameters.as_ref(),
+                STREAMING_BUF_CAP,
+            )?;
+            let state_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                state.as_ref(),
+                STREAMING_BUF_CAP,
+            )?;
+            let related_serialized = bincode::serialize(related)?;
+            let related_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                &related_serialized,
+                STREAMING_BUF_CAP,
+            )?;
 
             let result = self.engine.call_3i64_blocking(
                 &running.handle,
@@ -136,26 +166,30 @@ impl ContractRuntimeInterface for super::Runtime {
         let req_bytes =
             parameters.size() + state.size() + update_data.iter().map(|e| e.size()).sum::<usize>();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<UpdateModification<'static>> {
             let linear_mem = self.linear_mem(&running.handle)?;
 
-            let param_buf_ptr = {
-                let mut param_buf = self.init_buf(&running.handle, parameters)?;
-                param_buf.write(parameters)?;
-                param_buf.ptr()
-            };
-            let state_buf_ptr = {
-                let mut state_buf = self.init_buf(&running.handle, state)?;
-                state_buf.write(state)?;
-                state_buf.ptr()
-            };
-            let update_data_buf_ptr = {
-                let size = bincode::serialized_size(update_data)? as usize;
-                let mut update_data_buf = self.init_buf_with_capacity(&running.handle, size)?;
-                bincode::serialize_into(&mut update_data_buf, update_data)?;
-                update_data_buf.ptr()
-            };
+            let param_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                parameters.as_ref(),
+                STREAMING_BUF_CAP,
+            )?;
+            let state_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                state.as_ref(),
+                STREAMING_BUF_CAP,
+            )?;
+            let update_data_serialized = bincode::serialize(update_data)?;
+            let update_data_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                &update_data_serialized,
+                STREAMING_BUF_CAP,
+            )?;
 
             let result = self.engine.call_3i64_blocking(
                 &running.handle,
@@ -189,20 +223,23 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<StateSummary<'static>> {
             let linear_mem = self.linear_mem(&running.handle)?;
 
-            let param_buf_ptr = {
-                let mut param_buf = self.init_buf(&running.handle, parameters)?;
-                param_buf.write(parameters)?;
-                param_buf.ptr()
-            };
-            let state_buf_ptr = {
-                let mut state_buf = self.init_buf(&running.handle, state)?;
-                state_buf.write(state)?;
-                state_buf.ptr()
-            };
+            let param_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                parameters.as_ref(),
+                STREAMING_BUF_CAP,
+            )?;
+            let state_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                state.as_ref(),
+                STREAMING_BUF_CAP,
+            )?;
 
             let result = self.engine.call_2i64_blocking(
                 &running.handle,
@@ -236,25 +273,29 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<StateDelta<'static>> {
             let linear_mem = self.linear_mem(&running.handle)?;
 
-            let param_buf_ptr = {
-                let mut param_buf = self.init_buf(&running.handle, parameters)?;
-                param_buf.write(parameters)?;
-                param_buf.ptr()
-            };
-            let state_buf_ptr = {
-                let mut state_buf = self.init_buf(&running.handle, state)?;
-                state_buf.write(state)?;
-                state_buf.ptr()
-            };
-            let summary_buf_ptr = {
-                let mut summary_buf = self.init_buf(&running.handle, summary)?;
-                summary_buf.write(summary)?;
-                summary_buf.ptr()
-            };
+            let param_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                parameters.as_ref(),
+                STREAMING_BUF_CAP,
+            )?;
+            let state_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                state.as_ref(),
+                STREAMING_BUF_CAP,
+            )?;
+            let summary_buf_ptr = self.write_streaming_buf(
+                &running.handle,
+                running.id,
+                summary.as_ref(),
+                STREAMING_BUF_CAP,
+            )?;
 
             let result = self.engine.call_3i64_blocking(
                 &running.handle,

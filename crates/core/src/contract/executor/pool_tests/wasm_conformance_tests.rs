@@ -89,11 +89,14 @@ async fn wasm_conformance_validate_state() -> Result<(), Box<dyn std::error::Err
     let mut wasm = setup_wasm_runtime().await?;
     let mut mock = setup_mock();
 
+    // Include a 100KB state to exercise the streaming refill path (STREAMING_BUF_CAP = 64KB)
+    let large_state: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
     let test_states = [
         WrappedState::new(vec![]),
         WrappedState::new(vec![1, 2, 3]),
         WrappedState::new(vec![0; 1024]),
         WrappedState::new(b"hello world".to_vec()),
+        WrappedState::new(large_state),
     ];
     let params = Parameters::from(vec![]);
     let related = RelatedContracts::default();
@@ -419,6 +422,75 @@ async fn wasm_conformance_empty_state() -> Result<(), Box<dyn std::error::Error>
     let md = mock.get_state_delta(&wasm.contract_key, &params, &empty, &summary)?;
     assert_eq!(wd.as_ref(), md.as_ref());
     assert!(wd.as_ref().is_empty());
+
+    Ok(())
+}
+
+// =========================================================================
+// Large state (>64KB): exercises the streaming refill path
+// =========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_conformance_large_state_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    let mut wasm = setup_wasm_runtime().await?;
+    let mut mock = setup_mock();
+
+    // 100KB state — exceeds the 64KB STREAMING_BUF_CAP, forcing at least one
+    // host refill callback during contract execution.
+    let large: Vec<u8> = (0u32..100_000).map(|i| (i % 251) as u8).collect();
+    let state = WrappedState::new(large);
+    let params = Parameters::from(vec![]);
+
+    // validate_state with large state
+    let wasm_valid =
+        wasm.runtime
+            .validate_state(&wasm.contract_key, &params, &state, &Default::default())?;
+    let mock_valid =
+        mock.validate_state(&wasm.contract_key, &params, &state, &Default::default())?;
+    assert_eq!(wasm_valid, mock_valid, "validate diverged on large state");
+
+    // summarize_state with large state
+    let wasm_summary = wasm
+        .runtime
+        .summarize_state(&wasm.contract_key, &params, &state)?;
+    let mock_summary = mock.summarize_state(&wasm.contract_key, &params, &state)?;
+    assert_eq!(
+        wasm_summary.as_ref(),
+        mock_summary.as_ref(),
+        "summarize diverged on large state"
+    );
+
+    // get_state_delta with large state
+    let wasm_delta =
+        wasm.runtime
+            .get_state_delta(&wasm.contract_key, &params, &state, &wasm_summary)?;
+    let mock_delta = mock.get_state_delta(&wasm.contract_key, &params, &state, &mock_summary)?;
+    assert_eq!(
+        wasm_delta.as_ref(),
+        mock_delta.as_ref(),
+        "get_state_delta diverged on large state"
+    );
+
+    // update_state with large delta
+    let old = WrappedState::new(vec![0]);
+    let wasm_updated = wasm.runtime.update_state(
+        &wasm.contract_key,
+        &params,
+        &old,
+        &[UpdateData::Delta(wasm_delta)],
+    )?;
+    let mock_updated = mock.update_state(
+        &wasm.contract_key,
+        &params,
+        &old,
+        &[UpdateData::Delta(mock_delta)],
+    )?;
+
+    assert_eq!(
+        wasm_updated.unwrap_valid().as_ref(),
+        mock_updated.unwrap_valid().as_ref(),
+        "update diverged on large state"
+    );
 
     Ok(())
 }
