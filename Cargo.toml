@@ -112,7 +112,7 @@ statrs = "0.18"
 test-log = "0.2"
 testresult = "0.4"
 turmoil = "0.7"
-ureq = { version = "3.1", features = ["json"] }
+ureq = { version = "3.3", features = ["json"] }
 which = "8.0"
 
 # Versioning
