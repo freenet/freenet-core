@@ -62,6 +62,80 @@ thread_local! {
 
 pub(super) type InstanceId = i64;
 
+// ---------------------------------------------------------------------------
+// Contract I/O: streaming refill buffers
+// ---------------------------------------------------------------------------
+
+/// Pending data for the streaming refill pattern.
+/// The host writes an initial chunk into the WASM buffer; the remainder
+/// is stored here and fed to the contract on demand via `fill_buffer_impl`.
+pub(super) struct PendingContractData {
+    pub data: Vec<u8>,
+    pub cursor: usize,
+}
+
+/// Per-instance, per-buffer pending data.
+/// Key: (instance_id, buffer_builder_ptr_offset_in_wasm).
+pub(super) static CONTRACT_IO: LazyLock<DashMap<(InstanceId, i64), PendingContractData>> =
+    LazyLock::new(DashMap::default);
+
+/// Host-side fill callback. Resets buffer to position 0, copies next chunk.
+///
+/// Called by the contract's `StreamingBuffer::read` when the buffer is exhausted.
+/// Returns the number of bytes written into the buffer, or 0 for EOF.
+pub(super) fn fill_buffer_impl(instance_id: InstanceId, buf_ptr_offset: i64) -> u32 {
+    use freenet_stdlib::memory::buf::{compute_ptr, BufferBuilder};
+    use freenet_stdlib::memory::WasmLinearMem;
+
+    let Some(mut pending) = CONTRACT_IO.get_mut(&(instance_id, buf_ptr_offset)) else {
+        return 0; // No pending data — all data fit in the initial buffer
+    };
+    if pending.cursor >= pending.data.len() {
+        return 0; // EOF
+    }
+    let Some(info) = MEM_ADDR.get(&instance_id) else {
+        tracing::warn!(
+            instance_id,
+            "fill_buffer_impl: MEM_ADDR missing for instance — returning EOF (possible data truncation)"
+        );
+        return 0;
+    };
+    // SAFETY: `start_ptr` and `mem_size` come from the live wasmtime Caller's memory
+    // export, refreshed by `refresh_mem_addr_from_caller` before this function is called.
+    let linear_mem =
+        unsafe { WasmLinearMem::new(info.start_ptr as *const u8, info.mem_size as u64) };
+
+    // Get the BufferBuilder in WASM memory
+    let builder_ptr = compute_ptr(buf_ptr_offset as *mut BufferBuilder, &linear_mem);
+    // SAFETY: `builder_ptr` was computed from the WASM-side buffer offset and the
+    // validated linear memory base. The buffer was allocated by `initiate_buffer`.
+    let builder = unsafe { &mut *builder_ptr };
+    let capacity = builder.capacity();
+
+    // SAFETY: The read/write pointers and data buffer are within the WASM linear
+    // memory region validated above. We reset them to 0 and write the next chunk.
+    unsafe {
+        // Reset read/write pointers to 0
+        let read_ptr = compute_ptr(builder.last_read_ptr(), &linear_mem);
+        let write_ptr = compute_ptr(builder.last_write_ptr(), &linear_mem);
+        *read_ptr = 0;
+        *write_ptr = 0;
+
+        // Copy next chunk from pending data into the buffer
+        let remaining = &pending.data[pending.cursor..];
+        let chunk_size = remaining.len().min(capacity);
+        let buf_data_ptr = compute_ptr(builder.start(), &linear_mem);
+        std::ptr::copy_nonoverlapping(remaining.as_ptr(), buf_data_ptr, chunk_size);
+
+        // Update write pointer to reflect bytes written
+        let write_ptr = compute_ptr(builder.last_write_ptr(), &linear_mem);
+        *write_ptr = chunk_size as u32;
+
+        pending.cursor += chunk_size;
+        chunk_size as u32
+    }
+}
+
 /// Error codes returned by host functions.
 ///
 /// Negative values indicate errors, non-negative values are success/data.

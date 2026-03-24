@@ -333,6 +333,54 @@ impl Runtime {
         }
     }
 
+    /// Write data into a streaming buffer with a `[total_len: u32]` header.
+    ///
+    /// Allocates a buffer of at most `max_cap` bytes, writes the header and
+    /// as much data as fits. If the data exceeds the buffer capacity, the
+    /// remainder is stored in `CONTRACT_IO` for on-demand refill.
+    pub(super) fn write_streaming_buf(
+        &mut self,
+        handle: &InstanceHandle,
+        instance_id: i64,
+        data: &[u8],
+        max_cap: usize,
+    ) -> RuntimeResult<*mut BufferBuilder> {
+        use super::native_api::{PendingContractData, CONTRACT_IO};
+
+        // Header: 4 bytes for total payload length
+        let header_size = 4usize;
+        debug_assert!(
+            data.len() <= u32::MAX as usize,
+            "streaming buffer payload exceeds u32::MAX ({} bytes)",
+            data.len()
+        );
+        let buf_cap = max_cap.min(data.len().saturating_add(header_size));
+        let mut buf = self.init_buf_with_capacity(handle, buf_cap)?;
+
+        // Write total_len header (LE u32)
+        let total_len = data.len() as u32;
+        buf.write(total_len.to_le_bytes())?;
+
+        // Write as much data as fits in the remaining capacity
+        let first_chunk_size = data.len().min(buf_cap - header_size);
+        buf.write(&data[..first_chunk_size])?;
+
+        let ptr = buf.ptr();
+
+        // Store remainder for the fill callback if data didn't fit
+        if first_chunk_size < data.len() {
+            CONTRACT_IO.insert(
+                (instance_id, ptr as i64),
+                PendingContractData {
+                    data: data[first_chunk_size..].to_vec(),
+                    cursor: 0,
+                },
+            );
+        }
+
+        Ok(ptr)
+    }
+
     pub(super) fn linear_mem(&mut self, handle: &InstanceHandle) -> RuntimeResult<WasmLinearMem> {
         let (ptr, size) = self.engine.memory_info(handle)?;
         // SAFETY: `ptr` and `size` come from the engine's live memory export for this

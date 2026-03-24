@@ -1123,6 +1123,18 @@ impl WasmtimeEngine {
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
+        // Contract I/O namespace: streaming refill buffer
+        linker
+            .func_wrap(
+                "freenet_contract_io",
+                "__frnt__fill_buffer",
+                |mut caller: Caller<'_, HostState>, id: i64, buf_ptr: i64| -> u32 {
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::fill_buffer_impl(id, buf_ptr)
+                },
+            )
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+
         Ok(())
     }
 }
