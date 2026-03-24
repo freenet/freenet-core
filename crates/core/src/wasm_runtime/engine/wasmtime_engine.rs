@@ -85,7 +85,9 @@
 //! ## On-Demand Instance Allocation
 //!
 //! Uses wasmtime's default on-demand allocation — each instance gets its own
-//! mmap'd memory region, allocated at instantiation and freed on drop.
+//! mmap'd virtual memory region (~4 GiB guard pages), allocated at instantiation.
+//! Instance memory is only freed when the Store itself is dropped; see
+//! `STORE_REFRESH_THRESHOLD` and `replace_store()` for periodic reclamation.
 //!
 //! ## Compact Code Generation (Cranelift)
 //!
@@ -133,7 +135,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use wasmtime::{
@@ -167,12 +169,39 @@ fn compile_coalesce_map() -> &'static DashMap<[u8; 32], Arc<Mutex<()>>> {
 /// WASM stack size in bytes (8 MiB).
 const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Refresh the Store after this many cumulative instance creations.
+///
+/// wasmtime's Store uses arena-style allocation for instances. When an Instance
+/// handle is dropped, the underlying virtual memory (4 GiB guard region per
+/// instance) is NOT reclaimed — it stays mapped until the entire Store is dropped.
+/// On a gateway with ~64 contracts and a 5-minute interest heartbeat, this means
+/// ~768 leaked memory mappings per hour. After ~70 days the process hits the
+/// kernel's vm.max_map_count limit (default 1M) and crashes.
+///
+/// Refreshing the Store drops the old arena and all its accumulated mappings.
+/// 500 is chosen to keep virtual memory overhead under ~2 TB (500 × 4 GiB)
+/// while avoiding overly frequent refreshes.
+const STORE_REFRESH_THRESHOLD: u64 = 500;
+
+/// Maximum age of a Store before forced refresh, even with live instances.
+///
+/// Safety net for the case where orphaned instances (leaked without engine
+/// cleanup) prevent `instances.is_empty()` from ever being true. After this
+/// duration, `drop_instance` will force a store replacement regardless of
+/// live instance count, logging a warning about the orphaned entries.
+///
+/// 4 hours is chosen to limit virtual memory accumulation to ~12K mappings
+/// (~3K instances/hr on a busy gateway) while being long enough that it
+/// should never fire under normal operation.
+const STORE_MAX_AGE: Duration = Duration::from_secs(4 * 3600);
+
 /// Wasmtime 27.x backend implementation.
 pub(crate) struct WasmtimeEngine {
     /// The wasmtime Engine (shared, Arc-wrapped internally).
     engine: Engine,
     /// The Store holds runtime state (memory, globals, etc).
-    /// Taken during blocking operations, restored after. Recreated on timeout/panic.
+    /// Taken during blocking operations, restored after. Recreated on timeout/panic
+    /// or when `lifetime_instances` exceeds `STORE_REFRESH_THRESHOLD`.
     store: Option<Store<HostState>>,
     /// Linker pre-configured with all host functions.
     linker: Linker<HostState>,
@@ -184,6 +213,11 @@ pub(crate) struct WasmtimeEngine {
     enabled_metering: bool,
     /// Max fuel for each execution (computed from max_execution_seconds).
     max_fuel: u64,
+    /// Instances created in the current Store; reset on `replace_store`.
+    /// See [`STORE_REFRESH_THRESHOLD`].
+    lifetime_instances: u64,
+    /// When the current Store was created. Used by [`STORE_MAX_AGE`] fallback.
+    store_created_at: Instant,
 }
 
 /// Host state for wasmtime Store, implementing ResourceLimiter for memory limits.
@@ -232,13 +266,10 @@ impl ResourceLimiter for HostState {
 
     /// Disable wasmtime's per-Store instance limit.
     ///
-    /// Wasmtime's `Store` has a monotonic instance counter (only incremented in
-    /// `Store::check_new_instance`, never decremented) with a default limit of 10,000.
-    /// Since freenet properly cleans up instances (drops them from the HashMap and frees
-    /// their memory), we hit this artificial limit during long-running gateway sessions
-    /// where the 5-minute interest heartbeat calls `summarize_state()` for every contract,
-    /// each creating a WASM instance. With hundreds of contracts the store exhausts
-    /// within ~100 minutes.
+    /// Wasmtime's `Store` has a monotonic instance counter (never decremented)
+    /// with a default limit of 10,000. We disable it because the Store is
+    /// long-lived; virtual memory is reclaimed by periodic `replace_store()`
+    /// calls instead (see [`STORE_REFRESH_THRESHOLD`]).
     fn instances(&self) -> usize {
         usize::MAX
     }
@@ -287,6 +318,8 @@ impl WasmEngine for WasmtimeEngine {
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
             max_fuel,
+            lifetime_instances: 0,
+            store_created_at: Instant::now(),
         })
     }
 
@@ -363,6 +396,7 @@ impl WasmEngine for WasmtimeEngine {
         Self::ensure_memory(store, &instance, req_bytes)?;
 
         self.instances.insert(id, instance);
+        self.lifetime_instances += 1;
 
         Ok(InstanceHandle { id })
     }
@@ -370,6 +404,30 @@ impl WasmEngine for WasmtimeEngine {
     fn drop_instance(&mut self, handle: &InstanceHandle) {
         self.instances.remove(&handle.id);
         MEM_ADDR.remove(&handle.id);
+
+        let threshold_exceeded = self.lifetime_instances >= STORE_REFRESH_THRESHOLD;
+        let store_expired = self.store_created_at.elapsed() >= STORE_MAX_AGE;
+
+        if self.instances.is_empty() && threshold_exceeded {
+            // Normal path: all instances dropped and threshold exceeded.
+            tracing::info!(
+                lifetime_instances = self.lifetime_instances,
+                "Refreshing engine store to reclaim virtual memory"
+            );
+            self.replace_store();
+        } else if threshold_exceeded && store_expired {
+            // Safety net: orphaned instances (leaked without engine cleanup) are
+            // preventing is_empty() from being true. After STORE_MAX_AGE, force
+            // a refresh to bound virtual memory growth. The orphaned Instance
+            // handles become invalid but they were already leaked and unusable.
+            tracing::warn!(
+                lifetime_instances = self.lifetime_instances,
+                orphaned_instances = self.instances.len(),
+                store_age_secs = self.store_created_at.elapsed().as_secs(),
+                "Force-refreshing engine store — orphaned instances preventing normal refresh"
+            );
+            self.replace_store();
+        }
     }
 
     fn memory_info(&mut self, handle: &InstanceHandle) -> Result<(*const u8, usize), WasmError> {
@@ -706,6 +764,8 @@ impl WasmtimeEngine {
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
             max_fuel,
+            lifetime_instances: 0,
+            store_created_at: Instant::now(),
         })
     }
 
@@ -728,8 +788,9 @@ impl WasmtimeEngine {
         // ==================================================================
         //
         // Use wasmtime's default on-demand allocation strategy. Each instance
-        // gets its own mmap'd memory region, allocated at instantiation time
-        // and freed when the instance is dropped.
+        // gets its own mmap'd memory region, allocated at instantiation time.
+        // NOTE: Instance memory is only freed when the Store is dropped.
+        // See STORE_REFRESH_THRESHOLD and replace_store().
         //
         // Wasmtime memory management:
         // 1. Frees compiled code when modules are dropped
@@ -773,24 +834,34 @@ impl WasmtimeEngine {
     /// Recover the engine after a timeout or panic that consumed the store.
     ///
     /// Creates a fresh Store and clears all instance references (they were tied
-    /// to the old store and are now invalid). The pooling allocator reclaims
-    /// those instance slots when the old Store is dropped by the abandoned task.
+    /// to the old store and are now invalid). Dropping the old Store frees all
+    /// accumulated virtual memory mappings.
     fn recover_store(&mut self) {
         tracing::warn!(
             orphaned_instances = self.instances.len(),
             "Recovering engine store after timeout/panic — creating fresh store"
         );
+        self.replace_store();
+    }
+
+    /// Replace the Store with a fresh one, resetting the instance counter.
+    ///
+    /// Drops the old Store (freeing all accumulated virtual memory mappings)
+    /// and creates a fresh one. Called by `drop_instance` when
+    /// `lifetime_instances >= STORE_REFRESH_THRESHOLD` and no instances are live,
+    /// and by `recover_store` after a timeout/panic.
+    fn replace_store(&mut self) {
         let mut store = Store::new(&self.engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|state| state);
         if self.enabled_metering {
             if let Err(e) = store.set_fuel(self.max_fuel) {
-                tracing::error!("Failed to set fuel on recovery store: {e}");
+                tracing::error!("Failed to set fuel on replacement store: {e}");
             }
         }
-        // Old instances are invalid without their store — clear them so the
-        // pooling allocator can reclaim the slots when the old store drops.
         self.instances.clear();
         self.store = Some(store);
+        self.lifetime_instances = 0;
+        self.store_created_at = Instant::now();
     }
 
     fn compute_max_fuel(config: &RuntimeConfig) -> u64 {
@@ -1783,5 +1854,191 @@ mod tests {
         );
 
         engine.drop_instance(&handle);
+    }
+
+    /// Verify that the Store is refreshed after STORE_REFRESH_THRESHOLD instances,
+    /// reclaiming virtual memory from wasmtime's arena allocator.
+    #[test]
+    fn test_store_refresh_reclaims_virtual_memory() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        // Create and drop exactly STORE_REFRESH_THRESHOLD instances.
+        // The last drop_instance should trigger a store refresh.
+        for i in 0..STORE_REFRESH_THRESHOLD {
+            let handle = engine
+                .create_instance(&module, i as i64, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
+            engine.drop_instance(&handle);
+        }
+
+        // After refresh, lifetime_instances should be reset to 0
+        assert_eq!(
+            engine.lifetime_instances, 0,
+            "lifetime_instances should be 0 after store refresh"
+        );
+
+        // Engine should still be healthy and able to create new instances
+        assert!(
+            engine.is_healthy(),
+            "engine should be healthy after refresh"
+        );
+        let handle = engine
+            .create_instance(&module, 999_999, 1024)
+            .expect("should create instance after refresh");
+        engine.drop_instance(&handle);
+    }
+
+    /// Verify that the Store is NOT refreshed when instances are still live,
+    /// even if lifetime_instances exceeds the threshold.
+    #[test]
+    fn test_store_not_refreshed_with_live_instances() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        // First, burn through most of the threshold with create/drop cycles
+        // so we don't need hundreds of simultaneous live instances.
+        let burn = STORE_REFRESH_THRESHOLD - 3;
+        for i in 0..burn {
+            let handle = engine
+                .create_instance(&module, i as i64, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
+            engine.drop_instance(&handle);
+        }
+        assert_eq!(engine.lifetime_instances, burn);
+
+        // Now create 3 live instances to cross the threshold
+        let mut handles = Vec::new();
+        for i in burn..STORE_REFRESH_THRESHOLD {
+            let handle = engine
+                .create_instance(&module, i as i64, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
+            handles.push(handle);
+        }
+
+        // Drop all but the last — threshold exceeded but one instance is still live
+        for handle in &handles[..handles.len() - 1] {
+            engine.drop_instance(handle);
+        }
+
+        // lifetime_instances should NOT be reset — one instance is still live
+        assert_eq!(
+            engine.lifetime_instances, STORE_REFRESH_THRESHOLD,
+            "lifetime_instances should NOT reset while instances are live"
+        );
+
+        // Drop the last instance — now refresh should trigger
+        engine.drop_instance(handles.last().unwrap());
+        assert_eq!(
+            engine.lifetime_instances, 0,
+            "lifetime_instances should be 0 after all instances dropped"
+        );
+    }
+
+    /// Verify that recover_store (error path) also resets lifetime_instances.
+    #[test]
+    fn test_recover_store_resets_lifetime_instances() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        // Create some instances to bump the counter
+        for i in 0..10 {
+            let handle = engine
+                .create_instance(&module, i, 1024)
+                .expect("should succeed");
+            engine.drop_instance(&handle);
+        }
+        assert_eq!(engine.lifetime_instances, 10);
+
+        // Simulate timeout/panic recovery
+        engine.recover_store();
+        assert_eq!(
+            engine.lifetime_instances, 0,
+            "recover_store should reset lifetime_instances via replace_store"
+        );
+
+        // Engine should still work after recovery
+        let handle = engine
+            .create_instance(&module, 999, 1024)
+            .expect("should create instance after recovery");
+        engine.drop_instance(&handle);
+    }
+
+    /// Verify that store refresh works correctly when fuel metering is enabled.
+    #[test]
+    fn test_store_refresh_with_metering_enabled() {
+        let config = RuntimeConfig {
+            enable_metering: true,
+            max_execution_seconds: 10.0,
+            ..Default::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        // Create and drop enough instances to trigger refresh
+        for i in 0..STORE_REFRESH_THRESHOLD {
+            let handle = engine
+                .create_instance(&module, i as i64, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
+            engine.drop_instance(&handle);
+        }
+
+        assert_eq!(engine.lifetime_instances, 0, "refresh should have fired");
+
+        // Verify that instance creation and WASM execution still work after
+        // refresh — the replacement store must have fuel set correctly.
+        let handle = engine
+            .create_instance(&module, 999_999, 1024)
+            .expect("should create instance after metered refresh");
+        engine.drop_instance(&handle);
+    }
+
+    /// Verify store refresh works correctly on Linux by checking virtual memory maps.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_store_refresh_reduces_vm_maps() {
+        fn count_maps() -> usize {
+            std::fs::read_to_string("/proc/self/maps")
+                .expect("Failed to read /proc/self/maps")
+                .lines()
+                .count()
+        }
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        let baseline_maps = count_maps();
+
+        // Create and drop instances just below the threshold (no refresh yet)
+        for i in 0..STORE_REFRESH_THRESHOLD - 1 {
+            let handle = engine
+                .create_instance(&module, i as i64, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
+            engine.drop_instance(&handle);
+        }
+
+        let leaked_maps = count_maps();
+        assert!(
+            leaked_maps > baseline_maps,
+            "Dropping instances without store refresh should accumulate maps: \
+             baseline={baseline_maps}, after={leaked_maps}"
+        );
+
+        // One more instance hits the threshold and triggers refresh
+        let handle = engine
+            .create_instance(&module, STORE_REFRESH_THRESHOLD as i64, 1024)
+            .expect("final instance should succeed");
+        engine.drop_instance(&handle);
+
+        let after_refresh_maps = count_maps();
+        assert!(
+            after_refresh_maps < leaked_maps,
+            "Store refresh should reduce memory maps: \
+             before_refresh={leaked_maps}, after_refresh={after_refresh_maps}"
+        );
     }
 }

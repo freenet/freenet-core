@@ -8,6 +8,18 @@ pub(super) const OUTBOUND_REQUEST_COUNTER_WINDOW_SIZE: usize = 10000;
 pub(super) const MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION: f64 = 0.5;
 pub(super) const MAXIMUM_DESIRED_RESOURCE_USAGE_PROPORTION: f64 = 0.9;
 
+/// Cap on how far above `min_connections` the low-bandwidth heuristic can grow.
+///
+/// When bandwidth usage is below `MINIMUM_DESIRED_RESOURCE_USAGE_PROPORTION`,
+/// `adjust_topology` adds connections — but only up to `min_connections * factor`.
+/// Beyond this cap, low bandwidth is assumed to reflect low demand (few contract
+/// operations), not insufficient connections.
+///
+/// Without this cap, every peer in a low-activity network perpetually initiates
+/// CONNECT operations every 60s tick, generating ~90% of all network traffic.
+/// See: <https://github.com/freenet/freenet-core/issues/3630>
+pub(super) const LOW_USAGE_CONNECTION_GROWTH_FACTOR: f64 = 2.0;
+
 /// Minimum connections before switching from location-based to Kleinberg target selection.
 /// Below this threshold, peers target their own location to build local neighborhoods.
 /// At or above this threshold, peers use Kleinberg 1/d sampling for optimal ring coverage.

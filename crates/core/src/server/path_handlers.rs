@@ -343,7 +343,7 @@ fn shell_page(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Freenet</title>
 <link rel="icon" type="image/svg+xml" href="{favicon}">
-<style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none}}</style>
+<style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
 </head>
 <body>
 <iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" src="{iframe_src}"></iframe>
