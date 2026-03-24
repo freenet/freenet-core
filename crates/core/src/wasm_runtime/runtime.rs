@@ -62,6 +62,9 @@ pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 1024;
 pub(super) struct RunningInstance {
     pub id: i64,
     pub handle: InstanceHandle,
+    /// Whether the contract imports `freenet_contract_io` (streaming buffer support).
+    /// Contracts compiled against stdlib >= 0.3.4 have this; older ones don't.
+    pub supports_streaming: bool,
     /// Set to true when the engine instance has been explicitly cleaned up.
     dropped_from_engine: bool,
 }
@@ -80,9 +83,15 @@ impl RunningInstance {
         let (ptr, size) = engine.memory_info(&handle)?;
         native_api::MEM_ADDR.insert(id, InstanceInfo::new(ptr as i64, size, key));
 
+        // Detect if the contract supports streaming buffers by checking
+        // whether it imports the freenet_contract_io namespace. Contracts
+        // compiled against stdlib >= 0.3.4 have this import.
+        let supports_streaming = engine.module_has_streaming_io(module);
+
         Ok(Self {
             id,
             handle,
+            supports_streaming,
             dropped_from_engine: false,
         })
     }
@@ -377,6 +386,43 @@ impl Runtime {
         }
 
         Ok(ptr)
+    }
+
+    /// Write data into a WASM buffer, choosing between the streaming protocol
+    /// (for contracts compiled against stdlib >= 0.3.4) and the legacy one-shot
+    /// protocol (for older contracts).
+    pub(super) fn write_contract_buf(
+        &mut self,
+        running: &RunningInstance,
+        data: &[u8],
+        max_cap: usize,
+    ) -> RuntimeResult<*mut BufferBuilder> {
+        if running.supports_streaming {
+            self.write_streaming_buf(&running.handle, running.id, data, max_cap)
+        } else {
+            let mut buf = self.init_buf(&running.handle, data)?;
+            buf.write(data)?;
+            Ok(buf.ptr())
+        }
+    }
+
+    /// Write bincode-serialized data into a WASM buffer, choosing between
+    /// streaming and legacy protocols.
+    pub(super) fn write_contract_buf_serialized<T: serde::Serialize + ?Sized>(
+        &mut self,
+        running: &RunningInstance,
+        value: &T,
+        max_cap: usize,
+    ) -> RuntimeResult<*mut BufferBuilder> {
+        if running.supports_streaming {
+            let serialized = bincode::serialize(value)?;
+            self.write_streaming_buf(&running.handle, running.id, &serialized, max_cap)
+        } else {
+            let size = bincode::serialized_size(value)? as usize;
+            let mut buf = self.init_buf_with_capacity(&running.handle, size)?;
+            bincode::serialize_into(&mut buf, value)?;
+            Ok(buf.ptr())
+        }
     }
 
     pub(super) fn linear_mem(&mut self, handle: &InstanceHandle) -> RuntimeResult<WasmLinearMem> {
