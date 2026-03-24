@@ -349,6 +349,7 @@ impl Runtime {
 
         // Header: 4 bytes for total payload length (LE u32)
         let header_size = 4usize;
+        debug_assert!(max_cap >= header_size, "max_cap must be >= {header_size}");
         if data.len() > u32::MAX as usize {
             return Err(super::ContractExecError::InvalidArrayLength(data.len()).into());
         }

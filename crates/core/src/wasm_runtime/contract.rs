@@ -75,14 +75,26 @@ pub(crate) trait ContractRuntimeBridge:
 {
 }
 
-/// Clean up any pending streaming data for this instance.
-///
-/// Each contract call inserts at most 3 entries (one per buffer argument),
-/// so the total CONTRACT_IO size is bounded by concurrent contract calls.
-/// The retain scan is acceptable at this scale; if concurrency grows
-/// significantly, switch to a two-level map (instance_id → per-buffer map).
-fn cleanup_contract_io(instance_id: i64) {
-    CONTRACT_IO.retain(|(id, _), _| *id != instance_id);
+/// RAII guard that cleans up CONTRACT_IO entries for an instance on drop.
+/// Ensures cleanup runs even if the contract call panics.
+struct ContractIoGuard {
+    instance_id: i64,
+}
+
+impl ContractIoGuard {
+    fn new(instance_id: i64) -> Self {
+        Self { instance_id }
+    }
+}
+
+impl Drop for ContractIoGuard {
+    fn drop(&mut self) {
+        // Each contract call inserts at most 3 entries (one per buffer argument),
+        // so the total CONTRACT_IO size is bounded by concurrent contract calls.
+        // The retain scan is acceptable at this scale; if concurrency grows
+        // significantly, switch to a two-level map (instance_id → per-buffer map).
+        CONTRACT_IO.retain(|(id, _), _| *id != self.instance_id);
+    }
 }
 
 impl ContractRuntimeInterface for super::Runtime {
@@ -95,6 +107,7 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<ValidateResult> {
         let req_bytes = parameters.size() + state.size();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<ValidateResult> {
             let linear_mem = self.linear_mem(&running.handle)?;
@@ -139,7 +152,6 @@ impl ContractRuntimeInterface for super::Runtime {
             Ok(is_valid)
         })();
 
-        cleanup_contract_io(running.id);
         self.drop_running_instance(&mut running);
         result
     }
@@ -154,6 +166,7 @@ impl ContractRuntimeInterface for super::Runtime {
         let req_bytes =
             parameters.size() + state.size() + update_data.iter().map(|e| e.size()).sum::<usize>();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<UpdateModification<'static>> {
             let linear_mem = self.linear_mem(&running.handle)?;
@@ -198,7 +211,6 @@ impl ContractRuntimeInterface for super::Runtime {
             Ok(update_res)
         })();
 
-        cleanup_contract_io(running.id);
         self.drop_running_instance(&mut running);
         result
     }
@@ -211,6 +223,7 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<StateSummary<'static>> {
         let req_bytes = parameters.size() + state.size();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<StateSummary<'static>> {
             let linear_mem = self.linear_mem(&running.handle)?;
@@ -247,7 +260,6 @@ impl ContractRuntimeInterface for super::Runtime {
             Ok(summary)
         })();
 
-        cleanup_contract_io(running.id);
         self.drop_running_instance(&mut running);
         result
     }
@@ -261,6 +273,7 @@ impl ContractRuntimeInterface for super::Runtime {
     ) -> RuntimeResult<StateDelta<'static>> {
         let req_bytes = parameters.size() + state.size() + summary.size();
         let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<StateDelta<'static>> {
             let linear_mem = self.linear_mem(&running.handle)?;
@@ -304,7 +317,6 @@ impl ContractRuntimeInterface for super::Runtime {
             Ok(delta)
         })();
 
-        cleanup_contract_io(running.id);
         self.drop_running_instance(&mut running);
         result
     }
