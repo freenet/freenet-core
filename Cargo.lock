@@ -1581,7 +1581,7 @@ dependencies = [
  "dashmap",
  "either",
  "freenet",
- "freenet-stdlib 0.3.4",
+ "freenet-stdlib 0.3.5",
  "futures 0.3.32",
  "glob",
  "http 1.4.0",
@@ -1743,7 +1743,7 @@ dependencies = [
  "flatbuffers 25.12.19",
  "flate2",
  "freenet-macros 0.1.0",
- "freenet-stdlib 0.3.4",
+ "freenet-stdlib 0.3.5",
  "freenet-test-network",
  "futures 0.3.32",
  "gag",
@@ -1848,7 +1848,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.3.4",
+ "freenet-stdlib 0.3.5",
  "freenet-test-network",
  "futures 0.3.32",
  "humantime",
@@ -1870,7 +1870,7 @@ name = "freenet-ping-contract"
 version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.3.4",
+ "freenet-stdlib 0.3.5",
  "serde_json",
 ]
 
@@ -1880,7 +1880,7 @@ version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.3.4",
+ "freenet-stdlib 0.3.5",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1917,9 +1917,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef488e176c95a18617414d4861dfd205d92a114afb006572fe6dd3e1fd055d09"
+checksum = "7c3ac04f50790cc912697afa60d303a9d3efff2a70e5f787192b7cd053ae2fb9"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -5431,7 +5431,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.3.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5461,7 +5461,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.11"
 dependencies = [
- "freenet-stdlib 0.3.4",
+ "freenet-stdlib 0.3.5",
  "serde",
  "serde_json",
 ]
@@ -5471,14 +5471,14 @@ name = "test-contract-mock-aligned"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "freenet-stdlib 0.3.4",
+ "freenet-stdlib 0.3.5",
 ]
 
 [[package]]
 name = "test-contract-update-nochange"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.3.4",
+ "freenet-stdlib 0.3.5",
  "serde",
  "serde_json",
 ]
