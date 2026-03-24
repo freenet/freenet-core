@@ -112,25 +112,12 @@ impl ContractRuntimeInterface for super::Runtime {
         let result = (|| -> RuntimeResult<ValidateResult> {
             let linear_mem = self.linear_mem(&running.handle)?;
 
-            let param_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                parameters.as_ref(),
-                STREAMING_BUF_CAP,
-            )?;
-            let state_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                state.as_ref(),
-                STREAMING_BUF_CAP,
-            )?;
-            let related_serialized = bincode::serialize(related)?;
-            let related_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                &related_serialized,
-                STREAMING_BUF_CAP,
-            )?;
+            let param_buf_ptr =
+                self.write_contract_buf(&running, parameters.as_ref(), STREAMING_BUF_CAP)?;
+            let state_buf_ptr =
+                self.write_contract_buf(&running, state.as_ref(), STREAMING_BUF_CAP)?;
+            let related_buf_ptr =
+                self.write_contract_buf_serialized(&running, related, STREAMING_BUF_CAP)?;
 
             let result = self.engine.call_3i64_blocking(
                 &running.handle,
@@ -171,25 +158,12 @@ impl ContractRuntimeInterface for super::Runtime {
         let result = (|| -> RuntimeResult<UpdateModification<'static>> {
             let linear_mem = self.linear_mem(&running.handle)?;
 
-            let param_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                parameters.as_ref(),
-                STREAMING_BUF_CAP,
-            )?;
-            let state_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                state.as_ref(),
-                STREAMING_BUF_CAP,
-            )?;
-            let update_data_serialized = bincode::serialize(update_data)?;
-            let update_data_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                &update_data_serialized,
-                STREAMING_BUF_CAP,
-            )?;
+            let param_buf_ptr =
+                self.write_contract_buf(&running, parameters.as_ref(), STREAMING_BUF_CAP)?;
+            let state_buf_ptr =
+                self.write_contract_buf(&running, state.as_ref(), STREAMING_BUF_CAP)?;
+            let update_data_buf_ptr =
+                self.write_contract_buf_serialized(&running, update_data, STREAMING_BUF_CAP)?;
 
             let result = self.engine.call_3i64_blocking(
                 &running.handle,
@@ -228,18 +202,10 @@ impl ContractRuntimeInterface for super::Runtime {
         let result = (|| -> RuntimeResult<StateSummary<'static>> {
             let linear_mem = self.linear_mem(&running.handle)?;
 
-            let param_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                parameters.as_ref(),
-                STREAMING_BUF_CAP,
-            )?;
-            let state_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                state.as_ref(),
-                STREAMING_BUF_CAP,
-            )?;
+            let param_buf_ptr =
+                self.write_contract_buf(&running, parameters.as_ref(), STREAMING_BUF_CAP)?;
+            let state_buf_ptr =
+                self.write_contract_buf(&running, state.as_ref(), STREAMING_BUF_CAP)?;
 
             let result = self.engine.call_2i64_blocking(
                 &running.handle,
@@ -278,24 +244,12 @@ impl ContractRuntimeInterface for super::Runtime {
         let result = (|| -> RuntimeResult<StateDelta<'static>> {
             let linear_mem = self.linear_mem(&running.handle)?;
 
-            let param_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                parameters.as_ref(),
-                STREAMING_BUF_CAP,
-            )?;
-            let state_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                state.as_ref(),
-                STREAMING_BUF_CAP,
-            )?;
-            let summary_buf_ptr = self.write_streaming_buf(
-                &running.handle,
-                running.id,
-                summary.as_ref(),
-                STREAMING_BUF_CAP,
-            )?;
+            let param_buf_ptr =
+                self.write_contract_buf(&running, parameters.as_ref(), STREAMING_BUF_CAP)?;
+            let state_buf_ptr =
+                self.write_contract_buf(&running, state.as_ref(), STREAMING_BUF_CAP)?;
+            let summary_buf_ptr =
+                self.write_contract_buf(&running, summary.as_ref(), STREAMING_BUF_CAP)?;
 
             let result = self.engine.call_3i64_blocking(
                 &running.handle,
