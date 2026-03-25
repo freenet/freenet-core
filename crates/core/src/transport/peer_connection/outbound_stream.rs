@@ -997,6 +997,66 @@ mod tests {
     }
 
     /// Test that fragment #1 with embedded metadata never exceeds MAX_DATA_SIZE.
+    /// Test that send_stream aborts with ConnectionClosed when the cwnd wait
+    /// exceeds CWND_WAIT_TIMEOUT. Simulates a dead outbound connection where
+    /// cwnd is too small for any packet (#3608).
+    #[tokio::test(start_paused = true)]
+    async fn test_send_stream_cwnd_wait_timeout() -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, _outbound_receiver) = fast_channel::bounded(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = vec![0u8; 10_000];
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        // Use RealTime with tokio's paused time (start_paused = true) for
+        // deterministic auto-advancing sleep. VirtualTime requires manual
+        // advance() calls which don't interleave well with the cwnd wait loop.
+        let time_source = RealTime::new();
+
+        // Create a congestion controller with a tiny cwnd (1 byte).
+        // Any real packet exceeds this, so the cwnd wait loop never breaks
+        // and must hit the CWND_WAIT_TIMEOUT.
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1,
+            min_cwnd: 1,
+            max_cwnd: 1,
+            ..Default::default()
+        })
+        .build_arc();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let send_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            None,
+        ));
+
+        // With start_paused=true, tokio auto-advances time through sleep calls.
+        // The cwnd wait loop sleeps in 1ms increments, and the timeout is 15s,
+        // so tokio will auto-advance through ~15,000 iterations instantly.
+        let result = send_task.await.expect("join error");
+        assert!(
+            matches!(result, Err(TransportError::ConnectionClosed(_))),
+            "Expected ConnectionClosed after cwnd wait timeout, got: {result:?}",
+        );
+
+        Ok(())
+    }
+
     /// This is a regression test for the critical bug where adding metadata to
     /// fragment #1 caused size overflow, breaking all streaming operations >1422 bytes.
     #[test]
