@@ -138,6 +138,7 @@ tokio-tungstenite = { workspace = true }
 ureq = { workspace = true }
 which = { workspace = true }
 regex = { workspace = true }
+serial_test = { workspace = true }
 
 # CI-optimized benchmark suite (~5 min, deterministic)
 [[bench]]
