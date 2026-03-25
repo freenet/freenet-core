@@ -627,7 +627,8 @@ mod dual_stack_tests {
         let bound_port = dual_sock.local_addr().unwrap().port();
 
         // Send a packet from an IPv4 socket to the dual-stack socket
-        let v4_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        let v4_sender = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
         let target = SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             bound_port,
@@ -651,7 +652,8 @@ mod dual_stack_tests {
             .expect("bind to [::]:0 should succeed");
         let bound_port = dual_sock.local_addr().unwrap().port();
 
-        let v6_sender = UdpSocket::bind("[::1]:0").await.unwrap();
+        let v6_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+        let v6_sender = <UdpSocket as Socket>::bind(v6_addr).await.unwrap();
         let target = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), bound_port);
         v6_sender
             .send_to(b"world", target)
