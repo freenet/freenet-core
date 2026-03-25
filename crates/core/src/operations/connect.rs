@@ -1110,6 +1110,10 @@ impl ConnectOp {
         // The bloom filter uses transaction-specific hash keys for privacy, and these
         // must be restored since hash keys aren't serialized.
         request.visited = request.visited.with_transaction(&id);
+        // Clamp uphill_budget to prevent amplification from malicious peers
+        // sending inflated values. Without halving, the budget directly controls
+        // the number of uphill hops, so we must enforce the cap.
+        request.uphill_budget = request.uphill_budget.min(DEFAULT_UPHILL_BUDGET);
         let state = ConnectState::Relaying(Box::new(RelayState {
             upstream_addr,
             request,
