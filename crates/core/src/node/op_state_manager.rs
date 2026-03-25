@@ -1523,10 +1523,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 const MAX_SPECULATIVE_PATHS: u8 = 2;
                 /// Time to wait after ForwardingAck before re-enabling retry.
                 /// If a relay ACKed but no response arrives within this window,
-                /// the downstream chain has likely stalled. 20s balances giving
-                /// slow multi-hop chains time to complete vs. not wasting the
-                /// full 60s OPERATION_TTL on dead chains.
-                const PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
+                /// the downstream chain has likely stalled. Even a 4-hop chain
+                /// at 500ms/hop completes in ~2.5s; 7s gives ~3x headroom while
+                /// keeping worst-case stall detection under 10s.
+                const PROGRESS_TIMEOUT: Duration = Duration::from_secs(7);
                 {
                     // Clean up entries for completed operations
                     get_retried.retain(|tx, _| ops.get.contains_key(tx));
@@ -1599,6 +1599,17 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         for tx in retry_candidates {
                             if let Some((_, get_op)) = ops.get.remove(&tx) {
+                                // Report failure for the stalled peer BEFORE retry
+                                // overwrites stats.next_peer (get.rs:1039).
+                                if let Some((peer, contract_location)) =
+                                    get_op.failure_routing_info()
+                                {
+                                    ring.routing_finished(crate::router::RouteEvent {
+                                        peer,
+                                        contract_location,
+                                        outcome: crate::router::RouteOutcome::Failure,
+                                    });
+                                }
                                 let max_htl = ring.max_hops_to_live;
                                 match get_op.retry_with_next_alternative(max_htl, &all_connected)
                                 {
@@ -1679,19 +1690,33 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             continue;
                         }
 
-                        // If ACK received, the downstream chain is alive — don't retry
-                        if sub_op.ack_received {
-                            continue;
-                        }
-
                         // Cap speculative paths
                         if sub_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
                             continue;
                         }
 
                         let elapsed = tx.elapsed();
+
+                        if sub_op.ack_received {
+                            // ACK received — trust chain for PROGRESS_TIMEOUT, then
+                            // re-enable retry (matching GET/PUT behavior).
+                            if elapsed <= PROGRESS_TIMEOUT {
+                                continue;
+                            }
+                            tracing::info!(
+                                %tx,
+                                elapsed_ms = elapsed.as_millis(),
+                                "SUBSCRIBE chain stalled after ForwardingAck \
+                                 — re-enabling speculative retry"
+                            );
+                        }
+
                         let retry_count = subscribe_retried.get(&tx).copied().unwrap_or(0);
-                        let base = ACK_TIMEOUT * (retry_count as u32 + 1);
+                        let base = if sub_op.ack_received {
+                            PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32)
+                        } else {
+                            ACK_TIMEOUT * (retry_count as u32 + 1)
+                        };
                         // Only consume GlobalRng when elapsed exceeds 80% of base
                         // (minimum possible jittered threshold). This avoids shifting
                         // the global RNG state on every GC tick for ops that are
@@ -1732,6 +1757,16 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         for tx in retry_candidates.into_iter().take(MAX_SUBSCRIBE_RETRIES_PER_TICK) {
                             if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
+                                // Report failure for the stalled peer before retry.
+                                if let Some((peer, contract_location)) =
+                                    sub_op.failure_routing_info()
+                                {
+                                    ring.routing_finished(crate::router::RouteEvent {
+                                        peer,
+                                        contract_location,
+                                        outcome: crate::router::RouteOutcome::Failure,
+                                    });
+                                }
                                 let max_htl = ring.max_hops_to_live;
                                 match sub_op.retry_with_next_alternative(max_htl, &all_connected) {
                                     Ok((mut new_op, msg)) => {
@@ -1830,6 +1865,16 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         for tx in put_retry_candidates {
                             if let Some((_, put_op)) = ops.put.remove(&tx) {
+                                // Report failure for the stalled peer before retry.
+                                if let Some((peer, contract_location)) =
+                                    put_op.failure_routing_info()
+                                {
+                                    ring.routing_finished(crate::router::RouteEvent {
+                                        peer,
+                                        contract_location,
+                                        outcome: crate::router::RouteOutcome::Failure,
+                                    });
+                                }
                                 let max_htl = ring.max_hops_to_live;
                                 match put_op
                                     .retry_with_next_alternative(max_htl, &all_connected)

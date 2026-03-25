@@ -26,6 +26,13 @@ use futures::StreamExt;
 use super::streaming::StreamHandle;
 use super::StreamId;
 
+/// Maximum time to wait for congestion window space to open in `pipe_stream`.
+/// If ACKs stop arriving (broken connection, one-directional path failure),
+/// this prevents the cwnd wait loop from blocking forever (#3608).
+/// 15s is generous: at even 1 Mbps with 1500-byte MTU, a full 64KB cwnd
+/// drains in ~0.5s. If it hasn't opened in 15s, the connection is dead.
+const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Stream payload type using zero-copy Bytes for efficient fragmentation.
 /// Using Bytes::slice() instead of Vec::split_off() eliminates per-fragment allocations.
 pub(crate) type SerializedStream = Bytes;
@@ -110,9 +117,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // cwnd space. If recv() is never called, flightsize never decreases and this
         // loop will block forever.
         //
-        // In production, PeerConnection is always used in a bidirectional select! loop
-        // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
-        // always being polled. Tests must follow the same pattern.
+        // Safety: the loop is bounded by CWND_WAIT_TIMEOUT (#3608).
+        let cwnd_wait_start = time_source.now();
         let mut cwnd_wait_iterations = 0;
         loop {
             let flightsize = congestion_controller.flightsize();
@@ -132,6 +138,37 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                     packet_size,
                     "Waiting for cwnd space (ensure recv() is being called to process ACKs)"
                 );
+            }
+
+            // Timeout: if cwnd space never opens (ACKs stopped arriving),
+            // fail the stream instead of blocking forever (#3608).
+            let cwnd_elapsed = time_source.now().saturating_sub(cwnd_wait_start);
+            if cwnd_elapsed >= CWND_WAIT_TIMEOUT {
+                let elapsed = time_source.now().saturating_sub(start_time);
+                tracing::warn!(
+                    stream_id = %stream_id.0,
+                    destination = %destination_addr,
+                    sent_so_far,
+                    total_packets,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    cwnd_wait_ms = cwnd_elapsed.as_millis(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "send_stream cwnd wait timed out — ACKs likely stopped arriving"
+                );
+                emit_transfer_failed(
+                    stream_id.0 as u64,
+                    destination_addr,
+                    sent_so_far as u64,
+                    format!(
+                        "cwnd wait timeout after {}s (sent {sent_so_far}/{total_packets} packets, \
+                         flightsize={flightsize}B, cwnd={cwnd}B)",
+                        cwnd_elapsed.as_secs()
+                    ),
+                    elapsed.as_millis() as u64,
+                    TransferDirection::Send,
+                );
+                return Err(TransportError::ConnectionClosed(destination_addr));
             }
 
             // Exponential backoff to balance responsiveness and CPU usage
@@ -428,11 +465,13 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         // IMPORTANT: This loop requires that recv() is being called on this connection
         // to process incoming ACKs. ACKs reduce flightsize via on_ack(), which opens
         // cwnd space. If recv() is never called, flightsize never decreases and this
-        // loop will block forever.
+        // loop will block forever — which is exactly what happened in #3608 when the
+        // relay GET streaming path (#3586) lost ACKs mid-transfer.
         //
-        // In production, PeerConnection is always used in a bidirectional select! loop
-        // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
-        // always being polled. Tests must follow the same pattern.
+        // Safety: the loop is bounded by CWND_WAIT_TIMEOUT. If cwnd space doesn't
+        // open within the timeout, the pipe fails with ConnectionClosed rather than
+        // hanging indefinitely.
+        let cwnd_wait_start = time_source.now();
         let mut cwnd_wait_iterations = 0;
         loop {
             let flightsize = congestion_controller.flightsize();
@@ -451,6 +490,38 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                     cwnd_kb = cwnd / 1024,
                     "Waiting for cwnd space in pipe_stream"
                 );
+            }
+
+            // Timeout: if cwnd space never opens (ACKs stopped arriving),
+            // fail the pipe instead of blocking forever (#3608).
+            let cwnd_elapsed = time_source.now().saturating_sub(cwnd_wait_start);
+            if cwnd_elapsed >= CWND_WAIT_TIMEOUT {
+                let elapsed = time_source.now().saturating_sub(start_time);
+                tracing::warn!(
+                    stream_id = %outbound_stream_id.0,
+                    destination = %destination_addr,
+                    fragment_number,
+                    sent_so_far,
+                    total_bytes,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    cwnd_wait_ms = cwnd_elapsed.as_millis(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "pipe_stream cwnd wait timed out — ACKs likely stopped arriving"
+                );
+                emit_transfer_failed(
+                    outbound_stream_id.0 as u64,
+                    destination_addr,
+                    sent_so_far,
+                    format!(
+                        "cwnd wait timeout after {}s (sent {sent_so_far}/{total_bytes} bytes, \
+                         flightsize={flightsize}B, cwnd={cwnd}B)",
+                        cwnd_elapsed.as_secs()
+                    ),
+                    elapsed.as_millis() as u64,
+                    TransferDirection::Send,
+                );
+                return Err(TransportError::ConnectionClosed(destination_addr));
             }
 
             if cwnd_wait_iterations <= 10 {
