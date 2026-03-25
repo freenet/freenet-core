@@ -4757,7 +4757,7 @@ mod tests {
     /// Returns true if the op would be selected as a retry candidate.
     fn gc_would_retry(op: &GetOp, retry_count: usize) -> bool {
         const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-        const PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+        const PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
         const MAX_SPECULATIVE_PATHS: u8 = 2;
 
         // Must be originator
@@ -4795,8 +4795,8 @@ mod tests {
         let mut op = make_awaiting_op(vec![make_peer(5001)], &[]);
         op.ack_received = true;
 
-        // Advance time past ACK_TIMEOUT (3s) but within PROGRESS_TIMEOUT (20s)
-        GlobalSimulationTime::set_time_ms(base_ms + 10_000);
+        // Advance time past ACK_TIMEOUT (3s) but within PROGRESS_TIMEOUT (7s)
+        GlobalSimulationTime::set_time_ms(base_ms + 5_000);
 
         assert!(
             !gc_would_retry(&op, 0),
@@ -4814,8 +4814,8 @@ mod tests {
         let mut op = make_awaiting_op(vec![make_peer(5001)], &[]);
         op.ack_received = true;
 
-        // Advance time past PROGRESS_TIMEOUT (20s) + ACK_TIMEOUT (3s) for jitter headroom
-        GlobalSimulationTime::set_time_ms(base_ms + 25_000);
+        // Advance time past PROGRESS_TIMEOUT (7s) + ACK_TIMEOUT (3s) for jitter headroom
+        GlobalSimulationTime::set_time_ms(base_ms + 12_000);
 
         assert!(
             gc_would_retry(&op, 0),
