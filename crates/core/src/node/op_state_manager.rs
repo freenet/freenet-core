@@ -1599,21 +1599,25 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         for tx in retry_candidates {
                             if let Some((_, get_op)) = ops.get.remove(&tx) {
-                                // Report failure for the stalled peer BEFORE retry
+                                // Capture the stalled peer's routing info BEFORE retry
                                 // overwrites stats.next_peer (get.rs:1039).
-                                if let Some((peer, contract_location)) =
-                                    get_op.failure_routing_info()
-                                {
-                                    ring.routing_finished(crate::router::RouteEvent {
-                                        peer,
-                                        contract_location,
-                                        outcome: crate::router::RouteOutcome::Failure,
-                                    });
-                                }
+                                let stalled_peer_info = get_op.failure_routing_info();
                                 let max_htl = ring.max_hops_to_live;
                                 match get_op.retry_with_next_alternative(max_htl, &all_connected)
                                 {
                                     Ok((mut new_op, msg)) => {
+                                        // Only report routing failure when we found an
+                                        // alternative. In small topologies (e.g., 3 nodes)
+                                        // the "stalled" peer may be the only relay — poisoning
+                                        // its routing score would make all future ops fail.
+                                        if let Some((peer, contract_location)) = stalled_peer_info
+                                        {
+                                            ring.routing_finished(crate::router::RouteEvent {
+                                                peer,
+                                                contract_location,
+                                                outcome: crate::router::RouteOutcome::Failure,
+                                            });
+                                        }
                                         let msg = crate::message::NetMessage::from(msg);
                                         // Track speculative path for ACK-aware retry bounds
                                         new_op.speculative_paths += 1;
@@ -1757,19 +1761,19 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         for tx in retry_candidates.into_iter().take(MAX_SUBSCRIBE_RETRIES_PER_TICK) {
                             if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
-                                // Report failure for the stalled peer before retry.
-                                if let Some((peer, contract_location)) =
-                                    sub_op.failure_routing_info()
-                                {
-                                    ring.routing_finished(crate::router::RouteEvent {
-                                        peer,
-                                        contract_location,
-                                        outcome: crate::router::RouteOutcome::Failure,
-                                    });
-                                }
+                                let stalled_peer_info = sub_op.failure_routing_info();
                                 let max_htl = ring.max_hops_to_live;
                                 match sub_op.retry_with_next_alternative(max_htl, &all_connected) {
                                     Ok((mut new_op, msg)) => {
+                                        // Only report failure when alternative found (see GET comment).
+                                        if let Some((peer, contract_location)) = stalled_peer_info
+                                        {
+                                            ring.routing_finished(crate::router::RouteEvent {
+                                                peer,
+                                                contract_location,
+                                                outcome: crate::router::RouteOutcome::Failure,
+                                            });
+                                        }
                                         let msg = crate::message::NetMessage::from(msg);
                                         // Track speculative path for ACK-aware retry bounds
                                         new_op.speculative_paths += 1;
@@ -1865,21 +1869,21 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         for tx in put_retry_candidates {
                             if let Some((_, put_op)) = ops.put.remove(&tx) {
-                                // Report failure for the stalled peer before retry.
-                                if let Some((peer, contract_location)) =
-                                    put_op.failure_routing_info()
-                                {
-                                    ring.routing_finished(crate::router::RouteEvent {
-                                        peer,
-                                        contract_location,
-                                        outcome: crate::router::RouteOutcome::Failure,
-                                    });
-                                }
+                                let stalled_peer_info = put_op.failure_routing_info();
                                 let max_htl = ring.max_hops_to_live;
                                 match put_op
                                     .retry_with_next_alternative(max_htl, &all_connected)
                                 {
                                     Ok((mut new_op, msg)) => {
+                                        // Only report failure when alternative found (see GET comment).
+                                        if let Some((peer, contract_location)) = stalled_peer_info
+                                        {
+                                            ring.routing_finished(crate::router::RouteEvent {
+                                                peer,
+                                                contract_location,
+                                                outcome: crate::router::RouteOutcome::Failure,
+                                            });
+                                        }
                                         let msg = crate::message::NetMessage::from(msg);
                                         new_op.speculative_paths += 1;
                                         new_op.ack_received = false;
