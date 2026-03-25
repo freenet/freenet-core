@@ -26,11 +26,17 @@ use futures::StreamExt;
 use super::streaming::StreamHandle;
 use super::StreamId;
 
-/// Maximum time to wait for congestion window space to open in `pipe_stream`.
-/// If ACKs stop arriving (broken connection, one-directional path failure),
-/// this prevents the cwnd wait loop from blocking forever (#3608).
+/// Maximum time to wait for congestion window space to open in `send_stream`
+/// and `pipe_stream`. If ACKs stop arriving (broken connection, one-directional
+/// path failure), this prevents the cwnd wait loop from blocking forever (#3608).
 /// 15s is generous: at even 1 Mbps with 1500-byte MTU, a full 64KB cwnd
 /// drains in ~0.5s. If it hasn't opened in 15s, the connection is dead.
+///
+/// This is intentionally longer than `PROGRESS_TIMEOUT` (7s) in the GC task:
+/// if a cwnd stall causes a GET to stall, the GC task fires first (launching
+/// a speculative retry on a different peer), then this timeout fires later
+/// (cleaning up the stuck send task). The layered recovery ensures the user
+/// gets a fast retry without waiting for the transport-level timeout.
 const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Stream payload type using zero-copy Bytes for efficient fragmentation.
