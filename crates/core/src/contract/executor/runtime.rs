@@ -1948,8 +1948,7 @@ where
                 let state = self.state_store.get(&full_key).await.map_err(|_| {
                     ExecutorError::request(StdContractError::MissingRelated { key: *id })
                 })?;
-                let state_bytes: Vec<u8> = state.as_ref().to_vec();
-                related_map.insert(*id, Some(State::from(state_bytes).into_owned()));
+                related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
             }
             Ok::<(), ExecutorError>(())
         };
@@ -2001,20 +2000,23 @@ where
         Ok(retry_result)
     }
 
+    /// Build an error for a non-Valid validation result.
+    ///
+    /// Only called after `fetch_related_for_validation`, which resolves
+    /// `RequestRelated` internally -- so only `Invalid` is reachable here.
     fn validation_error(key: ContractKey, result: ValidateResult) -> ExecutorError {
         match result {
-            ValidateResult::Valid => unreachable!("called validation_error on Valid result"),
             ValidateResult::Invalid => {
                 ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
                     key,
                     cause: "invalid outcome state".into(),
                 })
             }
-            ValidateResult::RequestRelated(_) => {
-                ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
-                    key,
-                    cause: "missing related contracts for validation".into(),
-                })
+            ValidateResult::Valid | ValidateResult::RequestRelated(_) => {
+                unreachable!(
+                    "validation_error called with {:?} — should only be called on Invalid",
+                    result
+                )
             }
         }
     }
@@ -2772,11 +2774,8 @@ impl Executor<Runtime> {
             let validate_result = self
                 .fetch_related_for_validation(&key, &params, &new_state, &related_contracts)
                 .await?;
-            match validate_result {
-                ValidateResult::Valid => {}
-                ValidateResult::Invalid | ValidateResult::RequestRelated(_) => {
-                    return Err(Self::validation_error(key, validate_result));
-                }
+            if validate_result != ValidateResult::Valid {
+                return Err(Self::validation_error(key, validate_result));
             }
 
             // Commit locally
@@ -3241,21 +3240,16 @@ impl Executor<Runtime> {
                 }
             })?;
 
-        match result {
-            ValidateResult::Valid => {}
-            ValidateResult::Invalid => {
-                if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
-                    tracing::warn!(contract = %key, error = %e, "failed to remove contract after invalid validation");
-                }
-                return Err(ExecutorError::request(StdContractError::Put {
-                    key,
-                    cause: "not valid".into(),
-                }));
+        // fetch_related_for_validation resolves RequestRelated internally,
+        // so only Valid or Invalid are possible here.
+        if result != ValidateResult::Valid {
+            if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
+                tracing::warn!(contract = %key, error = %e, "failed to remove contract after invalid validation");
             }
-            ValidateResult::RequestRelated(_) => {
-                // fetch_related_for_validation handles RequestRelated internally
-                unreachable!("fetch_related_for_validation should never return RequestRelated");
-            }
+            return Err(ExecutorError::request(StdContractError::Put {
+                key,
+                cause: "not valid".into(),
+            }));
         }
 
         tracing::debug!(

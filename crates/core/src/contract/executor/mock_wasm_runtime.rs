@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 /// Configurable validation behavior for testing related contracts.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Variants used in tests
+#[allow(dead_code)] // Variants constructed in test code only
 pub(crate) enum ValidateOverride {
     /// Return `RequestRelated(ids)` on first call (when related map is empty),
     /// then `Valid` on second call (when related contracts are populated).
@@ -46,15 +46,14 @@ impl ContractRuntimeInterface for MockWasmRuntime {
         if let Some(override_behavior) = self.validate_overrides.get(instance_id).cloned() {
             return Ok(match override_behavior {
                 ValidateOverride::RequestRelated(ids) => {
-                    // If related contracts have been populated (Some state), return Valid.
-                    // On first call related is empty/default → return RequestRelated.
-                    // On second call (after fetch) related is populated → return Valid.
-                    let populated = related
+                    // First call (related empty) → RequestRelated.
+                    // Second call (related populated after fetch) → Valid.
+                    let has_populated = related
                         .clone()
                         .into_owned()
                         .states()
                         .any(|(_, s)| s.is_some());
-                    if populated {
+                    if has_populated {
                         ValidateResult::Valid
                     } else {
                         ValidateResult::RequestRelated(ids)

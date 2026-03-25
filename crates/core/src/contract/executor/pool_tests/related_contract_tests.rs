@@ -108,19 +108,13 @@ async fn test_put_with_gate_closed() {
         .await
         .expect("gate PUT");
 
-    // Now PUT gated contract — configure it to return Invalid after receiving related
+    // PUT gated contract configured to always return Invalid.
+    // The mock doesn't inspect state content, so we use ValidateOverride::Invalid
+    // directly to simulate a gate that rejects validation.
     let gated_contract = make_contract(b"gated_code_closed");
     let gated_key = gated_contract.key();
     let gated_state = WrappedState::new(br#"{"count": 0}"#.to_vec());
 
-    // Use AlwaysRequestRelated so it requests on first call, but since AlwaysRequestRelated
-    // always returns RequestRelated, the second call will also return it → depth exceeded error.
-    // Actually, we want: first call returns RequestRelated, second call returns Invalid.
-    // ValidateOverride::RequestRelated does this but returns Valid (not Invalid) when related
-    // is populated. We need a different approach.
-    //
-    // For testing "gate closed → Invalid", we use ValidateOverride::Invalid directly
-    // since the mock doesn't actually inspect state content.
     executor
         .runtime
         .validate_overrides
