@@ -102,6 +102,13 @@ async fn test_contract_operations_via_docker_nat() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to deploy contract: {}", e))?;
     tracing::info!("Contract deployed: {contract_key}");
 
+    // --- Fetch contract on peer before subscribing ---
+    // PutResponse is sent after local upsert on the gateway; the contract may
+    // not have propagated to the peer yet. A GET with return_contract_code=true
+    // ensures the peer caches the WASM before subscribing.
+    get_contract_state(&mut peer_client, contract_key, true).await?;
+    tracing::info!("Peer fetched contract");
+
     // --- Subscribe from peer ---
     subscribe_to_contract(&mut peer_client, contract_key).await?;
     tracing::info!("Peer subscribed to contract");
