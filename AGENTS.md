@@ -24,7 +24,7 @@
 ### BEFORE committing
 
 ```
-1. Run: cargo fmt && cargo clippy --all-targets && cargo test
+1. Run: cargo fmt && cargo clippy -- -D warnings && cargo test
 2. Check: Does commit message follow conventional commits?
 3. Check .claude/rules/git-workflow.md for PR requirements
 ```
@@ -89,7 +89,7 @@ See: docs/weekly-fix-review-2025-02.md (befb0bd → 0b88945 cycle)
 ```bash
 cargo build                    # Build
 cargo test -p freenet          # Test all
-cargo fmt && cargo clippy --all-targets --all-features  # Lint
+cargo fmt && cargo clippy -- -D warnings  # Lint (must match CI)
 ```
 
 ### Repository Structure
