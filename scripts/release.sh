@@ -740,10 +740,11 @@ create_release_pr() {
     fi
 
     # Only commit if there are uncommitted changes (handles re-run after partial failure)
-    if git diff --quiet HEAD 2>/dev/null; then
+    if git diff --quiet HEAD; then
         echo "  ℹ️  No changes to commit (version bump already committed)"
     else
-        git add -A
+        # Stage only the files modified by the version bump — never git add -A
+        git add crates/core/Cargo.toml crates/fdev/Cargo.toml Cargo.lock
         run_cmd "Committing version bump" git commit -m "build: bump versions to $VERSION
 
 - freenet: → $VERSION
