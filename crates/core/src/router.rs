@@ -348,7 +348,7 @@ impl Router {
             };
 
         Ok(RoutingPrediction {
-            failure_probability: failure_estimate,
+            failure_probability: failure_estimate.clamp(0.0, 1.0),
             xfer_speed: TransferSpeed {
                 bytes_per_second: xfer_speed,
             },
