@@ -653,6 +653,11 @@ mod version_discovery_tests {
 
 #[cfg(test)]
 mod dual_stack_tests {
+    //! These tests use real UdpSocket (not SimulationSocket) because they validate
+    //! OS-level dual-stack behavior: IPv4-mapped address normalization, kernel
+    //! address-family mapping in sendto(), and IPV6_V6ONLY socket option effects.
+    //! SimulationSocket cannot exercise any of these kernel-level behaviors.
+
     use super::*;
     use std::net::{Ipv6Addr, SocketAddr};
 
