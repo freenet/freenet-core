@@ -705,4 +705,16 @@ mod tests {
         assert!(!hosts.contains("0.0.0.0"));
         assert!(!hosts.contains("0.0.0.0:7509"));
     }
+
+    #[test]
+    fn test_build_allowed_hosts_excludes_ipv6_unspecified() {
+        // :: is the new default bind address; verify it's excluded from allowlist
+        // but localhost variants are still included
+        let hosts = build_allowed_hosts(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7509, &[]);
+        assert!(!hosts.contains("::"));
+        assert!(!hosts.contains("[::]:7509"));
+        assert!(hosts.contains("localhost"));
+        assert!(hosts.contains("[::1]"));
+        assert!(hosts.contains("127.0.0.1"));
+    }
 }
