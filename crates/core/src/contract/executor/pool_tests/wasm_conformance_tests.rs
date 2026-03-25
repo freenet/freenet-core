@@ -77,6 +77,7 @@ async fn setup_wasm_runtime() -> Result<WasmTestSetup, Box<dyn std::error::Error
 fn setup_mock() -> MockWasmRuntime {
     MockWasmRuntime {
         contract_store: InMemoryContractStore::new(),
+        validate_overrides: std::collections::HashMap::new(),
     }
 }
 

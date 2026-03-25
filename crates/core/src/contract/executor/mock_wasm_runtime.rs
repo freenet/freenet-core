@@ -2,6 +2,23 @@ use super::*;
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStoreBridge, InMemoryContractStore, MockStateStorage,
 };
+use std::collections::HashMap;
+
+/// Configurable validation behavior for testing related contracts.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Variants used in tests
+pub(crate) enum ValidateOverride {
+    /// Return `RequestRelated(ids)` on first call (when related map is empty),
+    /// then `Valid` on second call (when related contracts are populated).
+    RequestRelated(Vec<ContractInstanceId>),
+    /// Always return `RequestRelated(ids)` regardless of provided related contracts.
+    /// Used to test depth>1 rejection / repeated request rejection.
+    AlwaysRequestRelated(Vec<ContractInstanceId>),
+    /// Always return `Invalid`.
+    Invalid,
+    /// Return `RequestRelated` with an empty vec (malformed request).
+    EmptyRequestRelated,
+}
 
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
 /// simulation tests exercise the **production** `ContractExecutor` code path
@@ -13,16 +30,41 @@ use crate::wasm_runtime::{
 /// notification pipeline, corrupted state recovery, and contract key indexing.
 pub(crate) struct MockWasmRuntime {
     pub(crate) contract_store: InMemoryContractStore,
+    /// Per-contract validation overrides for testing related contract flows.
+    pub(crate) validate_overrides: HashMap<ContractInstanceId, ValidateOverride>,
 }
 
 impl ContractRuntimeInterface for MockWasmRuntime {
     fn validate_state(
         &mut self,
-        _key: &ContractKey,
+        key: &ContractKey,
         _parameters: &Parameters<'_>,
         _state: &WrappedState,
-        _related: &RelatedContracts<'_>,
+        related: &RelatedContracts<'_>,
     ) -> crate::wasm_runtime::RuntimeResult<ValidateResult> {
+        let instance_id = key.id();
+        if let Some(override_behavior) = self.validate_overrides.get(instance_id).cloned() {
+            return Ok(match override_behavior {
+                ValidateOverride::RequestRelated(ids) => {
+                    // If related contracts have been populated (Some state), return Valid.
+                    // On first call related is empty/default → return RequestRelated.
+                    // On second call (after fetch) related is populated → return Valid.
+                    let populated = related
+                        .clone()
+                        .into_owned()
+                        .states()
+                        .any(|(_, s)| s.is_some());
+                    if populated {
+                        ValidateResult::Valid
+                    } else {
+                        ValidateResult::RequestRelated(ids)
+                    }
+                }
+                ValidateOverride::AlwaysRequestRelated(ids) => ValidateResult::RequestRelated(ids),
+                ValidateOverride::Invalid => ValidateResult::Invalid,
+                ValidateOverride::EmptyRequestRelated => ValidateResult::RequestRelated(vec![]),
+            });
+        }
         Ok(ValidateResult::Valid)
     }
 
@@ -191,6 +233,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
 
         let runtime = MockWasmRuntime {
             contract_store: InMemoryContractStore::new(),
+            validate_overrides: HashMap::new(),
         };
 
         Executor::new(
