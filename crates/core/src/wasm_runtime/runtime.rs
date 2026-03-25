@@ -62,6 +62,9 @@ pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 1024;
 pub(super) struct RunningInstance {
     pub id: i64,
     pub handle: InstanceHandle,
+    /// Whether the contract imports `freenet_contract_io` (streaming buffer support).
+    /// Contracts compiled against stdlib >= 0.3.4 have this; older ones don't.
+    pub supports_streaming: bool,
     /// Set to true when the engine instance has been explicitly cleaned up.
     dropped_from_engine: bool,
 }
@@ -80,9 +83,15 @@ impl RunningInstance {
         let (ptr, size) = engine.memory_info(&handle)?;
         native_api::MEM_ADDR.insert(id, InstanceInfo::new(ptr as i64, size, key));
 
+        // Detect if the contract supports streaming buffers by checking
+        // whether it imports the freenet_contract_io namespace. Contracts
+        // compiled against stdlib >= 0.3.4 have this import.
+        let supports_streaming = engine.module_has_streaming_io(module);
+
         Ok(Self {
             id,
             handle,
+            supports_streaming,
             dropped_from_engine: false,
         })
     }
@@ -330,6 +339,89 @@ impl Runtime {
                 builder_ptr as *mut BufferBuilder,
                 linear_mem,
             ))
+        }
+    }
+
+    /// Write data into a streaming buffer with a `[total_len: u32]` header.
+    ///
+    /// Allocates a buffer of at most `max_cap` bytes, writes the header and
+    /// as much data as fits. If the data exceeds the buffer capacity, the
+    /// remainder is stored in `CONTRACT_IO` for on-demand refill.
+    pub(super) fn write_streaming_buf(
+        &mut self,
+        handle: &InstanceHandle,
+        instance_id: i64,
+        data: &[u8],
+        max_cap: usize,
+    ) -> RuntimeResult<*mut BufferBuilder> {
+        use super::native_api::{PendingContractData, CONTRACT_IO};
+
+        // Header: 4 bytes for total payload length (LE u32)
+        let header_size = 4usize;
+        debug_assert!(max_cap >= header_size, "max_cap must be >= {header_size}");
+        if data.len() > u32::MAX as usize {
+            return Err(super::ContractExecError::InvalidArrayLength(data.len()).into());
+        }
+        let buf_cap = max_cap.min(data.len().saturating_add(header_size));
+        let mut buf = self.init_buf_with_capacity(handle, buf_cap)?;
+
+        let total_len = data.len() as u32;
+        buf.write(total_len.to_le_bytes())?;
+
+        // Write as much data as fits in the remaining capacity
+        let first_chunk_size = data.len().min(buf_cap - header_size);
+        buf.write(&data[..first_chunk_size])?;
+
+        let ptr = buf.ptr();
+
+        // Store remainder for the fill callback if data didn't fit
+        if first_chunk_size < data.len() {
+            CONTRACT_IO.insert(
+                (instance_id, ptr as i64),
+                PendingContractData {
+                    data: data[first_chunk_size..].to_vec(),
+                    cursor: 0,
+                },
+            );
+        }
+
+        Ok(ptr)
+    }
+
+    /// Write data into a WASM buffer, choosing between the streaming protocol
+    /// (for contracts compiled against stdlib >= 0.3.4) and the legacy one-shot
+    /// protocol (for older contracts).
+    pub(super) fn write_contract_buf(
+        &mut self,
+        running: &RunningInstance,
+        data: &[u8],
+        max_cap: usize,
+    ) -> RuntimeResult<*mut BufferBuilder> {
+        if running.supports_streaming {
+            self.write_streaming_buf(&running.handle, running.id, data, max_cap)
+        } else {
+            let mut buf = self.init_buf(&running.handle, data)?;
+            buf.write(data)?;
+            Ok(buf.ptr())
+        }
+    }
+
+    /// Write bincode-serialized data into a WASM buffer, choosing between
+    /// streaming and legacy protocols.
+    pub(super) fn write_contract_buf_serialized<T: serde::Serialize + ?Sized>(
+        &mut self,
+        running: &RunningInstance,
+        value: &T,
+        max_cap: usize,
+    ) -> RuntimeResult<*mut BufferBuilder> {
+        if running.supports_streaming {
+            let serialized = bincode::serialize(value)?;
+            self.write_streaming_buf(&running.handle, running.id, &serialized, max_cap)
+        } else {
+            let size = bincode::serialized_size(value)? as usize;
+            let mut buf = self.init_buf_with_capacity(&running.handle, size)?;
+            bincode::serialize_into(&mut buf, value)?;
+            Ok(buf.ptr())
         }
     }
 

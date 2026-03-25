@@ -713,6 +713,15 @@ fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id:
 }
 
 impl WasmtimeEngine {
+    /// Check if a compiled module imports the streaming buffer host function.
+    /// Contracts compiled against freenet-stdlib >= 0.3.4 import `freenet_contract_io`;
+    /// older contracts do not and must use the legacy one-shot buffer protocol.
+    pub(crate) fn module_has_streaming_io(&self, module: &Module) -> bool {
+        module
+            .imports()
+            .any(|import| import.module() == "freenet_contract_io")
+    }
+
     /// Create a new backend engine that can be shared across multiple Runtime instances.
     pub(crate) fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {
         let (engine, _, _) = Self::create_engine(config)?;
@@ -1190,6 +1199,18 @@ impl WasmtimeEngine {
                             out_hash_ptr,
                         )
                     })
+                },
+            )
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+
+        // Contract I/O namespace: streaming refill buffer
+        linker
+            .func_wrap(
+                "freenet_contract_io",
+                "__frnt__fill_buffer",
+                |mut caller: Caller<'_, HostState>, id: i64, buf_ptr: i64| -> u32 {
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::fill_buffer_impl(id, buf_ptr)
                 },
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
@@ -1958,9 +1979,11 @@ mod tests {
     /// Verify that store refresh works correctly when fuel metering is enabled.
     #[test]
     fn test_store_refresh_with_metering_enabled() {
-        let mut config = RuntimeConfig::default();
-        config.enable_metering = true;
-        config.max_execution_seconds = 10.0;
+        let config = RuntimeConfig {
+            enable_metering: true,
+            max_execution_seconds: 10.0,
+            ..Default::default()
+        };
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
@@ -2025,6 +2048,46 @@ mod tests {
             after_refresh_maps < leaked_maps,
             "Store refresh should reduce memory maps: \
              before_refresh={leaked_maps}, after_refresh={after_refresh_maps}"
+        );
+    }
+
+    #[test]
+    fn test_module_without_streaming_io_detected_as_legacy() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+
+        // A minimal contract module with no freenet_contract_io import
+        let wat = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "validate_state") (param i64 i64 i64) (result i64)
+            i64.const 0))
+        "#;
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        assert!(
+            !engine.module_has_streaming_io(&module),
+            "Legacy module should not have freenet_contract_io imports"
+        );
+    }
+
+    #[test]
+    fn test_module_with_streaming_io_detected() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+
+        // A contract module that imports the streaming fill buffer function
+        let wat = r#"
+        (module
+          (import "freenet_contract_io" "__frnt__fill_buffer"
+            (func $fill (param i64 i64) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "validate_state") (param i64 i64 i64) (result i64)
+            i64.const 0))
+        "#;
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        assert!(
+            engine.module_has_streaming_io(&module),
+            "Module with freenet_contract_io import should be detected as streaming"
         );
     }
 }

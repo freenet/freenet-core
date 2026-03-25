@@ -112,7 +112,7 @@ statrs = "0.18"
 test-log = "0.2"
 testresult = "0.4"
 turmoil = "0.7"
-ureq = { version = "3.1", features = ["json"] }
+ureq = { version = "3.3", features = ["json"] }
 which = "8.0"
 
 # Versioning
@@ -134,7 +134,7 @@ winapi = "0.3"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-freenet-stdlib = "0.3.3"
+freenet-stdlib = "0.3.5"
 
 [profile.dev.package."*"]
 opt-level = 3
