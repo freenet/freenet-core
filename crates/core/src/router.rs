@@ -514,17 +514,17 @@ impl Router {
             .failure_estimator
             .peer_adjustments
             .get(peer)
-            .map(|a| (a.mean(), a.event_count()));
+            .map(|a| (a.value(), a.event_count()));
         let response_time_adj = self
             .response_start_time_estimator
             .peer_adjustments
             .get(peer)
-            .map(|a| (a.mean(), a.event_count()));
+            .map(|a| (a.value(), a.event_count()));
         let transfer_rate_adj = self
             .transfer_rate_estimator
             .peer_adjustments
             .get(peer)
-            .map(|a| (a.mean(), a.event_count()));
+            .map(|a| (a.value(), a.event_count()));
 
         // Compute a sample prediction at the peer's own location (distance=0)
         let prediction = peer

@@ -64,17 +64,15 @@ impl IsotonicEstimator {
             all_points.pop_front();
         }
 
-        let points_vec: Vec<Point<f64>> = all_points.iter().cloned().collect();
-
+        let points: Vec<Point<f64>> = all_points.iter().cloned().collect();
         let global_regression = match estimator_type {
-            EstimatorType::Positive => IsotonicRegression::new_ascending(&points_vec),
-            EstimatorType::Negative => IsotonicRegression::new_descending(&points_vec),
+            EstimatorType::Positive => IsotonicRegression::new_ascending(&points),
+            EstimatorType::Negative => IsotonicRegression::new_descending(&points),
         }
         .expect("Failed to create isotonic regression");
 
-        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
         let global_regression_big_enough =
-            global_regression.len() >= adjustment_prior_size as usize;
+            global_regression.len() >= Self::ADJUSTMENT_PRIOR_SIZE as usize;
 
         let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
 
@@ -83,7 +81,7 @@ impl IsotonicEstimator {
                 let mut adjustment = Adjustment::new();
                 // Seed with ADJUSTMENT_PRIOR_SIZE phantom neutral observations
                 // so peers with few real observations are shrunk toward zero.
-                adjustment.effective_count = adjustment_prior_size as f64;
+                adjustment.effective_count = Self::ADJUSTMENT_PRIOR_SIZE as f64;
 
                 for event in events {
                     let global_estimate = global_regression
@@ -119,8 +117,7 @@ impl IsotonicEstimator {
             }
         }
 
-        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
-        if self.global_regression.len() >= adjustment_prior_size as usize {
+        if self.global_regression.len() >= Self::ADJUSTMENT_PRIOR_SIZE as usize {
             let adjustment = event.result
                 - self
                     .global_regression
@@ -261,12 +258,8 @@ impl Adjustment {
         self.effective_count = 1.0 + (1.0 - self.alpha) * self.effective_count;
     }
 
-    fn value(&self) -> f64 {
-        self.smoothed
-    }
-
     /// EWMA smoothed adjustment value.
-    pub(crate) fn mean(&self) -> f64 {
+    pub(crate) fn value(&self) -> f64 {
         self.smoothed
     }
 
@@ -473,23 +466,25 @@ mod tests {
         );
     }
 
-    fn simulate_positive_request(
+    /// Deterministic per-peer noise derived from the public key hash.
+    fn peer_noise(peer: &PeerKeyLocation) -> f64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{}", peer.pub_key()).hash(&mut hasher);
+        (hasher.finish() as u8) as f64
+    }
+
+    fn simulate_request(
         peer: PeerKeyLocation,
         contract_location: Location,
+        result_fn: impl FnOnce(f64) -> f64,
     ) -> IsotonicEvent {
-        let distance: f64 = peer
+        let distance = peer
             .location()
             .unwrap()
             .distance(contract_location)
             .as_f64();
-
-        let key_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            format!("{}", peer.pub_key()).hash(&mut hasher);
-            hasher.finish()
-        };
-        let result = distance.powf(0.5) + (key_hash as u8) as f64;
+        let result = result_fn(distance) + peer_noise(&peer);
         IsotonicEvent {
             peer,
             contract_location,
@@ -497,27 +492,17 @@ mod tests {
         }
     }
 
+    fn simulate_positive_request(
+        peer: PeerKeyLocation,
+        contract_location: Location,
+    ) -> IsotonicEvent {
+        simulate_request(peer, contract_location, |d| d.powf(0.5))
+    }
+
     fn simulate_negative_request(
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer
-            .location()
-            .unwrap()
-            .distance(contract_location)
-            .as_f64();
-
-        let key_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            format!("{}", peer.pub_key()).hash(&mut hasher);
-            hasher.finish()
-        };
-        let result = (100.0 - distance).powf(0.5) + (key_hash as u8) as f64;
-        IsotonicEvent {
-            peer,
-            contract_location,
-            result,
-        }
+        simulate_request(peer, contract_location, |d| (100.0 - d).powf(0.5))
     }
 }
