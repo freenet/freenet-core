@@ -6756,9 +6756,9 @@ fn test_get_succeeds_despite_readiness_gating() {
 fn test_get_routing_coverage_low_htl() {
     use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
 
-    // Seed updated: should_accept now rejects already-connected peers (PR #3557),
-    // which changes topology formation under the original seed.
-    const SEED: u64 = 0xC0DE_B0CA_0021;
+    // Seed updated: uphill_budget replaces TTL halving (PR #3621),
+    // which changes topology formation timing under the previous seed.
+    const SEED: u64 = 0xC0DE_B0CA_0031;
     const NETWORK_NAME: &str = "get-routing-coverage";
 
     GlobalTestMetrics::reset();
