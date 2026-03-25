@@ -790,22 +790,13 @@ impl RelayContext for RelayEnv<'_> {
         recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation> {
-        // Capture now once so that the exclusion set computation and
-        // the recency cooldown check both see the same timestamp for this routing decision.
+        // Capture now once so that the reliability lookup and the recency cooldown
+        // check both see the same timestamp for this routing decision.
         let now = Instant::now();
-
-        // Precompute the excluded set once per routing decision. This uses percentage-based
-        // capping (max 50% of ring peers) to prevent death spiral where all peers get excluded.
-        let excluded_peers = self
-            .op_manager
-            .ring
-            .connection_manager
-            .compute_connect_excluded_peers(now);
 
         let skip = SkipListWithSelf {
             visited,
             self_addr: self.self_location.socket_addr(),
-            excluded_peers,
         };
         let router = self.op_manager.ring.router.read();
 
@@ -823,6 +814,8 @@ impl RelayContext for RelayEnv<'_> {
             .map(|loc| loc.distance(desired_location));
         let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::new();
         let mut eligible: Vec<PeerKeyLocation> = Vec::new();
+
+        let conn_mgr = &self.op_manager.ring.connection_manager;
 
         for cand in candidates {
             if let Some(ts) = recency.get(&cand) {
@@ -847,13 +840,23 @@ impl RelayContext for RelayEnv<'_> {
                 }
             }
 
+            // Look up acceptor reliability for this candidate. Peers with no history
+            // get 0.5 (unknown prior); peers with observed failures get lower scores.
+            let reliability = cand
+                .socket_addr()
+                .map(|addr| conn_mgr.peer_acceptor_reliability(addr, now))
+                .unwrap_or(0.5);
+
             if cand.location().is_some() {
-                if let Some(score) = estimator.estimate(&cand, desired_location) {
-                    scored.push((score, cand.clone()));
+                if let Some(estimator_score) = estimator.estimate(&cand, desired_location) {
+                    // Multiply estimator score by reliability so unreliable peers
+                    // are down-weighted even when the estimator rates them highly.
+                    let combined_score = estimator_score * reliability;
+                    scored.push((combined_score, cand.clone()));
                     continue;
                 }
-                // Keep candidates without estimates for fallback.
-                eligible.push(cand.clone());
+                // No estimator data — use reliability as the score directly.
+                scored.push((reliability, cand.clone()));
                 continue;
             }
             eligible.push(cand.clone());
@@ -903,25 +906,22 @@ impl RelayContext for RelayEnv<'_> {
         // that we don't know about.
         //
         let now = Instant::now();
-        let excluded_peers = self
-            .op_manager
-            .ring
-            .connection_manager
-            .compute_connect_excluded_peers(now);
         let skip = SkipListWithSelf {
             visited,
             self_addr: self.self_location.socket_addr(),
-            excluded_peers,
         };
         let router = self.op_manager.ring.router.read();
+        let conn_mgr = &self.op_manager.ring.connection_manager;
 
-        let candidates = self.op_manager.ring.connection_manager.routing_candidates(
+        let candidates = conn_mgr.routing_candidates(
             desired_location,
             None,
             skip,
             false, // CONNECT bypasses readiness filter to allow routing to not-yet-ready peers
         );
-        let eligible: Vec<PeerKeyLocation> = candidates
+
+        // Score candidates by acceptor reliability, filtering out recency cooldown.
+        let mut scored: Vec<(f64, PeerKeyLocation)> = candidates
             .into_iter()
             .filter(|cand| {
                 // Skip peers we recently forwarded to
@@ -932,9 +932,14 @@ impl RelayContext for RelayEnv<'_> {
                 }
                 true
             })
+            .filter_map(|cand| {
+                let addr = cand.socket_addr()?;
+                let reliability = conn_mgr.peer_acceptor_reliability(addr, now);
+                Some((reliability, cand))
+            })
             .collect();
 
-        if eligible.is_empty() {
+        if scored.is_empty() {
             tracing::debug!(
                 target = %desired_location,
                 "connect: no uphill candidates available"
@@ -942,11 +947,23 @@ impl RelayContext for RelayEnv<'_> {
             return None;
         }
 
+        // Sort by reliability descending (most reliable first).
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Among the best-reliability candidates (ties), partition into close/far
+        // and use the router to break ties.
+        let best_reliability = scored[0].0;
+        let best_candidates: Vec<PeerKeyLocation> = scored
+            .into_iter()
+            .filter(|(r, _)| (*r - best_reliability).abs() < f64::EPSILON)
+            .map(|(_, c)| c)
+            .collect();
+
         // Partition into "close uphill" (within 2× NEAR_TERMINUS_DISTANCE of target)
         // and "far uphill". Prefer close uphill peers as they're more likely to know
         // peers near the target that we don't.
         let close_threshold = NEAR_TERMINUS_DISTANCE * 2.0;
-        let (close, far): (Vec<_>, Vec<_>) = eligible.into_iter().partition(|cand| {
+        let (close, far): (Vec<_>, Vec<_>) = best_candidates.into_iter().partition(|cand| {
             cand.location()
                 .map(|loc| loc.distance(desired_location).as_f64() < close_threshold)
                 .unwrap_or(false)
@@ -1739,12 +1756,16 @@ impl Operation for ConnectOp {
                                             elapsed_ms = self.id.elapsed().as_millis(),
                                             "connect joined peer"
                                         );
-                                        // Clear exclusion for this acceptor on successful hole-punch
+                                        // Record success for this acceptor's reliability score
                                         if let Some(addr) = new_acceptor.peer.socket_addr() {
                                             op_manager
                                                 .ring
                                                 .connection_manager
-                                                .clear_connect_exclusion(addr);
+                                                .record_acceptor_outcome(
+                                                    addr,
+                                                    true,
+                                                    Instant::now(),
+                                                );
                                         }
                                         true
                                     } else {
@@ -2067,14 +2088,12 @@ impl Operation for ConnectOp {
                         if state.response_forwarded {
                             if let Some(ref fwd) = state.forwarded_to {
                                 if let Some(fwd_addr) = fwd.socket_addr() {
-                                    // Record failure so this relay avoids the bad acceptor in future CONNECTs.
-                                    op_manager
-                                        .ring
-                                        .connection_manager
-                                        .record_connect_acceptor_failure(
-                                            *failed_acceptor_addr,
-                                            now,
-                                        );
+                                    // Record failure so this relay down-weights the bad acceptor in future CONNECTs.
+                                    op_manager.ring.connection_manager.record_acceptor_outcome(
+                                        *failed_acceptor_addr,
+                                        false,
+                                        now,
+                                    );
 
                                     let fwd_msg = ConnectMsg::ConnectFailed {
                                         id: self.id,
@@ -2104,11 +2123,12 @@ impl Operation for ConnectOp {
                         let failed_peer = state.forwarded_to.clone();
                         let desired_location = state.request.desired_location;
 
-                        // Record failure in exclusion tracker
-                        op_manager
-                            .ring
-                            .connection_manager
-                            .record_connect_acceptor_failure(*failed_acceptor_addr, now);
+                        // Record failure in acceptor reliability tracker
+                        op_manager.ring.connection_manager.record_acceptor_outcome(
+                            *failed_acceptor_addr,
+                            false,
+                            now,
+                        );
 
                         // Record forward failure in estimator (drops state borrow via self)
                         if let Some(ref fwd) = failed_peer {
@@ -2218,18 +2238,15 @@ impl Operation for ConnectOp {
     }
 }
 
-/// Skip list that combines visited peers, own address, and CONNECT-excluded peers.
+/// Skip list that combines visited peers and own address.
 /// This ensures we never select ourselves as a forwarding target and avoids
-/// peers with repeated acceptor failures.
+/// peers already visited in this CONNECT transaction.
 ///
-/// The excluded set is precomputed via `compute_connect_excluded_peers()` to ensure
-/// percentage-based capping: at most 50% of ring peers are excluded, preventing
-/// a death spiral where all peers accumulate failures and routing stalls.
+/// Acceptor reliability is applied as a score multiplier after candidate
+/// selection rather than as a binary filter, so it does not appear here.
 struct SkipListWithSelf<'a> {
     visited: &'a VisitedPeers,
     self_addr: Option<SocketAddr>,
-    /// Precomputed set of peers excluded from CONNECT routing.
-    excluded_peers: HashSet<SocketAddr>,
 }
 
 impl Contains<SocketAddr> for SkipListWithSelf<'_> {
@@ -2238,9 +2255,6 @@ impl Contains<SocketAddr> for SkipListWithSelf<'_> {
             if target == self_addr {
                 return true;
             }
-        }
-        if self.excluded_peers.contains(&target) {
-            return true;
         }
         self.visited.probably_visited(target)
     }
@@ -4105,7 +4119,6 @@ mod tests {
         let skip = SkipListWithSelf {
             visited: &visited,
             self_addr: Some(self_addr),
-            excluded_peers: HashSet::new(),
         };
 
         // Should skip visited addresses
@@ -4550,53 +4563,60 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_exclusion_tracking() {
+    fn test_acceptor_reliability_tracking() {
         let cm = crate::ring::ConnectionManager::test_default();
         let addr: SocketAddr = "10.0.0.5:9000".parse().unwrap();
         let now = Instant::now();
 
-        // Not excluded initially
-        let excluded = cm.compute_connect_excluded_peers(now);
-        assert!(!excluded.contains(&addr));
+        // Unknown peer starts at 0.5 prior
+        let score = cm.peer_acceptor_reliability(addr, now);
+        assert!(
+            (score - 0.5).abs() < f64::EPSILON,
+            "unknown peer should have 0.5 reliability"
+        );
 
-        // Record failures below threshold
-        cm.record_connect_acceptor_failure(addr, now);
-        cm.record_connect_acceptor_failure(addr, now);
-        let excluded = cm.compute_connect_excluded_peers(now);
-        assert!(!excluded.contains(&addr), "below threshold");
+        // Record failures — reliability should decrease
+        cm.record_acceptor_outcome(addr, false, now);
+        cm.record_acceptor_outcome(addr, false, now);
+        cm.record_acceptor_outcome(addr, false, now);
+        let score = cm.peer_acceptor_reliability(addr, now);
+        // (0+1)/(3+2) = 0.2
+        assert!(
+            (score - 0.2).abs() < 0.01,
+            "3 failures should give ~0.2 reliability, got {}",
+            score
+        );
 
-        // Third failure crosses threshold
-        cm.record_connect_acceptor_failure(addr, now);
-        let excluded = cm.compute_connect_excluded_peers(now);
-        assert!(excluded.contains(&addr), "at threshold");
-
-        // Clear exclusion
-        cm.clear_connect_exclusion(addr);
-        let excluded = cm.compute_connect_excluded_peers(now);
-        assert!(!excluded.contains(&addr), "after clear");
+        // Record a success — reliability should increase
+        cm.record_acceptor_outcome(addr, true, now);
+        let score = cm.peer_acceptor_reliability(addr, now);
+        // (1+1)/(4+2) ≈ 0.333
+        assert!(
+            score > 0.2,
+            "success should increase reliability from 0.2, got {}",
+            score
+        );
     }
 
     #[test]
-    fn test_skip_list_excludes_connect_excluded_peers() {
+    fn test_skip_list_skips_self_and_visited() {
         let tx = Transaction::new::<ConnectMsg>();
-        let visited = VisitedPeers::new(&tx);
+        let mut visited = VisitedPeers::new(&tx);
         let self_addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-        let excluded_addr: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let visited_addr: SocketAddr = "10.0.0.2:5000".parse().unwrap();
         let normal_addr: SocketAddr = "10.0.0.3:5000".parse().unwrap();
 
-        let mut excluded_peers = HashSet::new();
-        excluded_peers.insert(excluded_addr);
+        visited.mark_visited(visited_addr);
 
         let skip = SkipListWithSelf {
             visited: &visited,
             self_addr: Some(self_addr),
-            excluded_peers,
         };
 
         assert!(skip.has_element(self_addr), "self should be skipped");
         assert!(
-            skip.has_element(excluded_addr),
-            "connect-excluded peer should be skipped"
+            skip.has_element(visited_addr),
+            "visited peer should be skipped"
         );
         assert!(
             !skip.has_element(normal_addr),
