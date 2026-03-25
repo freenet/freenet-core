@@ -9,7 +9,7 @@
 //!
 //! All tests use `run_controlled_simulation()` for deterministic execution via Turmoil.
 //!
-//! Enable with: cargo test -p freenet --features "simulation_tests,testing" --test streaming_e2e
+//! Run: `cargo test -p freenet --features "simulation_tests,testing" --test streaming_e2e`
 
 #![cfg(feature = "simulation_tests")]
 
@@ -566,5 +566,93 @@ fn test_streaming_multi_hop_forwarding() {
     assert_eq!(
         stored_bytes, large_state,
         "Stored state bytes should match the original 200KB state"
+    );
+}
+
+// =============================================================================
+// Test 8: Streaming GET through relay hop
+// =============================================================================
+
+/// Tests that a large contract can be retrieved via streaming GET through relay nodes.
+///
+/// This exercises the relay pipe_stream path for GET responses (#3586), which was
+/// the code path responsible for the streaming hang bug (#3608). The scenario:
+///
+/// 1. Gateway PUTs a ~1MB contract (stored at nodes near its ring location)
+/// 2. A different node GETs the contract, routing through intermediate relay nodes
+/// 3. The relay uses pipe_stream to forward the streaming GET response
+///
+/// With 1 gateway + 4 nodes, the GET request from a non-storing node must relay
+/// through at least one intermediate node, exercising the pipe_stream forwarding
+/// path that the cwnd timeout protects.
+#[test]
+fn test_streaming_get_through_relay() {
+    const SEED: u64 = 0xDE1A_0008_FACE_B00C;
+    const NETWORK_NAME: &str = "streaming-get-relay";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 1024 * 1024; // ~1MB, similar to River UI container
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 4, SEED, THRESHOLD));
+
+    let contract = SimOperation::create_test_contract(0xAB);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0xAB);
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+
+    let operations = vec![
+        // Gateway PUTs 1MB contract
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: large_state.clone(),
+                subscribe: false,
+            },
+        ),
+        // A different node GETs the contract — must relay through network
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300), // Longer timeout for 1MB streaming GET
+        Duration::from_secs(120),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Streaming GET through relay should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The GET-requesting node should have the contract state
+    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
+    let node3_storage = result
+        .node_storages
+        .get(&node3_label)
+        .expect("node 3 should have a storage handle");
+    let node3_state = node3_storage.get_stored_state(&contract_key);
+
+    assert!(
+        node3_state.is_some(),
+        "Node 3 should have 1MB contract state after streaming GET through relay"
+    );
+    let stored_bytes: Vec<u8> = node3_state.unwrap().as_ref().to_vec();
+    assert_eq!(
+        stored_bytes, large_state,
+        "Stored state bytes should match the original 1MB state after relay GET"
     );
 }
