@@ -1512,7 +1512,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // a different path (same tx ID).
                 //
                 // If an ACK has been received, the chain is alive — trust it for
-                // PROGRESS_TIMEOUT (20s). If no response arrives within that window,
+                // PROGRESS_TIMEOUT (7s). If no response arrives within that window,
                 // the chain has stalled and we re-enable speculative retry (#3570).
                 // Without this, a single ACK permanently disables retry, causing
                 // the originator to wait the full OPERATION_TTL (60s) with no recovery.
