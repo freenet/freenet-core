@@ -1412,14 +1412,7 @@ impl Default for WebsocketApiConfig {
     }
 }
 
-/// Default listening address for network mode.
-///
-/// Uses IPv6 unspecified (`::`) which, combined with `IPV6_V6ONLY=false`,
-/// accepts both IPv4 and IPv6 connections on a single socket (dual-stack).
-/// This is important for mobile networks which are increasingly IPv6-only.
-///
-/// Backward compatible: existing configs with `"0.0.0.0"` are deserialized
-/// as `IpAddr::V4` and still work — dual-stack is only the new default.
+/// Default listening address: `::` (IPv6 dual-stack, accepts IPv4 via mapped addresses).
 #[inline]
 const fn default_listening_address() -> IpAddr {
     IpAddr::V6(Ipv6Addr::UNSPECIFIED)

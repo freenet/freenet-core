@@ -380,14 +380,15 @@ impl Socket for UdpSocket {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
         // Use socket2 to configure dual-stack before binding, then convert
         // to a tokio UdpSocket. This ensures IPv6 sockets accept IPv4 too.
-        let domain = if addr.is_ipv6() {
+        let is_ipv6 = addr.is_ipv6();
+        let domain = if is_ipv6 {
             socket2::Domain::IPV6
         } else {
             socket2::Domain::IPV4
         };
         let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
             .map_err(|e| io::Error::new(e.kind(), format!("Failed to create UDP socket: {e}")))?;
-        if addr.is_ipv6() {
+        if is_ipv6 {
             // Dual-stack: accept both IPv4 (mapped as ::ffff:x.x.x.x) and IPv6
             sock.set_only_v6(false)?;
         }

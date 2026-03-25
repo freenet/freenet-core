@@ -181,20 +181,16 @@ async fn serve_with_listener(
 /// - **IPv4**: loopback (127/8), RFC 1918 (10/8, 172.16/12, 192.168/16),
 ///   link-local (169.254/16), unspecified (0.0.0.0)
 /// - **IPv6**: loopback (::1), link-local (fe80::/10), ULA (fc00::/7),
-///   unspecified (::)
+///   unspecified (::), IPv4-mapped (::ffff:x.x.x.x) delegated to IPv4 checks
 pub fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
         }
         IpAddr::V6(v6) => {
-            // Check IPv4-mapped addresses (::ffff:x.x.x.x) which appear when IPv4 clients
-            // connect to a dual-stack socket. Delegate to IPv4 private check.
+            // IPv4-mapped addresses (::ffff:x.x.x.x) from dual-stack sockets
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified();
+                return is_private_ip(&IpAddr::V4(v4));
             }
             v6.is_loopback() || v6.is_unspecified() || is_ipv6_link_local(v6) || is_ipv6_ula(v6)
         }
