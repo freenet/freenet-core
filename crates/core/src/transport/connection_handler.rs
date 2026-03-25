@@ -121,7 +121,7 @@ const SOCKET_BIND_BACKOFF: ExponentialBackoff =
 ///
 /// # Arguments
 /// * `keypair` - X25519 keypair for this peer
-/// * `listen_host` - IP address to bind to (use 0.0.0.0 for all interfaces)
+/// * `listen_host` - IP address to bind to (default `::` for dual-stack on all interfaces)
 /// * `listen_port` - UDP port to bind to
 /// * `is_gateway` - Whether this peer acts as a gateway
 /// * `bandwidth_limit` - Optional per-connection bandwidth limit in bytes/sec

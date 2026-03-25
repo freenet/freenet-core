@@ -121,11 +121,12 @@ async fn serve_with_listener(
             // Use SO_REUSEADDR so we can rebind immediately if the previous
             // process exited but the socket is still in TIME_WAIT.
             let std_listener = {
+                let is_ipv6 = socket.is_ipv6();
                 let sock = socket2::Socket::new(
-                    if socket.is_ipv4() {
-                        socket2::Domain::IPV4
-                    } else {
+                    if is_ipv6 {
                         socket2::Domain::IPV6
+                    } else {
+                        socket2::Domain::IPV4
                     },
                     socket2::Type::STREAM,
                     Some(socket2::Protocol::TCP),
@@ -133,6 +134,11 @@ async fn serve_with_listener(
                 .map_err(|e| {
                     std::io::Error::new(e.kind(), format!("Failed to create socket: {e}"))
                 })?;
+                // Enable dual-stack: accept both IPv4 and IPv6 on a single socket.
+                // IPv4 clients connect via IPv4-mapped addresses (::ffff:x.x.x.x).
+                if is_ipv6 {
+                    sock.set_only_v6(false)?;
+                }
                 sock.set_reuse_address(true)?;
                 sock.set_nonblocking(true)?;
                 sock.bind(&socket.into()).map_err(|e| {
@@ -182,6 +188,14 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
             v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
         }
         IpAddr::V6(v6) => {
+            // Check IPv4-mapped addresses (::ffff:x.x.x.x) which appear when IPv4 clients
+            // connect to a dual-stack socket. Delegate to IPv4 private check.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified();
+            }
             v6.is_loopback() || v6.is_unspecified() || is_ipv6_link_local(v6) || is_ipv6_ula(v6)
         }
     }
@@ -635,6 +649,17 @@ mod tests {
         assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
             0x2607, 0xf8b0, 0, 0, 0, 0, 0, 1
         ))));
+
+        // IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) — appear when IPv4 clients
+        // connect to dual-stack sockets. Must delegate to IPv4 private checks.
+        assert!(is_private_ip(
+            &"::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
+        )); // loopback
+        assert!(is_private_ip(&"::ffff:10.0.0.1".parse::<IpAddr>().unwrap())); // RFC 1918
+        assert!(is_private_ip(
+            &"::ffff:192.168.1.1".parse::<IpAddr>().unwrap()
+        )); // RFC 1918
+        assert!(!is_private_ip(&"::ffff:8.8.8.8".parse::<IpAddr>().unwrap())); // public
     }
 
     #[test]

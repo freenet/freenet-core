@@ -3,7 +3,7 @@ use std::{
     fs::{self, File},
     future::Future,
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc, LazyLock},
     time::Duration,
@@ -759,7 +759,7 @@ impl Config {
 
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetworkArgs {
-    /// Address to bind to for the network event listener, default is 0.0.0.0
+    /// Address to bind to for the network event listener, default is :: (dual-stack)
     #[arg(
         name = "network_address",
         long = "network-address",
@@ -1222,7 +1222,7 @@ fn default_bbr_startup_rate() -> Option<u64> {
 
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiArgs {
-    /// Address to bind to for the websocket API, default is 0.0.0.0
+    /// Address to bind to for the websocket API, default is :: (dual-stack)
     #[arg(
         name = "ws_api_address",
         long = "ws-api-address",
@@ -1412,14 +1412,22 @@ impl Default for WebsocketApiConfig {
     }
 }
 
+/// Default listening address for network mode.
+///
+/// Uses IPv6 unspecified (`::`) which, combined with `IPV6_V6ONLY=false`,
+/// accepts both IPv4 and IPv6 connections on a single socket (dual-stack).
+/// This is important for mobile networks which are increasingly IPv6-only.
+///
+/// Backward compatible: existing configs with `"0.0.0.0"` are deserialized
+/// as `IpAddr::V4` and still work — dual-stack is only the new default.
 #[inline]
 const fn default_listening_address() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
 }
 
 #[inline]
 const fn default_local_address() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::LOCALHOST)
+    IpAddr::V6(Ipv6Addr::LOCALHOST)
 }
 
 #[inline]

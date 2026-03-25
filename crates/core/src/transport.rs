@@ -378,7 +378,28 @@ pub trait Socket: Sized + Send + Sync + 'static {
 
 impl Socket for UdpSocket {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
-        Self::bind(addr).await
+        // Use socket2 to configure dual-stack before binding, then convert
+        // to a tokio UdpSocket. This ensures IPv6 sockets accept IPv4 too.
+        let domain = if addr.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        };
+        let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+            .map_err(|e| io::Error::new(e.kind(), format!("Failed to create UDP socket: {e}")))?;
+        if addr.is_ipv6() {
+            // Dual-stack: accept both IPv4 (mapped as ::ffff:x.x.x.x) and IPv6
+            sock.set_only_v6(false)?;
+        }
+        sock.set_nonblocking(true)?;
+        sock.bind(&addr.into()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Failed to bind UDP socket to {addr}: {e}"),
+            )
+        })?;
+        let std_socket: std::net::UdpSocket = sock.into();
+        Self::from_std(std_socket)
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -586,5 +607,58 @@ mod version_discovery_tests {
         report_peer_version((1, 0, 0));
         report_peer_version((1, 0, 0));
         assert_eq!(get_highest_seen_version(), Some((1, 0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod dual_stack_tests {
+    use super::*;
+    use std::net::{Ipv6Addr, SocketAddr};
+
+    /// Verify that binding to [::]:0 creates a dual-stack UDP socket that
+    /// can receive IPv4 traffic (via IPv4-mapped addresses).
+    #[tokio::test]
+    async fn udp_dual_stack_accepts_ipv4() {
+        let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr)
+            .await
+            .expect("bind to [::]:0 should succeed");
+        let bound_port = dual_sock.local_addr().unwrap().port();
+
+        // Send a packet from an IPv4 socket to the dual-stack socket
+        let v4_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            bound_port,
+        );
+        v4_sender
+            .send_to(b"hello", target)
+            .await
+            .expect("send from IPv4 should succeed");
+
+        let mut buf = [0u8; 16];
+        let (len, _src) = dual_sock.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"hello");
+    }
+
+    /// Verify that binding to [::]:0 also accepts IPv6 traffic.
+    #[tokio::test]
+    async fn udp_dual_stack_accepts_ipv6() {
+        let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr)
+            .await
+            .expect("bind to [::]:0 should succeed");
+        let bound_port = dual_sock.local_addr().unwrap().port();
+
+        let v6_sender = UdpSocket::bind("[::1]:0").await.unwrap();
+        let target = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), bound_port);
+        v6_sender
+            .send_to(b"world", target)
+            .await
+            .expect("send from IPv6 should succeed");
+
+        let mut buf = [0u8; 16];
+        let (len, _src) = dual_sock.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"world");
     }
 }
