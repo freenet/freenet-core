@@ -558,6 +558,36 @@ impl Operation for PutOp {
                     // Network peer notification is now automatic via BroadcastStateChange
                     // event emitted by the executor when state changes. No manual triggering needed.
 
+                    // For originator PUTs, respond to client immediately after local
+                    // upsert. Network propagation continues asynchronously via forwarding.
+                    //
+                    // Uses raw try_send (not send_client_result) because the operation must
+                    // remain in the state map for routing. When the operation eventually
+                    // completes (via PutMsg::Response or no-next-hop), report_result will
+                    // send a second PutResponse through send_client_result. This duplicate
+                    // is safe: SessionActor.client_transactions is consumed on first
+                    // delivery, so the second send finds no recipients and is a no-op.
+                    if is_originator {
+                        let result_op = PutOp {
+                            id,
+                            state: Some(PutState::Finished(FinishedData { key })),
+                            upstream_addr: None,
+                            stats: None,
+                            ack_received: false,
+                            speculative_paths: 0,
+                        };
+                        if let Err(error) = op_manager
+                            .result_router_tx
+                            .try_send((id, result_op.to_host_result()))
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %error,
+                                "Failed to send early PutResponse to client"
+                            );
+                        }
+                    }
+
                     // Step 2: Determine if we should forward or respond
                     // Build skip list: include sender (upstream) and already-tried peers
                     let mut new_skip_list = skip_list.clone();
