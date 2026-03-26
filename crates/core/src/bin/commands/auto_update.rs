@@ -135,6 +135,7 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
 }
 
 /// Result of comparing the current version against the latest GitHub release.
+#[derive(Debug)]
 enum VersionComparison {
     /// A newer version exists on GitHub.
     Newer(String),
@@ -150,19 +151,23 @@ async fn compare_with_github(current_version: &str) -> VersionComparison {
         Ok(v) => v,
         Err(e) => return VersionComparison::Failed(e.to_string()),
     };
+    compare_versions(current_version, &latest)
+}
 
+/// Pure version comparison: parse both strings as semver and compare.
+fn compare_versions(current_version: &str, latest_version: &str) -> VersionComparison {
     let current = match Version::parse(current_version) {
         Ok(v) => v,
         Err(e) => return VersionComparison::Failed(format!("bad current version: {e}")),
     };
 
-    let latest_ver = match Version::parse(&latest) {
+    let latest_ver = match Version::parse(latest_version) {
         Ok(v) => v,
         Err(e) => return VersionComparison::Failed(format!("bad latest version: {e}")),
     };
 
     if latest_ver > current {
-        VersionComparison::Newer(latest)
+        VersionComparison::Newer(latest_version.to_string())
     } else {
         VersionComparison::UpToDate
     }
@@ -279,13 +284,15 @@ pub fn should_attempt_update() -> bool {
     get_update_failure_count() < MAX_UPDATE_FAILURES
 }
 
-/// Proactive version check that bypasses backoff state.
+/// Proactive version check that bypasses the reactive backoff timer.
 ///
 /// Used for periodic GitHub polling independent of peer handshakes (#3664).
 /// Peers with full same-version connections never exchange version info via
 /// handshakes, so they need this independent check to discover updates.
 ///
-/// Still respects the failure count limit to avoid hammering a broken API.
+/// Unlike `check_if_update_available`, this does not call `record_check_time()`
+/// or `increase_backoff()` on failure — the caller's 4-hour timer provides
+/// sufficient rate limiting. Does not modify backoff state on failure.
 pub async fn check_update_proactive(current_version: &str) -> UpdateCheckResult {
     if !should_attempt_update() {
         return UpdateCheckResult::Skipped;
@@ -380,6 +387,48 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("0.1.74"));
         assert!(msg.contains("auto-update"));
+    }
+
+    #[test]
+    fn test_compare_versions_newer() {
+        match compare_versions("0.2.13", "0.2.14") {
+            VersionComparison::Newer(v) => assert_eq!(v, "0.2.14"),
+            other => panic!("expected Newer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_compare_versions_up_to_date() {
+        assert!(matches!(
+            compare_versions("0.2.14", "0.2.14"),
+            VersionComparison::UpToDate
+        ));
+        // Current ahead of latest (pre-release gateway)
+        assert!(matches!(
+            compare_versions("0.2.15", "0.2.14"),
+            VersionComparison::UpToDate
+        ));
+    }
+
+    #[test]
+    fn test_compare_versions_invalid() {
+        assert!(matches!(
+            compare_versions("not-a-version", "0.2.14"),
+            VersionComparison::Failed(_)
+        ));
+        assert!(matches!(
+            compare_versions("0.2.14", "bad"),
+            VersionComparison::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn test_compare_versions_prerelease() {
+        // Pre-release is less than release per semver
+        match compare_versions("0.2.14-rc1", "0.2.14") {
+            VersionComparison::Newer(v) => assert_eq!(v, "0.2.14"),
+            other => panic!("expected Newer, got {other:?}"),
+        }
     }
 
     #[test]
