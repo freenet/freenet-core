@@ -329,6 +329,9 @@ impl Router {
             .estimate_retrieval_time(peer, target_location)
             .ok();
 
+        // Clamp before using in cost formulas — per-peer EWMA adjustments can
+        // push the raw estimate slightly outside [0, 1].
+        let failure_estimate = failure_estimate.clamp(0.0, 1.0);
         let failure_cost_multiplier = 3.0;
 
         let (expected_total_time, time_to_response_start, xfer_speed) =
@@ -348,7 +351,7 @@ impl Router {
             };
 
         Ok(RoutingPrediction {
-            failure_probability: failure_estimate.clamp(0.0, 1.0),
+            failure_probability: failure_estimate,
             xfer_speed: TransferSpeed {
                 bytes_per_second: xfer_speed,
             },
@@ -723,7 +726,7 @@ mod tests {
             // Note: Due to isotonic regression implementation details, values might
             // occasionally be slightly outside [0, 1] due to floating point errors
             assert!(
-                prediction.failure_probability >= -0.01 && prediction.failure_probability <= 1.01,
+                prediction.failure_probability >= 0.0 && prediction.failure_probability <= 1.0,
                 "failure_probability out of range: {}",
                 prediction.failure_probability
             );
@@ -2050,8 +2053,8 @@ mod tests {
                     if let Some(pred) = &candidate.prediction {
                         // Allow small float tolerance around [0, 1]
                         prop_assert!(
-                            pred.failure_probability >= -0.01
-                                && pred.failure_probability <= 1.01,
+                            pred.failure_probability >= 0.0
+                                && pred.failure_probability <= 1.0,
                             "failure_probability {} out of [0, 1] range",
                             pred.failure_probability
                         );

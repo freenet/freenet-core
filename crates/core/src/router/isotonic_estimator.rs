@@ -47,21 +47,25 @@ impl IsotonicEstimator {
     where
         I: IntoIterator<Item = IsotonicEvent>,
     {
-        let mut all_points = VecDeque::new();
+        let mut all_events: Vec<IsotonicEvent> = history.into_iter().collect();
+
+        // If history exceeds the window, keep only the most recent events.
+        // Both the regression points and the peer adjustment deltas are computed
+        // from the same windowed subset to avoid stale-data bias.
+        if all_events.len() > MAX_REGRESSION_POINTS {
+            all_events.drain(..all_events.len() - MAX_REGRESSION_POINTS);
+        }
+
+        let mut all_points = VecDeque::with_capacity(all_events.len());
         let mut peer_events: HashMap<PeerKeyLocation, Vec<IsotonicEvent>> = HashMap::new();
 
-        for event in history {
+        for event in all_events {
             let point = Point::new(event.route_distance().as_f64(), event.result);
             all_points.push_back(point);
             peer_events
                 .entry(event.peer.clone())
                 .or_default()
                 .push(event);
-        }
-
-        // If history exceeds the window, keep only the most recent points.
-        while all_points.len() > MAX_REGRESSION_POINTS {
-            all_points.pop_front();
         }
 
         let points: Vec<Point<f64>> = all_points.iter().cloned().collect();
