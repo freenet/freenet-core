@@ -24,7 +24,7 @@ either = "1"
 event-listener = "5"
 hex = "0.4"
 parking_lot = "0.12"
-pav_regression = "0.6.1"
+pav_regression = "0.7.0"
 pin-project = "1"
 thiserror = "2"
 ulid = { version = "1.1", features = ["serde"] }
