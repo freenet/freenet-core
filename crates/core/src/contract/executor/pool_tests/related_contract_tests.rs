@@ -493,3 +493,101 @@ async fn test_update_with_related_succeeds() {
         "update with related validation should succeed: {result:?}"
     );
 }
+
+// =========================================================================
+// Test: Exactly 10 related contracts (boundary) succeeds
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_exactly_at_limit_succeeds() {
+    let mut executor = create_executor().await;
+
+    // Create and PUT exactly 10 related contracts
+    let mut related_ids = Vec::new();
+    for i in 0..10u8 {
+        let contract = make_contract(&[i, 200, 200]);
+        let key = contract.key();
+        related_ids.push(*key.id());
+        executor
+            .upsert_contract_state(
+                key,
+                Either::Left(WrappedState::new(vec![i])),
+                RelatedContracts::default(),
+                Some(contract),
+            )
+            .await
+            .expect("related contract PUT");
+    }
+
+    // PUT a contract that requests all 10
+    let contract = make_contract(b"boundary_code");
+    let key = contract.key();
+    let state = WrappedState::new(vec![1, 2, 3]);
+
+    executor
+        .runtime
+        .validate_overrides
+        .insert(*key.id(), ValidateOverride::RequestRelated(related_ids));
+
+    let result = executor
+        .upsert_contract_state(
+            key,
+            Either::Left(state),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "exactly 10 related contracts should succeed: {result:?}"
+    );
+}
+
+// =========================================================================
+// Test: Multiple distinct related contracts in single request
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_multiple_related_contracts() {
+    let mut executor = create_executor().await;
+
+    // PUT 3 distinct related contracts
+    let mut related_ids = Vec::new();
+    for i in 0..3u8 {
+        let contract = make_contract(&[i, 150, 150]);
+        let key = contract.key();
+        related_ids.push(*key.id());
+        executor
+            .upsert_contract_state(
+                key,
+                Either::Left(WrappedState::new(vec![10 + i])),
+                RelatedContracts::default(),
+                Some(contract),
+            )
+            .await
+            .expect("related contract PUT");
+    }
+
+    // PUT a contract that requests all 3
+    let contract = make_contract(b"multi_related_code");
+    let key = contract.key();
+    let state = WrappedState::new(vec![1, 2, 3]);
+
+    executor
+        .runtime
+        .validate_overrides
+        .insert(*key.id(), ValidateOverride::RequestRelated(related_ids));
+
+    let result = executor
+        .upsert_contract_state(
+            key,
+            Either::Left(state),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "multiple related contracts should succeed: {result:?}"
+    );
+}

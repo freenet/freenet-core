@@ -218,9 +218,12 @@ MUST:
   RELATED_FETCH_TIMEOUT = 10s. Self-reference is rejected.
   Empty RequestRelated is rejected.
 
-- Network inbound upsert: DEFERRED. When another node broadcasts
-  an update, the receiver currently errors on RequestRelated.
-  The sending node already validated. See issue for this.
+- Network inbound upsert: Related contracts are fetched locally
+  during validation. If the related contract isn't already stored
+  locally, it will fail with MissingRelated. The sending node
+  already validated at depth=1, so this is acceptable. Network
+  fetch during broadcast processing is deferred to avoid
+  cascading backpressure (documented anti-pattern).
 ```
 
 ### WHEN a contract's validate_state returns RequestRelated

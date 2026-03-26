@@ -1088,6 +1088,14 @@ where
                                 tracing::warn!(contract = %key, error = %e, "failed to remove contract after validation failure");
                             }
                         }
+                        // Clean up init_tracker so queued operations aren't left dangling
+                        if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
+                            tracing::warn!(
+                                contract = %key,
+                                dropped_operations = dropped_count,
+                                "Related contract validation failed, dropping queued operations"
+                            );
+                        }
                     })?;
                 match result {
                     ValidateResult::Valid => {
@@ -1234,12 +1242,20 @@ where
                         return Err(ExecutorError::request(StdContractError::invalid_put(key)));
                     }
                     ValidateResult::RequestRelated(_) => {
-                        // fetch_related_for_validation handles RequestRelated internally;
-                        // if it still returns RequestRelated, it means depth>1 was needed
-                        // which is already rejected inside the helper. This is unreachable.
-                        unreachable!(
-                            "fetch_related_for_validation should never return RequestRelated"
-                        );
+                        // fetch_related_for_validation resolves RequestRelated internally.
+                        // If this is reached, it indicates a logic error in the helper.
+                        if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
+                            tracing::warn!(
+                                contract = %key,
+                                dropped_operations = dropped_count,
+                                "Unexpected RequestRelated after fetch, dropping queued operations"
+                            );
+                        }
+                        return Err(ExecutorError::request(StdContractError::Put {
+                            key,
+                            cause: "unexpected RequestRelated after related contract resolution"
+                                .into(),
+                        }));
                     }
                 }
 
@@ -1852,10 +1868,14 @@ where
     /// Validate a contract's state, automatically fetching related contracts if requested.
     ///
     /// Depth=1 only: the original contract may request related contract states via
-    /// `RequestRelated`. Those related contracts are fetched (local or network) and
+    /// `RequestRelated`. Those related contracts are fetched locally and
     /// `validate_state` is called exactly once more. If the second call also returns
     /// `RequestRelated`, that's an error — contracts must declare all dependencies in
     /// one round.
+    ///
+    /// # Return value
+    /// On success, returns only `Valid` or `Invalid`, never `RequestRelated`.
+    /// `RequestRelated` is resolved internally or converted to an error.
     ///
     /// # Safety limits
     /// - At most `MAX_RELATED_CONTRACTS_PER_REQUEST` (10) related contracts
@@ -1978,7 +1998,17 @@ where
             }
         }
 
-        // Re-call validate_state with populated related contracts
+        // Merge initial_related (caller-provided) with newly fetched states.
+        // The contract's first call saw initial_related; the second call should see
+        // both the original entries and the newly fetched ones.
+        let initial_owned = initial_related.clone().into_owned();
+        for (id, state) in initial_owned.states() {
+            if let Some(s) = state {
+                related_map
+                    .entry(*id)
+                    .or_insert_with(|| Some(s.clone().into_owned()));
+            }
+        }
         let populated_related = RelatedContracts::from(related_map);
         let retry_result = self
             .runtime
@@ -2012,11 +2042,25 @@ where
                     cause: "invalid outcome state".into(),
                 })
             }
-            ValidateResult::Valid | ValidateResult::RequestRelated(_) => {
-                unreachable!(
-                    "validation_error called with {:?} — should only be called on Invalid",
-                    result
-                )
+            ValidateResult::RequestRelated(_) => {
+                // fetch_related_for_validation should resolve RequestRelated internally.
+                // If this is reached, it's a defensive fallback — return error, don't panic.
+                tracing::error!(
+                    contract = %key,
+                    "validation_error called with RequestRelated — expected only Invalid"
+                );
+                ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
+                    key,
+                    cause: "missing related contracts for validation".into(),
+                })
+            }
+            ValidateResult::Valid => {
+                // Should never be called with Valid, but don't panic in production
+                tracing::error!(
+                    contract = %key,
+                    "validation_error called with Valid result — this is a bug"
+                );
+                ExecutorError::internal_error()
             }
         }
     }
