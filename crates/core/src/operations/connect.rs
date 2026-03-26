@@ -813,7 +813,7 @@ impl RelayContext for RelayEnv<'_> {
             .location()
             .map(|loc| loc.distance(desired_location));
         let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::new();
-        let mut eligible: Vec<PeerKeyLocation> = Vec::new();
+        let mut fallbacks: Vec<PeerKeyLocation> = Vec::new();
 
         let conn_mgr = &self.op_manager.ring.connection_manager;
 
@@ -824,24 +824,17 @@ impl RelayContext for RelayEnv<'_> {
                 }
             }
 
-            // GREEDY ROUTING: Only consider neighbors that are CLOSER to the target than we are.
-            // This is essential for proper terminus detection - we're at terminus when no
-            // neighbor is closer to the target than we are.
-            //
-            // Note: We use `>` (not `>=`) to allow forwarding to equally-distant peers.
-            // This gives more routing flexibility when peers are equidistant to the target
-            // (common near ring boundary 0.0/1.0). Routing loops are prevented by the
-            // `visited` list, not by this distance check.
+            // GREEDY ROUTING: Only consider neighbors that are CLOSER to the target
+            // than we are. We use `>` (not `>=`) to allow equally-distant peers,
+            // giving more flexibility near ring boundary 0.0/1.0. Routing loops
+            // are prevented by the `visited` list, not by this distance check.
             if let (Some(cand_loc), Some(my_dist)) = (cand.location(), my_distance) {
-                let cand_distance = cand_loc.distance(desired_location);
-                if cand_distance > my_dist {
-                    // Neighbor is farther from target than us - skip
+                if cand_loc.distance(desired_location) > my_dist {
                     continue;
                 }
             }
 
-            // Look up acceptor reliability for this candidate. Peers with no history
-            // get 0.5 (unknown prior); peers with observed failures get lower scores.
+            // Acceptor reliability: unknown peers get 0.5, observed failures lower.
             let reliability = cand
                 .socket_addr()
                 .map(|addr| conn_mgr.peer_acceptor_reliability(addr, now))
@@ -849,21 +842,19 @@ impl RelayContext for RelayEnv<'_> {
 
             if cand.location().is_some() {
                 if let Some(estimator_score) = estimator.estimate(&cand, desired_location) {
-                    // Multiply estimator score by reliability so unreliable peers
-                    // are down-weighted even when the estimator rates them highly.
-                    let combined_score = estimator_score * reliability;
-                    scored.push((combined_score, cand.clone()));
+                    scored.push((estimator_score * reliability, cand.clone()));
                     continue;
                 }
-                // No estimator data — use reliability as the score directly.
+                // No estimator data -- use reliability as the score directly.
                 scored.push((reliability, cand.clone()));
                 continue;
             }
-            eligible.push(cand.clone());
+            // Candidates without a location go to fallback pool.
+            fallbacks.push(cand.clone());
         }
 
         // Filter out low-score peers when alternatives exist.
-        filter_low_score_peers(&mut scored, eligible.len());
+        filter_low_score_peers(&mut scored, fallbacks.len());
 
         if !scored.is_empty() {
             let best_score = scored
@@ -881,11 +872,11 @@ impl RelayContext for RelayEnv<'_> {
             }
         }
 
-        if eligible.is_empty() {
+        if fallbacks.is_empty() {
             None
         } else {
             router
-                .select_peer(eligible.iter(), desired_location)
+                .select_peer(fallbacks.iter(), desired_location)
                 .cloned()
         }
     }
@@ -921,7 +912,7 @@ impl RelayContext for RelayEnv<'_> {
         );
 
         // Score candidates by acceptor reliability, filtering out recency cooldown.
-        let mut scored: Vec<(f64, PeerKeyLocation)> = candidates
+        let scored: Vec<(f64, PeerKeyLocation)> = candidates
             .into_iter()
             .filter(|cand| {
                 // Skip peers we recently forwarded to
@@ -947,15 +938,13 @@ impl RelayContext for RelayEnv<'_> {
             return None;
         }
 
-        // Sort by reliability descending (most reliable first).
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Among the best-reliability candidates (ties), partition into close/far
-        // and use the router to break ties.
-        let best_reliability = scored[0].0;
+        // Keep candidates whose reliability is within 0.1 of the best.
+        // This avoids discarding close-to-target peers over tiny reliability
+        // differences while still filtering out genuinely unreliable ones.
+        let best_reliability = scored.iter().map(|(r, _)| *r).fold(0.0_f64, f64::max);
         let best_candidates: Vec<PeerKeyLocation> = scored
             .into_iter()
-            .filter(|(r, _)| (*r - best_reliability).abs() < f64::EPSILON)
+            .filter(|(r, _)| best_reliability - *r < 0.1)
             .map(|(_, c)| c)
             .collect();
 
@@ -2239,11 +2228,8 @@ impl Operation for ConnectOp {
 }
 
 /// Skip list that combines visited peers and own address.
-/// This ensures we never select ourselves as a forwarding target and avoids
+/// Ensures we never select ourselves as a forwarding target and avoids
 /// peers already visited in this CONNECT transaction.
-///
-/// Acceptor reliability is applied as a score multiplier after candidate
-/// selection rather than as a binary filter, so it does not appear here.
 struct SkipListWithSelf<'a> {
     visited: &'a VisitedPeers,
     self_addr: Option<SocketAddr>,

@@ -73,11 +73,8 @@ const FAILED_ADDR_MAX_TTL: Duration = Duration::from_secs(3600);
 /// Entries are evicted LRU-style when the limit is reached.
 const FAILED_ADDR_MAX_ENTRIES: usize = 1024;
 
-/// Tracks per-peer success rate for CONNECT acceptance (hole-punching).
-/// Used by `ConnectionManager` to estimate the probability that a given peer
-/// can successfully accept an inbound connection. Peers with no history get
-/// a prior of 0.5 (unknown reliability); the score converges to the true rate
-/// as observations accumulate via Laplace smoothing: `(successes + 1) / (attempts + 2)`.
+/// Per-peer CONNECT acceptance success/failure counts.
+/// See [`ConnectionManager::peer_acceptor_reliability`] for scoring formula.
 #[derive(Debug, Clone)]
 struct AcceptorStats {
     successes: u32,
@@ -1687,14 +1684,7 @@ impl ConnectionManager {
     const ACCEPTOR_STATS_TTL: Duration = Duration::from_secs(30 * 60);
 
     /// Record the outcome of a CONNECT attempt where `addr` was the acceptor.
-    ///
-    /// Increments the attempt count unconditionally and the success count when
-    /// `success` is true. The reliability score for this peer will converge to
-    /// `successes / attempts` with Laplace smoothing.
-    ///
-    /// `now` should be captured once by the caller and shared with related
-    /// time-sensitive calls in the same handler so they all see a consistent
-    /// timestamp.
+    /// Increments the attempt count and, if `success`, the success count.
     pub fn record_acceptor_outcome(&self, addr: SocketAddr, success: bool, now: Instant) {
         let mut map = self.acceptor_reliability.write();
         let entry = map.entry(addr).or_insert(AcceptorStats {
@@ -1726,12 +1716,8 @@ impl ConnectionManager {
         }
     }
 
-    /// Remove expired acceptor reliability entries. Called from
-    /// `connection_maintenance` on each tick.
-    ///
-    /// `now` should be the tick's captured timestamp so that all cleanup
-    /// operations in the same maintenance cycle share a consistent view of
-    /// current time.
+    /// Remove acceptor reliability entries older than `ACCEPTOR_STATS_TTL`.
+    /// Called from `connection_maintenance` on each tick.
     pub fn cleanup_expired_acceptor_stats(&self, now: Instant) {
         self.acceptor_reliability
             .write()
@@ -4162,9 +4148,9 @@ mod tests {
     }
 
     #[test]
-    fn test_acceptor_reliability_differentiates_worst_offenders() {
-        // Peers with many failures should have lower reliability than peers with
-        // few failures. This replaces the old binary exclusion cap test.
+    fn test_acceptor_reliability_failure_only_peers() {
+        // Peers with only failures (no successes) should score below the 0.5
+        // unknown prior, with more failures producing lower scores.
         let own_addr: SocketAddr = "10.0.0.100:9000".parse().unwrap();
         let cm = make_connection_manager(Some(own_addr), 1, 200, true);
         let now = Instant::now();
