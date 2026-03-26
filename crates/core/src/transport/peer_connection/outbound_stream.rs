@@ -26,18 +26,27 @@ use futures::StreamExt;
 use super::streaming::StreamHandle;
 use super::StreamId;
 
-/// Maximum time to wait for congestion window space to open in `send_stream`
-/// and `pipe_stream`. If ACKs stop arriving (broken connection, one-directional
-/// path failure), this prevents the cwnd wait loop from blocking forever (#3608).
-/// 15s is generous: at even 1 Mbps with 1500-byte MTU, a full 64KB cwnd
-/// drains in ~0.5s. If it hasn't opened in 15s, the connection is dead.
+/// Maximum time to wait for congestion window space *per fragment* before aborting a stream
+/// transfer. Resets for each fragment, so a slow-but-progressing transfer won't time out.
+///
+/// Derived from the receiver's STREAM_INACTIVITY_TIMEOUT minus a 10s margin, so the sender
+/// fails first with a diagnostic message rather than the receiver timing out silently.
 ///
 /// This is intentionally longer than `PROGRESS_TIMEOUT` (7s) in the GC task:
 /// if a cwnd stall causes a GET to stall, the GC task fires first (launching
 /// a speculative retry on a different peer), then this timeout fires later
 /// (cleaning up the stuck send task). The layered recovery ensures the user
 /// gets a fast retry without waiting for the transport-level timeout.
-const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const CWND_WAIT_TIMEOUT: Duration = {
+    const MARGIN_SECS: u64 = 10;
+    const INACTIVITY_SECS: u64 = super::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs();
+    // Compile-time check: STREAM_INACTIVITY_TIMEOUT must exceed the margin.
+    assert!(
+        INACTIVITY_SECS > MARGIN_SECS,
+        "STREAM_INACTIVITY_TIMEOUT must be > 10s"
+    );
+    Duration::from_secs(INACTIVITY_SECS - MARGIN_SECS)
+};
 
 /// Stream payload type using zero-copy Bytes for efficient fragmentation.
 /// Using Bytes::slice() instead of Vec::split_off() eliminates per-fragment allocations.
@@ -1143,5 +1152,63 @@ mod tests {
             serialized_frag2.len(),
             packet_data::MAX_DATA_SIZE
         );
+    }
+
+    /// Test that pipe_stream aborts with ConnectionClosed when the cwnd wait
+    /// exceeds CWND_WAIT_TIMEOUT. This exercises the same timeout logic as
+    /// send_stream but through the pipe_stream code path with different state
+    /// variables (sent_so_far as u64 bytes, no completion_tx).
+    #[tokio::test(start_paused = true)]
+    async fn test_pipe_stream_cwnd_wait_timeout() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+
+        let (outbound_sender, _outbound_receiver) = fast_channel::bounded(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // Create a StreamHandle with a fragment already buffered so the
+        // inactivity timeout (30s) doesn't fire before the cwnd timeout (20s).
+        let stream_id = StreamId::next();
+        let handle = StreamHandle::new(stream_id, 10_000);
+        handle
+            .push_fragment(1, Bytes::from(vec![0u8; 1400]))
+            .unwrap();
+
+        // Stuck congestion controller (same pattern as send_stream test)
+        let congestion_controller = CongestionControlConfig::default().build_arc();
+        congestion_controller.on_send(1_000_000);
+        congestion_controller.on_timeout();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let pipe_task = GlobalExecutor::spawn(pipe_stream(
+            handle,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+        ));
+
+        let result = pipe_task.await.expect("join error");
+        assert!(
+            matches!(result, Err(TransportError::ConnectionClosed(_))),
+            "Expected ConnectionClosed after pipe_stream cwnd wait timeout, got: {:?}",
+            result
+        );
+
+        Ok(())
     }
 }
