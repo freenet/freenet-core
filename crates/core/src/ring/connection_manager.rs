@@ -1692,9 +1692,9 @@ impl ConnectionManager {
             attempts: 0,
             last_updated: now,
         });
-        entry.attempts += 1;
+        entry.attempts = entry.attempts.saturating_add(1);
         if success {
-            entry.successes += 1;
+            entry.successes = entry.successes.saturating_add(1);
         }
         entry.last_updated = now;
     }
@@ -4179,5 +4179,38 @@ mod tests {
         // Both should be below the unknown prior of 0.5
         assert!(high_score < 0.5, "high-failure peer should be below prior");
         assert!(low_score < 0.5, "low-failure peer should be below prior");
+    }
+
+    #[test]
+    fn test_acceptor_reliability_ttl_expiry() {
+        let cm = crate::ring::ConnectionManager::test_default();
+        let addr: SocketAddr = "10.0.0.7:9000".parse().unwrap();
+        let now = Instant::now();
+
+        // Record failures
+        for _ in 0..5 {
+            cm.record_acceptor_outcome(addr, false, now);
+        }
+        let score = cm.peer_acceptor_reliability(addr, now);
+        assert!(score < 0.3, "5 failures should give low score, got {score}");
+
+        // After TTL expires, should return to prior
+        let expired = now + ConnectionManager::ACCEPTOR_STATS_TTL + Duration::from_secs(1);
+        let score = cm.peer_acceptor_reliability(addr, expired);
+        assert!(
+            (score - 0.5).abs() < f64::EPSILON,
+            "expired stats should return 0.5 prior, got {score}"
+        );
+
+        // Cleanup should remove the entry
+        cm.cleanup_expired_acceptor_stats(expired);
+        // Recording again should start fresh
+        cm.record_acceptor_outcome(addr, true, expired);
+        let score = cm.peer_acceptor_reliability(addr, expired);
+        // 1 success, 0 failures: (1+1)/(1+2) = 0.667
+        assert!(
+            (score - 2.0 / 3.0).abs() < 0.01,
+            "fresh entry after cleanup should reflect new data, got {score}"
+        );
     }
 }

@@ -141,6 +141,12 @@ const NEAR_TERMINUS_DISTANCE: f64 = 0.05;
 /// At distance 0 this is the full probability; at `NEAR_TERMINUS_DISTANCE` it's 0.
 const NEAR_TERMINUS_ACCEPT_PROB: f64 = 0.6;
 
+/// Tolerance band for reliability-based uphill peer selection.
+/// Candidates within this delta of the best reliability score are
+/// treated as equivalent, allowing distance-based partitioning to
+/// differentiate among similarly-reliable peers.
+const UPHILL_RELIABILITY_TOLERANCE: f64 = 0.1;
+
 /// Filter out scored peers below `MIN_FORWARD_SCORE` when alternatives exist.
 ///
 /// If filtering would leave zero scored peers AND zero eligible (unscored) peers,
@@ -842,7 +848,16 @@ impl RelayContext for RelayEnv<'_> {
 
             if cand.location().is_some() {
                 if let Some(estimator_score) = estimator.estimate(&cand, desired_location) {
-                    scored.push((estimator_score * reliability, cand.clone()));
+                    // Combine path quality (estimator) with endpoint reliability.
+                    // These signals partially overlap (the estimator sees end-to-end
+                    // outcomes including hole-punch failures), but telemetry shows
+                    // the estimator's global curve is too optimistic at close distances
+                    // for specific bad peers (scores 0.4-0.8 where true rate is ~0.05).
+                    // Multiplication is the correct combination for P(path_success) ×
+                    // P(holepunch_success) — the partial overlap means we slightly
+                    // over-penalize, but this is preferable to under-penalizing.
+                    let combined_score = estimator_score * reliability;
+                    scored.push((combined_score, cand.clone()));
                     continue;
                 }
                 // No estimator data -- use reliability as the score directly.
@@ -923,10 +938,12 @@ impl RelayContext for RelayEnv<'_> {
                 }
                 true
             })
-            .filter_map(|cand| {
-                let addr = cand.socket_addr()?;
-                let reliability = conn_mgr.peer_acceptor_reliability(addr, now);
-                Some((reliability, cand))
+            .map(|cand| {
+                let reliability = cand
+                    .socket_addr()
+                    .map(|addr| conn_mgr.peer_acceptor_reliability(addr, now))
+                    .unwrap_or(0.5);
+                (reliability, cand)
             })
             .collect();
 
@@ -944,7 +961,7 @@ impl RelayContext for RelayEnv<'_> {
         let best_reliability = scored.iter().map(|(r, _)| *r).fold(0.0_f64, f64::max);
         let best_candidates: Vec<PeerKeyLocation> = scored
             .into_iter()
-            .filter(|(r, _)| best_reliability - *r < 0.1)
+            .filter(|(r, _)| best_reliability - *r < UPHILL_RELIABILITY_TOLERANCE)
             .map(|(_, c)| c)
             .collect();
 
@@ -4422,6 +4439,43 @@ mod tests {
             2,
             "Must keep all low-score peers when no alternatives exist"
         );
+    }
+
+    #[test]
+    fn test_filter_low_score_preserves_all_when_no_alternatives() {
+        // When all scored candidates are below MIN_FORWARD_SCORE and there are
+        // no fallback candidates, filter_low_score_peers must keep them all
+        // to prevent a routing dead-end.
+        let mut scored = vec![
+            (0.08, make_peer(7001)), // below MIN_FORWARD_SCORE
+            (0.10, make_peer(7002)), // below MIN_FORWARD_SCORE
+            (0.12, make_peer(7003)), // below MIN_FORWARD_SCORE
+        ];
+        let fallback_count = 0; // no fallbacks available
+        filter_low_score_peers(&mut scored, fallback_count);
+        assert_eq!(
+            scored.len(),
+            3,
+            "all peers should be preserved when no alternatives exist"
+        );
+    }
+
+    #[test]
+    fn test_filter_low_score_removes_bad_when_alternatives_exist() {
+        let good_peer = make_peer(7002);
+        let good_key = good_peer.pub_key().clone();
+        let mut scored = vec![
+            (0.08, make_peer(7001)), // below MIN_FORWARD_SCORE
+            (0.30, good_peer),       // above MIN_FORWARD_SCORE
+        ];
+        let fallback_count = 1; // fallbacks available
+        filter_low_score_peers(&mut scored, fallback_count);
+        assert_eq!(
+            scored.len(),
+            1,
+            "low-score peer should be filtered when alternatives exist"
+        );
+        assert_eq!(scored[0].1.pub_key(), &good_key);
     }
 
     // ==================== ConnectFailed + Jitter + Exclusion Tests ====================
