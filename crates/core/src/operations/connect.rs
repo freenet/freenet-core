@@ -873,21 +873,30 @@ impl RelayContext for RelayEnv<'_> {
         // Filter out low-score peers when alternatives exist.
         filter_low_score_peers(&mut scored, fallbacks.len());
 
-        // If all remaining scored candidates are below MIN_FORWARD_SCORE and
+        // If all remaining scored candidates have very low acceptor reliability
+        // (from actual observed failures, not just sparse estimator data) and
         // there are no fallbacks, return None so the caller escalates to uphill
         // routing. Without this, a single unreliable closer peer would prevent
         // the node from ever reaching terminus — it would keep forwarding to
         // the bad peer instead of trying uphill alternatives.
-        if !scored.is_empty()
-            && fallbacks.is_empty()
-            && scored.iter().all(|(s, _)| *s < MIN_FORWARD_SCORE)
-        {
-            tracing::debug!(
-                best_score = scored.iter().map(|(s, _)| *s).fold(0.0_f64, f64::max),
-                candidates = scored.len(),
-                "connect: all closer peers below reliability threshold, escalating to uphill"
-            );
-            return None;
+        //
+        // We check reliability directly (not the combined score) because a low
+        // combined score from a fresh estimator × 0.5 prior should NOT trigger
+        // uphill escalation — those are untested peers, not known-bad ones.
+        if !scored.is_empty() && fallbacks.is_empty() {
+            let all_unreliable = scored.iter().all(|(_, cand)| {
+                cand.socket_addr()
+                    .map(|addr| conn_mgr.peer_acceptor_reliability(addr, now))
+                    .unwrap_or(0.5)
+                    < MIN_FORWARD_SCORE
+            });
+            if all_unreliable {
+                tracing::debug!(
+                    candidates = scored.len(),
+                    "connect: all closer peers have low acceptor reliability, escalating to uphill"
+                );
+                return None;
+            }
         }
 
         if !scored.is_empty() {
