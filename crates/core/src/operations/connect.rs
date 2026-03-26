@@ -860,8 +860,10 @@ impl RelayContext for RelayEnv<'_> {
                     scored.push((combined_score, cand.clone()));
                     continue;
                 }
-                // No estimator data -- use reliability as the score directly.
-                scored.push((reliability, cand.clone()));
+                // No estimator data — keep as fallback to avoid ranking untrained
+                // peers above routes with learned history (score 0.5 from raw
+                // reliability could beat a trained route at 0.4 * 1.0 = 0.4).
+                fallbacks.push(cand.clone());
                 continue;
             }
             // Candidates without a location go to fallback pool.
@@ -870,6 +872,23 @@ impl RelayContext for RelayEnv<'_> {
 
         // Filter out low-score peers when alternatives exist.
         filter_low_score_peers(&mut scored, fallbacks.len());
+
+        // If all remaining scored candidates are below MIN_FORWARD_SCORE and
+        // there are no fallbacks, return None so the caller escalates to uphill
+        // routing. Without this, a single unreliable closer peer would prevent
+        // the node from ever reaching terminus — it would keep forwarding to
+        // the bad peer instead of trying uphill alternatives.
+        if !scored.is_empty()
+            && fallbacks.is_empty()
+            && scored.iter().all(|(s, _)| *s < MIN_FORWARD_SCORE)
+        {
+            tracing::debug!(
+                best_score = scored.iter().map(|(s, _)| *s).fold(0.0_f64, f64::max),
+                candidates = scored.len(),
+                "connect: all closer peers below reliability threshold, escalating to uphill"
+            );
+            return None;
+        }
 
         if !scored.is_empty() {
             let best_score = scored
