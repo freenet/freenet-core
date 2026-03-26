@@ -3274,7 +3274,17 @@ impl Executor<Runtime> {
                 ExecutorError::other(e)
             })?;
 
-        // Validate with depth=1 related contract resolution
+        // Validate with depth=1 related contract resolution.
+        //
+        // DEPTH PROTECTION: fetch_related_for_validation enforces depth=1 —
+        // if validate_state returns RequestRelated(ids), we fetch those contracts
+        // and retry exactly once. A second RequestRelated is rejected as an error.
+        // This prevents:
+        //   - Recursive depth (related contracts requesting their own related contracts)
+        //   - Amplification attacks (contract requesting new contracts on every retry)
+        //   - Self-reference (contract requesting its own state)
+        //   - Excessive fan-out (max 10 related contracts per request)
+        // See MAX_RELATED_CONTRACTS_PER_REQUEST and RELATED_FETCH_TIMEOUT constants.
         let result = self
             .fetch_related_for_validation(&key, &params, &state, &related_contracts)
             .await
