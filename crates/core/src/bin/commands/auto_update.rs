@@ -106,64 +106,65 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
     // Record that we're checking now
     record_check_time();
 
-    // Fetch latest version from GitHub
-    match get_latest_version().await {
-        Ok(latest) => {
-            let current = match Version::parse(current_version) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse current version '{}': {}",
-                        current_version,
-                        e
-                    );
-                    // Increase backoff and retry later
-                    increase_backoff();
-                    return UpdateCheckResult::Skipped;
-                }
-            };
-
-            let latest_ver = match Version::parse(&latest) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("Failed to parse latest version '{}': {}", latest, e);
-                    // Increase backoff and retry later
-                    increase_backoff();
-                    return UpdateCheckResult::Skipped;
-                }
-            };
-
-            if latest_ver > current {
-                tracing::info!(
-                    current = %current_version,
-                    latest = %latest,
-                    "Newer version confirmed on GitHub"
-                );
-                // Clear failure count and backoff since we found an update
-                clear_update_failures();
-                reset_backoff();
-                UpdateCheckResult::UpdateAvailable(latest)
-            } else {
-                tracing::debug!(
-                    current = %current_version,
-                    latest = %latest,
-                    backoff_secs = current_backoff.as_secs(),
-                    "No newer version on GitHub yet, will retry with increased backoff"
-                );
-                // No update yet - increase backoff and keep the mismatch flag for retry
-                increase_backoff();
-                UpdateCheckResult::Skipped
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to check GitHub for updates: {}. Will retry with increased backoff.",
-                e
+    match compare_with_github(current_version).await {
+        VersionComparison::Newer(latest) => {
+            tracing::info!(
+                current = %current_version,
+                latest = %latest,
+                "Newer version confirmed on GitHub"
             );
-            // Network error - increase backoff and retry later
+            clear_update_failures();
+            reset_backoff();
+            UpdateCheckResult::UpdateAvailable(latest)
+        }
+        VersionComparison::UpToDate => {
+            tracing::debug!(
+                current = %current_version,
+                backoff_secs = current_backoff.as_secs(),
+                "No newer version on GitHub yet, will retry with increased backoff"
+            );
             increase_backoff();
             UpdateCheckResult::Skipped
         }
+        VersionComparison::Failed(reason) => {
+            tracing::warn!("Update check failed: {reason}. Will retry with increased backoff.");
+            increase_backoff();
+            UpdateCheckResult::Skipped
+        }
+    }
+}
+
+/// Result of comparing the current version against the latest GitHub release.
+enum VersionComparison {
+    /// A newer version exists on GitHub.
+    Newer(String),
+    /// Current version is up to date (or ahead).
+    UpToDate,
+    /// Could not determine (network error, parse failure).
+    Failed(String),
+}
+
+/// Fetch the latest GitHub release and compare it against `current_version`.
+async fn compare_with_github(current_version: &str) -> VersionComparison {
+    let latest = match get_latest_version().await {
+        Ok(v) => v,
+        Err(e) => return VersionComparison::Failed(e.to_string()),
+    };
+
+    let current = match Version::parse(current_version) {
+        Ok(v) => v,
+        Err(e) => return VersionComparison::Failed(format!("bad current version: {e}")),
+    };
+
+    let latest_ver = match Version::parse(&latest) {
+        Ok(v) => v,
+        Err(e) => return VersionComparison::Failed(format!("bad latest version: {e}")),
+    };
+
+    if latest_ver > current {
+        VersionComparison::Newer(latest)
+    } else {
+        VersionComparison::UpToDate
     }
 }
 
@@ -290,36 +291,26 @@ pub async fn check_update_proactive(current_version: &str) -> UpdateCheckResult 
         return UpdateCheckResult::Skipped;
     }
 
-    match get_latest_version().await {
-        Ok(latest) => {
-            let current = match Version::parse(current_version) {
-                Ok(v) => v,
-                Err(_) => return UpdateCheckResult::Skipped,
-            };
-            let latest_ver = match Version::parse(&latest) {
-                Ok(v) => v,
-                Err(_) => return UpdateCheckResult::Skipped,
-            };
-            if latest_ver > current {
-                tracing::info!(
-                    current = %current_version,
-                    latest = %latest,
-                    "Proactive check: newer version confirmed on GitHub"
-                );
-                clear_update_failures();
-                reset_backoff();
-                UpdateCheckResult::UpdateAvailable(latest)
-            } else {
-                tracing::debug!(
-                    current = %current_version,
-                    latest = %latest,
-                    "Proactive check: no newer version on GitHub"
-                );
-                UpdateCheckResult::Skipped
-            }
+    match compare_with_github(current_version).await {
+        VersionComparison::Newer(latest) => {
+            tracing::info!(
+                current = %current_version,
+                latest = %latest,
+                "Proactive check: newer version confirmed on GitHub"
+            );
+            clear_update_failures();
+            reset_backoff();
+            UpdateCheckResult::UpdateAvailable(latest)
         }
-        Err(e) => {
-            tracing::debug!("Proactive update check failed: {}", e);
+        VersionComparison::UpToDate => {
+            tracing::debug!(
+                current = %current_version,
+                "Proactive check: no newer version on GitHub"
+            );
+            UpdateCheckResult::Skipped
+        }
+        VersionComparison::Failed(reason) => {
+            tracing::debug!("Proactive update check failed: {reason}");
             UpdateCheckResult::Skipped
         }
     }
