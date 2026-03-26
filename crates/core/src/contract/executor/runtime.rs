@@ -2030,10 +2030,9 @@ where
         Ok(retry_result)
     }
 
-    /// Build an error for a non-Valid validation result.
+    /// Build an Update error for a non-Valid validation result.
     ///
-    /// Only called after `fetch_related_for_validation`, which resolves
-    /// `RequestRelated` internally -- so only `Invalid` is reachable here.
+    /// Used by UPDATE code paths. For PUT paths, use `validation_error_put`.
     fn validation_error(key: ContractKey, result: ValidateResult) -> ExecutorError {
         match result {
             ValidateResult::Invalid => {
@@ -2043,8 +2042,6 @@ where
                 })
             }
             ValidateResult::RequestRelated(_) => {
-                // fetch_related_for_validation should resolve RequestRelated internally.
-                // If this is reached, it's a defensive fallback — return error, don't panic.
                 tracing::error!(
                     contract = %key,
                     "validation_error called with RequestRelated — expected only Invalid"
@@ -2055,10 +2052,38 @@ where
                 })
             }
             ValidateResult::Valid => {
-                // Should never be called with Valid, but don't panic in production
                 tracing::error!(
                     contract = %key,
                     "validation_error called with Valid result — this is a bug"
+                );
+                ExecutorError::internal_error()
+            }
+        }
+    }
+
+    /// Build a Put error for a non-Valid validation result.
+    ///
+    /// Used by PUT code paths to preserve correct error semantics for callers.
+    fn validation_error_put(key: ContractKey, result: ValidateResult) -> ExecutorError {
+        match result {
+            ValidateResult::Invalid => ExecutorError::request(StdContractError::Put {
+                key,
+                cause: "invalid outcome state after merge".into(),
+            }),
+            ValidateResult::RequestRelated(_) => {
+                tracing::error!(
+                    contract = %key,
+                    "validation_error_put called with RequestRelated — expected only Invalid"
+                );
+                ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "missing related contracts for validation".into(),
+                })
+            }
+            ValidateResult::Valid => {
+                tracing::error!(
+                    contract = %key,
+                    "validation_error_put called with Valid result — this is a bug"
                 );
                 ExecutorError::internal_error()
             }
@@ -2814,12 +2839,12 @@ impl Executor<Runtime> {
                 }
             };
 
-            // Validate before persisting (fetch related contracts if needed)
+            // Validate before persisting (fetch related contracts from network if needed)
             let validate_result = self
-                .fetch_related_for_validation(&key, &params, &new_state, &related_contracts)
+                .fetch_related_for_validation_network(&key, &params, &new_state, &related_contracts)
                 .await?;
             if validate_result != ValidateResult::Valid {
-                return Err(Self::validation_error(key, validate_result));
+                return Err(Self::validation_error_put(key, validate_result));
             }
 
             // Commit locally
@@ -3197,9 +3222,9 @@ impl Executor<Runtime> {
             }
         };
 
-        // Validate before persisting or broadcasting (fetch related contracts if needed).
+        // Validate before persisting or broadcasting (fetch related contracts from network if needed).
         let result = self
-            .fetch_related_for_validation(
+            .fetch_related_for_validation_network(
                 &key,
                 parameters,
                 &new_state,
@@ -3286,7 +3311,7 @@ impl Executor<Runtime> {
         //   - Excessive fan-out (max 10 related contracts per request)
         // See MAX_RELATED_CONTRACTS_PER_REQUEST and RELATED_FETCH_TIMEOUT constants.
         let result = self
-            .fetch_related_for_validation(&key, &params, &state, &related_contracts)
+            .fetch_related_for_validation_network(&key, &params, &state, &related_contracts)
             .await
             .inspect_err(|_| {
                 if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
@@ -3328,6 +3353,117 @@ impl Executor<Runtime> {
 }
 
 impl Executor<Runtime> {
+    /// Network-aware version of `fetch_related_for_validation`.
+    ///
+    /// Uses `local_state_or_from_network` to fetch related contracts, allowing
+    /// first-time publishes that depend on contracts not yet stored locally.
+    /// The base `fetch_related_for_validation` on the bridged impl only does
+    /// local lookups.
+    async fn fetch_related_for_validation_network(
+        &mut self,
+        key: &ContractKey,
+        params: &Parameters<'_>,
+        state: &WrappedState,
+        initial_related: &RelatedContracts<'_>,
+    ) -> Result<ValidateResult, ExecutorError> {
+        let result = self
+            .runtime
+            .validate_state(key, params, state, initial_related)
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        let requested_ids = match result {
+            ValidateResult::Valid | ValidateResult::Invalid => return Ok(result),
+            ValidateResult::RequestRelated(ids) => ids,
+        };
+
+        // Apply the same safety checks as the base helper
+        if requested_ids.is_empty() {
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: "contract requested related contracts but provided empty list".into(),
+            }));
+        }
+        let self_id = key.id();
+        if requested_ids.iter().any(|id| id == self_id) {
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: "contract cannot request itself as a related contract".into(),
+            }));
+        }
+        let unique_ids: HashSet<ContractInstanceId> = requested_ids.into_iter().collect();
+        if unique_ids.len() > MAX_RELATED_CONTRACTS_PER_REQUEST {
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: format!(
+                    "contract requested {} related contracts, limit is {}",
+                    unique_ids.len(),
+                    MAX_RELATED_CONTRACTS_PER_REQUEST
+                )
+                .into(),
+            }));
+        }
+
+        tracing::debug!(
+            contract = %key,
+            related_count = unique_ids.len(),
+            "Fetching related contracts (with network fallback) for validation"
+        );
+
+        let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
+            HashMap::with_capacity(unique_ids.len());
+
+        let fetch_all = async {
+            for id in &unique_ids {
+                match self.local_state_or_from_network(id, false).await? {
+                    Either::Left(state) => {
+                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                    }
+                    Either::Right(get_result) => {
+                        related_map
+                            .insert(*id, Some(State::from(get_result.state.as_ref().to_vec())));
+                    }
+                }
+            }
+            Ok::<(), ExecutorError>(())
+        };
+
+        match tokio::time::timeout(RELATED_FETCH_TIMEOUT, fetch_all).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                return Err(ExecutorError::request(StdContractError::Put {
+                    key: *key,
+                    cause: "timed out fetching related contracts".into(),
+                }));
+            }
+        }
+
+        // Merge initial_related with newly fetched states
+        let initial_owned = initial_related.clone().into_owned();
+        for (id, state) in initial_owned.states() {
+            if let Some(s) = state {
+                related_map
+                    .entry(*id)
+                    .or_insert_with(|| Some(s.clone().into_owned()));
+            }
+        }
+
+        let populated_related = RelatedContracts::from(related_map);
+        let retry_result = self
+            .runtime
+            .validate_state(key, params, state, &populated_related)
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        if let ValidateResult::RequestRelated(_) = &retry_result {
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: "contract requested additional related contracts after first round (depth=1 limit exceeded)".into(),
+            }));
+        }
+
+        Ok(retry_result)
+    }
+
     async fn subscribe(&mut self, key: ContractKey) -> Result<(), ExecutorError> {
         if self.mode == OperationMode::Local {
             return Ok(());
