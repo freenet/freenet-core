@@ -4150,6 +4150,7 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
     nodes = ["gateway", "node-a", "node-b"],
     timeout_secs = 600,
     startup_wait_secs = 40,
+    health_check_readiness = true,
     aggregate_events = "always",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4

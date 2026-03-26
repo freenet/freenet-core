@@ -3074,7 +3074,11 @@ mod tests {
         let mut state = RelayState {
             upstream_addr: joiner.socket_addr().expect("test peer must have address"),
             request: ConnectRequest {
-                desired_location: Location::random(),
+                // Use next_hop's location so it's guaranteed closer to the target
+                // than self_loc, ensuring the relay is NOT at terminus.
+                // Location::random() was flaky — could land near self_loc,
+                // triggering near-terminus acceptance. See #3657.
+                desired_location: next_hop.location().expect("test peer has location"),
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
