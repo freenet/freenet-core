@@ -3819,9 +3819,9 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pav_regression"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eb0b883df1700344786c158cf21a3cb04974b0b6f98a827dec11cef921cd3d8"
+checksum = "13b98f8d045a436a126434db4d8358865908760623ce1c8cdccab242c1c0394a"
 dependencies = [
  "eytzinger-interpolation",
  "ordered-float 3.9.2",
