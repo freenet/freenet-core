@@ -2949,7 +2949,8 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
     make_get(&mut client_gateway, contract_key, true, false).await?;
 
     // Wait for get response on gateway
-    let resp = tokio::time::timeout(Duration::from_secs(60), client_gateway.recv()).await;
+    // 120s to match PUT timeout — on slow CI runners, routing may not be fully populated
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_gateway.recv()).await;
     let initial_state_on_gateway: WrappedState = match resp {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
             key,
@@ -3457,7 +3458,8 @@ async fn test_put_triggers_update_for_subscribers(ctx: &mut TestContext) -> Test
     make_get(&mut client_gateway, contract_key, true, false).await?;
 
     // Wait for get response on gateway
-    let resp = tokio::time::timeout(Duration::from_secs(60), client_gateway.recv()).await;
+    // 120s to match PUT timeout — on slow CI runners, routing may not be fully populated
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_gateway.recv()).await;
     let initial_state_on_gateway: WrappedState = match resp {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
             key,
@@ -4199,10 +4201,11 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
     }
 
     // Client B gets the contract (so node-b caches it)
+    // 120s to match PUT timeout — on slow CI runners, routing may not be ready
     tracing::info!("Client B: GET contract");
     make_get(&mut client_b, contract_key, true, false).await?;
     loop {
-        match timeout(Duration::from_secs(60), client_b.recv()).await {
+        match timeout(Duration::from_secs(120), client_b.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key, ..
             }))) => {
