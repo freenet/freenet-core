@@ -126,9 +126,9 @@ async fn run_network_node_with_signals(
     shutdown_handle: freenet::ShutdownHandle,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
-        check_if_update_available, clear_version_mismatch, get_open_connection_count,
-        has_reached_max_backoff, has_version_mismatch, reset_backoff, version_mismatch_generation,
-        UpdateCheckResult, UpdateNeededError,
+        check_if_update_available, check_update_proactive, clear_version_mismatch,
+        get_open_connection_count, has_reached_max_backoff, has_version_mismatch, reset_backoff,
+        version_mismatch_generation, UpdateCheckResult, UpdateNeededError,
     };
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
@@ -191,9 +191,11 @@ async fn run_network_node_with_signals(
         })
     };
 
-    // Monitor for version mismatches and check for updates (#3204).
+    // Monitor for version mismatches and check for updates (#3204, #3664).
     //
-    // Three update triggers (checked each 60s tick):
+    // Four update triggers (checked each 60s tick):
+    //   0. Proactive periodic: poll GitHub every ~4h regardless of peer signals (#3664).
+    //      Catches updates when all connected peers are the same old version.
     //   1. Urgent update: remote's min_compatible > our version → verify with GitHub, exit immediately
     //   2. Decentralized discovery: highest_seen_version > our version → start stagger timer,
     //      verify with GitHub when timer expires
@@ -240,6 +242,10 @@ async fn run_network_node_with_signals(
         // wait at least this long before re-arming. Prevents polling GitHub every
         // few hours indefinitely when peers report a version that isn't on GitHub yet.
         const STAGGER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+        // Proactive GitHub poll interval: 4 hours base, with ±20% jitter (#3664).
+        // Ensures peers with full same-version connections still discover updates,
+        // even when no peer handshakes report a newer version.
+        const PROACTIVE_CHECK_INTERVAL_SECS: u64 = 4 * 3600;
 
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut last_mismatch_generation = version_mismatch_generation();
@@ -247,9 +253,44 @@ async fn run_network_node_with_signals(
         let mut stagger_deadline: Option<Instant> = None;
         let mut stagger_cooldown_until: Option<Instant> = None;
         let our_version = parse_our_version();
+        // Initial proactive check: random delay 0-4h so nodes don't all poll at once.
+        let initial_delay_secs =
+            freenet::config::GlobalRng::random_u64() % PROACTIVE_CHECK_INTERVAL_SECS;
+        let mut next_proactive_check =
+            Instant::now() + std::time::Duration::from_secs(initial_delay_secs);
 
         loop {
             interval.tick().await;
+
+            // --- Priority 0: Proactive periodic GitHub check (#3664) ---
+            // Peers with full same-version connections never trigger handshake-based
+            // version discovery. This check polls GitHub directly on a timer so those
+            // peers still discover and install updates.
+            if Instant::now() >= next_proactive_check {
+                match check_update_proactive(build_info::VERSION).await {
+                    UpdateCheckResult::UpdateAvailable(new_version) => {
+                        clear_version_mismatch();
+                        clear_urgent_update();
+                        tracing::info!(
+                            new_version = %new_version,
+                            "Proactive GitHub check found update, triggering auto-update"
+                        );
+                        #[allow(clippy::let_underscore_must_use)]
+                        let _ = update_tx.send(new_version);
+                        return;
+                    }
+                    UpdateCheckResult::Skipped => {}
+                }
+                // Schedule next check with ±20% jitter to prevent thundering herd
+                let jitter_range = PROACTIVE_CHECK_INTERVAL_SECS / 5;
+                let jitter_offset = freenet::config::GlobalRng::random_u64() % (jitter_range * 2);
+                let next_secs = PROACTIVE_CHECK_INTERVAL_SECS - jitter_range + jitter_offset;
+                next_proactive_check = Instant::now() + std::time::Duration::from_secs(next_secs);
+                tracing::debug!(
+                    next_check_secs = next_secs,
+                    "Proactive update check complete, next check scheduled"
+                );
+            }
 
             // --- Priority 1: Urgent update (breaking change) ---
             if is_urgent_update() {

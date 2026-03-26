@@ -278,6 +278,53 @@ pub fn should_attempt_update() -> bool {
     get_update_failure_count() < MAX_UPDATE_FAILURES
 }
 
+/// Proactive version check that bypasses backoff state.
+///
+/// Used for periodic GitHub polling independent of peer handshakes (#3664).
+/// Peers with full same-version connections never exchange version info via
+/// handshakes, so they need this independent check to discover updates.
+///
+/// Still respects the failure count limit to avoid hammering a broken API.
+pub async fn check_update_proactive(current_version: &str) -> UpdateCheckResult {
+    if !should_attempt_update() {
+        return UpdateCheckResult::Skipped;
+    }
+
+    match get_latest_version().await {
+        Ok(latest) => {
+            let current = match Version::parse(current_version) {
+                Ok(v) => v,
+                Err(_) => return UpdateCheckResult::Skipped,
+            };
+            let latest_ver = match Version::parse(&latest) {
+                Ok(v) => v,
+                Err(_) => return UpdateCheckResult::Skipped,
+            };
+            if latest_ver > current {
+                tracing::info!(
+                    current = %current_version,
+                    latest = %latest,
+                    "Proactive check: newer version confirmed on GitHub"
+                );
+                clear_update_failures();
+                reset_backoff();
+                UpdateCheckResult::UpdateAvailable(latest)
+            } else {
+                tracing::debug!(
+                    current = %current_version,
+                    latest = %latest,
+                    "Proactive check: no newer version on GitHub"
+                );
+                UpdateCheckResult::Skipped
+            }
+        }
+        Err(e) => {
+            tracing::debug!("Proactive update check failed: {}", e);
+            UpdateCheckResult::Skipped
+        }
+    }
+}
+
 /// Returns true if the update check backoff has reached the maximum (1 hour).
 /// At that point, we've checked GitHub multiple times with no update found,
 /// so the version mismatch flag should be cleared to stop log spam.
