@@ -1909,8 +1909,9 @@ impl Ring {
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
 
-            // Expire connect-exclusion entries for peers whose TTL has elapsed
-            self.connection_manager.cleanup_expired_exclusions(tick_now);
+            // Expire acceptor reliability entries for peers whose TTL has elapsed
+            self.connection_manager
+                .cleanup_expired_acceptor_stats(tick_now);
 
             // Clean up expired transient connections
             let expired_transients = self.connection_manager.cleanup_expired_transients();

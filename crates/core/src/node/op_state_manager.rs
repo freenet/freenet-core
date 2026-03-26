@@ -1397,7 +1397,7 @@ fn remove_get_and_report_failure(
 }
 
 /// Log when a connect operation in Relaying state with an outstanding uphill forward times out,
-/// and record the unresponsive peer as an acceptor failure for routing exclusion.
+/// and record the unresponsive peer as an acceptor failure for reliability scoring.
 fn record_connect_uphill_timeout(
     tx: &Transaction,
     op: &ConnectOp,
@@ -1429,11 +1429,10 @@ fn record_connect_uphill_timeout(
     );
     if let Some(addr) = peer.socket_addr() {
         let now = tokio::time::Instant::now();
-        let count = conn_manager.record_connect_acceptor_failure(addr, now);
+        conn_manager.record_acceptor_outcome(addr, false, now);
         tracing::info!(
             tx = %tx,
             addr = %addr,
-            failure_count = count,
             "recorded GC timeout as acceptor failure"
         );
     }
@@ -2875,8 +2874,8 @@ mod tests {
         }
 
         /// Regression test for #3392: GC-expired CONNECT forwards to unresponsive
-        /// peers must be recorded as acceptor failures so the peer gets excluded
-        /// from routing after CONNECT_EXCLUDE_THRESHOLD (3) timeouts.
+        /// peers must be recorded as acceptor failures so the peer gets a low
+        /// reliability score for future routing decisions.
         #[test]
         fn records_failure_for_unresponsive_relay() {
             let peer = make_peer(5001);
@@ -2885,18 +2884,31 @@ mod tests {
             let tx = Transaction::new::<ConnectMsg>();
             let cm = ConnectionManager::test_default();
 
-            let excluded = cm.compute_connect_excluded_peers(tokio::time::Instant::now());
-            assert!(!excluded.contains(&peer_addr));
+            let now = tokio::time::Instant::now();
+            // Initially unknown → 0.5 prior
+            let initial = cm.peer_acceptor_reliability(peer_addr, now);
+            assert!(
+                (initial - 0.5).abs() < f64::EPSILON,
+                "unknown peer should start at 0.5"
+            );
 
-            // Three GC timeouts should trigger exclusion
+            // Three GC timeouts should lower reliability
             for _ in 0..3 {
                 record_connect_uphill_timeout(&tx, &op, &cm);
             }
 
-            let excluded = cm.compute_connect_excluded_peers(tokio::time::Instant::now());
+            let after = cm.peer_acceptor_reliability(peer_addr, now);
             assert!(
-                excluded.contains(&peer_addr),
-                "peer should be excluded after 3 GC timeouts"
+                after < initial,
+                "peer reliability should decrease after 3 GC timeouts: {} vs {}",
+                after,
+                initial
+            );
+            // (0+1)/(3+2) = 0.2
+            assert!(
+                (after - 0.2).abs() < 0.01,
+                "expected ~0.2 after 3 failures, got {}",
+                after
             );
         }
 
@@ -2915,10 +2927,12 @@ mod tests {
                 record_connect_uphill_timeout(&tx, &op, &cm);
             }
 
-            let excluded = cm.compute_connect_excluded_peers(tokio::time::Instant::now());
+            let now = tokio::time::Instant::now();
+            let score = cm.peer_acceptor_reliability(peer_addr, now);
             assert!(
-                !excluded.contains(&peer_addr),
-                "peer should NOT be excluded when response was already forwarded"
+                (score - 0.5).abs() < f64::EPSILON,
+                "peer should still have 0.5 reliability when response was already forwarded, got {}",
+                score
             );
         }
 
