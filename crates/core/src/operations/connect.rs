@@ -1783,14 +1783,11 @@ impl Operation for ConnectOp {
                                         );
                                         // Record success for this acceptor's reliability score
                                         if let Some(addr) = new_acceptor.peer.socket_addr() {
+                                            let now = Instant::now();
                                             op_manager
                                                 .ring
                                                 .connection_manager
-                                                .record_acceptor_outcome(
-                                                    addr,
-                                                    true,
-                                                    Instant::now(),
-                                                );
+                                                .record_acceptor_outcome(addr, true, now);
                                         }
                                         true
                                     } else {
