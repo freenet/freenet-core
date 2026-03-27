@@ -848,6 +848,7 @@ impl Ring {
         // Wait indefinitely for the first ring connection before starting
         // subscription recovery. The per-cycle connection check below is the
         // real gate; this just avoids running the loop body with no peers.
+        let mut wait_logged = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if ring.open_connections() > 0 {
@@ -856,6 +857,14 @@ impl Ring {
                     "Ring connection established, starting subscription recovery"
                 );
                 break;
+            }
+            // Log periodically so operators can diagnose stuck nodes.
+            if !wait_logged {
+                wait_logged = true;
+                tracing::info!(
+                    hosted_contracts = ring.hosting_contract_keys().len(),
+                    "Waiting for ring connection before starting subscription recovery"
+                );
             }
         }
 
@@ -878,15 +887,11 @@ impl Ring {
                 interval.tick().await;
             }
 
-            // Gate: skip this cycle if we have no ring connections (#3676).
-            // Subscribe requests require connected peers to route through.
-            // Without this, disconnected peers flood the notification channel
-            // with doomed subscribe requests every 30 seconds.
-            if ring.open_connections() == 0 {
-                tracing::debug!("Skipping subscription renewal cycle: no ring connections");
-                continue;
-            }
-
+            // Always run expiry sweeps, even when disconnected. Stale
+            // subscriptions and downstream subscribers must be cleaned up
+            // to keep interest manager counts accurate. Only the renewal
+            // spawning (below) is gated on having connections.
+            //
             // First, expire any stale subscriptions
             let expired = ring.expire_stale_subscriptions();
             if !expired.is_empty() {
@@ -924,6 +929,15 @@ impl Ring {
                         }
                     }
                 }
+            }
+
+            // Gate: skip renewal spawning if we have no ring connections (#3676).
+            // Subscribe requests require connected peers to route through.
+            // Without this, disconnected peers flood the notification channel
+            // with doomed subscribe requests every 30 seconds.
+            if ring.open_connections() == 0 {
+                tracing::debug!("Skipping subscription renewal: no ring connections");
+                continue;
             }
 
             // Get contracts that need subscription renewal (have client subscriptions)
