@@ -322,7 +322,7 @@ jobs:
           cp artifacts/x86_64-windows-freenet/freenet.exe freenet.exe
 
           # Display the created files
-          ls -lh *.tar.gz *.zip
+          ls -lh *.tar.gz *.zip *.exe
 
       - name: Generate SHA256 checksums
         run: |
