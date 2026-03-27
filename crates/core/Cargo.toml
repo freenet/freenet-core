@@ -115,7 +115,7 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, features = ["sysinfoapi", "wincon", "urlmon", "winuser"] }
+winapi = { workspace = true, features = ["sysinfoapi", "wincon", "winuser"] }
 serde = { workspace = true }
 zip = { workspace = true }
 tray-icon = { workspace = true }

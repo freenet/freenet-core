@@ -9,6 +9,7 @@ mod platform {
     use super::super::installer::{self, InstallProgress};
     use native_windows_derive as nwd;
     use native_windows_gui as nwg;
+    use nwg::NativeUi;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};

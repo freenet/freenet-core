@@ -160,12 +160,28 @@ fn download_url_to_file(url: &str, dest: &Path) -> Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
+    // winapi 0.3.9 does not include URLDownloadToFileW bindings,
+    // so we declare the FFI import directly from urlmon.dll.
+    #[link(name = "urlmon")]
+    extern "system" {
+        // SAFETY: Standard Win32 API from urlmon.dll.
+        // Signature: HRESULT URLDownloadToFileW(LPUNKNOWN, LPCWSTR, LPCWSTR, DWORD, LPBINDSTATUSCALLBACK)
+        fn URLDownloadToFileW(
+            caller: *mut std::ffi::c_void,
+            url: *const u16,
+            file_name: *const u16,
+            reserved: u32,
+            status_cb: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
     let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
     let dest_wide: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
 
     // SAFETY: FFI call to urlmon.dll. Both strings are null-terminated wide strings.
+    // All pointer parameters except the two strings are null (unused).
     let hr = unsafe {
-        winapi::um::urlmon::URLDownloadToFileW(
+        URLDownloadToFileW(
             std::ptr::null_mut(),
             url_wide.as_ptr(),
             dest_wide.as_ptr(),
