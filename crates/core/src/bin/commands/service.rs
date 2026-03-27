@@ -169,6 +169,102 @@ const WRAPPER_MAX_BACKOFF_SECS: u64 = 300;
 /// Maximum port-conflict kill-and-retry attempts before giving up.
 const WRAPPER_MAX_PORT_CONFLICT_KILLS: u32 = 3;
 
+/// State for the wrapper backoff state machine.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct WrapperState {
+    backoff_secs: u64,
+    consecutive_failures: u32,
+    port_conflict_kills: u32,
+}
+
+#[allow(dead_code)]
+impl WrapperState {
+    fn new() -> Self {
+        Self {
+            backoff_secs: WRAPPER_INITIAL_BACKOFF_SECS,
+            consecutive_failures: 0,
+            port_conflict_kills: 0,
+        }
+    }
+}
+
+/// Action the wrapper should take after the child process exits.
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
+enum WrapperAction {
+    /// Run update, then relaunch.
+    Update,
+    /// Exit the wrapper cleanly.
+    Exit,
+    /// Kill stale processes and retry immediately.
+    KillAndRetry,
+    /// Wait (with jitter) then relaunch.
+    BackoffAndRelaunch { secs: u64 },
+}
+
+/// Pure function: given current state and exit info, determine the next action
+/// and update the state. Testable without spawning processes.
+#[allow(dead_code)]
+fn next_wrapper_action(
+    state: &mut WrapperState,
+    exit_code: i32,
+    is_port_conflict: bool,
+    update_succeeded: Option<bool>, // None if not an update exit code
+) -> WrapperAction {
+    match exit_code {
+        code if code == WRAPPER_EXIT_UPDATE_NEEDED => {
+            match update_succeeded {
+                Some(true) => {
+                    state.consecutive_failures = 0;
+                    state.port_conflict_kills = 0;
+                    state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+                    WrapperAction::Update
+                }
+                Some(false) => {
+                    state.consecutive_failures += 1;
+                    let secs = state.backoff_secs;
+                    state.backoff_secs = (state.backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
+                    WrapperAction::BackoffAndRelaunch { secs }
+                }
+                None => WrapperAction::Update, // Will be called again with result
+            }
+        }
+        code if code == WRAPPER_EXIT_ALREADY_RUNNING => WrapperAction::Exit,
+        0 => WrapperAction::Exit,
+        _ => {
+            if is_port_conflict {
+                state.port_conflict_kills += 1;
+                if state.port_conflict_kills <= WRAPPER_MAX_PORT_CONFLICT_KILLS {
+                    state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+                    return WrapperAction::KillAndRetry;
+                }
+                // Fall through to normal crash backoff
+            }
+            state.consecutive_failures += 1;
+            state.port_conflict_kills = 0;
+            let secs = state.backoff_secs;
+            state.backoff_secs = (state.backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
+            WrapperAction::BackoffAndRelaunch { secs }
+        }
+    }
+}
+
+/// Sleep for `secs` with ±20% random jitter to prevent thundering herd.
+fn sleep_with_jitter(secs: u64) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    // Simple jitter using a hash of the current time as a pseudo-random source.
+    // We avoid pulling in rand just for this.
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut hasher);
+    let hash = hasher.finish();
+    // Map hash to a jitter factor in [0.8, 1.2]
+    let factor = 0.8 + (hash % 1000) as f64 / 2500.0;
+    let jittered = (secs as f64 * factor) as u64;
+    std::thread::sleep(std::time::Duration::from_secs(jittered.max(1)));
+}
+
 /// Run the wrapper loop that manages a `freenet network` child process.
 ///
 /// This is the compiled equivalent of the macOS shell wrapper script
@@ -336,7 +432,7 @@ fn run_wrapper_loop(
                                 "Update failed (attempt {consecutive_failures}), backing off {backoff_secs}s..."
                             ),
                         );
-                        std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                        sleep_with_jitter(backoff_secs);
                         backoff_secs = (backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
                     }
                 }
@@ -436,8 +532,17 @@ fn log_wrapper_event(log_dir: &Path, message: &str) {
 fn kill_stale_freenet_processes(log_dir: &Path) {
     #[cfg(unix)]
     {
+        // Scope to current user to avoid killing other users' processes on shared machines.
+        // Mirrors the macOS wrapper script: pkill -f -u "$(id -u)" "freenet network"
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let uid = uid.trim();
         let status = std::process::Command::new("pkill")
-            .args(["-f", "freenet network"])
+            .args(["-f", "-u", uid, "freenet network"])
             .status();
         if let Ok(s) = status {
             if s.success() {
@@ -1866,5 +1971,144 @@ mod tests {
     fn test_should_purge_no_flags_non_tty() {
         // In CI/test environments stdin is not a TTY, so this should default to false
         assert!(!should_purge(false, false).unwrap());
+    }
+
+    // ── Wrapper backoff state machine tests ──
+
+    #[test]
+    fn test_wrapper_exit_42_update_success_resets_state() {
+        let mut state = WrapperState::new();
+        state.consecutive_failures = 3;
+        state.backoff_secs = 80;
+
+        let action = next_wrapper_action(&mut state, 42, false, Some(true));
+        assert_eq!(action, WrapperAction::Update);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
+        assert_eq!(state.port_conflict_kills, 0);
+    }
+
+    #[test]
+    fn test_wrapper_exit_42_update_failure_backs_off() {
+        let mut state = WrapperState::new();
+        assert_eq!(state.backoff_secs, 10);
+
+        let action = next_wrapper_action(&mut state, 42, false, Some(false));
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 10 });
+        assert_eq!(state.consecutive_failures, 1);
+        assert_eq!(state.backoff_secs, 20); // doubled
+
+        let action = next_wrapper_action(&mut state, 42, false, Some(false));
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 20 });
+        assert_eq!(state.backoff_secs, 40);
+    }
+
+    #[test]
+    fn test_wrapper_exit_43_exits_immediately() {
+        let mut state = WrapperState::new();
+        let action = next_wrapper_action(&mut state, 43, false, None);
+        assert_eq!(action, WrapperAction::Exit);
+    }
+
+    #[test]
+    fn test_wrapper_exit_0_exits_cleanly() {
+        let mut state = WrapperState::new();
+        let action = next_wrapper_action(&mut state, 0, false, None);
+        assert_eq!(action, WrapperAction::Exit);
+    }
+
+    #[test]
+    fn test_wrapper_crash_exponential_backoff_with_cap() {
+        let mut state = WrapperState::new();
+
+        // First crash: 10s
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 10 });
+        assert_eq!(state.backoff_secs, 20);
+
+        // Second: 20s
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 20 });
+        assert_eq!(state.backoff_secs, 40);
+
+        // Keep doubling...
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 40 });
+        assert_eq!(state.backoff_secs, 80);
+
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 80 });
+        assert_eq!(state.backoff_secs, 160);
+
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 160 });
+        assert_eq!(state.backoff_secs, 300); // capped at MAX
+
+        // Should stay capped
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 300 });
+        assert_eq!(state.backoff_secs, 300);
+
+        assert_eq!(state.consecutive_failures, 6);
+    }
+
+    #[test]
+    fn test_wrapper_port_conflict_kill_and_retry() {
+        let mut state = WrapperState::new();
+
+        // First port conflict: kill and retry
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::KillAndRetry);
+        assert_eq!(state.port_conflict_kills, 1);
+        assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
+
+        // Second: still kill and retry
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::KillAndRetry);
+        assert_eq!(state.port_conflict_kills, 2);
+
+        // Third: still kill and retry (at the limit)
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::KillAndRetry);
+        assert_eq!(state.port_conflict_kills, 3);
+
+        // Fourth: exceeds limit, falls through to backoff
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 10 });
+        assert_eq!(state.port_conflict_kills, 0); // reset on fallthrough
+        assert_eq!(state.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn test_wrapper_port_conflict_resets_backoff() {
+        let mut state = WrapperState::new();
+        state.backoff_secs = 160; // simulate previous crashes
+
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::KillAndRetry);
+        assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn test_find_latest_log_file_picks_newest() {
+        use std::fs;
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create some log files with different modification times
+        let old = tmp.path().join("freenet.2025-01-01.log");
+        let new = tmp.path().join("freenet.2025-12-31.log");
+        let unrelated = tmp.path().join("other.log");
+
+        fs::write(&old, "old").unwrap();
+        // Ensure different mtime
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut f = fs::File::create(&new).unwrap();
+        f.write_all(b"new").unwrap();
+        fs::write(&unrelated, "unrelated").unwrap();
+
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(new));
     }
 }
