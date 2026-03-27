@@ -163,7 +163,7 @@ fn download_url_to_file(url: &str, dest: &Path) -> Result<()> {
     // winapi 0.3.9 does not include URLDownloadToFileW bindings,
     // so we declare the FFI import directly from urlmon.dll.
     #[link(name = "urlmon")]
-    extern "system" {
+    unsafe extern "system" {
         // SAFETY: Standard Win32 API from urlmon.dll.
         // Signature: HRESULT URLDownloadToFileW(LPUNKNOWN, LPCWSTR, LPCWSTR, DWORD, LPBINDSTATUSCALLBACK)
         fn URLDownloadToFileW(
