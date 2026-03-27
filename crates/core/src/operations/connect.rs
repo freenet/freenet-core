@@ -2554,6 +2554,10 @@ pub(crate) async fn initial_join_procedure(
 
         const BASE_WAIT_SECS: u64 = 1;
         const LONG_WAIT_SECS: u64 = 30;
+        // Per-peer timeout for cached peer reconnection attempts.
+        // Kept short to avoid delaying gateway bootstrap if NAT holes
+        // have expired or cached peers are unreachable.
+        const CACHED_PEER_TIMEOUT: Duration = Duration::from_secs(5);
         // Use min_connections as the bootstrap threshold so the gateway-directed
         // join loop keeps driving connections until the node has enough peers for
         // ring-based acquisition to take over reliably. Previously hardcoded to 4,
@@ -2590,43 +2594,50 @@ pub(crate) async fn initial_join_procedure(
                     .map(|cp| PeerKeyLocation::new(cp.pub_key.clone(), cp.addr))
                     .collect();
 
-                // Try connecting to cached peers in parallel.
-                let mut cached_join_handles = Vec::new();
-                for peer in &cached_peer_locs {
-                    let op_mgr = op_manager.clone();
-                    let peer = peer.clone();
-                    cached_join_handles.push(GlobalExecutor::spawn(async move {
-                        match join_ring_request(&peer, &op_mgr).await {
-                            Ok(()) => {
-                                tracing::info!(peer = %peer, "Reconnected to cached peer");
-                                true
+                // Spawn each cached peer reconnection as a separate task for true
+                // parallelism (not just cooperative concurrency). Each task has its
+                // own timeout so we don't need to track abort handles.
+                let mut cached_futs: FuturesUnordered<_> = cached_peer_locs
+                    .iter()
+                    .map(|peer| {
+                        let op_mgr = op_manager.clone();
+                        let peer = peer.clone();
+                        GlobalExecutor::spawn(async move {
+                            match tokio::time::timeout(
+                                CACHED_PEER_TIMEOUT,
+                                join_ring_request(&peer, &op_mgr),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    tracing::info!(peer = %peer, "Reconnected to cached peer");
+                                    true
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::debug!(
+                                        peer = %peer, error = %e,
+                                        "Cached peer reconnection failed"
+                                    );
+                                    false
+                                }
+                                Err(_) => {
+                                    tracing::debug!(
+                                        peer = %peer,
+                                        "Cached peer reconnection timed out"
+                                    );
+                                    false
+                                }
                             }
-                            Err(e) => {
-                                tracing::debug!(peer = %peer, error = %e, "Cached peer reconnection failed");
-                                false
-                            }
-                        }
-                    }));
-                }
+                        })
+                    })
+                    .collect();
 
-                // Wait for all cached peer attempts with a short timeout.
-                // Don't block gateway bootstrap indefinitely.
-                let cached_results = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    futures::future::join_all(cached_join_handles),
-                )
-                .await;
-
-                let successes = match cached_results {
-                    Ok(results) => results
-                        .into_iter()
-                        .filter(|r| matches!(r, Ok(true)))
-                        .count(),
-                    Err(_) => {
-                        tracing::debug!("Cached peer reconnection timed out");
-                        0
+                let mut successes = 0usize;
+                while let Some(result) = cached_futs.next().await {
+                    if matches!(result, Ok(true)) {
+                        successes += 1;
                     }
-                };
+                }
 
                 tracing::info!(
                     successes,

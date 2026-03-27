@@ -3,6 +3,10 @@
 //! Persists known peer addresses and public keys to disk so that after a brief
 //! restart, the node can attempt direct transport connections to previously-known
 //! peers, reusing existing NAT holes before they expire.
+//!
+//! Note: Uses `SystemTime` rather than the `TimeSource` trait because cache entries
+//! must survive process restarts. `Instant`/`TimeSource` values reset on restart
+//! and cannot represent "when was this entry saved?" across process boundaries.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -26,7 +30,6 @@ const CACHE_FILENAME: &str = "peer_cache.json";
 /// A single cached peer entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CachedPeer {
-    /// Hex-encoded public key (matches TransportPublicKey serde format).
     pub pub_key: TransportPublicKey,
     pub addr: SocketAddr,
     /// When this entry was saved (for expiry).
