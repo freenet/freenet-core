@@ -46,7 +46,7 @@ mod platform {
     use super::*;
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use std::sync::mpsc as std_mpsc;
-    use tray_icon::{icon::Icon, TrayIconBuilder};
+    use tray_icon::{Icon, TrayIconBuilder};
 
     const DASHBOARD_URL: &str = super::super::service::DASHBOARD_URL;
 
@@ -63,13 +63,15 @@ mod platform {
     fn open_url(url: &str) {
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("cmd")
-                .args(["/c", "start", url])
-                .spawn();
+            drop(
+                std::process::Command::new("cmd")
+                    .args(["/c", "start", url])
+                    .spawn(),
+            );
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = std::process::Command::new("open").arg(url).spawn();
+            drop(std::process::Command::new("open").arg(url).spawn());
         }
     }
 
@@ -97,16 +99,16 @@ mod platform {
         let separator3 = PredefinedMenuItem::separator();
         let quit_item = MenuItem::new("Quit", true, None);
 
-        let _ = menu.append(&open_dashboard);
-        let _ = menu.append(&separator1);
-        let _ = menu.append(&status_item);
-        let _ = menu.append(&version_item);
-        let _ = menu.append(&separator2);
-        let _ = menu.append(&restart_item);
-        let _ = menu.append(&check_update);
-        let _ = menu.append(&view_logs);
-        let _ = menu.append(&separator3);
-        let _ = menu.append(&quit_item);
+        drop(menu.append(&open_dashboard));
+        drop(menu.append(&separator1));
+        drop(menu.append(&status_item));
+        drop(menu.append(&version_item));
+        drop(menu.append(&separator2));
+        drop(menu.append(&restart_item));
+        drop(menu.append(&check_update));
+        drop(menu.append(&view_logs));
+        drop(menu.append(&separator3));
+        drop(menu.append(&quit_item));
 
         let icon = match build_icon() {
             Ok(i) => i,
@@ -151,14 +153,14 @@ mod platform {
                 } else if event.id == view_logs_id {
                     Some(TrayAction::ViewLogs)
                 } else if event.id == quit_id {
-                    let _ = action_tx.send(TrayAction::Quit);
+                    drop(action_tx.send(TrayAction::Quit));
                     break;
                 } else {
                     None
                 };
 
                 if let Some(action) = action {
-                    let _ = action_tx.send(action);
+                    drop(action_tx.send(action));
                 }
             }
 
@@ -169,8 +171,8 @@ mod platform {
                     WrapperStatus::Updating => "Updating...",
                     WrapperStatus::Stopped => "Stopped",
                 };
-                let _ = status_item.set_text(format!("Status: {status_text}"));
-                let _ = _tray.set_tooltip(Some(format!("Freenet {version} - {status_text}")));
+                status_item.set_text(format!("Status: {status_text}"));
+                drop(_tray.set_tooltip(Some(format!("Freenet {version} - {status_text}"))));
             }
 
             // Yield to avoid busy-spinning. The platform message pump is driven
@@ -217,11 +219,11 @@ pub fn open_log_file() {
         Some(path) => {
             #[cfg(target_os = "windows")]
             {
-                let _ = std::process::Command::new("notepad").arg(&path).spawn();
+                drop(std::process::Command::new("notepad").arg(&path).spawn());
             }
             #[cfg(target_os = "macos")]
             {
-                let _ = std::process::Command::new("open").arg(&path).spawn();
+                drop(std::process::Command::new("open").arg(&path).spawn());
             }
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {

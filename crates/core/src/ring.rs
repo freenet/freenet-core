@@ -91,7 +91,7 @@ pub(crate) struct Ring {
     /// Injectable time source used by `connection_maintenance`. Using `util::TimeSource`
     /// (which returns `tokio::time::Instant`) lets tests supply `SharedMockTimeSource` for
     /// fine-grained control without pausing the entire tokio runtime.
-    time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
+    pub(crate) time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
     /// Directory for persisting the peer address cache. When set, the peer cache
     /// is periodically saved here and loaded on startup for fast reconnection.
     pub(crate) peer_cache_dir: Option<std::path::PathBuf>,
@@ -1989,7 +1989,10 @@ impl Ring {
             if last_peer_cache_save.elapsed() > PEER_CACHE_SAVE_INTERVAL {
                 last_peer_cache_save = self.time_source.now();
                 if let Some(ref dir) = self.peer_cache_dir {
-                    let cache = peer_cache::PeerCache::snapshot_from(&self.connection_manager);
+                    let cache = peer_cache::PeerCache::snapshot_from(
+                        &self.connection_manager,
+                        self.time_source.as_ref(),
+                    );
                     if !cache.peers.is_empty() {
                         if let Err(e) = cache.save(dir) {
                             tracing::warn!(error = %e, "Failed to save peer cache");

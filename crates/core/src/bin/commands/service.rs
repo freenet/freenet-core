@@ -280,7 +280,9 @@ fn sleep_with_jitter_interruptible(
                 match action {
                     super::tray::TrayAction::Quit => return true,
                     super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
-                    _ => {}
+                    super::tray::TrayAction::OpenDashboard
+                    | super::tray::TrayAction::Restart
+                    | super::tray::TrayAction::CheckUpdate => {}
                 }
             }
         }
@@ -375,7 +377,7 @@ fn run_wrapper_loop(
         // Notify tray that we're starting
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         if let Some((_, status_tx)) = tray {
-            let _ = status_tx.send(WrapperStatus::Running);
+            drop(status_tx.send(WrapperStatus::Running));
         }
 
         let stderr_path = log_dir.join("freenet.error.log.last");
@@ -472,7 +474,7 @@ fn run_wrapper_loop(
 
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             if let Some((_, status_tx)) = tray {
-                let _ = status_tx.send(WrapperStatus::Updating);
+                drop(status_tx.send(WrapperStatus::Updating));
             }
 
             let ok = std::process::Command::new(&exe_path)
@@ -536,7 +538,7 @@ fn run_wrapper_loop(
 
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
                 if let Some((_, status_tx)) = tray {
-                    let _ = status_tx.send(WrapperStatus::Stopped);
+                    drop(status_tx.send(WrapperStatus::Stopped));
                 }
 
                 log_wrapper_event(
@@ -1684,9 +1686,11 @@ pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
     }
 
     // Stop if running
-    let _ = std::process::Command::new("schtasks")
-        .args(["/end", "/tn", "Freenet"])
-        .status();
+    drop(
+        std::process::Command::new("schtasks")
+            .args(["/end", "/tn", "Freenet"])
+            .status(),
+    );
 
     // Delete the task
     let status = std::process::Command::new("schtasks")
@@ -1777,7 +1781,7 @@ fn stop_service(system: bool) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn restart_service(system: bool) -> Result<()> {
     check_no_system_flag_windows(system)?;
-    let _ = stop_service(false);
+    drop(stop_service(false));
     // Give it a moment to stop
     std::thread::sleep(std::time::Duration::from_secs(2));
     start_service(false)
@@ -1817,18 +1821,20 @@ fn service_logs(error_only: bool) -> Result<()> {
                 .context("Failed to open log file")?;
             if !status.success() {
                 // Fallback: just open in notepad
-                let _ = std::process::Command::new("notepad").arg(&log_path).spawn();
+                drop(std::process::Command::new("notepad").arg(&log_path).spawn());
             }
         }
         None => {
             if let Some(ref wl) = wrapper_log {
                 println!("No node logs found, showing wrapper log:");
-                let _ = std::process::Command::new("powershell")
-                    .args([
-                        "-Command",
-                        &format!("Get-Content -Path '{}' -Tail 50 -Wait", wl.display()),
-                    ])
-                    .status();
+                drop(
+                    std::process::Command::new("powershell")
+                        .args([
+                            "-Command",
+                            &format!("Get-Content -Path '{}' -Tail 50 -Wait", wl.display()),
+                        ])
+                        .status(),
+                );
             } else {
                 anyhow::bail!(
                     "No log files found in {}.\n\

@@ -4,9 +4,8 @@
 //! restart, the node can attempt direct transport connections to previously-known
 //! peers, reusing existing NAT holes before they expire.
 //!
-//! Note: Uses `SystemTime` rather than the `TimeSource` trait because cache entries
-//! must survive process restarts. `Instant`/`TimeSource` values reset on restart
-//! and cannot represent "when was this entry saved?" across process boundaries.
+//! Uses `SystemTime` for timestamps (wall-clock time survives restarts), obtained
+//! via `TimeSource::system_time_now()` so that simulation tests remain deterministic.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -16,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ring::connection_manager::ConnectionManager;
 use crate::transport::TransportPublicKey;
+use crate::util::time_source::TimeSource;
 
 /// Maximum number of peers to cache.
 const MAX_CACHED_PEERS: usize = 50;
@@ -44,7 +44,7 @@ pub(crate) struct PeerCache {
 
 impl PeerCache {
     /// Load the peer cache from the given data directory, filtering expired entries.
-    pub fn load(data_dir: &Path) -> Self {
+    pub fn load(data_dir: &Path, time_source: &dyn TimeSource) -> Self {
         let path = data_dir.join(CACHE_FILENAME);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -62,7 +62,7 @@ impl PeerCache {
                 return Self::default();
             }
         };
-        let now = SystemTime::now();
+        let now = time_source.system_time_now();
         cache.peers.retain(|p| {
             now.duration_since(p.saved_at)
                 .map(|age| age < CACHE_EXPIRY)
@@ -84,8 +84,8 @@ impl PeerCache {
     }
 
     /// Build a peer cache snapshot from the current ring connections.
-    pub fn snapshot_from(conn_manager: &ConnectionManager) -> Self {
-        let now = SystemTime::now();
+    pub fn snapshot_from(conn_manager: &ConnectionManager, time_source: &dyn TimeSource) -> Self {
+        let now = time_source.system_time_now();
         let connections = conn_manager.get_connections_by_location();
         let mut peers: Vec<CachedPeer> = connections
             .values()
@@ -112,27 +112,29 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     use crate::transport::TransportKeypair;
+    use crate::util::time_source::SharedMockTimeSource;
 
     fn make_pub_key() -> TransportPublicKey {
         TransportKeypair::new().public().clone()
     }
 
-    fn make_cached_peer(port: u16) -> CachedPeer {
+    fn make_cached_peer(ts: &dyn TimeSource, port: u16) -> CachedPeer {
         CachedPeer {
             pub_key: make_pub_key(),
             addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), port)),
-            saved_at: SystemTime::now(),
+            saved_at: ts.system_time_now(),
         }
     }
 
     #[test]
     fn test_cache_roundtrip() {
+        let ts = SharedMockTimeSource::new();
         let dir = tempfile::tempdir().unwrap();
         let cache = PeerCache {
-            peers: vec![make_cached_peer(1000), make_cached_peer(1001)],
+            peers: vec![make_cached_peer(&ts, 1000), make_cached_peer(&ts, 1001)],
         };
         cache.save(dir.path()).unwrap();
-        let loaded = PeerCache::load(dir.path());
+        let loaded = PeerCache::load(dir.path(), &ts);
         assert_eq!(loaded.peers.len(), 2);
         assert_eq!(loaded.peers[0].addr, cache.peers[0].addr);
         assert_eq!(loaded.peers[1].addr, cache.peers[1].addr);
@@ -140,34 +142,40 @@ mod tests {
 
     #[test]
     fn test_cache_expiry() {
+        let ts = SharedMockTimeSource::new();
         let dir = tempfile::tempdir().unwrap();
+        // Create a peer saved "now" (at mock epoch)
+        let fresh_peer = make_cached_peer(&ts, 1001);
+        // Create an old peer saved 600s before the current mock time.
+        // Since mock epoch is UNIX_EPOCH + 1_000_000s, subtracting 600s is safe.
         let old_peer = CachedPeer {
             pub_key: make_pub_key(),
             addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 1000)),
-            saved_at: SystemTime::now() - Duration::from_secs(600),
+            saved_at: ts.system_time_now() - Duration::from_secs(600),
         };
-        let fresh_peer = make_cached_peer(1001);
         let cache = PeerCache {
             peers: vec![old_peer, fresh_peer.clone()],
         };
         cache.save(dir.path()).unwrap();
-        let loaded = PeerCache::load(dir.path());
+        let loaded = PeerCache::load(dir.path(), &ts);
         assert_eq!(loaded.peers.len(), 1);
         assert_eq!(loaded.peers[0].addr, fresh_peer.addr);
     }
 
     #[test]
     fn test_missing_cache_file() {
+        let ts = SharedMockTimeSource::new();
         let dir = tempfile::tempdir().unwrap();
-        let loaded = PeerCache::load(dir.path());
+        let loaded = PeerCache::load(dir.path(), &ts);
         assert!(loaded.peers.is_empty());
     }
 
     #[test]
     fn test_corrupt_cache_file() {
+        let ts = SharedMockTimeSource::new();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(CACHE_FILENAME), "not valid json").unwrap();
-        let loaded = PeerCache::load(dir.path());
+        let loaded = PeerCache::load(dir.path(), &ts);
         assert!(loaded.peers.is_empty());
     }
 }
