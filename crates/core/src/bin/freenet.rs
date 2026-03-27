@@ -625,6 +625,10 @@ fn freenet_main() -> anyhow::Result<()> {
             run_node(config)
         }
         None => {
+            // On Windows, if not installed, show setup wizard before starting
+            if commands::setup_wizard::maybe_show_setup_wizard()? {
+                return Ok(());
+            }
             // Default behavior: run with the config from top-level args
             run_node(cli.config)
         }
