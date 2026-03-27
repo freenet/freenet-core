@@ -18,7 +18,7 @@ use super::report::ReportCommand;
 /// Handles both static files (e.g., "freenet.log" from systemd) and
 /// rotated files (e.g., "freenet.2025-12-27.log" from tracing-appender).
 /// Returns the most recently modified file.
-fn find_latest_log_file(log_dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
+pub(super) fn find_latest_log_file(log_dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
     use std::fs;
 
     let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
@@ -115,6 +115,11 @@ pub enum ServiceCommand {
     },
     /// Generate and upload a diagnostic report for debugging
     Report(ReportCommand),
+    /// Internal: process wrapper that manages the freenet node lifecycle.
+    /// Handles auto-update (exit code 42), crash backoff, log capture,
+    /// and on Windows shows a system tray icon.
+    #[command(hide = true)]
+    RunWrapper,
 }
 
 impl ServiceCommand {
@@ -140,6 +145,542 @@ impl ServiceCommand {
             ServiceCommand::Logs { err } => service_logs(*err),
             ServiceCommand::Report(cmd) => {
                 cmd.run(version, git_commit, git_dirty, build_timestamp, config_dirs)
+            }
+            ServiceCommand::RunWrapper => run_wrapper(version),
+        }
+    }
+}
+
+// ── Run-wrapper: compiled process wrapper for auto-update + tray icon ──
+
+/// Exit codes from the freenet binary that we handle specially.
+const WRAPPER_EXIT_UPDATE_NEEDED: i32 = 42;
+const WRAPPER_EXIT_ALREADY_RUNNING: i32 = 43;
+
+/// Initial backoff delay after a crash (seconds).
+const WRAPPER_INITIAL_BACKOFF_SECS: u64 = 10;
+/// Maximum backoff delay (seconds).
+const WRAPPER_MAX_BACKOFF_SECS: u64 = 300;
+/// Maximum port-conflict kill-and-retry attempts before giving up.
+const WRAPPER_MAX_PORT_CONFLICT_KILLS: u32 = 3;
+/// Maximum consecutive failures before the wrapper gives up.
+const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
+
+/// Dashboard URL served by the local freenet node.
+#[allow(dead_code)] // Used on Windows (tray + wrapper loop)
+pub(super) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
+
+/// State for the wrapper backoff state machine.
+#[derive(Debug, Clone)]
+struct WrapperState {
+    backoff_secs: u64,
+    consecutive_failures: u32,
+    port_conflict_kills: u32,
+}
+
+impl WrapperState {
+    fn new() -> Self {
+        Self {
+            backoff_secs: WRAPPER_INITIAL_BACKOFF_SECS,
+            consecutive_failures: 0,
+            port_conflict_kills: 0,
+        }
+    }
+}
+
+/// Action the wrapper should take after the child process exits.
+#[derive(Debug, PartialEq)]
+enum WrapperAction {
+    /// Run update, then relaunch.
+    Update,
+    /// Exit the wrapper cleanly.
+    Exit,
+    /// Kill stale processes and retry immediately.
+    KillAndRetry,
+    /// Wait (with jitter) then relaunch.
+    BackoffAndRelaunch { secs: u64 },
+}
+
+/// Pure function: given current state and exit info, determine the next action
+/// and update the state. Testable without spawning processes.
+fn next_wrapper_action(
+    state: &mut WrapperState,
+    exit_code: i32,
+    is_port_conflict: bool,
+    update_succeeded: Option<bool>, // None if not an update exit code
+) -> WrapperAction {
+    match exit_code {
+        code if code == WRAPPER_EXIT_UPDATE_NEEDED => {
+            match update_succeeded {
+                Some(true) => {
+                    state.consecutive_failures = 0;
+                    state.port_conflict_kills = 0;
+                    state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+                    WrapperAction::Update
+                }
+                Some(false) => {
+                    state.consecutive_failures += 1;
+                    let secs = state.backoff_secs;
+                    state.backoff_secs = (state.backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
+                    WrapperAction::BackoffAndRelaunch { secs }
+                }
+                None => WrapperAction::Update, // Will be called again with result
+            }
+        }
+        code if code == WRAPPER_EXIT_ALREADY_RUNNING => WrapperAction::Exit,
+        0 => WrapperAction::Exit,
+        _ => {
+            if is_port_conflict {
+                state.port_conflict_kills += 1;
+                if state.port_conflict_kills <= WRAPPER_MAX_PORT_CONFLICT_KILLS {
+                    state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+                    return WrapperAction::KillAndRetry;
+                }
+                // Fall through to normal crash backoff
+            }
+            state.consecutive_failures += 1;
+            state.port_conflict_kills = 0;
+            let secs = state.backoff_secs;
+            state.backoff_secs = (state.backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
+            WrapperAction::BackoffAndRelaunch { secs }
+        }
+    }
+}
+
+/// Compute a jittered duration: `secs` ±20%.
+fn jitter_secs(secs: u64) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut hasher);
+    let hash = hasher.finish();
+    let factor = 0.8 + (hash % 1000) as f64 / 2500.0;
+    (secs as f64 * factor) as u64
+}
+
+/// Sleep for `secs` with ±20% jitter, interruptible via an optional action
+/// channel. Returns `true` if a Quit action was received during the sleep.
+/// Sleeps in 1-second chunks to remain responsive to tray actions.
+fn sleep_with_jitter_interruptible(
+    secs: u64,
+    #[cfg(any(target_os = "windows", target_os = "macos"))] action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+) -> bool {
+    let jittered = jitter_secs(secs).max(1);
+    for _ in 0..jittered {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some(rx) = action_rx {
+            if let Ok(action) = rx.try_recv() {
+                match action {
+                    super::tray::TrayAction::Quit => return true,
+                    super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Run the wrapper loop that manages a `freenet network` child process.
+///
+/// Compiled process wrapper that manages a `freenet network` child process.
+/// On Windows and macOS, shows a system tray / menu bar icon.
+/// On Linux, runs the wrapper loop directly (no tray).
+fn run_wrapper(version: &str) -> Result<()> {
+    use freenet::tracing::tracer::get_log_dir;
+    use std::sync::mpsc;
+
+    let log_dir = get_log_dir().unwrap_or_else(|| {
+        let fallback = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("freenet")
+            .join("logs");
+        eprintln!(
+            "Warning: could not determine log directory, using {}",
+            fallback.display()
+        );
+        fallback
+    });
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+
+    // Kill stale freenet network processes from a previous wrapper instance
+    kill_stale_freenet_processes(&log_dir);
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        use super::tray::{TrayAction, WrapperStatus};
+
+        let (action_tx, action_rx) = mpsc::channel::<TrayAction>();
+        let (status_tx, status_rx) = mpsc::channel::<WrapperStatus>();
+        let version_owned = version.to_string();
+        let log_dir_clone = log_dir.clone();
+
+        // Wrapper loop runs on a background thread
+        let loop_handle = std::thread::spawn(move || {
+            run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)))
+        });
+
+        // Tray icon runs on the main thread (platform message pump)
+        super::tray::run_tray_event_loop(action_tx, status_rx, &version_owned);
+
+        // Tray loop exited (user clicked Quit) — join the wrapper thread
+        match loop_handle.join() {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!("Wrapper loop thread panicked"),
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = version;
+        run_wrapper_loop(
+            &log_dir,
+            None::<(
+                &mpsc::Receiver<super::tray::TrayAction>,
+                &mpsc::Sender<super::tray::WrapperStatus>,
+            )>,
+        )
+    }
+}
+
+/// The core wrapper loop. Spawns `freenet network`, handles exit codes,
+/// and communicates with the tray icon (if present).
+fn run_wrapper_loop(
+    log_dir: &Path,
+    #[cfg(any(target_os = "windows", target_os = "macos"))] tray: Option<(
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+        &std::sync::mpsc::Sender<super::tray::WrapperStatus>,
+    )>,
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _tray: Option<(
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+        &std::sync::mpsc::Sender<super::tray::WrapperStatus>,
+    )>,
+) -> Result<()> {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    use super::tray::WrapperStatus;
+
+    let exe_path = std::env::current_exe().context("Failed to get current executable")?;
+
+    let mut state = WrapperState::new();
+
+    loop {
+        // Notify tray that we're starting
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some((_, status_tx)) = tray {
+            let _ = status_tx.send(WrapperStatus::Running);
+        }
+
+        let stderr_path = log_dir.join("freenet.error.log.last");
+        let stderr_file = std::fs::File::create(&stderr_path).ok();
+
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("network");
+
+        // Redirect stderr to a file for port-conflict detection
+        if let Some(stderr_file) = stderr_file {
+            cmd.stderr(stderr_file);
+        }
+
+        // Use spawn + polling so we can handle tray actions while child runs
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                log_wrapper_event(log_dir, &format!("Failed to spawn freenet network: {e}"));
+                return Err(e).context("Failed to spawn freenet network");
+            }
+        };
+
+        // Poll child + tray actions until child exits or a tray action kills it
+        let exit_code = loop {
+            // Check if child has exited
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code().unwrap_or(1),
+                Ok(None) => {} // still running
+                Err(e) => {
+                    log_wrapper_event(log_dir, &format!("Error waiting for child: {e}"));
+                    break 1;
+                }
+            }
+
+            // Process tray actions while child is running
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            if let Some((action_rx, _)) = tray {
+                if let Ok(action) = action_rx.try_recv() {
+                    match action {
+                        super::tray::TrayAction::Quit => {
+                            drop(child.kill());
+                            drop(child.wait());
+                            return Ok(());
+                        }
+                        super::tray::TrayAction::Restart => {
+                            log_wrapper_event(log_dir, "Restart requested via tray");
+                            drop(child.kill());
+                            drop(child.wait());
+                            break -1; // sentinel: skip exit-code handling, just relaunch
+                        }
+                        super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
+                        super::tray::TrayAction::CheckUpdate => {
+                            drop(
+                                std::process::Command::new(&exe_path)
+                                    .args(["update", "--check"])
+                                    .status(),
+                            );
+                        }
+                        super::tray::TrayAction::OpenDashboard => {
+                            drop(
+                                std::process::Command::new("cmd")
+                                    .args(["/c", "start", DASHBOARD_URL])
+                                    .spawn(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Sleep briefly before polling again
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        };
+
+        // Restart sentinel from tray Restart action — skip exit code handling
+        if exit_code == -1 {
+            continue;
+        }
+
+        // Determine if this is a port conflict (for the state machine)
+        let is_port_conflict = stderr_path
+            .exists()
+            .then(|| std::fs::read_to_string(&stderr_path).unwrap_or_default())
+            .map(|s| s.contains("already in use"))
+            .unwrap_or(false);
+
+        // For exit code 42, run the update first and pass result to state machine.
+        // On Windows, this works because replace_binary() renames the running exe
+        // (freenet.exe → freenet.exe.old) rather than deleting it. Windows allows
+        // renaming a running executable. The new binary is placed at the original
+        // path, so the next child launch uses it. The .old file is cleaned up on
+        // the subsequent update.
+        let update_succeeded = if exit_code == WRAPPER_EXIT_UPDATE_NEEDED {
+            log_wrapper_event(log_dir, "Update needed, running freenet update...");
+
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            if let Some((_, status_tx)) = tray {
+                let _ = status_tx.send(WrapperStatus::Updating);
+            }
+
+            let ok = std::process::Command::new(&exe_path)
+                .args(["update", "--quiet"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if ok {
+                log_wrapper_event(log_dir, "Update successful, restarting...");
+            } else {
+                log_wrapper_event(log_dir, "Update failed");
+            }
+            Some(ok)
+        } else {
+            None
+        };
+
+        // Use the tested state machine to determine next action
+        let action = next_wrapper_action(&mut state, exit_code, is_port_conflict, update_succeeded);
+
+        match action {
+            WrapperAction::Update => {
+                // Update succeeded — brief pause then relaunch
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            WrapperAction::Exit => {
+                let reason = if exit_code == WRAPPER_EXIT_ALREADY_RUNNING {
+                    "Another instance is already running, exiting cleanly"
+                } else if exit_code == 0 {
+                    "Normal shutdown"
+                } else {
+                    "Exiting"
+                };
+                log_wrapper_event(log_dir, reason);
+                return Ok(());
+            }
+            WrapperAction::KillAndRetry => {
+                log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "Port conflict detected (attempt {}/{WRAPPER_MAX_PORT_CONFLICT_KILLS}) — killing stale process and retrying...",
+                        state.port_conflict_kills,
+                    ),
+                );
+                kill_stale_freenet_processes(log_dir);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            WrapperAction::BackoffAndRelaunch { secs } => {
+                if state.consecutive_failures >= WRAPPER_MAX_CONSECUTIVE_FAILURES {
+                    log_wrapper_event(
+                        log_dir,
+                        &format!(
+                            "Giving up after {} consecutive failures. \
+                             Run 'freenet network' manually to diagnose.",
+                            state.consecutive_failures,
+                        ),
+                    );
+                    return Ok(());
+                }
+
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                if let Some((_, status_tx)) = tray {
+                    let _ = status_tx.send(WrapperStatus::Stopped);
+                }
+
+                log_wrapper_event(
+                    log_dir,
+                    &format!("Exited with code {exit_code}, restarting after {secs}s backoff..."),
+                );
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                let quit = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                let quit = sleep_with_jitter_interruptible(secs, None);
+                if quit {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Maximum number of wrapper log files to keep (one per day).
+const WRAPPER_LOG_RETENTION_DAYS: usize = 7;
+
+/// Append a timestamped message to a date-based wrapper log file.
+/// Files are named `freenet-wrapper.YYYY-MM-DD.log` with automatic rotation.
+/// Old files beyond `WRAPPER_LOG_RETENTION_DAYS` are deleted.
+fn log_wrapper_event(log_dir: &Path, message: &str) {
+    use std::io::Write;
+
+    let now = chrono::Local::now();
+    let date_str = now.format("%Y-%m-%d");
+    let log_path = log_dir.join(format!("freenet-wrapper.{date_str}.log"));
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let timestamp = now.format("%H:%M:%S");
+        drop(writeln!(file, "{timestamp}: {message}"));
+    }
+    // Also print to stderr for debugging when run manually
+    eprintln!("{message}");
+
+    // Clean up old log files (best-effort, don't let cleanup failure block anything)
+    cleanup_old_wrapper_logs(log_dir);
+}
+
+/// Delete wrapper log files older than the retention period.
+fn cleanup_old_wrapper_logs(log_dir: &Path) {
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut wrapper_logs: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("freenet-wrapper.") && n.ends_with(".log"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if wrapper_logs.len() <= WRAPPER_LOG_RETENTION_DAYS {
+        return;
+    }
+
+    // Sort by name (date is embedded, so lexicographic = chronological)
+    wrapper_logs.sort();
+
+    // Remove oldest files beyond retention
+    let to_remove = wrapper_logs.len() - WRAPPER_LOG_RETENTION_DAYS;
+    for path in &wrapper_logs[..to_remove] {
+        drop(std::fs::remove_file(path));
+    }
+}
+
+/// Kill stale `freenet network` processes from a previous wrapper instance.
+fn kill_stale_freenet_processes(log_dir: &Path) {
+    #[cfg(unix)]
+    {
+        // Scope to current user to avoid killing other users' processes on shared machines.
+        // Mirrors the macOS wrapper script: pkill -f -u "$(id -u)" "freenet network"
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let uid = uid.trim();
+        let status = std::process::Command::new("pkill")
+            .args(["-f", "-u", uid, "freenet network"])
+            .status();
+        if let Ok(s) = status {
+            if s.success() {
+                log_wrapper_event(
+                    log_dir,
+                    "Killed stale freenet network process(es) on startup",
+                );
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Use WMIC to find freenet.exe processes with "network" in the command line,
+        // then kill them by PID. This avoids killing the wrapper itself or other
+        // freenet subcommands (update, service, etc.).
+        let output = std::process::Command::new("wmic")
+            .args([
+                "process",
+                "where",
+                "name='freenet.exe' and commandline like '%network%'",
+                "get",
+                "processid",
+                "/format:list",
+            ])
+            .output();
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut killed = false;
+            for line in stdout.lines() {
+                if let Some(pid_str) = line.strip_prefix("ProcessId=") {
+                    let pid = pid_str.trim();
+                    if !pid.is_empty() {
+                        drop(
+                            std::process::Command::new("taskkill")
+                                .args(["/F", "/PID", pid])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status(),
+                        );
+                        killed = true;
+                    }
+                }
+            }
+            if killed {
+                log_wrapper_event(
+                    log_dir,
+                    "Killed stale freenet network process(es) on startup",
+                );
+                std::thread::sleep(std::time::Duration::from_secs(2));
             }
         }
     }
@@ -1083,15 +1624,16 @@ fn install_service(system: bool) -> Result<()> {
         .to_str()
         .context("Executable path contains invalid UTF-8")?;
 
-    // Use Task Scheduler to run at login
-    // schtasks /create /tn "Freenet" /tr "path\to\freenet.exe network" /sc onlogon /rl highest
+    // Use Task Scheduler to run the wrapper at login. The wrapper manages the
+    // freenet network child process, handles auto-update (exit code 42), crash
+    // backoff, log capture, and shows a system tray icon.
     let status = std::process::Command::new("schtasks")
         .args([
             "/create",
             "/tn",
             "Freenet",
             "/tr",
-            &format!("\"{}\" network", exe_path_str),
+            &format!("\"{}\" service run-wrapper", exe_path_str),
             "/sc",
             "onlogon",
             "/rl",
@@ -1111,9 +1653,7 @@ fn install_service(system: bool) -> Result<()> {
     println!("  freenet service start");
     println!();
     println!("Freenet will start automatically when you log in.");
-    println!();
-    println!("Note: For production use, consider running Freenet as a Windows Service.");
-    println!("See: https://freenet.org/docs/windows-service");
+    println!("A system tray icon will appear with status and controls.");
 
     Ok(())
 }
@@ -1244,14 +1784,62 @@ fn restart_service(system: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn service_logs(_error_only: bool) -> Result<()> {
-    // Windows Task Scheduler doesn't capture stdout/stderr to files by default.
-    // Users can check Event Viewer or run Freenet manually to see output.
-    anyhow::bail!(
-        "Log viewing is not yet supported on Windows.\n\
-         To view logs, run 'freenet network' manually in a terminal,\n\
-         or check Windows Event Viewer for application errors."
-    )
+fn service_logs(error_only: bool) -> Result<()> {
+    use freenet::tracing::tracer::get_log_dir;
+
+    let log_dir = get_log_dir().context(
+        "Could not determine log directory. \
+         Ensure Freenet has been run at least once via 'freenet service run-wrapper'.",
+    )?;
+
+    let base_name = if error_only {
+        "freenet.error"
+    } else {
+        "freenet"
+    };
+
+    // Also check the wrapper log (now date-rotated: freenet-wrapper.YYYY-MM-DD.log)
+    let wrapper_log = find_latest_log_file(&log_dir, "freenet-wrapper");
+
+    match find_latest_log_file(&log_dir, base_name) {
+        Some(log_path) => {
+            println!("Log file: {}", log_path.display());
+            if let Some(ref wl) = wrapper_log {
+                println!("Wrapper log: {}", wl.display());
+            }
+            // Use PowerShell Get-Content -Wait to follow the log (like tail -f)
+            let status = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!("Get-Content -Path '{}' -Tail 50 -Wait", log_path.display()),
+                ])
+                .status()
+                .context("Failed to open log file")?;
+            if !status.success() {
+                // Fallback: just open in notepad
+                let _ = std::process::Command::new("notepad").arg(&log_path).spawn();
+            }
+        }
+        None => {
+            if let Some(ref wl) = wrapper_log {
+                println!("No node logs found, showing wrapper log:");
+                let _ = std::process::Command::new("powershell")
+                    .args([
+                        "-Command",
+                        &format!("Get-Content -Path '{}' -Tail 50 -Wait", wl.display()),
+                    ])
+                    .status();
+            } else {
+                anyhow::bail!(
+                    "No log files found in {}.\n\
+                     Ensure Freenet has been run at least once.",
+                    log_dir.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // Fallback for unsupported platforms
@@ -1488,5 +2076,144 @@ mod tests {
     fn test_should_purge_no_flags_non_tty() {
         // In CI/test environments stdin is not a TTY, so this should default to false
         assert!(!should_purge(false, false).unwrap());
+    }
+
+    // ── Wrapper backoff state machine tests ──
+
+    #[test]
+    fn test_wrapper_exit_42_update_success_resets_state() {
+        let mut state = WrapperState::new();
+        state.consecutive_failures = 3;
+        state.backoff_secs = 80;
+
+        let action = next_wrapper_action(&mut state, 42, false, Some(true));
+        assert_eq!(action, WrapperAction::Update);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
+        assert_eq!(state.port_conflict_kills, 0);
+    }
+
+    #[test]
+    fn test_wrapper_exit_42_update_failure_backs_off() {
+        let mut state = WrapperState::new();
+        assert_eq!(state.backoff_secs, 10);
+
+        let action = next_wrapper_action(&mut state, 42, false, Some(false));
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 10 });
+        assert_eq!(state.consecutive_failures, 1);
+        assert_eq!(state.backoff_secs, 20); // doubled
+
+        let action = next_wrapper_action(&mut state, 42, false, Some(false));
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 20 });
+        assert_eq!(state.backoff_secs, 40);
+    }
+
+    #[test]
+    fn test_wrapper_exit_43_exits_immediately() {
+        let mut state = WrapperState::new();
+        let action = next_wrapper_action(&mut state, 43, false, None);
+        assert_eq!(action, WrapperAction::Exit);
+    }
+
+    #[test]
+    fn test_wrapper_exit_0_exits_cleanly() {
+        let mut state = WrapperState::new();
+        let action = next_wrapper_action(&mut state, 0, false, None);
+        assert_eq!(action, WrapperAction::Exit);
+    }
+
+    #[test]
+    fn test_wrapper_crash_exponential_backoff_with_cap() {
+        let mut state = WrapperState::new();
+
+        // First crash: 10s
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 10 });
+        assert_eq!(state.backoff_secs, 20);
+
+        // Second: 20s
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 20 });
+        assert_eq!(state.backoff_secs, 40);
+
+        // Keep doubling...
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 40 });
+        assert_eq!(state.backoff_secs, 80);
+
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 80 });
+        assert_eq!(state.backoff_secs, 160);
+
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 160 });
+        assert_eq!(state.backoff_secs, 300); // capped at MAX
+
+        // Should stay capped
+        let action = next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 300 });
+        assert_eq!(state.backoff_secs, 300);
+
+        assert_eq!(state.consecutive_failures, 6);
+    }
+
+    #[test]
+    fn test_wrapper_port_conflict_kill_and_retry() {
+        let mut state = WrapperState::new();
+
+        // First port conflict: kill and retry
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::KillAndRetry);
+        assert_eq!(state.port_conflict_kills, 1);
+        assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
+
+        // Second: still kill and retry
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::KillAndRetry);
+        assert_eq!(state.port_conflict_kills, 2);
+
+        // Third: still kill and retry (at the limit)
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::KillAndRetry);
+        assert_eq!(state.port_conflict_kills, 3);
+
+        // Fourth: exceeds limit, falls through to backoff
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 10 });
+        assert_eq!(state.port_conflict_kills, 0); // reset on fallthrough
+        assert_eq!(state.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn test_wrapper_port_conflict_resets_backoff() {
+        let mut state = WrapperState::new();
+        state.backoff_secs = 160; // simulate previous crashes
+
+        let action = next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(action, WrapperAction::KillAndRetry);
+        assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn test_find_latest_log_file_picks_newest() {
+        use std::fs;
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create some log files with different modification times
+        let old = tmp.path().join("freenet.2025-01-01.log");
+        let new = tmp.path().join("freenet.2025-12-31.log");
+        let unrelated = tmp.path().join("other.log");
+
+        fs::write(&old, "old").unwrap();
+        // Ensure different mtime
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut f = fs::File::create(&new).unwrap();
+        f.write_all(b"new").unwrap();
+        fs::write(&unrelated, "unrelated").unwrap();
+
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(new));
     }
 }

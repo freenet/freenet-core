@@ -863,8 +863,65 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
+/// Migrate old-style Windows Task Scheduler entries from `freenet network` to
+/// `freenet service run-wrapper` for auto-update and tray icon support.
+#[cfg(target_os = "windows")]
+fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
+    // Query current task configuration
+    let output = std::process::Command::new("schtasks")
+        .args(["/query", "/tn", "Freenet", "/v", "/fo", "csv"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Ok(()), // No task installed, nothing to update
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Check if the task still uses the old-style "freenet network" command
+    // (without the run-wrapper). If so, update it.
+    let needs_update = stdout.contains("network")
+        && !stdout.contains("service run-wrapper")
+        && !stdout.contains("run-wrapper");
+
+    if !needs_update {
+        return Ok(());
+    }
+
+    let exe_path_str = binary_path
+        .to_str()
+        .context("Executable path contains invalid UTF-8")?;
+
+    if !quiet {
+        println!("Updating scheduled task to use run-wrapper for auto-update support...");
+    }
+
+    let status = std::process::Command::new("schtasks")
+        .args([
+            "/create",
+            "/tn",
+            "Freenet",
+            "/tr",
+            &format!("\"{}\" service run-wrapper", exe_path_str),
+            "/sc",
+            "onlogon",
+            "/rl",
+            "highest",
+            "/f",
+        ])
+        .status()
+        .context("Failed to update scheduled task")?;
+
+    if status.success() && !quiet {
+        println!("Scheduled task updated successfully.");
+    }
+
+    Ok(())
+}
+
 /// No-op on other platforms
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn ensure_service_file_updated(_binary_path: &Path, _quiet: bool) -> Result<()> {
     Ok(())
 }

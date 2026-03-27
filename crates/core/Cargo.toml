@@ -117,6 +117,12 @@ tikv-jemalloc-ctl = { workspace = true, optional = true }
 winapi = { workspace = true, features = ["sysinfoapi"] }
 serde = { workspace = true }
 zip = { workspace = true }
+tray-icon = { workspace = true }
+muda = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { workspace = true }
+muda = { workspace = true }
 
 [dev-dependencies]
 arbitrary = { workspace = true }
