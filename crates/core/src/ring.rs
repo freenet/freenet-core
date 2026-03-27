@@ -838,13 +838,17 @@ impl Ring {
     /// - A race condition left us hosting without subscription
     ///
     /// The task respects existing backoff mechanisms to avoid subscription spam.
+    ///
+    /// **Connection gating (#3676):** This task skips renewal cycles entirely when
+    /// the node has zero ring connections. Without this gate, disconnected peers
+    /// generate a subscribe retry storm — thousands of subscribe requests per cycle
+    /// that all fail immediately because there's no one to send them to. Telemetry
+    /// showed 3 peers with 0 connections generating 96% of all subscribe traffic.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
-        // Wait for the first ring connection before starting subscription recovery.
-        // Poll until the first ring connection appears (or timeout after 5 min).
-        // This replaces the old fixed 30-60s random delay. Sub-second polling
-        // keeps the sleep interruptible per code-style.md rules.
-        const MAX_WAIT: Duration = Duration::from_secs(300);
-        let wait_start = tokio::time::Instant::now();
+        // Wait indefinitely for the first ring connection before starting
+        // subscription recovery. The per-cycle connection check below is the
+        // real gate; this just avoids running the loop body with no peers.
+        let mut wait_logged = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if ring.open_connections() > 0 {
@@ -854,13 +858,13 @@ impl Ring {
                 );
                 break;
             }
-            if wait_start.elapsed() >= MAX_WAIT {
-                tracing::warn!(
+            // Log periodically so operators can diagnose stuck nodes.
+            if !wait_logged {
+                wait_logged = true;
+                tracing::info!(
                     hosted_contracts = ring.hosting_contract_keys().len(),
-                    "No ring connections after {:?}, starting subscription recovery anyway",
-                    MAX_WAIT
+                    "Waiting for ring connection before starting subscription recovery"
                 );
-                break;
             }
         }
 
@@ -883,6 +887,11 @@ impl Ring {
                 interval.tick().await;
             }
 
+            // Always run expiry sweeps, even when disconnected. Stale
+            // subscriptions and downstream subscribers must be cleaned up
+            // to keep interest manager counts accurate. Only the renewal
+            // spawning (below) is gated on having connections.
+            //
             // First, expire any stale subscriptions
             let expired = ring.expire_stale_subscriptions();
             if !expired.is_empty() {
@@ -922,6 +931,15 @@ impl Ring {
                 }
             }
 
+            // Gate: skip renewal spawning if we have no ring connections (#3676).
+            // Subscribe requests require connected peers to route through.
+            // Without this, disconnected peers flood the notification channel
+            // with doomed subscribe requests every 30 seconds.
+            if ring.open_connections() == 0 {
+                tracing::debug!("Skipping subscription renewal: no ring connections");
+                continue;
+            }
+
             // Get contracts that need subscription renewal (have client subscriptions)
             let mut contracts_needing_renewal = ring.contracts_needing_renewal();
 
@@ -938,18 +956,6 @@ impl Ring {
                 hosted = ring.hosting_contract_keys().len(),
                 "Starting subscription renewal cycle"
             );
-
-            // Skip renewal entirely when we have no ring connections.
-            // Without connections we can't route Subscribe messages, so spawning
-            // tasks just fills the notification channel and can deadlock the
-            // event loop (see production incident 2026-02-11 on vega gateway).
-            if ring.open_connections() == 0 {
-                tracing::debug!(
-                    contracts = contracts_needing_renewal.len(),
-                    "Skipping subscription renewal: no ring connections available"
-                );
-                continue;
-            }
 
             // Shuffle to prevent starvation: without this, the same failing contracts
             // (first N in iteration order) would always be tried first, blocking later

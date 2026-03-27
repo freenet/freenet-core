@@ -1342,11 +1342,26 @@ fn remove_subscribe_and_notify_timeout(
     ring: &crate::ring::Ring,
 ) -> Option<()> {
     let (_, sub_op) = ops.subscribe.remove(tx)?;
+    let is_originator = sub_op.is_originator();
     if let Some((peer, contract_location)) = sub_op.failure_routing_info() {
         report_timeout_failure(ring, tx, peer, contract_location);
     }
-    if let Some(instance_id) = sub_op.instance_id() {
+    let instance_id = sub_op.instance_id();
+    if let Some(instance_id) = instance_id {
         notify_subscription_timeout(ch_outbound, instance_id);
+    }
+    // Emit telemetry so subscribe timeouts are visible in the dashboard (#3676).
+    // Without this, timed-out subscribes were invisible — only subscribe_request
+    // and subscribe_success were emitted, so timeouts looked like missing data.
+    if is_originator {
+        crate::tracing::telemetry::send_standalone_event(
+            "subscribe_timeout",
+            serde_json::json!({
+                "tx": tx.to_string(),
+                "instance_id": instance_id.map(|id| id.to_string()),
+                "elapsed_ms": tx.elapsed().as_millis() as u64,
+            }),
+        );
     }
     Some(())
 }
