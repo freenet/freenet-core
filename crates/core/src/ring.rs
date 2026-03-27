@@ -1783,7 +1783,7 @@ impl Ring {
         let mut pending_conn_adds = BTreeSet::new();
         let mut last_backoff_cleanup = Instant::now();
         let mut last_health_check = Instant::now();
-        let mut last_peer_cache_save = Instant::now();
+        let mut last_peer_cache_save = self.time_source.now();
         const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
         // How often to snapshot the peer cache to disk.
         const PEER_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -1964,7 +1964,7 @@ impl Ring {
 
             // Periodically save peer cache for fast reconnection after restart.
             if last_peer_cache_save.elapsed() > PEER_CACHE_SAVE_INTERVAL {
-                last_peer_cache_save = Instant::now();
+                last_peer_cache_save = self.time_source.now();
                 if let Some(ref dir) = self.peer_cache_dir {
                     let cache = peer_cache::PeerCache::snapshot_from(&self.connection_manager);
                     if !cache.peers.is_empty() {
