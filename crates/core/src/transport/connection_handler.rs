@@ -1279,7 +1279,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 // This lets the restarted peer reconnect directly
                                                 // via an existing NAT hole without full gateway
                                                 // re-bootstrap.
-                                                self.connections.record_asym_attempt(remote_addr);
                                                 let inbound_key_bytes = key_from_addr(&remote_addr);
                                                 let (gw_ongoing_connection, packets_sender) =
                                                     self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);

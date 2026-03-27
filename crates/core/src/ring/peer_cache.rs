@@ -73,8 +73,7 @@ impl PeerCache {
     pub fn save(&self, data_dir: &Path) -> Result<(), std::io::Error> {
         let path = data_dir.join(CACHE_FILENAME);
         let tmp_path = data_dir.join(format!(".{}.tmp", CACHE_FILENAME));
-        let content = serde_json::to_string_pretty(self)
-            .map_err(std::io::Error::other)?;
+        let content = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(&tmp_path, &content)?;
         std::fs::rename(&tmp_path, &path)?;
         tracing::debug!(count = self.peers.len(), "Saved peer cache");
@@ -152,17 +151,6 @@ mod tests {
         let loaded = PeerCache::load(dir.path());
         assert_eq!(loaded.peers.len(), 1);
         assert_eq!(loaded.peers[0].addr, fresh_peer.addr);
-    }
-
-    #[test]
-    fn test_cache_max_entries() {
-        let peers: Vec<_> = (0..100).map(|i| make_cached_peer(1000 + i)).collect();
-        let cache = PeerCache { peers };
-        // snapshot_from would truncate, but let's test the truncation logic directly
-        assert!(cache.peers.len() > MAX_CACHED_PEERS);
-        let mut truncated = cache;
-        truncated.peers.truncate(MAX_CACHED_PEERS);
-        assert_eq!(truncated.peers.len(), MAX_CACHED_PEERS);
     }
 
     #[test]

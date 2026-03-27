@@ -2586,29 +2586,23 @@ pub(crate) async fn initial_join_procedure(
                 let cached_peer_locs: Vec<PeerKeyLocation> = cache
                     .peers
                     .iter()
+                    .take(number_of_parallel_connections)
                     .map(|cp| PeerKeyLocation::new(cp.pub_key.clone(), cp.addr))
                     .collect();
 
-                // Try connecting to cached peers in parallel (up to number_of_parallel_connections).
+                // Try connecting to cached peers in parallel.
                 let mut cached_join_handles = Vec::new();
-                for peer in cached_peer_locs.iter().take(number_of_parallel_connections) {
+                for peer in &cached_peer_locs {
                     let op_mgr = op_manager.clone();
                     let peer = peer.clone();
                     cached_join_handles.push(GlobalExecutor::spawn(async move {
                         match join_ring_request(&peer, &op_mgr).await {
                             Ok(()) => {
-                                tracing::info!(
-                                    peer = %peer,
-                                    "Successfully reconnected to cached peer"
-                                );
+                                tracing::info!(peer = %peer, "Reconnected to cached peer");
                                 true
                             }
                             Err(e) => {
-                                tracing::debug!(
-                                    peer = %peer,
-                                    error = %e,
-                                    "Failed to reconnect to cached peer"
-                                );
+                                tracing::debug!(peer = %peer, error = %e, "Cached peer reconnection failed");
                                 false
                             }
                         }
@@ -2626,8 +2620,7 @@ pub(crate) async fn initial_join_procedure(
                 let successes = match cached_results {
                     Ok(results) => results
                         .into_iter()
-                        .filter_map(|r| r.ok())
-                        .filter(|&ok| ok)
+                        .filter(|r| matches!(r, Ok(true)))
                         .count(),
                     Err(_) => {
                         tracing::debug!("Cached peer reconnection timed out");
@@ -2637,17 +2630,9 @@ pub(crate) async fn initial_join_procedure(
 
                 tracing::info!(
                     successes,
-                    total = cache.peers.len(),
+                    attempted = cached_peer_locs.len(),
                     "Cached peer reconnection complete"
                 );
-
-                // If we already have enough connections, skip directly to
-                // the steady-state monitoring loop.
-                if op_manager.ring.open_connections() >= bootstrap_threshold {
-                    tracing::info!(
-                        "Reached bootstrap threshold via cached peers, skipping gateway bootstrap"
-                    );
-                }
             }
         }
 

@@ -1785,7 +1785,7 @@ impl Ring {
         let mut last_health_check = Instant::now();
         let mut last_peer_cache_save = Instant::now();
         const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
-        /// How often to snapshot the peer cache to disk.
+        // How often to snapshot the peer cache to disk.
         const PEER_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(30);
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
