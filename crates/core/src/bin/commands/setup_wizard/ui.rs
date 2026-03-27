@@ -14,13 +14,14 @@ mod platform {
     use std::sync::{Arc, Mutex};
 
     /// Result of the setup dialog interaction.
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, Default)]
     pub enum SetupResult {
         /// User clicked "Install" and installation completed successfully.
         Installed,
         /// User clicked "Run without installing".
         RunWithout,
         /// User closed the dialog window.
+        #[default]
         Cancelled,
     }
 
@@ -122,6 +123,8 @@ mod platform {
         install_step: RefCell<u32>,
         /// Set to true after install completes or errors — changes button to "Close"
         finished: RefCell<bool>,
+        /// Guard against double-click spawning multiple installer threads
+        installing: RefCell<bool>,
     }
 
     impl SetupWizard {
@@ -131,6 +134,12 @@ mod platform {
                 nwg::stop_thread_dispatch();
                 return;
             }
+
+            // Guard against double-click race
+            if *self.installing.borrow() {
+                return;
+            }
+            *self.installing.borrow_mut() = true;
 
             // Hide buttons, show progress elements
             self.install_btn.set_visible(false);

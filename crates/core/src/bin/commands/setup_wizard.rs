@@ -38,22 +38,15 @@ pub fn maybe_show_setup_wizard() -> anyhow::Result<bool> {
             return Ok(false);
         }
 
-        // Detach from console before showing the GUI window.
-        // This hides the brief console flash that would otherwise appear
-        // when the user double-clicks freenet.exe from Explorer.
-        //
-        // Note: if the user chooses "Run without installing", the node
-        // will run without console output since we already detached.
-        // This is acceptable for double-click-from-Explorer scenarios
-        // where there's no terminal to show output in anyway. CLI users
-        // who run `freenet network` explicitly don't hit this path.
-        unsafe {
-            winapi::um::wincon::FreeConsole();
-        }
+        // Show the setup dialog. The dialog creates its own window, so the
+        // console from Explorer may briefly flash. We detach it AFTER the user
+        // makes their choice so that "Run without installing" preserves console
+        // output for CLI users who happen to run from a non-install location.
+        let result = ui::show_setup_dialog()?;
 
-        match ui::show_setup_dialog()? {
+        match result {
             ui::SetupResult::Installed => Ok(true),
-            ui::SetupResult::RunWithout => Ok(false),
+            ui::SetupResult::RunWithout => Ok(false), // Caller runs node with console intact
             ui::SetupResult::Cancelled => Ok(true),
         }
     }

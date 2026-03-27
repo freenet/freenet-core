@@ -187,6 +187,8 @@ fn download_url_to_file(_url: &str, _dest: &Path) -> Result<()> {
 }
 
 /// Add a directory to the user's PATH environment variable via the registry.
+/// Preserves the existing registry value type (REG_EXPAND_SZ) to avoid
+/// breaking PATH entries that use `%VARIABLE%` expansion.
 #[cfg(target_os = "windows")]
 fn add_to_user_path(dir: &Path) -> Result<()> {
     use winreg::enums::*;
@@ -195,14 +197,33 @@ fn add_to_user_path(dir: &Path) -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let env = hkcu.open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)?;
 
-    let current_path: String = env.get_value("Path").unwrap_or_default();
+    // Read as raw value to preserve REG_EXPAND_SZ type
+    let raw_val = env
+        .get_raw_value("Path")
+        .unwrap_or_else(|_| winreg::RegValue {
+            bytes: Vec::new(),
+            vtype: REG_EXPAND_SZ,
+        });
+
+    // Decode the wide string from the registry
+    let current_path = String::from_utf16_lossy(
+        &raw_val
+            .bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect::<Vec<u16>>(),
+    )
+    .trim_end_matches('\0')
+    .to_string();
+
     let dir_str = dir.to_string_lossy();
 
-    // Check if already in PATH (case-insensitive)
-    if current_path
-        .to_lowercase()
-        .contains(&dir_str.to_lowercase())
-    {
+    // Check if already in PATH — compare individual entries, not substrings
+    let already_present = current_path
+        .split(';')
+        .any(|entry| entry.trim().eq_ignore_ascii_case(dir_str.as_ref()));
+
+    if already_present {
         return Ok(());
     }
 
@@ -213,7 +234,22 @@ fn add_to_user_path(dir: &Path) -> Result<()> {
         format!("{current_path};{dir_str}")
     };
 
-    env.set_value("Path", &new_path)?;
+    // Write back preserving the original value type (typically REG_EXPAND_SZ)
+    let mut new_bytes: Vec<u8> = new_path
+        .encode_utf16()
+        .chain(Some(0)) // null terminator
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    // Ensure double-null termination for REG_EXPAND_SZ
+    new_bytes.extend_from_slice(&[0, 0]);
+
+    env.set_raw_value(
+        "Path",
+        &winreg::RegValue {
+            bytes: new_bytes,
+            vtype: raw_val.vtype, // preserve original type
+        },
+    )?;
 
     // Broadcast WM_SETTINGCHANGE so running Explorer picks up the change
     broadcast_environment_change();
