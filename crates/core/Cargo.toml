@@ -58,6 +58,7 @@ hostname = "0.4"
 notify = { workspace = true }
 pav_regression = { workspace = true }
 parking_lot = { workspace = true }
+renegade-ml = { workspace = true }
 pin-project = { workspace = true }
 rand = { features = ["small_rng"], workspace = true }
 redb = { workspace = true, optional = true }

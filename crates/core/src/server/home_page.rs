@@ -1317,12 +1317,36 @@ fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">This peer: response time</div><div class="info-value">{pr} events</div>
                     <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
                 </div>
+                <h3 style="margin-top: 1em;">Renegade ML Predictor</h3>
+                <div class="info-grid">
+                    <div class="info-label">Failure observations</div><div class="info-value">{rf}</div>
+                    <div class="info-label">Response time observations</div><div class="info-value">{rr}</div>
+                    <div class="info-label">Transfer speed observations</div><div class="info-value">{rt}</div>
+                    <div class="info-label">Known peers</div><div class="info-value">{rp}</div>
+                    <div class="info-label">Predictions evaluated</div><div class="info-value">{n_eval}</div>
+                    <div class="info-label">Brier score (overall)</div><div class="info-value">{brier}</div>
+                    <div class="info-label">Brier score (recent)</div><div class="info-value">{recent_brier}</div>
+                </div>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.5em;">Brier score: 0 = perfect · &lt;0.05 excellent · &lt;0.1 good · &lt;0.15 fair · 0.25 = random coin flip</p>
             </div>"#,
             active = if rs.prediction_active { "Yes" } else { "No" },
             total = total_events,
             pf = peer_failure_events,
             pr = peer_response_events,
             pt = peer_transfer_events,
+            rf = rs.renegade_failure_events,
+            rr = rs.renegade_response_time_events,
+            rt = rs.renegade_transfer_speed_events,
+            rp = rs.renegade_known_peers,
+            brier = rs
+                .renegade_brier_score
+                .map(|b| format!("{:.4}", b))
+                .unwrap_or_else(|| "—".to_string()),
+            recent_brier = rs
+                .renegade_recent_brier_score
+                .map(|b| format!("{:.4}", b))
+                .unwrap_or_else(|| "—".to_string()),
+            n_eval = rs.renegade_predictions_evaluated,
         )
     } else {
         r#"<div class="card"><h2>Routing Model</h2><p class="empty">Router data not available</p></div>"#.to_string()
@@ -1376,6 +1400,17 @@ fn peer_detail_html(address_str: &str) -> String {
             response_chart = response_chart,
             transfer_chart = transfer_chart,
         )
+    } else {
+        String::new()
+    };
+
+    // Build renegade accuracy chart
+    let renegade_chart = if let Some(ref rs) = router_snapshot {
+        if rs.renegade_accuracy_pairs.is_empty() {
+            String::new()
+        } else {
+            build_renegade_accuracy_chart(&rs.renegade_accuracy_pairs)
+        }
     } else {
         String::new()
     };
@@ -1439,6 +1474,7 @@ fn peer_detail_html(address_str: &str) -> String {
         {info_card}
         {model_card}
         {charts}
+        {renegade_chart}
         {prediction_card}
     </main>
 </body>
@@ -1451,6 +1487,7 @@ fn peer_detail_html(address_str: &str) -> String {
         info_card = info_card,
         model_card = model_card,
         charts = charts,
+        renegade_chart = renegade_chart,
         prediction_card = prediction_card,
     )
 }
@@ -1654,6 +1691,158 @@ fn build_estimator_chart(
         )
         .ok();
     }
+
+    svg.push_str("</svg></div>");
+    svg
+}
+
+/// Build an SVG strip chart showing predicted failure probability vs actual outcome.
+/// X-axis: predicted probability [0, 1].
+/// Y-axis: actual outcome (0 = success at bottom, 1 = failure at top).
+/// Good calibration: successes cluster left, failures cluster right.
+fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
+    use std::fmt::Write;
+
+    let w = 400.0_f64;
+    let h = 160.0_f64;
+    let pad_l = 50.0;
+    let pad_r = 20.0;
+    let pad_t = 30.0;
+    let pad_b = 30.0;
+    let plot_w = w - pad_l - pad_r;
+    let plot_h = h - pad_t - pad_b;
+
+    let to_x = |predicted: f64| -> f64 { pad_l + predicted.clamp(0.0, 1.0) * plot_w };
+    let to_y = |actual: f64| -> f64 {
+        if actual > 0.5 {
+            pad_t + 10.0 // failure near top
+        } else {
+            pad_t + plot_h - 10.0 // success near bottom
+        }
+    };
+
+    let mut svg = format!(
+        r#"<div class="card">
+        <h2>Renegade Prediction Accuracy</h2>
+        <p style="font-size:0.8em;color:var(--text-muted);">
+            Each dot is a routing event. X = predicted failure probability.
+            Top row = actual failures, bottom = actual successes.
+            Well-calibrated: failures cluster right, successes cluster left.
+        </p>
+        <svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="chart-svg">"#,
+        w = w as u32,
+        h = h as u32,
+    );
+
+    // Background
+    write!(
+        svg,
+        r#"<rect x="{lx}" y="{ty}" width="{pw}" height="{ph}" fill="var(--bg-secondary)" rx="2"/>"#,
+        lx = pad_l,
+        ty = pad_t,
+        pw = plot_w,
+        ph = plot_h,
+    )
+    .ok();
+
+    // Axes
+    write!(
+        svg,
+        r#"<line x1="{lx}" y1="{by}" x2="{rx}" y2="{by}" stroke="var(--text-muted)" stroke-width="1"/>"#,
+        lx = pad_l,
+        by = pad_t + plot_h,
+        rx = pad_l + plot_w,
+    )
+    .ok();
+
+    // X-axis labels
+    for &v in &[0.0, 0.25, 0.5, 0.75, 1.0] {
+        let x = to_x(v);
+        write!(
+            svg,
+            r#"<text x="{x}" y="{y}" text-anchor="middle" font-size="9" fill="var(--text-muted)">{v}</text>"#,
+            x = x,
+            y = pad_t + plot_h + 15.0,
+            v = v,
+        )
+        .ok();
+        // Grid line
+        write!(
+            svg,
+            r#"<line x1="{x}" y1="{ty}" x2="{x}" y2="{by}" stroke="var(--text-muted)" stroke-width="0.3" stroke-dasharray="3"/>"#,
+            x = x,
+            ty = pad_t,
+            by = pad_t + plot_h,
+        )
+        .ok();
+    }
+
+    // Y-axis labels
+    write!(
+        svg,
+        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--text-muted)">Failure</text>"#,
+        x = pad_l - 4.0,
+        y = pad_t + 14.0,
+    )
+    .ok();
+    write!(
+        svg,
+        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--text-muted)">Success</text>"#,
+        x = pad_l - 4.0,
+        y = pad_t + plot_h - 6.0,
+    )
+    .ok();
+
+    // X-axis title
+    write!(
+        svg,
+        r#"<text x="{x}" y="{y}" text-anchor="middle" font-size="9" fill="var(--text-muted)">Predicted failure probability</text>"#,
+        x = pad_l + plot_w / 2.0,
+        y = h - 2.0,
+    )
+    .ok();
+
+    // Plot points with jitter to avoid overlap
+    let mut jitter_seed = 0u32;
+    for &(predicted, actual) in pairs {
+        // Simple deterministic jitter
+        jitter_seed = jitter_seed.wrapping_mul(1103515245).wrapping_add(12345);
+        let jitter = ((jitter_seed >> 16) as f64 / 65535.0 - 0.5) * (plot_h * 0.3);
+
+        let x = to_x(predicted);
+        let y = to_y(actual) + jitter;
+        let y = y.clamp(pad_t + 2.0, pad_t + plot_h - 2.0);
+
+        let color = if actual > 0.5 {
+            "var(--accent-danger, #f85149)"
+        } else {
+            "var(--accent-success, #3fb950)"
+        };
+
+        write!(
+            svg,
+            r#"<circle cx="{x:.1}" cy="{y:.1}" r="2.5" fill="{color}" opacity="0.6"/>"#,
+            x = x,
+            y = y,
+            color = color,
+        )
+        .ok();
+    }
+
+    // Count stats
+    let n_success = pairs.iter().filter(|(_, a)| *a < 0.5).count();
+    let n_failure = pairs.len() - n_success;
+
+    write!(
+        svg,
+        r#"<text x="{x}" y="{y}" text-anchor="start" font-size="9" fill="var(--text-muted)">{n} pts ({s} ok, {f} fail)</text>"#,
+        x = pad_l + 2.0,
+        y = pad_t - 5.0,
+        n = pairs.len(),
+        s = n_success,
+        f = n_failure,
+    )
+    .ok();
 
     svg.push_str("</svg></div>");
     svg
