@@ -24,7 +24,7 @@ pub use mock_state_storage::MockStateStorage;
 pub(crate) use native_api::{
     CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS, DELEGATE_SUBSCRIPTIONS,
 };
-pub use runtime::{ContractExecError, Runtime, DEFAULT_MODULE_CACHE_CAPACITY};
+pub use runtime::{ContractExecError, DEFAULT_MODULE_CACHE_CAPACITY, Runtime};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
 pub(crate) use secrets_store::SecretStoreError;
 pub use secrets_store::SecretsStore;
@@ -33,4 +33,4 @@ pub use secrets_store::SecretsStore;
 #[allow(unused_imports)]
 pub(crate) use simulation_runtime::{InMemoryContractStore, SimulationStores};
 pub use state_store::StateStore;
-pub(crate) use state_store::{StateStorage, StateStoreError, MAX_STATE_SIZE};
+pub(crate) use state_store::{MAX_STATE_SIZE, StateStorage, StateStoreError};

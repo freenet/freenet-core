@@ -851,7 +851,7 @@ mod tests {
     // ============ Delegate creation resource limit tests ============
 
     use super::super::native_api::DelegateCreateError;
-    use crate::contract::{MAX_DELEGATE_CREATIONS_PER_CALL, MAX_DELEGATE_CREATION_DEPTH};
+    use crate::contract::{MAX_DELEGATE_CREATION_DEPTH, MAX_DELEGATE_CREATIONS_PER_CALL};
 
     /// Minimal raw WASM bytes for delegate creation tests.
     /// The host function wraps raw WASM into a versioned DelegateContainer internally.

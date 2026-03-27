@@ -127,8 +127,8 @@ pub(in crate::transport) mod tests {
     use super::*;
     use crate::util::time_source::MockTimeSource;
 
-    pub(in crate::transport) fn mock_received_packet_tracker(
-    ) -> ReceivedPacketTracker<MockTimeSource> {
+    pub(in crate::transport) fn mock_received_packet_tracker()
+    -> ReceivedPacketTracker<MockTimeSource> {
         ReceivedPacketTracker {
             pending_receipts: Vec::new(),
             packet_id_time: VecDeque::new(),

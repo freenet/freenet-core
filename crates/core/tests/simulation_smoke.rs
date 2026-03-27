@@ -1003,7 +1003,9 @@ async fn test_stale_reservation_allows_gateway_retry() {
     assert_eq!(sim.has_connection_or_pending(&gw, phantom_addr), Some(true));
 
     // Expired reservation becomes invisible — allows retry
-    assert!(sim.inject_stale_reservation(&gw, phantom_addr, phantom_loc, Duration::from_secs(120),));
+    assert!(
+        sim.inject_stale_reservation(&gw, phantom_addr, phantom_loc, Duration::from_secs(120),)
+    );
     assert_eq!(
         sim.has_connection_or_pending(&gw, phantom_addr),
         Some(false)

@@ -1,6 +1,6 @@
 //! Topology quality metrics: distance distribution, routing efficiency, neighbor connectivity.
 
-use crate::network::{ring_distance, Network};
+use crate::network::{Network, ring_distance};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashSet;

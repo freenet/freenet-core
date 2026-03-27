@@ -19,7 +19,7 @@ use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::common::{create_peer_pair_with_virtual_time, spawn_auto_advance_task, SMALL_SIZES};
+use super::common::{SMALL_SIZES, create_peer_pair_with_virtual_time, spawn_auto_advance_task};
 
 /// Cold start benchmark with VirtualTime: measures connection establishment + transfer
 ///

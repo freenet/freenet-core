@@ -233,18 +233,18 @@ impl Network {
                     self.route_to_peer(i, target_loc)
                 };
 
-                if let Some(candidate) = candidate {
-                    if candidate != drop_id {
-                        let target_ctx = self.build_peer_context(candidate);
-                        if self.strategy.accept_connection(
-                            &target_ctx,
-                            self.peers[i].location,
-                            self.min_connections,
-                            self.max_connections,
-                            &mut self.rng,
-                        ) {
-                            replacements.push((i, drop_id, candidate));
-                        }
+                if let Some(candidate) = candidate
+                    && candidate != drop_id
+                {
+                    let target_ctx = self.build_peer_context(candidate);
+                    if self.strategy.accept_connection(
+                        &target_ctx,
+                        self.peers[i].location,
+                        self.min_connections,
+                        self.max_connections,
+                        &mut self.rng,
+                    ) {
+                        replacements.push((i, drop_id, candidate));
                     }
                 }
             }

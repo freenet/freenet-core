@@ -9,8 +9,8 @@ use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::sync::watch::{Receiver, Sender};
 use tokio::sync::Mutex;
+use tokio::sync::watch::{Receiver, Sender};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub struct NetworkPeer {

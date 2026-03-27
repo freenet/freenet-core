@@ -31,8 +31,8 @@ compile_error!("The wasmtime-backend feature must be enabled.");
 #[cfg(feature = "wasmtime-backend")]
 mod wasmtime_engine;
 
-use super::runtime::RuntimeConfig;
 use super::ContractError;
+use super::runtime::RuntimeConfig;
 
 /// Default maximum memory limit in WASM pages (64 KiB each).
 /// 4096 pages = 256 MiB.

@@ -13,9 +13,9 @@ use std::{
 use tar::Builder;
 
 use crate::{
+    Error,
     config::{BuildToolConfig, PackageType},
     util::{get_workspace_target_dir, pipe_std_streams},
-    Error,
 };
 pub(crate) use contract::*;
 
@@ -513,7 +513,9 @@ mod contract {
                         "Contract size exceeds 10MB! This may cause issues with WebSocket transmission (16MB limit). Consider building in release mode with --release flag."
                     );
                     if cli_config.debug {
-                        tracing::warn!("Contract was built in debug mode. Release mode typically reduces size by 40-50x.");
+                        tracing::warn!(
+                            "Contract was built in debug mode. Release mode typically reduces size by 40-50x."
+                        );
                     }
                 } else if size > WARN_SIZE {
                     tracing::warn!(
@@ -522,7 +524,9 @@ mod contract {
                         "Contract size exceeds 5MB. Consider optimizing or building in release mode if not already."
                     );
                     if cli_config.debug {
-                        tracing::info!("Contract was built in debug mode. Use --release flag for smaller size.");
+                        tracing::info!(
+                            "Contract was built in debug mode. Use --release flag for smaller size."
+                        );
                     }
                 } else {
                     tracing::info!(
@@ -723,11 +727,12 @@ mod contract {
 
             build_generic_state(&mut config, &cwd)?;
 
-            assert!(cwd
-                .join("build")
-                .join("freenet")
-                .join(DEFAULT_OUTPUT_NAME)
-                .exists());
+            assert!(
+                cwd.join("build")
+                    .join("freenet")
+                    .join(DEFAULT_OUTPUT_NAME)
+                    .exists()
+            );
 
             Ok(())
         }
@@ -788,7 +793,9 @@ mod delegate {
                 "Delegate size exceeds 10MB! This may cause issues with WebSocket transmission (16MB limit). Consider building in release mode with --release flag."
             );
             if cli_config.debug {
-                tracing::warn!("Delegate was built in debug mode. Release mode typically reduces size by 40-50x.");
+                tracing::warn!(
+                    "Delegate was built in debug mode. Release mode typically reduces size by 40-50x."
+                );
             }
         } else if size > WARN_SIZE {
             tracing::warn!(

@@ -34,4 +34,4 @@
 
 mod controller;
 
-pub use controller::{FixedRateConfig, FixedRateController, DEFAULT_RATE_BYTES_PER_SEC};
+pub use controller::{DEFAULT_RATE_BYTES_PER_SEC, FixedRateConfig, FixedRateController};

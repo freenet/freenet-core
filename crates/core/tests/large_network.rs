@@ -24,7 +24,7 @@
 
 mod common;
 
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use common::{RiverSession, RiverUser};
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
 use serde_json::to_string_pretty;

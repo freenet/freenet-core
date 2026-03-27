@@ -17,9 +17,9 @@ use std::{
 
 use anyhow::anyhow;
 use common::{
-    allocate_test_node_block, base_node_test_config_with_ip, connect_ws_with_retry,
-    get_all_ping_states, gw_config_from_path_with_ip, test_ip_for_node, test_node_config,
-    wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, allocate_test_node_block,
+    base_node_test_config_with_ip, connect_ws_with_retry, get_all_ping_states,
+    gw_config_from_path_with_ip, test_ip_for_node, test_node_config, wait_for_node_connected,
 };
 use freenet::server::serve_client_api;
 use freenet_ping_app::ping_client::{
@@ -32,7 +32,7 @@ use freenet_stdlib::{
 };
 use futures::FutureExt;
 use tokio::{select, time::sleep};
-use tracing::{span, Instrument, Level};
+use tracing::{Instrument, Level, span};
 
 /// Maximum number of retries when port allocation fails
 const MAX_PORT_RETRY_ATTEMPTS: usize = 5;

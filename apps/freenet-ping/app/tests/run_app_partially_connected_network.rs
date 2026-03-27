@@ -30,12 +30,12 @@ use freenet_stdlib::{
 };
 use futures::FutureExt;
 use tokio::{select, time::timeout};
-use tracing::{span, Instrument, Level};
+use tracing::{Instrument, Level, span};
 
 use common::{
-    allocate_test_node_block, base_node_test_config_with_ip, connect_ws_with_retry,
-    gw_config_from_path_with_ip, test_ip_for_node, test_node_config, wait_for_node_connected,
-    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, allocate_test_node_block,
+    base_node_test_config_with_ip, connect_ws_with_retry, gw_config_from_path_with_ip,
+    test_ip_for_node, test_node_config, wait_for_node_connected,
 };
 
 /// Maximum number of retries when port allocation fails
@@ -834,11 +834,11 @@ async fn run_partially_connected_test(attempt: usize) -> anyhow::Result<()> {
                         ..
                     }))) => {
                         if key == contract_key {
-                            if let Ok(ping_state) = serde_json::from_slice::<Ping>(&state) {
-                                if ping_state.get(&update_tag).is_some() {
-                                    println!("Node {node_idx} received update");
-                                    nodes_received_update[node_idx] = true;
-                                }
+                            if let Ok(ping_state) = serde_json::from_slice::<Ping>(&state)
+                                && ping_state.get(&update_tag).is_some()
+                            {
+                                println!("Node {node_idx} received update");
+                                nodes_received_update[node_idx] = true;
                             }
                             get_state_requests.remove(i);
                             continue;
@@ -868,11 +868,11 @@ async fn run_partially_connected_test(attempt: usize) -> anyhow::Result<()> {
                         ..
                     }))) => {
                         if key == contract_key {
-                            if let Ok(ping_state) = serde_json::from_slice::<Ping>(&state) {
-                                if ping_state.get(&update_tag).is_some() {
-                                    println!("Gateway {gw_idx} received update");
-                                    gateways_received_update[gw_idx] = true;
-                                }
+                            if let Ok(ping_state) = serde_json::from_slice::<Ping>(&state)
+                                && ping_state.get(&update_tag).is_some()
+                            {
+                                println!("Gateway {gw_idx} received update");
+                                gateways_received_update[gw_idx] = true;
                             }
                             gw_get_state_requests.remove(i);
                             continue;

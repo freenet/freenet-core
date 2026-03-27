@@ -14,8 +14,8 @@ use freenet_stdlib::{
 };
 
 use super::{
-    put, should_use_streaming, OpEnum, OpError, OpInitialization, OpOutcome, Operation,
-    OperationResult, VisitedPeers,
+    OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult, VisitedPeers, put,
+    should_use_streaming,
 };
 
 /// Minimum HTL to use when retrying — prevents retries from being too shallow.
@@ -28,7 +28,7 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
     ring::{KnownPeerKeyLocation, Location, PeerKeyLocation},
-    tracing::{state_hash_full, NetEventLog, OperationFailure},
+    tracing::{NetEventLog, OperationFailure, state_hash_full},
 };
 use either::Either;
 

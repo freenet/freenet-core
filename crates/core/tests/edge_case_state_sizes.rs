@@ -8,8 +8,8 @@
 //! These tests validate that the system correctly handles edge cases in contract state sizes.
 
 use freenet::test_utils::{
-    create_large_todo_list, create_minimal_state, create_oversized_todo_list, load_contract,
-    make_get, make_put, make_update, Task, TestContext, TodoList,
+    Task, TestContext, TodoList, create_large_todo_list, create_minimal_state,
+    create_oversized_todo_list, load_contract, make_get, make_put, make_update,
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{

@@ -1,20 +1,20 @@
 use std::{fmt::Display, net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
+    Router,
     body::Body,
     extract::{
-        ws::{Message, WebSocket},
         State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use dashmap::DashMap;
 use freenet::config::GlobalExecutor;
 use freenet::generated::{
-    topology::ControllerResponse, ChangesWrapper, ContractChange, PeerChange, TryFromFbs,
+    ChangesWrapper, ContractChange, PeerChange, TryFromFbs, topology::ControllerResponse,
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -367,8 +367,8 @@ async fn pull_interface(ws: WebSocket, state: Arc<ServerState>) -> anyhow::Resul
             } => {
                 let msg = PeerChange::added_connection_msg(
                     transaction.as_ref(),
-                    (from.0 .0, from.1),
-                    (to.0 .0, to.1),
+                    (from.0.0, from.1),
+                    (to.0.0, to.1),
                 );
                 tx.send(Message::Binary(msg.into())).await?;
             }
@@ -828,7 +828,9 @@ impl ServerState {
                     }
                     dashmap::mapref::entry::Entry::Vacant(_vac) => {
                         // this should not happen
-                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before the PutSuccess.");
+                        tracing::error!(
+                            "this tx should be included on transactions_data. It should exists a PutRequest before the PutSuccess."
+                        );
                     }
                 }
 
@@ -912,7 +914,9 @@ impl ServerState {
                     }
                     dashmap::mapref::entry::Entry::Vacant(_vac) => {
                         // this should not happen
-                        unreachable!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastEmitted.");
+                        unreachable!(
+                            "this tx should be included on transactions_data. It should exists a PutRequest before BroadcastEmitted."
+                        );
                     }
                 }
 
@@ -967,7 +971,9 @@ impl ServerState {
                     }
                     dashmap::mapref::entry::Entry::Vacant(_vac) => {
                         // this should not happen
-                        tracing::error!("this tx should be included on transactions_data. It should exists a PutRequest before BroadcastReceived.");
+                        tracing::error!(
+                            "this tx should be included on transactions_data. It should exists a PutRequest before BroadcastReceived."
+                        );
                     }
                 }
 

@@ -18,7 +18,7 @@
 //!
 //! For comprehensive testing: `cargo bench --bench transport_extended`
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::time::Duration;
 
 mod transport;

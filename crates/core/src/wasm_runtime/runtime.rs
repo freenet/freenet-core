@@ -1,4 +1,5 @@
 use super::{
+    RuntimeResult,
     contract_store::ContractStore,
     delegate_api::DelegateApiVersion,
     delegate_store::DelegateStore,
@@ -6,12 +7,11 @@ use super::{
     error::RuntimeInnerError,
     native_api,
     secrets_store::SecretsStore,
-    RuntimeResult,
 };
 use freenet_stdlib::{
     memory::{
-        buf::{BufferBuilder, BufferMut},
         WasmLinearMem,
+        buf::{BufferBuilder, BufferMut},
     },
     prelude::*,
 };
@@ -153,7 +153,9 @@ pub enum ContractExecError {
     #[error("unexpected result from contract interface")]
     UnexpectedResult,
 
-    #[error("The operation ran out of gas. This might be caused by an infinite loop or an inefficient computation.")]
+    #[error(
+        "The operation ran out of gas. This might be caused by an infinite loop or an inefficient computation."
+    )]
     OutOfGas,
 
     #[error("The operation exceeded the maximum allowed compute time")]
@@ -354,7 +356,7 @@ impl Runtime {
         data: &[u8],
         max_cap: usize,
     ) -> RuntimeResult<*mut BufferBuilder> {
-        use super::native_api::{PendingContractData, CONTRACT_IO};
+        use super::native_api::{CONTRACT_IO, PendingContractData};
 
         // Header: 4 bytes for total payload length (LE u32)
         let header_size = 4usize;

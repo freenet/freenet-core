@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use crate::config::{GlobalExecutor, GlobalRng, PCK_VERSION};
@@ -14,9 +14,9 @@ use crate::util::backoff::ExponentialBackoff;
 use aes_gcm::{Aes128Gcm, KeyInit};
 use dashmap::DashSet;
 use futures::{
+    Future, FutureExt, TryFutureExt,
     future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
-    Future, FutureExt, TryFutureExt,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -25,22 +25,22 @@ use tokio::{
     sync::{mpsc, oneshot},
     task_local,
 };
-use tracing::{span, Instrument};
+use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
+    Socket, TransportError,
     congestion_control::CongestionControlConfig,
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
     packet_data::{
-        PacketData, SymmetricAES, MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE,
+        MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
     },
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
-    Socket, TransportError,
 };
 use crate::simulation::{RealTime, TimeSource};
 
@@ -2807,7 +2807,7 @@ mod version_cmp {
     /// from GatewayHandshake to Established with no intermediate None state.
     #[test]
     fn test_atomic_handshake_completion_no_packet_loss() {
-        use super::{fast_channel, ConnectionStateManager};
+        use super::{ConnectionStateManager, fast_channel};
         use crate::simulation::VirtualTime;
         use crate::transport::packet_data::{PacketData, UnknownEncryption};
         use std::net::SocketAddr;
@@ -2855,7 +2855,7 @@ mod version_cmp {
     #[test]
     fn test_recently_closed_prevents_asymmetric_decryption() {
         use super::{
-            fast_channel, ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION,
+            ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION, fast_channel,
         };
         use crate::simulation::VirtualTime;
         use crate::transport::packet_data::{PacketData, UnknownEncryption};
@@ -2911,8 +2911,8 @@ mod version_cmp {
     #[test]
     fn test_gateway_connection_rate_limiter() {
         use super::{
-            GatewayConnectionRateLimiter, GW_RAMP_PHASE1_DURATION, GW_RAMP_PHASE1_RATE,
-            GW_RAMP_PHASE2_DURATION, GW_RAMP_PHASE2_RATE,
+            GW_RAMP_PHASE1_DURATION, GW_RAMP_PHASE1_RATE, GW_RAMP_PHASE2_DURATION,
+            GW_RAMP_PHASE2_RATE, GatewayConnectionRateLimiter,
         };
         use crate::simulation::VirtualTime;
         use std::time::Duration;
@@ -2983,9 +2983,9 @@ pub mod mock_transport {
     };
 
     use dashmap::DashMap;
-    use futures::{stream::FuturesOrdered, TryStreamExt};
+    use futures::{TryStreamExt, stream::FuturesOrdered};
     use rand::{Rng, SeedableRng};
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
     use tokio::sync::Mutex;
     use tracing::info;
 
@@ -3799,7 +3799,9 @@ pub mod mock_transport {
             // Use timeout to avoid hanging if connection detection is slow
             let res = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
             if res.is_err() {
-                tracing::error!("Test timeout: connection detection took longer than 10s - investigate if this causes test failures");
+                tracing::error!(
+                    "Test timeout: connection detection took longer than 10s - investigate if this causes test failures"
+                );
             }
             assert!(res.is_err() || res.unwrap().is_err());
             Ok::<_, anyhow::Error>(())

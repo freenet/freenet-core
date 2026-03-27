@@ -2,7 +2,7 @@ use freenet_stdlib::client_api::ClientRequest;
 
 use crate::CommandReceiver;
 
-use super::{state::AppState, ExecutorConfig};
+use super::{ExecutorConfig, state::AppState};
 
 pub(super) async fn wasm_runtime(
     _config: ExecutorConfig,

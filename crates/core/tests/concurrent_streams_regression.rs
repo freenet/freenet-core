@@ -12,7 +12,7 @@
 
 use dashmap::DashMap;
 use freenet::transport::mock_transport::{
-    create_mock_peer, Channels, MockSocket, PacketDropPolicy,
+    Channels, MockSocket, PacketDropPolicy, create_mock_peer,
 };
 use freenet::transport::{OutboundConnectionHandler, PeerConnection};
 use std::sync::Arc;

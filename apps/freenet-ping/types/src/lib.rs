@@ -76,13 +76,13 @@ impl Ping {
         self.from.entry(name.clone()).or_default().push(now);
 
         // Keep only the last MAX_HISTORY_PER_PEER entries
-        if let Some(entries) = self.from.get_mut(&name) {
-            if entries.len() > MAX_HISTORY_PER_PEER {
-                // Sort in descending order (newest first)
-                entries.sort_by(|a, b| b.cmp(a));
-                // Keep only the newest MAX_HISTORY_PER_PEER entries
-                entries.truncate(MAX_HISTORY_PER_PEER);
-            }
+        if let Some(entries) = self.from.get_mut(&name)
+            && entries.len() > MAX_HISTORY_PER_PEER
+        {
+            // Sort in descending order (newest first)
+            entries.sort_by(|a, b| b.cmp(a));
+            // Keep only the newest MAX_HISTORY_PER_PEER entries
+            entries.truncate(MAX_HISTORY_PER_PEER);
         }
     }
 

@@ -19,7 +19,7 @@ mod message;
 
 /// Node configuration, implementations and execution (entry points for the binaries).
 mod node;
-pub use node::{run_local_node, run_network_node, EventLoopExitReason, Node, ShutdownHandle};
+pub use node::{EventLoopExitReason, Node, ShutdownHandle, run_local_node, run_network_node};
 
 /// Network operation/transaction state machines.
 mod operations;
@@ -65,25 +65,25 @@ pub mod dev_tool {
     use super::*;
     pub use crate::config::{Config, GlobalTestMetrics};
     pub use client_events::{
-        test::MemoryEventsGen, test::NetworkEventGenerator, AuthToken, ClientEventsProxy, ClientId,
-        OpenRequest,
+        AuthToken, ClientEventsProxy, ClientId, OpenRequest, test::MemoryEventsGen,
+        test::NetworkEventGenerator,
     };
     pub use contract::{
-        clear_crdt_contracts, is_crdt_contract, register_crdt_contract, storages::Storage,
-        Executor, OperationMode,
+        Executor, OperationMode, clear_crdt_contracts, is_crdt_contract, register_crdt_contract,
+        storages::Storage,
     };
     pub use flatbuffers;
     pub use message::Transaction;
     pub use node::{
-        testing_impl::{
-            check_convergence_from_logs, run_turmoil_simulation, ChurnConfig, ContractDistribution,
-            ControlledEventChain, ControlledSimulationResult, ConvergedContract, ConvergenceResult,
-            DivergedContract, EventChain, EventSummary, NetworkPeer, NodeLabel, OperationStats,
-            OperationSummary, PeerMessage, PeerStatus, PutOperationStats, RunningNode,
-            ScheduledOperation, SimNetwork, SimOperation, TurmoilConfig, TurmoilResult,
-            UpdateOperationStats,
-        },
         InitPeerNode, NetworkStats, NodeConfig, PeerId,
+        testing_impl::{
+            ChurnConfig, ContractDistribution, ControlledEventChain, ControlledSimulationResult,
+            ConvergedContract, ConvergenceResult, DivergedContract, EventChain, EventSummary,
+            NetworkPeer, NodeLabel, OperationStats, OperationSummary, PeerMessage, PeerStatus,
+            PutOperationStats, RunningNode, ScheduledOperation, SimNetwork, SimOperation,
+            TurmoilConfig, TurmoilResult, UpdateOperationStats, check_convergence_from_logs,
+            run_turmoil_simulation,
+        },
     };
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
@@ -93,11 +93,11 @@ pub mod dev_tool {
 
     // Re-export topology registry for subscription validation in tests
     pub use ring::topology_registry::{
+        ContractSubscription, ProximityViolation, TopologySnapshot, TopologyValidationResult,
         clear_all_topology_snapshots, clear_current_network_name, clear_topology_snapshots,
         get_all_topology_snapshots, get_current_network_name, get_topology_snapshot,
         register_topology_snapshot, set_current_network_name, validate_topology,
-        validate_topology_from_snapshots, ContractSubscription, ProximityViolation,
-        TopologySnapshot, TopologyValidationResult,
+        validate_topology_from_snapshots,
     };
     pub use wasm_runtime::{
         ContractStore, DelegateStore, MockStateStorage, Runtime, SecretsStore, StateStore,
@@ -110,15 +110,15 @@ pub mod dev_tool {
     };
 
     // Re-export fault injector for mid-simulation fault injection in Turmoil tests
-    pub use crate::node::{get_fault_injector, set_fault_injector, FaultInjectorState};
+    pub use crate::node::{FaultInjectorState, get_fault_injector, set_fault_injector};
 
     // Re-export counter reset functions for deterministic simulation testing
     pub use crate::client_events::RequestId;
     pub use crate::contract::reset_event_id_counter;
     pub use crate::node::reset_channel_id_counter;
     pub use crate::test_utils::reset_global_node_index;
-    pub use crate::transport::reset_nonce_counter;
     pub use crate::transport::StreamId;
+    pub use crate::transport::reset_nonce_counter;
 }
 
 /// Deadlock detection for parking_lot locks in test builds.

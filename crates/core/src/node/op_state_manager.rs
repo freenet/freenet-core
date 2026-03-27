@@ -10,7 +10,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashSet},
     net::SocketAddr,
-    sync::{atomic::AtomicBool, Arc, OnceLock},
+    sync::{Arc, OnceLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -30,13 +30,13 @@ use crate::{
         TransactionType,
     },
     operations::{
+        OpEnum, OpError,
         connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
         get::GetOp,
         orphan_streams::OrphanStreamRegistry,
         put::PutOp,
         subscribe::SubscribeOp,
         update::UpdateOp,
-        OpEnum, OpError,
     },
     ring::{
         ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
@@ -47,8 +47,8 @@ use crate::{
 };
 
 use super::{
-    neighbor_hosting::NeighborHostingManager, network_bridge::EventLoopNotificationsSender,
-    NetEventRegister, NodeConfig, RequestRouter,
+    NetEventRegister, NodeConfig, RequestRouter, neighbor_hosting::NeighborHostingManager,
+    network_bridge::EventLoopNotificationsSender,
 };
 
 #[cfg(debug_assertions)]
@@ -2116,7 +2116,7 @@ mod tests {
     use super::*;
     use crate::node::network_bridge::EventLoopNotificationsReceiver;
     use either::Either;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn notify_timeout_succeeds_when_receiver_alive() {
@@ -2612,8 +2612,8 @@ mod tests {
     /// Simulates rapid completion of children to verify the counter stays consistent.
     #[test]
     fn sub_operation_tracker_multiple_children_concurrent_completion() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let tracker = Arc::new(SubOperationTracker::new());
         let parent = Transaction::ttl_transaction();
@@ -2853,10 +2853,10 @@ mod tests {
     mod record_connect_uphill_timeout_tests {
         use super::super::record_connect_uphill_timeout;
         use crate::message::Transaction;
-        use crate::operations::connect::{
-            ConnectMsg, ConnectOp, ConnectRequest, ConnectState, RelayState, DEFAULT_UPHILL_BUDGET,
-        };
         use crate::operations::VisitedPeers;
+        use crate::operations::connect::{
+            ConnectMsg, ConnectOp, ConnectRequest, ConnectState, DEFAULT_UPHILL_BUDGET, RelayState,
+        };
         use crate::ring::{ConnectionManager, Location, PeerKeyLocation};
         use crate::transport::TransportKeypair;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};

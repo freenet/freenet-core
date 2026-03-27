@@ -1,6 +1,6 @@
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use freenet::test_utils::{
-    self, make_get, make_put, make_subscribe, make_update, TestContext, TestResult,
+    self, TestContext, TestResult, make_get, make_put, make_subscribe, make_update,
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use aes_gcm::Aes128Gcm;
@@ -12,19 +12,19 @@ use crate::{
     simulation::TimeSource,
     tracing::TransferDirection,
     transport::{
+        TransferStats, TransportError,
         congestion_control::{CongestionControl, CongestionController},
         metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
         packet_data,
         sent_packet_tracker::SentPacketTracker,
         symmetric_message::{self},
-        TransferStats, TransportError,
     },
 };
 
 use futures::StreamExt;
 
-use super::streaming::StreamHandle;
 use super::StreamId;
+use super::streaming::StreamHandle;
 
 /// Maximum time to wait for congestion window space *per fragment* before aborting a stream
 /// transfer. Resets for each fragment, so a slow-but-progressing transfer won't time out.

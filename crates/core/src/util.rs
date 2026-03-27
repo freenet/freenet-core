@@ -17,8 +17,8 @@ use crate::{
     node::PeerId,
 };
 use rand::{
-    prelude::{Rng, StdRng},
     SeedableRng,
+    prelude::{Rng, StdRng},
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -293,10 +293,9 @@ pub(crate) mod tests {
 
     /// Use this to guarantee unique directory names in case you are running multiple tests in parallel.
     pub fn get_temp_dir() -> TempDir {
-        let dir = tempfile::Builder::new()
-            .tempdir()
-            .expect("Failed to create a temporary directory");
         // eprintln!("Created temp dir: {:?}", dir.path());
-        dir
+        tempfile::Builder::new()
+            .tempdir()
+            .expect("Failed to create a temporary directory")
     }
 }

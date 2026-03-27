@@ -1,8 +1,8 @@
 [package]
 name = "fdev"
 version = "0.3.178"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.85"
 publish = true
 description = "Freenet development tool"
 license-file = "LICENSE.md"

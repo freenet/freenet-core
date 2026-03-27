@@ -1,5 +1,5 @@
-use super::bbr::DeliveryRateToken;
 use super::PacketId;
+use super::bbr::DeliveryRateToken;
 #[cfg(test)]
 use crate::simulation::RealTime;
 use crate::simulation::TimeSource;
@@ -277,11 +277,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             Some(srtt) => {
                 // Subsequent RTT samples (RFC 6298 Section 2.3)
                 // RTTVAR = (1 - BETA) * RTTVAR + BETA * |SRTT - R|
-                let abs_diff = if sample > srtt {
-                    sample - srtt
-                } else {
-                    srtt - sample
-                };
+                let abs_diff = sample.abs_diff(srtt);
                 self.rttvar = self.rttvar.mul_f64(1.0 - BETA) + abs_diff.mul_f64(BETA);
 
                 // SRTT = (1 - ALPHA) * SRTT + ALPHA * R

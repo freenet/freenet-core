@@ -149,7 +149,7 @@ pub fn bench_fragmentation(c: &mut Criterion) {
 /// Simulates the complete flow: serialize -> encrypt -> prepare for send
 /// This helps measure the relative contribution of allocation overhead.
 pub fn bench_packet_preparation(c: &mut Criterion) {
-    use aes_gcm::{aead::AeadInPlace, Aes128Gcm, KeyInit};
+    use aes_gcm::{Aes128Gcm, KeyInit, aead::AeadInPlace};
 
     let mut group = c.benchmark_group("allocation/packet_preparation");
 

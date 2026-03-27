@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, LazyLock},
+    sync::{Arc, LazyLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -2503,7 +2503,7 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
 
 #[cfg(test)]
 mod tests {
-    use httptest::{matchers::*, responders::*, Expectation, Server};
+    use httptest::{Expectation, Server, matchers::*, responders::*};
 
     use crate::node::NodeConfig;
     use crate::transport::TransportKeypair;

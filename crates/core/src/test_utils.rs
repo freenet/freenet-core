@@ -170,7 +170,7 @@ impl TestLogger {
     /// ```
     pub fn init(mut self) -> Self {
         use tracing_subscriber::{
-            fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+            EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt,
         };
 
         // Always use the explicitly configured level for test isolation.

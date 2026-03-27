@@ -4,7 +4,7 @@ use freenet_stdlib::prelude::*;
 
 pub(crate) use self::messages::{BroadcastStreamingPayload, UpdateMsg, UpdateStreamingPayload};
 use super::{
-    should_use_streaming, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult,
+    OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult, should_use_streaming,
 };
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
@@ -14,7 +14,7 @@ use crate::transport::peer_connection::StreamId;
 use crate::{
     client_events::HostResult,
     node::{NetworkBridge, OpManager},
-    tracing::{state_hash_full, NetEventLog, OperationFailure},
+    tracing::{NetEventLog, OperationFailure, state_hash_full},
 };
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -2447,8 +2447,8 @@ pub enum UpdateState {
 #[allow(clippy::wildcard_enum_match_arm)]
 mod tests {
     use super::*;
-    use crate::operations::test_utils::make_contract_key;
     use crate::operations::OpOutcome;
+    use crate::operations::test_utils::make_contract_key;
 
     fn make_update_op(state: Option<UpdateState>, stats: Option<UpdateStats>) -> UpdateOp {
         UpdateOp {

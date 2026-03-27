@@ -365,11 +365,11 @@ pub async fn run_ping_client(
 
     loop {
         // Check max duration if specified
-        if let Some(max_dur) = max_duration {
-            if start_time.elapsed() >= max_dur {
-                tracing::info!("reached maximum test duration, shutting down...");
-                break;
-            }
+        if let Some(max_dur) = max_duration
+            && start_time.elapsed() >= max_dur
+        {
+            tracing::info!("reached maximum test duration, shutting down...");
+            break;
         }
 
         if errors > 100 {

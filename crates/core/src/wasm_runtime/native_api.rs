@@ -4,8 +4,8 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::contract_store::ContractStore;
 use super::delegate_store::DelegateStore;
@@ -84,8 +84,8 @@ pub(super) static CONTRACT_IO: LazyLock<DashMap<(InstanceId, i64), PendingContra
 /// Called by the contract's `StreamingBuffer::read` when the buffer is exhausted.
 /// Returns the number of bytes written into the buffer, or 0 for EOF.
 pub(super) fn fill_buffer_impl(instance_id: InstanceId, buf_ptr_offset: i64) -> u32 {
-    use freenet_stdlib::memory::buf::{compute_ptr, BufferBuilder};
     use freenet_stdlib::memory::WasmLinearMem;
+    use freenet_stdlib::memory::buf::{BufferBuilder, compute_ptr};
 
     let Some(mut pending) = CONTRACT_IO.get_mut(&(instance_id, buf_ptr_offset)) else {
         return 0; // No pending data — all data fit in the initial buffer
@@ -355,8 +355,8 @@ impl DelegateCallEnv {
         nonce_bytes: [u8; 24],
     ) -> Result<DelegateKey, DelegateCreateError> {
         use crate::contract::{
-            MAX_CREATED_DELEGATES_PER_NODE, MAX_DELEGATE_CREATIONS_PER_CALL,
-            MAX_DELEGATE_CREATION_DEPTH,
+            MAX_CREATED_DELEGATES_PER_NODE, MAX_DELEGATE_CREATION_DEPTH,
+            MAX_DELEGATE_CREATIONS_PER_CALL,
         };
         use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
         use freenet_stdlib::prelude::{
@@ -649,7 +649,7 @@ pub(super) mod log {
 }
 
 pub(super) mod rand {
-    use ::rand::{rng, RngCore};
+    use ::rand::{RngCore, rng};
 
     use super::*;
 

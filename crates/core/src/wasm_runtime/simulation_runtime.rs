@@ -81,7 +81,7 @@ impl InMemoryContractStore {
                 (key, code, params)
             }
             ContractContainer::Wasm(_) | _ => {
-                return Err(anyhow::anyhow!("unsupported contract type"))
+                return Err(anyhow::anyhow!("unsupported contract type"));
             }
         };
 

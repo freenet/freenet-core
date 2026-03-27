@@ -7,20 +7,20 @@ use syn::{ItemFn, LitInt, LitStr, Result};
 
 /// Get the configured location for a node or fall back to randomness.
 fn node_location(args: &FreenetTestArgs, idx: usize, label: &str) -> TokenStream {
-    if let Some(config) = args.node_configs.get(label) {
-        if let Some(expr) = &config.location_expr {
-            let label_lit = LitStr::new(label, proc_macro2::Span::call_site());
-            return quote! {{
-                let value: f64 = (#expr);
-                if !(0.0..=1.0).contains(&value) {
-                    panic!(
-                        "node '{}' location {} is out of range [0.0, 1.0]",
-                        #label_lit, value
-                    );
-                }
-                value
-            }};
-        }
+    if let Some(config) = args.node_configs.get(label)
+        && let Some(expr) = &config.location_expr
+    {
+        let label_lit = LitStr::new(label, proc_macro2::Span::call_site());
+        return quote! {{
+            let value: f64 = (#expr);
+            if !(0.0..=1.0).contains(&value) {
+                panic!(
+                    "node '{}' location {} is out of range [0.0, 1.0]",
+                    #label_lit, value
+                );
+            }
+            value
+        }};
     }
 
     if let Some(ref locations) = args.node_locations {

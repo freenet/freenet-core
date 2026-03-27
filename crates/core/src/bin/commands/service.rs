@@ -377,7 +377,7 @@ fn run_wrapper_loop(
         // Notify tray that we're starting
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         if let Some((_, status_tx)) = tray {
-            drop(status_tx.send(WrapperStatus::Running));
+            status_tx.send(WrapperStatus::Running).ok();
         }
 
         let stderr_path = log_dir.join("freenet.error.log.last");
@@ -474,7 +474,7 @@ fn run_wrapper_loop(
 
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             if let Some((_, status_tx)) = tray {
-                drop(status_tx.send(WrapperStatus::Updating));
+                status_tx.send(WrapperStatus::Updating).ok();
             }
 
             let ok = std::process::Command::new(&exe_path)
@@ -538,7 +538,7 @@ fn run_wrapper_loop(
 
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
                 if let Some((_, status_tx)) = tray {
-                    drop(status_tx.send(WrapperStatus::Stopped));
+                    status_tx.send(WrapperStatus::Stopped).ok();
                 }
 
                 log_wrapper_event(
@@ -712,7 +712,9 @@ pub fn should_purge(purge: bool, keep_data: bool) -> Result<bool> {
         let answer = line.trim().to_ascii_lowercase();
         Ok(answer == "y" || answer == "yes")
     } else {
-        println!("Non-interactive mode: keeping data. Use --purge to also remove data, config, and logs.");
+        println!(
+            "Non-interactive mode: keeping data. Use --purge to also remove data, config, and logs."
+        );
         Ok(false)
     }
 }
@@ -775,7 +777,9 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
                 remove_if_exists("cache", dirs.cache_dir())?;
             }
             None => {
-                eprintln!("Warning: Could not determine Freenet directories. Data and config may not have been removed.");
+                eprintln!(
+                    "Warning: Could not determine Freenet directories. Data and config may not have been removed."
+                );
             }
         }
 

@@ -63,15 +63,14 @@ mod platform {
     fn open_url(url: &str) {
         #[cfg(target_os = "windows")]
         {
-            drop(
-                std::process::Command::new("cmd")
-                    .args(["/c", "start", url])
-                    .spawn(),
-            );
+            std::process::Command::new("cmd")
+                .args(["/c", "start", url])
+                .spawn()
+                .ok();
         }
         #[cfg(target_os = "macos")]
         {
-            drop(std::process::Command::new("open").arg(url).spawn());
+            std::process::Command::new("open").arg(url).spawn().ok();
         }
     }
 
@@ -99,16 +98,16 @@ mod platform {
         let separator3 = PredefinedMenuItem::separator();
         let quit_item = MenuItem::new("Quit", true, None);
 
-        drop(menu.append(&open_dashboard));
-        drop(menu.append(&separator1));
-        drop(menu.append(&status_item));
-        drop(menu.append(&version_item));
-        drop(menu.append(&separator2));
-        drop(menu.append(&restart_item));
-        drop(menu.append(&check_update));
-        drop(menu.append(&view_logs));
-        drop(menu.append(&separator3));
-        drop(menu.append(&quit_item));
+        menu.append(&open_dashboard).ok();
+        menu.append(&separator1).ok();
+        menu.append(&status_item).ok();
+        menu.append(&version_item).ok();
+        menu.append(&separator2).ok();
+        menu.append(&restart_item).ok();
+        menu.append(&check_update).ok();
+        menu.append(&view_logs).ok();
+        menu.append(&separator3).ok();
+        menu.append(&quit_item).ok();
 
         let icon = match build_icon() {
             Ok(i) => i,
@@ -153,14 +152,14 @@ mod platform {
                 } else if event.id == view_logs_id {
                     Some(TrayAction::ViewLogs)
                 } else if event.id == quit_id {
-                    drop(action_tx.send(TrayAction::Quit));
+                    action_tx.send(TrayAction::Quit).ok();
                     break;
                 } else {
                     None
                 };
 
                 if let Some(action) = action {
-                    drop(action_tx.send(action));
+                    action_tx.send(action).ok();
                 }
             }
 
@@ -172,7 +171,9 @@ mod platform {
                     WrapperStatus::Stopped => "Stopped",
                 };
                 status_item.set_text(format!("Status: {status_text}"));
-                drop(_tray.set_tooltip(Some(format!("Freenet {version} - {status_text}"))));
+                _tray
+                    .set_tooltip(Some(format!("Freenet {version} - {status_text}")))
+                    .ok();
             }
 
             // Yield to avoid busy-spinning. The platform message pump is driven
@@ -219,11 +220,14 @@ pub fn open_log_file() {
         Some(path) => {
             #[cfg(target_os = "windows")]
             {
-                drop(std::process::Command::new("notepad").arg(&path).spawn());
+                std::process::Command::new("notepad")
+                    .arg(&path)
+                    .spawn()
+                    .ok();
             }
             #[cfg(target_os = "macos")]
             {
-                drop(std::process::Command::new("open").arg(&path).spawn());
+                std::process::Command::new("open").arg(&path).spawn().ok();
             }
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {

@@ -95,7 +95,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{StreamExt, stream::FuturesUnordered};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -113,7 +113,7 @@ use crate::ring::{ConnectionFailureReason, KnownPeerKeyLocation, PeerAddr, PeerK
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use crate::tracing::NetEventLog;
 use crate::transport::TransportKeypair;
-use crate::util::{time_source::InstantTimeSrc, Contains, IterExt};
+use crate::util::{Contains, IterExt, time_source::InstantTimeSrc};
 use freenet_stdlib::client_api::HostResponse;
 
 use super::VisitedPeers;
@@ -3179,9 +3179,11 @@ mod tests {
         assert_eq!(forward_to.pub_key(), next_hop.pub_key());
         assert_eq!(request.ttl, 1);
         // visited now contains SocketAddr (bloom filter check)
-        assert!(request
-            .visited
-            .probably_visited(joiner.socket_addr().expect("test peer must have address")));
+        assert!(
+            request
+                .visited
+                .probably_visited(joiner.socket_addr().expect("test peer must have address"))
+        );
     }
 
     /// Test the terminus-only acceptance behavior: relays should NOT accept when they can

@@ -15,16 +15,16 @@ use freenet_stdlib::{
 use futures::FutureExt;
 use rand::SeedableRng;
 use tokio::{select, time::sleep, time::timeout};
-use tracing::{span, Instrument, Level};
+use tracing::{Instrument, Level, span};
 
 use common::{
-    allocate_test_node_block, base_node_test_config_with_rng, connect_ws_with_retry,
-    gw_config_from_path_with_rng, test_ip_for_node, test_node_config, wait_for_node_connected,
-    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, allocate_test_node_block,
+    base_node_test_config_with_rng, connect_ws_with_retry, gw_config_from_path_with_rng,
+    test_ip_for_node, test_node_config, wait_for_node_connected,
 };
 use freenet_ping_app::ping_client::{
-    run_ping_client, wait_for_get_response, wait_for_put_response, wait_for_subscribe_response,
-    wait_for_update_notification, wait_for_update_response, PingStats,
+    PingStats, run_ping_client, wait_for_get_response, wait_for_put_response,
+    wait_for_subscribe_response, wait_for_update_notification, wait_for_update_response,
 };
 
 /// Helper function to collect diagnostics from all nodes for debugging update propagation issues
@@ -73,7 +73,9 @@ async fn collect_node_diagnostics(
                 loop {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        println!("WARNING: {node_name} diagnostics timed out after skipping {skipped_messages} messages");
+                        println!(
+                            "WARNING: {node_name} diagnostics timed out after skipping {skipped_messages} messages"
+                        );
                         break;
                     }
 

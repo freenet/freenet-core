@@ -3,11 +3,11 @@
 //! Provides a `RiverSession` abstraction for creating rooms, inviting users,
 //! and sending messages via `riverctl`.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use std::path::PathBuf;
 use tempfile::TempDir;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 /// Identifies a user in a River session.
 #[derive(Clone, Copy, Debug)]

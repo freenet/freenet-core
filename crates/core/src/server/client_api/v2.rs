@@ -1,4 +1,4 @@
-use axum::{extract::Path, routing::get, Extension, Router};
+use axum::{Extension, Router, extract::Path, routing::get};
 
 use super::*;
 

@@ -264,13 +264,15 @@ mod tests {
     fn test_empty_meter() {
         let meter = Meter::new_with_window_size(100);
 
-        assert!(meter
-            .attributed_usage_rate(
-                &AttributionSource::Peer(PeerKeyLocation::random()),
-                &ResourceType::InboundBandwidthBytes,
-                Instant::now(),
-            )
-            .is_none());
+        assert!(
+            meter
+                .attributed_usage_rate(
+                    &AttributionSource::Peer(PeerKeyLocation::random()),
+                    &ResourceType::InboundBandwidthBytes,
+                    Instant::now(),
+                )
+                .is_none()
+        );
         assert!(meter.attribution_meters.read().unwrap().is_empty());
     }
 
@@ -280,20 +282,24 @@ mod tests {
 
         // Test that the attributed usage is 0.0 for all resources
         let attribution = AttributionSource::Peer(PeerKeyLocation::random());
-        assert!(meter
-            .attributed_usage_rate(
-                &attribution,
-                &ResourceType::InboundBandwidthBytes,
-                Instant::now()
-            )
-            .is_none());
-        assert!(meter
-            .attributed_usage_rate(
-                &attribution,
-                &ResourceType::OutboundBandwidthBytes,
-                Instant::now()
-            )
-            .is_none());
+        assert!(
+            meter
+                .attributed_usage_rate(
+                    &attribution,
+                    &ResourceType::InboundBandwidthBytes,
+                    Instant::now()
+                )
+                .is_none()
+        );
+        assert!(
+            meter
+                .attributed_usage_rate(
+                    &attribution,
+                    &ResourceType::OutboundBandwidthBytes,
+                    Instant::now()
+                )
+                .is_none()
+        );
 
         // Report some usage and test that the attributed usage is updated
         meter.report(

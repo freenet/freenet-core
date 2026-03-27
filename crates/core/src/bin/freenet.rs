@@ -126,9 +126,9 @@ async fn run_network_node_with_signals(
     shutdown_handle: freenet::ShutdownHandle,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
-        check_if_update_available, clear_version_mismatch, get_open_connection_count,
-        has_reached_max_backoff, has_version_mismatch, reset_backoff, version_mismatch_generation,
-        UpdateCheckResult, UpdateNeededError,
+        UpdateCheckResult, UpdateNeededError, check_if_update_available, clear_version_mismatch,
+        get_open_connection_count, has_reached_max_backoff, has_version_mismatch, reset_backoff,
+        version_mismatch_generation,
     };
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
@@ -632,7 +632,7 @@ fn freenet_main() -> anyhow::Result<()> {
 }
 
 fn main() {
-    use commands::auto_update::{UpdateNeededError, EXIT_CODE_UPDATE_NEEDED};
+    use commands::auto_update::{EXIT_CODE_UPDATE_NEEDED, UpdateNeededError};
 
     match freenet_main() {
         Ok(()) => std::process::exit(0),

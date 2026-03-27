@@ -31,8 +31,8 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Guard that keeps the deadlock detector thread running.

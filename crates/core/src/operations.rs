@@ -426,7 +426,9 @@ pub(crate) enum OpError {
 
     #[error("unexpected operation state")]
     UnexpectedOpState,
-    #[error("cannot perform a state transition from the current state with the provided input (tx: {tx})")]
+    #[error(
+        "cannot perform a state transition from the current state with the provided input (tx: {tx})"
+    )]
     InvalidStateTransition {
         tx: Transaction,
         #[cfg(debug_assertions)]

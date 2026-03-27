@@ -49,7 +49,7 @@
 //! a gateway that can place connections near Kleinberg-sampled targets — the production
 //! gateway protocol must approximate this capability for the results to transfer.
 
-use crate::network::{ring_distance, PeerContext};
+use crate::network::{PeerContext, ring_distance};
 use rand::Rng;
 
 /// Dispatch enum for connection strategies.
@@ -168,11 +168,7 @@ impl Current {
                 (loc_a + loc_b) / 2.0
             } else {
                 let mid = (loc_a + loc_b + 1.0) / 2.0;
-                if mid >= 1.0 {
-                    mid - 1.0
-                } else {
-                    mid
-                }
+                if mid >= 1.0 { mid - 1.0 } else { mid }
             };
 
             let dist = ring_distance(ctx.location, midpoint).max(MIN_DISTANCE);

@@ -23,8 +23,9 @@ use dashmap::DashMap;
 use freenet::simulation::{RealTime, TimeSource, VirtualTime};
 use freenet::transport::congestion_control::{CongestionControlAlgorithm, CongestionControlConfig};
 use freenet::transport::mock_transport::{
-    create_mock_peer, create_mock_peer_with_congestion_config, create_mock_peer_with_delay,
-    create_mock_peer_with_virtual_time, Channels, MockSocket, PacketDelayPolicy, PacketDropPolicy,
+    Channels, MockSocket, PacketDelayPolicy, PacketDropPolicy, create_mock_peer,
+    create_mock_peer_with_congestion_config, create_mock_peer_with_delay,
+    create_mock_peer_with_virtual_time,
 };
 use freenet::transport::{OutboundConnectionHandler, PeerConnection, TransportPublicKey};
 use std::net::SocketAddr;

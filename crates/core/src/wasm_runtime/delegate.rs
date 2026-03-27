@@ -10,7 +10,7 @@ use freenet_stdlib::prelude::{
 use serde::{Deserialize, Serialize};
 
 use super::engine::{InstanceHandle, WasmEngine};
-use super::native_api::{DelegateCallEnv, InstanceId, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV};
+use super::native_api::{CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, InstanceId};
 use super::{Runtime, RuntimeResult};
 use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
@@ -664,7 +664,7 @@ mod test {
 
     use crate::util::tests::get_temp_dir;
 
-    use super::super::{delegate_store::DelegateStore, ContractStore, SecretsStore};
+    use super::super::{ContractStore, SecretsStore, delegate_store::DelegateStore};
     use super::*;
 
     const TEST_DELEGATE_2: &str = "test_delegate_2";
@@ -1618,8 +1618,8 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_set_secret_failure_returns_secret_store_failed(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_set_secret_failure_returns_secret_store_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
         use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
 
         let contract = WrappedContract::new(
@@ -2440,8 +2440,8 @@ mod test {
     /// state_store_db is configured. This ensures backward compatibility —
     /// V2 detection is based on module imports, not runtime configuration.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_v1_delegate_detected_as_v1_with_state_store(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_v1_delegate_detected_as_v1_with_state_store()
+    -> Result<(), Box<dyn std::error::Error>> {
         use crate::contract::storages::Storage;
         use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
 
@@ -3634,9 +3634,11 @@ mod test {
         }
 
         // Verify subscriptions exist
-        assert!(crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .get(&contract_instance_id)
-            .is_some());
+        assert!(
+            crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+                .get(&contract_instance_id)
+                .is_some()
+        );
 
         // Remove the contract — should clean up subscriptions
         runtime.contract_store.remove_contract(&contract_key)?;
@@ -3943,8 +3945,8 @@ mod test {
     /// all of them get sender attestation (not just the first one).
     /// Regression test for PR #3282 review: drain(..) bypass.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_multiple_send_delegate_messages_all_attested(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_multiple_send_delegate_messages_all_attested()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (delegate_a, mut runtime, _temp_dir) =
             setup_runtime_with_params(TEST_DELEGATE_MESSAGING, vec![1]).await?;
         let key_a = delegate_a.key().clone();

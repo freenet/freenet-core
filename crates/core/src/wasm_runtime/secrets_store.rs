@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use chacha20poly1305::{aead::Aead, Error as EncryptionError, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{Error as EncryptionError, XChaCha20Poly1305, XNonce, aead::Aead};
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
 

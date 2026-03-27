@@ -20,10 +20,10 @@ use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 use crate::client_events::AuthToken;
 
 use super::{
+    ApiVersion, ClientConnection, HostCallbackResult,
     app_packaging::{WebApp, WebContractError},
     client_api::HttpClientApiRequest,
     errors::WebSocketApiError,
-    ApiVersion, ClientConnection, HostCallbackResult,
 };
 use tracing::{debug, instrument};
 
@@ -387,7 +387,7 @@ async fn sandbox_content_body(
     path: &Path,
     contract_key: &str,
     api_version: ApiVersion,
-) -> Result<impl IntoResponse, WebSocketApiError> {
+) -> Result<impl IntoResponse + use<>, WebSocketApiError> {
     let web_path = path.join("index.html");
     let mut key_file = File::open(&web_path)
         .await

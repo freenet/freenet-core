@@ -2,15 +2,15 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 
-use aes_gcm::{aead::AeadInPlace, Aes128Gcm};
+use aes_gcm::{Aes128Gcm, aead::AeadInPlace};
 
 use crate::config::GlobalRng;
 use crate::transport::crypto::{
-    TransportPublicKey, PACKET_TYPE_INTRO, PACKET_TYPE_SIZE, PACKET_TYPE_SYMMETRIC,
+    PACKET_TYPE_INTRO, PACKET_TYPE_SIZE, PACKET_TYPE_SYMMETRIC, TransportPublicKey,
 };
 
-use super::crypto::TransportSecretKey;
 use super::TransportError;
+use super::crypto::TransportSecretKey;
 
 const ETHERNET_MTU: usize = 1500;
 
