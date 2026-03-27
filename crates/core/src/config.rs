@@ -1603,6 +1603,10 @@ impl ConfigPaths {
         self.config_dir.clone()
     }
 
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone()
+    }
+
     pub fn secrets_dir(&self, mode: OperationMode) -> PathBuf {
         match mode {
             OperationMode::Local => self.secrets_dir.join("local"),
@@ -1707,6 +1711,10 @@ impl Config {
 
     pub fn config_dir(&self) -> PathBuf {
         self.config_paths.config_dir()
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.config_paths.data_dir()
     }
 }
 

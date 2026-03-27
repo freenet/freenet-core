@@ -1231,8 +1231,14 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             if let Some(state) = self.connections.get_state(&remote_addr) {
                                 match state {
                                     ConnectionState::Established { .. } => {
-                                        // Check for new identity (peer restart)
-                                        let is_new_identity = if self.is_gateway && packet_data.is_intro_packet() {
+                                        // Check for new identity (peer restart).
+                                        // Both gateways and regular peers detect restart: a valid
+                                        // intro packet on an established connection means the remote
+                                        // restarted and is attempting to reconnect (possibly reusing
+                                        // an existing NAT hole). Tearing down the stale session
+                                        // lets the new handshake proceed. Rate-limited to 1/sec per
+                                        // IP to prevent asymmetric decryption DoS.
+                                        let is_new_identity = if packet_data.is_intro_packet() {
                                             if self.connections.is_rate_limited(&remote_addr) {
                                                 false
                                             } else {
@@ -1261,11 +1267,34 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         if is_new_identity {
                                             tracing::info!(
                                                 peer_addr = %remote_addr,
-                                                "Detected new peer identity. Resetting session."
+                                                is_gateway = self.is_gateway,
+                                                "Detected peer restart (new intro on established connection). Resetting session."
                                             );
                                             self.connections.clear_rate_limit(&remote_addr);
                                             self.connections.remove_established(&remote_addr);
-                                            // Fall through to gateway handler for fresh session
+
+                                            if !self.is_gateway {
+                                                // Non-gateway: accept the restarted peer's intro
+                                                // using a server-side handshake (same as gateways).
+                                                // This lets the restarted peer reconnect directly
+                                                // via an existing NAT hole without full gateway
+                                                // re-bootstrap.
+                                                self.connections.record_asym_attempt(remote_addr);
+                                                let inbound_key_bytes = key_from_addr(&remote_addr);
+                                                let (gw_ongoing_connection, packets_sender) =
+                                                    self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
+                                                if self.connections.start_gateway_handshake(remote_addr, packets_sender) {
+                                                    let task = GlobalExecutor::spawn(gw_ongoing_connection
+                                                        .instrument(tracing::span!(tracing::Level::DEBUG, "reconnect_accept"))
+                                                        .map_err(move |error| {
+                                                            tracing::debug!(peer_addr = %remote_addr, error = %error, "Reconnect accept error");
+                                                            (error, remote_addr)
+                                                        }));
+                                                    gw_connection_tasks.push(task);
+                                                }
+                                                continue;
+                                            }
+                                            // Gateway: fall through to gateway handler for fresh session
                                         } else {
                                             match self.connections.try_send_established(&remote_addr, packet_data) {
                                                 Ok(true) => continue,

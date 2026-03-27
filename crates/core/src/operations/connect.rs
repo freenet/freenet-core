@@ -2572,6 +2572,85 @@ pub(crate) async fn initial_join_procedure(
             gateways.len()
         );
 
+        // Attempt fast reconnection to cached peers before gateway bootstrap.
+        // After a brief restart, NAT holes to previously-connected peers may
+        // still be open. Connecting directly is faster than routing through
+        // gateways and avoids gateway load.
+        if let Some(ref cache_dir) = op_manager.ring.peer_cache_dir {
+            let cache = crate::ring::peer_cache::PeerCache::load(cache_dir);
+            if !cache.peers.is_empty() {
+                tracing::info!(
+                    cached_peers = cache.peers.len(),
+                    "Attempting fast reconnection to cached peers"
+                );
+                let cached_peer_locs: Vec<PeerKeyLocation> = cache
+                    .peers
+                    .iter()
+                    .map(|cp| PeerKeyLocation::new(cp.pub_key.clone(), cp.addr))
+                    .collect();
+
+                // Try connecting to cached peers in parallel (up to number_of_parallel_connections).
+                let mut cached_join_handles = Vec::new();
+                for peer in cached_peer_locs.iter().take(number_of_parallel_connections) {
+                    let op_mgr = op_manager.clone();
+                    let peer = peer.clone();
+                    cached_join_handles.push(GlobalExecutor::spawn(async move {
+                        match join_ring_request(&peer, &op_mgr).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    peer = %peer,
+                                    "Successfully reconnected to cached peer"
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    peer = %peer,
+                                    error = %e,
+                                    "Failed to reconnect to cached peer"
+                                );
+                                false
+                            }
+                        }
+                    }));
+                }
+
+                // Wait for all cached peer attempts with a short timeout.
+                // Don't block gateway bootstrap indefinitely.
+                let cached_results = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    futures::future::join_all(cached_join_handles),
+                )
+                .await;
+
+                let successes = match cached_results {
+                    Ok(results) => results
+                        .into_iter()
+                        .filter_map(|r| r.ok())
+                        .filter(|&ok| ok)
+                        .count(),
+                    Err(_) => {
+                        tracing::debug!("Cached peer reconnection timed out");
+                        0
+                    }
+                };
+
+                tracing::info!(
+                    successes,
+                    total = cache.peers.len(),
+                    "Cached peer reconnection complete"
+                );
+
+                // If we already have enough connections, skip directly to
+                // the steady-state monitoring loop.
+                if op_manager.ring.open_connections() >= bootstrap_threshold {
+                    tracing::info!(
+                        "Reached bootstrap threshold via cached peers, skipping gateway bootstrap"
+                    );
+                }
+            }
+        }
+
         loop {
             let open_conns = op_manager.ring.open_connections();
 
