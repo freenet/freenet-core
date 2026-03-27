@@ -114,11 +114,14 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, features = ["sysinfoapi"] }
+winapi = { workspace = true, features = ["sysinfoapi", "wincon", "urlmon"] }
 serde = { workspace = true }
 zip = { workspace = true }
 tray-icon = { workspace = true }
 muda = { workspace = true }
+native-windows-gui = { workspace = true }
+native-windows-derive = { workspace = true }
+winreg = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = { workspace = true }

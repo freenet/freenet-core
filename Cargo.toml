@@ -131,6 +131,9 @@ tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_support
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 gag = "1"
 winapi = "0.3"
+native-windows-gui = "1.0"
+native-windows-derive = "1.0"
+winreg = "0.55"
 tray-icon = "0.21"
 muda = "0.17"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
