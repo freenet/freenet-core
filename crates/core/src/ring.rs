@@ -2661,6 +2661,120 @@ mod pending_additions_tests {
     }
 }
 
+#[cfg(test)]
+mod refresh_router_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use either::Either;
+    use futures::FutureExt;
+    use parking_lot::RwLock;
+
+    use crate::ring::location::Location;
+    use crate::ring::PeerKeyLocation;
+    use crate::router::{RouteEvent, RouteOutcome, Router};
+    use crate::tracing::{NetEventLog, NetEventRegister};
+
+    /// Mock register that returns pre-populated RouteEvents on startup.
+    #[derive(Clone)]
+    struct WarmStartRegister {
+        events: Vec<RouteEvent>,
+    }
+
+    impl NetEventRegister for WarmStartRegister {
+        fn register_events<'a>(
+            &'a self,
+            _events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
+        ) -> futures::future::BoxFuture<'a, ()> {
+            async {}.boxed()
+        }
+
+        fn notify_of_time_out(
+            &mut self,
+            _tx: crate::message::Transaction,
+            _op_type: &str,
+            _target_peer: Option<String>,
+        ) -> futures::future::BoxFuture<'_, ()> {
+            async {}.boxed()
+        }
+
+        fn trait_clone(&self) -> Box<dyn NetEventRegister> {
+            Box::new(self.clone())
+        }
+
+        fn get_router_events(
+            &self,
+            number: usize,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
+            let events = self.events.iter().take(number).cloned().collect();
+            async move { Ok(events) }.boxed()
+        }
+    }
+
+    fn make_route_events(count: usize) -> Vec<RouteEvent> {
+        (0..count)
+            .map(|_| RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(50),
+                    payload_size: 1000,
+                    payload_transfer_time: Duration::from_millis(100),
+                },
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn refresh_router_loads_history_on_startup() {
+        let events = make_route_events(100);
+        let register = WarmStartRegister {
+            events: events.clone(),
+        };
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+
+        // Verify the router starts empty
+        let snapshot = router.read().snapshot();
+        assert_eq!(snapshot.failure_events, 0);
+        assert_eq!(snapshot.success_events, 0);
+
+        // Run refresh_router with a timeout so it doesn't loop forever.
+        // The startup load happens before the interval loop, so it completes
+        // within the first few milliseconds.
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::Ring::refresh_router(router.clone(), register),
+        )
+        .await
+        .ok(); // timeout is expected — the function loops forever
+
+        // Verify the router was populated from the historical events
+        let snapshot = router.read().snapshot();
+        assert_eq!(
+            snapshot.success_events, 100,
+            "Router should have been populated with startup history"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_router_handles_empty_history() {
+        let register = WarmStartRegister { events: vec![] };
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::Ring::refresh_router(router.clone(), register),
+        )
+        .await
+        .ok();
+
+        // Router should remain empty
+        let snapshot = router.read().snapshot();
+        assert_eq!(snapshot.failure_events, 0);
+        assert_eq!(snapshot.success_events, 0);
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
     #[error(transparent)]
