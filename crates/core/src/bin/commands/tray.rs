@@ -198,7 +198,7 @@ pub fn open_log_file() {
     };
 
     // Find the latest log file using the same logic as service_logs
-    let latest = super::service::find_latest_log_file_pub(&log_dir, "freenet");
+    let latest = super::service::find_latest_log_file(&log_dir, "freenet");
 
     match latest {
         Some(path) => {

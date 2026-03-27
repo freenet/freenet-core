@@ -18,12 +18,7 @@ use super::report::ReportCommand;
 /// Handles both static files (e.g., "freenet.log" from systemd) and
 /// rotated files (e.g., "freenet.2025-12-27.log" from tracing-appender).
 /// Returns the most recently modified file.
-/// Public accessor for the tray module to find log files.
-pub fn find_latest_log_file_pub(log_dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
-    find_latest_log_file(log_dir, base_name)
-}
-
-fn find_latest_log_file(log_dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
+pub(super) fn find_latest_log_file(log_dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
     use std::fs;
 
     let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
@@ -177,14 +172,12 @@ pub(super) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 
 /// State for the wrapper backoff state machine.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct WrapperState {
     backoff_secs: u64,
     consecutive_failures: u32,
     port_conflict_kills: u32,
 }
 
-#[allow(dead_code)]
 impl WrapperState {
     fn new() -> Self {
         Self {
@@ -197,7 +190,6 @@ impl WrapperState {
 
 /// Action the wrapper should take after the child process exits.
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 enum WrapperAction {
     /// Run update, then relaunch.
     Update,
@@ -211,7 +203,6 @@ enum WrapperAction {
 
 /// Pure function: given current state and exit info, determine the next action
 /// and update the state. Testable without spawning processes.
-#[allow(dead_code)]
 fn next_wrapper_action(
     state: &mut WrapperState,
     exit_code: i32,
@@ -378,9 +369,7 @@ fn run_wrapper_loop(
 
     let exe_path = std::env::current_exe().context("Failed to get current executable")?;
 
-    let mut backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
-    let mut consecutive_failures: u32 = 0;
-    let mut port_conflict_kills: u32 = 0;
+    let mut state = WrapperState::new();
 
     loop {
         // Notify tray that we're starting
@@ -465,97 +454,76 @@ fn run_wrapper_loop(
             continue;
         }
 
-        match exit_code {
-            code if code == WRAPPER_EXIT_UPDATE_NEEDED => {
-                log_wrapper_event(log_dir, "Update needed, running freenet update...");
+        // Determine if this is a port conflict (for the state machine)
+        let is_port_conflict = stderr_path
+            .exists()
+            .then(|| std::fs::read_to_string(&stderr_path).unwrap_or_default())
+            .map(|s| s.contains("already in use"))
+            .unwrap_or(false);
 
-                #[cfg(target_os = "windows")]
-                if let Some((_, status_tx)) = tray {
-                    let _ = status_tx.send(WrapperStatus::Updating);
-                }
+        // For exit code 42, run the update first and pass result to state machine
+        let update_succeeded = if exit_code == WRAPPER_EXIT_UPDATE_NEEDED {
+            log_wrapper_event(log_dir, "Update needed, running freenet update...");
 
-                let update_status = std::process::Command::new(&exe_path)
-                    .args(["update", "--quiet"])
-                    .status();
-
-                match update_status {
-                    Ok(s) if s.success() => {
-                        log_wrapper_event(log_dir, "Update successful, restarting...");
-                        consecutive_failures = 0;
-                        port_conflict_kills = 0;
-                        backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                    }
-                    _ => {
-                        consecutive_failures += 1;
-                        log_wrapper_event(
-                            log_dir,
-                            &format!(
-                                "Update failed (attempt {consecutive_failures}), backing off {backoff_secs}s..."
-                            ),
-                        );
-                        #[cfg(target_os = "windows")]
-                        let quit =
-                            sleep_with_jitter_interruptible(backoff_secs, tray.map(|(rx, _)| rx));
-                        #[cfg(not(target_os = "windows"))]
-                        let quit = sleep_with_jitter_interruptible(backoff_secs, None);
-                        if quit {
-                            return Ok(());
-                        }
-                        backoff_secs = (backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
-                    }
-                }
+            #[cfg(target_os = "windows")]
+            if let Some((_, status_tx)) = tray {
+                let _ = status_tx.send(WrapperStatus::Updating);
             }
-            code if code == WRAPPER_EXIT_ALREADY_RUNNING => {
+
+            let ok = std::process::Command::new(&exe_path)
+                .args(["update", "--quiet"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if ok {
+                log_wrapper_event(log_dir, "Update successful, restarting...");
+            } else {
+                log_wrapper_event(log_dir, "Update failed");
+            }
+            Some(ok)
+        } else {
+            None
+        };
+
+        // Use the tested state machine to determine next action
+        let action = next_wrapper_action(&mut state, exit_code, is_port_conflict, update_succeeded);
+
+        match action {
+            WrapperAction::Update => {
+                // Update succeeded — brief pause then relaunch
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            WrapperAction::Exit => {
+                let reason = if exit_code == WRAPPER_EXIT_ALREADY_RUNNING {
+                    "Another instance is already running, exiting cleanly"
+                } else if exit_code == 0 {
+                    "Normal shutdown"
+                } else {
+                    "Exiting"
+                };
+                log_wrapper_event(log_dir, reason);
+                return Ok(());
+            }
+            WrapperAction::KillAndRetry => {
                 log_wrapper_event(
                     log_dir,
-                    "Another instance is already running, exiting cleanly",
+                    &format!(
+                        "Port conflict detected (attempt {}/{WRAPPER_MAX_PORT_CONFLICT_KILLS}) — killing stale process and retrying...",
+                        state.port_conflict_kills,
+                    ),
                 );
-                return Ok(());
+                kill_stale_freenet_processes(log_dir);
+                std::thread::sleep(std::time::Duration::from_secs(2));
             }
-            0 => {
-                log_wrapper_event(log_dir, "Normal shutdown");
-                return Ok(());
-            }
-            code => {
-                // Check for port-already-in-use
-                let is_port_conflict = stderr_path
-                    .exists()
-                    .then(|| std::fs::read_to_string(&stderr_path).unwrap_or_default())
-                    .map(|s| s.contains("already in use"))
-                    .unwrap_or(false);
-
-                if is_port_conflict {
-                    port_conflict_kills += 1;
-                    if port_conflict_kills <= WRAPPER_MAX_PORT_CONFLICT_KILLS {
-                        log_wrapper_event(
-                            log_dir,
-                            &format!(
-                                "Port conflict detected (attempt {port_conflict_kills}/{WRAPPER_MAX_PORT_CONFLICT_KILLS}) — killing stale process and retrying..."
-                            ),
-                        );
-                        kill_stale_freenet_processes(log_dir);
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
-                        continue;
-                    }
+            WrapperAction::BackoffAndRelaunch { secs } => {
+                if state.consecutive_failures >= WRAPPER_MAX_CONSECUTIVE_FAILURES {
                     log_wrapper_event(
                         log_dir,
                         &format!(
-                            "Port conflict persists after {WRAPPER_MAX_PORT_CONFLICT_KILLS} kill attempts. Manual intervention may be required."
-                        ),
-                    );
-                }
-
-                consecutive_failures += 1;
-                port_conflict_kills = 0;
-
-                if consecutive_failures >= WRAPPER_MAX_CONSECUTIVE_FAILURES {
-                    log_wrapper_event(
-                        log_dir,
-                        &format!(
-                            "Giving up after {consecutive_failures} consecutive failures. \
-                             Run 'freenet network' manually to diagnose."
+                            "Giving up after {} consecutive failures. \
+                             Run 'freenet network' manually to diagnose.",
+                            state.consecutive_failures,
                         ),
                     );
                     return Ok(());
@@ -568,18 +536,15 @@ fn run_wrapper_loop(
 
                 log_wrapper_event(
                     log_dir,
-                    &format!(
-                        "Exited with code {code}, restarting after {backoff_secs}s backoff..."
-                    ),
+                    &format!("Exited with code {exit_code}, restarting after {secs}s backoff..."),
                 );
                 #[cfg(target_os = "windows")]
-                let quit = sleep_with_jitter_interruptible(backoff_secs, tray.map(|(rx, _)| rx));
+                let quit = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
                 #[cfg(not(target_os = "windows"))]
-                let quit = sleep_with_jitter_interruptible(backoff_secs, None);
+                let quit = sleep_with_jitter_interruptible(secs, None);
                 if quit {
                     return Ok(());
                 }
-                backoff_secs = (backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
             }
         }
     }
