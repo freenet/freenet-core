@@ -703,8 +703,7 @@ impl Ring {
                 }
             };
             if !history.is_empty() {
-                let router_ref = &mut *router.write();
-                *router_ref = Router::new(&history);
+                *router.write() = Router::new(&history);
             }
         }
     }
