@@ -668,11 +668,16 @@ impl Ring {
         self.event_register.register_events(events).await;
     }
 
+    /// Maximum number of route events to load from the AOF event log on startup
+    /// and during periodic refresh. Caps memory use while retaining enough history
+    /// for the isotonic estimators to converge.
+    const ROUTER_HISTORY_LIMIT: usize = 10_000;
+
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
         // Load routing history immediately on startup so the router doesn't
         // start cold — without this, peers route suboptimally for ~5 minutes
         // until the first periodic refresh.
-        match register.get_router_events(10_000).await {
+        match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
             Ok(history) if !history.is_empty() => {
                 tracing::info!(
                     events = history.len(),
@@ -692,7 +697,7 @@ impl Ring {
         interval.tick().await;
         loop {
             interval.tick().await;
-            let history = match register.get_router_events(10_000).await {
+            let history = match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
                 Ok(h) => h,
                 Err(error) => {
                     // Previously this was an `expect()` that would silently panic
