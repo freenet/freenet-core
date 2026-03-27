@@ -202,6 +202,10 @@ try {
         if ($installService -eq "" -or $installService -match "^[Yy]") {
             Write-Info "Installing service..."
             & $installedFreenet service install
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn "Service installation failed (exit code $LASTEXITCODE). You may need to run as Administrator."
+                Write-Warn "You can retry later with: freenet service install"
+            }
         } else {
             Write-Info "Skipping service installation."
             Write-Info "You can install the service later with: freenet service install"
@@ -210,6 +214,10 @@ try {
         # Non-interactive (piped via iex) — install service by default
         Write-Info "Installing service..."
         & $installedFreenet service install
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "Service installation failed (exit code $LASTEXITCODE). You may need to run as Administrator."
+            Write-Warn "You can retry later with: freenet service install"
+        }
     }
 
     # ── Done ─────────────────────────────────────────────────────────

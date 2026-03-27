@@ -461,7 +461,12 @@ fn run_wrapper_loop(
             .map(|s| s.contains("already in use"))
             .unwrap_or(false);
 
-        // For exit code 42, run the update first and pass result to state machine
+        // For exit code 42, run the update first and pass result to state machine.
+        // On Windows, this works because replace_binary() renames the running exe
+        // (freenet.exe → freenet.exe.old) rather than deleting it. Windows allows
+        // renaming a running executable. The new binary is placed at the original
+        // path, so the next child launch uses it. The .old file is cleaned up on
+        // the subsequent update.
         let update_succeeded = if exit_code == WRAPPER_EXIT_UPDATE_NEEDED {
             log_wrapper_event(log_dir, "Update needed, running freenet update...");
 
@@ -1793,14 +1798,14 @@ fn service_logs(error_only: bool) -> Result<()> {
         "freenet"
     };
 
-    // Also check the wrapper log
-    let wrapper_log = log_dir.join("freenet-wrapper.log");
+    // Also check the wrapper log (now date-rotated: freenet-wrapper.YYYY-MM-DD.log)
+    let wrapper_log = find_latest_log_file(&log_dir, "freenet-wrapper");
 
     match find_latest_log_file(&log_dir, base_name) {
         Some(log_path) => {
             println!("Log file: {}", log_path.display());
-            if wrapper_log.exists() {
-                println!("Wrapper log: {}", wrapper_log.display());
+            if let Some(ref wl) = wrapper_log {
+                println!("Wrapper log: {}", wl.display());
             }
             // Use PowerShell Get-Content -Wait to follow the log (like tail -f)
             let status = std::process::Command::new("powershell")
@@ -1816,15 +1821,12 @@ fn service_logs(error_only: bool) -> Result<()> {
             }
         }
         None => {
-            if wrapper_log.exists() {
+            if let Some(ref wl) = wrapper_log {
                 println!("No node logs found, showing wrapper log:");
                 let _ = std::process::Command::new("powershell")
                     .args([
                         "-Command",
-                        &format!(
-                            "Get-Content -Path '{}' -Tail 50 -Wait",
-                            wrapper_log.display()
-                        ),
+                        &format!("Get-Content -Path '{}' -Tail 50 -Wait", wl.display()),
                     ])
                     .status();
             } else {
