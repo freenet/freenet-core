@@ -256,19 +256,45 @@ fn next_wrapper_action(
     }
 }
 
-/// Sleep for `secs` with ±20% random jitter to prevent thundering herd.
-fn sleep_with_jitter(secs: u64) {
+/// Compute a jittered duration: `secs` ±20%.
+fn jitter_secs(secs: u64) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    // Simple jitter using a hash of the current time as a pseudo-random source.
-    // We avoid pulling in rand just for this.
     let mut hasher = DefaultHasher::new();
     std::time::SystemTime::now().hash(&mut hasher);
     let hash = hasher.finish();
-    // Map hash to a jitter factor in [0.8, 1.2]
     let factor = 0.8 + (hash % 1000) as f64 / 2500.0;
-    let jittered = (secs as f64 * factor) as u64;
-    std::thread::sleep(std::time::Duration::from_secs(jittered.max(1)));
+    (secs as f64 * factor) as u64
+}
+
+/// Sleep for `secs` with ±20% jitter, interruptible via an optional action
+/// channel. Returns `true` if a Quit action was received during the sleep.
+/// Sleeps in 1-second chunks to remain responsive to tray actions.
+fn sleep_with_jitter_interruptible(
+    secs: u64,
+    #[cfg(target_os = "windows")] action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+    #[cfg(not(target_os = "windows"))] _action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+) -> bool {
+    let jittered = jitter_secs(secs).max(1);
+    for _ in 0..jittered {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        #[cfg(target_os = "windows")]
+        if let Some(rx) = action_rx {
+            if let Ok(action) = rx.try_recv() {
+                match action {
+                    super::tray::TrayAction::Quit => return true,
+                    super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Run the wrapper loop that manages a `freenet network` child process.
@@ -468,7 +494,14 @@ fn run_wrapper_loop(
                                 "Update failed (attempt {consecutive_failures}), backing off {backoff_secs}s..."
                             ),
                         );
-                        sleep_with_jitter(backoff_secs);
+                        #[cfg(target_os = "windows")]
+                        let quit =
+                            sleep_with_jitter_interruptible(backoff_secs, tray.map(|(rx, _)| rx));
+                        #[cfg(not(target_os = "windows"))]
+                        let quit = sleep_with_jitter_interruptible(backoff_secs, None);
+                        if quit {
+                            return Ok(());
+                        }
                         backoff_secs = (backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
                     }
                 }
@@ -539,7 +572,13 @@ fn run_wrapper_loop(
                         "Exited with code {code}, restarting after {backoff_secs}s backoff..."
                     ),
                 );
-                sleep_with_jitter(backoff_secs);
+                #[cfg(target_os = "windows")]
+                let quit = sleep_with_jitter_interruptible(backoff_secs, tray.map(|(rx, _)| rx));
+                #[cfg(not(target_os = "windows"))]
+                let quit = sleep_with_jitter_interruptible(backoff_secs, None);
+                if quit {
+                    return Ok(());
+                }
                 backoff_secs = (backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
             }
         }

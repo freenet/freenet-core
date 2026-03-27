@@ -51,9 +51,9 @@ mod platform {
 
     /// Build the tray icon from embedded 32x32 RGBA pixel data of the Freenet logo.
     /// Pre-rendered from the SVG logo at freenet/web with the blue gradient preserved.
-    fn build_icon() -> Icon {
+    fn build_icon() -> Result<Icon, tray_icon::BadIcon> {
         let rgba = include_bytes!("assets/freenet_32x32.rgba").to_vec();
-        Icon::from_rgba(rgba, 32, 32).expect("embedded icon data is valid")
+        Icon::from_rgba(rgba, 32, 32)
     }
 
     /// Run the tray icon event loop on the current thread (must be the main thread
@@ -91,14 +91,26 @@ mod platform {
         let _ = menu.append(&separator3);
         let _ = menu.append(&quit_item);
 
-        let icon = build_icon();
+        let icon = match build_icon() {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("Failed to build tray icon: {e}. Running without tray.");
+                return;
+            }
+        };
 
-        let _tray = TrayIconBuilder::new()
+        let _tray = match TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip(format!("Freenet {version} - Starting..."))
             .with_icon(icon)
             .build()
-            .expect("failed to create tray icon");
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Failed to create tray icon: {e}. Running without tray.");
+                return;
+            }
+        };
 
         let menu_rx = MenuEvent::receiver();
 
