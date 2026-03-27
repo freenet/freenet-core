@@ -195,7 +195,8 @@ try {
 
     if ($env:FREENET_NO_SERVICE -eq "1") {
         Write-Info "Skipping service installation (FREENET_NO_SERVICE=1)."
-    } else {
+    } elseif ([Environment]::UserInteractive -and [Console]::In -ne $null) {
+        # Interactive terminal — prompt the user
         Write-Host ""
         $installService = Read-Host "Install Freenet as a background service? (starts on login with tray icon) [Y/n]"
         if ($installService -eq "" -or $installService -match "^[Yy]") {
@@ -205,6 +206,10 @@ try {
             Write-Info "Skipping service installation."
             Write-Info "You can install the service later with: freenet service install"
         }
+    } else {
+        # Non-interactive (piped via iex) — install service by default
+        Write-Info "Installing service..."
+        & $installedFreenet service install
     }
 
     # ── Done ─────────────────────────────────────────────────────────

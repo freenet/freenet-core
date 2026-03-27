@@ -47,7 +47,7 @@ mod platform {
     use std::sync::mpsc as std_mpsc;
     use tray_icon::{icon::Icon, TrayIcon, TrayIconBuilder};
 
-    const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
+    const DASHBOARD_URL: &str = super::service::DASHBOARD_URL;
 
     /// Build the tray icon from embedded 32x32 RGBA pixel data of the Freenet logo.
     /// Pre-rendered from the SVG logo at freenet/web with the blue gradient preserved.

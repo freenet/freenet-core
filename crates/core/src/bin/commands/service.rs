@@ -168,6 +168,12 @@ const WRAPPER_INITIAL_BACKOFF_SECS: u64 = 10;
 const WRAPPER_MAX_BACKOFF_SECS: u64 = 300;
 /// Maximum port-conflict kill-and-retry attempts before giving up.
 const WRAPPER_MAX_PORT_CONFLICT_KILLS: u32 = 3;
+/// Maximum consecutive failures before the wrapper gives up.
+const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
+
+/// Dashboard URL served by the local freenet node.
+#[allow(dead_code)] // Used on Windows (tray + wrapper loop)
+pub(super) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 
 /// State for the wrapper backoff state machine.
 #[derive(Debug, Clone)]
@@ -351,30 +357,6 @@ fn run_wrapper_loop(
     let mut port_conflict_kills: u32 = 0;
 
     loop {
-        // Check for tray actions before launching
-        #[cfg(target_os = "windows")]
-        if let Some((action_rx, _)) = tray {
-            if let Ok(action) = action_rx.try_recv() {
-                match action {
-                    super::tray::TrayAction::Quit => return Ok(()),
-                    super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
-                    super::tray::TrayAction::CheckUpdate => {
-                        let _ = std::process::Command::new(&exe_path)
-                            .args(["update", "--check"])
-                            .status();
-                    }
-                    super::tray::TrayAction::OpenDashboard => {
-                        let _ = std::process::Command::new("cmd")
-                            .args(["/c", "start", "http://127.0.0.1:7509/"])
-                            .spawn();
-                    }
-                    super::tray::TrayAction::Restart => {
-                        // Just continue the loop — we'll launch a new child
-                    }
-                }
-            }
-        }
-
         // Notify tray that we're starting
         #[cfg(target_os = "windows")]
         if let Some((_, status_tx)) = tray {
@@ -392,16 +374,70 @@ fn run_wrapper_loop(
             cmd.stderr(stderr_file);
         }
 
-        let status = cmd.status();
-
-        let exit_code = match status {
-            Ok(s) => s.code().unwrap_or(1),
+        // Use spawn + polling so we can handle tray actions while child runs
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
             Err(e) => {
                 log_wrapper_event(log_dir, &format!("Failed to spawn freenet network: {e}"));
-                // Fatal — can't even start the process
                 return Err(e).context("Failed to spawn freenet network");
             }
         };
+
+        // Poll child + tray actions until child exits or a tray action kills it
+        let exit_code = loop {
+            // Check if child has exited
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code().unwrap_or(1),
+                Ok(None) => {} // still running
+                Err(e) => {
+                    log_wrapper_event(log_dir, &format!("Error waiting for child: {e}"));
+                    break 1;
+                }
+            }
+
+            // Process tray actions while child is running
+            #[cfg(target_os = "windows")]
+            if let Some((action_rx, _)) = tray {
+                if let Ok(action) = action_rx.try_recv() {
+                    match action {
+                        super::tray::TrayAction::Quit => {
+                            drop(child.kill());
+                            drop(child.wait());
+                            return Ok(());
+                        }
+                        super::tray::TrayAction::Restart => {
+                            log_wrapper_event(log_dir, "Restart requested via tray");
+                            drop(child.kill());
+                            drop(child.wait());
+                            break -1; // sentinel: skip exit-code handling, just relaunch
+                        }
+                        super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
+                        super::tray::TrayAction::CheckUpdate => {
+                            drop(
+                                std::process::Command::new(&exe_path)
+                                    .args(["update", "--check"])
+                                    .status(),
+                            );
+                        }
+                        super::tray::TrayAction::OpenDashboard => {
+                            drop(
+                                std::process::Command::new("cmd")
+                                    .args(["/c", "start", DASHBOARD_URL])
+                                    .spawn(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Sleep briefly before polling again
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        };
+
+        // Restart sentinel from tray Restart action — skip exit code handling
+        if exit_code == -1 {
+            continue;
+        }
 
         match exit_code {
             code if code == WRAPPER_EXIT_UPDATE_NEEDED => {
@@ -481,6 +517,17 @@ fn run_wrapper_loop(
                 consecutive_failures += 1;
                 port_conflict_kills = 0;
 
+                if consecutive_failures >= WRAPPER_MAX_CONSECUTIVE_FAILURES {
+                    log_wrapper_event(
+                        log_dir,
+                        &format!(
+                            "Giving up after {consecutive_failures} consecutive failures. \
+                             Run 'freenet network' manually to diagnose."
+                        ),
+                    );
+                    return Ok(());
+                }
+
                 #[cfg(target_os = "windows")]
                 if let Some((_, status_tx)) = tray {
                     let _ = status_tx.send(WrapperStatus::Stopped);
@@ -492,20 +539,8 @@ fn run_wrapper_loop(
                         "Exited with code {code}, restarting after {backoff_secs}s backoff..."
                     ),
                 );
-                std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                sleep_with_jitter(backoff_secs);
                 backoff_secs = (backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
-            }
-        }
-
-        // Drain any pending tray actions between iterations
-        #[cfg(target_os = "windows")]
-        if let Some((action_rx, _)) = tray {
-            while let Ok(action) = action_rx.try_recv() {
-                match action {
-                    super::tray::TrayAction::Quit => return Ok(()),
-                    super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
-                    _ => {}
-                }
             }
         }
     }
@@ -557,21 +592,42 @@ fn kill_stale_freenet_processes(log_dir: &Path) {
 
     #[cfg(target_os = "windows")]
     {
-        // Use taskkill with a specific command-line filter to avoid killing unrelated freenet processes
-        let status = std::process::Command::new("taskkill")
+        // Use WMIC to find freenet.exe processes with "network" in the command line,
+        // then kill them by PID. This avoids killing the wrapper itself or other
+        // freenet subcommands (update, service, etc.).
+        let output = std::process::Command::new("wmic")
             .args([
-                "/F",
-                "/FI",
-                "IMAGENAME eq freenet.exe",
-                "/FI",
-                "WINDOWTITLE ne *",
+                "process",
+                "where",
+                "name='freenet.exe' and commandline like '%network%'",
+                "get",
+                "processid",
+                "/format:list",
             ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if let Ok(s) = status {
-            if s.success() {
-                log_wrapper_event(log_dir, "Killed stale freenet process(es) on startup");
+            .output();
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut killed = false;
+            for line in stdout.lines() {
+                if let Some(pid_str) = line.strip_prefix("ProcessId=") {
+                    let pid = pid_str.trim();
+                    if !pid.is_empty() {
+                        drop(
+                            std::process::Command::new("taskkill")
+                                .args(["/F", "/PID", pid])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status(),
+                        );
+                        killed = true;
+                    }
+                }
+            }
+            if killed {
+                log_wrapper_event(
+                    log_dir,
+                    "Killed stale freenet network process(es) on startup",
+                );
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
         }
