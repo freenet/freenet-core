@@ -1351,9 +1351,8 @@ fn remove_subscribe_and_notify_timeout(
         notify_subscription_timeout(ch_outbound, instance_id);
     }
     // Emit telemetry so subscribe timeouts are visible in the dashboard (#3676).
-    // Previously, subscribes that timed out were invisible — only subscribe_request
-    // and subscribe_success were emitted, making the failure rate appear much higher
-    // than it actually was.
+    // Without this, timed-out subscribes were invisible — only subscribe_request
+    // and subscribe_success were emitted, so timeouts looked like missing data.
     if is_originator {
         crate::tracing::telemetry::send_standalone_event(
             "subscribe_timeout",

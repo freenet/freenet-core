@@ -845,10 +845,9 @@ impl Ring {
     /// that all fail immediately because there's no one to send them to. Telemetry
     /// showed 3 peers with 0 connections generating 96% of all subscribe traffic.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
-        // Wait for the first ring connection before starting subscription recovery.
-        // Unlike the previous approach which gave up after 5 minutes and started
-        // anyway (causing subscribe storms on disconnected peers), we now wait
-        // indefinitely — the per-cycle connection check below is the real gate.
+        // Wait indefinitely for the first ring connection before starting
+        // subscription recovery. The per-cycle connection check below is the
+        // real gate; this just avoids running the loop body with no peers.
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if ring.open_connections() > 0 {
@@ -883,8 +882,7 @@ impl Ring {
             // Subscribe requests require connected peers to route through.
             // Without this, disconnected peers flood the notification channel
             // with doomed subscribe requests every 30 seconds.
-            let conn_count = ring.open_connections();
-            if conn_count == 0 {
+            if ring.open_connections() == 0 {
                 tracing::debug!("Skipping subscription renewal cycle: no ring connections");
                 continue;
             }
