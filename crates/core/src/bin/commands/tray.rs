@@ -51,12 +51,12 @@ mod platform {
     const DASHBOARD_URL: &str = super::super::service::DASHBOARD_URL;
 
     /// Build the tray icon from embedded RGBA pixel data of the Freenet logo.
-    /// Pre-rendered from the SVG logo at freenet/web with the blue gradient preserved.
-    /// Uses 64x64 as the source — the OS downscales to 16/32/48 as needed,
-    /// which gives better results on high-DPI displays than upscaling from 32.
+    /// Pre-rendered from the SVG at freenet/web with the blue gradient preserved.
+    /// Uses 256x256 as the source so the OS has full detail to downscale from
+    /// at any DPI (100%-300%). Adds ~256KB to the binary.
     fn build_icon() -> Result<Icon, tray_icon::BadIcon> {
-        let rgba = include_bytes!("assets/freenet_64x64.rgba").to_vec();
-        Icon::from_rgba(rgba, 64, 64)
+        let rgba = include_bytes!("assets/freenet_256x256.rgba").to_vec();
+        Icon::from_rgba(rgba, 256, 256)
     }
 
     /// Open a URL in the default browser, platform-appropriately.
