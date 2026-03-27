@@ -55,7 +55,7 @@ detect_os() {
             echo "macos"
             ;;
         MINGW*|MSYS*|CYGWIN*)
-            error "Windows is not yet supported. Please check https://freenet.org for updates."
+            error "For Windows, use PowerShell: irm https://freenet.org/install.ps1 | iex"
             ;;
         *)
             error "Unsupported operating system: $os"

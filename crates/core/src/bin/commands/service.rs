@@ -18,6 +18,11 @@ use super::report::ReportCommand;
 /// Handles both static files (e.g., "freenet.log" from systemd) and
 /// rotated files (e.g., "freenet.2025-12-27.log" from tracing-appender).
 /// Returns the most recently modified file.
+/// Public accessor for the tray module to find log files.
+pub fn find_latest_log_file_pub(log_dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
+    find_latest_log_file(log_dir, base_name)
+}
+
 fn find_latest_log_file(log_dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
     use std::fs;
 
@@ -115,6 +120,11 @@ pub enum ServiceCommand {
     },
     /// Generate and upload a diagnostic report for debugging
     Report(ReportCommand),
+    /// Internal: process wrapper that manages the freenet node lifecycle.
+    /// Handles auto-update (exit code 42), crash backoff, log capture,
+    /// and on Windows shows a system tray icon.
+    #[command(hide = true)]
+    RunWrapper,
 }
 
 impl ServiceCommand {
@@ -140,6 +150,324 @@ impl ServiceCommand {
             ServiceCommand::Logs { err } => service_logs(*err),
             ServiceCommand::Report(cmd) => {
                 cmd.run(version, git_commit, git_dirty, build_timestamp, config_dirs)
+            }
+            ServiceCommand::RunWrapper => run_wrapper(version),
+        }
+    }
+}
+
+// ── Run-wrapper: compiled process wrapper for auto-update + tray icon ──
+
+/// Exit codes from the freenet binary that we handle specially.
+const WRAPPER_EXIT_UPDATE_NEEDED: i32 = 42;
+const WRAPPER_EXIT_ALREADY_RUNNING: i32 = 43;
+
+/// Initial backoff delay after a crash (seconds).
+const WRAPPER_INITIAL_BACKOFF_SECS: u64 = 10;
+/// Maximum backoff delay (seconds).
+const WRAPPER_MAX_BACKOFF_SECS: u64 = 300;
+/// Maximum port-conflict kill-and-retry attempts before giving up.
+const WRAPPER_MAX_PORT_CONFLICT_KILLS: u32 = 3;
+
+/// Run the wrapper loop that manages a `freenet network` child process.
+///
+/// This is the compiled equivalent of the macOS shell wrapper script
+/// (`generate_wrapper_script`). On Windows it additionally shows a system
+/// tray icon; on other platforms it runs the loop directly.
+fn run_wrapper(version: &str) -> Result<()> {
+    use freenet::tracing::tracer::get_log_dir;
+    use std::sync::mpsc;
+
+    let log_dir = get_log_dir().unwrap_or_else(|| {
+        let fallback = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("freenet")
+            .join("logs");
+        eprintln!(
+            "Warning: could not determine log directory, using {}",
+            fallback.display()
+        );
+        fallback
+    });
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+
+    // Kill stale freenet network processes from a previous wrapper instance
+    kill_stale_freenet_processes(&log_dir);
+
+    #[cfg(target_os = "windows")]
+    {
+        use super::tray::{TrayAction, WrapperStatus};
+
+        let (action_tx, action_rx) = mpsc::channel::<TrayAction>();
+        let (status_tx, status_rx) = mpsc::channel::<WrapperStatus>();
+        let version_owned = version.to_string();
+        let log_dir_clone = log_dir.clone();
+
+        // Wrapper loop runs on a background thread
+        let loop_handle = std::thread::spawn(move || {
+            run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)))
+        });
+
+        // Tray icon runs on the main thread (Windows message pump)
+        super::tray::run_tray_event_loop(action_tx, status_rx, &version_owned);
+
+        // Tray loop exited (user clicked Quit) — join the wrapper thread
+        match loop_handle.join() {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!("Wrapper loop thread panicked"),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = version; // suppress unused warning
+        run_wrapper_loop(
+            &log_dir,
+            None::<(
+                &mpsc::Receiver<super::tray::TrayAction>,
+                &mpsc::Sender<super::tray::WrapperStatus>,
+            )>,
+        )
+    }
+}
+
+/// The core wrapper loop. Spawns `freenet network`, handles exit codes,
+/// and communicates with the tray icon (if present).
+fn run_wrapper_loop(
+    log_dir: &Path,
+    #[cfg(target_os = "windows")] tray: Option<(
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+        &std::sync::mpsc::Sender<super::tray::WrapperStatus>,
+    )>,
+    #[cfg(not(target_os = "windows"))] _tray: Option<(
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+        &std::sync::mpsc::Sender<super::tray::WrapperStatus>,
+    )>,
+) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    use super::tray::WrapperStatus;
+
+    let exe_path = std::env::current_exe().context("Failed to get current executable")?;
+
+    let mut backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+    let mut consecutive_failures: u32 = 0;
+    let mut port_conflict_kills: u32 = 0;
+
+    loop {
+        // Check for tray actions before launching
+        #[cfg(target_os = "windows")]
+        if let Some((action_rx, _)) = tray {
+            if let Ok(action) = action_rx.try_recv() {
+                match action {
+                    super::tray::TrayAction::Quit => return Ok(()),
+                    super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
+                    super::tray::TrayAction::CheckUpdate => {
+                        let _ = std::process::Command::new(&exe_path)
+                            .args(["update", "--check"])
+                            .status();
+                    }
+                    super::tray::TrayAction::OpenDashboard => {
+                        let _ = std::process::Command::new("cmd")
+                            .args(["/c", "start", "http://127.0.0.1:7509/"])
+                            .spawn();
+                    }
+                    super::tray::TrayAction::Restart => {
+                        // Just continue the loop — we'll launch a new child
+                    }
+                }
+            }
+        }
+
+        // Notify tray that we're starting
+        #[cfg(target_os = "windows")]
+        if let Some((_, status_tx)) = tray {
+            let _ = status_tx.send(WrapperStatus::Running);
+        }
+
+        let stderr_path = log_dir.join("freenet.error.log.last");
+        let stderr_file = std::fs::File::create(&stderr_path).ok();
+
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("network");
+
+        // Redirect stderr to a file for port-conflict detection
+        if let Some(stderr_file) = stderr_file {
+            cmd.stderr(stderr_file);
+        }
+
+        let status = cmd.status();
+
+        let exit_code = match status {
+            Ok(s) => s.code().unwrap_or(1),
+            Err(e) => {
+                log_wrapper_event(log_dir, &format!("Failed to spawn freenet network: {e}"));
+                // Fatal — can't even start the process
+                return Err(e).context("Failed to spawn freenet network");
+            }
+        };
+
+        match exit_code {
+            code if code == WRAPPER_EXIT_UPDATE_NEEDED => {
+                log_wrapper_event(log_dir, "Update needed, running freenet update...");
+
+                #[cfg(target_os = "windows")]
+                if let Some((_, status_tx)) = tray {
+                    let _ = status_tx.send(WrapperStatus::Updating);
+                }
+
+                let update_status = std::process::Command::new(&exe_path)
+                    .args(["update", "--quiet"])
+                    .status();
+
+                match update_status {
+                    Ok(s) if s.success() => {
+                        log_wrapper_event(log_dir, "Update successful, restarting...");
+                        consecutive_failures = 0;
+                        port_conflict_kills = 0;
+                        backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                    _ => {
+                        consecutive_failures += 1;
+                        log_wrapper_event(
+                            log_dir,
+                            &format!(
+                                "Update failed (attempt {consecutive_failures}), backing off {backoff_secs}s..."
+                            ),
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                        backoff_secs = (backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
+                    }
+                }
+            }
+            code if code == WRAPPER_EXIT_ALREADY_RUNNING => {
+                log_wrapper_event(
+                    log_dir,
+                    "Another instance is already running, exiting cleanly",
+                );
+                return Ok(());
+            }
+            0 => {
+                log_wrapper_event(log_dir, "Normal shutdown");
+                return Ok(());
+            }
+            code => {
+                // Check for port-already-in-use
+                let is_port_conflict = stderr_path
+                    .exists()
+                    .then(|| std::fs::read_to_string(&stderr_path).unwrap_or_default())
+                    .map(|s| s.contains("already in use"))
+                    .unwrap_or(false);
+
+                if is_port_conflict {
+                    port_conflict_kills += 1;
+                    if port_conflict_kills <= WRAPPER_MAX_PORT_CONFLICT_KILLS {
+                        log_wrapper_event(
+                            log_dir,
+                            &format!(
+                                "Port conflict detected (attempt {port_conflict_kills}/{WRAPPER_MAX_PORT_CONFLICT_KILLS}) — killing stale process and retrying..."
+                            ),
+                        );
+                        kill_stale_freenet_processes(log_dir);
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+                        continue;
+                    }
+                    log_wrapper_event(
+                        log_dir,
+                        &format!(
+                            "Port conflict persists after {WRAPPER_MAX_PORT_CONFLICT_KILLS} kill attempts. Manual intervention may be required."
+                        ),
+                    );
+                }
+
+                consecutive_failures += 1;
+                port_conflict_kills = 0;
+
+                #[cfg(target_os = "windows")]
+                if let Some((_, status_tx)) = tray {
+                    let _ = status_tx.send(WrapperStatus::Stopped);
+                }
+
+                log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "Exited with code {code}, restarting after {backoff_secs}s backoff..."
+                    ),
+                );
+                std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                backoff_secs = (backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
+            }
+        }
+
+        // Drain any pending tray actions between iterations
+        #[cfg(target_os = "windows")]
+        if let Some((action_rx, _)) = tray {
+            while let Ok(action) = action_rx.try_recv() {
+                match action {
+                    super::tray::TrayAction::Quit => return Ok(()),
+                    super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Append a timestamped message to the wrapper log file.
+fn log_wrapper_event(log_dir: &Path, message: &str) {
+    use std::io::Write;
+
+    let log_path = log_dir.join("freenet-wrapper.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        drop(writeln!(file, "{timestamp}: {message}"));
+    }
+    // Also print to stderr for debugging when run manually
+    eprintln!("{message}");
+}
+
+/// Kill stale `freenet network` processes from a previous wrapper instance.
+fn kill_stale_freenet_processes(log_dir: &Path) {
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("pkill")
+            .args(["-f", "freenet network"])
+            .status();
+        if let Ok(s) = status {
+            if s.success() {
+                log_wrapper_event(
+                    log_dir,
+                    "Killed stale freenet network process(es) on startup",
+                );
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Use taskkill with a specific command-line filter to avoid killing unrelated freenet processes
+        let status = std::process::Command::new("taskkill")
+            .args([
+                "/F",
+                "/FI",
+                "IMAGENAME eq freenet.exe",
+                "/FI",
+                "WINDOWTITLE ne *",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Ok(s) = status {
+            if s.success() {
+                log_wrapper_event(log_dir, "Killed stale freenet process(es) on startup");
+                std::thread::sleep(std::time::Duration::from_secs(2));
             }
         }
     }
@@ -1083,15 +1411,16 @@ fn install_service(system: bool) -> Result<()> {
         .to_str()
         .context("Executable path contains invalid UTF-8")?;
 
-    // Use Task Scheduler to run at login
-    // schtasks /create /tn "Freenet" /tr "path\to\freenet.exe network" /sc onlogon /rl highest
+    // Use Task Scheduler to run the wrapper at login. The wrapper manages the
+    // freenet network child process, handles auto-update (exit code 42), crash
+    // backoff, log capture, and shows a system tray icon.
     let status = std::process::Command::new("schtasks")
         .args([
             "/create",
             "/tn",
             "Freenet",
             "/tr",
-            &format!("\"{}\" network", exe_path_str),
+            &format!("\"{}\" service run-wrapper", exe_path_str),
             "/sc",
             "onlogon",
             "/rl",
@@ -1111,9 +1440,7 @@ fn install_service(system: bool) -> Result<()> {
     println!("  freenet service start");
     println!();
     println!("Freenet will start automatically when you log in.");
-    println!();
-    println!("Note: For production use, consider running Freenet as a Windows Service.");
-    println!("See: https://freenet.org/docs/windows-service");
+    println!("A system tray icon will appear with status and controls.");
 
     Ok(())
 }
@@ -1244,14 +1571,65 @@ fn restart_service(system: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn service_logs(_error_only: bool) -> Result<()> {
-    // Windows Task Scheduler doesn't capture stdout/stderr to files by default.
-    // Users can check Event Viewer or run Freenet manually to see output.
-    anyhow::bail!(
-        "Log viewing is not yet supported on Windows.\n\
-         To view logs, run 'freenet network' manually in a terminal,\n\
-         or check Windows Event Viewer for application errors."
-    )
+fn service_logs(error_only: bool) -> Result<()> {
+    use freenet::tracing::tracer::get_log_dir;
+
+    let log_dir = get_log_dir().context(
+        "Could not determine log directory. \
+         Ensure Freenet has been run at least once via 'freenet service run-wrapper'.",
+    )?;
+
+    let base_name = if error_only {
+        "freenet.error"
+    } else {
+        "freenet"
+    };
+
+    // Also check the wrapper log
+    let wrapper_log = log_dir.join("freenet-wrapper.log");
+
+    match find_latest_log_file(&log_dir, base_name) {
+        Some(log_path) => {
+            println!("Log file: {}", log_path.display());
+            if wrapper_log.exists() {
+                println!("Wrapper log: {}", wrapper_log.display());
+            }
+            // Use PowerShell Get-Content -Wait to follow the log (like tail -f)
+            let status = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    &format!("Get-Content -Path '{}' -Tail 50 -Wait", log_path.display()),
+                ])
+                .status()
+                .context("Failed to open log file")?;
+            if !status.success() {
+                // Fallback: just open in notepad
+                let _ = std::process::Command::new("notepad").arg(&log_path).spawn();
+            }
+        }
+        None => {
+            if wrapper_log.exists() {
+                println!("No node logs found, showing wrapper log:");
+                let _ = std::process::Command::new("powershell")
+                    .args([
+                        "-Command",
+                        &format!(
+                            "Get-Content -Path '{}' -Tail 50 -Wait",
+                            wrapper_log.display()
+                        ),
+                    ])
+                    .status();
+            } else {
+                anyhow::bail!(
+                    "No log files found in {}.\n\
+                     Ensure Freenet has been run at least once.",
+                    log_dir.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // Fallback for unsupported platforms
