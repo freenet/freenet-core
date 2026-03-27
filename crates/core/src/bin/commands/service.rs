@@ -263,10 +263,10 @@ fn jitter_secs(secs: u64) -> u64 {
 /// Sleeps in 1-second chunks to remain responsive to tray actions.
 fn sleep_with_jitter_interruptible(
     secs: u64,
-    #[cfg(target_os = "windows")] action_rx: Option<
+    #[cfg(any(target_os = "windows", target_os = "macos"))] action_rx: Option<
         &std::sync::mpsc::Receiver<super::tray::TrayAction>,
     >,
-    #[cfg(not(target_os = "windows"))] _action_rx: Option<
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
         &std::sync::mpsc::Receiver<super::tray::TrayAction>,
     >,
 ) -> bool {
@@ -274,7 +274,7 @@ fn sleep_with_jitter_interruptible(
     for _ in 0..jittered {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if let Some(rx) = action_rx {
             if let Ok(action) = rx.try_recv() {
                 match action {
@@ -290,9 +290,9 @@ fn sleep_with_jitter_interruptible(
 
 /// Run the wrapper loop that manages a `freenet network` child process.
 ///
-/// This is the compiled equivalent of the macOS shell wrapper script
-/// (`generate_wrapper_script`). On Windows it additionally shows a system
-/// tray icon; on other platforms it runs the loop directly.
+/// Compiled process wrapper that manages a `freenet network` child process.
+/// On Windows and macOS, shows a system tray / menu bar icon.
+/// On Linux, runs the wrapper loop directly (no tray).
 fn run_wrapper(version: &str) -> Result<()> {
     use freenet::tracing::tracer::get_log_dir;
     use std::sync::mpsc;
@@ -314,7 +314,7 @@ fn run_wrapper(version: &str) -> Result<()> {
     // Kill stale freenet network processes from a previous wrapper instance
     kill_stale_freenet_processes(&log_dir);
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         use super::tray::{TrayAction, WrapperStatus};
 
@@ -328,7 +328,7 @@ fn run_wrapper(version: &str) -> Result<()> {
             run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)))
         });
 
-        // Tray icon runs on the main thread (Windows message pump)
+        // Tray icon runs on the main thread (platform message pump)
         super::tray::run_tray_event_loop(action_tx, status_rx, &version_owned);
 
         // Tray loop exited (user clicked Quit) — join the wrapper thread
@@ -338,9 +338,9 @@ fn run_wrapper(version: &str) -> Result<()> {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = version; // suppress unused warning
+        let _ = version;
         run_wrapper_loop(
             &log_dir,
             None::<(
@@ -355,16 +355,16 @@ fn run_wrapper(version: &str) -> Result<()> {
 /// and communicates with the tray icon (if present).
 fn run_wrapper_loop(
     log_dir: &Path,
-    #[cfg(target_os = "windows")] tray: Option<(
+    #[cfg(any(target_os = "windows", target_os = "macos"))] tray: Option<(
         &std::sync::mpsc::Receiver<super::tray::TrayAction>,
         &std::sync::mpsc::Sender<super::tray::WrapperStatus>,
     )>,
-    #[cfg(not(target_os = "windows"))] _tray: Option<(
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _tray: Option<(
         &std::sync::mpsc::Receiver<super::tray::TrayAction>,
         &std::sync::mpsc::Sender<super::tray::WrapperStatus>,
     )>,
 ) -> Result<()> {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     use super::tray::WrapperStatus;
 
     let exe_path = std::env::current_exe().context("Failed to get current executable")?;
@@ -373,7 +373,7 @@ fn run_wrapper_loop(
 
     loop {
         // Notify tray that we're starting
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if let Some((_, status_tx)) = tray {
             let _ = status_tx.send(WrapperStatus::Running);
         }
@@ -411,7 +411,7 @@ fn run_wrapper_loop(
             }
 
             // Process tray actions while child is running
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             if let Some((action_rx, _)) = tray {
                 if let Ok(action) = action_rx.try_recv() {
                     match action {
@@ -465,7 +465,7 @@ fn run_wrapper_loop(
         let update_succeeded = if exit_code == WRAPPER_EXIT_UPDATE_NEEDED {
             log_wrapper_event(log_dir, "Update needed, running freenet update...");
 
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             if let Some((_, status_tx)) = tray {
                 let _ = status_tx.send(WrapperStatus::Updating);
             }
@@ -529,7 +529,7 @@ fn run_wrapper_loop(
                     return Ok(());
                 }
 
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 if let Some((_, status_tx)) = tray {
                     let _ = status_tx.send(WrapperStatus::Stopped);
                 }
@@ -538,9 +538,9 @@ fn run_wrapper_loop(
                     log_dir,
                     &format!("Exited with code {exit_code}, restarting after {secs}s backoff..."),
                 );
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 let quit = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 let quit = sleep_with_jitter_interruptible(secs, None);
                 if quit {
                     return Ok(());
@@ -550,21 +550,64 @@ fn run_wrapper_loop(
     }
 }
 
-/// Append a timestamped message to the wrapper log file.
+/// Maximum number of wrapper log files to keep (one per day).
+const WRAPPER_LOG_RETENTION_DAYS: usize = 7;
+
+/// Append a timestamped message to a date-based wrapper log file.
+/// Files are named `freenet-wrapper.YYYY-MM-DD.log` with automatic rotation.
+/// Old files beyond `WRAPPER_LOG_RETENTION_DAYS` are deleted.
 fn log_wrapper_event(log_dir: &Path, message: &str) {
     use std::io::Write;
 
-    let log_path = log_dir.join("freenet-wrapper.log");
+    let now = chrono::Local::now();
+    let date_str = now.format("%Y-%m-%d");
+    let log_path = log_dir.join(format!("freenet-wrapper.{date_str}.log"));
+
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
     {
-        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let timestamp = now.format("%H:%M:%S");
         drop(writeln!(file, "{timestamp}: {message}"));
     }
     // Also print to stderr for debugging when run manually
     eprintln!("{message}");
+
+    // Clean up old log files (best-effort, don't let cleanup failure block anything)
+    cleanup_old_wrapper_logs(log_dir);
+}
+
+/// Delete wrapper log files older than the retention period.
+fn cleanup_old_wrapper_logs(log_dir: &Path) {
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut wrapper_logs: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("freenet-wrapper.") && n.ends_with(".log"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if wrapper_logs.len() <= WRAPPER_LOG_RETENTION_DAYS {
+        return;
+    }
+
+    // Sort by name (date is embedded, so lexicographic = chronological)
+    wrapper_logs.sort();
+
+    // Remove oldest files beyond retention
+    let to_remove = wrapper_logs.len() - WRAPPER_LOG_RETENTION_DAYS;
+    for path in &wrapper_logs[..to_remove] {
+        drop(std::fs::remove_file(path));
+    }
 }
 
 /// Kill stale `freenet network` processes from a previous wrapper instance.

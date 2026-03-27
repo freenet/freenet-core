@@ -1,12 +1,13 @@
-//! Windows system tray icon for the Freenet run-wrapper.
+//! System tray/menu bar icon for the Freenet run-wrapper.
 //!
 //! Displays a tray icon with a right-click menu while the Freenet node
 //! is running. The menu mirrors `freenet service` CLI commands plus
 //! extras like "Open Dashboard" and "View Logs".
 //!
-//! On non-Windows platforms, this module provides no-op stubs.
+//! Supported on Windows (system tray) and macOS (menu bar).
+//! On other platforms, this module provides no-op stubs.
 
-// Types and functions are only used on Windows; suppress warnings on other platforms.
+// Types are used on Windows/macOS only; suppress warnings on Linux.
 #[allow(unused_imports)]
 use std::sync::mpsc;
 
@@ -38,26 +39,42 @@ pub enum WrapperStatus {
     Stopped,
 }
 
-// ── Windows implementation ──────────────────────────────────────────
+// ── Windows + macOS implementation ──────────────────────────────────
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod platform {
     use super::*;
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use std::sync::mpsc as std_mpsc;
-    use tray_icon::{icon::Icon, TrayIcon, TrayIconBuilder};
+    use tray_icon::{icon::Icon, TrayIconBuilder};
 
-    const DASHBOARD_URL: &str = super::service::DASHBOARD_URL;
+    const DASHBOARD_URL: &str = super::super::service::DASHBOARD_URL;
 
-    /// Build the tray icon from embedded 32x32 RGBA pixel data of the Freenet logo.
+    /// Build the tray icon from embedded RGBA pixel data of the Freenet logo.
     /// Pre-rendered from the SVG logo at freenet/web with the blue gradient preserved.
+    /// Uses 64x64 as the source — the OS downscales to 16/32/48 as needed,
+    /// which gives better results on high-DPI displays than upscaling from 32.
     fn build_icon() -> Result<Icon, tray_icon::BadIcon> {
-        let rgba = include_bytes!("assets/freenet_32x32.rgba").to_vec();
-        Icon::from_rgba(rgba, 32, 32)
+        let rgba = include_bytes!("assets/freenet_64x64.rgba").to_vec();
+        Icon::from_rgba(rgba, 64, 64)
+    }
+
+    /// Open a URL in the default browser, platform-appropriately.
+    fn open_url(url: &str) {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "start", url])
+                .spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(url).spawn();
+        }
     }
 
     /// Run the tray icon event loop on the current thread (must be the main thread
-    /// on Windows for the message pump to work).
+    /// for the platform message pump to work — required by both Windows and macOS).
     ///
     /// `action_tx` sends user menu actions to the wrapper loop running on another thread.
     /// `status_rx` receives status updates from the wrapper loop to update the tooltip.
@@ -122,13 +139,10 @@ mod platform {
         let quit_id = quit_item.id().clone();
 
         loop {
-            // Process menu events (non-blocking peek with timeout)
+            // Process menu events (non-blocking peek)
             if let Ok(event) = menu_rx.try_recv() {
                 let action = if event.id == open_dashboard_id {
-                    // Open dashboard directly — no need to go through the wrapper loop
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/c", "start", DASHBOARD_URL])
-                        .spawn();
+                    open_url(DASHBOARD_URL);
                     None
                 } else if event.id == restart_id {
                     Some(TrayAction::Restart)
@@ -159,28 +173,28 @@ mod platform {
                 let _ = _tray.set_tooltip(Some(format!("Freenet {version} - {status_text}")));
             }
 
-            // Yield to avoid busy-spinning. The Windows message pump is driven
+            // Yield to avoid busy-spinning. The platform message pump is driven
             // by tray-icon internally; we just need to process events periodically.
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }
 
-// ── Non-Windows stub ────────────────────────────────────────────────
+// ── Stub for platforms without tray support (Linux, etc.) ───────────
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod platform {
     use super::*;
     use std::sync::mpsc as std_mpsc;
 
-    /// No-op on non-Windows platforms. Returns immediately.
+    /// No-op on unsupported platforms. Returns immediately.
     pub fn run_tray_event_loop(
         _action_tx: std_mpsc::Sender<TrayAction>,
         _status_rx: std_mpsc::Receiver<WrapperStatus>,
         _version: &str,
     ) {
-        // Tray icon is Windows-only. On other platforms the wrapper loop
-        // runs directly on the main thread without a tray.
+        // Tray icon not supported. The wrapper loop runs directly on the
+        // main thread without a tray.
     }
 }
 
@@ -197,7 +211,6 @@ pub fn open_log_file() {
         return;
     };
 
-    // Find the latest log file using the same logic as service_logs
     let latest = super::service::find_latest_log_file(&log_dir, "freenet");
 
     match latest {
@@ -206,7 +219,11 @@ pub fn open_log_file() {
             {
                 let _ = std::process::Command::new("notepad").arg(&path).spawn();
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg(&path).spawn();
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {
                 drop(std::process::Command::new("xdg-open").arg(&path).spawn());
             }

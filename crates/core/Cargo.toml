@@ -120,6 +120,10 @@ zip = { workspace = true }
 tray-icon = { workspace = true }
 muda = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { workspace = true }
+muda = { workspace = true }
+
 [dev-dependencies]
 arbitrary = { workspace = true }
 proptest = { workspace = true }
