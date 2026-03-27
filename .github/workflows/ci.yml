@@ -150,7 +150,8 @@ jobs:
     name: Windows Check
     runs-on: windows-latest
     timeout-minutes: 20
-    if: github.event_name == 'pull_request'
+    needs: fmt_check
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
 
     steps:
       - uses: actions/checkout@v6
