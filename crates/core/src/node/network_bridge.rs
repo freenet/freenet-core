@@ -23,7 +23,7 @@ pub(crate) mod p2p_protoc;
 pub(crate) mod priority_select;
 
 // Re-export fault injection types and functions for testing
-pub use in_memory::{get_fault_injector, set_fault_injector, FaultInjectorState, NetworkStats};
+pub use in_memory::{FaultInjectorState, NetworkStats, get_fault_injector, set_fault_injector};
 // Re-export event loop exit reason for graceful shutdown handling
 pub use p2p_protoc::EventLoopExitReason;
 
@@ -154,8 +154,8 @@ pub fn reset_channel_id_counter() {
 /// Channel capacity for event loop notification and op execution channels.
 const EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
 
-pub(crate) fn event_loop_notification_channel(
-) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
+pub(crate) fn event_loop_notification_channel()
+-> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
     let _channel_id = CHANNEL_ID_COUNTER.with(|c| {
         let v = c.get();
         c.set(v + 1);
@@ -227,7 +227,7 @@ mod tests {
     use crate::config::GlobalExecutor;
     use either::Either;
     use freenet_stdlib::prelude::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     /// Test that notification channel works correctly with biased select
     /// This test simulates the event loop scenario where we use biased select

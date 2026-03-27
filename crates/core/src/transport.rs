@@ -6,8 +6,8 @@
 //! Handles the raw sending and receiving of byte packets over the network.
 //! See `architecture.md`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
@@ -216,7 +216,7 @@ pub use congestion_control::{
     CongestionControlStats, CongestionController,
 };
 // Re-export transport metrics for periodic telemetry snapshots
-pub use metrics::{TransportMetrics, TransportSnapshot, TRANSPORT_METRICS};
+pub use metrics::{TRANSPORT_METRICS, TransportMetrics, TransportSnapshot};
 // Re-export reset functions for deterministic simulation testing
 pub use packet_data::reset_nonce_counter;
 pub use peer_connection::StreamId;
@@ -307,8 +307,8 @@ impl From<SocketAddr> for ObservedAddr {
     }
 }
 
-pub use self::connection_handler::create_connection_handler;
 pub(crate) use self::connection_handler::ExpectedInboundTracker;
+pub use self::connection_handler::create_connection_handler;
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
@@ -330,7 +330,9 @@ pub enum TransportError {
     ConnectionClosed(SocketAddr),
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
-    #[error("Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core")]
+    #[error(
+        "Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core"
+    )]
     ProtocolVersionMismatch { expected: String, actual: String },
     #[error("send to {0} failed: {1}")]
     SendFailed(SocketAddr, std::io::ErrorKind),

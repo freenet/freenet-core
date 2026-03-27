@@ -1,7 +1,7 @@
 [package]
 name = "redb-migration-generator"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 # Exclude from workspace to avoid version conflicts with main project's redb dependency

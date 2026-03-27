@@ -3,8 +3,8 @@
 //! These tests verify the behavior of the sync polling loop in `handle_execution_call`,
 //! including timeout handling, panic recovery, and store management.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 

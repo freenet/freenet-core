@@ -8,7 +8,7 @@ use tokio::{
     sync::Mutex,
 };
 
-use super::{EventKind, NetLogMessage, RouteEvent, NEW_RECORDS_TS};
+use super::{EventKind, NEW_RECORDS_TS, NetLogMessage, RouteEvent};
 
 static FILE_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -23,8 +23,8 @@ pub(super) const MAX_LOG_RECORDS: usize = 100_000;
 #[cfg(test)]
 pub(super) const MAX_LOG_RECORDS: usize = 10_000;
 pub(super) const REMOVE_RECS: usize = 1000 + EVENT_REGISTER_BATCH_SIZE; // making space for 1000 new records
-                                                                        // Reduced from 100 to 5 to ensure events are written more frequently,
-                                                                        // especially important for integration tests which generate few events
+// Reduced from 100 to 5 to ensure events are written more frequently,
+// especially important for integration tests which generate few events
 const EVENT_REGISTER_BATCH_SIZE: usize = 5;
 pub(super) const BATCH_SIZE: usize = EVENT_REGISTER_BATCH_SIZE;
 
@@ -499,13 +499,13 @@ mod tests {
 
         let mut log = LogFile::open(&log_path).await?;
         let bytes = crate::util::test::random_bytes_2mb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let mut unstructured = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
         let mut peers = vec![];
         let mut events = vec![];
 
         for _ in 0..TEST_LOGS {
-            let tx: Transaction = gen.arbitrary()?;
+            let tx: Transaction = unstructured.arbitrary()?;
             transactions.push(tx);
             let peer: PeerId = PeerId::random();
             peers.push(peer);
@@ -513,7 +513,7 @@ mod tests {
         let mut total_route_events: usize = 0;
 
         for i in 0..TEST_LOGS {
-            let kind: EventKind = gen.arbitrary()?;
+            let kind: EventKind = unstructured.arbitrary()?;
             // The route events in first REMOVE_RECS will be dropped
             if matches!(kind, EventKind::Route(_)) {
                 total_route_events += 1;
@@ -545,13 +545,13 @@ mod tests {
 
         let mut log = LogFile::open(&log_path).await?;
         let bytes = crate::util::test::random_bytes_2mb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let mut unstructured = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
         let mut peers = vec![];
         let mut events = vec![];
 
         for _ in 0..TEST_LOGS {
-            let tx: Transaction = gen.arbitrary()?;
+            let tx: Transaction = unstructured.arbitrary()?;
             transactions.push(tx);
             let peer: PeerId = PeerId::random();
             peers.push(peer);
@@ -559,7 +559,7 @@ mod tests {
         let mut total_route_events: usize = 0;
 
         for i in 0..TEST_LOGS {
-            let kind: EventKind = gen.arbitrary()?;
+            let kind: EventKind = unstructured.arbitrary()?;
             // The route events in first REMOVE_RECS will be dropped
             if matches!(kind, EventKind::Route(_)) {
                 total_route_events += 1;
@@ -591,13 +591,13 @@ mod tests {
 
         let mut log = LogFile::open(&log_path).await?;
         let bytes = crate::util::test::random_bytes_2mb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
+        let mut unstructured = arbitrary::Unstructured::new(&bytes);
         let mut transactions = vec![];
         let mut peers = vec![];
         let mut events = vec![];
 
         for _ in 0..TEST_LOGS {
-            let tx: Transaction = gen.arbitrary()?;
+            let tx: Transaction = unstructured.arbitrary()?;
             transactions.push(tx);
             let peer: PeerId = PeerId::random();
             peers.push(peer);
@@ -605,7 +605,7 @@ mod tests {
         let mut total_route_events: usize = 0;
 
         for i in 0..TEST_LOGS {
-            let kind: EventKind = gen.arbitrary()?;
+            let kind: EventKind = unstructured.arbitrary()?;
             // The route events in first REMOVE_RECS will be dropped
             if matches!(kind, EventKind::Route(_)) && i >= REMOVE_RECS {
                 total_route_events += 1;

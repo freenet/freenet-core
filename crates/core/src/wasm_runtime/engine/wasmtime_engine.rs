@@ -144,9 +144,9 @@ use wasmtime::{
 };
 
 use super::{InstanceHandle, WasmEngine, WasmError};
+use crate::wasm_runtime::ContractError;
 use crate::wasm_runtime::native_api::{self, MEM_ADDR};
 use crate::wasm_runtime::runtime::RuntimeConfig;
-use crate::wasm_runtime::ContractError;
 
 // Use shared constants from parent module to ensure consistency
 // with host function bounds validation

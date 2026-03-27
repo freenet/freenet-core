@@ -7,8 +7,8 @@
 //! - Capacity limits and backpressure
 
 use crate::config::GlobalExecutor;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -16,8 +16,8 @@ use tokio::time::timeout;
 
 use crate::contract::executor::{OpRequestError, OpRequestReceiver, OpRequestSender};
 use crate::message::Transaction;
-use crate::operations::get::GetMsg;
 use crate::operations::OpEnum;
+use crate::operations::get::GetMsg;
 
 // =============================================================================
 // Test Helper: Simplified Mediator for Unit Testing

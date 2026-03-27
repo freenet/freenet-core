@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{atomic::AtomicU64, Arc, Weak};
+use std::sync::{Arc, Weak, atomic::AtomicU64};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -18,17 +18,17 @@ use parking_lot::{Mutex, RwLock};
 pub use hosting::{AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult};
 
 use crate::message::TransactionType;
-use crate::topology::rate::Rate;
 use crate::topology::TopologyAdjustment;
+use crate::topology::rate::Rate;
 use crate::tracing::{NetEventLog, NetEventRegister};
 
 use crate::transport::TransportPublicKey;
-use crate::util::{time_source::InstantTimeSrc, Contains};
+use crate::util::{Contains, time_source::InstantTimeSrc};
 use crate::{
     config::{GlobalExecutor, GlobalRng},
     message::{NetMessage, NetMessageV1, Transaction},
     node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
-    operations::{connect::ConnectOp, OpEnum},
+    operations::{OpEnum, connect::ConnectOp},
     router::Router,
 };
 
@@ -2711,8 +2711,8 @@ mod refresh_router_tests {
     use futures::FutureExt;
     use parking_lot::RwLock;
 
-    use crate::ring::location::Location;
     use crate::ring::PeerKeyLocation;
+    use crate::ring::location::Location;
     use crate::router::{RouteEvent, RouteOutcome, Router};
     use crate::tracing::{NetEventLog, NetEventRegister};
 

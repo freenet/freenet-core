@@ -9,10 +9,10 @@
 
 mod common;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use common::RiverSession;
 use freenet_test_network::{BuildProfile, FreenetBinary, TestNetwork};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::info;
 
 const ITERATIONS: usize = 5;

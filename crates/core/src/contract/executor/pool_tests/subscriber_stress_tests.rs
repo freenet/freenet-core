@@ -6,8 +6,8 @@
 //! - Rapid client churn (register/remove cycles)
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;

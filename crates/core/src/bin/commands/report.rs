@@ -6,8 +6,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use clap::Args;
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use freenet::config::ConfigPaths;
 use freenet::tracing::tracer::get_log_dir;
 use freenet_stdlib::client_api::{
@@ -268,7 +268,9 @@ impl ReportCommand {
 
         // Interactive prompt
         println!();
-        println!("What issue are you experiencing? (Enter on empty line to finish, or just Enter to skip)");
+        println!(
+            "What issue are you experiencing? (Enter on empty line to finish, or just Enter to skip)"
+        );
         print!("> ");
         io::stdout().flush()?;
 

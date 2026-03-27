@@ -3468,7 +3468,8 @@ fn test_adaptive_floor_path_change_without_explicit_min() {
         assert!(
             floor_after > spec_floor,
             "Without path change detection, BDP proxy should still be used. floor={}, spec_floor={}",
-            floor_after, spec_floor
+            floor_after,
+            spec_floor
         );
         println!("Note: base_delay window not fully flushed, testing BDP proxy behavior instead");
     }

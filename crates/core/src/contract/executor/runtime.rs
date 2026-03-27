@@ -1,12 +1,12 @@
 use super::*;
 use super::{
-    now_nanos, ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
-    OpRequestSender, RequestError, Response, StateStoreError, SLOW_INIT_THRESHOLD,
-    STALE_INIT_THRESHOLD,
+    ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
+    OpRequestSender, RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
+    StateStoreError, now_nanos,
 };
 use crate::node::OpManager;
 use crate::wasm_runtime::{
-    BackendEngine, RuntimeConfig, SharedModuleCache, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE,
+    BackendEngine, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE, RuntimeConfig, SharedModuleCache,
 };
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{MessageOrigin, RelatedContract};
@@ -1261,7 +1261,7 @@ where
             }
             Err(StateStoreError::Any(err)) => return Err(ExecutorError::other(err)),
             Err(err @ StateStoreError::StateTooLarge { .. }) => {
-                return Err(ExecutorError::other(err))
+                return Err(ExecutorError::other(err));
             }
         };
 
@@ -1683,7 +1683,7 @@ where
                     return Err(ExecutorError::execution(
                         err,
                         Some(InnerOpError::Upsert(*key)),
-                    ))
+                    ));
                 }
             };
         let UpdateModification {
@@ -2882,7 +2882,7 @@ impl Executor<Runtime> {
                     return Err(ExecutorError::execution(
                         err,
                         Some(InnerOpError::Upsert(*key)),
-                    ))
+                    ));
                 }
             };
 

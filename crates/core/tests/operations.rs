@@ -1,7 +1,7 @@
 use anyhow::{bail, ensure};
 use freenet::test_utils::{
-    self, load_contract, load_delegate, make_get, make_get_with_blocking, make_put,
-    make_put_with_blocking, make_subscribe, make_update, verify_contract_exists, TestContext,
+    self, TestContext, load_contract, load_delegate, make_get, make_get_with_blocking, make_put,
+    make_put_with_blocking, make_subscribe, make_update, verify_contract_exists,
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
@@ -867,7 +867,10 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
             }
             Err(_) => {
                 let elapsed = get_start.elapsed();
-                bail!("Client 3: Timeout waiting for get response after {:?}. Contract may not have propagated from Node A to Node B", elapsed);
+                bail!(
+                    "Client 3: Timeout waiting for get response after {:?}. Contract may not have propagated from Node A to Node B",
+                    elapsed
+                );
             }
         }
     }
@@ -2184,9 +2187,12 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
     const TEST_DELEGATE: &str = "test-delegate-integration";
 
     // Configure environment variables for optimized release build
-    std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
-    std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
-    std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+    // SAFETY: test environment, no concurrent threads reading these env vars
+    unsafe {
+        std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
+        std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+        std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+    }
 
     // Load delegate (moving this outside the async block)
     let params = Parameters::from(vec![]);
@@ -2852,7 +2858,9 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
         }
         Err(_) => {
             // This is where the test will currently fail
-            bail!("TIMEOUT waiting for update response - UpdateNoChange bug: client not notified when update results in no state change");
+            bail!(
+                "TIMEOUT waiting for update response - UpdateNoChange bug: client not notified when update results in no state change"
+            );
         }
     }
 

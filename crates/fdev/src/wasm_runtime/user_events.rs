@@ -15,11 +15,11 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::future::BoxFuture;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{util, CommandSender};
+use crate::{CommandSender, util};
 
-use super::{state::AppState, DeserializationFmt, ExecutorConfig};
+use super::{DeserializationFmt, ExecutorConfig, state::AppState};
 
 const HELP: &str = "Freenet Contract Development Environment
 

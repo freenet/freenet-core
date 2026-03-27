@@ -2,8 +2,8 @@ use freenet_stdlib::prelude::*;
 
 use crate::wasm_runtime::tests::TestSetup;
 
-use super::super::contract::*;
 use super::super::Runtime;
+use super::super::contract::*;
 
 const TEST_CONTRACT_1: &str = "test_contract_1";
 

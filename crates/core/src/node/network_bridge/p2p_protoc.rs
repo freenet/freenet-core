@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{self, error::TryRecvError, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender, error::TryRecvError};
 use tokio::time::Instant;
 use tokio::time::{sleep, timeout};
 use tracing::Instrument;
@@ -31,9 +31,9 @@ use crate::ring::Location;
 #[cfg(feature = "simulation_tests")]
 use crate::ring::PeerKey;
 use crate::transport::{
-    create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
     CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi, Socket, TransportError,
-    TransportKeypair, TransportPublicKey,
+    TransportKeypair, TransportPublicKey, create_connection_handler,
+    global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
 };
 use crate::{
     client_events::ClientId,
@@ -44,8 +44,8 @@ use crate::{
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
-        handle_aborted_op, process_message_decoupled, NetEventRegister, NodeConfig, OpManager,
-        PeerId,
+        NetEventRegister, NodeConfig, OpManager, PeerId, handle_aborted_op,
+        process_message_decoupled,
     },
     ring::{KnownPeerKeyLocation, PeerConnectionBackoff, PeerKeyLocation},
     tracing::NetEventLog,
@@ -5107,10 +5107,10 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 #[cfg(test)]
 mod tests {
     use crate::config::GlobalExecutor;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
-    use tokio::time::{sleep, timeout, Duration, Instant};
+    use tokio::time::{Duration, Instant, sleep, timeout};
 
     /// Regression test for message loss during shutdown.
     ///

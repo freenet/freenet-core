@@ -23,8 +23,8 @@
 
 use dashmap::DashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::tracing::{TransferDirection, TransferEvent};
@@ -245,22 +245,14 @@ impl TransportMetrics {
         // Update min
         self.min_rtt_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if rtt_us < current {
-                    Some(rtt_us)
-                } else {
-                    None
-                }
+                if rtt_us < current { Some(rtt_us) } else { None }
             })
             .ok();
 
         // Update max
         self.max_rtt_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if rtt_us > current {
-                    Some(rtt_us)
-                } else {
-                    None
-                }
+                if rtt_us > current { Some(rtt_us) } else { None }
             })
             .ok();
     }

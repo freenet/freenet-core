@@ -4305,7 +4305,7 @@ mod tests {
     /// Helper for approximate Duration comparison with tolerance.
     /// Returns true if `a` and `b` differ by at most `tolerance_ms` milliseconds.
     fn duration_approx_eq(a: Duration, b: Duration, tolerance_ms: u64) -> bool {
-        let diff = if a > b { a - b } else { b - a };
+        let diff = a.abs_diff(b);
         diff <= Duration::from_millis(tolerance_ms)
     }
 

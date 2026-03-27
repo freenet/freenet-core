@@ -114,14 +114,19 @@ impl UpdateCommand {
                 Ok(c) => Some(c),
                 Err(e) => {
                     if !self.quiet {
-                        eprintln!("Warning: Failed to download checksums: {}. Continuing without verification.", e);
+                        eprintln!(
+                            "Warning: Failed to download checksums: {}. Continuing without verification.",
+                            e
+                        );
                     }
                     None
                 }
             }
         } else {
             if !self.quiet {
-                eprintln!("Warning: SHA256SUMS.txt not found in release. Continuing without checksum verification.");
+                eprintln!(
+                    "Warning: SHA256SUMS.txt not found in release. Continuing without checksum verification."
+                );
             }
             None
         };
@@ -137,7 +142,7 @@ impl UpdateCommand {
         )
         .await?;
 
-        if let Some(ref checksums) = checksums {
+        if let Some(checksums) = &checksums {
             if let Some(expected_hash) = checksums.get(&freenet_asset_name) {
                 if !self.quiet {
                     println!("Verifying freenet checksum...");
@@ -211,8 +216,13 @@ impl UpdateCommand {
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
-                        Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
+                        Ok(_) => eprintln!(
+                            "Warning: Failed to restart service. Run 'freenet service restart' manually."
+                        ),
+                        Err(e) => eprintln!(
+                            "Warning: Failed to restart service: {}. Run 'freenet service restart' manually.",
+                            e
+                        ),
                     }
                 }
             }
@@ -233,8 +243,13 @@ impl UpdateCommand {
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
-                        Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
+                        Ok(_) => eprintln!(
+                            "Warning: Failed to restart service. Run 'freenet service restart' manually."
+                        ),
+                        Err(e) => eprintln!(
+                            "Warning: Failed to restart service: {}. Run 'freenet service restart' manually.",
+                            e
+                        ),
                     }
                 }
             }
@@ -266,7 +281,7 @@ impl UpdateCommand {
             return;
         }
 
-        if let Some(ref checksums) = checksums {
+        if let Some(checksums) = &checksums {
             if let Some(expected_hash) = checksums.get(asset_name) {
                 if !self.quiet {
                     println!("Verifying fdev checksum...");
@@ -322,7 +337,10 @@ impl UpdateCommand {
 
         if let Err(e) = replace_binary(&extracted_fdev, &fdev_dest) {
             if !self.quiet {
-                eprintln!("Warning: Failed to update fdev: {}. You can update it manually with: curl -fsSL https://freenet.org/install.sh | sh", e);
+                eprintln!(
+                    "Warning: Failed to update fdev: {}. You can update it manually with: curl -fsSL https://freenet.org/install.sh | sh",
+                    e
+                );
             }
         } else if !self.quiet {
             println!("Successfully updated fdev.");
@@ -779,7 +797,9 @@ fn update_service_file(
                 "Warning: Failed to reload systemd daemon. Run 'systemctl daemon-reload' manually."
             );
         } else {
-            eprintln!("Warning: Failed to reload systemd daemon. Run 'systemctl --user daemon-reload' manually.");
+            eprintln!(
+                "Warning: Failed to reload systemd daemon. Run 'systemctl --user daemon-reload' manually."
+            );
         }
     } else if !quiet {
         println!("Service file updated with auto-update hook.");

@@ -156,7 +156,7 @@ impl syn::parse::Parse for FreenetTestArgs {
                                 return Err(syn::Error::new(
                                     other.span(),
                                     "node_locations must be numeric literals",
-                                ))
+                                ));
                             }
                         };
 
@@ -233,7 +233,7 @@ impl syn::parse::Parse for FreenetTestArgs {
                                      Must be 'on_failure', 'always', or 'never'",
                                     other
                                 ),
-                            ))
+                            ));
                         }
                     };
                 }
@@ -254,7 +254,7 @@ impl syn::parse::Parse for FreenetTestArgs {
                                      Must be 'multi_thread' or 'current_thread'",
                                     other
                                 ),
-                            ))
+                            ));
                         }
                     };
                 }
@@ -270,7 +270,7 @@ impl syn::parse::Parse for FreenetTestArgs {
                     return Err(syn::Error::new(
                         key.span(),
                         format!("Unknown attribute '{}'", key),
-                    ))
+                    ));
                 }
             }
 

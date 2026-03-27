@@ -14,7 +14,7 @@ use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::common::{create_peer_pair_with_virtual_time, spawn_auto_advance_task, STREAM_SIZES};
+use super::common::{STREAM_SIZES, create_peer_pair_with_virtual_time, spawn_auto_advance_task};
 
 /// Benchmark large message streaming with VirtualTime (multi-packet transfers)
 ///

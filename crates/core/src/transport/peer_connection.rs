@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -17,11 +17,11 @@ use crate::transport::fast_channel::{self, FastReceiver, FastSender};
 use crate::transport::packet_data::UnknownEncryption;
 use crate::transport::sent_packet_tracker::MESSAGE_CONFIRMATION_TIMEOUT;
 use aes_gcm::Aes128Gcm;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
-use tracing::{instrument, span, Instrument};
+use tracing::{Instrument, instrument, span};
 
 mod inbound_stream;
 mod outbound_stream;
@@ -36,6 +36,7 @@ pub mod streaming_buffer;
 pub(crate) mod streaming_buffer;
 
 use super::{
+    TransportError,
     bbr::DeliveryRateToken,
     congestion_control::{CongestionControl, CongestionController},
     connection_handler::SerializedMessage,
@@ -46,7 +47,6 @@ use super::{
     sent_packet_tracker::{ResendAction, SentPacketTracker},
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
-    TransportError,
 };
 use crate::operations::orphan_streams::OrphanStreamRegistry;
 use crate::util::time_source::InstantTimeSrc;
@@ -2011,7 +2011,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::{
-        inbound_stream::{recv_stream, InboundStream},
+        inbound_stream::{InboundStream, recv_stream},
         outbound_stream::send_stream,
         *,
     };
@@ -2480,8 +2480,8 @@ mod tests {
     #[test]
     fn keepalive_interval_backs_off_for_unanswered_pings() {
         use super::{
-            keepalive_interval_for_pending, KEEP_ALIVE_INTERVAL, MAX_KEEPALIVE_INTERVAL,
-            MAX_UNANSWERED_PINGS,
+            KEEP_ALIVE_INTERVAL, MAX_KEEPALIVE_INTERVAL, MAX_UNANSWERED_PINGS,
+            keepalive_interval_for_pending,
         };
 
         // At or below threshold: base interval (5s)

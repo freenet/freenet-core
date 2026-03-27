@@ -19,8 +19,8 @@ use std::{
     cmp::Ordering,
     collections::BinaryHeap,
     sync::{
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
     },
     task::{Context, Poll, Waker},
 };

@@ -10,8 +10,8 @@ mod common;
 
 use anyhow::Result;
 use common::{
-    connect_ws_with_retry, get_contract_state, load_contract, subscribe_to_contract,
-    update_contract_state, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, connect_ws_with_retry, get_contract_state,
+    load_contract, subscribe_to_contract, update_contract_state,
 };
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};

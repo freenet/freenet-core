@@ -7,7 +7,7 @@ use freenet::simulation::FaultConfig;
 pub(crate) mod network;
 mod single_process;
 
-use crate::network_metrics_server::{start_server, ServerConfig};
+use crate::network_metrics_server::{ServerConfig, start_server};
 
 /// Parse a seed value that can be decimal or hex (0x prefix).
 fn parse_seed(s: &str) -> Result<u64, String> {

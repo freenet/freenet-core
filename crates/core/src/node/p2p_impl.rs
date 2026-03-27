@@ -1,32 +1,32 @@
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use super::{
-    network_bridge::{
-        event_loop_notification_channel, p2p_protoc::P2pConnManager, EventLoopNotificationsReceiver,
-    },
     NetEventRegister, PeerId,
+    network_bridge::{
+        EventLoopNotificationsReceiver, event_loop_notification_channel, p2p_protoc::P2pConnManager,
+    },
 };
 use crate::{
     client_events::client_event_handling,
     ring::{ConnectionManager, Location},
 };
 use crate::{
-    client_events::{combinator::ClientEventsCombinator, BoxedClient},
+    client_events::{BoxedClient, combinator::ClientEventsCombinator},
     config::GlobalExecutor,
     contract::{
-        self, mediator_channels, run_op_request_mediator, ContractHandler, ContractHandlerChannel,
-        ExecutorToEventLoopChannel, NetworkEventListenerHalve, WaitingResolution,
+        self, ContractHandler, ContractHandlerChannel, ExecutorToEventLoopChannel,
+        NetworkEventListenerHalve, WaitingResolution, mediator_channels, run_op_request_mediator,
     },
     message::NodeEvent,
     node::NodeConfig,
     operations::connect,
 };
 
-use super::{background_task_monitor::BackgroundTaskMonitor, OpManager};
+use super::{OpManager, background_task_monitor::BackgroundTaskMonitor};
 
 pub(crate) struct NodeP2P {
     pub(crate) op_manager: Arc<OpManager>,

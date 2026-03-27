@@ -11,8 +11,8 @@ use criterion::{BenchmarkId, Criterion, Throughput};
 use std::hint::black_box as std_black_box;
 
 use aes_gcm::{
-    aead::{AeadInPlace, KeyInit},
     Aes128Gcm,
+    aead::{AeadInPlace, KeyInit},
 };
 
 /// Payload sizes to benchmark (bytes)

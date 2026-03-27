@@ -4,7 +4,7 @@ use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 use super::{BoxedClient, ClientError, ClientId, HostResult, OpenRequest};
 use crate::config::GlobalExecutor;
@@ -362,7 +362,7 @@ mod test {
 
     use freenet_stdlib::client_api::ClientRequest;
     use futures::try_join;
-    use tokio::sync::mpsc::{channel, Receiver, Sender};
+    use tokio::sync::mpsc::{Receiver, Sender, channel};
 
     use super::*;
     use crate::client_events::ClientEventsProxy;
@@ -853,7 +853,7 @@ mod test {
                     Ok(req) => return Ok(req),
                     Err(e) if matches!(e.kind(), ErrorKind::ChannelClosed) => continue,
                     Err(e) if matches!(e.kind(), ErrorKind::TransportProtocolDisconnect) => {
-                        continue
+                        continue;
                     }
                     Err(e) => return Err(e),
                 }

@@ -8,8 +8,8 @@ use freenet_stdlib::client_api::{
 };
 use freenet_stdlib::prelude::*;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;

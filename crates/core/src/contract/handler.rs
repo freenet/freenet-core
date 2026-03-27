@@ -22,9 +22,9 @@ use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use super::executor::{OpRequestSender, RuntimePool};
 use super::ExecutorError;
-use super::{executor::ContractExecutor, ContractError};
+use super::executor::{OpRequestSender, RuntimePool};
+use super::{ContractError, executor::ContractExecutor};
 use crate::client_events::ClientId;
 use crate::client_events::{AuthToken, HostResult, RequestId};
 use crate::config::Config;
@@ -1123,9 +1123,9 @@ pub mod test {
 pub(super) mod in_memory {
     use super::{
         super::{
-            executor::{mock_wasm_runtime::MockWasmRuntime, OpRequestSender},
-            storages::Storage,
             Executor, MockRuntime,
+            executor::{OpRequestSender, mock_wasm_runtime::MockWasmRuntime},
+            storages::Storage,
         },
         ContractHandler, ContractHandlerChannel, ContractHandlerHalve,
     };
@@ -1310,8 +1310,8 @@ pub(super) mod in_memory {
     fn serialization() -> anyhow::Result<()> {
         use freenet_stdlib::prelude::WrappedContract;
         let bytes = crate::util::test::random_bytes_1kb();
-        let mut gen = arbitrary::Unstructured::new(&bytes);
-        let contract: WrappedContract = gen.arbitrary()?;
+        let mut unstructured = arbitrary::Unstructured::new(&bytes);
+        let contract: WrappedContract = unstructured.arbitrary()?;
 
         let serialized = bincode::serialize(&contract)?;
         let deser: WrappedContract = bincode::deserialize(&serialized)?;

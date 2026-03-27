@@ -12,7 +12,7 @@ use freenet::{
 };
 use std::net::{Ipv4Addr, TcpListener};
 use testresult::TestResult;
-use tracing::{info, span, Instrument, Level};
+use tracing::{Instrument, Level, info, span};
 
 /// Creates a local node configuration with custom token TTL and cleanup interval.
 async fn create_test_config(
@@ -183,7 +183,7 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
     use freenet::{
         config::WebsocketApiConfig,
         dev_tool::{AuthToken, ClientId},
-        server::{serve_client_api_for_test, OriginContract},
+        server::{OriginContract, serve_client_api_for_test},
         test_utils,
     };
     use std::time::Duration;

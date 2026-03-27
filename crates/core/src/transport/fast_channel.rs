@@ -42,10 +42,10 @@
 //! let packet = rx.recv_async().await.unwrap();
 //! ```
 
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tokio::sync::Notify;
 
 /// Error returned when the channel is disconnected.
@@ -699,8 +699,7 @@ mod tests {
                 let tx = tx.clone();
                 GlobalExecutor::spawn(async move {
                     // This will block because channel is full
-                    let result = tx.send_async(100 + i).await;
-                    result
+                    tx.send_async(100 + i).await
                 })
             })
             .collect();

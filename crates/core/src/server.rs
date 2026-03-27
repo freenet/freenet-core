@@ -25,12 +25,12 @@ use freenet_stdlib::{
     prelude::*,
 };
 
-use axum::{response::IntoResponse, Extension};
+use axum::{Extension, response::IntoResponse};
 use client_api::HttpClientApi;
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    client_events::{websocket::WebSocketProxy, AuthToken, BoxedClient, ClientId, HostResult},
+    client_events::{AuthToken, BoxedClient, ClientId, HostResult, websocket::WebSocketProxy},
     config::{GlobalExecutor, WebsocketApiConfig},
 };
 
@@ -213,7 +213,7 @@ pub mod local_node {
     use tower_http::trace::TraceLayer;
 
     use crate::{
-        client_events::{websocket::WebSocketProxy, ClientEventsProxy, OpenRequest},
+        client_events::{ClientEventsProxy, OpenRequest, websocket::WebSocketProxy},
         contract::{Executor, ExecutorError},
     };
 

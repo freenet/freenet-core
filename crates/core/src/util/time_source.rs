@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};

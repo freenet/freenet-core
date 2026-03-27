@@ -51,9 +51,12 @@ enum OutboundAppMessage {
 /// and verifies the runtime delivers to B and returns B's output.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
-    std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
-    std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
-    std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+    // SAFETY: test environment, no concurrent threads reading these env vars
+    unsafe {
+        std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
+        std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+        std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+    }
 
     // Load two instances of the same delegate with different params → different keys
     let params_a = Parameters::from(vec![1u8]);
@@ -191,7 +194,7 @@ async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
                 other => {
                     return Err(anyhow!(
                         "Expected DelegateResponse for ping, got: {other:?}"
-                    ))
+                    ));
                 }
             }
         }
@@ -253,7 +256,7 @@ async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
                         _ => {
                             return Err(anyhow!(
                                 "Expected DelegateMessageReceived from B in accumulated output"
-                            ))
+                            ));
                         }
                     }
 
@@ -276,7 +279,7 @@ async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
                 other => {
                     return Err(anyhow!(
                         "Expected DelegateResponse for send-to-delegate, got: {other:?}"
-                    ))
+                    ));
                 }
             }
         }

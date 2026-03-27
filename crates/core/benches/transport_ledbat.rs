@@ -14,7 +14,7 @@
 //! - Validating slow start behavior
 //! - Measuring cold-start vs steady-state performance
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::time::Duration;
 
 mod transport;

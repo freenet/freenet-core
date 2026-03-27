@@ -242,7 +242,7 @@ pub fn reset_backoff() {
 fn should_check_for_update(backoff: Duration) -> bool {
     get_last_check_time()
         .and_then(|last| last.elapsed().ok())
-        .map_or(true, |elapsed| elapsed > backoff)
+        .is_none_or(|elapsed| elapsed > backoff)
 }
 
 /// Get the number of consecutive update failures.

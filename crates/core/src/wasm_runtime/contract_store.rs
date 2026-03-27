@@ -417,8 +417,8 @@ mod test {
     /// - Only the first room's instance_id was indexed
     /// - Subscribe to 2nd+ rooms failed because lookup_key() returned None
     #[tokio::test]
-    async fn test_multiple_contracts_same_code_different_params(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_multiple_contracts_same_code_different_params()
+    -> Result<(), Box<dyn std::error::Error>> {
         let contract_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(contract_dir.path())?;
         let db = create_test_db(contract_dir.path()).await;

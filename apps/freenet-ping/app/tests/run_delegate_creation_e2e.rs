@@ -155,7 +155,7 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
             other => {
                 return Err(anyhow!(
                     "Expected DelegateResponse for parent, got: {other:?}"
-                ))
+                ));
             }
         }
 
@@ -198,7 +198,7 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
                 other => {
                     return Err(anyhow!(
                         "Expected DelegateResponse for ping, got: {other:?}"
-                    ))
+                    ));
                 }
             }
         }
@@ -249,19 +249,19 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
                         OutboundAppMessage::CreateFailed { error_code } => {
                             return Err(anyhow!(
                                 "Child delegate creation failed with error code: {error_code}"
-                            ))
+                            ));
                         }
                         other => {
                             return Err(anyhow!(
                                 "Expected ChildCreated or CreateFailed, got: {other:?}"
-                            ))
+                            ));
                         }
                     }
                 }
                 other => {
                     return Err(anyhow!(
                         "Expected DelegateResponse for creation, got: {other:?}"
-                    ))
+                    ));
                 }
             }
         };
@@ -311,14 +311,14 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
                             tracing::info!("Child delegate responded to ping — creation verified!");
                         }
                         other => {
-                            return Err(anyhow!("Expected child PingResponse, got: {other:?}"))
+                            return Err(anyhow!("Expected child PingResponse, got: {other:?}"));
                         }
                     }
                 }
                 other => {
                     return Err(anyhow!(
                         "Expected DelegateResponse for child ping, got: {other:?}"
-                    ))
+                    ));
                 }
             }
         }
@@ -367,17 +367,15 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
                         OutboundAppMessage::CreateFailed { error_code } => {
                             return Err(anyhow!(
                                 "Second creation should succeed (limit resets per call), got error: {error_code}"
-                            ))
+                            ));
                         }
-                        other => {
-                            return Err(anyhow!("Unexpected response: {other:?}"))
-                        }
+                        other => return Err(anyhow!("Unexpected response: {other:?}")),
                     }
                 }
                 other => {
                     return Err(anyhow!(
                         "Expected DelegateResponse for second creation, got: {other:?}"
-                    ))
+                    ));
                 }
             }
         }

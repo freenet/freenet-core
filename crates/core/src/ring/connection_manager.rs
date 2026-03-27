@@ -21,7 +21,7 @@
 
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -697,7 +697,7 @@ impl ConnectionManager {
         crate::topology::small_world_rand::kleinberg_score(
             candidate_distance,
             connections.iter().flat_map(|(loc, conns)| {
-                std::iter::repeat(my_location.distance(*loc).as_f64()).take(conns.len())
+                std::iter::repeat_n(my_location.distance(*loc).as_f64(), conns.len())
             }),
         )
     }

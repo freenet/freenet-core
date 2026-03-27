@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::{
-    packet_data::PacketData, packet_data::MAX_DATA_SIZE, peer_connection::StreamId, MessagePayload,
-    PacketId,
+    MessagePayload, PacketId, packet_data::MAX_DATA_SIZE, packet_data::PacketData,
+    peer_connection::StreamId,
 };
 
 #[serde_as]

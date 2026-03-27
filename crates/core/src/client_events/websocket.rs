@@ -98,14 +98,14 @@ fn delegate_error_key(err: &DelegateError) -> Option<&[u8]> {
 }
 
 use axum::{
+    Extension, Router,
     extract::{
-        ws::{Message, WebSocket},
         Query, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Extension, Router,
 };
 use freenet_stdlib::{
     client_api::{
@@ -114,17 +114,17 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use futures::{future::BoxFuture, stream::SplitSink, FutureExt, SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture, stream::SplitSink};
 use headers::Header;
 use serde::Deserialize;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     client_events::AuthToken,
     server::{ApiVersion, ClientConnection, HostCallbackResult},
     util::{
-        backoff::{ExponentialBackoff, TrackedBackoff},
         EncodingProtocol,
+        backoff::{ExponentialBackoff, TrackedBackoff},
     },
 };
 
@@ -424,8 +424,8 @@ async fn connection_info(
     next: axum::middleware::Next,
 ) -> Response {
     use headers::{
-        authorization::{Authorization, Bearer},
         HeaderMapExt,
+        authorization::{Authorization, Bearer},
     };
     // tracing::info!(
     //     "headers: {:?}",
@@ -446,7 +446,7 @@ async fn connection_info(
                     header = EncodingProtocolExt::name()
                 ),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -461,7 +461,7 @@ async fn connection_info(
                     header = Authorization::<Bearer>::name()
                 ),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -869,7 +869,7 @@ fn prepare_response_messages(
     conn_state: &mut ConnectionState,
     stream_content: Option<freenet_stdlib::client_api::StreamContent>,
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
-    use freenet_stdlib::client_api::streaming::{chunk_response, CHUNK_THRESHOLD};
+    use freenet_stdlib::client_api::streaming::{CHUNK_THRESHOLD, chunk_response};
 
     if payload.len() > CHUNK_THRESHOLD {
         let stream_id = conn_state.next_stream_id;
@@ -913,7 +913,7 @@ async fn send_response_message(
     conn_state: &mut ConnectionState,
     stream_content: Option<freenet_stdlib::client_api::StreamContent>,
 ) -> Result<(), axum::Error> {
-    use freenet_stdlib::client_api::streaming::{chunk_response, CHUNK_THRESHOLD};
+    use freenet_stdlib::client_api::streaming::{CHUNK_THRESHOLD, chunk_response};
 
     if serialized.len() > CHUNK_THRESHOLD {
         let stream_id = conn_state.next_stream_id;
@@ -1537,7 +1537,7 @@ impl ClientEventsProxy for WebSocketProxy {
 mod tests {
     use super::*;
     use freenet_stdlib::client_api::streaming::{
-        chunk_request, ReassemblyBuffer, CHUNK_SIZE, CHUNK_THRESHOLD,
+        CHUNK_SIZE, CHUNK_THRESHOLD, ReassemblyBuffer, chunk_request,
     };
 
     fn test_conn_state(encoding: EncodingProtocol) -> ConnectionState {
@@ -2056,7 +2056,7 @@ mod tests {
 
     #[test]
     fn reassembly_rejects_too_many_concurrent_streams() {
-        use freenet_stdlib::client_api::streaming::{StreamError, MAX_CONCURRENT_STREAMS};
+        use freenet_stdlib::client_api::streaming::{MAX_CONCURRENT_STREAMS, StreamError};
 
         let mut buf = ReassemblyBuffer::new();
         for i in 0..MAX_CONCURRENT_STREAMS as u32 {
@@ -2076,7 +2076,7 @@ mod tests {
 
     #[test]
     fn reassembly_rejects_oversized_total_chunks() {
-        use freenet_stdlib::client_api::streaming::{StreamError, MAX_TOTAL_CHUNKS};
+        use freenet_stdlib::client_api::streaming::{MAX_TOTAL_CHUNKS, StreamError};
 
         let mut buf = ReassemblyBuffer::new();
         let err = buf

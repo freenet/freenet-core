@@ -1,5 +1,5 @@
-use super::super::contract::*;
 use super::super::Runtime;
+use super::super::contract::*;
 use crate::wasm_runtime::runtime::RuntimeConfig;
 use crate::wasm_runtime::tests::TestSetup;
 use crate::wasm_runtime::{ContractExecError, RuntimeInnerError};

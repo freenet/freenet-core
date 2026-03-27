@@ -80,7 +80,7 @@ use request_density_tracker::{CachedDensityMap, RequestDensityTracker};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use tokio::time::Instant;
-use tracing::{debug, event, info, span, trace, warn, Level};
+use tracing::{Level, debug, event, info, span, trace, warn};
 
 pub mod connection_evaluator;
 mod constants;
@@ -780,11 +780,7 @@ impl TopologyManager {
         if roll >= swap_prob {
             trace!(
                 largest_gap,
-                expected_gap,
-                excess,
-                swap_prob,
-                roll,
-                "Topology swap check: not triggered"
+                expected_gap, excess, swap_prob, roll, "Topology swap check: not triggered"
             );
             return TopologyAdjustment::NoChange;
         }
@@ -1885,7 +1881,7 @@ mod tests {
         for i in 0..10 {
             let u = (i as f64 + 0.5) / 5.0; // 5 evenly spaced per side
             let dist = d_at(u.min(0.999)); // clamp for safety
-                                           // Alternate CW and CCW
+            // Alternate CW and CCW
             let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
             let loc = Location::new_rounded(my_location.as_f64() + sign * dist);
             let peer = PeerKeyLocation::random();

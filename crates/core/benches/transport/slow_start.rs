@@ -13,12 +13,12 @@
 use criterion::{Criterion, Throughput};
 use dashmap::DashMap;
 use freenet::simulation::{TimeSource, VirtualTime};
+use freenet::transport::PeerConnection;
 use freenet::transport::congestion_control::CongestionControlConfig;
 use freenet::transport::mock_transport::{
-    create_mock_peer_with_congestion_config, Channels, MockSocket, PacketDelayPolicy,
-    PacketDropPolicy,
+    Channels, MockSocket, PacketDelayPolicy, PacketDropPolicy,
+    create_mock_peer_with_congestion_config,
 };
-use freenet::transport::PeerConnection;
 use std::hint::black_box as std_black_box;
 use std::sync::Arc;
 use std::time::Duration;

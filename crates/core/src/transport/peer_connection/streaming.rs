@@ -38,8 +38,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use super::streaming_buffer::LockFreeStreamBuffer;
 use super::StreamId;
+use super::streaming_buffer::LockFreeStreamBuffer;
 
 /// No new fragments arrived within this duration → assume the stream is dead.
 ///

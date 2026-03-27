@@ -9,8 +9,8 @@
 //! Each connection's TokenBucket is updated to use this derived rate, while LEDBAT
 //! remains the primary congestion controller.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Default minimum bandwidth per connection (1 MB/s)
 pub const DEFAULT_MIN_PER_CONNECTION: usize = 1_000_000;
