@@ -257,4 +257,5 @@ mod platform {
     }
 }
 
-pub use platform::{show_setup_dialog, SetupResult};
+#[rustfmt::skip]  // Import order differs between local and CI rustfmt versions
+pub use platform::{SetupResult, show_setup_dialog};
