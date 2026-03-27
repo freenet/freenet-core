@@ -2554,6 +2554,10 @@ pub(crate) async fn initial_join_procedure(
 
         const BASE_WAIT_SECS: u64 = 1;
         const LONG_WAIT_SECS: u64 = 30;
+        // Per-peer timeout for cached peer reconnection attempts.
+        // Kept short to avoid delaying gateway bootstrap if NAT holes
+        // have expired or cached peers are unreachable.
+        const CACHED_PEER_TIMEOUT: Duration = Duration::from_secs(5);
         // Use min_connections as the bootstrap threshold so the gateway-directed
         // join loop keeps driving connections until the node has enough peers for
         // ring-based acquisition to take over reliably. Previously hardcoded to 4,
@@ -2571,6 +2575,77 @@ pub(crate) async fn initial_join_procedure(
             "Starting initial join procedure with {} gateways",
             gateways.len()
         );
+
+        // Attempt fast reconnection to cached peers before gateway bootstrap.
+        // After a brief restart, NAT holes to previously-connected peers may
+        // still be open. Connecting directly is faster than routing through
+        // gateways and avoids gateway load.
+        if let Some(ref cache_dir) = op_manager.ring.peer_cache_dir {
+            let cache = crate::ring::peer_cache::PeerCache::load(cache_dir);
+            if !cache.peers.is_empty() {
+                tracing::info!(
+                    cached_peers = cache.peers.len(),
+                    "Attempting fast reconnection to cached peers"
+                );
+                let cached_peer_locs: Vec<PeerKeyLocation> = cache
+                    .peers
+                    .iter()
+                    .take(number_of_parallel_connections)
+                    .map(|cp| PeerKeyLocation::new(cp.pub_key.clone(), cp.addr))
+                    .collect();
+
+                // Spawn each cached peer reconnection as a separate task for true
+                // parallelism (not just cooperative concurrency). Each task has its
+                // own timeout so we don't need to track abort handles.
+                let mut cached_futs: FuturesUnordered<_> = cached_peer_locs
+                    .iter()
+                    .map(|peer| {
+                        let op_mgr = op_manager.clone();
+                        let peer = peer.clone();
+                        GlobalExecutor::spawn(async move {
+                            match tokio::time::timeout(
+                                CACHED_PEER_TIMEOUT,
+                                join_ring_request(&peer, &op_mgr),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    tracing::info!(peer = %peer, "Reconnected to cached peer");
+                                    true
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::debug!(
+                                        peer = %peer, error = %e,
+                                        "Cached peer reconnection failed"
+                                    );
+                                    false
+                                }
+                                Err(_) => {
+                                    tracing::debug!(
+                                        peer = %peer,
+                                        "Cached peer reconnection timed out"
+                                    );
+                                    false
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+
+                let mut successes = 0usize;
+                while let Some(result) = cached_futs.next().await {
+                    if matches!(result, Ok(true)) {
+                        successes += 1;
+                    }
+                }
+
+                tracing::info!(
+                    successes,
+                    attempted = cached_peer_locs.len(),
+                    "Cached peer reconnection complete"
+                );
+            }
+        }
 
         loop {
             let open_conns = op_manager.ring.open_connections();

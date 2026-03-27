@@ -41,6 +41,7 @@ pub use hosting::{AccessType, RecordAccessResult};
 pub mod interest;
 mod live_tx;
 mod location;
+pub(crate) mod peer_cache;
 mod peer_connection_backoff;
 mod peer_key_location;
 pub mod topology_registry;
@@ -91,6 +92,9 @@ pub(crate) struct Ring {
     /// (which returns `tokio::time::Instant`) lets tests supply `SharedMockTimeSource` for
     /// fine-grained control without pausing the entire tokio runtime.
     time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
+    /// Directory for persisting the peer address cache. When set, the peer cache
+    /// is periodically saved here and loaded on startup for fast reconnection.
+    pub(crate) peer_cache_dir: Option<std::path::PathBuf>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -195,6 +199,12 @@ impl Ring {
         const TOPOLOGY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
+        let peer_cache_dir = if is_gateway {
+            // Gateways don't need peer cache — peers connect to them.
+            None
+        } else {
+            Some(config.config.data_dir())
+        };
         let ring = Ring {
             max_hops_to_live,
             router,
@@ -207,6 +217,7 @@ impl Ring {
             connection_backoff: Arc::new(Mutex::new(ConnectionBackoff::new())),
             contract_connect_backoff: Mutex::new(HashMap::new()),
             time_source: Arc::new(InstantTimeSrc::new()),
+            peer_cache_dir,
         };
 
         if let Some(loc) = config.location {
@@ -1772,7 +1783,10 @@ impl Ring {
         let mut pending_conn_adds = BTreeSet::new();
         let mut last_backoff_cleanup = Instant::now();
         let mut last_health_check = Instant::now();
+        let mut last_peer_cache_save = self.time_source.now();
         const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+        // How often to snapshot the peer cache to disk.
+        const PEER_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(30);
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
@@ -1944,6 +1958,19 @@ impl Ring {
                         .await
                     {
                         tracing::debug!(error = ?e, "Failed to send DropConnection for unhealthy peer");
+                    }
+                }
+            }
+
+            // Periodically save peer cache for fast reconnection after restart.
+            if last_peer_cache_save.elapsed() > PEER_CACHE_SAVE_INTERVAL {
+                last_peer_cache_save = self.time_source.now();
+                if let Some(ref dir) = self.peer_cache_dir {
+                    let cache = peer_cache::PeerCache::snapshot_from(&self.connection_manager);
+                    if !cache.peers.is_empty() {
+                        if let Err(e) = cache.save(dir) {
+                            tracing::warn!(error = %e, "Failed to save peer cache");
+                        }
                     }
                 }
             }
