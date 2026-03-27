@@ -100,32 +100,15 @@ mod platform {
         #[nwg_events(OnButtonClick: [SetupWizard::on_run_only])]
         run_only_btn: nwg::Button,
 
-        // ── Progress (hidden initially) ──
-        #[nwg_control(
-            size: (400, 22),
-            position: (40, 270),
-            range: 0..7,
-            flags: "VISIBLE"
-        )]
+        // ── Progress (hidden until install starts) ──
+        #[nwg_control(size: (400, 22), position: (40, 270), range: 0..7)]
         progress_bar: nwg::ProgressBar,
 
-        #[nwg_control(
-            text: "",
-            size: (400, 24),
-            position: (40, 300),
-            font: Some(&data.body_font),
-            flags: "VISIBLE"
-        )]
+        #[nwg_control(text: "", size: (400, 24), position: (40, 300), font: Some(&data.body_font))]
         status_label: nwg::Label,
 
-        // ── Error display ──
-        #[nwg_control(
-            text: "",
-            size: (400, 60),
-            position: (40, 340),
-            font: Some(&data.body_font),
-            flags: "VISIBLE"
-        )]
+        // ── Error display (hidden until error) ──
+        #[nwg_control(text: "", size: (400, 60), position: (40, 340), font: Some(&data.body_font))]
         error_label: nwg::Label,
 
         // ── Cross-thread notification ──
@@ -137,13 +120,23 @@ mod platform {
         result: RefCell<SetupResult>,
         progress_queue: Arc<Mutex<VecDeque<InstallProgress>>>,
         install_step: RefCell<u32>,
+        /// Set to true after install completes or errors — changes button to "Close"
+        finished: RefCell<bool>,
     }
 
     impl SetupWizard {
         fn on_install(&self) {
-            // Hide buttons, show progress
+            // If install already finished (success or error), button acts as "Close"
+            if *self.finished.borrow() {
+                nwg::stop_thread_dispatch();
+                return;
+            }
+
+            // Hide buttons, show progress elements
             self.install_btn.set_visible(false);
             self.run_only_btn.set_visible(false);
+            self.progress_bar.set_visible(true);
+            self.status_label.set_visible(true);
             self.desc_label.set_text("Installing...");
             self.progress_bar.set_pos(0);
 
@@ -197,10 +190,11 @@ mod platform {
                     InstallProgress::OpeningDashboard => ("Opening dashboard...", 6),
                     InstallProgress::Complete => ("Installation complete!", 7),
                     InstallProgress::Error(msg) => {
+                        self.error_label.set_visible(true);
                         self.error_label.set_text(&format!("Error: {msg}"));
                         self.install_btn.set_text("Close");
                         self.install_btn.set_visible(true);
-                        // Repurpose install button as close button
+                        *self.finished.borrow_mut() = true;
                         return;
                     }
                 };
@@ -214,6 +208,7 @@ mod platform {
                         .set_text("Freenet is running! Look for the icon in your system tray.");
                     self.install_btn.set_text("Close");
                     self.install_btn.set_visible(true);
+                    *self.finished.borrow_mut() = true;
                     *self.result.borrow_mut() = SetupResult::Installed;
                 }
             }
@@ -230,11 +225,6 @@ mod platform {
 
         let wizard = SetupWizard::build_ui(Default::default())
             .map_err(|e| anyhow::anyhow!("Failed to build setup UI: {e}"))?;
-
-        // Initially hide progress elements
-        wizard.progress_bar.set_visible(false);
-        wizard.status_label.set_visible(false);
-        wizard.error_label.set_visible(false);
 
         nwg::dispatch_thread_events();
 

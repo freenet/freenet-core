@@ -41,6 +41,12 @@ pub fn maybe_show_setup_wizard() -> anyhow::Result<bool> {
         // Detach from console before showing the GUI window.
         // This hides the brief console flash that would otherwise appear
         // when the user double-clicks freenet.exe from Explorer.
+        //
+        // Note: if the user chooses "Run without installing", the node
+        // will run without console output since we already detached.
+        // This is acceptable for double-click-from-Explorer scenarios
+        // where there's no terminal to show output in anyway. CLI users
+        // who run `freenet network` explicitly don't hit this path.
         unsafe {
             winapi::um::wincon::FreeConsole();
         }
