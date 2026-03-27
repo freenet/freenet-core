@@ -669,6 +669,25 @@ impl Ring {
     }
 
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
+        // Load routing history immediately on startup so the router doesn't
+        // start cold — without this, peers route suboptimally for ~5 minutes
+        // until the first periodic refresh.
+        match register.get_router_events(10_000).await {
+            Ok(history) if !history.is_empty() => {
+                tracing::info!(
+                    events = history.len(),
+                    "Restored routing history from event log"
+                );
+                *router.write() = Router::new(&history);
+            }
+            Ok(_) => {
+                tracing::debug!("No routing history to restore on startup");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Failed to load routing history on startup, starting cold");
+            }
+        }
+
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;
         loop {
