@@ -191,7 +191,8 @@ fn download_url_to_file(_url: &str, _dest: &Path) -> Result<()> {
 /// breaking PATH entries that use `%VARIABLE%` expansion.
 #[cfg(target_os = "windows")]
 fn add_to_user_path(dir: &Path) -> Result<()> {
-    use winreg::{enums::*, RegKey};
+    #[rustfmt::skip] // CI and local rustfmt disagree on ordering
+    use winreg::{RegKey, enums::*};
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let env = hkcu.open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)?;
