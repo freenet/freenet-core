@@ -161,17 +161,27 @@ impl TimeSource for CachingSystemTimeSrc {
     }
 }
 
+/// Fixed, deterministic base wall-clock time for all mock time sources.
+#[cfg(test)]
+fn mock_system_epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct MockTimeSource {
+    start_instant: Instant,
     current_instant: Instant,
+    system_time_epoch: SystemTime,
 }
 
 #[cfg(test)]
 impl MockTimeSource {
     pub fn new(start_instant: Instant) -> Self {
         MockTimeSource {
+            start_instant,
             current_instant: start_instant,
+            system_time_epoch: mock_system_epoch(),
         }
     }
 
@@ -184,6 +194,11 @@ impl MockTimeSource {
 impl TimeSource for MockTimeSource {
     fn now(&self) -> Instant {
         self.current_instant
+    }
+
+    fn system_time_now(&self) -> SystemTime {
+        let elapsed = self.current_instant.duration_since(self.start_instant);
+        self.system_time_epoch + elapsed
     }
 }
 
@@ -217,18 +232,12 @@ pub struct SharedMockTimeSource {
 
 #[cfg(test)]
 impl SharedMockTimeSource {
-    /// A fixed, deterministic base time for mock system time.
-    /// We can't use const arithmetic on SystemTime, so this is computed in new().
-    fn mock_system_epoch() -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
-    }
-
     /// Create a new shared mock time source starting at zero elapsed time.
     pub fn new() -> Self {
         Self {
             epoch: Instant::now(),
             elapsed: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
-            system_time_epoch: Self::mock_system_epoch(),
+            system_time_epoch: mock_system_epoch(),
         }
     }
 
@@ -238,7 +247,7 @@ impl SharedMockTimeSource {
         Self {
             epoch: start,
             elapsed: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
-            system_time_epoch: Self::mock_system_epoch(),
+            system_time_epoch: mock_system_epoch(),
         }
     }
 
