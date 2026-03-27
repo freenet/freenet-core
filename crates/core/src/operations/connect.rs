@@ -2581,7 +2581,10 @@ pub(crate) async fn initial_join_procedure(
         // still be open. Connecting directly is faster than routing through
         // gateways and avoids gateway load.
         if let Some(ref cache_dir) = op_manager.ring.peer_cache_dir {
-            let cache = crate::ring::peer_cache::PeerCache::load(cache_dir);
+            let cache = crate::ring::peer_cache::PeerCache::load(
+                cache_dir,
+                op_manager.ring.time_source.as_ref(),
+            );
             if !cache.peers.is_empty() {
                 tracing::info!(
                     cached_peers = cache.peers.len(),
