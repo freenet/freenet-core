@@ -27,15 +27,20 @@ pub mod ui {
 
 /// Check if Freenet needs to be installed and show the setup wizard if so.
 ///
-/// Returns `Ok(true)` if the wizard was shown and the caller should exit
-/// (either installation completed or user cancelled).
-/// Returns `Ok(false)` if Freenet is already installed or the user chose
-/// to run without installing — the caller should proceed with normal startup.
+/// Returns `Ok(true)` if the caller should exit (wizard shown, or service started).
+/// Returns `Ok(false)` if the caller should proceed with normal startup
+/// (non-Windows, or user chose "Run without installing").
+///
+/// On Windows, when Freenet is already installed, this starts the background
+/// service (with tray icon) instead of returning false — users expect that
+/// running `freenet.exe` with no args launches the tray app, not console mode.
 pub fn maybe_show_setup_wizard() -> anyhow::Result<bool> {
     #[cfg(target_os = "windows")]
     {
         if detection::is_installed() {
-            return Ok(false);
+            // Already installed: start the service (tray icon + background node)
+            // rather than dropping into raw console mode.
+            return start_installed_service();
         }
 
         // Show the setup dialog. The dialog creates its own window, so the
@@ -54,5 +59,24 @@ pub fn maybe_show_setup_wizard() -> anyhow::Result<bool> {
     #[cfg(not(target_os = "windows"))]
     {
         Ok(false)
+    }
+}
+
+/// Start the background service on an already-installed Windows system.
+///
+/// Spawns `freenet service start` (which launches the run-wrapper with tray icon
+/// as a detached process) and exits. If starting fails, falls back to console mode
+/// so the user isn't left with nothing.
+#[cfg(target_os = "windows")]
+fn start_installed_service() -> anyhow::Result<bool> {
+    let exe = std::env::current_exe().unwrap_or_default();
+
+    let status = std::process::Command::new(&exe)
+        .args(["service", "start"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => Ok(true), // Service started, caller should exit
+        _ => Ok(false),                   // Failed — fall back to console mode
     }
 }
