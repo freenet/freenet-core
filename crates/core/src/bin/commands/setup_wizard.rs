@@ -69,14 +69,27 @@ pub fn maybe_show_setup_wizard() -> anyhow::Result<bool> {
 /// so the user isn't left with nothing.
 #[cfg(target_os = "windows")]
 fn start_installed_service() -> anyhow::Result<bool> {
-    let exe = std::env::current_exe().unwrap_or_default();
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let exe = std::env::current_exe()?;
 
     let status = std::process::Command::new(&exe)
         .args(["service", "start"])
+        .creation_flags(CREATE_NO_WINDOW)
         .status();
 
     match status {
         Ok(s) if s.success() => Ok(true), // Service started, caller should exit
-        _ => Ok(false),                   // Failed — fall back to console mode
+        Ok(_) => {
+            eprintln!("Warning: could not start Freenet service, falling back to console mode");
+            Ok(false)
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not start Freenet service ({e}), falling back to console mode"
+            );
+            Ok(false)
+        }
     }
 }
