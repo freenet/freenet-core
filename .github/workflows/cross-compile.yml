@@ -316,17 +316,18 @@ jobs:
             cd artifacts/x86_64-macos-fdev && tar -czvf ../../fdev-x86_64-apple-darwin.tar.gz fdev && cd ../..
           fi
 
-          # Windows x86_64 (use zip for Windows)
+          # Windows x86_64 (zip for backwards compat + bare exe for direct download)
           cd artifacts/x86_64-windows-freenet && zip ../../freenet-x86_64-pc-windows-msvc.zip freenet.exe && cd ../..
           cd artifacts/x86_64-windows-fdev && zip ../../fdev-x86_64-pc-windows-msvc.zip fdev.exe && cd ../..
+          cp artifacts/x86_64-windows-freenet/freenet.exe freenet.exe
 
           # Display the created files
-          ls -lh *.tar.gz *.zip
+          ls -lh *.tar.gz *.zip *.exe
 
       - name: Generate SHA256 checksums
         run: |
           # Generate checksums for all available release assets
-          sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS.txt || true
+          sha256sum *.tar.gz *.zip *.exe 2>/dev/null > SHA256SUMS.txt || true
 
           # Display checksums
           echo "=== SHA256 Checksums ==="
@@ -339,9 +340,9 @@ jobs:
           # Extract the tag name (e.g., v0.1.30)
           TAG_NAME="${GITHUB_REF#refs/tags/}"
 
-          # Collect all archives that were successfully built
+          # Collect all release assets
           ASSETS=""
-          for f in *.tar.gz *.zip; do
+          for f in *.tar.gz *.zip *.exe; do
             [ -f "$f" ] && ASSETS="$ASSETS $f"
           done
           ASSETS="$ASSETS SHA256SUMS.txt"
