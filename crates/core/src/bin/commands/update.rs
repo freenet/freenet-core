@@ -15,6 +15,10 @@ use super::service::{generate_system_service_file, generate_user_service_file};
 
 const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
 
+/// Exit code returned when the binary is already up to date (no update performed).
+/// Used by the service wrapper to avoid unnecessary restarts.
+pub const EXIT_CODE_ALREADY_UP_TO_DATE: i32 = 2;
+
 #[derive(Args, Debug, Clone)]
 pub struct UpdateCommand {
     /// Only check if an update is available without installing
@@ -59,7 +63,9 @@ impl UpdateCommand {
             if !self.quiet {
                 println!("You are already running the latest version.");
             }
-            return Ok(());
+            // Exit with a distinct code so the service wrapper knows no update
+            // was performed and can skip the unnecessary restart.
+            std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
         }
 
         if self.check {

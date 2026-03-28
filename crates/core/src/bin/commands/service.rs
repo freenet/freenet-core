@@ -455,19 +455,39 @@ fn run_wrapper_loop(
                         super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
                         super::tray::TrayAction::CheckUpdate => {
                             // Run the actual update (not just --check). If it
-                            // succeeds, kill the child so the wrapper restarts
-                            // it with the new binary.
-                            let updated = spawn_update_command(&exe_path)
-                                .map(|s| s.success())
-                                .unwrap_or(false);
-                            if updated {
-                                log_wrapper_event(
-                                    log_dir,
-                                    "Update installed via tray, restarting...",
-                                );
-                                drop(child.kill());
-                                drop(child.wait());
-                                break -1; // restart with new binary
+                            // succeeds (exit 0), kill the child so the wrapper
+                            // restarts it with the new binary. Exit 2 means
+                            // already up to date — no restart needed.
+                            #[cfg(any(target_os = "windows", target_os = "macos"))]
+                            if let Some((_, status_tx)) = tray {
+                                status_tx.send(WrapperStatus::Updating).ok();
+                            }
+                            let result = spawn_update_command(&exe_path);
+                            #[cfg(any(target_os = "windows", target_os = "macos"))]
+                            if let Some((_, status_tx)) = tray {
+                                status_tx.send(WrapperStatus::Running).ok();
+                            }
+                            match result {
+                                Ok(s) if s.success() => {
+                                    log_wrapper_event(
+                                        log_dir,
+                                        "Update installed via tray, restarting...",
+                                    );
+                                    drop(child.kill());
+                                    drop(child.wait());
+                                    break -1; // restart with new binary
+                                }
+                                Ok(_) => {
+                                    // Exit code 2 = already up to date, or other
+                                    // non-zero = update failed. Either way, no restart.
+                                    log_wrapper_event(log_dir, "No update available");
+                                }
+                                Err(e) => {
+                                    log_wrapper_event(
+                                        log_dir,
+                                        &format!("Update check failed: {e}"),
+                                    );
+                                }
                             }
                         }
                         super::tray::TrayAction::OpenDashboard => {
