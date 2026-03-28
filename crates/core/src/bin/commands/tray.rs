@@ -53,22 +53,30 @@ mod platform {
     /// Dispatch pending Win32 messages so the tray-icon crate's hidden HWND
     /// receives user interaction events (WM_USER_TRAYICON → right-click menu).
     /// On macOS, tray-icon uses a Cocoa run-loop internally, so this is a no-op.
+    /// Returns `true` if `WM_QUIT` was received (caller should exit the loop).
     #[cfg(target_os = "windows")]
-    fn pump_platform_messages() {
-        use winapi::um::winuser::{DispatchMessageW, PM_REMOVE, PeekMessageW, TranslateMessage};
+    fn pump_platform_messages() -> bool {
+        use winapi::um::winuser::{
+            DispatchMessageW, PM_REMOVE, PeekMessageW, TranslateMessage, WM_QUIT,
+        };
         // Safety: standard Win32 message pump on the thread that created the HWND.
         unsafe {
             let mut msg = std::mem::zeroed();
             while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if msg.message == WM_QUIT {
+                    return true;
+                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
+        false
     }
 
     #[cfg(target_os = "macos")]
-    fn pump_platform_messages() {
+    fn pump_platform_messages() -> bool {
         // macOS: tray-icon drives the NSRunLoop internally; nothing to pump.
+        false
     }
 
     /// Build the tray icon from embedded RGBA pixel data of the Freenet logo.
@@ -163,7 +171,10 @@ mod platform {
         loop {
             // Pump platform messages so the tray-icon crate's hidden HWND
             // receives user interaction events (right-click, etc.).
-            pump_platform_messages();
+            if pump_platform_messages() {
+                action_tx.send(TrayAction::Quit).ok();
+                break;
+            }
 
             // Process menu events (non-blocking peek)
             if let Ok(event) = menu_rx.try_recv() {

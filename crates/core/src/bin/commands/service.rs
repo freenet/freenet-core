@@ -296,6 +296,13 @@ fn sleep_with_jitter_interruptible(
 /// On Windows and macOS, shows a system tray / menu bar icon.
 /// On Linux, runs the wrapper loop directly (no tray).
 fn run_wrapper(version: &str) -> Result<()> {
+    // On Windows, detach from the console so no terminal window is visible.
+    // The wrapper runs as a background service — all output goes to log files.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        winapi::um::wincon::FreeConsole();
+    }
+
     use freenet::tracing::tracer::get_log_dir;
     use std::sync::mpsc;
 
