@@ -120,8 +120,8 @@ serde = { workspace = true }
 zip = { workspace = true }
 tray-icon = { workspace = true }
 muda = { workspace = true }
-native-windows-gui = { workspace = true }
-native-windows-derive = { workspace = true }
+tao = { workspace = true }
+wry = { workspace = true }
 winreg = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
