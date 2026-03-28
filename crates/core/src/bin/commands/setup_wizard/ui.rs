@@ -9,6 +9,7 @@ mod platform {
     use super::super::installer::{self, InstallProgress};
     use tao::event::{Event, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
+    use tao::platform::run_return::EventLoopExtRunReturn;
     use tao::window::WindowBuilder;
     use wry::WebViewBuilder;
 
@@ -34,11 +35,11 @@ mod platform {
     }
 
     /// Show the setup wizard dialog and block until the user makes a choice.
+    ///
+    /// Uses `run_return` instead of `run` so the event loop returns control
+    /// to the caller when the dialog closes (tao's `run` calls `process::exit`).
     pub fn show_setup_dialog() -> anyhow::Result<SetupResult> {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
+        let mut event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
         let proxy = event_loop.create_proxy();
 
         let window = WindowBuilder::new()
@@ -68,10 +69,11 @@ mod platform {
             .build(&window)
             .map_err(|e| anyhow::anyhow!("Failed to create WebView2: {e}"))?;
 
-        let result: Rc<RefCell<SetupResult>> = Rc::new(RefCell::new(SetupResult::Cancelled));
-        let result_clone = result.clone();
+        let mut result = SetupResult::Cancelled;
+        // Guard against double-click spawning multiple installer threads.
+        let mut installing = false;
 
-        event_loop.run(move |event, _, control_flow| {
+        event_loop.run_return(|event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
 
             match event {
@@ -84,6 +86,10 @@ mod platform {
 
                 Event::UserEvent(UiEvent::Action(action)) => match action.as_str() {
                     "install" => {
+                        if installing {
+                            return;
+                        }
+                        installing = true;
                         let install_proxy = proxy.clone();
                         std::thread::spawn(move || {
                             let cb_result = installer::run_install(|progress| {
@@ -97,7 +103,7 @@ mod platform {
                         });
                     }
                     "run_without" => {
-                        *result_clone.borrow_mut() = SetupResult::RunWithout;
+                        result = SetupResult::RunWithout;
                         *control_flow = ControlFlow::Exit;
                     }
                     "close" => {
@@ -133,7 +139,7 @@ mod platform {
                             "updateProgress(92, 'Opening dashboard...')".to_string()
                         }
                         InstallProgress::Complete => {
-                            *result_clone.borrow_mut() = SetupResult::Installed;
+                            result = SetupResult::Installed;
                             "showComplete()".to_string()
                         }
                         InstallProgress::Error(msg) => {
@@ -148,7 +154,7 @@ mod platform {
             }
         });
 
-        Ok(result.take())
+        Ok(result)
     }
 
     /// Escape a string for safe embedding in a JS single-quoted string literal.
