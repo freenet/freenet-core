@@ -50,6 +50,27 @@ mod platform {
 
     const DASHBOARD_URL: &str = super::super::service::DASHBOARD_URL;
 
+    /// Dispatch pending Win32 messages so the tray-icon crate's hidden HWND
+    /// receives user interaction events (WM_USER_TRAYICON → right-click menu).
+    /// On macOS, tray-icon uses a Cocoa run-loop internally, so this is a no-op.
+    #[cfg(target_os = "windows")]
+    fn pump_platform_messages() {
+        use winapi::um::winuser::{DispatchMessageW, PM_REMOVE, PeekMessageW, TranslateMessage};
+        // Safety: standard Win32 message pump on the thread that created the HWND.
+        unsafe {
+            let mut msg = std::mem::zeroed();
+            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pump_platform_messages() {
+        // macOS: tray-icon drives the NSRunLoop internally; nothing to pump.
+    }
+
     /// Build the tray icon from embedded RGBA pixel data of the Freenet logo.
     /// Pre-rendered from the SVG at freenet/web with the blue gradient preserved.
     /// Uses 256x256 as the source so the OS has full detail to downscale from
@@ -140,6 +161,10 @@ mod platform {
         let quit_id = quit_item.id().clone();
 
         loop {
+            // Pump platform messages so the tray-icon crate's hidden HWND
+            // receives user interaction events (right-click, etc.).
+            pump_platform_messages();
+
             // Process menu events (non-blocking peek)
             if let Ok(event) = menu_rx.try_recv() {
                 let action = if event.id == open_dashboard_id {
@@ -176,8 +201,7 @@ mod platform {
                     .ok();
             }
 
-            // Yield to avoid busy-spinning. The platform message pump is driven
-            // by tray-icon internally; we just need to process events periodically.
+            // Yield to avoid busy-spinning between iterations.
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
