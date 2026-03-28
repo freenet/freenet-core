@@ -1669,7 +1669,7 @@ fn check_no_system_flag_windows(system: bool) -> Result<()> {
     if system {
         anyhow::bail!(
             "The --system flag is only supported on Linux.\n\
-             On Windows, use the default scheduled task commands without --system."
+             On Windows, use the default service commands without --system."
         );
     }
     Ok(())
@@ -1690,10 +1690,17 @@ pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
 
     let had_registry = run_key.delete_value("Freenet").is_ok();
 
-    // Kill any running freenet processes (wrapper + child)
+    // Kill any running freenet processes (wrapper + child), excluding ourselves
+    let our_pid = std::process::id().to_string();
     drop(
         std::process::Command::new("taskkill")
-            .args(["/f", "/im", "freenet.exe"])
+            .args([
+                "/f",
+                "/im",
+                "freenet.exe",
+                "/fi",
+                &format!("PID ne {}", our_pid),
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status(),
@@ -1726,7 +1733,7 @@ fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
 
     stop_and_remove_service(system)?;
 
-    println!("Freenet scheduled task uninstalled.");
+    println!("Freenet autostart uninstalled.");
 
     if should_purge(purge, keep_data)? {
         purge_data_dirs(false)?;
@@ -1777,12 +1784,18 @@ fn start_service(system: bool) -> Result<()> {
 
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
 
-    // Spawn the wrapper as a detached process
+    // Spawn the wrapper as a detached process that survives parent exit.
+    // CREATE_NEW_PROCESS_GROUP (0x200) + DETACHED_PROCESS (0x08) ensures
+    // the child is not killed when the parent's console or job object closes.
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x00000008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     std::process::Command::new(&exe_path)
         .args(["service", "run-wrapper"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .context("Failed to start Freenet")?;
 
@@ -1796,8 +1809,16 @@ fn start_service(system: bool) -> Result<()> {
 fn stop_service(system: bool) -> Result<()> {
     check_no_system_flag_windows(system)?;
 
+    // Kill freenet processes, excluding the current one (which IS freenet.exe)
+    let our_pid = std::process::id().to_string();
     let status = std::process::Command::new("taskkill")
-        .args(["/f", "/im", "freenet.exe"])
+        .args([
+            "/f",
+            "/im",
+            "freenet.exe",
+            "/fi",
+            &format!("PID ne {}", our_pid),
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
