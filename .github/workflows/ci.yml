@@ -218,6 +218,29 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo clippy --locked -- -D warnings
 
+  # Windows compile check - catches missing imports, feature flags, and
+  # platform-specific errors that Linux CI misses. Added after #3685 where
+  # PRs #3669/#3680 introduced Windows-only code that failed to compile,
+  # but wasn't caught until the release cross-compile workflow ran.
+  windows_check:
+    name: Windows Check
+    runs-on: windows-latest
+    timeout-minutes: 20
+    needs: fmt_check
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check compilation
+        run: cargo check --locked -p freenet -p fdev
+
   test_unit:
     name: Unit & Integration
     runs-on: "${{ (github.event_name == 'merge_group' && startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"

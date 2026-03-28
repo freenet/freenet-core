@@ -625,6 +625,11 @@ fn freenet_main() -> anyhow::Result<()> {
             run_node(config)
         }
         None => {
+            // Handle --version before the setup wizard so it works in CI
+            // and headless environments where a GUI dialog would hang.
+            if cli.config.version {
+                return run_node(cli.config);
+            }
             // On Windows, if not installed, show setup wizard before starting
             if commands::setup_wizard::maybe_show_setup_wizard()? {
                 return Ok(());
