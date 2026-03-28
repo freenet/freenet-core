@@ -1630,30 +1630,30 @@ fn install_service(system: bool) -> Result<()> {
         .to_str()
         .context("Executable path contains invalid UTF-8")?;
 
-    // Use Task Scheduler to run the wrapper at login. The wrapper manages the
-    // freenet network child process, handles auto-update (exit code 42), crash
-    // backoff, log capture, and shows a system tray icon.
-    let status = std::process::Command::new("schtasks")
-        .args([
-            "/create",
-            "/tn",
-            "Freenet",
-            "/tr",
-            &format!("\"{}\" service run-wrapper", exe_path_str),
-            "/sc",
-            "onlogon",
-            "/rl",
-            "highest",
-            "/f", // Force overwrite if exists
-        ])
-        .status()
-        .context("Failed to create scheduled task")?;
+    // Register Freenet to start at logon via the registry Run key.
+    // This requires no admin privileges — HKCU is user-writable.
+    // The wrapper manages the freenet network child process, handles
+    // auto-update (exit code 42), crash backoff, log capture, and
+    // shows a system tray icon.
+    let run_command = format!("\"{}\" service run-wrapper", exe_path_str);
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let (run_key, _) = hkcu
+        .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .context("Failed to open registry Run key")?;
+    run_key
+        .set_value("Freenet", &run_command)
+        .context("Failed to write Freenet registry entry")?;
 
-    if !status.success() {
-        anyhow::bail!("Failed to create scheduled task. You may need to run as Administrator.");
-    }
+    // Also clean up any legacy scheduled task from older installs
+    drop(
+        std::process::Command::new("schtasks")
+            .args(["/delete", "/tn", "Freenet", "/f"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status(),
+    );
 
-    println!("Freenet scheduled task installed successfully.");
+    println!("Freenet autostart registered successfully.");
     println!();
     println!("To start Freenet now:");
     println!("  freenet service start");
@@ -1675,38 +1675,49 @@ fn check_no_system_flag_windows(system: bool) -> Result<()> {
     Ok(())
 }
 
-/// Stop and remove the Freenet scheduled task. Does not purge data.
-/// Returns true if a task was found and removed.
+/// Stop and remove Freenet autostart. Kills running process, removes registry
+/// Run key, and cleans up any legacy scheduled task. Does not purge data.
+/// Returns true if Freenet was registered.
 #[cfg(target_os = "windows")]
 pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
-    // Check if task exists
-    let query = std::process::Command::new("schtasks")
-        .args(["/query", "/tn", "Freenet"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    if !query.map(|s| s.success()).unwrap_or(false) {
-        return Ok(false);
-    }
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let run_key = hkcu
+        .open_subkey_with_flags(
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
+        )
+        .context("Failed to open registry Run key")?;
 
-    // Stop if running
+    let had_registry = run_key.delete_value("Freenet").is_ok();
+
+    // Kill any running freenet processes (wrapper + child)
     drop(
-        std::process::Command::new("schtasks")
-            .args(["/end", "/tn", "Freenet"])
+        std::process::Command::new("taskkill")
+            .args(["/f", "/im", "freenet.exe"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status(),
     );
 
-    // Delete the task
-    let status = std::process::Command::new("schtasks")
-        .args(["/delete", "/tn", "Freenet", "/f"])
+    // Also clean up any legacy scheduled task from older installs
+    let had_task = std::process::Command::new("schtasks")
+        .args(["/query", "/tn", "Freenet"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
-        .context("Failed to delete scheduled task")?;
-
-    if !status.success() {
-        anyhow::bail!("Failed to delete scheduled task. You may need Administrator privileges.");
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if had_task {
+        drop(
+            std::process::Command::new("schtasks")
+                .args(["/delete", "/tn", "Freenet", "/f"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status(),
+        );
     }
 
-    Ok(true)
+    Ok(had_registry || had_task)
 }
 
 #[cfg(target_os = "windows")]
@@ -1729,16 +1740,31 @@ fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
 fn service_status(system: bool) -> Result<()> {
     check_no_system_flag_windows(system)?;
 
-    let output = std::process::Command::new("schtasks")
-        .args(["/query", "/tn", "Freenet", "/v", "/fo", "list"])
-        .output()
-        .context("Failed to query scheduled task")?;
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let registered = hkcu
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("Freenet").ok())
+        .is_some();
 
-    if output.status.success() {
-        println!("Freenet scheduled task is installed.");
-        println!("{}", String::from_utf8_lossy(&output.stdout));
+    if registered {
+        println!("Freenet autostart is registered.");
+        // Check if actually running
+        let running = std::process::Command::new("tasklist")
+            .args(["/fi", "imagename eq freenet.exe", "/fo", "csv", "/nh"])
+            .output()
+            .map(|o| {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                stdout.contains("freenet.exe")
+            })
+            .unwrap_or(false);
+        if running {
+            println!("Freenet is currently running.");
+        } else {
+            println!("Freenet is not currently running.");
+        }
     } else {
-        println!("Freenet scheduled task is not installed.");
+        println!("Freenet autostart is not registered.");
         std::process::exit(3);
     }
 
@@ -1749,17 +1775,19 @@ fn service_status(system: bool) -> Result<()> {
 fn start_service(system: bool) -> Result<()> {
     check_no_system_flag_windows(system)?;
 
-    let status = std::process::Command::new("schtasks")
-        .args(["/run", "/tn", "Freenet"])
-        .status()
-        .context("Failed to start scheduled task")?;
+    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
 
-    if status.success() {
-        println!("Freenet started.");
-        println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
-    } else {
-        anyhow::bail!("Failed to start Freenet. Make sure the scheduled task is installed.");
-    }
+    // Spawn the wrapper as a detached process
+    std::process::Command::new(&exe_path)
+        .args(["service", "run-wrapper"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to start Freenet")?;
+
+    println!("Freenet started.");
+    println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
 
     Ok(())
 }
@@ -1768,10 +1796,12 @@ fn start_service(system: bool) -> Result<()> {
 fn stop_service(system: bool) -> Result<()> {
     check_no_system_flag_windows(system)?;
 
-    let status = std::process::Command::new("schtasks")
-        .args(["/end", "/tn", "Freenet"])
+    let status = std::process::Command::new("taskkill")
+        .args(["/f", "/im", "freenet.exe"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
-        .context("Failed to stop scheduled task")?;
+        .context("Failed to stop Freenet")?;
 
     if status.success() {
         println!("Freenet stopped.");

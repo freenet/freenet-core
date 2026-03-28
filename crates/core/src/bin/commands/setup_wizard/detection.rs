@@ -9,7 +9,7 @@
 ///
 /// Returns `true` if either:
 /// 1. The binary is running from `%LOCALAPPDATA%\Freenet\bin\`, OR
-/// 2. A "Freenet" scheduled task is registered (service installed)
+/// 2. Freenet autostart is registered (registry Run key or legacy scheduled task)
 pub fn is_installed() -> bool {
     is_in_install_dir() || is_service_registered()
 }
@@ -36,8 +36,19 @@ fn is_in_install_dir() -> bool {
     paths_equivalent(exe_dir, &install_dir)
 }
 
-/// Check if a "Freenet" scheduled task is registered.
+/// Check if Freenet autostart is registered (registry Run key or legacy scheduled task).
 fn is_service_registered() -> bool {
+    // Check registry Run key (new mechanism)
+    let has_registry = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("Freenet").ok())
+        .is_some();
+    if has_registry {
+        return true;
+    }
+
+    // Fallback: check legacy scheduled task
     std::process::Command::new("schtasks")
         .args(["/query", "/tn", "Freenet"])
         .stdout(std::process::Stdio::null())
