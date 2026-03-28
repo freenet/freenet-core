@@ -14,12 +14,12 @@ use crate::{
     node::{NetworkBridge, OpManager},
     operations::{OpInitialization, Operation},
     ring::{Location, PeerKeyLocation, RingError},
-    tracing::{state_hash_full, NetEventLog, OperationFailure},
+    tracing::{NetEventLog, OperationFailure, state_hash_full},
 };
 use either::Either;
 
 use super::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
-use super::{should_use_streaming, OpEnum, OpError, OpOutcome, OperationResult};
+use super::{OpEnum, OpError, OpOutcome, OperationResult, should_use_streaming};
 use crate::transport::peer_connection::StreamId;
 
 use self::messages::GetStreamingPayload;
@@ -512,7 +512,11 @@ impl Display for GetState {
                 write!(
                     f,
                     "AwaitingResponse(requester: {:?}, fetch_contract: {}, retries: {}, current_hop: {}, subscribe: {})",
-                    data.requester, data.fetch_contract, data.retries, data.current_hop, data.subscribe
+                    data.requester,
+                    data.fetch_contract,
+                    data.retries,
+                    data.current_hop,
+                    data.subscribe
                 )
             }
             GetState::Finished(data) => write!(f, "Finished(key: {})", data.key),
@@ -1849,7 +1853,9 @@ impl Operation for GetOp {
                                         notify_get_failed(
                                             op_manager,
                                             id,
-                                            &format!("contract {instance_id} not found after exhausting all peers"),
+                                            &format!(
+                                                "contract {instance_id} not found after exhausting all peers"
+                                            ),
                                         );
                                         return_msg = None;
                                         new_state = None;
@@ -1981,7 +1987,9 @@ impl Operation for GetOp {
                                         notify_get_failed(
                                             op_manager,
                                             id,
-                                            &format!("contract {instance_id} not found after max retries"),
+                                            &format!(
+                                                "contract {instance_id} not found after max retries"
+                                            ),
                                         );
                                         return_msg = None;
                                         new_state = None;
@@ -2211,7 +2219,9 @@ impl Operation for GetOp {
                                     .await?;
 
                                 match res {
-                                    ContractHandlerEvent::PutResponse { new_value: Ok(_), .. } => {
+                                    ContractHandlerEvent::PutResponse {
+                                        new_value: Ok(_), ..
+                                    } => {
                                         tracing::debug!(tx = %id, %key, "Contract put at executor");
 
                                         // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
@@ -2271,12 +2281,17 @@ impl Operation for GetOp {
                                         // Auto-subscribe to receive updates for this contract.
                                         // Only the original requester subscribes — relay peers cache
                                         // for durability but don't subscribe (no freshness obligation).
-                                        if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
+                                        if crate::ring::AUTO_SUBSCRIBE_ON_GET
+                                            && is_original_requester
+                                        {
                                             // Only start new subscription if not already subscribed
-                                            if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
+                                            if access_result.is_new
+                                                || !op_manager.ring.is_subscribed(&key)
+                                            {
                                                 let blocking = subscribe_requested && blocking_sub;
-                                                let child_tx =
-                                                    super::start_subscription_request(op_manager, id, key, blocking);
+                                                let child_tx = super::start_subscription_request(
+                                                    op_manager, id, key, blocking,
+                                                );
                                                 tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription");
                                             }
                                         }
@@ -2297,9 +2312,29 @@ impl Operation for GetOp {
                                         // Don't return error - the GET succeeded, caching is optional
                                         // Continue to process the GET result below
                                     }
-                                    ContractHandlerEvent::DelegateRequest { .. } | ContractHandlerEvent::DelegateResponse(_) | ContractHandlerEvent::PutQuery { .. } | ContractHandlerEvent::GetQuery { .. } | ContractHandlerEvent::GetResponse { .. } | ContractHandlerEvent::UpdateQuery { .. } | ContractHandlerEvent::UpdateResponse { .. } | ContractHandlerEvent::UpdateNoChange { .. } | ContractHandlerEvent::RegisterSubscriberListener { .. } | ContractHandlerEvent::RegisterSubscriberListenerResponse | ContractHandlerEvent::QuerySubscriptions { .. } | ContractHandlerEvent::QuerySubscriptionsResponse | ContractHandlerEvent::GetSummaryQuery { .. } | ContractHandlerEvent::GetSummaryResponse { .. } | ContractHandlerEvent::GetDeltaQuery { .. } | ContractHandlerEvent::GetDeltaResponse { .. } | ContractHandlerEvent::NotifySubscriptionError { .. } | ContractHandlerEvent::NotifySubscriptionErrorResponse | ContractHandlerEvent::ClientDisconnect { .. } => unreachable!(
-                                        "PutQuery from Get operation should always return PutResponse"
-                                    ),
+                                    ContractHandlerEvent::DelegateRequest { .. }
+                                    | ContractHandlerEvent::DelegateResponse(_)
+                                    | ContractHandlerEvent::PutQuery { .. }
+                                    | ContractHandlerEvent::GetQuery { .. }
+                                    | ContractHandlerEvent::GetResponse { .. }
+                                    | ContractHandlerEvent::UpdateQuery { .. }
+                                    | ContractHandlerEvent::UpdateResponse { .. }
+                                    | ContractHandlerEvent::UpdateNoChange { .. }
+                                    | ContractHandlerEvent::RegisterSubscriberListener { .. }
+                                    | ContractHandlerEvent::RegisterSubscriberListenerResponse
+                                    | ContractHandlerEvent::QuerySubscriptions { .. }
+                                    | ContractHandlerEvent::QuerySubscriptionsResponse
+                                    | ContractHandlerEvent::GetSummaryQuery { .. }
+                                    | ContractHandlerEvent::GetSummaryResponse { .. }
+                                    | ContractHandlerEvent::GetDeltaQuery { .. }
+                                    | ContractHandlerEvent::GetDeltaResponse { .. }
+                                    | ContractHandlerEvent::NotifySubscriptionError { .. }
+                                    | ContractHandlerEvent::NotifySubscriptionErrorResponse
+                                    | ContractHandlerEvent::ClientDisconnect { .. } => {
+                                        unreachable!(
+                                            "PutQuery from Get operation should always return PutResponse"
+                                        )
+                                    }
                                 }
                             } else {
                                 // No contract code in GET response - can't cache or subscribe locally.
@@ -2370,7 +2405,7 @@ impl Operation for GetOp {
                         // here because relay peers should not advertise contracts they
                         // are not responsible for in the ring.
                         tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
-                        if let Some(ref code) = contract {
+                        if let Some(code) = contract {
                             if !op_manager.ring.is_hosting_contract(&key) {
                                 let om = op_manager.clone();
                                 let cache_key = key;
@@ -3386,8 +3421,8 @@ mod messages {
 mod tests {
     use super::*;
     use crate::message::Transaction;
-    use crate::operations::test_utils::make_contract_key;
     use crate::operations::VisitedPeers;
+    use crate::operations::test_utils::make_contract_key;
 
     fn make_get_op(state: Option<GetState>, result: Option<GetResult>) -> GetOp {
         GetOp {
@@ -4149,9 +4184,10 @@ mod tests {
         let (new_op, _msg) = result.unwrap_or_else(|_| panic!("expected Ok"));
         if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
             assert_eq!(data.alternatives.len(), 0, "Only one fresh peer injected");
-            assert!(data
-                .tried_peers
-                .contains(&fresh_peer.socket_addr().unwrap()));
+            assert!(
+                data.tried_peers
+                    .contains(&fresh_peer.socket_addr().unwrap())
+            );
         } else {
             panic!("Expected AwaitingResponse state");
         }
@@ -4757,7 +4793,7 @@ mod tests {
     /// Returns true if the op would be selected as a retry candidate.
     fn gc_would_retry(op: &GetOp, retry_count: usize) -> bool {
         const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-        const PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+        const PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
         const MAX_SPECULATIVE_PATHS: u8 = 2;
 
         // Must be originator
@@ -4795,8 +4831,8 @@ mod tests {
         let mut op = make_awaiting_op(vec![make_peer(5001)], &[]);
         op.ack_received = true;
 
-        // Advance time past ACK_TIMEOUT (3s) but within PROGRESS_TIMEOUT (20s)
-        GlobalSimulationTime::set_time_ms(base_ms + 10_000);
+        // Advance time past ACK_TIMEOUT (3s) but within PROGRESS_TIMEOUT (7s)
+        GlobalSimulationTime::set_time_ms(base_ms + 5_000);
 
         assert!(
             !gc_would_retry(&op, 0),
@@ -4814,8 +4850,8 @@ mod tests {
         let mut op = make_awaiting_op(vec![make_peer(5001)], &[]);
         op.ack_received = true;
 
-        // Advance time past PROGRESS_TIMEOUT (20s) + ACK_TIMEOUT (3s) for jitter headroom
-        GlobalSimulationTime::set_time_ms(base_ms + 25_000);
+        // Advance time past PROGRESS_TIMEOUT (7s) + ACK_TIMEOUT (3s) for jitter headroom
+        GlobalSimulationTime::set_time_ms(base_ms + 12_000);
 
         assert!(
             gc_would_retry(&op, 0),

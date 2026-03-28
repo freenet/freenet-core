@@ -100,8 +100,8 @@ pub(crate) type DelegateNotificationSender = mpsc::Sender<DelegateNotification>;
 pub(crate) type DelegateNotificationReceiver = mpsc::Receiver<DelegateNotification>;
 
 pub(crate) use init_tracker::{
-    now_nanos, ContractInitTracker, InitCheckResult, MAX_CONCURRENT_INITIALIZATIONS,
-    MAX_QUEUED_OPS_PER_CONTRACT, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
+    ContractInitTracker, InitCheckResult, MAX_CONCURRENT_INITIALIZATIONS,
+    MAX_QUEUED_OPS_PER_CONTRACT, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, now_nanos,
 };
 pub(crate) use runtime::RuntimePool;
 
@@ -221,7 +221,7 @@ impl ExecutorError {
         if let RuntimeInnerError::WasmError(e) = error {
             match op {
                 Some(InnerOpError::Upsert(key)) => {
-                    return ExecutorError::request(StdContractError::update_exec_error(key, e))
+                    return ExecutorError::request(StdContractError::update_exec_error(key, e));
                 }
                 _ => return ExecutorError::other(anyhow::anyhow!("execution error: {e}")),
             }
@@ -739,8 +739,9 @@ pub(crate) trait ContractExecutor: Send + 'static {
         &mut self,
         key: ContractKey,
         return_contract_code: bool,
-    ) -> impl Future<Output = Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError>>
-           + Send;
+    ) -> impl Future<
+        Output = Result<(Option<WrappedState>, Option<ContractContainer>), ExecutorError>,
+    > + Send;
 
     /// Upsert contract state.
     ///

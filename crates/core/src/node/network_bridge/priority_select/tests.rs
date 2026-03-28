@@ -3,7 +3,7 @@ use crate::config::GlobalExecutor;
 use futures::stream::StreamExt;
 use std::future::Future;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{Duration, sleep, timeout};
 
 /// Mock HandshakeStream for testing that pends forever
 struct MockHandshakeStream;
@@ -562,9 +562,9 @@ async fn test_priority_select_concurrent_random_stress() {
 }
 
 async fn test_with_seed(seed: u64) {
-    use rand::rngs::StdRng;
     use rand::Rng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     tracing::info!("=== Stress test with seed {} ===", seed);
 
@@ -846,8 +846,12 @@ async fn test_with_seed(seed: u64) {
 
         // Safety check to prevent infinite loop
         if iteration > TOTAL_MESSAGES * 3 {
-            tracing::error!("Receiver loop exceeded maximum iterations. Received {} of {} messages after {} iterations",
-                    received_events.len(), TOTAL_MESSAGES, iteration);
+            tracing::error!(
+                "Receiver loop exceeded maximum iterations. Received {} of {} messages after {} iterations",
+                received_events.len(),
+                TOTAL_MESSAGES,
+                iteration
+            );
             panic!("Receiver loop exceeded maximum iterations - possible deadlock");
         }
     }
@@ -972,7 +976,9 @@ async fn test_with_seed(seed: u64) {
         TOTAL_MESSAGES
     );
     tracing::info!("  Received events: {:?}", received_events);
-    tracing::info!("  Priority ordering respected: when multiple messages buffered, highest priority selected first");
+    tracing::info!(
+        "  Priority ordering respected: when multiple messages buffered, highest priority selected first"
+    );
 }
 
 /// Test that verifies waker registration across ALL channels when they're all Pending
@@ -1182,11 +1188,11 @@ async fn test_sparse_messages_reproduce_race() {
     tracing::info!("Sender task completed, received {} messages", received);
 
     assert_eq!(
-            received, 5,
-            "❌ FAIL: PrioritySelectStream still lost messages! Expected 5 but received {} in {} iterations.\n\
+        received, 5,
+        "❌ FAIL: PrioritySelectStream still lost messages! Expected 5 but received {} in {} iterations.\n\
              The fix should prevent lost wakeups by keeping the stream alive.",
-            received, iteration
-        );
+        received, iteration
+    );
     tracing::info!("✅ PASS: All 5 messages received without loss using PrioritySelectStream!");
 }
 
@@ -1559,8 +1565,8 @@ async fn test_recreating_futures_with_nested_select() {
     assert_eq!(final_counter, 3, "Counter should be 3");
 
     tracing::info!(
-            "✅ SUCCESS: Stream with NESTED select (like HandshakeHandler) maintains waker registration!"
-        );
+        "✅ SUCCESS: Stream with NESTED select (like HandshakeHandler) maintains waker registration!"
+    );
     tracing::info!("✅ Received all messages: {:?}", received);
 }
 
@@ -1704,12 +1710,14 @@ async fn test_nested_select_concurrent_arrivals() {
     }
 
     assert_eq!(
-            received.len(), MESSAGE_COUNT,
-            "Should receive all {} messages even with rapid arrivals! Got {}. First 10: {:?}, Last 10: {:?}",
-            MESSAGE_COUNT, received.len(),
-            &received[..received.len().min(10)],
-            &received[received.len().saturating_sub(10)..]
-        );
+        received.len(),
+        MESSAGE_COUNT,
+        "Should receive all {} messages even with rapid arrivals! Got {}. First 10: {:?}, Last 10: {:?}",
+        MESSAGE_COUNT,
+        received.len(),
+        &received[..received.len().min(10)],
+        &received[received.len().saturating_sub(10)..]
+    );
 
     tracing::info!("✅ SUCCESS: All {} rapid messages received!", MESSAGE_COUNT);
     tracing::info!(

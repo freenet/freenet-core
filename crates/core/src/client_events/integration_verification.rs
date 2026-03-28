@@ -2,7 +2,7 @@
 
 use crate::client_events::{ClientId, OpenRequest, RequestId};
 use crate::config::GlobalExecutor;
-use crate::contract::{contract_handler_channel, SessionMessage};
+use crate::contract::{SessionMessage, contract_handler_channel};
 use freenet_stdlib::client_api::ClientRequest;
 use tokio::sync::mpsc;
 
@@ -61,7 +61,7 @@ async fn test_session_adapter_installation() {
 #[tokio::test]
 async fn test_result_router_receives_host_responses() {
     // Test that result router can receive and forward HostResult messages
-    use crate::client_events::{result_router::ResultRouter, HostResult};
+    use crate::client_events::{HostResult, result_router::ResultRouter};
     use crate::message::Transaction;
     use freenet_stdlib::client_api::HostResponse;
 

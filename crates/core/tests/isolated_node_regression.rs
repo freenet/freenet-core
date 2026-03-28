@@ -8,7 +8,7 @@
 //! 5. UPDATE operations complete successfully for local contracts
 
 use freenet::test_utils::{
-    load_contract, make_get, make_put, make_subscribe, make_update, TestContext,
+    TestContext, load_contract, make_get, make_put, make_subscribe, make_update,
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{

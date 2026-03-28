@@ -5,7 +5,7 @@ use std::pin::Pin;
 use either::Either;
 
 pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
-use super::{get, OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
+use super::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult, get};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::node::IsOperationCompleted;
 use crate::ring::PeerKeyLocation;
@@ -21,7 +21,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 /// Maximum peers to try per hop (breadth search).
 /// Matches GET operation's DEFAULT_MAX_BREADTH; change both together.

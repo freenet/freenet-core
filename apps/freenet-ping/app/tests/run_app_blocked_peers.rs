@@ -17,9 +17,9 @@ use std::{
 
 use anyhow::anyhow;
 use common::{
-    allocate_test_node_block, base_node_test_config_with_ip, connect_ws_with_retry,
-    get_all_ping_states, gw_config_from_path_with_ip, test_ip_for_node, test_node_config,
-    wait_for_node_connected, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, allocate_test_node_block,
+    base_node_test_config_with_ip, connect_ws_with_retry, get_all_ping_states,
+    gw_config_from_path_with_ip, test_ip_for_node, test_node_config, wait_for_node_connected,
 };
 use freenet::server::serve_client_api;
 use freenet_ping_app::ping_client::{
@@ -32,7 +32,7 @@ use freenet_stdlib::{
 };
 use futures::FutureExt;
 use tokio::{select, time::sleep};
-use tracing::{span, Instrument, Level};
+use tracing::{Instrument, Level, span};
 
 /// Maximum number of retries when port allocation fails
 const MAX_PORT_RETRY_ATTEMPTS: usize = 5;
@@ -278,26 +278,53 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
         tracing::info!("Gateway: contract deployed!");
 
-        // Node1 and Node2 get the contract
+        // Node1 and Node2 get the contract (with retry — on slow CI runners the
+        // node's internal operation timeout can fire before routing is fully ready)
         for (client, name) in [(&mut client_node1, "Node1"), (&mut client_node2, "Node2")] {
-            tracing::info!("{} getting contract...", name);
-            client
-                .send(ClientRequest::ContractOp(ContractRequest::Get {
-                    key: *contract_key.id(),
-                    return_contract_code: true,
-                    subscribe: false,
-                    blocking_subscribe: false,
-                }))
-                .await?;
+            let mut got_contract = false;
+            for get_attempt in 1..=3 {
+                tracing::info!("{} getting contract (attempt {}/3)...", name, get_attempt);
+                client
+                    .send(ClientRequest::ContractOp(ContractRequest::Get {
+                        key: *contract_key.id(),
+                        return_contract_code: true,
+                        subscribe: false,
+                        blocking_subscribe: false,
+                    }))
+                    .await?;
 
-            tokio::time::timeout(
-                Duration::from_secs(120),
-                wait_for_get_response(client, &contract_key),
-            )
-            .await
-            .map_err(|_| anyhow!("{} get timed out", name))?
-            .map_err(anyhow::Error::msg)?;
-            tracing::info!("{}: got contract!", name);
+                match tokio::time::timeout(
+                    Duration::from_secs(120),
+                    wait_for_get_response(client, &contract_key),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        tracing::info!("{}: got contract!", name);
+                        got_contract = true;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "{}: GET attempt {}/3 failed: {}, retrying...",
+                            name,
+                            get_attempt,
+                            e
+                        );
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "{}: GET attempt {}/3 timed out, retrying...",
+                            name,
+                            get_attempt,
+                        );
+                    }
+                }
+            }
+            if !got_contract {
+                return Err(anyhow!("{} failed to get contract after 3 attempts", name));
+            }
         }
 
         // Subscribe all nodes

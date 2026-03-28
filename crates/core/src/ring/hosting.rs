@@ -33,7 +33,7 @@ mod cache;
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 pub use cache::{AccessType, RecordAccessResult};
-use cache::{HostingCache, DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL};
+use cache::{DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL, HostingCache};
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;

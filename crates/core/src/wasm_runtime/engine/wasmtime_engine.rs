@@ -144,9 +144,9 @@ use wasmtime::{
 };
 
 use super::{InstanceHandle, WasmEngine, WasmError};
+use crate::wasm_runtime::ContractError;
 use crate::wasm_runtime::native_api::{self, MEM_ADDR};
 use crate::wasm_runtime::runtime::RuntimeConfig;
-use crate::wasm_runtime::ContractError;
 
 // Use shared constants from parent module to ensure consistency
 // with host function bounds validation
@@ -2005,7 +2005,11 @@ mod tests {
         engine.drop_instance(&handle);
     }
 
-    /// Verify store refresh works correctly on Linux by checking virtual memory maps.
+    /// Verify store refresh reduces virtual memory maps on Linux.
+    ///
+    /// Uses /proc/self/maps which is process-global, so concurrent tests can
+    /// add noise. We assert the maps dropped by at least half the amount they
+    /// grew, which is robust against moderate concurrent allocation.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_store_refresh_reduces_vm_maps() {
@@ -2031,10 +2035,11 @@ mod tests {
         }
 
         let leaked_maps = count_maps();
+        let growth = leaked_maps.saturating_sub(baseline_maps);
         assert!(
-            leaked_maps > baseline_maps,
+            growth > 10,
             "Dropping instances without store refresh should accumulate maps: \
-             baseline={baseline_maps}, after={leaked_maps}"
+             baseline={baseline_maps}, after={leaked_maps}, growth={growth}"
         );
 
         // One more instance hits the threshold and triggers refresh
@@ -2044,10 +2049,15 @@ mod tests {
         engine.drop_instance(&handle);
 
         let after_refresh_maps = count_maps();
+        // Assert maps dropped by at least half the growth — tolerates noise from
+        // concurrent tests that may add a few mappings during this window.
+        let reduction = leaked_maps.saturating_sub(after_refresh_maps);
         assert!(
-            after_refresh_maps < leaked_maps,
-            "Store refresh should reduce memory maps: \
-             before_refresh={leaked_maps}, after_refresh={after_refresh_maps}"
+            reduction > growth / 2,
+            "Store refresh should substantially reduce memory maps: \
+             leaked={leaked_maps}, after_refresh={after_refresh_maps}, \
+             growth={growth}, reduction={reduction} (need >{half})",
+            half = growth / 2,
         );
     }
 

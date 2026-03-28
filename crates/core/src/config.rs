@@ -3,9 +3,9 @@ use std::{
     fs::{self, File},
     future::Future,
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, LazyLock},
+    sync::{Arc, LazyLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -759,7 +759,7 @@ impl Config {
 
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetworkArgs {
-    /// Address to bind to for the network event listener, default is 0.0.0.0
+    /// Address to bind to for the network event listener, default is :: (dual-stack)
     #[arg(
         name = "network_address",
         long = "network-address",
@@ -1222,7 +1222,7 @@ fn default_bbr_startup_rate() -> Option<u64> {
 
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiArgs {
-    /// Address to bind to for the websocket API, default is 0.0.0.0
+    /// Address to bind to for the websocket API, default is :: (dual-stack)
     #[arg(
         name = "ws_api_address",
         long = "ws-api-address",
@@ -1412,14 +1412,15 @@ impl Default for WebsocketApiConfig {
     }
 }
 
+/// Default listening address: `::` (IPv6 dual-stack, accepts IPv4 via mapped addresses).
 #[inline]
 const fn default_listening_address() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
 }
 
 #[inline]
 const fn default_local_address() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::LOCALHOST)
+    IpAddr::V6(Ipv6Addr::LOCALHOST)
 }
 
 #[inline]
@@ -1602,6 +1603,10 @@ impl ConfigPaths {
         self.config_dir.clone()
     }
 
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone()
+    }
+
     pub fn secrets_dir(&self, mode: OperationMode) -> PathBuf {
         match mode {
             OperationMode::Local => self.secrets_dir.join("local"),
@@ -1706,6 +1711,10 @@ impl Config {
 
     pub fn config_dir(&self) -> PathBuf {
         self.config_paths.config_dir()
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.config_paths.data_dir()
     }
 }
 
@@ -2494,7 +2503,7 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
 
 #[cfg(test)]
 mod tests {
-    use httptest::{matchers::*, responders::*, Expectation, Server};
+    use httptest::{Expectation, Server, matchers::*, responders::*};
 
     use crate::node::NodeConfig;
     use crate::transport::TransportKeypair;

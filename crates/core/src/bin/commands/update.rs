@@ -114,14 +114,19 @@ impl UpdateCommand {
                 Ok(c) => Some(c),
                 Err(e) => {
                     if !self.quiet {
-                        eprintln!("Warning: Failed to download checksums: {}. Continuing without verification.", e);
+                        eprintln!(
+                            "Warning: Failed to download checksums: {}. Continuing without verification.",
+                            e
+                        );
                     }
                     None
                 }
             }
         } else {
             if !self.quiet {
-                eprintln!("Warning: SHA256SUMS.txt not found in release. Continuing without checksum verification.");
+                eprintln!(
+                    "Warning: SHA256SUMS.txt not found in release. Continuing without checksum verification."
+                );
             }
             None
         };
@@ -137,7 +142,7 @@ impl UpdateCommand {
         )
         .await?;
 
-        if let Some(ref checksums) = checksums {
+        if let Some(checksums) = &checksums {
             if let Some(expected_hash) = checksums.get(&freenet_asset_name) {
                 if !self.quiet {
                     println!("Verifying freenet checksum...");
@@ -211,8 +216,13 @@ impl UpdateCommand {
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
-                        Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
+                        Ok(_) => eprintln!(
+                            "Warning: Failed to restart service. Run 'freenet service restart' manually."
+                        ),
+                        Err(e) => eprintln!(
+                            "Warning: Failed to restart service: {}. Run 'freenet service restart' manually.",
+                            e
+                        ),
                     }
                 }
             }
@@ -233,8 +243,13 @@ impl UpdateCommand {
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!("Warning: Failed to restart service. Run 'freenet service restart' manually."),
-                        Err(e) => eprintln!("Warning: Failed to restart service: {}. Run 'freenet service restart' manually.", e),
+                        Ok(_) => eprintln!(
+                            "Warning: Failed to restart service. Run 'freenet service restart' manually."
+                        ),
+                        Err(e) => eprintln!(
+                            "Warning: Failed to restart service: {}. Run 'freenet service restart' manually.",
+                            e
+                        ),
                     }
                 }
             }
@@ -266,7 +281,7 @@ impl UpdateCommand {
             return;
         }
 
-        if let Some(ref checksums) = checksums {
+        if let Some(checksums) = &checksums {
             if let Some(expected_hash) = checksums.get(asset_name) {
                 if !self.quiet {
                     println!("Verifying fdev checksum...");
@@ -322,7 +337,10 @@ impl UpdateCommand {
 
         if let Err(e) = replace_binary(&extracted_fdev, &fdev_dest) {
             if !self.quiet {
-                eprintln!("Warning: Failed to update fdev: {}. You can update it manually with: curl -fsSL https://freenet.org/install.sh | sh", e);
+                eprintln!(
+                    "Warning: Failed to update fdev: {}. You can update it manually with: curl -fsSL https://freenet.org/install.sh | sh",
+                    e
+                );
             }
         } else if !self.quiet {
             println!("Successfully updated fdev.");
@@ -779,7 +797,9 @@ fn update_service_file(
                 "Warning: Failed to reload systemd daemon. Run 'systemctl daemon-reload' manually."
             );
         } else {
-            eprintln!("Warning: Failed to reload systemd daemon. Run 'systemctl --user daemon-reload' manually.");
+            eprintln!(
+                "Warning: Failed to reload systemd daemon. Run 'systemctl --user daemon-reload' manually."
+            );
         }
     } else if !quiet {
         println!("Service file updated with auto-update hook.");
@@ -863,8 +883,72 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
+/// Migrate old-style Windows Task Scheduler entries to registry Run key,
+/// and ensure the run-wrapper command is used for auto-update and tray support.
+#[cfg(target_os = "windows")]
+fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
+    let exe_path_str = binary_path
+        .to_str()
+        .context("Executable path contains invalid UTF-8")?;
+    let run_command = format!("\"{}\" service run-wrapper", exe_path_str);
+
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+
+    // Check if registry Run key already has the correct command
+    let current_value = hkcu
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("Freenet").ok());
+
+    let needs_update = match &current_value {
+        None => {
+            // No registry entry — check if there's a legacy scheduled task to migrate
+            let has_legacy_task = std::process::Command::new("schtasks")
+                .args(["/query", "/tn", "Freenet"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            has_legacy_task
+        }
+        Some(val) => !val.contains("run-wrapper"),
+    };
+
+    if !needs_update {
+        return Ok(());
+    }
+
+    if !quiet {
+        println!("Migrating Freenet autostart to registry Run key...");
+    }
+
+    // Write registry Run key
+    let (run_key, _) = hkcu
+        .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .context("Failed to open registry Run key")?;
+    run_key
+        .set_value("Freenet", &run_command)
+        .context("Failed to write Freenet registry entry")?;
+
+    // Clean up legacy scheduled task (best-effort, may need admin)
+    drop(
+        std::process::Command::new("schtasks")
+            .args(["/delete", "/tn", "Freenet", "/f"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status(),
+    );
+
+    if !quiet {
+        println!("Freenet autostart migrated successfully.");
+    }
+
+    Ok(())
+}
+
 /// No-op on other platforms
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn ensure_service_file_updated(_binary_path: &Path, _quiet: bool) -> Result<()> {
     Ok(())
 }

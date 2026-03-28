@@ -87,8 +87,8 @@ use crate::{
     simulation::{FaultConfig, VirtualTime},
     tracing::TestEventListener,
     transport::{
-        in_memory_socket::{register_network_time_source, unregister_network_time_source},
         TransportPublicKey,
+        in_memory_socket::{register_network_time_source, unregister_network_time_source},
     },
 };
 
@@ -97,7 +97,7 @@ mod network;
 pub mod turmoil_runner;
 
 pub use self::network::{NetworkPeer, PeerMessage, PeerStatus};
-pub use self::turmoil_runner::{run_turmoil_simulation, TurmoilConfig, TurmoilResult};
+pub use self::turmoil_runner::{TurmoilConfig, TurmoilResult, run_turmoil_simulation};
 
 pub(crate) type EventId = u32;
 
@@ -359,12 +359,14 @@ impl<'a> From<&'a str> for NodeLabel {
         assert!(value.starts_with("gateway-") || value.starts_with("node-"));
         let mut parts = value.split('-');
         assert!(parts.next().is_some());
-        assert!(parts
-            .next()
-            .map(|s| s.parse::<u16>())
-            .transpose()
-            .expect("should be an u16")
-            .is_some());
+        assert!(
+            parts
+                .next()
+                .map(|s| s.parse::<u16>())
+                .transpose()
+                .expect("should be an u16")
+                .is_some()
+        );
         assert!(parts.next().is_none());
         Self(value.to_string().into())
     }
@@ -886,7 +888,7 @@ impl SimNetwork {
     /// Initializes the default fault injection with VirtualTime but no faults.
     /// Users can call with_fault_injection() to add message loss, latency, etc.
     fn init_default_fault_injection(&mut self) {
-        use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
+        use crate::node::network_bridge::{FaultInjectorState, set_fault_injector};
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         let state = FaultInjectorState::new(FaultConfig::default(), fault_seed)
             .with_virtual_time(self.virtual_time.clone());
@@ -1009,7 +1011,7 @@ impl SimNetwork {
     /// sim.advance_virtual_time();
     /// ```
     pub fn with_fault_injection(&mut self, config: FaultConfig) {
-        use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
+        use crate::node::network_bridge::{FaultInjectorState, set_fault_injector};
         // Use a derived seed for fault injection to maintain determinism
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         // Always use VirtualTime for deterministic behavior
@@ -1042,7 +1044,7 @@ impl SimNetwork {
         config: FaultConfig,
         virtual_time: VirtualTime,
     ) {
-        use crate::node::network_bridge::{set_fault_injector, FaultInjectorState};
+        use crate::node::network_bridge::{FaultInjectorState, set_fault_injector};
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         let state = FaultInjectorState::new(config, fault_seed).with_virtual_time(virtual_time);
         set_fault_injector(
@@ -2466,7 +2468,9 @@ impl SimNetwork {
             ((self.max_connections - self.min_connections) / 2) + self.min_connections;
         let avg_connections: usize = connections_per_peer.iter().sum::<usize>() / num_nodes;
         if avg_connections < expected_avg_connections {
-            tracing::warn!("Average number of connections ({avg_connections}) is low (< {expected_avg_connections})");
+            tracing::warn!(
+                "Average number of connections ({avg_connections}) is low (< {expected_avg_connections})"
+            );
         }
         Ok(())
     }
@@ -3266,8 +3270,8 @@ impl SimNetwork {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             // Use a seeded RNG for deterministic peer selection
-            use rand::prelude::*;
             use rand::SeedableRng;
+            use rand::prelude::*;
             let mut event_rng = <rand::rngs::SmallRng as SeedableRng>::seed_from_u64(seed);
 
             // Trigger events by sending signals to peer event generators
@@ -3818,8 +3822,8 @@ impl SimNetwork {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             // Use a seeded RNG for deterministic peer selection
-            use rand::prelude::*;
             use rand::SeedableRng;
+            use rand::prelude::*;
             let mut event_rng = <rand::rngs::SmallRng as SeedableRng>::seed_from_u64(seed);
 
             // Trigger events by sending signals to peer event generators
@@ -4074,8 +4078,8 @@ impl SimNetwork {
             // all its messages are dropped.
             let chaos_driver = if let Some(churn_config) = self.churn_config.clone() {
                 use crate::node::network_bridge::get_fault_injector;
-                use rand::prelude::*;
                 use rand::SeedableRng;
+                use rand::prelude::*;
 
                 let chaos_nodes = direct_nodes.clone();
                 let network_name = self.name.clone();
@@ -4215,8 +4219,8 @@ impl SimNetwork {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             // Use a seeded RNG for deterministic peer selection
-            use rand::prelude::*;
             use rand::SeedableRng;
+            use rand::prelude::*;
             let mut event_rng = <rand::rngs::SmallRng as SeedableRng>::seed_from_u64(seed);
 
             for event_id in 0..iterations as u32 {

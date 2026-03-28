@@ -10,7 +10,7 @@
 use freenet::{
     local_node::NodeConfig,
     server::serve_client_api,
-    test_utils::{load_contract, make_get, make_subscribe, TestContext},
+    test_utils::{TestContext, load_contract, make_get, make_subscribe},
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{

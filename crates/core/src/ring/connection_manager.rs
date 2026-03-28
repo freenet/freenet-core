@@ -16,12 +16,12 @@
 //! with the locks above) so they do not participate in the ordering:
 //!
 //! - `connect_jitter_failures` (`parking_lot::Mutex<(u32, Option<Instant>)>`)
-//! - `connect_excluded_peers` (`parking_lot::RwLock<BTreeMap<SocketAddr, (u32, Instant)>>`)
+//! - `acceptor_reliability` (`parking_lot::RwLock<BTreeMap<SocketAddr, AcceptorStats>>`)
 //! - `recently_failed_addrs` (`parking_lot::Mutex<TrackedBackoff<SocketAddr>>`)
 
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
-use std::collections::{btree_map::Entry, BTreeMap, HashSet};
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -72,6 +72,15 @@ const FAILED_ADDR_MAX_TTL: Duration = Duration::from_secs(3600);
 /// Maximum number of failed addresses tracked in the recently-failed cache.
 /// Entries are evicted LRU-style when the limit is reached.
 const FAILED_ADDR_MAX_ENTRIES: usize = 1024;
+
+/// Per-peer CONNECT acceptance success/failure counts.
+/// See [`ConnectionManager::peer_acceptor_reliability`] for scoring formula.
+#[derive(Debug, Clone)]
+struct AcceptorStats {
+    successes: u32,
+    attempts: u32,
+    last_updated: Instant,
+}
 
 /// RAII guard that releases a connect admission slot when dropped.
 ///
@@ -312,10 +321,13 @@ pub(crate) struct ConnectionManager {
     /// accumulated during an idle period are partially wound down before the next
     /// attempt, preventing artificially inflated jitter after idle periods.
     connect_jitter_failures: Arc<parking_lot::Mutex<(u32, Option<Instant>)>>,
-    /// Peers excluded from CONNECT routing due to repeated acceptor failures.
-    /// Key: peer addr, Value: (failure_count, last_failure_time).
-    /// Entries expire after `CONNECT_EXCLUDE_TTL`.
-    connect_excluded_peers: Arc<parking_lot::RwLock<BTreeMap<SocketAddr, (u32, Instant)>>>,
+    /// Per-peer CONNECT acceptor reliability. Tracks success/attempt counts
+    /// to estimate the probability that a peer can successfully accept a
+    /// connection (primarily: NAT hole-punch success rate).
+    ///
+    /// Key: peer socket address
+    /// Value: AcceptorStats (successes, attempts, last_updated)
+    acceptor_reliability: Arc<parking_lot::RwLock<BTreeMap<SocketAddr, AcceptorStats>>>,
 }
 
 impl ConnectionManager {
@@ -436,7 +448,7 @@ impl ConnectionManager {
             connected_since: Arc::new(RwLock::new(BTreeMap::new())),
             peer_health: Arc::new(Mutex::new(PeerHealthTracker::new())),
             connect_jitter_failures: Arc::new(parking_lot::Mutex::new((0, None))),
-            connect_excluded_peers: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+            acceptor_reliability: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -685,7 +697,7 @@ impl ConnectionManager {
         crate::topology::small_world_rand::kleinberg_score(
             candidate_distance,
             connections.iter().flat_map(|(loc, conns)| {
-                std::iter::repeat(my_location.distance(*loc).as_f64()).take(conns.len())
+                std::iter::repeat_n(my_location.distance(*loc).as_f64(), conns.len())
             }),
         )
     }
@@ -1665,96 +1677,51 @@ impl ConnectionManager {
         self.connect_jitter_failures.lock().0
     }
 
-    // ==================== CONNECT Routing Exclusion ====================
+    // ==================== CONNECT Acceptor Reliability ====================
 
-    /// How long a peer stays excluded from CONNECT routing after repeated failures.
-    const CONNECT_EXCLUDE_TTL: Duration = Duration::from_secs(30 * 60);
+    /// How long acceptor reliability stats are retained before expiring.
+    /// After this period the peer reverts to the unknown-reliability prior (0.5).
+    const ACCEPTOR_STATS_TTL: Duration = Duration::from_secs(30 * 60);
 
-    /// Minimum failure count before a peer is eligible for exclusion.
-    const CONNECT_EXCLUDE_MIN_FAILURES: u32 = 3;
-
-    /// Maximum fraction of ring peers that can be excluded from CONNECT routing.
-    /// Never exclude more than this fraction to prevent routing death spiral where
-    /// all peers accumulate failures and get blanket-excluded, leaving zero candidates.
-    const CONNECT_EXCLUDE_MAX_FRACTION: f64 = 0.5;
-
-    /// Record a ConnectFailed for a peer acting as acceptor. Returns the new failure count.
-    ///
-    /// `now` should be captured once by the caller and shared with related time-sensitive
-    /// calls in the same handler so they all see a consistent timestamp.
-    pub fn record_connect_acceptor_failure(&self, addr: SocketAddr, now: Instant) -> u32 {
-        let mut map = self.connect_excluded_peers.write();
-        let entry = map.entry(addr).or_insert((0, now));
-        entry.0 += 1;
-        entry.1 = now;
-        entry.0
-    }
-
-    /// Compute the set of peers currently excluded from CONNECT routing.
-    ///
-    /// Returns peers with the most failures, up to `CONNECT_EXCLUDE_MAX_FRACTION`
-    /// of total ring peers. Only peers with >= `CONNECT_EXCLUDE_MIN_FAILURES` within
-    /// `CONNECT_EXCLUDE_TTL` are eligible for exclusion. This prevents a death spiral
-    /// where all ring peers get excluded after accumulating NAT hole-punch failures.
-    pub fn compute_connect_excluded_peers(&self, now: Instant) -> HashSet<SocketAddr> {
-        let map = self.connect_excluded_peers.read();
-
-        // Collect eligible peers (within TTL and above min failures)
-        let mut eligible: Vec<(SocketAddr, u32)> = map
-            .iter()
-            .filter(|(_, (count, last_failure))| {
-                *count >= Self::CONNECT_EXCLUDE_MIN_FAILURES
-                    && now.duration_since(*last_failure) < Self::CONNECT_EXCLUDE_TTL
-            })
-            .map(|(addr, (count, _))| (*addr, *count))
-            .collect();
-
-        if eligible.is_empty() {
-            return HashSet::new();
+    /// Record the outcome of a CONNECT attempt where `addr` was the acceptor.
+    /// Increments the attempt count and, if `success`, the success count.
+    pub fn record_acceptor_outcome(&self, addr: SocketAddr, success: bool, now: Instant) {
+        let mut map = self.acceptor_reliability.write();
+        let entry = map.entry(addr).or_insert(AcceptorStats {
+            successes: 0,
+            attempts: 0,
+            last_updated: now,
+        });
+        entry.attempts = entry.attempts.saturating_add(1);
+        if success {
+            entry.successes = entry.successes.saturating_add(1);
         }
-
-        // Sort by failure count descending (worst offenders first)
-        eligible.sort_by(|a, b| b.1.cmp(&a.1));
-
-        // Cap at CONNECT_EXCLUDE_MAX_FRACTION of total ring peers.
-        // Use floor() so we never exceed the stated 50% cap.
-        let ring_peer_count = self.connection_count();
-        let max_excluded =
-            ((ring_peer_count as f64) * Self::CONNECT_EXCLUDE_MAX_FRACTION).floor() as usize;
-        // Always allow excluding at least 1 peer (if any are eligible)
-        let max_excluded = max_excluded.max(1);
-
-        if eligible.len() > max_excluded {
-            tracing::info!(
-                eligible = eligible.len(),
-                max_excluded,
-                ring_peer_count,
-                "CONNECT exclusion cap activated: {} eligible peers reduced to {} \
-                 (max {}% of {} ring peers)",
-                eligible.len(),
-                max_excluded,
-                (Self::CONNECT_EXCLUDE_MAX_FRACTION * 100.0) as u32,
-                ring_peer_count,
-            );
-        }
-
-        eligible.truncate(max_excluded);
-        eligible.into_iter().map(|(addr, _)| addr).collect()
+        entry.last_updated = now;
     }
 
-    /// Clear connect exclusion for a peer (on successful hole-punch).
-    pub fn clear_connect_exclusion(&self, addr: SocketAddr) {
-        self.connect_excluded_peers.write().remove(&addr);
-    }
-
-    /// Remove expired exclusion entries. Called from `connection_maintenance` on each tick.
+    /// Return the estimated reliability of `addr` as a CONNECT acceptor.
     ///
-    /// `now` should be the tick's captured timestamp so that all cleanup operations in
-    /// the same maintenance cycle share a consistent view of current time.
-    pub fn cleanup_expired_exclusions(&self, now: Instant) {
-        self.connect_excluded_peers
+    /// Returns a value in `[0.0, 1.0]`:
+    /// - Peers with no history (or expired history): **0.5** (unknown prior)
+    /// - Peers with history: Bayesian estimate via Laplace smoothing
+    ///   `(successes + 1) / (attempts + 2)`, starting at 0.5 for zero
+    ///   observations and converging to the true rate.
+    pub fn peer_acceptor_reliability(&self, addr: SocketAddr, now: Instant) -> f64 {
+        let map = self.acceptor_reliability.read();
+        match map.get(&addr) {
+            Some(stats) if now.duration_since(stats.last_updated) < Self::ACCEPTOR_STATS_TTL => {
+                (stats.successes as f64 + 1.0) / (stats.attempts as f64 + 2.0)
+            }
+            _ => 0.5, // unknown prior
+        }
+    }
+
+    /// Remove acceptor reliability entries older than `ACCEPTOR_STATS_TTL`.
+    /// Called from `connection_maintenance` on each tick.
+    pub fn cleanup_expired_acceptor_stats(&self, now: Instant) {
+        self.acceptor_reliability
             .write()
-            .retain(|_, (_, ts)| now.duration_since(*ts) < Self::CONNECT_EXCLUDE_TTL);
+            .retain(|_, stats| now.duration_since(stats.last_updated) < Self::ACCEPTOR_STATS_TTL);
     }
 
     #[allow(dead_code)]
@@ -4121,111 +4088,129 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_exclusion_never_excludes_all_peers() {
-        // With 10 ring peers all having 5+ failures, at most 50% should be excluded.
-        // This prevents the death spiral where all peers get excluded and routing stalls.
+    fn test_acceptor_reliability_scoring() {
+        // Reliability scoring should give lower scores to peers with more failures
+        // and higher scores to peers with more successes. No cap — all peers remain
+        // routable, just with different weights.
         let own_addr: SocketAddr = "10.0.0.100:9000".parse().unwrap();
         let cm = make_connection_manager(Some(own_addr), 1, 200, true);
-
         let now = Instant::now();
-        let ring_addrs: Vec<SocketAddr> = (1..=10)
-            .map(|i| format!("10.0.0.{}:9000", i).parse().unwrap())
-            .collect();
 
-        // Add all 10 as ring connections
-        for (i, &addr) in ring_addrs.iter().enumerate() {
-            let loc = Location::new(i as f64 / 10.0);
-            let keypair = TransportKeypair::new();
-            cm.add_connection(loc, addr, keypair.public().clone(), false);
+        let good_addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let bad_addr: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        let unknown_addr: SocketAddr = "10.0.0.3:9000".parse().unwrap();
+
+        // Good peer: 8 successes, 2 failures
+        for _ in 0..8 {
+            cm.record_acceptor_outcome(good_addr, true, now);
+        }
+        for _ in 0..2 {
+            cm.record_acceptor_outcome(good_addr, false, now);
         }
 
-        assert_eq!(cm.connection_count(), 10, "should have 10 ring peers");
-
-        // Record 5 failures for ALL 10 peers
-        for &addr in &ring_addrs {
-            for _ in 0..5 {
-                cm.record_connect_acceptor_failure(addr, now);
-            }
+        // Bad peer: 1 success, 9 failures
+        cm.record_acceptor_outcome(bad_addr, true, now);
+        for _ in 0..9 {
+            cm.record_acceptor_outcome(bad_addr, false, now);
         }
 
-        let excluded = cm.compute_connect_excluded_peers(now);
+        let good_score = cm.peer_acceptor_reliability(good_addr, now);
+        let bad_score = cm.peer_acceptor_reliability(bad_addr, now);
+        let unknown_score = cm.peer_acceptor_reliability(unknown_addr, now);
 
-        // At most 50% of 10 = 5 should be excluded
+        // Good peer: (8+1)/(10+2) = 0.75
         assert!(
-            excluded.len() <= 5,
-            "should exclude at most 50% of ring peers, got {}/10 excluded",
-            excluded.len()
+            (good_score - 0.75).abs() < 0.01,
+            "good peer should have ~0.75 reliability, got {}",
+            good_score
         );
-        // At least 1 should be excluded (they all have failures above threshold)
+        // Bad peer: (1+1)/(10+2) ≈ 0.167
         assert!(
-            !excluded.is_empty(),
-            "should exclude at least 1 peer with 5 failures"
+            (bad_score - 1.0 / 6.0).abs() < 0.01,
+            "bad peer should have ~0.167 reliability, got {}",
+            bad_score
         );
-        // At least 5 peers remain available for routing
-        let available = ring_addrs.iter().filter(|a| !excluded.contains(a)).count();
+        // Unknown peer: 0.5 prior
         assert!(
-            available >= 5,
-            "at least 50% of peers must remain available for routing, got {}",
-            available
+            (unknown_score - 0.5).abs() < f64::EPSILON,
+            "unknown peer should have 0.5 reliability, got {}",
+            unknown_score
+        );
+        // Ordering: good > unknown > bad
+        assert!(
+            good_score > unknown_score,
+            "good peer should be more reliable than unknown"
+        );
+        assert!(
+            unknown_score > bad_score,
+            "unknown peer should be more reliable than bad peer"
         );
     }
 
     #[test]
-    fn test_connect_exclusion_prioritizes_worst_offenders() {
-        // When the cap kicks in, the peers with the MOST failures should be excluded,
-        // not arbitrary ones.
+    fn test_acceptor_reliability_failure_only_peers() {
+        // Peers with only failures (no successes) should score below the 0.5
+        // unknown prior, with more failures producing lower scores.
         let own_addr: SocketAddr = "10.0.0.100:9000".parse().unwrap();
         let cm = make_connection_manager(Some(own_addr), 1, 200, true);
         let now = Instant::now();
 
-        // Create 6 ring peers
-        let addrs: Vec<SocketAddr> = (1..=6)
-            .map(|i| format!("10.0.0.{}:9000", i).parse().unwrap())
-            .collect();
-        for (i, &addr) in addrs.iter().enumerate() {
-            let loc = Location::new(i as f64 / 6.0);
-            let keypair = TransportKeypair::new();
-            cm.add_connection(loc, addr, keypair.public().clone(), false);
+        let high_failure_addr: SocketAddr = "10.0.0.1:9000".parse().unwrap();
+        let low_failure_addr: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+
+        // High failure: 0 successes, 10 failures → (0+1)/(10+2) ≈ 0.083
+        for _ in 0..10 {
+            cm.record_acceptor_outcome(high_failure_addr, false, now);
+        }
+        // Low failure: 0 successes, 3 failures → (0+1)/(3+2) = 0.2
+        for _ in 0..3 {
+            cm.record_acceptor_outcome(low_failure_addr, false, now);
         }
 
-        // Give peers 1-3 many failures (10 each), peers 4-6 few failures (3 each)
-        let high_failure_addrs: Vec<SocketAddr> = addrs[0..3].to_vec();
-        let low_failure_addrs: Vec<SocketAddr> = addrs[3..6].to_vec();
+        let high_score = cm.peer_acceptor_reliability(high_failure_addr, now);
+        let low_score = cm.peer_acceptor_reliability(low_failure_addr, now);
 
-        for &addr in &high_failure_addrs {
-            for _ in 0..10 {
-                cm.record_connect_acceptor_failure(addr, now);
-            }
-        }
-        for &addr in &low_failure_addrs {
-            for _ in 0..3 {
-                cm.record_connect_acceptor_failure(addr, now);
-            }
-        }
-
-        let excluded = cm.compute_connect_excluded_peers(now);
-
-        // floor(6 * 0.5) = 3, so at most 3 excluded
-        assert_eq!(
-            excluded.len(),
-            3,
-            "should exclude exactly 3 (50% of 6 ring peers)"
+        assert!(
+            low_score > high_score,
+            "peer with fewer failures ({}) should have higher reliability than peer with more ({})",
+            low_score,
+            high_score
         );
-        // The excluded set should be the 3 worst offenders (10 failures each)
-        for &addr in &high_failure_addrs {
-            assert!(
-                excluded.contains(&addr),
-                "high-failure peer {} should be excluded",
-                addr
-            );
+        // Both should be below the unknown prior of 0.5
+        assert!(high_score < 0.5, "high-failure peer should be below prior");
+        assert!(low_score < 0.5, "low-failure peer should be below prior");
+    }
+
+    #[test]
+    fn test_acceptor_reliability_ttl_expiry() {
+        let cm = crate::ring::ConnectionManager::test_default();
+        let addr: SocketAddr = "10.0.0.7:9000".parse().unwrap();
+        let now = Instant::now();
+
+        // Record failures
+        for _ in 0..5 {
+            cm.record_acceptor_outcome(addr, false, now);
         }
-        // The low-failure peers should NOT be excluded
-        for &addr in &low_failure_addrs {
-            assert!(
-                !excluded.contains(&addr),
-                "low-failure peer {} should NOT be excluded",
-                addr
-            );
-        }
+        let score = cm.peer_acceptor_reliability(addr, now);
+        assert!(score < 0.3, "5 failures should give low score, got {score}");
+
+        // After TTL expires, should return to prior
+        let expired = now + ConnectionManager::ACCEPTOR_STATS_TTL + Duration::from_secs(1);
+        let score = cm.peer_acceptor_reliability(addr, expired);
+        assert!(
+            (score - 0.5).abs() < f64::EPSILON,
+            "expired stats should return 0.5 prior, got {score}"
+        );
+
+        // Cleanup should remove the entry
+        cm.cleanup_expired_acceptor_stats(expired);
+        // Recording again should start fresh
+        cm.record_acceptor_outcome(addr, true, expired);
+        let score = cm.peer_acceptor_reliability(addr, expired);
+        // 1 success, 0 failures: (1+1)/(1+2) = 0.667
+        assert!(
+            (score - 2.0 / 3.0).abs() < 0.01,
+            "fresh entry after cleanup should reflect new data, got {score}"
+        );
     }
 }

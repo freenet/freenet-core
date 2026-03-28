@@ -10,8 +10,8 @@ use axum::response::IntoResponse;
 use axum::{Extension, Router};
 use freenet_stdlib::client_api::{ClientError, ErrorKind, HostResponse};
 use freenet_stdlib::prelude::ContractInstanceId;
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use tracing::instrument;
 
@@ -19,7 +19,7 @@ use crate::client_events::{ClientEventsProxy, ClientId, OpenRequest};
 use crate::server::HostCallbackResult;
 
 use super::{
-    errors::WebSocketApiError, home_page, path_handlers, ApiVersion, AuthToken, ClientConnection,
+    ApiVersion, AuthToken, ClientConnection, errors::WebSocketApiError, home_page, path_handlers,
 };
 
 mod v1;
@@ -314,7 +314,7 @@ impl ClientEventsProxy for HttpClientApi {
                     } => {
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)
-                            .with_origin_contract(origin_contract))
+                            .with_origin_contract(origin_contract));
                     }
                 }
             }

@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use crate::config::{GlobalExecutor, GlobalRng, PCK_VERSION};
@@ -14,9 +14,9 @@ use crate::util::backoff::ExponentialBackoff;
 use aes_gcm::{Aes128Gcm, KeyInit};
 use dashmap::DashSet;
 use futures::{
+    Future, FutureExt, TryFutureExt,
     future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
-    Future, FutureExt, TryFutureExt,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -25,22 +25,22 @@ use tokio::{
     sync::{mpsc, oneshot},
     task_local,
 };
-use tracing::{span, Instrument};
+use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
+    Socket, TransportError,
     congestion_control::CongestionControlConfig,
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
     packet_data::{
-        PacketData, SymmetricAES, MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE,
+        MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
     },
     peer_connection::{PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
-    Socket, TransportError,
 };
 use crate::simulation::{RealTime, TimeSource};
 
@@ -121,7 +121,7 @@ const SOCKET_BIND_BACKOFF: ExponentialBackoff =
 ///
 /// # Arguments
 /// * `keypair` - X25519 keypair for this peer
-/// * `listen_host` - IP address to bind to (use 0.0.0.0 for all interfaces)
+/// * `listen_host` - IP address to bind to (default `::` for dual-stack on all interfaces)
 /// * `listen_port` - UDP port to bind to
 /// * `is_gateway` - Whether this peer acts as a gateway
 /// * `bandwidth_limit` - Optional per-connection bandwidth limit in bytes/sec
@@ -1231,8 +1231,14 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             if let Some(state) = self.connections.get_state(&remote_addr) {
                                 match state {
                                     ConnectionState::Established { .. } => {
-                                        // Check for new identity (peer restart)
-                                        let is_new_identity = if self.is_gateway && packet_data.is_intro_packet() {
+                                        // Check for new identity (peer restart).
+                                        // Both gateways and regular peers detect restart: a valid
+                                        // intro packet on an established connection means the remote
+                                        // restarted and is attempting to reconnect (possibly reusing
+                                        // an existing NAT hole). Tearing down the stale session
+                                        // lets the new handshake proceed. Rate-limited to 1/sec per
+                                        // IP to prevent asymmetric decryption DoS.
+                                        let is_new_identity = if packet_data.is_intro_packet() {
                                             if self.connections.is_rate_limited(&remote_addr) {
                                                 false
                                             } else {
@@ -1261,11 +1267,33 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         if is_new_identity {
                                             tracing::info!(
                                                 peer_addr = %remote_addr,
-                                                "Detected new peer identity. Resetting session."
+                                                is_gateway = self.is_gateway,
+                                                "Detected peer restart (new intro on established connection). Resetting session."
                                             );
                                             self.connections.clear_rate_limit(&remote_addr);
                                             self.connections.remove_established(&remote_addr);
-                                            // Fall through to gateway handler for fresh session
+
+                                            if !self.is_gateway {
+                                                // Non-gateway: accept the restarted peer's intro
+                                                // using a server-side handshake (same as gateways).
+                                                // This lets the restarted peer reconnect directly
+                                                // via an existing NAT hole without full gateway
+                                                // re-bootstrap.
+                                                let inbound_key_bytes = key_from_addr(&remote_addr);
+                                                let (gw_ongoing_connection, packets_sender) =
+                                                    self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
+                                                if self.connections.start_gateway_handshake(remote_addr, packets_sender) {
+                                                    let task = GlobalExecutor::spawn(gw_ongoing_connection
+                                                        .instrument(tracing::span!(tracing::Level::DEBUG, "reconnect_accept"))
+                                                        .map_err(move |error| {
+                                                            tracing::debug!(peer_addr = %remote_addr, error = %error, "Reconnect accept error");
+                                                            (error, remote_addr)
+                                                        }));
+                                                    gw_connection_tasks.push(task);
+                                                }
+                                                continue;
+                                            }
+                                            // Gateway: fall through to gateway handler for fresh session
                                         } else {
                                             match self.connections.try_send_established(&remote_addr, packet_data) {
                                                 Ok(true) => continue,
@@ -2779,7 +2807,7 @@ mod version_cmp {
     /// from GatewayHandshake to Established with no intermediate None state.
     #[test]
     fn test_atomic_handshake_completion_no_packet_loss() {
-        use super::{fast_channel, ConnectionStateManager};
+        use super::{ConnectionStateManager, fast_channel};
         use crate::simulation::VirtualTime;
         use crate::transport::packet_data::{PacketData, UnknownEncryption};
         use std::net::SocketAddr;
@@ -2827,7 +2855,7 @@ mod version_cmp {
     #[test]
     fn test_recently_closed_prevents_asymmetric_decryption() {
         use super::{
-            fast_channel, ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION,
+            ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION, fast_channel,
         };
         use crate::simulation::VirtualTime;
         use crate::transport::packet_data::{PacketData, UnknownEncryption};
@@ -2883,8 +2911,8 @@ mod version_cmp {
     #[test]
     fn test_gateway_connection_rate_limiter() {
         use super::{
-            GatewayConnectionRateLimiter, GW_RAMP_PHASE1_DURATION, GW_RAMP_PHASE1_RATE,
-            GW_RAMP_PHASE2_DURATION, GW_RAMP_PHASE2_RATE,
+            GW_RAMP_PHASE1_DURATION, GW_RAMP_PHASE1_RATE, GW_RAMP_PHASE2_DURATION,
+            GW_RAMP_PHASE2_RATE, GatewayConnectionRateLimiter,
         };
         use crate::simulation::VirtualTime;
         use std::time::Duration;
@@ -2955,9 +2983,9 @@ pub mod mock_transport {
     };
 
     use dashmap::DashMap;
-    use futures::{stream::FuturesOrdered, TryStreamExt};
+    use futures::{TryStreamExt, stream::FuturesOrdered};
     use rand::{Rng, SeedableRng};
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
     use tokio::sync::Mutex;
     use tracing::info;
 
@@ -3771,7 +3799,9 @@ pub mod mock_transport {
             // Use timeout to avoid hanging if connection detection is slow
             let res = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await;
             if res.is_err() {
-                tracing::error!("Test timeout: connection detection took longer than 10s - investigate if this causes test failures");
+                tracing::error!(
+                    "Test timeout: connection detection took longer than 10s - investigate if this causes test failures"
+                );
             }
             assert!(res.is_err() || res.unwrap().is_err());
             Ok::<_, anyhow::Error>(())

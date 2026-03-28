@@ -31,8 +31,8 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Guard that keeps the deadlock detector thread running.
@@ -122,11 +122,13 @@ pub fn init_deadlock_detector() -> DeadlockDetectorGuard {
 mod tests {
     use super::*;
     use parking_lot::Mutex;
+    use serial_test::serial;
     use std::sync::Arc;
 
     /// Verify that the deadlock detector can be initialized and dropped cleanly,
     /// and that normal lock usage does not produce false positives.
     #[test]
+    #[serial(deadlock_detection)]
     fn test_detector_lifecycle_no_false_positives() {
         let guard = init_deadlock_detector_with_config(Duration::from_millis(100), false);
 
@@ -155,12 +157,11 @@ mod tests {
     /// We then call `check_deadlock()` and verify it reports the cycle.
     ///
     /// **Important**: `check_deadlock()` clears detected deadlocks on each call
-    /// (it returns deadlocks "since the last call"). This test must not share
-    /// a process with other tests that call `check_deadlock()`, otherwise they
-    /// can consume each other's results. With nextest (one process per test),
-    /// this is guaranteed. With `cargo test`, use `--test-threads=1` or run
-    /// this test in isolation.
+    /// (it returns deadlocks "since the last call"). Both deadlock tests use
+    /// `#[serial(deadlock_detection)]` to prevent concurrent access to this
+    /// process-global state.
     #[test]
+    #[serial(deadlock_detection)]
     fn test_deadlock_is_detected() {
         use std::sync::Barrier;
 

@@ -24,8 +24,8 @@ use std::{
 use tokio::{select, time::timeout};
 
 use common::{
-    base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    test_node_config, ws_config, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, base_node_test_config_with_ip,
+    connect_async_with_config, gw_config_from_path_with_ip, test_node_config, ws_config,
 };
 
 const NUM_GATEWAYS: usize = 3; // Multiple gateways to distribute load
@@ -60,8 +60,8 @@ async fn test_50_node_operations() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn setup_50_node_network(
-) -> anyhow::Result<(Vec<WebApi>, Vec<WebApi>, ContractKey, WrappedState)> {
+async fn setup_50_node_network()
+-> anyhow::Result<(Vec<WebApi>, Vec<WebApi>, ContractKey, WrappedState)> {
     println!("🔧 Setting up 50-node network...");
 
     // Generate unique IPs for all nodes

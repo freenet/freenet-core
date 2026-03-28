@@ -11,7 +11,7 @@ use freenet::{server::serve_client_api, test_utils::test_ip_for_node};
 use freenet_stdlib::client_api::WebApi;
 use futures::FutureExt;
 use tokio::{select, time::timeout};
-use tracing::{span, Instrument, Level};
+use tracing::{Instrument, Level, span};
 
 use common::{
     base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,

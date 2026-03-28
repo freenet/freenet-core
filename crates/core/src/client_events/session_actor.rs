@@ -403,13 +403,16 @@ impl<T: TimeSource> SessionActor<T> {
 
                 tracing::debug!(
                     "Delivered result for transaction {} to specific client {} with request correlation {}",
-                    tx, client_id, request_id
+                    tx,
+                    client_id,
+                    request_id
                 );
             }
         } else {
             tracing::warn!(
                 "No client found for transaction {} with request ID {}, falling back to general delivery",
-                tx, request_id
+                tx,
+                request_id
             );
             // Fall back to general delivery mechanism
             self.handle_result_delivery(tx, result).await;
@@ -838,11 +841,13 @@ mod tests {
         actor.client_request_ids.insert((tx, client_id), request_id);
 
         // Verify client is registered
-        assert!(actor
-            .client_transactions
-            .get(&tx)
-            .unwrap()
-            .contains(&client_id));
+        assert!(
+            actor
+                .client_transactions
+                .get(&tx)
+                .unwrap()
+                .contains(&client_id)
+        );
         assert!(actor.client_request_ids.contains_key(&(tx, client_id)));
 
         // Simulate client disconnect

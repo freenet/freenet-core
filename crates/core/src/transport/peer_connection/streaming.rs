@@ -38,8 +38,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use super::streaming_buffer::LockFreeStreamBuffer;
 use super::StreamId;
+use super::streaming_buffer::LockFreeStreamBuffer;
 
 /// No new fragments arrived within this duration → assume the stream is dead.
 ///
@@ -47,6 +47,9 @@ use super::StreamId;
 /// PeerConnection hasn't been torn down yet (e.g., one-directional path failure,
 /// slow liveness detection). 30 seconds is generous — even at the reduced 10%
 /// send rate, fragments arrive every few seconds for active transfers.
+///
+/// NOTE: `outbound_stream::CWND_WAIT_TIMEOUT` is derived from this value (minus 10s margin).
+/// If reducing this below 10s, update that constant too.
 pub const STREAM_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Error type for streaming operations.

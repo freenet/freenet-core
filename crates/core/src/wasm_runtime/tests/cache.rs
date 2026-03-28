@@ -1,9 +1,9 @@
 //! Tests for WASM module cache behavior (LRU eviction).
 
+use super::super::Runtime;
 use super::super::contract::ContractRuntimeInterface;
 use super::super::runtime::RuntimeConfig;
-use super::super::Runtime;
-use super::{setup_test_contract, TestSetup};
+use super::{TestSetup, setup_test_contract};
 use freenet_stdlib::prelude::*;
 
 /// Test that the module cache respects capacity limits and evicts LRU entries.

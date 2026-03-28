@@ -2,8 +2,8 @@ use std::{path::Path, str::FromStr};
 
 use freenet_stdlib::prelude::*;
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteRow},
     ConnectOptions, Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteRow},
 };
 
 use crate::wasm_runtime::{ContractError, StateStorage, StateStoreError};

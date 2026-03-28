@@ -6,7 +6,7 @@
 
 ```
 1. Run: cargo fmt
-2. Run: cargo clippy --all-targets
+2. Run: cargo clippy -- -D warnings
 3. Run: cargo test
 ```
 

@@ -11,10 +11,10 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    Error,
     build::*,
     config::{ContractKind, InitPackageConfig},
     util::pipe_std_streams,
-    Error,
 };
 
 pub fn create_new_package(config: InitPackageConfig) -> anyhow::Result<()> {

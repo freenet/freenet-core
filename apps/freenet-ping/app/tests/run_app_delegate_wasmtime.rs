@@ -37,9 +37,12 @@ enum OutboundAppMessage {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_delegate_e2e_wasmtime() -> anyhow::Result<()> {
     // Configure optimized WASM builds
-    std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
-    std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
-    std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+    // SAFETY: test environment, no concurrent threads reading these env vars
+    unsafe {
+        std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
+        std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+        std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+    }
 
     // Load delegate before starting nodes
     let params = Parameters::from(vec![]);
@@ -116,7 +119,7 @@ async fn test_delegate_e2e_wasmtime() -> anyhow::Result<()> {
             other => {
                 return Err(anyhow!(
                     "Expected DelegateResponse for register, got: {other:?}"
-                ))
+                ));
             }
         }
 
@@ -153,7 +156,7 @@ async fn test_delegate_e2e_wasmtime() -> anyhow::Result<()> {
                     let app_msg = match &outbound[0] {
                         OutboundDelegateMsg::ApplicationMessage(msg) => msg,
                         other => {
-                            return Err(anyhow!("Expected ApplicationMessage, got: {other:?}"))
+                            return Err(anyhow!("Expected ApplicationMessage, got: {other:?}"));
                         }
                     };
                     assert!(app_msg.processed, "Message not marked as processed");

@@ -9,7 +9,7 @@ use freenet_stdlib::{
     prelude::*,
 };
 use futures::stream::FuturesUnordered;
-use futures::{future::BoxFuture, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, future::BoxFuture};
 use std::cell::Cell;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
-use crate::operations::{get, put, update, OpError, VisitedPeers};
+use crate::operations::{OpError, VisitedPeers, get, put, update};
 use crate::ring::KnownPeerKeyLocation;
 use crate::tracing::NetEventLog;
 use crate::{
@@ -1927,7 +1927,9 @@ async fn process_open_request(
                         request_id = %request_id,
                         "callback_tx not available for NodeQueries"
                     );
-                    unreachable!("callback_tx should always be Some for NodeQueries based on initialization logic");
+                    unreachable!(
+                        "callback_tx should always be Some for NodeQueries based on initialization logic"
+                    );
                 };
 
                 let node_event = match query {
@@ -2012,8 +2014,8 @@ pub(crate) mod test {
     use futures::{FutureExt, StreamExt};
     use rand::SeedableRng;
     use tokio::net::TcpStream;
-    use tokio::sync::watch::Receiver;
     use tokio::sync::Mutex;
+    use tokio::sync::watch::Receiver;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 

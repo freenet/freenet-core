@@ -1,4 +1,5 @@
 mod isotonic_estimator;
+mod routing_predictor;
 mod util;
 
 use crate::config::GlobalRng;
@@ -49,6 +50,10 @@ pub(crate) struct RoutingPredictionInfo {
     pub time_to_response_start: f64,
     pub expected_total_time: f64,
     pub transfer_speed_bps: f64,
+    /// How much renegade shifted the failure estimate (positive = renegade thinks more likely to fail).
+    /// None if renegade had no prediction for this candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renegade_failure_adjustment: Option<f64>,
 }
 
 impl From<RoutingPrediction> for RoutingPredictionInfo {
@@ -58,6 +63,7 @@ impl From<RoutingPrediction> for RoutingPredictionInfo {
             time_to_response_start: p.time_to_response_start,
             expected_total_time: p.expected_total_time,
             transfer_speed_bps: p.xfer_speed.bytes_per_second,
+            renegade_failure_adjustment: p.renegade_failure_adjustment,
         }
     }
 }
@@ -84,6 +90,19 @@ pub(crate) struct RouterSnapshotInfo {
     pub connect_forward_curve: Option<Vec<(f64, f64)>>,
     pub connect_forward_events: Option<usize>,
     pub connect_forward_peer_adjustments: Option<usize>,
+    /// Renegade predictor diagnostics
+    pub renegade_failure_events: usize,
+    pub renegade_response_time_events: usize,
+    pub renegade_transfer_speed_events: usize,
+    pub renegade_known_peers: usize,
+    /// Brier score for failure predictions (lower is better, 0.25 = random).
+    pub renegade_brier_score: Option<f64>,
+    /// Recent Brier score (EWMA).
+    pub renegade_recent_brier_score: Option<f64>,
+    /// Number of predictions evaluated against actual outcomes.
+    pub renegade_predictions_evaluated: u64,
+    /// Recent (predicted_failure, actual_outcome) pairs for accuracy visualization.
+    pub renegade_accuracy_pairs: Vec<(f64, f64)>,
 }
 
 /// Per-peer routing data for the dashboard detail page.
@@ -101,14 +120,38 @@ pub(crate) struct PeerRoutingSnapshot {
 /// # Usage
 /// Important when using this type:
 /// Need to periodically rebuild the Router using `history` for better predictions.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct Router {
     response_start_time_estimator: IsotonicEstimator,
     transfer_rate_estimator: IsotonicEstimator,
     failure_estimator: IsotonicEstimator,
     mean_transfer_size: Mean,
     consider_n_closest_peers: usize,
+    /// Renegade-ML predictor for peer × contract interaction patterns.
+    /// Complements the isotonic estimators by detecting targeted attacks
+    /// and per-peer behavior that varies by contract location.
+    #[serde(skip)]
+    renegade_predictor: routing_predictor::RoutingPredictor,
 }
+
+impl Clone for Router {
+    fn clone(&self) -> Self {
+        // RoutingPredictor is not cloneable. When Router is cloned (e.g., for
+        // batch reconstruction from history), the predictor starts empty and
+        // gets rebuilt as events are added.
+        Router {
+            response_start_time_estimator: self.response_start_time_estimator.clone(),
+            transfer_rate_estimator: self.transfer_rate_estimator.clone(),
+            failure_estimator: self.failure_estimator.clone(),
+            mean_transfer_size: self.mean_transfer_size,
+            consider_n_closest_peers: self.consider_n_closest_peers,
+            renegade_predictor: routing_predictor::RoutingPredictor::new(RENEGADE_MAX_OBSERVATIONS),
+        }
+    }
+}
+
+/// Maximum observations to retain per renegade funnel stage.
+const RENEGADE_MAX_OBSERVATIONS: usize = 5000;
 
 impl Router {
     pub fn new(history: &[RouteEvent]) -> Self {
@@ -180,6 +223,36 @@ impl Router {
             }
         }
 
+        let mut renegade_predictor =
+            routing_predictor::RoutingPredictor::new_batch(RENEGADE_MAX_OBSERVATIONS);
+
+        // Feed historical events into the renegade predictor.
+        // Use record_at_time with index-based ordering to preserve temporal
+        // relationships (batch events don't have real timestamps, but ordering
+        // is preserved from the event log).
+        for (idx, event) in history.iter().enumerate() {
+            let distance = event
+                .peer
+                .location()
+                .map(|loc| event.contract_location.distance(loc).as_f64())
+                .unwrap_or(0.5);
+
+            let (outcome, _) =
+                routing_predictor::RoutingOutcome::from_route_outcome(&event.outcome);
+
+            // Use index-based time: events are ordered, each ~1 minute apart
+            let time_hours = idx as f64 / 60.0;
+            renegade_predictor.record_at_time(
+                &event.peer,
+                event.contract_location,
+                distance,
+                outcome,
+                time_hours,
+            );
+        }
+
+        renegade_predictor.finish_batch();
+
         Router {
             // Positive because we expect time to increase as distance increases
             response_start_time_estimator: IsotonicEstimator::new(
@@ -195,6 +268,7 @@ impl Router {
             ),
             mean_transfer_size,
             consider_n_closest_peers: 5,
+            renegade_predictor,
         }
     }
 
@@ -207,6 +281,23 @@ impl Router {
     pub fn add_event(&mut self, event: RouteEvent) {
         let was_below_threshold = !self.has_sufficient_routing_events();
 
+        // Feed renegade predictor (before isotonic, which moves event.peer)
+        let distance = event
+            .peer
+            .location()
+            .map(|loc| event.contract_location.distance(loc).as_f64())
+            .unwrap_or(0.5);
+
+        let (renegade_outcome, _) =
+            routing_predictor::RoutingOutcome::from_route_outcome(&event.outcome);
+        self.renegade_predictor.record(
+            &event.peer,
+            event.contract_location,
+            distance,
+            renegade_outcome,
+        );
+
+        // Feed isotonic estimators
         match event.outcome {
             RouteOutcome::Success {
                 time_to_response_start,
@@ -329,23 +420,62 @@ impl Router {
             .estimate_retrieval_time(peer, target_location)
             .ok();
 
+        // Clamp before using in cost formulas — per-peer EWMA adjustments can
+        // push the raw estimate slightly outside [0, 1].
+        let mut failure_estimate = failure_estimate.clamp(0.0, 1.0);
+        let isotonic_failure = failure_estimate;
         let failure_cost_multiplier = 3.0;
 
-        let (expected_total_time, time_to_response_start, xfer_speed) =
-            match (time_estimate, transfer_estimate) {
-                (Some(time), Some(rate)) => {
-                    // Full prediction with timing data
-                    let total = time
-                        + (self.mean_transfer_size.compute() / rate)
-                        + (time * failure_estimate * failure_cost_multiplier);
-                    (total, time, rate)
+        // Blend renegade prediction if available. The renegade predictor captures
+        // peer × contract interactions that the global isotonic model cannot see
+        // (e.g., a peer selectively dropping requests for specific contracts).
+        let distance = peer
+            .location()
+            .map(|loc| target_location.distance(loc).as_f64())
+            .unwrap_or(0.5);
+        let renegade = self
+            .renegade_predictor
+            .predict(peer, target_location, distance);
+
+        let renegade_failure_adjustment =
+            if let Some(renegade_failure) = renegade.failure_probability {
+                if renegade_failure.is_finite() {
+                    let w = self.renegade_predictor.failure_weight();
+                    failure_estimate =
+                        failure_estimate * (1.0 - w) + renegade_failure.clamp(0.0, 1.0) * w;
+                    failure_estimate = failure_estimate.clamp(0.0, 1.0);
+                    Some(failure_estimate - isotonic_failure)
+                } else {
+                    None
                 }
-                _ => {
-                    // Failure-only prediction: use failure probability as cost
-                    let total = failure_estimate * failure_cost_multiplier;
-                    (total, 0.0, 0.0)
-                }
+            } else {
+                None
             };
+
+        let mut time_to_response_start = time_estimate.unwrap_or(0.0);
+        let mut xfer_speed = transfer_estimate.unwrap_or(0.0);
+
+        // Blend renegade timing predictions if available (only when finite and positive)
+        if let Some(renegade_time) = renegade.time_to_response_start {
+            if time_estimate.is_some() && renegade_time.is_finite() && renegade_time >= 0.0 {
+                let w = self.renegade_predictor.response_time_weight();
+                time_to_response_start = time_to_response_start * (1.0 - w) + renegade_time * w;
+            }
+        }
+        if let Some(renegade_speed) = renegade.transfer_speed {
+            if transfer_estimate.is_some() && renegade_speed.is_finite() && renegade_speed > 0.0 {
+                let w = self.renegade_predictor.transfer_speed_weight();
+                xfer_speed = xfer_speed * (1.0 - w) + renegade_speed * w;
+            }
+        }
+
+        let expected_total_time = if time_estimate.is_some() && transfer_estimate.is_some() {
+            time_to_response_start
+                + (self.mean_transfer_size.compute() / xfer_speed)
+                + (time_to_response_start * failure_estimate * failure_cost_multiplier)
+        } else {
+            failure_estimate * failure_cost_multiplier
+        };
 
         Ok(RoutingPrediction {
             failure_probability: failure_estimate,
@@ -354,6 +484,7 @@ impl Router {
             },
             time_to_response_start,
             expected_total_time,
+            renegade_failure_adjustment,
         })
     }
 
@@ -505,6 +636,20 @@ impl Router {
             connect_forward_curve: None,
             connect_forward_events: None,
             connect_forward_peer_adjustments: None,
+            // Renegade predictor diagnostics
+            renegade_failure_events: self.renegade_predictor.len(),
+            renegade_response_time_events: self.renegade_predictor.stage_sizes().1,
+            renegade_transfer_speed_events: self.renegade_predictor.stage_sizes().2,
+            renegade_known_peers: self.renegade_predictor.known_peers(),
+            renegade_brier_score: self.renegade_predictor.brier_score(),
+            renegade_recent_brier_score: self.renegade_predictor.recent_brier_score(),
+            renegade_predictions_evaluated: self.renegade_predictor.predictions_evaluated(),
+            renegade_accuracy_pairs: self
+                .renegade_predictor
+                .recent_accuracy_pairs()
+                .iter()
+                .copied()
+                .collect(),
         }
     }
 
@@ -514,17 +659,17 @@ impl Router {
             .failure_estimator
             .peer_adjustments
             .get(peer)
-            .map(|a| (a.mean(), a.event_count()));
+            .map(|a| (a.value(), a.event_count()));
         let response_time_adj = self
             .response_start_time_estimator
             .peer_adjustments
             .get(peer)
-            .map(|a| (a.mean(), a.event_count()));
+            .map(|a| (a.value(), a.event_count()));
         let transfer_rate_adj = self
             .transfer_rate_estimator
             .peer_adjustments
             .get(peer)
-            .map(|a| (a.mean(), a.event_count()));
+            .map(|a| (a.value(), a.event_count()));
 
         // Compute a sample prediction at the peer's own location (distance=0)
         let prediction = peer
@@ -574,6 +719,8 @@ pub(crate) struct RoutingPrediction {
     pub xfer_speed: TransferSpeed,
     pub time_to_response_start: f64,
     pub expected_total_time: f64,
+    /// How much renegade shifted the failure estimate from isotonic baseline.
+    pub renegade_failure_adjustment: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -723,7 +870,7 @@ mod tests {
             // Note: Due to isotonic regression implementation details, values might
             // occasionally be slightly outside [0, 1] due to floating point errors
             assert!(
-                prediction.failure_probability >= -0.01 && prediction.failure_probability <= 1.01,
+                prediction.failure_probability >= 0.0 && prediction.failure_probability <= 1.0,
                 "failure_probability out of range: {}",
                 prediction.failure_probability
             );
@@ -803,6 +950,7 @@ mod tests {
             },
             time_to_response_start,
             expected_total_time: time_to_response_start + transfer_time,
+            renegade_failure_adjustment: None,
         }
     }
 
@@ -2050,8 +2198,8 @@ mod tests {
                     if let Some(pred) = &candidate.prediction {
                         // Allow small float tolerance around [0, 1]
                         prop_assert!(
-                            pred.failure_probability >= -0.01
-                                && pred.failure_probability <= 1.01,
+                            pred.failure_probability >= 0.0
+                                && pred.failure_probability <= 1.0,
                             "failure_probability {} out of [0, 1] range",
                             pred.failure_probability
                         );

@@ -3,6 +3,11 @@ name: Claude PR Rule Review
 # Advisory review: checks every PR against .claude/rules/ and posts findings
 # as a sticky comment. Non-blocking — does not gate merge.
 #
+# Critical patterns (banned APIs in crates/core/) are enforced by the
+# grep-based "Rule Lint" job in ci.yml, which hard-fails like clippy.
+# This AI review catches nuanced issues (missing jitter, fire-and-forget
+# spawns, etc.) that need human judgment.
+#
 # Triggers:
 # - pull_request_target: runs for all PRs (including forks) with base-repo
 #   secrets available. Safe because we only read the diff — we never execute
@@ -11,7 +16,7 @@ name: Claude PR Rule Review
 #   for fork PRs where the initial run may have been skipped.
 #
 # Complements (does not replace):
-# - ci.yml: cargo fmt, clippy, tests, conventional commits
+# - ci.yml: cargo fmt, clippy, tests, conventional commits, rule lint
 # - claude.yml: interactive @claude mentions
 # - claude-ci-analysis (in ci.yml): failure debugging
 
@@ -24,70 +29,19 @@ on:
       - 'LICENSE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/FUNDING.yml'
-  merge_group:
 
 concurrency:
   group: claude-pr-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  # Auto-pass rule-review/findings for merge queue commits.
-  # Findings were already acknowledged on the PR; the merge queue creates new
-  # merge commits that would never receive this commit status otherwise.
-  merge-queue-pass:
-    name: Claude Rule Review
-    runs-on: ubuntu-latest
-    if: github.event_name == 'merge_group'
-    permissions:
-      statuses: write
-    steps:
-      - name: Set rule-review/findings to success
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.sha,
-              state: 'success',
-              context: 'rule-review/findings',
-              description: 'Auto-passed for merge queue (findings acknowledged on PR)',
-            });
-
-  # Auto-pass rule-review/findings for release and dependabot PRs.
-  # The rule-review job skips these branches, but rule-review/findings is a
-  # required status check — without this, release/dependabot PRs can never merge.
-  skip-pass:
-    name: Claude Rule Review
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name != 'merge_group' &&
-      (startsWith(github.event.pull_request.head.ref, 'release/v') ||
-       startsWith(github.event.pull_request.head.ref, 'dependabot/'))
-    permissions:
-      statuses: write
-    steps:
-      - name: Set rule-review/findings to success
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.payload.pull_request.head.sha,
-              state: 'success',
-              context: 'rule-review/findings',
-              description: 'Auto-passed (release/dependabot PR — no rule review needed)',
-            });
-
   rule-review:
     name: Claude Rule Review
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Skip draft PRs, release branches, dependabot, and merge queue events.
+    # Skip draft PRs, release branches, and dependabot.
     # For label events, only run when the 'claude-review' label was added.
     if: |
-      github.event_name != 'merge_group' &&
       !github.event.pull_request.draft &&
       !startsWith(github.event.pull_request.head.ref, 'release/v') &&
       !startsWith(github.event.pull_request.head.ref, 'dependabot/') &&
@@ -97,7 +51,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      statuses: write
 
     steps:
       - name: Checkout repository
@@ -228,6 +181,11 @@ jobs:
 
             Focus on the DIFF only. Do not review unchanged code.
 
+            NOTE: Critical patterns (banned APIs like Instant::now(), rand::thread_rng(),
+            tokio::net::UdpSocket in crates/core/) are already enforced by the "Rule Lint"
+            CI job via grep. Do NOT report those here — focus on nuanced issues that
+            require judgment.
+
             ## Applicable Rules
 
             The following rules apply to this PR based on the changed file paths:
@@ -244,20 +202,14 @@ jobs:
 
             ## Severity Levels
 
-            **CRITICAL** — Violations that will cause bugs or break deterministic simulation:
-            - `std::time::Instant::now()` or `tokio::time::sleep()` in crates/core/ (must use TimeSource)
-            - `rand::random()` or `rand::thread_rng()` in crates/core/ (must use GlobalRng)
-            - `tokio::net::UdpSocket` in crates/core/ (must use Socket trait)
-            - Network send before `op_manager.push()` (push-before-send violation)
-            - Deleted or commented-out tests (must use #[ignore] + TODO-MUST-FIX)
-
-            **WARNING** — Issues that should be addressed but aren't showstoppers:
+            **WARNING** — Issues that should be addressed:
             - `.unwrap()` in new production code (not tests)
             - Fire-and-forget spawns without BackgroundTaskMonitor
             - Retry loops without jitter
             - Missing PR description sections
             - Cleanup exemptions without TTL or age threshold
             - Unguarded `biased;` in tokio::select!
+            - Network send before `op_manager.push()` (push-before-send violation)
 
             **INFO** — Style suggestions and minor improvements:
             - Missing doc comments on new public APIs
@@ -269,32 +221,25 @@ jobs:
 
             Use this format:
 
-            ### 🔍 Rule Review: [summary]
+            ### Rule Review: [summary]
 
             **Rules checked:** [list of rule files checked]
             **Files reviewed:** [count]
 
-            #### Critical
-            - [ ] `file:line` — description (rule: X)
-
             #### Warnings
-            - [ ] `file:line` — description (rule: X)
+            - `file:line` — description (rule: X)
 
             #### Info
-            - [ ] `file:line` — description (rule: X)
-
-            > **To acknowledge findings:** Check each box above once addressed (or a tracking issue opened),
-            > or post `/ack` to dismiss all findings for this revision.
-            > Merge is blocked until Critical and Warning findings are acknowledged.
+            - `file:line` — description (rule: X)
 
             If there are no findings at any severity level, output:
 
-            ### ✅ Rule Review: No issues found
+            ### Rule Review: No issues found
 
             **Rules checked:** [list]
             **Files reviewed:** [count]
 
-            No rule violations detected — merge is not blocked by this check.
+            No rule violations detected.
 
       - name: Post review comment
         if: steps.rules.outputs.skip != 'true'
@@ -308,10 +253,10 @@ jobs:
             // If Claude step failed, post a warning instead of silently doing nothing
             if (reviewOutcome === 'failure') {
               const warningBody = marker + '\n' +
-                '### ⚠️ Claude Rule Review: Failed to run\n\n' +
+                '### Claude Rule Review: Failed to run\n\n' +
                 'The Claude rule review step failed (likely an authentication or API issue). ' +
                 'Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n' +
-                '---\n*Automated review against `.claude/rules/`. Critical and Warning findings block merge — check boxes or post `/ack` to acknowledge.*';
+                '---\n*Advisory review against `.claude/rules/`. Critical patterns are enforced by the Rule Lint CI job.*';
 
               const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
@@ -369,7 +314,7 @@ jobs:
               return;
             }
 
-            const body = report + '\n\n---\n*Automated review against `.claude/rules/`. Critical and Warning findings block merge — check boxes or post `/ack` to acknowledge.*';
+            const body = report + '\n\n---\n*Advisory review against `.claude/rules/`. Critical patterns are enforced by the Rule Lint CI job.*';
 
             // Find and update existing sticky comment, or create new one
             const { data: comments } = await github.rest.issues.listComments({
@@ -399,46 +344,3 @@ jobs:
               });
               console.log('Created new review comment');
             }
-
-      - name: Set acknowledgment status
-        if: steps.rules.outputs.skip != 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const marker = '<!-- claude-rule-review -->';
-
-            // Read the already-posted comment body
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              per_page: 100,
-            });
-            const existing = comments.find(c => c.body.includes(marker));
-            const body = existing ? existing.body : '';
-
-            function countUnchecked(text) {
-              const lines = text.split('\n');
-              let inSection = false, unchecked = 0;
-              for (const line of lines) {
-                if (/^####\s*(Critical|Warning)/i.test(line)) inSection = true;
-                else if (/^####/.test(line)) inSection = false;
-                if (inSection && /^- \[ \]/.test(line)) unchecked++;
-              }
-              return unchecked;
-            }
-
-            const unchecked = countUnchecked(body);
-            const noFindings = !body.includes('- [ ]') && !body.includes('- [x]');
-
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: '${{ github.event.pull_request.head.sha }}',
-              state: unchecked > 0 ? 'failure' : 'success',
-              context: 'rule-review/findings',
-              description: unchecked > 0
-                ? `${unchecked} finding(s) need acknowledgment — check boxes or comment /ack`
-                : noFindings ? 'No critical/warning findings' : 'All findings acknowledged',
-              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/pull/${context.issue.number}`,
-            });

@@ -59,7 +59,7 @@ impl DelegateStore {
         if let Ok(dir) = std::fs::read_dir(&delegates_dir) {
             for entry in dir.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(true, |e| e != "reg") {
+                if path.extension().is_none_or(|e| e != "reg") {
                     continue;
                 }
                 let Some(dk_encoded) = path.file_stem().and_then(|s| s.to_str()) else {

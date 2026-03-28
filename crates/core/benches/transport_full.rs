@@ -15,7 +15,7 @@
 //! - ledbat_validation: LEDBAT with large transfers
 //! - slow_start: Cold-start vs warm throughput
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::time::Duration;
 
 mod transport;

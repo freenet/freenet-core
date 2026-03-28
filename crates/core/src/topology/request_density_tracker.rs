@@ -78,7 +78,9 @@ impl RequestDensityTracker {
                             .or_insert(0) += sample_count;
                     }
                 }
-                _ => unreachable!("previous_neighbor and next_neighbor should always be Some if neighbor_locations is not empty"),
+                _ => unreachable!(
+                    "previous_neighbor and next_neighbor should always be Some if neighbor_locations is not empty"
+                ),
             }
         }
 
@@ -127,7 +129,9 @@ impl DensityMap {
                 next_neighbor_prop * *previous_neighbor_count as f64
                     + previous_neighbor_prop * *next_neighbor_count as f64
             }
-            _ => unreachable!("previous_neighbor and next_neighbor should always be Some if neighbor_request_counts is not empty"),
+            _ => unreachable!(
+                "previous_neighbor and next_neighbor should always be Some if neighbor_request_counts is not empty"
+            ),
         };
 
         Ok(count_estimate)

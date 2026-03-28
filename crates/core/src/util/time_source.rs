@@ -1,14 +1,27 @@
-use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr};
 use std::thread;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 const UPDATE_CACHED_TIME_EVERY: Duration = Duration::from_millis(10);
 
 pub trait TimeSource: std::fmt::Debug {
     fn now(&self) -> Instant;
+
+    /// Returns the current wall-clock time as `SystemTime`.
+    ///
+    /// Unlike `now()` which returns a monotonic `Instant` (resets on restart),
+    /// this method provides wall-clock time that survives process restarts.
+    /// Used by persistence layers (e.g., `PeerCache`) that need to timestamp
+    /// entries for cross-restart expiry.
+    ///
+    /// The default implementation delegates to `SystemTime::now()`.
+    /// Test implementations can return a controllable value for determinism.
+    fn system_time_now(&self) -> SystemTime {
+        SystemTime::now()
+    }
 }
 
 /// A simple time source that returns the current time using `Instant::now()`.
@@ -148,17 +161,27 @@ impl TimeSource for CachingSystemTimeSrc {
     }
 }
 
+/// Fixed, deterministic base wall-clock time for all mock time sources.
+#[cfg(test)]
+fn mock_system_epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct MockTimeSource {
+    start_instant: Instant,
     current_instant: Instant,
+    system_time_epoch: SystemTime,
 }
 
 #[cfg(test)]
 impl MockTimeSource {
     pub fn new(start_instant: Instant) -> Self {
         MockTimeSource {
+            start_instant,
             current_instant: start_instant,
+            system_time_epoch: mock_system_epoch(),
         }
     }
 
@@ -171,6 +194,11 @@ impl MockTimeSource {
 impl TimeSource for MockTimeSource {
     fn now(&self) -> Instant {
         self.current_instant
+    }
+
+    fn system_time_now(&self) -> SystemTime {
+        let elapsed = self.current_instant.duration_since(self.start_instant);
+        self.system_time_epoch + elapsed
     }
 }
 
@@ -198,6 +226,8 @@ pub struct SharedMockTimeSource {
     epoch: Instant,
     /// Current elapsed time from the epoch
     elapsed: Arc<std::sync::Mutex<Duration>>,
+    /// Wall-clock epoch for `system_time_now()` (defaults to UNIX_EPOCH + 1_000_000s)
+    system_time_epoch: SystemTime,
 }
 
 #[cfg(test)]
@@ -207,6 +237,7 @@ impl SharedMockTimeSource {
         Self {
             epoch: Instant::now(),
             elapsed: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+            system_time_epoch: mock_system_epoch(),
         }
     }
 
@@ -216,6 +247,7 @@ impl SharedMockTimeSource {
         Self {
             epoch: start,
             elapsed: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+            system_time_epoch: mock_system_epoch(),
         }
     }
 
@@ -245,6 +277,10 @@ impl Default for SharedMockTimeSource {
 impl TimeSource for SharedMockTimeSource {
     fn now(&self) -> Instant {
         self.epoch + *self.elapsed.lock().unwrap()
+    }
+
+    fn system_time_now(&self) -> SystemTime {
+        self.system_time_epoch + *self.elapsed.lock().unwrap()
     }
 }
 

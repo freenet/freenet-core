@@ -78,11 +78,7 @@ impl ExponentialBackoff {
         let multiplier = 1u64 << exponent;
         let delay = self.base.saturating_mul(multiplier as u32);
 
-        if delay > self.max {
-            self.max
-        } else {
-            delay
-        }
+        if delay > self.max { self.max } else { delay }
     }
 
     /// Calculate the delay for a given failure count (1-indexed).

@@ -1,7 +1,7 @@
 use anyhow::{bail, ensure};
 use freenet::test_utils::{
-    self, load_contract, load_delegate, make_get, make_get_with_blocking, make_put,
-    make_put_with_blocking, make_subscribe, make_update, verify_contract_exists, TestContext,
+    self, TestContext, load_contract, load_delegate, make_get, make_get_with_blocking, make_put,
+    make_put_with_blocking, make_subscribe, make_update, verify_contract_exists,
 };
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
@@ -867,7 +867,10 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
             }
             Err(_) => {
                 let elapsed = get_start.elapsed();
-                bail!("Client 3: Timeout waiting for get response after {:?}. Contract may not have propagated from Node A to Node B", elapsed);
+                bail!(
+                    "Client 3: Timeout waiting for get response after {:?}. Contract may not have propagated from Node A to Node B",
+                    elapsed
+                );
             }
         }
     }
@@ -2184,9 +2187,12 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
     const TEST_DELEGATE: &str = "test-delegate-integration";
 
     // Configure environment variables for optimized release build
-    std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
-    std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
-    std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+    // SAFETY: test environment, no concurrent threads reading these env vars
+    unsafe {
+        std::env::set_var("CARGO_PROFILE_RELEASE_LTO", "true");
+        std::env::set_var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+        std::env::set_var("CARGO_PROFILE_RELEASE_STRIP", "true");
+    }
 
     // Load delegate (moving this outside the async block)
     let params = Parameters::from(vec![]);
@@ -2852,7 +2858,9 @@ async fn test_update_no_change_notification(ctx: &mut TestContext) -> TestResult
         }
         Err(_) => {
             // This is where the test will currently fail
-            bail!("TIMEOUT waiting for update response - UpdateNoChange bug: client not notified when update results in no state change");
+            bail!(
+                "TIMEOUT waiting for update response - UpdateNoChange bug: client not notified when update results in no state change"
+            );
         }
     }
 
@@ -2949,7 +2957,8 @@ async fn test_update_broadcast_propagation_issue_2301(ctx: &mut TestContext) -> 
     make_get(&mut client_gateway, contract_key, true, false).await?;
 
     // Wait for get response on gateway
-    let resp = tokio::time::timeout(Duration::from_secs(60), client_gateway.recv()).await;
+    // 120s to match PUT timeout — on slow CI runners, routing may not be fully populated
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_gateway.recv()).await;
     let initial_state_on_gateway: WrappedState = match resp {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
             key,
@@ -3457,7 +3466,8 @@ async fn test_put_triggers_update_for_subscribers(ctx: &mut TestContext) -> Test
     make_get(&mut client_gateway, contract_key, true, false).await?;
 
     // Wait for get response on gateway
-    let resp = tokio::time::timeout(Duration::from_secs(60), client_gateway.recv()).await;
+    // 120s to match PUT timeout — on slow CI runners, routing may not be fully populated
+    let resp = tokio::time::timeout(Duration::from_secs(120), client_gateway.recv()).await;
     let initial_state_on_gateway: WrappedState = match resp {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
             key,
@@ -4150,6 +4160,7 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
     nodes = ["gateway", "node-a", "node-b"],
     timeout_secs = 600,
     startup_wait_secs = 40,
+    health_check_readiness = true,
     aggregate_events = "always",
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
@@ -4199,10 +4210,11 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
     }
 
     // Client B gets the contract (so node-b caches it)
+    // 120s to match PUT timeout — on slow CI runners, routing may not be ready
     tracing::info!("Client B: GET contract");
     make_get(&mut client_b, contract_key, true, false).await?;
     loop {
-        match timeout(Duration::from_secs(60), client_b.recv()).await {
+        match timeout(Duration::from_secs(120), client_b.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key, ..
             }))) => {

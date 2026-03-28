@@ -36,8 +36,8 @@ use tokio::time::Instant;
 use dashmap::DashMap;
 use tokio::sync::oneshot;
 
-use crate::transport::peer_connection::streaming::StreamHandle;
 use crate::transport::peer_connection::StreamId;
+use crate::transport::peer_connection::streaming::StreamHandle;
 
 /// Timeout for unclaimed orphan streams.
 /// Orphan streams not claimed within this duration are garbage collected.

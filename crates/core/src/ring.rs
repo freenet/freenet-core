@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{atomic::AtomicU64, Arc, Weak};
+use std::sync::{Arc, Weak, atomic::AtomicU64};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -18,17 +18,17 @@ use parking_lot::{Mutex, RwLock};
 pub use hosting::{AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult};
 
 use crate::message::TransactionType;
-use crate::topology::rate::Rate;
 use crate::topology::TopologyAdjustment;
+use crate::topology::rate::Rate;
 use crate::tracing::{NetEventLog, NetEventRegister};
 
 use crate::transport::TransportPublicKey;
-use crate::util::{time_source::InstantTimeSrc, Contains};
+use crate::util::{Contains, time_source::InstantTimeSrc};
 use crate::{
     config::{GlobalExecutor, GlobalRng},
     message::{NetMessage, NetMessageV1, Transaction},
     node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
-    operations::{connect::ConnectOp, OpEnum},
+    operations::{OpEnum, connect::ConnectOp},
     router::Router,
 };
 
@@ -41,6 +41,7 @@ pub use hosting::{AccessType, RecordAccessResult};
 pub mod interest;
 mod live_tx;
 mod location;
+pub(crate) mod peer_cache;
 mod peer_connection_backoff;
 mod peer_key_location;
 pub mod topology_registry;
@@ -90,7 +91,10 @@ pub(crate) struct Ring {
     /// Injectable time source used by `connection_maintenance`. Using `util::TimeSource`
     /// (which returns `tokio::time::Instant`) lets tests supply `SharedMockTimeSource` for
     /// fine-grained control without pausing the entire tokio runtime.
-    time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
+    pub(crate) time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
+    /// Directory for persisting the peer address cache. When set, the peer cache
+    /// is periodically saved here and loaded on startup for fast reconnection.
+    pub(crate) peer_cache_dir: Option<std::path::PathBuf>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -195,6 +199,12 @@ impl Ring {
         const TOPOLOGY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
         // Just initialize with a fake location, this will be later updated when the peer has an actual location assigned.
+        let peer_cache_dir = if is_gateway {
+            // Gateways don't need peer cache — peers connect to them.
+            None
+        } else {
+            Some(config.config.data_dir())
+        };
         let ring = Ring {
             max_hops_to_live,
             router,
@@ -207,6 +217,7 @@ impl Ring {
             connection_backoff: Arc::new(Mutex::new(ConnectionBackoff::new())),
             contract_connect_backoff: Mutex::new(HashMap::new()),
             time_source: Arc::new(InstantTimeSrc::new()),
+            peer_cache_dir,
         };
 
         if let Some(loc) = config.location {
@@ -668,12 +679,36 @@ impl Ring {
         self.event_register.register_events(events).await;
     }
 
+    /// Maximum number of route events to load from the AOF event log on startup
+    /// and during periodic refresh. Caps memory use while retaining enough history
+    /// for the isotonic estimators to converge.
+    const ROUTER_HISTORY_LIMIT: usize = 10_000;
+
     async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
+        // Load routing history immediately on startup so the router doesn't
+        // start cold — without this, peers route suboptimally for ~5 minutes
+        // until the first periodic refresh.
+        match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
+            Ok(history) if !history.is_empty() => {
+                tracing::info!(
+                    events = history.len(),
+                    "Restored routing history from event log"
+                );
+                *router.write() = Router::new(&history);
+            }
+            Ok(_) => {
+                tracing::debug!("No routing history to restore on startup");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Failed to load routing history on startup, starting cold");
+            }
+        }
+
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;
         loop {
             interval.tick().await;
-            let history = match register.get_router_events(10_000).await {
+            let history = match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
                 Ok(h) => h,
                 Err(error) => {
                     // Previously this was an `expect()` that would silently panic
@@ -684,8 +719,7 @@ impl Ring {
                 }
             };
             if !history.is_empty() {
-                let router_ref = &mut *router.write();
-                *router_ref = Router::new(&history);
+                *router.write() = Router::new(&history);
             }
         }
     }
@@ -804,13 +838,17 @@ impl Ring {
     /// - A race condition left us hosting without subscription
     ///
     /// The task respects existing backoff mechanisms to avoid subscription spam.
+    ///
+    /// **Connection gating (#3676):** This task skips renewal cycles entirely when
+    /// the node has zero ring connections. Without this gate, disconnected peers
+    /// generate a subscribe retry storm — thousands of subscribe requests per cycle
+    /// that all fail immediately because there's no one to send them to. Telemetry
+    /// showed 3 peers with 0 connections generating 96% of all subscribe traffic.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
-        // Wait for the first ring connection before starting subscription recovery.
-        // Poll until the first ring connection appears (or timeout after 5 min).
-        // This replaces the old fixed 30-60s random delay. Sub-second polling
-        // keeps the sleep interruptible per code-style.md rules.
-        const MAX_WAIT: Duration = Duration::from_secs(300);
-        let wait_start = tokio::time::Instant::now();
+        // Wait indefinitely for the first ring connection before starting
+        // subscription recovery. The per-cycle connection check below is the
+        // real gate; this just avoids running the loop body with no peers.
+        let mut wait_logged = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if ring.open_connections() > 0 {
@@ -820,13 +858,13 @@ impl Ring {
                 );
                 break;
             }
-            if wait_start.elapsed() >= MAX_WAIT {
-                tracing::warn!(
+            // Log periodically so operators can diagnose stuck nodes.
+            if !wait_logged {
+                wait_logged = true;
+                tracing::info!(
                     hosted_contracts = ring.hosting_contract_keys().len(),
-                    "No ring connections after {:?}, starting subscription recovery anyway",
-                    MAX_WAIT
+                    "Waiting for ring connection before starting subscription recovery"
                 );
-                break;
             }
         }
 
@@ -849,6 +887,11 @@ impl Ring {
                 interval.tick().await;
             }
 
+            // Always run expiry sweeps, even when disconnected. Stale
+            // subscriptions and downstream subscribers must be cleaned up
+            // to keep interest manager counts accurate. Only the renewal
+            // spawning (below) is gated on having connections.
+            //
             // First, expire any stale subscriptions
             let expired = ring.expire_stale_subscriptions();
             if !expired.is_empty() {
@@ -888,6 +931,15 @@ impl Ring {
                 }
             }
 
+            // Gate: skip renewal spawning if we have no ring connections (#3676).
+            // Subscribe requests require connected peers to route through.
+            // Without this, disconnected peers flood the notification channel
+            // with doomed subscribe requests every 30 seconds.
+            if ring.open_connections() == 0 {
+                tracing::debug!("Skipping subscription renewal: no ring connections");
+                continue;
+            }
+
             // Get contracts that need subscription renewal (have client subscriptions)
             let mut contracts_needing_renewal = ring.contracts_needing_renewal();
 
@@ -904,18 +956,6 @@ impl Ring {
                 hosted = ring.hosting_contract_keys().len(),
                 "Starting subscription renewal cycle"
             );
-
-            // Skip renewal entirely when we have no ring connections.
-            // Without connections we can't route Subscribe messages, so spawning
-            // tasks just fills the notification channel and can deadlock the
-            // event loop (see production incident 2026-02-11 on vega gateway).
-            if ring.open_connections() == 0 {
-                tracing::debug!(
-                    contracts = contracts_needing_renewal.len(),
-                    "Skipping subscription renewal: no ring connections available"
-                );
-                continue;
-            }
 
             // Shuffle to prevent starvation: without this, the same failing contracts
             // (first N in iteration order) would always be tried first, blocking later
@@ -1772,7 +1812,10 @@ impl Ring {
         let mut pending_conn_adds = BTreeSet::new();
         let mut last_backoff_cleanup = Instant::now();
         let mut last_health_check = Instant::now();
+        let mut last_peer_cache_save = self.time_source.now();
         const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+        // How often to snapshot the peer cache to disk.
+        const PEER_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(30);
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
@@ -1909,8 +1952,9 @@ impl Ring {
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
 
-            // Expire connect-exclusion entries for peers whose TTL has elapsed
-            self.connection_manager.cleanup_expired_exclusions(tick_now);
+            // Expire acceptor reliability entries for peers whose TTL has elapsed
+            self.connection_manager
+                .cleanup_expired_acceptor_stats(tick_now);
 
             // Clean up expired transient connections
             let expired_transients = self.connection_manager.cleanup_expired_transients();
@@ -1943,6 +1987,22 @@ impl Ring {
                         .await
                     {
                         tracing::debug!(error = ?e, "Failed to send DropConnection for unhealthy peer");
+                    }
+                }
+            }
+
+            // Periodically save peer cache for fast reconnection after restart.
+            if last_peer_cache_save.elapsed() > PEER_CACHE_SAVE_INTERVAL {
+                last_peer_cache_save = self.time_source.now();
+                if let Some(ref dir) = self.peer_cache_dir {
+                    let cache = peer_cache::PeerCache::snapshot_from(
+                        &self.connection_manager,
+                        self.time_source.as_ref(),
+                    );
+                    if !cache.peers.is_empty() {
+                        if let Err(e) = cache.save(dir) {
+                            tracing::warn!(error = %e, "Failed to save peer cache");
+                        }
                     }
                 }
             }
@@ -2639,6 +2699,120 @@ mod pending_additions_tests {
     fn respects_requested_when_capacity_allows() {
         let allowed = calculate_allowed_connection_additions(50, 0, 25, 200, 3);
         assert_eq!(allowed, 3);
+    }
+}
+
+#[cfg(test)]
+mod refresh_router_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use either::Either;
+    use futures::FutureExt;
+    use parking_lot::RwLock;
+
+    use crate::ring::PeerKeyLocation;
+    use crate::ring::location::Location;
+    use crate::router::{RouteEvent, RouteOutcome, Router};
+    use crate::tracing::{NetEventLog, NetEventRegister};
+
+    /// Mock register that returns pre-populated RouteEvents on startup.
+    #[derive(Clone)]
+    struct WarmStartRegister {
+        events: Vec<RouteEvent>,
+    }
+
+    impl NetEventRegister for WarmStartRegister {
+        fn register_events<'a>(
+            &'a self,
+            _events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
+        ) -> futures::future::BoxFuture<'a, ()> {
+            async {}.boxed()
+        }
+
+        fn notify_of_time_out(
+            &mut self,
+            _tx: crate::message::Transaction,
+            _op_type: &str,
+            _target_peer: Option<String>,
+        ) -> futures::future::BoxFuture<'_, ()> {
+            async {}.boxed()
+        }
+
+        fn trait_clone(&self) -> Box<dyn NetEventRegister> {
+            Box::new(self.clone())
+        }
+
+        fn get_router_events(
+            &self,
+            number: usize,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
+            let events = self.events.iter().take(number).cloned().collect();
+            async move { Ok(events) }.boxed()
+        }
+    }
+
+    fn make_route_events(count: usize) -> Vec<RouteEvent> {
+        (0..count)
+            .map(|_| RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(50),
+                    payload_size: 1000,
+                    payload_transfer_time: Duration::from_millis(100),
+                },
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn refresh_router_loads_history_on_startup() {
+        let events = make_route_events(100);
+        let register = WarmStartRegister {
+            events: events.clone(),
+        };
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+
+        // Verify the router starts empty
+        let snapshot = router.read().snapshot();
+        assert_eq!(snapshot.failure_events, 0);
+        assert_eq!(snapshot.success_events, 0);
+
+        // Run refresh_router with a timeout so it doesn't loop forever.
+        // The startup load happens before the interval loop, so it completes
+        // within the first few milliseconds.
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::Ring::refresh_router(router.clone(), register),
+        )
+        .await
+        .ok(); // timeout is expected — the function loops forever
+
+        // Verify the router was populated from the historical events
+        let snapshot = router.read().snapshot();
+        assert_eq!(
+            snapshot.success_events, 100,
+            "Router should have been populated with startup history"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_router_handles_empty_history() {
+        let register = WarmStartRegister { events: vec![] };
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::Ring::refresh_router(router.clone(), register),
+        )
+        .await
+        .ok();
+
+        // Router should remain empty
+        let snapshot = router.read().snapshot();
+        assert_eq!(snapshot.failure_events, 0);
+        assert_eq!(snapshot.success_events, 0);
     }
 }
 

@@ -95,7 +95,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{StreamExt, stream::FuturesUnordered};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -113,7 +113,7 @@ use crate::ring::{ConnectionFailureReason, KnownPeerKeyLocation, PeerAddr, PeerK
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use crate::tracing::NetEventLog;
 use crate::transport::TransportKeypair;
-use crate::util::{time_source::InstantTimeSrc, Contains, IterExt};
+use crate::util::{Contains, IterExt, time_source::InstantTimeSrc};
 use freenet_stdlib::client_api::HostResponse;
 
 use super::VisitedPeers;
@@ -140,6 +140,12 @@ const NEAR_TERMINUS_DISTANCE: f64 = 0.05;
 /// Actual probability scales linearly with proximity: closer = higher chance.
 /// At distance 0 this is the full probability; at `NEAR_TERMINUS_DISTANCE` it's 0.
 const NEAR_TERMINUS_ACCEPT_PROB: f64 = 0.6;
+
+/// Tolerance band for reliability-based uphill peer selection.
+/// Candidates within this delta of the best reliability score are
+/// treated as equivalent, allowing distance-based partitioning to
+/// differentiate among similarly-reliable peers.
+const UPHILL_RELIABILITY_TOLERANCE: f64 = 0.1;
 
 /// Filter out scored peers below `MIN_FORWARD_SCORE` when alternatives exist.
 ///
@@ -227,8 +233,8 @@ impl fmt::Display for ConnectMsg {
         match self {
             ConnectMsg::Request { payload, .. } => write!(
                 f,
-                "ConnectRequest {{ desired: {}, ttl: {}, joiner: {} }}",
-                payload.desired_location, payload.ttl, payload.joiner
+                "ConnectRequest {{ desired: {}, ttl: {}, uphill: {}, joiner: {} }}",
+                payload.desired_location, payload.ttl, payload.uphill_budget, payload.joiner
             ),
             ConnectMsg::Response { payload, .. } => {
                 write!(f, "ConnectResponse {{ acceptor: {} }}", payload.acceptor,)
@@ -254,6 +260,17 @@ impl fmt::Display for ConnectMsg {
     }
 }
 
+/// Maximum number of uphill routing hops per CONNECT transaction.
+///
+/// Uphill routing occurs when a terminus peer cannot accept a connection
+/// (already connected, at capacity, NAT failure) and forwards the request
+/// away from the target to give other peers a chance.
+///
+/// This budget bounds amplification to O(UPHILL_BUDGET) messages per transaction,
+/// independent of TTL. With ~84% NAT hole-punch failure rate in production,
+/// 8 candidates give P(at least one success) ≈ 1 - 0.84^8 ≈ 72%.
+pub(crate) const DEFAULT_UPHILL_BUDGET: u8 = 8;
+
 /// Two-message request payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ConnectRequest {
@@ -270,6 +287,15 @@ pub(crate) struct ConnectRequest {
     /// Uses transaction-specific hashing for privacy (same peer hashes differently
     /// in different transactions, preventing topology inference).
     pub visited: VisitedPeers,
+    /// Remaining uphill routing budget. Decremented only when routing away
+    /// from the target (uphill hops). Normal toward-target hops use only TTL.
+    /// Bounds amplification to O(uphill_budget) per transaction regardless of TTL.
+    #[serde(default = "default_uphill_budget")]
+    pub uphill_budget: u8,
+}
+
+fn default_uphill_budget() -> u8 {
+    DEFAULT_UPHILL_BUDGET
 }
 
 /// Acceptance payload returned by candidates.
@@ -654,15 +680,15 @@ impl RelayState {
             // At terminus but should_accept() returned false (e.g., already connected
             // or at capacity). Route uphill to give other peers a chance to accept.
             //
-            // Uphill routing halves the forwarded TTL per hop to prevent
-            // amplification cascades at scale. Without this, 500-node networks
-            // with high connectivity generate O(nodes × TTL) uphill messages per
-            // maintenance cycle, overwhelming the transport layer.
-            // The burn applies only to the outgoing message (not self.request),
-            // so retries after rejection still have enough TTL.
-            // With TTL=15: forwarded as 7→3→1→reject (~3 uphill hops).
-            // With TTL=4: forwarded as 1→reject (~1 uphill hop).
-            if self.request.ttl >= 2 {
+            // Amplification is bounded by uphill_budget (separate from TTL).
+            // Each uphill hop decrements uphill_budget by 1 but only decrements
+            // TTL by the normal -1 (no extra burn). This separates the two concerns:
+            // - TTL controls network reach (how far a CONNECT can travel)
+            // - uphill_budget controls amplification (how many uphill retries)
+            //
+            // With DEFAULT_UPHILL_BUDGET=8 and ~84% NAT failure rate, peers get
+            // enough candidates for ~72% chance of finding a reachable acceptor.
+            if self.request.uphill_budget > 0 && self.request.ttl >= 2 {
                 let uphill_hop = ctx.select_uphill_hop(
                     self.request.desired_location,
                     &self.request.visited,
@@ -675,25 +701,25 @@ impl RelayState {
                     tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
+                        uphill_budget = self.request.uphill_budget,
                         uphill_peer = %uphill_peer.pub_key(),
                         uphill_loc = ?uphill_peer.location(),
                         ring_distance_to_target = ?dist,
                         "connect: at terminus but cannot accept, routing uphill"
                     );
-                    // Halve TTL on the forwarded request to limit uphill hops to
-                    // O(log TTL) instead of O(TTL). The burn is applied only to the
-                    // outgoing message, NOT to self.request.ttl, so that if this
-                    // uphill attempt is rejected and we retry with a different peer,
-                    // the retry still has enough TTL to proceed.
+                    // Decrement uphill_budget on both the forwarded request AND
+                    // self.request, so retries from the same relay also consume budget.
+                    // TTL is decremented normally (-1) by forward_to_peer — no extra burn.
                     let (peer, mut fwd_req) =
                         self.forward_to_peer(ctx, uphill_peer, forward_attempts, now);
-                    let extra_burn = fwd_req.ttl / 2;
-                    fwd_req.ttl = fwd_req.ttl.saturating_sub(extra_burn);
+                    fwd_req.uphill_budget = fwd_req.uphill_budget.saturating_sub(1);
+                    self.request.uphill_budget = self.request.uphill_budget.saturating_sub(1);
                     actions.forward = Some((peer, fwd_req));
                 } else {
                     tracing::info!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
+                        uphill_budget = self.request.uphill_budget,
                         visited = ?self.request.visited,
                         "connect: at terminus, cannot accept, no uphill peers available — rejecting"
                     );
@@ -703,8 +729,9 @@ impl RelayState {
                 tracing::info!(
                     target = %self.request.desired_location,
                     ttl = self.request.ttl,
+                    uphill_budget = self.request.uphill_budget,
                     visited = ?self.request.visited,
-                    "connect: at terminus, cannot accept, TTL exhausted — rejecting"
+                    "connect: at terminus, cannot accept, uphill budget or TTL exhausted — rejecting"
                 );
                 actions.rejected = true;
             }
@@ -769,22 +796,13 @@ impl RelayContext for RelayEnv<'_> {
         recency: &HashMap<PeerKeyLocation, Instant>,
         estimator: &ConnectForwardEstimator,
     ) -> Option<PeerKeyLocation> {
-        // Capture now once so that the exclusion set computation and
-        // the recency cooldown check both see the same timestamp for this routing decision.
+        // Capture now once so that the reliability lookup and the recency cooldown
+        // check both see the same timestamp for this routing decision.
         let now = Instant::now();
-
-        // Precompute the excluded set once per routing decision. This uses percentage-based
-        // capping (max 50% of ring peers) to prevent death spiral where all peers get excluded.
-        let excluded_peers = self
-            .op_manager
-            .ring
-            .connection_manager
-            .compute_connect_excluded_peers(now);
 
         let skip = SkipListWithSelf {
             visited,
             self_addr: self.self_location.socket_addr(),
-            excluded_peers,
         };
         let router = self.op_manager.ring.router.read();
 
@@ -801,7 +819,9 @@ impl RelayContext for RelayEnv<'_> {
             .location()
             .map(|loc| loc.distance(desired_location));
         let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::new();
-        let mut eligible: Vec<PeerKeyLocation> = Vec::new();
+        let mut fallbacks: Vec<PeerKeyLocation> = Vec::new();
+
+        let conn_mgr = &self.op_manager.ring.connection_manager;
 
         for cand in candidates {
             if let Some(ts) = recency.get(&cand) {
@@ -810,36 +830,74 @@ impl RelayContext for RelayEnv<'_> {
                 }
             }
 
-            // GREEDY ROUTING: Only consider neighbors that are CLOSER to the target than we are.
-            // This is essential for proper terminus detection - we're at terminus when no
-            // neighbor is closer to the target than we are.
-            //
-            // Note: We use `>` (not `>=`) to allow forwarding to equally-distant peers.
-            // This gives more routing flexibility when peers are equidistant to the target
-            // (common near ring boundary 0.0/1.0). Routing loops are prevented by the
-            // `visited` list, not by this distance check.
+            // GREEDY ROUTING: Only consider neighbors that are CLOSER to the target
+            // than we are. We use `>` (not `>=`) to allow equally-distant peers,
+            // giving more flexibility near ring boundary 0.0/1.0. Routing loops
+            // are prevented by the `visited` list, not by this distance check.
             if let (Some(cand_loc), Some(my_dist)) = (cand.location(), my_distance) {
-                let cand_distance = cand_loc.distance(desired_location);
-                if cand_distance > my_dist {
-                    // Neighbor is farther from target than us - skip
+                if cand_loc.distance(desired_location) > my_dist {
                     continue;
                 }
             }
 
+            // Acceptor reliability: unknown peers get 0.5, observed failures lower.
+            let reliability = cand
+                .socket_addr()
+                .map(|addr| conn_mgr.peer_acceptor_reliability(addr, now))
+                .unwrap_or(0.5);
+
             if cand.location().is_some() {
-                if let Some(score) = estimator.estimate(&cand, desired_location) {
-                    scored.push((score, cand.clone()));
+                if let Some(estimator_score) = estimator.estimate(&cand, desired_location) {
+                    // Combine path quality (estimator) with endpoint reliability.
+                    // These signals partially overlap (the estimator sees end-to-end
+                    // outcomes including hole-punch failures), but telemetry shows
+                    // the estimator's global curve is too optimistic at close distances
+                    // for specific bad peers (scores 0.4-0.8 where true rate is ~0.05).
+                    // Multiplication is the correct combination for P(path_success) ×
+                    // P(holepunch_success) — the partial overlap means we slightly
+                    // over-penalize, but this is preferable to under-penalizing.
+                    let combined_score = estimator_score * reliability;
+                    scored.push((combined_score, cand.clone()));
                     continue;
                 }
-                // Keep candidates without estimates for fallback.
-                eligible.push(cand.clone());
+                // No estimator data — keep as fallback to avoid ranking untrained
+                // peers above routes with learned history (score 0.5 from raw
+                // reliability could beat a trained route at 0.4 * 1.0 = 0.4).
+                fallbacks.push(cand.clone());
                 continue;
             }
-            eligible.push(cand.clone());
+            // Candidates without a location go to fallback pool.
+            fallbacks.push(cand.clone());
         }
 
         // Filter out low-score peers when alternatives exist.
-        filter_low_score_peers(&mut scored, eligible.len());
+        filter_low_score_peers(&mut scored, fallbacks.len());
+
+        // If all remaining scored candidates have very low acceptor reliability
+        // (from actual observed failures, not just sparse estimator data) and
+        // there are no fallbacks, return None so the caller escalates to uphill
+        // routing. Without this, a single unreliable closer peer would prevent
+        // the node from ever reaching terminus — it would keep forwarding to
+        // the bad peer instead of trying uphill alternatives.
+        //
+        // We check reliability directly (not the combined score) because a low
+        // combined score from a fresh estimator × 0.5 prior should NOT trigger
+        // uphill escalation — those are untested peers, not known-bad ones.
+        if !scored.is_empty() && fallbacks.is_empty() {
+            let all_unreliable = scored.iter().all(|(_, cand)| {
+                cand.socket_addr()
+                    .map(|addr| conn_mgr.peer_acceptor_reliability(addr, now))
+                    .unwrap_or(0.5)
+                    < MIN_FORWARD_SCORE
+            });
+            if all_unreliable {
+                tracing::debug!(
+                    candidates = scored.len(),
+                    "connect: all closer peers have low acceptor reliability, escalating to uphill"
+                );
+                return None;
+            }
+        }
 
         if !scored.is_empty() {
             let best_score = scored
@@ -857,11 +915,11 @@ impl RelayContext for RelayEnv<'_> {
             }
         }
 
-        if eligible.is_empty() {
+        if fallbacks.is_empty() {
             None
         } else {
             router
-                .select_peer(eligible.iter(), desired_location)
+                .select_peer(fallbacks.iter(), desired_location)
                 .cloned()
         }
     }
@@ -882,25 +940,22 @@ impl RelayContext for RelayEnv<'_> {
         // that we don't know about.
         //
         let now = Instant::now();
-        let excluded_peers = self
-            .op_manager
-            .ring
-            .connection_manager
-            .compute_connect_excluded_peers(now);
         let skip = SkipListWithSelf {
             visited,
             self_addr: self.self_location.socket_addr(),
-            excluded_peers,
         };
         let router = self.op_manager.ring.router.read();
+        let conn_mgr = &self.op_manager.ring.connection_manager;
 
-        let candidates = self.op_manager.ring.connection_manager.routing_candidates(
+        let candidates = conn_mgr.routing_candidates(
             desired_location,
             None,
             skip,
             false, // CONNECT bypasses readiness filter to allow routing to not-yet-ready peers
         );
-        let eligible: Vec<PeerKeyLocation> = candidates
+
+        // Score candidates by acceptor reliability, filtering out recency cooldown.
+        let scored: Vec<(f64, PeerKeyLocation)> = candidates
             .into_iter()
             .filter(|cand| {
                 // Skip peers we recently forwarded to
@@ -911,9 +966,16 @@ impl RelayContext for RelayEnv<'_> {
                 }
                 true
             })
+            .map(|cand| {
+                let reliability = cand
+                    .socket_addr()
+                    .map(|addr| conn_mgr.peer_acceptor_reliability(addr, now))
+                    .unwrap_or(0.5);
+                (reliability, cand)
+            })
             .collect();
 
-        if eligible.is_empty() {
+        if scored.is_empty() {
             tracing::debug!(
                 target = %desired_location,
                 "connect: no uphill candidates available"
@@ -921,11 +983,21 @@ impl RelayContext for RelayEnv<'_> {
             return None;
         }
 
+        // Keep candidates whose reliability is within 0.1 of the best.
+        // This avoids discarding close-to-target peers over tiny reliability
+        // differences while still filtering out genuinely unreliable ones.
+        let best_reliability = scored.iter().map(|(r, _)| *r).fold(0.0_f64, f64::max);
+        let best_candidates: Vec<PeerKeyLocation> = scored
+            .into_iter()
+            .filter(|(r, _)| best_reliability - *r < UPHILL_RELIABILITY_TOLERANCE)
+            .map(|(_, c)| c)
+            .collect();
+
         // Partition into "close uphill" (within 2× NEAR_TERMINUS_DISTANCE of target)
         // and "far uphill". Prefer close uphill peers as they're more likely to know
         // peers near the target that we don't.
         let close_threshold = NEAR_TERMINUS_DISTANCE * 2.0;
-        let (close, far): (Vec<_>, Vec<_>) = eligible.into_iter().partition(|cand| {
+        let (close, far): (Vec<_>, Vec<_>) = best_candidates.into_iter().partition(|cand| {
             cand.location()
                 .map(|loc| loc.distance(desired_location).as_f64() < close_threshold)
                 .unwrap_or(false)
@@ -1089,6 +1161,10 @@ impl ConnectOp {
         // The bloom filter uses transaction-specific hash keys for privacy, and these
         // must be restored since hash keys aren't serialized.
         request.visited = request.visited.with_transaction(&id);
+        // Clamp uphill_budget to prevent amplification from malicious peers
+        // sending inflated values. Without halving, the budget directly controls
+        // the number of uphill hops, so we must enforce the cap.
+        request.uphill_budget = request.uphill_budget.min(DEFAULT_UPHILL_BUDGET);
         let state = ConnectState::Relaying(Box::new(RelayState {
             upstream_addr,
             request,
@@ -1197,6 +1273,7 @@ impl ConnectOp {
             joiner,
             ttl,
             visited,
+            uphill_budget: DEFAULT_UPHILL_BUDGET,
         };
 
         let op = ConnectOp::new_joiner(
@@ -1713,12 +1790,13 @@ impl Operation for ConnectOp {
                                             elapsed_ms = self.id.elapsed().as_millis(),
                                             "connect joined peer"
                                         );
-                                        // Clear exclusion for this acceptor on successful hole-punch
+                                        // Record success for this acceptor's reliability score
                                         if let Some(addr) = new_acceptor.peer.socket_addr() {
+                                            let now = Instant::now();
                                             op_manager
                                                 .ring
                                                 .connection_manager
-                                                .clear_connect_exclusion(addr);
+                                                .record_acceptor_outcome(addr, true, now);
                                         }
                                         true
                                     } else {
@@ -2041,14 +2119,12 @@ impl Operation for ConnectOp {
                         if state.response_forwarded {
                             if let Some(ref fwd) = state.forwarded_to {
                                 if let Some(fwd_addr) = fwd.socket_addr() {
-                                    // Record failure so this relay avoids the bad acceptor in future CONNECTs.
-                                    op_manager
-                                        .ring
-                                        .connection_manager
-                                        .record_connect_acceptor_failure(
-                                            *failed_acceptor_addr,
-                                            now,
-                                        );
+                                    // Record failure so this relay down-weights the bad acceptor in future CONNECTs.
+                                    op_manager.ring.connection_manager.record_acceptor_outcome(
+                                        *failed_acceptor_addr,
+                                        false,
+                                        now,
+                                    );
 
                                     let fwd_msg = ConnectMsg::ConnectFailed {
                                         id: self.id,
@@ -2078,11 +2154,12 @@ impl Operation for ConnectOp {
                         let failed_peer = state.forwarded_to.clone();
                         let desired_location = state.request.desired_location;
 
-                        // Record failure in exclusion tracker
-                        op_manager
-                            .ring
-                            .connection_manager
-                            .record_connect_acceptor_failure(*failed_acceptor_addr, now);
+                        // Record failure in acceptor reliability tracker
+                        op_manager.ring.connection_manager.record_acceptor_outcome(
+                            *failed_acceptor_addr,
+                            false,
+                            now,
+                        );
 
                         // Record forward failure in estimator (drops state borrow via self)
                         if let Some(ref fwd) = failed_peer {
@@ -2192,18 +2269,12 @@ impl Operation for ConnectOp {
     }
 }
 
-/// Skip list that combines visited peers, own address, and CONNECT-excluded peers.
-/// This ensures we never select ourselves as a forwarding target and avoids
-/// peers with repeated acceptor failures.
-///
-/// The excluded set is precomputed via `compute_connect_excluded_peers()` to ensure
-/// percentage-based capping: at most 50% of ring peers are excluded, preventing
-/// a death spiral where all peers accumulate failures and routing stalls.
+/// Skip list that combines visited peers and own address.
+/// Ensures we never select ourselves as a forwarding target and avoids
+/// peers already visited in this CONNECT transaction.
 struct SkipListWithSelf<'a> {
     visited: &'a VisitedPeers,
     self_addr: Option<SocketAddr>,
-    /// Precomputed set of peers excluded from CONNECT routing.
-    excluded_peers: HashSet<SocketAddr>,
 }
 
 impl Contains<SocketAddr> for SkipListWithSelf<'_> {
@@ -2212,9 +2283,6 @@ impl Contains<SocketAddr> for SkipListWithSelf<'_> {
             if target == self_addr {
                 return true;
             }
-        }
-        if self.excluded_peers.contains(&target) {
-            return true;
         }
         self.visited.probably_visited(target)
     }
@@ -2486,6 +2554,10 @@ pub(crate) async fn initial_join_procedure(
 
         const BASE_WAIT_SECS: u64 = 1;
         const LONG_WAIT_SECS: u64 = 30;
+        // Per-peer timeout for cached peer reconnection attempts.
+        // Kept short to avoid delaying gateway bootstrap if NAT holes
+        // have expired or cached peers are unreachable.
+        const CACHED_PEER_TIMEOUT: Duration = Duration::from_secs(5);
         // Use min_connections as the bootstrap threshold so the gateway-directed
         // join loop keeps driving connections until the node has enough peers for
         // ring-based acquisition to take over reliably. Previously hardcoded to 4,
@@ -2503,6 +2575,80 @@ pub(crate) async fn initial_join_procedure(
             "Starting initial join procedure with {} gateways",
             gateways.len()
         );
+
+        // Attempt fast reconnection to cached peers before gateway bootstrap.
+        // After a brief restart, NAT holes to previously-connected peers may
+        // still be open. Connecting directly is faster than routing through
+        // gateways and avoids gateway load.
+        if let Some(ref cache_dir) = op_manager.ring.peer_cache_dir {
+            let cache = crate::ring::peer_cache::PeerCache::load(
+                cache_dir,
+                op_manager.ring.time_source.as_ref(),
+            );
+            if !cache.peers.is_empty() {
+                tracing::info!(
+                    cached_peers = cache.peers.len(),
+                    "Attempting fast reconnection to cached peers"
+                );
+                let cached_peer_locs: Vec<PeerKeyLocation> = cache
+                    .peers
+                    .iter()
+                    .take(number_of_parallel_connections)
+                    .map(|cp| PeerKeyLocation::new(cp.pub_key.clone(), cp.addr))
+                    .collect();
+
+                // Spawn each cached peer reconnection as a separate task for true
+                // parallelism (not just cooperative concurrency). Each task has its
+                // own timeout so we don't need to track abort handles.
+                let mut cached_futs: FuturesUnordered<_> = cached_peer_locs
+                    .iter()
+                    .map(|peer| {
+                        let op_mgr = op_manager.clone();
+                        let peer = peer.clone();
+                        GlobalExecutor::spawn(async move {
+                            match tokio::time::timeout(
+                                CACHED_PEER_TIMEOUT,
+                                join_ring_request(&peer, &op_mgr),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    tracing::info!(peer = %peer, "Reconnected to cached peer");
+                                    true
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::debug!(
+                                        peer = %peer, error = %e,
+                                        "Cached peer reconnection failed"
+                                    );
+                                    false
+                                }
+                                Err(_) => {
+                                    tracing::debug!(
+                                        peer = %peer,
+                                        "Cached peer reconnection timed out"
+                                    );
+                                    false
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+
+                let mut successes = 0usize;
+                while let Some(result) = cached_futs.next().await {
+                    if matches!(result, Ok(true)) {
+                        successes += 1;
+                    }
+                }
+
+                tracing::info!(
+                    successes,
+                    attempted = cached_peer_locs.len(),
+                    "Cached peer reconnection complete"
+                );
+            }
+        }
 
         loop {
             let open_conns = op_manager.ring.open_connections();
@@ -2904,6 +3050,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -2955,6 +3102,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3003,6 +3151,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 2,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3030,9 +3179,11 @@ mod tests {
         assert_eq!(forward_to.pub_key(), next_hop.pub_key());
         assert_eq!(request.ttl, 1);
         // visited now contains SocketAddr (bloom filter check)
-        assert!(request
-            .visited
-            .probably_visited(joiner.socket_addr().expect("test peer must have address")));
+        assert!(
+            request
+                .visited
+                .probably_visited(joiner.socket_addr().expect("test peer must have address"))
+        );
     }
 
     /// Test the terminus-only acceptance behavior: relays should NOT accept when they can
@@ -3045,10 +3196,15 @@ mod tests {
         let mut state = RelayState {
             upstream_addr: joiner.socket_addr().expect("test peer must have address"),
             request: ConnectRequest {
-                desired_location: Location::random(),
+                // Use next_hop's location so it's guaranteed closer to the target
+                // than self_loc, ensuring the relay is NOT at terminus.
+                // Location::random() was flaky — could land near self_loc,
+                // triggering near-terminus acceptance. See #3657.
+                desired_location: next_hop.location().expect("test peer has location"),
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3117,6 +3273,7 @@ mod tests {
                 joiner: joiner_with_unknown_addr.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3187,6 +3344,7 @@ mod tests {
                 joiner: joiner_with_known_addr.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3294,6 +3452,7 @@ mod tests {
             joiner: joiner.clone(),
             ttl: 3,
             visited,
+            uphill_budget: DEFAULT_UPHILL_BUDGET,
         };
 
         let mut relay_op = ConnectOp::new_relay(
@@ -3378,6 +3537,7 @@ mod tests {
                 joiner: joiner_with_observed_addr.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3466,6 +3626,7 @@ mod tests {
             joiner: joiner.clone(),
             ttl: 3,
             visited,
+            uphill_budget: DEFAULT_UPHILL_BUDGET,
         };
 
         let mut relay_op = ConnectOp::new_relay(
@@ -3531,6 +3692,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3612,6 +3774,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3660,6 +3823,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3723,6 +3887,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3761,8 +3926,13 @@ mod tests {
             .expect("should route uphill when at terminus but cannot accept");
         assert_eq!(forward_to.pub_key(), uphill_peer.pub_key());
         assert_eq!(
-            request.ttl, 1,
-            "TTL should be decremented (-1) then halved for uphill forward: (3-1)/2 = 1"
+            request.ttl, 2,
+            "TTL should be decremented by 1 only (no extra burn): 3 - 1 = 2"
+        );
+        assert_eq!(
+            request.uphill_budget,
+            DEFAULT_UPHILL_BUDGET - 1,
+            "uphill_budget should be decremented by 1 on uphill forward"
         );
 
         // forwarded_to should be set
@@ -3785,6 +3955,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3838,6 +4009,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3875,6 +4047,56 @@ mod tests {
             actions.forward.is_none(),
             "should not forward uphill when TTL is exhausted"
         );
+    }
+
+    #[test]
+    fn no_uphill_routing_when_budget_exhausted() {
+        let self_loc = make_peer(4750);
+        let joiner = make_peer(5750);
+        let uphill_peer = make_peer(6750);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 5, // TTL is fine
+                visited: VisitedPeers::default(),
+                uphill_budget: 0, // Budget exhausted
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .next_hop(None)
+            .uphill_hop(Some(uphill_peer));
+
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
+
+        assert!(
+            actions.accept_response.is_none(),
+            "should not accept when should_accept() returns false"
+        );
+        assert!(
+            actions.forward.is_none(),
+            "should not forward uphill when budget is exhausted"
+        );
+        assert!(actions.rejected, "should reject when budget is exhausted");
     }
 
     // NOTE: A test for joiner_known = None was considered, but this edge case cannot
@@ -4009,7 +4231,6 @@ mod tests {
         let skip = SkipListWithSelf {
             visited: &visited,
             self_addr: Some(self_addr),
-            excluded_peers: HashSet::new(),
         };
 
         // Should skip visited addresses
@@ -4043,6 +4264,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4082,6 +4304,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4120,6 +4343,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4168,6 +4392,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4232,6 +4457,7 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4318,6 +4544,43 @@ mod tests {
             2,
             "Must keep all low-score peers when no alternatives exist"
         );
+    }
+
+    #[test]
+    fn test_filter_low_score_preserves_all_when_no_alternatives() {
+        // When all scored candidates are below MIN_FORWARD_SCORE and there are
+        // no fallback candidates, filter_low_score_peers must keep them all
+        // to prevent a routing dead-end.
+        let mut scored = vec![
+            (0.08, make_peer(7001)), // below MIN_FORWARD_SCORE
+            (0.10, make_peer(7002)), // below MIN_FORWARD_SCORE
+            (0.12, make_peer(7003)), // below MIN_FORWARD_SCORE
+        ];
+        let fallback_count = 0; // no fallbacks available
+        filter_low_score_peers(&mut scored, fallback_count);
+        assert_eq!(
+            scored.len(),
+            3,
+            "all peers should be preserved when no alternatives exist"
+        );
+    }
+
+    #[test]
+    fn test_filter_low_score_removes_bad_when_alternatives_exist() {
+        let good_peer = make_peer(7002);
+        let good_key = good_peer.pub_key().clone();
+        let mut scored = vec![
+            (0.08, make_peer(7001)), // below MIN_FORWARD_SCORE
+            (0.30, good_peer),       // above MIN_FORWARD_SCORE
+        ];
+        let fallback_count = 1; // fallbacks available
+        filter_low_score_peers(&mut scored, fallback_count);
+        assert_eq!(
+            scored.len(),
+            1,
+            "low-score peer should be filtered when alternatives exist"
+        );
+        assert_eq!(scored[0].1.pub_key(), &good_key);
     }
 
     // ==================== ConnectFailed + Jitter + Exclusion Tests ====================
@@ -4449,53 +4712,60 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_exclusion_tracking() {
+    fn test_acceptor_reliability_tracking() {
         let cm = crate::ring::ConnectionManager::test_default();
         let addr: SocketAddr = "10.0.0.5:9000".parse().unwrap();
         let now = Instant::now();
 
-        // Not excluded initially
-        let excluded = cm.compute_connect_excluded_peers(now);
-        assert!(!excluded.contains(&addr));
+        // Unknown peer starts at 0.5 prior
+        let score = cm.peer_acceptor_reliability(addr, now);
+        assert!(
+            (score - 0.5).abs() < f64::EPSILON,
+            "unknown peer should have 0.5 reliability"
+        );
 
-        // Record failures below threshold
-        cm.record_connect_acceptor_failure(addr, now);
-        cm.record_connect_acceptor_failure(addr, now);
-        let excluded = cm.compute_connect_excluded_peers(now);
-        assert!(!excluded.contains(&addr), "below threshold");
+        // Record failures — reliability should decrease
+        cm.record_acceptor_outcome(addr, false, now);
+        cm.record_acceptor_outcome(addr, false, now);
+        cm.record_acceptor_outcome(addr, false, now);
+        let score = cm.peer_acceptor_reliability(addr, now);
+        // (0+1)/(3+2) = 0.2
+        assert!(
+            (score - 0.2).abs() < 0.01,
+            "3 failures should give ~0.2 reliability, got {}",
+            score
+        );
 
-        // Third failure crosses threshold
-        cm.record_connect_acceptor_failure(addr, now);
-        let excluded = cm.compute_connect_excluded_peers(now);
-        assert!(excluded.contains(&addr), "at threshold");
-
-        // Clear exclusion
-        cm.clear_connect_exclusion(addr);
-        let excluded = cm.compute_connect_excluded_peers(now);
-        assert!(!excluded.contains(&addr), "after clear");
+        // Record a success — reliability should increase
+        cm.record_acceptor_outcome(addr, true, now);
+        let score = cm.peer_acceptor_reliability(addr, now);
+        // (1+1)/(4+2) ≈ 0.333
+        assert!(
+            score > 0.2,
+            "success should increase reliability from 0.2, got {}",
+            score
+        );
     }
 
     #[test]
-    fn test_skip_list_excludes_connect_excluded_peers() {
+    fn test_skip_list_skips_self_and_visited() {
         let tx = Transaction::new::<ConnectMsg>();
-        let visited = VisitedPeers::new(&tx);
+        let mut visited = VisitedPeers::new(&tx);
         let self_addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-        let excluded_addr: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let visited_addr: SocketAddr = "10.0.0.2:5000".parse().unwrap();
         let normal_addr: SocketAddr = "10.0.0.3:5000".parse().unwrap();
 
-        let mut excluded_peers = HashSet::new();
-        excluded_peers.insert(excluded_addr);
+        visited.mark_visited(visited_addr);
 
         let skip = SkipListWithSelf {
             visited: &visited,
             self_addr: Some(self_addr),
-            excluded_peers,
         };
 
         assert!(skip.has_element(self_addr), "self should be skipped");
         assert!(
-            skip.has_element(excluded_addr),
-            "connect-excluded peer should be skipped"
+            skip.has_element(visited_addr),
+            "visited peer should be skipped"
         );
         assert!(
             !skip.has_element(normal_addr),
@@ -4536,6 +4806,7 @@ mod tests {
                 joiner: make_peer(5002),
                 ttl: 5,
                 visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
             },
             forwarded_to: Some(relay_peer),
             forwarded_at: Some(Instant::now()),

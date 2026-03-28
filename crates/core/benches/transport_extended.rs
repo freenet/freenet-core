@@ -17,7 +17,7 @@
 //!
 //! For quick CI checks: `cargo bench --bench transport_ci`
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use dashmap::DashMap;
 use freenet::simulation::{TimeSource, VirtualTime};
 use freenet::transport::mock_transport::{Channels, PacketDelayPolicy, PacketDropPolicy};

@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc, time::SystemTime};
 use chrono::{DateTime, Utc};
 use either::Either;
 use freenet_stdlib::prelude::*;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -2212,9 +2212,8 @@ mod opentelemetry_tracer {
 
     use dashmap::DashMap;
     use opentelemetry::{
-        global,
+        KeyValue, global,
         trace::{self, Span},
-        KeyValue,
     };
 
     use super::*;

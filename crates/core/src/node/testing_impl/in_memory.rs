@@ -16,19 +16,19 @@ use crate::{
     client_events::ClientEventsProxy,
     config::GlobalExecutor,
     contract::{
-        self, mediator_channels, op_request_channel, run_op_request_mediator, ContractHandler,
-        MemoryContractHandler, MockWasmContractHandler, MockWasmHandlerBuilder,
-        SimulationContractHandler, SimulationHandlerBuilder,
+        self, ContractHandler, MemoryContractHandler, MockWasmContractHandler,
+        MockWasmHandlerBuilder, SimulationContractHandler, SimulationHandlerBuilder,
+        mediator_channels, op_request_channel, run_op_request_mediator,
     },
     node::{
+        EventLoopExitReason, NetEventRegister,
         background_task_monitor::BackgroundTaskMonitor,
         network_bridge::{event_loop_notification_channel, p2p_protoc::P2pConnManager},
         op_state_manager::OpManager,
-        EventLoopExitReason, NetEventRegister,
     },
     operations::connect,
     ring::{ConnectionManager, PeerKeyLocation},
-    transport::in_memory_socket::{register_address_network, SimulationSocket},
+    transport::in_memory_socket::{SimulationSocket, register_address_network},
     wasm_runtime::MockStateStorage,
 };
 

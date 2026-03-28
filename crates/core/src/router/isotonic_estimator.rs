@@ -2,21 +2,39 @@ use crate::ring::{Distance, Location, PeerKeyLocation};
 use pav_regression::IsotonicRegression;
 use pav_regression::Point;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 const MIN_POINTS_FOR_REGRESSION: usize = 5;
 
-/// `IsotonicEstimator`  provides outcome estimation for a given action, such as
+/// Maximum number of raw data points retained by the global regression.
+/// Once reached, each new point evicts the oldest via `remove_points`.
+const MAX_REGRESSION_POINTS: usize = 500;
+
+/// EWMA smoothing factor for per-peer adjustments.
+/// Alpha = 0.1 gives a half-life of ~6.6 events, meaning the influence of an
+/// observation drops below 50% after about 7 newer observations.
+const EWMA_ALPHA: f64 = 0.1;
+
+/// `IsotonicEstimator` provides outcome estimation for a given action, such as
 /// retrieving the state of a contract, based on the distance between the peer
 /// and the contract. It uses an isotonic regression model from the `pav.rs`
 /// library to estimate the outcome based on the distance between the peer and
 /// the contract, but then also tracks an adjustment for each peer based on the
 /// outcome of the peer's previous requests.
+///
+/// The global regression uses a rolling window: once `MAX_REGRESSION_POINTS`
+/// raw points have been accumulated, each new point evicts the oldest via
+/// `remove_points`. Per-peer adjustments use an exponentially-weighted moving
+/// average (EWMA) so recent events have more influence than old ones.
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct IsotonicEstimator {
     pub global_regression: IsotonicRegression<f64>,
     pub peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
+    /// Raw input points in insertion order. When len exceeds
+    /// `MAX_REGRESSION_POINTS`, the oldest is evicted via `remove_points`.
+    #[serde(skip)]
+    raw_points: VecDeque<Point<f64>>,
 }
 
 impl IsotonicEstimator {
@@ -24,83 +42,86 @@ impl IsotonicEstimator {
     // dominated by sparse/noisy data.
     const ADJUSTMENT_PRIOR_SIZE: u64 = 10;
 
-    /// Creates a new `PeerOutcomeEstimator` from a list of historical events.
+    /// Creates a new `IsotonicEstimator` from a list of historical events.
     pub fn new<I>(history: I, estimator_type: EstimatorType) -> Self
     where
         I: IntoIterator<Item = IsotonicEvent>,
     {
-        let mut all_points = Vec::new();
+        let mut all_events: Vec<IsotonicEvent> = history.into_iter().collect();
 
+        // If history exceeds the window, keep only the most recent events.
+        // Both the regression points and the peer adjustment deltas are computed
+        // from the same windowed subset to avoid stale-data bias.
+        if all_events.len() > MAX_REGRESSION_POINTS {
+            all_events.drain(..all_events.len() - MAX_REGRESSION_POINTS);
+        }
+
+        let mut all_points = VecDeque::with_capacity(all_events.len());
         let mut peer_events: HashMap<PeerKeyLocation, Vec<IsotonicEvent>> = HashMap::new();
 
-        for event in history {
+        for event in all_events {
             let point = Point::new(event.route_distance().as_f64(), event.result);
-
-            all_points.push(point);
+            all_points.push_back(point);
             peer_events
                 .entry(event.peer.clone())
                 .or_default()
                 .push(event);
         }
 
+        let points: Vec<Point<f64>> = all_points.iter().cloned().collect();
         let global_regression = match estimator_type {
-            EstimatorType::Positive => IsotonicRegression::new_ascending(&all_points),
-            EstimatorType::Negative => IsotonicRegression::new_descending(&all_points),
+            EstimatorType::Positive => IsotonicRegression::new_ascending(&points),
+            EstimatorType::Negative => IsotonicRegression::new_descending(&points),
         }
         .expect("Failed to create isotonic regression");
 
-        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
-        let global_regression_big_enough_to_estimate_peer_adjustments =
-            global_regression.len() >= adjustment_prior_size as usize;
+        let global_regression_big_enough =
+            global_regression.len() >= Self::ADJUSTMENT_PRIOR_SIZE as usize;
 
         let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
 
-        if global_regression_big_enough_to_estimate_peer_adjustments {
-            // Use the constant defined earlier.
-            let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
-
-            // Use more descriptive variable names.
+        if global_regression_big_enough {
             for (peer_location, events) in peer_events.iter() {
-                let mut event_count: u64 = adjustment_prior_size;
-                let mut total_adjustment: f64 = 0.0;
+                let mut adjustment = Adjustment::new();
+                // Seed with ADJUSTMENT_PRIOR_SIZE phantom neutral observations
+                // so peers with few real observations are shrunk toward zero.
+                adjustment.effective_count = Self::ADJUSTMENT_PRIOR_SIZE as f64;
+
                 for event in events {
-                    let global_estimate_from_distance = global_regression
+                    let global_estimate = global_regression
                         .interpolate(event.route_distance().as_f64())
                         .expect("Regression should always produce an estimate");
-                    let peer_adjustment = event.result - global_estimate_from_distance;
-
-                    event_count += 1;
-                    total_adjustment += peer_adjustment;
+                    let delta = event.result - global_estimate;
+                    adjustment.add(delta);
                 }
-                peer_adjustments.insert(
-                    peer_location.clone(),
-                    Adjustment {
-                        sum: total_adjustment,
-                        count: event_count,
-                    },
-                );
+                peer_adjustments.insert(peer_location.clone(), adjustment);
             }
         }
 
         IsotonicEstimator {
             global_regression,
             peer_adjustments,
+            raw_points: all_points,
         }
     }
 
     /// Adds a new event to the estimator.
     pub fn add_event(&mut self, event: IsotonicEvent) {
         let route_distance = event.route_distance();
-
         let point = Point::new(route_distance.as_f64(), event.result);
 
+        // Add the new point to the regression and raw-point FIFO.
         self.global_regression.add_points(&[point]);
+        self.raw_points.push_back(point);
 
-        let adjustment_prior_size = Self::ADJUSTMENT_PRIOR_SIZE;
-        let global_regression_big_enough_to_estimate_peer_adjustments =
-            self.global_regression.len() >= adjustment_prior_size as usize;
+        // Evict the oldest point if the window is full.
+        if self.raw_points.len() > MAX_REGRESSION_POINTS {
+            if let Some(oldest) = self.raw_points.pop_front() {
+                self.global_regression.remove_points(&[oldest]);
+            }
+        }
 
-        if global_regression_big_enough_to_estimate_peer_adjustments {
+        if self.global_regression.len() >= Self::ADJUSTMENT_PRIOR_SIZE as usize {
             let adjustment = event.result
                 - self
                     .global_regression
@@ -119,10 +140,6 @@ impl IsotonicEstimator {
         peer: &PeerKeyLocation,
         contract_location: Location,
     ) -> Result<f64, EstimationError> {
-        // Check if there are enough data points that the model won't produce
-        // garbage output, but users of this class must implement their own checks
-        // to ensure that the model is sufficiently accurate as this is an
-        // extremely low bar.
         if self.global_regression.len() < MIN_POINTS_FOR_REGRESSION {
             return Err(EstimationError::InsufficientData);
         }
@@ -143,7 +160,7 @@ impl IsotonicEstimator {
             .get(peer)
             .map_or(global_estimate, |peer_adjustment| {
                 let should_use_peer_adjustment =
-                    peer_adjustment.count >= MIN_POINTS_FOR_REGRESSION as u64;
+                    peer_adjustment.effective_count >= MIN_POINTS_FOR_REGRESSION as f64;
                 global_estimate
                     + if should_use_peer_adjustment {
                         peer_adjustment.value()
@@ -167,6 +184,7 @@ impl IsotonicEstimator {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(crate) enum EstimatorType {
     /// Where the estimated value is expected to increase as distance increases
     Positive,
@@ -203,10 +221,19 @@ impl IsotonicEvent {
     }
 }
 
+/// Per-peer adjustment using an exponentially-weighted moving average (EWMA).
+///
+/// Each new observation is blended with the running average:
+///   smoothed = alpha * new_value + (1 - alpha) * smoothed
+///
+/// `effective_count` tracks the decayed sample size so callers can decide
+/// whether the peer has enough data to be trusted.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Adjustment {
-    sum: f64,
-    count: u64,
+    smoothed: f64,
+    effective_count: f64,
+    #[serde(skip)]
+    alpha: f64,
 }
 
 impl Default for Adjustment {
@@ -217,30 +244,32 @@ impl Default for Adjustment {
 
 impl Adjustment {
     fn new() -> Self {
-        Self { sum: 0.0, count: 0 }
-    }
-
-    fn add(&mut self, value: f64) {
-        self.sum += value;
-        self.count += 1;
-    }
-
-    fn value(&self) -> f64 {
-        self.mean()
-    }
-
-    /// Mean adjustment value (sum / count).
-    pub(crate) fn mean(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.sum / self.count as f64
+        Self {
+            smoothed: 0.0,
+            effective_count: 0.0,
+            alpha: EWMA_ALPHA,
         }
     }
 
-    /// Number of events contributing to this adjustment.
+    fn add(&mut self, value: f64) {
+        if self.effective_count < 1.0 {
+            // First real observation — set directly rather than blending with zero.
+            self.smoothed = value;
+        } else {
+            self.smoothed = self.alpha * value + (1.0 - self.alpha) * self.smoothed;
+        }
+        // Decay the effective count and add 1 for this new observation.
+        self.effective_count = 1.0 + (1.0 - self.alpha) * self.effective_count;
+    }
+
+    /// EWMA smoothed adjustment value.
+    pub(crate) fn value(&self) -> f64 {
+        self.smoothed
+    }
+
+    /// Effective number of events contributing to this adjustment (decayed).
     pub(crate) fn event_count(&self) -> u64 {
-        self.count
+        self.effective_count.round() as u64
     }
 }
 
@@ -252,23 +281,8 @@ mod tests {
     use super::*;
     use tracing::debug;
 
-    // This test `test_peer_time_estimator` checks the accuracy of the `RoutingOutcomeEstimator` struct's
-    // `estimate_retrieval_time()` method. It generates a list of 100 random events, where each event
-    // represents a simulated request made by a random `PeerId` at a random `Location` to retrieve data
-    // from a contract at another random `Location`. Each event is created by calling the `simulate_request()`
-    // helper function which calculates the distance between the `Peer` and the `Contract`, then estimates
-    // the retrieval time based on the distance and some random factor. The list of events is then split
-    // into two sets: a training set and a testing set.
-    //
-    // The `RoutingOutcomeEstimator` is then instantiated using the training set, and the `estimate_retrieval_time()`
-    // method is called for each event in the testing set. The estimated retrieval time is compared to the
-    // actual retrieval time recorded in the event, and the error between the two is calculated. The average
-    // error across all events is then calculated, and the test passes if the average error is less than 0.01.
-    // If the error is greater than or equal to 0.01, the test fails.
-
     #[test]
     fn test_positive_peer_time_estimator() {
-        // Generate a list of random events
         let mut events = Vec::new();
         for _ in 0..100 {
             let peer = PeerKeyLocation::random();
@@ -279,14 +293,11 @@ mod tests {
             events.push(simulate_positive_request(peer, contract_location));
         }
 
-        // Split the events into two sets
         let (training_events, testing_events) = events.split_at(events.len() / 2);
 
-        // Create a new estimator from the training set
         let estimator =
             IsotonicEstimator::new(training_events.iter().cloned(), EstimatorType::Positive);
 
-        // Test the estimator on the testing set, recording the errors
         let mut errors = Vec::new();
         for event in testing_events {
             let estimated_time = estimator
@@ -297,7 +308,6 @@ mod tests {
             errors.push(error);
         }
 
-        // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
         debug!("Average error: {average_error}");
         // Threshold 0.02 to avoid flaky failures from random seed variation
@@ -306,7 +316,6 @@ mod tests {
 
     #[test]
     fn test_negative_peer_time_estimator() {
-        // Generate a list of random events
         let mut events = Vec::new();
         for _ in 0..100 {
             let peer = PeerKeyLocation::random();
@@ -317,14 +326,11 @@ mod tests {
             events.push(simulate_negative_request(peer, contract_location));
         }
 
-        // Split the events into two sets
         let (training_events, testing_events) = events.split_at(events.len() / 2);
 
-        // Create a new estimator from the training set
         let estimator =
             IsotonicEstimator::new(training_events.iter().cloned(), EstimatorType::Negative);
 
-        // Test the estimator on the testing set, recording the errors
         let mut errors = Vec::new();
         for event in testing_events {
             let estimated_time = estimator
@@ -335,31 +341,154 @@ mod tests {
             errors.push(error);
         }
 
-        // Check that the errors are small
         let average_error = errors.iter().sum::<f64>() / errors.len() as f64;
         debug!("Average error: {average_error}");
         // Threshold 0.02 to avoid flaky failures from random seed variation
         assert!(average_error < 0.02);
     }
 
-    fn simulate_positive_request(
+    #[test]
+    fn test_adjustment_ewma_recency() {
+        let mut adj = Adjustment::new();
+
+        // Feed 100 events with value 10.0 (simulating a "bad" period)
+        for _ in 0..100 {
+            adj.add(10.0);
+        }
+        let after_bad = adj.value();
+        assert!(
+            (after_bad - 10.0).abs() < 0.01,
+            "EWMA should converge to 10.0, got {after_bad}"
+        );
+
+        // Now feed 20 events with value 0.0 (simulating recovery)
+        for _ in 0..20 {
+            adj.add(0.0);
+        }
+        let after_recovery = adj.value();
+        // (1-0.1)^20 ≈ 0.12, so ~88% of the old 10.0 has decayed.
+        assert!(
+            after_recovery < 2.0,
+            "EWMA should reflect recent 0.0 events after 20 observations, got {after_recovery}"
+        );
+    }
+
+    #[test]
+    fn test_adjustment_ewma_first_observation() {
+        let mut adj = Adjustment {
+            alpha: 0.5,
+            ..Adjustment::new()
+        };
+        adj.add(5.0);
+        assert_eq!(adj.value(), 5.0, "First observation should be set directly");
+        assert_eq!(adj.event_count(), 1);
+
+        adj.add(3.0);
+        // alpha * 3.0 + (1-alpha) * 5.0 = 0.5 * 3.0 + 0.5 * 5.0 = 4.0
+        assert!(
+            (adj.value() - 4.0).abs() < 1e-10,
+            "Second observation should blend via EWMA"
+        );
+    }
+
+    #[test]
+    fn test_rolling_window_eviction() {
+        let peer = PeerKeyLocation::random();
+        let contract = Location::random();
+
+        let mut estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
+
+        // Add more events than MAX_REGRESSION_POINTS
+        for i in 0..(MAX_REGRESSION_POINTS + 100) {
+            estimator.add_event(IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                result: i as f64,
+            });
+        }
+
+        assert!(
+            estimator.raw_points.len() <= MAX_REGRESSION_POINTS,
+            "Raw points should be bounded, got {}",
+            estimator.raw_points.len()
+        );
+
+        let result = estimator.estimate_retrieval_time(&peer, contract);
+        assert!(
+            result.is_ok(),
+            "Estimator should produce estimates after eviction"
+        );
+    }
+
+    #[test]
+    fn test_estimator_adapts_to_regime_change() {
+        let peer = PeerKeyLocation::random();
+        let contract = Location::new(0.0);
+
+        let mut estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
+
+        // Phase 1: build up global regression with several peers at value 100.0
+        let peers: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
+        for _ in 0..30 {
+            for p in &peers {
+                estimator.add_event(IsotonicEvent {
+                    peer: p.clone(),
+                    contract_location: contract,
+                    result: 100.0,
+                });
+            }
+        }
+        // Target peer is "slow" — higher than average
+        for _ in 0..20 {
+            estimator.add_event(IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                result: 200.0,
+            });
+        }
+
+        let estimate_before = estimator
+            .estimate_retrieval_time(&peer, contract)
+            .unwrap_or(0.0);
+
+        // Phase 2: peer becomes "fast"
+        for _ in 0..20 {
+            estimator.add_event(IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                result: 50.0,
+            });
+        }
+
+        let estimate_after = estimator
+            .estimate_retrieval_time(&peer, contract)
+            .unwrap_or(0.0);
+
+        assert!(
+            estimate_after < estimate_before,
+            "Estimate should decrease after peer improves: before={estimate_before}, after={estimate_after}"
+        );
+    }
+
+    /// Deterministic per-peer noise derived from the public key hash.
+    fn peer_noise(peer: &PeerKeyLocation) -> f64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{}", peer.pub_key()).hash(&mut hasher);
+        (hasher.finish() as u8) as f64
+    }
+
+    fn simulate_request(
         peer: PeerKeyLocation,
         contract_location: Location,
+        result_fn: impl FnOnce(f64) -> f64,
     ) -> IsotonicEvent {
-        let distance: f64 = peer
+        let distance = peer
             .location()
             .unwrap()
             .distance(contract_location)
             .as_f64();
-
-        // Use the hash of the public key for deterministic but random-like variation
-        let key_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            format!("{}", peer.pub_key()).hash(&mut hasher);
-            hasher.finish()
-        };
-        let result = distance.powf(0.5) + (key_hash as u8) as f64;
+        let result = result_fn(distance) + peer_noise(&peer);
         IsotonicEvent {
             peer,
             contract_location,
@@ -367,28 +496,17 @@ mod tests {
         }
     }
 
+    fn simulate_positive_request(
+        peer: PeerKeyLocation,
+        contract_location: Location,
+    ) -> IsotonicEvent {
+        simulate_request(peer, contract_location, |d| d.powf(0.5))
+    }
+
     fn simulate_negative_request(
         peer: PeerKeyLocation,
         contract_location: Location,
     ) -> IsotonicEvent {
-        let distance: f64 = peer
-            .location()
-            .unwrap()
-            .distance(contract_location)
-            .as_f64();
-
-        // Use the hash of the public key for deterministic but random-like variation
-        let key_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            format!("{}", peer.pub_key()).hash(&mut hasher);
-            hasher.finish()
-        };
-        let result = (100.0 - distance).powf(0.5) + (key_hash as u8) as f64;
-        IsotonicEvent {
-            peer,
-            contract_location,
-            result,
-        }
+        simulate_request(peer, contract_location, |d| (100.0 - d).powf(0.5))
     }
 }

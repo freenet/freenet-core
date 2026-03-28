@@ -739,12 +739,19 @@ create_release_pr() {
         run_cmd "Creating release branch" git checkout -b "$branch_name"
     fi
 
-    run_cmd "Committing version bump" git commit -m "build: bump versions to $VERSION
+    # Only commit if there are uncommitted changes (handles re-run after partial failure)
+    if git diff --quiet HEAD; then
+        echo "  ℹ️  No changes to commit (version bump already committed)"
+    else
+        # Stage only the files modified by the version bump — never git add -A
+        git add crates/core/Cargo.toml crates/fdev/Cargo.toml Cargo.lock
+        run_cmd "Committing version bump" git commit -m "build: bump versions to $VERSION
 
 - freenet: → $VERSION
 - fdev: → $FDEV_VERSION
 
 🤖 Automated release commit"
+    fi
 
     run_cmd "Pushing branch" git push origin "$branch_name"
     

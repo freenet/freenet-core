@@ -36,10 +36,10 @@
 
 mod common;
 
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use common::{
-    topology::{analyze_small_world_topology, print_topology_details, print_topology_summary},
     RiverSession, RiverUser,
+    topology::{analyze_small_world_topology, print_topology_details, print_topology_summary},
 };
 use freenet_test_network::{Backend, BuildProfile, DockerNatConfig, FreenetBinary, TestNetwork};
 use serde_json::to_string_pretty;

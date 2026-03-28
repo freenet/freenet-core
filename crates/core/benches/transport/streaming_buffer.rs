@@ -21,7 +21,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use freenet::transport::peer_connection::streaming_buffer::{
-    LockFreeStreamBuffer, FRAGMENT_PAYLOAD_SIZE,
+    FRAGMENT_PAYLOAD_SIZE, LockFreeStreamBuffer,
 };
 
 /// Stream sizes to benchmark (in bytes)

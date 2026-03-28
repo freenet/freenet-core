@@ -108,6 +108,82 @@ jobs:
             exit 1
           fi
 
+  # Grep-based lint for banned patterns in crates/core/ (DST-breaking APIs).
+  # Only checks added lines in the diff — pre-existing violations are grandfathered.
+  # Fast (~2s on GitHub-hosted runner), no Rust toolchain needed.
+  rule_lint:
+    name: Rule Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for banned patterns in new code
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          # Get added lines in crates/core/ .rs files only (line starts with +, skip +++ headers)
+          ADDED=$(git diff "$BASE"..."$HEAD" -- 'crates/core/src/**/*.rs' \
+            | grep '^+' | grep -v '^+++' || true)
+
+          ERRORS=""
+
+          # Strip Rust line comments before matching — avoids false positives from
+          # "// don't use std::time::Instant::now()" style comments and TODOs.
+          STRIPPED=$(echo "$ADDED" | sed 's|//.*||' || true)
+
+          # 1. std::time::Instant::now() — must use TimeSource
+          if echo "$STRIPPED" | grep -qE 'std::time::Instant::now\(\)'; then
+            ERRORS="$ERRORS
+          ERROR: std::time::Instant::now() used in crates/core/ — use TimeSource trait instead
+          $(echo "$ADDED" | grep -n 'std::time::Instant::now()')"
+          fi
+
+          # 2. rand::thread_rng() or rand::random() — must use GlobalRng
+          if echo "$STRIPPED" | grep -qE 'rand::(thread_rng|random)\(\)'; then
+            ERRORS="$ERRORS
+          ERROR: rand::thread_rng()/rand::random() used in crates/core/ — use GlobalRng instead
+          $(echo "$ADDED" | grep -nE 'rand::(thread_rng|random)\(\)')"
+          fi
+
+          # 3. tokio::net::UdpSocket — must use Socket trait
+          if echo "$STRIPPED" | grep -qE 'tokio::net::UdpSocket'; then
+            ERRORS="$ERRORS
+          ERROR: tokio::net::UdpSocket used in crates/core/ — use Socket trait instead
+          $(echo "$ADDED" | grep -n 'tokio::net::UdpSocket')"
+          fi
+
+          # 4. Deleted test functions (removed #[test] or #[tokio::test] lines)
+          REMOVED=$(git diff "$BASE"..."$HEAD" -- 'crates/core/src/**/*.rs' 'crates/core/tests/**/*.rs' \
+            | grep '^-' | grep -v '^---' || true)
+          REMOVED_STRIPPED=$(echo "$REMOVED" | sed 's|//.*||' || true)
+          if echo "$REMOVED_STRIPPED" | grep -qE '#\[(tokio::)?test\]'; then
+            # Check it wasn't just moved (also present in added lines)
+            REMOVED_TESTS=$(echo "$REMOVED_STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
+            ADDED_TESTS=$(echo "$STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
+            if [ "$REMOVED_TESTS" -gt "$ADDED_TESTS" ]; then
+              ERRORS="$ERRORS
+          ERROR: Test function(s) removed — tests must not be deleted (use #[ignore] with a tracking issue if broken)
+          Removed $REMOVED_TESTS test(s), added $ADDED_TESTS test(s)"
+            fi
+          fi
+
+          if [ -n "$ERRORS" ]; then
+            echo "::error::Rule lint failed — banned patterns found in new code"
+            echo "$ERRORS"
+            echo ""
+            echo "These patterns break deterministic simulation testing (DST)."
+            echo "See .claude/rules/testing.md and .claude/rules/code-style.md for alternatives."
+            exit 1
+          fi
+
+          echo "Rule lint passed — no banned patterns in new code"
+
   # Clippy runs in parallel with fmt_check for faster fail-fast
   # Using Ubicloud for faster builds with more cores
   clippy_check:
@@ -141,6 +217,29 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo clippy --locked -- -D warnings
+
+  # Windows compile check - catches missing imports, feature flags, and
+  # platform-specific errors that Linux CI misses. Added after #3685 where
+  # PRs #3669/#3680 introduced Windows-only code that failed to compile,
+  # but wasn't caught until the release cross-compile workflow ran.
+  windows_check:
+    name: Windows Check
+    runs-on: windows-latest
+    timeout-minutes: 20
+    needs: fmt_check
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check compilation
+        run: cargo check --locked -p freenet -p fdev
 
   test_unit:
     name: Unit & Integration

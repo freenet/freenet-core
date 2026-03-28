@@ -10,8 +10,8 @@ mod common;
 
 use anyhow::Result;
 use common::{
-    connect_ws_with_retry, get_contract_state, load_contract, subscribe_to_contract,
-    update_contract_state, APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT,
+    APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, connect_ws_with_retry, get_contract_state,
+    load_contract, subscribe_to_contract, update_contract_state,
 };
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
@@ -101,6 +101,13 @@ async fn test_contract_operations_via_docker_nat() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to deploy contract: {}", e))?;
     tracing::info!("Contract deployed: {contract_key}");
+
+    // --- Fetch contract on peer before subscribing ---
+    // PutResponse is sent after local upsert on the gateway; the contract may
+    // not have propagated to the peer yet. A GET with return_contract_code=true
+    // ensures the peer caches the WASM before subscribing.
+    get_contract_state(&mut peer_client, contract_key, true).await?;
+    tracing::info!("Peer fetched contract");
 
     // --- Subscribe from peer ---
     subscribe_to_contract(&mut peer_client, contract_key).await?;

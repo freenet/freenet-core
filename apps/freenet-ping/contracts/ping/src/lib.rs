@@ -42,11 +42,9 @@ impl ContractInterface for Contract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         #[cfg(feature = "contract")]
-        freenet_stdlib::log::info(
-            &format!(
-                "[UPDATE_STATE] Ping contract update_state called with parameters: {parameters:?}, state: {state:?}, data: {data:?}"
-            )
-        );
+        freenet_stdlib::log::info(&format!(
+            "[UPDATE_STATE] Ping contract update_state called with parameters: {parameters:?}, state: {state:?}, data: {data:?}"
+        ));
         let opts = serde_json::from_slice::<PingContractOptions>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
         let mut ping = if state.is_empty() {

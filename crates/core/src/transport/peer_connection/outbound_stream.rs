@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use aes_gcm::Aes128Gcm;
@@ -12,19 +12,41 @@ use crate::{
     simulation::TimeSource,
     tracing::TransferDirection,
     transport::{
+        TransferStats, TransportError,
         congestion_control::{CongestionControl, CongestionController},
         metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
         packet_data,
         sent_packet_tracker::SentPacketTracker,
         symmetric_message::{self},
-        TransferStats, TransportError,
     },
 };
 
 use futures::StreamExt;
 
-use super::streaming::StreamHandle;
 use super::StreamId;
+use super::streaming::StreamHandle;
+
+/// Maximum time to wait for congestion window space *per fragment* before aborting a stream
+/// transfer. Resets for each fragment, so a slow-but-progressing transfer won't time out.
+///
+/// Derived from the receiver's STREAM_INACTIVITY_TIMEOUT minus a 10s margin, so the sender
+/// fails first with a diagnostic message rather than the receiver timing out silently.
+///
+/// This is intentionally longer than `PROGRESS_TIMEOUT` (7s) in the GC task:
+/// if a cwnd stall causes a GET to stall, the GC task fires first (launching
+/// a speculative retry on a different peer), then this timeout fires later
+/// (cleaning up the stuck send task). The layered recovery ensures the user
+/// gets a fast retry without waiting for the transport-level timeout.
+const CWND_WAIT_TIMEOUT: Duration = {
+    const MARGIN_SECS: u64 = 10;
+    const INACTIVITY_SECS: u64 = super::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs();
+    // Compile-time check: STREAM_INACTIVITY_TIMEOUT must exceed the margin.
+    assert!(
+        INACTIVITY_SECS > MARGIN_SECS,
+        "STREAM_INACTIVITY_TIMEOUT must be > 10s"
+    );
+    Duration::from_secs(INACTIVITY_SECS - MARGIN_SECS)
+};
 
 /// Stream payload type using zero-copy Bytes for efficient fragmentation.
 /// Using Bytes::slice() instead of Vec::split_off() eliminates per-fragment allocations.
@@ -110,9 +132,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // cwnd space. If recv() is never called, flightsize never decreases and this
         // loop will block forever.
         //
-        // In production, PeerConnection is always used in a bidirectional select! loop
-        // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
-        // always being polled. Tests must follow the same pattern.
+        // Safety: the loop is bounded by CWND_WAIT_TIMEOUT (#3608).
+        let cwnd_wait_start = time_source.now();
         let mut cwnd_wait_iterations = 0;
         loop {
             let flightsize = congestion_controller.flightsize();
@@ -132,6 +153,37 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                     packet_size,
                     "Waiting for cwnd space (ensure recv() is being called to process ACKs)"
                 );
+            }
+
+            // Timeout: if cwnd space never opens (ACKs stopped arriving),
+            // fail the stream instead of blocking forever (#3608).
+            let cwnd_elapsed = time_source.now().saturating_sub(cwnd_wait_start);
+            if cwnd_elapsed >= CWND_WAIT_TIMEOUT {
+                let elapsed = time_source.now().saturating_sub(start_time);
+                tracing::warn!(
+                    stream_id = %stream_id.0,
+                    destination = %destination_addr,
+                    sent_so_far,
+                    total_packets,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    cwnd_wait_ms = cwnd_elapsed.as_millis(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "send_stream cwnd wait timed out — ACKs likely stopped arriving"
+                );
+                emit_transfer_failed(
+                    stream_id.0 as u64,
+                    destination_addr,
+                    sent_so_far as u64,
+                    format!(
+                        "cwnd wait timeout after {}s (sent {sent_so_far}/{total_packets} packets, \
+                         flightsize={flightsize}B, cwnd={cwnd}B)",
+                        cwnd_elapsed.as_secs()
+                    ),
+                    elapsed.as_millis() as u64,
+                    TransferDirection::Send,
+                );
+                return Err(TransportError::ConnectionClosed(destination_addr));
             }
 
             // Exponential backoff to balance responsiveness and CPU usage
@@ -428,11 +480,13 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         // IMPORTANT: This loop requires that recv() is being called on this connection
         // to process incoming ACKs. ACKs reduce flightsize via on_ack(), which opens
         // cwnd space. If recv() is never called, flightsize never decreases and this
-        // loop will block forever.
+        // loop will block forever — which is exactly what happened in #3608 when the
+        // relay GET streaming path (#3586) lost ACKs mid-transfer.
         //
-        // In production, PeerConnection is always used in a bidirectional select! loop
-        // (see peer_connection_listener in p2p_protoc.rs) which ensures recv() is
-        // always being polled. Tests must follow the same pattern.
+        // Safety: the loop is bounded by CWND_WAIT_TIMEOUT. If cwnd space doesn't
+        // open within the timeout, the pipe fails with ConnectionClosed rather than
+        // hanging indefinitely.
+        let cwnd_wait_start = time_source.now();
         let mut cwnd_wait_iterations = 0;
         loop {
             let flightsize = congestion_controller.flightsize();
@@ -451,6 +505,38 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                     cwnd_kb = cwnd / 1024,
                     "Waiting for cwnd space in pipe_stream"
                 );
+            }
+
+            // Timeout: if cwnd space never opens (ACKs stopped arriving),
+            // fail the pipe instead of blocking forever (#3608).
+            let cwnd_elapsed = time_source.now().saturating_sub(cwnd_wait_start);
+            if cwnd_elapsed >= CWND_WAIT_TIMEOUT {
+                let elapsed = time_source.now().saturating_sub(start_time);
+                tracing::warn!(
+                    stream_id = %outbound_stream_id.0,
+                    destination = %destination_addr,
+                    fragment_number,
+                    sent_so_far,
+                    total_bytes,
+                    flightsize_kb = flightsize / 1024,
+                    cwnd_kb = cwnd / 1024,
+                    cwnd_wait_ms = cwnd_elapsed.as_millis(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "pipe_stream cwnd wait timed out — ACKs likely stopped arriving"
+                );
+                emit_transfer_failed(
+                    outbound_stream_id.0 as u64,
+                    destination_addr,
+                    sent_so_far,
+                    format!(
+                        "cwnd wait timeout after {}s (sent {sent_so_far}/{total_bytes} bytes, \
+                         flightsize={flightsize}B, cwnd={cwnd}B)",
+                        cwnd_elapsed.as_secs()
+                    ),
+                    elapsed.as_millis() as u64,
+                    TransferDirection::Send,
+                );
+                return Err(TransportError::ConnectionClosed(destination_addr));
             }
 
             if cwnd_wait_iterations <= 10 {
@@ -920,6 +1006,66 @@ mod tests {
     }
 
     /// Test that fragment #1 with embedded metadata never exceeds MAX_DATA_SIZE.
+    /// Test that send_stream aborts with ConnectionClosed when the cwnd wait
+    /// exceeds CWND_WAIT_TIMEOUT. Simulates a dead outbound connection where
+    /// cwnd is too small for any packet (#3608).
+    #[tokio::test(start_paused = true)]
+    async fn test_send_stream_cwnd_wait_timeout() -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, _outbound_receiver) = fast_channel::bounded(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = vec![0u8; 10_000];
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        // Use RealTime with tokio's paused time (start_paused = true) for
+        // deterministic auto-advancing sleep. VirtualTime requires manual
+        // advance() calls which don't interleave well with the cwnd wait loop.
+        let time_source = RealTime::new();
+
+        // Create a congestion controller with a tiny cwnd (1 byte).
+        // Any real packet exceeds this, so the cwnd wait loop never breaks
+        // and must hit the CWND_WAIT_TIMEOUT.
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1,
+            min_cwnd: 1,
+            max_cwnd: 1,
+            ..Default::default()
+        })
+        .build_arc();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let send_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            None,
+        ));
+
+        // With start_paused=true, tokio auto-advances time through sleep calls.
+        // The cwnd wait loop sleeps in 1ms increments, and the timeout is 15s,
+        // so tokio will auto-advance through ~15,000 iterations instantly.
+        let result = send_task.await.expect("join error");
+        assert!(
+            matches!(result, Err(TransportError::ConnectionClosed(_))),
+            "Expected ConnectionClosed after cwnd wait timeout, got: {result:?}",
+        );
+
+        Ok(())
+    }
+
     /// This is a regression test for the critical bug where adding metadata to
     /// fragment #1 caused size overflow, breaking all streaming operations >1422 bytes.
     #[test]
@@ -1006,5 +1152,63 @@ mod tests {
             serialized_frag2.len(),
             packet_data::MAX_DATA_SIZE
         );
+    }
+
+    /// Test that pipe_stream aborts with ConnectionClosed when the cwnd wait
+    /// exceeds CWND_WAIT_TIMEOUT. This exercises the same timeout logic as
+    /// send_stream but through the pipe_stream code path with different state
+    /// variables (sent_so_far as u64 bytes, no completion_tx).
+    #[tokio::test(start_paused = true)]
+    async fn test_pipe_stream_cwnd_wait_timeout() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+
+        let (outbound_sender, _outbound_receiver) = fast_channel::bounded(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // Create a StreamHandle with a fragment already buffered so the
+        // inactivity timeout (30s) doesn't fire before the cwnd timeout (20s).
+        let stream_id = StreamId::next();
+        let handle = StreamHandle::new(stream_id, 10_000);
+        handle
+            .push_fragment(1, Bytes::from(vec![0u8; 1400]))
+            .unwrap();
+
+        // Stuck congestion controller (same pattern as send_stream test)
+        let congestion_controller = CongestionControlConfig::default().build_arc();
+        congestion_controller.on_send(1_000_000);
+        congestion_controller.on_timeout();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let pipe_task = GlobalExecutor::spawn(pipe_stream(
+            handle,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+        ));
+
+        let result = pipe_task.await.expect("join error");
+        assert!(
+            matches!(result, Err(TransportError::ConnectionClosed(_))),
+            "Expected ConnectionClosed after pipe_stream cwnd wait timeout, got: {:?}",
+            result
+        );
+
+        Ok(())
     }
 }

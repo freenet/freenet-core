@@ -1,8 +1,8 @@
 [package]
 name = "freenet"
-version = "0.2.13"
-edition = "2021"
-rust-version = "1.80"
+version = "0.2.16"
+edition = "2024"
+rust-version = "1.85"
 publish = true
 description = "Freenet core software"
 license-file = "LICENSE.md"
@@ -13,7 +13,7 @@ readme = "README.md"
 # Minimum compatible protocol version. Peers older than this are rejected.
 # Updated by scripts/release.sh during releases. The env var
 # FREENET_MIN_COMPATIBLE_VERSION overrides this at build time.
-min-compatible-version = "0.2.12"
+min-compatible-version = "0.2.15"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
@@ -58,6 +58,7 @@ hostname = "0.4"
 notify = { workspace = true }
 pav_regression = { workspace = true }
 parking_lot = { workspace = true }
+renegade-ml = { workspace = true }
 pin-project = { workspace = true }
 rand = { features = ["small_rng"], workspace = true }
 redb = { workspace = true, optional = true }
@@ -114,9 +115,18 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, features = ["sysinfoapi"] }
+winapi = { workspace = true, features = ["sysinfoapi", "wincon", "winuser"] }
 serde = { workspace = true }
 zip = { workspace = true }
+tray-icon = { workspace = true }
+muda = { workspace = true }
+native-windows-gui = { workspace = true }
+native-windows-derive = { workspace = true }
+winreg = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { workspace = true }
+muda = { workspace = true }
 
 [dev-dependencies]
 arbitrary = { workspace = true }
@@ -138,6 +148,7 @@ tokio-tungstenite = { workspace = true }
 ureq = { workspace = true }
 which = { workspace = true }
 regex = { workspace = true }
+serial_test = { workspace = true }
 
 # CI-optimized benchmark suite (~5 min, deterministic)
 [[bench]]
@@ -171,6 +182,9 @@ required-features = ["bench", "bench_full"]
 
 [build-dependencies]
 chrono = { workspace = true }
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
 
 [features]
 default = ["redb", "trace", "websocket", "wasmtime-backend"]

@@ -1,5 +1,5 @@
 #![allow(unused)]
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use freenet::{
     config::{ConfigArgs, InlineGwConfig, NetworkArgs, SecretArgs, WebsocketApiArgs},
@@ -15,8 +15,8 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
-use futures::{future::BoxFuture, FutureExt};
-use rand::{random, Rng, SeedableRng};
+use futures::{FutureExt, future::BoxFuture};
+use rand::{Rng, SeedableRng, random};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -37,7 +37,7 @@ pub use freenet::test_utils::{
 static COMPILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 use tokio::{select, time::sleep};
 pub use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
-use tracing::{info, span, Instrument, Level};
+use tracing::{Instrument, Level, info, span};
 
 use serde::{Deserialize, Serialize};
 
@@ -505,7 +505,8 @@ fn ensure_target_dir_env() {
             .map(PathBuf::from)
             .unwrap_or_else(|_| find_workspace_root());
         let target_dir = workspace_dir.join("target");
-        std::env::set_var(TARGET_DIR_VAR, &target_dir);
+        // SAFETY: test environment, called before any threads are spawned
+        unsafe { std::env::set_var(TARGET_DIR_VAR, &target_dir) };
     }
 }
 

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // Importing from this namespace is what makes this a V2 delegate.
 #[cfg(target_family = "wasm")]
 #[link(wasm_import_module = "freenet_delegate_contracts")]
-extern "C" {
+unsafe extern "C" {
     /// Returns the byte length of the contract's state, or a negative error code.
     fn __frnt__delegate__get_contract_state_len(id_ptr: i64, id_len: i32) -> i64;
     /// Copies the contract state into the buffer at out_ptr. Returns bytes written,

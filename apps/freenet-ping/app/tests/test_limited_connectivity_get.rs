@@ -51,7 +51,7 @@ use freenet_stdlib::{
 };
 use futures::FutureExt;
 use tokio::{select, time::timeout};
-use tracing::{span, Instrument, Level};
+use tracing::{Instrument, Level, span};
 
 use common::{
     base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,

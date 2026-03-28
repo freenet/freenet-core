@@ -95,6 +95,14 @@ NAT traversal:
   4. Rate limit: 1 intro packet/second per source IP
   5. Gateway ramp-up: 5/s for 30s, 20/s for 2min, unlimited after
      (prevents thundering herd after gateway restart)
+
+Restart detection (all peers, not just gateways):
+  → If an intro packet arrives on an established connection, attempt
+    asymmetric decryption (rate-limited to 1/sec per IP).
+  → If valid: the remote peer restarted. Tear down stale session and
+    accept a fresh handshake (server-side, same as gateway_connection).
+  → This lets restarted peers reconnect via existing NAT holes without
+    full gateway re-bootstrap (#3671).
 ```
 
 ### WHEN maintaining connections

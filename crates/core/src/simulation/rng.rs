@@ -3,7 +3,7 @@
 //! This module provides a centralized RNG that can be shared across all
 //! simulation components to ensure deterministic behavior.
 
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

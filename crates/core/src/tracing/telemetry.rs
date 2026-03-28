@@ -25,8 +25,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use either::Either;
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use serde::Serialize;
 use tokio::sync::mpsc;
 

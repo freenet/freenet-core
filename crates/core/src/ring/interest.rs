@@ -1331,9 +1331,11 @@ mod tests {
         let delta = StateDelta::from(vec![7, 8, 9]);
 
         // Cache miss
-        assert!(manager
-            .get_cached_delta(&contract1, &peer_summary, &our_summary)
-            .is_none());
+        assert!(
+            manager
+                .get_cached_delta(&contract1, &peer_summary, &our_summary)
+                .is_none()
+        );
 
         // Cache the delta for contract1
         manager.cache_delta(&contract1, &peer_summary, &our_summary, delta.clone());
@@ -1344,9 +1346,11 @@ mod tests {
         assert_eq!(cached.unwrap().as_ref(), delta.as_ref());
 
         // Cache miss for contract2 with same summaries (contract key isolates cache entries)
-        assert!(manager
-            .get_cached_delta(&contract2, &peer_summary, &our_summary)
-            .is_none());
+        assert!(
+            manager
+                .get_cached_delta(&contract2, &peer_summary, &our_summary)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1517,10 +1521,12 @@ mod tests {
         }
 
         // Verify B now tracks A's interest in contract2
-        assert!(manager_b
-            .get_interested_peers(&contract2)
-            .iter()
-            .any(|(pk, _)| pk == &peer_a));
+        assert!(
+            manager_b
+                .get_interested_peers(&contract2)
+                .iter()
+                .any(|(pk, _)| pk == &peer_a)
+        );
 
         // Step 3: B sends summaries back for matching contracts
         // A receives and updates B's summary
@@ -1567,15 +1573,19 @@ mod tests {
         }
 
         // Only contract1 should have peer interest (we have local interest in it)
-        assert!(manager
-            .get_interested_peers(&contract1)
-            .iter()
-            .any(|(pk, _)| pk == &peer));
+        assert!(
+            manager
+                .get_interested_peers(&contract1)
+                .iter()
+                .any(|(pk, _)| pk == &peer)
+        );
         // contract2 wasn't registered because we don't have local interest
-        assert!(!manager
-            .get_interested_peers(&contract2)
-            .iter()
-            .any(|(pk, _)| pk == &peer));
+        assert!(
+            !manager
+                .get_interested_peers(&contract2)
+                .iter()
+                .any(|(pk, _)| pk == &peer)
+        );
 
         // Later: peer removes interest in contract1
         let removed_hashes = vec![hash1];
@@ -1586,10 +1596,12 @@ mod tests {
         }
 
         // Verify peer is no longer interested
-        assert!(!manager
-            .get_interested_peers(&contract1)
-            .iter()
-            .any(|(pk, _)| pk == &peer));
+        assert!(
+            !manager
+                .get_interested_peers(&contract1)
+                .iter()
+                .any(|(pk, _)| pk == &peer)
+        );
     }
 
     #[test]
@@ -1615,10 +1627,12 @@ mod tests {
         assert!(cached.is_none());
 
         // Peer should still be interested (just no summary)
-        assert!(manager
-            .get_interested_peers(&contract)
-            .iter()
-            .any(|(pk, _)| pk == &peer));
+        assert!(
+            manager
+                .get_interested_peers(&contract)
+                .iter()
+                .any(|(pk, _)| pk == &peer)
+        );
     }
 
     #[test]
@@ -1675,14 +1689,18 @@ mod tests {
         );
 
         // Both peers should still be interested
-        assert!(manager_a
-            .get_interested_peers(&contract)
-            .iter()
-            .any(|(pk, _)| pk == &peer_b));
-        assert!(manager_b
-            .get_interested_peers(&contract)
-            .iter()
-            .any(|(pk, _)| pk == &peer_a));
+        assert!(
+            manager_a
+                .get_interested_peers(&contract)
+                .iter()
+                .any(|(pk, _)| pk == &peer_b)
+        );
+        assert!(
+            manager_b
+                .get_interested_peers(&contract)
+                .iter()
+                .any(|(pk, _)| pk == &peer_a)
+        );
     }
 
     #[test]
@@ -1706,7 +1724,7 @@ mod tests {
 
         // Large summary (not efficient for delta)
         let large_summary = StateSummary::from(vec![1; 600]); // 600 bytes
-                                                              // 600/1000 = 60% > 50%, delta NOT efficient
+        // 600/1000 = 60% > 50%, delta NOT efficient
 
         // Register peer1 with small summary (delta should be efficient)
         manager.register_peer_interest(
@@ -1743,7 +1761,7 @@ mod tests {
 
         // Test 4: Edge case - summary exactly 50% of state size
         let half_summary = StateSummary::from(vec![1; 500]); // 500 bytes
-                                                             // 500 * 2 = 1000, not < 1000, so not efficient
+        // 500 * 2 = 1000, not < 1000, so not efficient
         assert!(
             !is_delta_efficient(half_summary.as_ref().len(), large_state_size),
             "summary at exactly 50% boundary should not be efficient"
@@ -1751,7 +1769,7 @@ mod tests {
 
         // Test 5: Summary just under 50%
         let just_under_half = StateSummary::from(vec![1; 499]); // 499 bytes
-                                                                // 499 * 2 = 998 < 1000, so efficient
+        // 499 * 2 = 998 < 1000, so efficient
         assert!(
             is_delta_efficient(just_under_half.as_ref().len(), large_state_size),
             "summary just under 50% should be efficient"

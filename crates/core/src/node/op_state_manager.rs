@@ -10,7 +10,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashSet},
     net::SocketAddr,
-    sync::{atomic::AtomicBool, Arc, OnceLock},
+    sync::{Arc, OnceLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -30,13 +30,13 @@ use crate::{
         TransactionType,
     },
     operations::{
+        OpEnum, OpError,
         connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
         get::GetOp,
         orphan_streams::OrphanStreamRegistry,
         put::PutOp,
         subscribe::SubscribeOp,
         update::UpdateOp,
-        OpEnum, OpError,
     },
     ring::{
         ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
@@ -47,8 +47,8 @@ use crate::{
 };
 
 use super::{
-    neighbor_hosting::NeighborHostingManager, network_bridge::EventLoopNotificationsSender,
-    NetEventRegister, NodeConfig, RequestRouter,
+    NetEventRegister, NodeConfig, RequestRouter, neighbor_hosting::NeighborHostingManager,
+    network_bridge::EventLoopNotificationsSender,
 };
 
 #[cfg(debug_assertions)]
@@ -1342,11 +1342,26 @@ fn remove_subscribe_and_notify_timeout(
     ring: &crate::ring::Ring,
 ) -> Option<()> {
     let (_, sub_op) = ops.subscribe.remove(tx)?;
+    let is_originator = sub_op.is_originator();
     if let Some((peer, contract_location)) = sub_op.failure_routing_info() {
         report_timeout_failure(ring, tx, peer, contract_location);
     }
-    if let Some(instance_id) = sub_op.instance_id() {
+    let instance_id = sub_op.instance_id();
+    if let Some(instance_id) = instance_id {
         notify_subscription_timeout(ch_outbound, instance_id);
+    }
+    // Emit telemetry so subscribe timeouts are visible in the dashboard (#3676).
+    // Without this, timed-out subscribes were invisible — only subscribe_request
+    // and subscribe_success were emitted, so timeouts looked like missing data.
+    if is_originator {
+        crate::tracing::telemetry::send_standalone_event(
+            "subscribe_timeout",
+            serde_json::json!({
+                "tx": tx.to_string(),
+                "instance_id": instance_id.map(|id| id.to_string()),
+                "elapsed_ms": tx.elapsed().as_millis() as u64,
+            }),
+        );
     }
     Some(())
 }
@@ -1397,7 +1412,7 @@ fn remove_get_and_report_failure(
 }
 
 /// Log when a connect operation in Relaying state with an outstanding uphill forward times out,
-/// and record the unresponsive peer as an acceptor failure for routing exclusion.
+/// and record the unresponsive peer as an acceptor failure for reliability scoring.
 fn record_connect_uphill_timeout(
     tx: &Transaction,
     op: &ConnectOp,
@@ -1429,11 +1444,10 @@ fn record_connect_uphill_timeout(
     );
     if let Some(addr) = peer.socket_addr() {
         let now = tokio::time::Instant::now();
-        let count = conn_manager.record_connect_acceptor_failure(addr, now);
+        conn_manager.record_acceptor_outcome(addr, false, now);
         tracing::info!(
             tx = %tx,
             addr = %addr,
-            failure_count = count,
             "recorded GC timeout as acceptor failure"
         );
     }
@@ -1512,7 +1526,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // a different path (same tx ID).
                 //
                 // If an ACK has been received, the chain is alive — trust it for
-                // PROGRESS_TIMEOUT (20s). If no response arrives within that window,
+                // PROGRESS_TIMEOUT (7s). If no response arrives within that window,
                 // the chain has stalled and we re-enable speculative retry (#3570).
                 // Without this, a single ACK permanently disables retry, causing
                 // the originator to wait the full OPERATION_TTL (60s) with no recovery.
@@ -1523,10 +1537,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 const MAX_SPECULATIVE_PATHS: u8 = 2;
                 /// Time to wait after ForwardingAck before re-enabling retry.
                 /// If a relay ACKed but no response arrives within this window,
-                /// the downstream chain has likely stalled. 20s balances giving
-                /// slow multi-hop chains time to complete vs. not wasting the
-                /// full 60s OPERATION_TTL on dead chains.
-                const PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
+                /// the downstream chain has likely stalled. Even a 4-hop chain
+                /// at 500ms/hop completes in ~2.5s; 7s gives ~3x headroom while
+                /// keeping worst-case stall detection under 10s.
+                const PROGRESS_TIMEOUT: Duration = Duration::from_secs(7);
                 {
                     // Clean up entries for completed operations
                     get_retried.retain(|tx, _| ops.get.contains_key(tx));
@@ -1599,10 +1613,25 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         for tx in retry_candidates {
                             if let Some((_, get_op)) = ops.get.remove(&tx) {
+                                // Capture the stalled peer's routing info BEFORE retry
+                                // overwrites stats.next_peer (get.rs:1039).
+                                let stalled_peer_info = get_op.failure_routing_info();
                                 let max_htl = ring.max_hops_to_live;
                                 match get_op.retry_with_next_alternative(max_htl, &all_connected)
                                 {
                                     Ok((mut new_op, msg)) => {
+                                        // Only report routing failure when we found an
+                                        // alternative. In small topologies (e.g., 3 nodes)
+                                        // the "stalled" peer may be the only relay — poisoning
+                                        // its routing score would make all future ops fail.
+                                        if let Some((peer, contract_location)) = stalled_peer_info
+                                        {
+                                            ring.routing_finished(crate::router::RouteEvent {
+                                                peer,
+                                                contract_location,
+                                                outcome: crate::router::RouteOutcome::Failure,
+                                            });
+                                        }
                                         let msg = crate::message::NetMessage::from(msg);
                                         // Track speculative path for ACK-aware retry bounds
                                         new_op.speculative_paths += 1;
@@ -1679,19 +1708,33 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             continue;
                         }
 
-                        // If ACK received, the downstream chain is alive — don't retry
-                        if sub_op.ack_received {
-                            continue;
-                        }
-
                         // Cap speculative paths
                         if sub_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
                             continue;
                         }
 
                         let elapsed = tx.elapsed();
+
+                        if sub_op.ack_received {
+                            // ACK received — trust chain for PROGRESS_TIMEOUT, then
+                            // re-enable retry (matching GET/PUT behavior).
+                            if elapsed <= PROGRESS_TIMEOUT {
+                                continue;
+                            }
+                            tracing::info!(
+                                %tx,
+                                elapsed_ms = elapsed.as_millis(),
+                                "SUBSCRIBE chain stalled after ForwardingAck \
+                                 — re-enabling speculative retry"
+                            );
+                        }
+
                         let retry_count = subscribe_retried.get(&tx).copied().unwrap_or(0);
-                        let base = ACK_TIMEOUT * (retry_count as u32 + 1);
+                        let base = if sub_op.ack_received {
+                            PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32)
+                        } else {
+                            ACK_TIMEOUT * (retry_count as u32 + 1)
+                        };
                         // Only consume GlobalRng when elapsed exceeds 80% of base
                         // (minimum possible jittered threshold). This avoids shifting
                         // the global RNG state on every GC tick for ops that are
@@ -1732,9 +1775,19 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         for tx in retry_candidates.into_iter().take(MAX_SUBSCRIBE_RETRIES_PER_TICK) {
                             if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
+                                let stalled_peer_info = sub_op.failure_routing_info();
                                 let max_htl = ring.max_hops_to_live;
                                 match sub_op.retry_with_next_alternative(max_htl, &all_connected) {
                                     Ok((mut new_op, msg)) => {
+                                        // Only report failure when alternative found (see GET comment).
+                                        if let Some((peer, contract_location)) = stalled_peer_info
+                                        {
+                                            ring.routing_finished(crate::router::RouteEvent {
+                                                peer,
+                                                contract_location,
+                                                outcome: crate::router::RouteOutcome::Failure,
+                                            });
+                                        }
                                         let msg = crate::message::NetMessage::from(msg);
                                         // Track speculative path for ACK-aware retry bounds
                                         new_op.speculative_paths += 1;
@@ -1830,11 +1883,21 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                         for tx in put_retry_candidates {
                             if let Some((_, put_op)) = ops.put.remove(&tx) {
+                                let stalled_peer_info = put_op.failure_routing_info();
                                 let max_htl = ring.max_hops_to_live;
                                 match put_op
                                     .retry_with_next_alternative(max_htl, &all_connected)
                                 {
                                     Ok((mut new_op, msg)) => {
+                                        // Only report failure when alternative found (see GET comment).
+                                        if let Some((peer, contract_location)) = stalled_peer_info
+                                        {
+                                            ring.routing_finished(crate::router::RouteEvent {
+                                                peer,
+                                                contract_location,
+                                                outcome: crate::router::RouteOutcome::Failure,
+                                            });
+                                        }
                                         let msg = crate::message::NetMessage::from(msg);
                                         new_op.speculative_paths += 1;
                                         new_op.ack_received = false;
@@ -2053,7 +2116,7 @@ mod tests {
     use super::*;
     use crate::node::network_bridge::EventLoopNotificationsReceiver;
     use either::Either;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn notify_timeout_succeeds_when_receiver_alive() {
@@ -2549,8 +2612,8 @@ mod tests {
     /// Simulates rapid completion of children to verify the counter stays consistent.
     #[test]
     fn sub_operation_tracker_multiple_children_concurrent_completion() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let tracker = Arc::new(SubOperationTracker::new());
         let parent = Transaction::ttl_transaction();
@@ -2790,10 +2853,10 @@ mod tests {
     mod record_connect_uphill_timeout_tests {
         use super::super::record_connect_uphill_timeout;
         use crate::message::Transaction;
-        use crate::operations::connect::{
-            ConnectMsg, ConnectOp, ConnectRequest, ConnectState, RelayState,
-        };
         use crate::operations::VisitedPeers;
+        use crate::operations::connect::{
+            ConnectMsg, ConnectOp, ConnectRequest, ConnectState, DEFAULT_UPHILL_BUDGET, RelayState,
+        };
         use crate::ring::{ConnectionManager, Location, PeerKeyLocation};
         use crate::transport::TransportKeypair;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2815,6 +2878,7 @@ mod tests {
                     joiner: make_peer(5002),
                     ttl: 5,
                     visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
+                    uphill_budget: DEFAULT_UPHILL_BUDGET,
                 },
                 forwarded_to,
                 forwarded_at: Some(tokio::time::Instant::now()),
@@ -2825,8 +2889,8 @@ mod tests {
         }
 
         /// Regression test for #3392: GC-expired CONNECT forwards to unresponsive
-        /// peers must be recorded as acceptor failures so the peer gets excluded
-        /// from routing after CONNECT_EXCLUDE_THRESHOLD (3) timeouts.
+        /// peers must be recorded as acceptor failures so the peer gets a low
+        /// reliability score for future routing decisions.
         #[test]
         fn records_failure_for_unresponsive_relay() {
             let peer = make_peer(5001);
@@ -2835,18 +2899,31 @@ mod tests {
             let tx = Transaction::new::<ConnectMsg>();
             let cm = ConnectionManager::test_default();
 
-            let excluded = cm.compute_connect_excluded_peers(tokio::time::Instant::now());
-            assert!(!excluded.contains(&peer_addr));
+            let now = tokio::time::Instant::now();
+            // Initially unknown → 0.5 prior
+            let initial = cm.peer_acceptor_reliability(peer_addr, now);
+            assert!(
+                (initial - 0.5).abs() < f64::EPSILON,
+                "unknown peer should start at 0.5"
+            );
 
-            // Three GC timeouts should trigger exclusion
+            // Three GC timeouts should lower reliability
             for _ in 0..3 {
                 record_connect_uphill_timeout(&tx, &op, &cm);
             }
 
-            let excluded = cm.compute_connect_excluded_peers(tokio::time::Instant::now());
+            let after = cm.peer_acceptor_reliability(peer_addr, now);
             assert!(
-                excluded.contains(&peer_addr),
-                "peer should be excluded after 3 GC timeouts"
+                after < initial,
+                "peer reliability should decrease after 3 GC timeouts: {} vs {}",
+                after,
+                initial
+            );
+            // (0+1)/(3+2) = 0.2
+            assert!(
+                (after - 0.2).abs() < 0.01,
+                "expected ~0.2 after 3 failures, got {}",
+                after
             );
         }
 
@@ -2865,10 +2942,12 @@ mod tests {
                 record_connect_uphill_timeout(&tx, &op, &cm);
             }
 
-            let excluded = cm.compute_connect_excluded_peers(tokio::time::Instant::now());
+            let now = tokio::time::Instant::now();
+            let score = cm.peer_acceptor_reliability(peer_addr, now);
             assert!(
-                !excluded.contains(&peer_addr),
-                "peer should NOT be excluded when response was already forwarded"
+                (score - 0.5).abs() < f64::EPSILON,
+                "peer should still have 0.5 reliability when response was already forwarded, got {}",
+                score
             );
         }
 

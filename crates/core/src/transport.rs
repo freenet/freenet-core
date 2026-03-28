@@ -6,8 +6,8 @@
 //! Handles the raw sending and receiving of byte packets over the network.
 //! See `architecture.md`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
@@ -216,7 +216,7 @@ pub use congestion_control::{
     CongestionControlStats, CongestionController,
 };
 // Re-export transport metrics for periodic telemetry snapshots
-pub use metrics::{TransportMetrics, TransportSnapshot, TRANSPORT_METRICS};
+pub use metrics::{TRANSPORT_METRICS, TransportMetrics, TransportSnapshot};
 // Re-export reset functions for deterministic simulation testing
 pub use packet_data::reset_nonce_counter;
 pub use peer_connection::StreamId;
@@ -307,8 +307,8 @@ impl From<SocketAddr> for ObservedAddr {
     }
 }
 
-pub use self::connection_handler::create_connection_handler;
 pub(crate) use self::connection_handler::ExpectedInboundTracker;
+pub use self::connection_handler::create_connection_handler;
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
@@ -330,7 +330,9 @@ pub enum TransportError {
     ConnectionClosed(SocketAddr),
     #[error("failed while establishing connection, reason: {cause}")]
     ConnectionEstablishmentFailure { cause: Cow<'static, str> },
-    #[error("Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core")]
+    #[error(
+        "Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core"
+    )]
     ProtocolVersionMismatch { expected: String, actual: String },
     #[error("send to {0} failed: {1}")]
     SendFailed(SocketAddr, std::io::ErrorKind),
@@ -376,16 +378,76 @@ pub trait Socket: Sized + Send + Sync + 'static {
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize>;
 }
 
+/// Normalize an IPv4-mapped IPv6 address (`::ffff:x.x.x.x`) to plain IPv4.
+///
+/// Dual-stack sockets report IPv4 peers as `::ffff:x.x.x.x`. Without
+/// normalization, the same peer gets different ring locations, connection map
+/// entries, and backoff tracking depending on whether the local socket is
+/// IPv4-only or dual-stack. Normalizing at the transport boundary ensures a
+/// single canonical representation throughout the system.
+pub fn normalize_mapped_addr(addr: SocketAddr) -> SocketAddr {
+    if let SocketAddr::V6(v6) = &addr {
+        if let Some(v4) = v6.ip().to_ipv4_mapped() {
+            return SocketAddr::new(std::net::IpAddr::V4(v4), v6.port());
+        }
+    }
+    addr
+}
+
+/// Convert a plain IPv4 address to IPv4-mapped IPv6 for sending on a dual-stack socket.
+///
+/// An AF_INET6 socket cannot `sendto()` a plain AF_INET address — the kernel
+/// rejects the address family mismatch with EINVAL. This function converts
+/// `x.x.x.x` to `::ffff:x.x.x.x` when the local socket is IPv6.
+fn map_addr_for_send(local_is_ipv6: bool, target: SocketAddr) -> SocketAddr {
+    if local_is_ipv6 {
+        if let SocketAddr::V4(v4) = &target {
+            let mapped = v4.ip().to_ipv6_mapped();
+            return SocketAddr::new(std::net::IpAddr::V6(mapped), v4.port());
+        }
+    }
+    target
+}
+
 impl Socket for UdpSocket {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
-        Self::bind(addr).await
+        // Use socket2 to configure dual-stack before binding, then convert
+        // to a tokio UdpSocket. This ensures IPv6 sockets accept IPv4 too.
+        let is_ipv6 = addr.is_ipv6();
+        let domain = if is_ipv6 {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        };
+        let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+            .map_err(|e| io::Error::new(e.kind(), format!("Failed to create UDP socket: {e}")))?;
+        if is_ipv6 {
+            // Dual-stack: accept both IPv4 (mapped as ::ffff:x.x.x.x) and IPv6
+            sock.set_only_v6(false)?;
+        }
+        sock.set_nonblocking(true)?;
+        sock.bind(&addr.into()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Failed to bind UDP socket to {addr}: {e}"),
+            )
+        })?;
+        let std_socket: std::net::UdpSocket = sock.into();
+        Self::from_std(std_socket)
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.recv_from(buf).await
+        let (len, addr) = self.recv_from(buf).await?;
+        // Normalize ::ffff:x.x.x.x → plain IPv4 so the rest of the system
+        // sees a consistent address regardless of socket type.
+        Ok((len, normalize_mapped_addr(addr)))
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        // Convert plain IPv4 targets to mapped form when sending on an IPv6 socket,
+        // since AF_INET6 sockets reject AF_INET addresses with EINVAL.
+        let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        let target = map_addr_for_send(local_is_ipv6, target);
         self.send_to(buf, target).await
     }
 
@@ -393,6 +455,8 @@ impl Socket for UdpSocket {
         // try_send_to is synchronous and for UDP typically succeeds immediately.
         // However, under high load the kernel buffer might be full, returning WouldBlock.
         // In that case, we retry with exponential backoff since we're in a blocking context.
+        let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        let target = map_addr_for_send(local_is_ipv6, target);
         let mut backoff_us = 1u64; // Start at 1μs
         const MAX_BACKOFF_US: u64 = 1000; // Cap at 1ms
 
@@ -586,5 +650,151 @@ mod version_discovery_tests {
         report_peer_version((1, 0, 0));
         report_peer_version((1, 0, 0));
         assert_eq!(get_highest_seen_version(), Some((1, 0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod dual_stack_tests {
+    //! These tests use real UdpSocket (not SimulationSocket) because they validate
+    //! OS-level dual-stack behavior: IPv4-mapped address normalization, kernel
+    //! address-family mapping in sendto(), and IPV6_V6ONLY socket option effects.
+    //! SimulationSocket cannot exercise any of these kernel-level behaviors.
+
+    use super::*;
+    use std::net::{Ipv6Addr, SocketAddr};
+
+    /// Verify that binding to [::]:0 creates a dual-stack UDP socket that
+    /// can receive IPv4 traffic (via IPv4-mapped addresses).
+    #[tokio::test]
+    async fn udp_dual_stack_accepts_ipv4() {
+        let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr)
+            .await
+            .expect("bind to [::]:0 should succeed");
+        let bound_port = dual_sock.local_addr().unwrap().port();
+
+        // Send a packet from an IPv4 socket to the dual-stack socket
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        let v4_sender = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let target = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            bound_port,
+        );
+        <UdpSocket as Socket>::send_to(&v4_sender, b"hello", target)
+            .await
+            .expect("send from IPv4 should succeed");
+
+        let mut buf = [0u8; 16];
+        let (len, src) = <UdpSocket as Socket>::recv_from(&dual_sock, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..len], b"hello");
+        // recv_from must normalize ::ffff:127.0.0.1 → 127.0.0.1
+        assert!(
+            src.is_ipv4(),
+            "IPv4 source should be normalized to plain IPv4, got {src}"
+        );
+    }
+
+    /// Verify that binding to [::]:0 also accepts IPv6 traffic.
+    #[tokio::test]
+    async fn udp_dual_stack_accepts_ipv6() {
+        let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr)
+            .await
+            .expect("bind to [::]:0 should succeed");
+        let bound_port = dual_sock.local_addr().unwrap().port();
+
+        let v6_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+        let v6_sender = <UdpSocket as Socket>::bind(v6_addr).await.unwrap();
+        let target = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), bound_port);
+        <UdpSocket as Socket>::send_to(&v6_sender, b"world", target)
+            .await
+            .expect("send from IPv6 should succeed");
+
+        let mut buf = [0u8; 16];
+        let (len, _src) = <UdpSocket as Socket>::recv_from(&dual_sock, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..len], b"world");
+    }
+
+    #[test]
+    fn normalize_mapped_addr_converts_ipv4_mapped() {
+        // ::ffff:127.0.0.1 → 127.0.0.1
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:1234".parse().unwrap();
+        let normalized = normalize_mapped_addr(mapped);
+        assert_eq!(normalized, "127.0.0.1:1234".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn normalize_mapped_addr_preserves_native_ipv4() {
+        let v4: SocketAddr = "1.2.3.4:5678".parse().unwrap();
+        assert_eq!(normalize_mapped_addr(v4), v4);
+    }
+
+    #[test]
+    fn normalize_mapped_addr_preserves_native_ipv6() {
+        let v6: SocketAddr = "[2001:db8::1]:9999".parse().unwrap();
+        assert_eq!(normalize_mapped_addr(v6), v6);
+    }
+
+    #[test]
+    fn map_addr_for_send_maps_ipv4_on_ipv6_socket() {
+        let v4: SocketAddr = "1.2.3.4:5678".parse().unwrap();
+        let mapped = map_addr_for_send(true, v4);
+        assert!(mapped.is_ipv6());
+        if let SocketAddr::V6(v6) = mapped {
+            assert_eq!(v6.ip().to_ipv4_mapped(), Some("1.2.3.4".parse().unwrap()));
+            assert_eq!(v6.port(), 5678);
+        }
+    }
+
+    #[test]
+    fn map_addr_for_send_noop_on_ipv4_socket() {
+        let v4: SocketAddr = "1.2.3.4:5678".parse().unwrap();
+        assert_eq!(map_addr_for_send(false, v4), v4);
+    }
+
+    /// Verify round-trip: dual-stack socket can send back to an IPv4 peer
+    /// whose address was learned via recv_from (normalized to plain IPv4).
+    #[tokio::test]
+    async fn udp_dual_stack_roundtrip_ipv4() {
+        let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr)
+            .await
+            .expect("bind to [::]:0 should succeed");
+        let dual_port = dual_sock.local_addr().unwrap().port();
+
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        let v4_sock = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let v4_port = v4_sock.local_addr().unwrap().port();
+
+        // IPv4 → dual-stack
+        let target = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            dual_port,
+        );
+        <UdpSocket as Socket>::send_to(&v4_sock, b"ping", target)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 16];
+        let (len, src) = <UdpSocket as Socket>::recv_from(&dual_sock, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..len], b"ping");
+        assert!(src.is_ipv4(), "source should be normalized to IPv4");
+
+        // dual-stack → IPv4 (using the normalized address from recv_from)
+        let reply_target = SocketAddr::new(src.ip(), v4_port);
+        <UdpSocket as Socket>::send_to(&dual_sock, b"pong", reply_target)
+            .await
+            .expect("sending to normalized IPv4 addr from IPv6 socket should work");
+
+        let (len, _) = <UdpSocket as Socket>::recv_from(&v4_sock, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..len], b"pong");
     }
 }

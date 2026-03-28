@@ -18,13 +18,13 @@
 use freenet::config::GlobalTestMetrics;
 use freenet::config::{GlobalRng, GlobalSimulationTime, SimulationTransportOpt};
 use freenet::dev_tool::{
-    check_convergence_from_logs, reset_channel_id_counter, reset_event_id_counter,
-    reset_global_node_index, reset_nonce_counter, RequestId, SimNetwork, StreamId, VirtualTime,
+    RequestId, SimNetwork, StreamId, VirtualTime, check_convergence_from_logs,
+    reset_channel_id_counter, reset_event_id_counter, reset_global_node_index, reset_nonce_counter,
 };
 use freenet::simulation::TimeSource;
 use freenet::transport::in_memory_socket::{
-    clear_all_socket_registries, register_address_network, register_network_time_source,
-    SimulationSocket,
+    SimulationSocket, clear_all_socket_registries, register_address_network,
+    register_network_time_source,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -1688,7 +1688,7 @@ fn ring_distance(a: f64, b: f64) -> f64 {
 #[test_log::test]
 fn test_topology_single_hoster() {
     use freenet::dev_tool::{
-        validate_topology_from_snapshots, Location, NodeLabel, ScheduledOperation, SimOperation,
+        Location, NodeLabel, ScheduledOperation, SimOperation, validate_topology_from_snapshots,
     };
 
     const SEED: u64 = 0x5EED_0001_CAFE;
@@ -1864,7 +1864,8 @@ fn test_topology_single_hoster() {
     } else {
         tracing::warn!(
             "Gateway is NOT source (distance={:.4} >= threshold={:.4}) - orphan/disconnected issues are expected",
-            gateway_distance, SOURCE_THRESHOLD
+            gateway_distance,
+            SOURCE_THRESHOLD
         );
 
         // Non-source hoster will have orphan/disconnected issues - this is expected behavior
@@ -2237,7 +2238,7 @@ fn test_full_state_send_no_incorrect_caching() {
 /// Delta: [from_version: u64][to_version: u64][new data]
 #[test_log::test]
 fn test_crdt_mode_version_tracking() {
-    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     const SEED: u64 = 0x0276_3CD0_0001;
     const NETWORK_NAME: &str = "crdt-version-test";
@@ -2394,7 +2395,7 @@ fn test_crdt_mode_version_tracking() {
 /// 6. System recovers via ResyncResponse
 #[test_log::test]
 fn test_pr2763_crdt_convergence_with_resync() {
-    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     const SEED: u64 = 0x0276_3B06_0001;
     const NETWORK_NAME: &str = "pr2763-crdt-resync";
@@ -2546,7 +2547,7 @@ fn test_pr2763_crdt_convergence_with_resync() {
 // Extended Edge Case Tests for Ring Protocol
 // =============================================================================
 
-use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
 /// Parametrized CRDT convergence test.
 ///
@@ -3310,7 +3311,7 @@ fn test_subscription_broadcast_propagation() {
 /// If the relay doesn't register node-2 as downstream, updates die at the gateway.
 #[test_log::test]
 fn test_subscription_relay_propagation() {
-    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     const SEED: u64 = 0xBEAD_FEED_3390;
     const NETWORK_NAME: &str = "relay-sub-test";
@@ -4911,7 +4912,7 @@ fn verify_contract_propagation(
 /// bugs, multi-contract interference.
 #[test_log::test]
 fn test_six_peer_contract_lifecycle() {
-    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     const SEED: u64 = 0x3151_0001_0001;
     const NETWORK_NAME: &str = "six-peer-lifecycle";
@@ -5021,7 +5022,7 @@ fn test_six_peer_contract_lifecycle() {
 /// validation, notification pipeline) without actual WASM.
 #[test_log::test]
 fn test_six_peer_lifecycle_mock_wasm() {
-    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     const SEED: u64 = 0x3151_0002_0001;
     const NETWORK_NAME: &str = "six-peer-mock-wasm";
@@ -5108,7 +5109,7 @@ fn test_six_peer_lifecycle_mock_wasm() {
 /// Catches PR #2360 regression (contract key mismatch on late GET).
 #[test_log::test]
 fn test_late_joiner_receives_current_state() {
-    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     const SEED: u64 = 0x3151_0003_0001;
     const NETWORK_NAME: &str = "late-joiner";
@@ -6754,11 +6755,12 @@ fn test_get_succeeds_despite_readiness_gating() {
 ///
 #[test_log::test]
 fn test_get_routing_coverage_low_htl() {
-    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
-    // Seed updated: should_accept now rejects already-connected peers (PR #3557),
-    // which changes topology formation under the original seed.
-    const SEED: u64 = 0xC0DE_B0CA_0021;
+    // Seed updated: per-peer acceptor reliability scoring replaces binary
+    // exclusion (PR #3659), changing the CONNECT routing code path and
+    // Turmoil scheduling. Previous seed: 0xC0DE_B0CA_0031 (PR #3621).
+    const SEED: u64 = 0xC0DE_B0CA_0032;
     const NETWORK_NAME: &str = "get-routing-coverage";
 
     GlobalTestMetrics::reset();
@@ -7032,7 +7034,7 @@ fn test_get_retry_with_alternatives_sparse_topology() {
 /// Exercises: `update.rs` try_auto_fetch_contract (BroadcastTo/BroadcastToStreaming paths)
 #[test_log::test]
 fn test_auto_fetch_from_update_sender() {
-    use freenet::dev_tool::{register_crdt_contract, NodeLabel, ScheduledOperation, SimOperation};
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     const SEED: u64 = 0xFE7C_A100_0001;
     const NETWORK_NAME: &str = "auto-fetch-update";

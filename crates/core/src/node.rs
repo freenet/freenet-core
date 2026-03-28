@@ -39,8 +39,9 @@ use crate::{
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{
+        OpEnum, OpError, OpOutcome,
         connect::{self, ConnectOp},
-        get, put, subscribe, update, OpEnum, OpError, OpOutcome,
+        get, put, subscribe, update,
     },
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
@@ -57,7 +58,7 @@ use tracing::Instrument;
 use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
 // Re-export types for dev_tool and testing
-pub use network_bridge::{reset_channel_id_counter, EventLoopExitReason, NetworkStats};
+pub use network_bridge::{EventLoopExitReason, NetworkStats, reset_channel_id_counter};
 
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
@@ -68,7 +69,7 @@ mod network_bridge;
 // Re-export fault injection types for test infrastructure.
 // No cfg gate: underlying items are unconditionally compiled and integration
 // tests compile the lib without cfg(test).
-pub use network_bridge::in_memory::{get_fault_injector, set_fault_injector, FaultInjectorState};
+pub use network_bridge::in_memory::{FaultInjectorState, get_fault_injector, set_fault_injector};
 pub(crate) mod background_task_monitor;
 pub(crate) mod neighbor_hosting;
 pub(crate) mod network_status;
@@ -491,8 +492,8 @@ impl NodeConfig {
 
         if !self.is_gateway && gateways.is_empty() {
             anyhow::bail!(
-            "At least one remote gateway is required to join an existing network for non-gateway nodes."
-        )
+                "At least one remote gateway is required to join an existing network for non-gateway nodes."
+            )
         } else {
             Ok(gateways)
         }
@@ -653,14 +654,12 @@ async fn report_result(
             {
                 use std::io::Write;
                 #[cfg(debug_assertions)]
-                let OpError::InvalidStateTransition { tx, state, trace } = err
-                else {
+                let OpError::InvalidStateTransition { tx, state, trace } = err else {
                     tracing::error!("Finished transaction with error: {err}");
                     return;
                 };
                 #[cfg(not(debug_assertions))]
-                let OpError::InvalidStateTransition { tx } = err
-                else {
+                let OpError::InvalidStateTransition { tx } = err else {
                     tracing::error!("Finished transaction with error: {err}");
                     return;
                 };

@@ -11,14 +11,14 @@ use std::{
 
 use anyhow::{anyhow, bail};
 use axum::{
+    Router,
     body::Body,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Path,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use freenet::config::GlobalExecutor;
 use freenet::dev_tool::{
@@ -26,14 +26,14 @@ use freenet::dev_tool::{
     PeerMessage, PeerStatus, SimNetwork, TransportPublicKey,
 };
 use futures::{
-    stream::{SplitSink, SplitStream},
     FutureExt, SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
 };
 use http::{Response, StatusCode};
 use thiserror::Error;
 use tokio::{
     process::Command,
-    sync::{oneshot, Mutex},
+    sync::{Mutex, oneshot},
 };
 
 use super::{Error, TestConfig};
@@ -177,7 +177,8 @@ async fn start_child(config: &TestConfig, cmd_config: &NetworkProcessConfig) -> 
     let Some(peer_id) = &cmd_config.id else {
         bail!("Peer id not set");
     };
-    std::env::set_var("FREENET_PEER_ID", peer_id);
+    // SAFETY: single-threaded at this point, no concurrent reads of this env var
+    unsafe { std::env::set_var("FREENET_PEER_ID", peer_id) };
     freenet::config::set_logger(None, None, None);
     let peer = NetworkPeer::new(peer_id.clone()).await?;
     peer.run(config, peer_id.clone()).await?;
