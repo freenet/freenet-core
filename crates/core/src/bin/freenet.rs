@@ -630,7 +630,10 @@ fn freenet_main() -> anyhow::Result<()> {
             if cli.config.version {
                 return run_node(cli.config);
             }
-            // On Windows, if not installed, show setup wizard before starting
+            // On Windows, if not installed, show setup wizard before starting.
+            // If already installed, start the background service (with tray icon)
+            // instead of running in console mode — this is what users expect when
+            // double-clicking freenet.exe or running it from the command line.
             if commands::setup_wizard::maybe_show_setup_wizard()? {
                 return Ok(());
             }
