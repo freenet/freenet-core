@@ -137,7 +137,7 @@ mod platform {
                             "showComplete()".to_string()
                         }
                         InstallProgress::Error(msg) => {
-                            let escaped = msg.replace('\\', "\\\\").replace('\'', "\\'");
+                            let escaped = escape_for_js(msg);
                             format!("showError('{escaped}')")
                         }
                     };
@@ -149,6 +149,31 @@ mod platform {
         });
 
         Ok(result.take())
+    }
+
+    /// Escape a string for safe embedding in a JS single-quoted string literal.
+    fn escape_for_js(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_escape_for_js_special_chars() {
+            assert_eq!(escape_for_js("hello"), "hello");
+            assert_eq!(escape_for_js("it's"), "it\\'s");
+            assert_eq!(escape_for_js("line1\nline2"), "line1\\nline2");
+            assert_eq!(escape_for_js("path\\to\\file"), "path\\\\to\\\\file");
+            assert_eq!(
+                escape_for_js("err: can't\ndo it\\now"),
+                "err: can\\'t\\ndo it\\\\now"
+            );
+        }
     }
 
     /// Embedded HTML/CSS/JS for the setup wizard UI.
