@@ -183,6 +183,9 @@ required-features = ["bench", "bench_full"]
 [build-dependencies]
 chrono = { workspace = true }
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [features]
 default = ["redb", "trace", "websocket", "wasmtime-backend"]
 sqlite = ["sqlx"]

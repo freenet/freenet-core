@@ -7,6 +7,25 @@ fn main() {
     // Emit min-compatible version for range-based version checking
     emit_min_compatible_version();
 
+    // On Windows, embed an application manifest that declares ComCtl32 v6
+    // dependency. Without this, native-windows-gui crashes at startup with
+    // "GetWindowSubclass Entry Point Not Found" because Windows loads the
+    // legacy ComCtl32 v5 by default. Also embeds the Freenet icon.
+    //
+    // Uses #[cfg] to gate on the host OS. The winres crate is only available
+    // as a build-dependency on Windows hosts (cfg(windows) in Cargo.toml).
+    // Since we build Windows binaries natively on windows-latest CI runners
+    // (not cross-compiled from Linux), this is correct.
+    #[cfg(target_os = "windows")]
+    {
+        let mut res = winres::WindowsResource::new();
+        res.set_manifest_file("freenet.manifest");
+        res.set_icon("src/bin/commands/assets/freenet.ico");
+        res.compile().expect("failed to compile Windows resources");
+        println!("cargo:rerun-if-changed=freenet.manifest");
+        println!("cargo:rerun-if-changed=src/bin/commands/assets/freenet.ico");
+    }
+
     // Flatbuffers codegen is intentionally NOT run automatically.
     // The generated file (src/generated/topology_generated.rs) is checked in
     // and only needs regeneration when schemas/flatbuffers/topology.fbs changes.

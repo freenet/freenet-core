@@ -198,6 +198,11 @@ jobs:
       - name: Compile for x86_64-pc-windows-msvc
         run: cargo build --release
 
+      - name: Smoke test
+        run: |
+          target/release/freenet.exe --version
+          target/release/freenet.exe service --help
+
       - name: Upload freenet binary
         uses: actions/upload-artifact@v7
         with:
