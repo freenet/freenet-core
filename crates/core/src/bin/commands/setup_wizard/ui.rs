@@ -210,6 +210,9 @@ mod platform {
                 };
 
                 self.status_label.set_text(text);
+                // Set pos to step+1 then back to defeat the ComCtl32 v6 progress
+                // bar "glow" animation that causes a visual gap in the bar.
+                self.progress_bar.set_pos(step + 1);
                 self.progress_bar.set_pos(step);
                 *self.install_step.borrow_mut() = step;
 

@@ -883,58 +883,65 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-/// Migrate old-style Windows Task Scheduler entries from `freenet network` to
-/// `freenet service run-wrapper` for auto-update and tray icon support.
+/// Migrate old-style Windows Task Scheduler entries to registry Run key,
+/// and ensure the run-wrapper command is used for auto-update and tray support.
 #[cfg(target_os = "windows")]
 fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
-    // Query current task configuration
-    let output = std::process::Command::new("schtasks")
-        .args(["/query", "/tn", "Freenet", "/v", "/fo", "csv"])
-        .output();
+    let exe_path_str = binary_path
+        .to_str()
+        .context("Executable path contains invalid UTF-8")?;
+    let run_command = format!("\"{}\" service run-wrapper", exe_path_str);
 
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Ok(()), // No task installed, nothing to update
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+
+    // Check if registry Run key already has the correct command
+    let current_value = hkcu
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("Freenet").ok());
+
+    let needs_update = match &current_value {
+        None => {
+            // No registry entry — check if there's a legacy scheduled task to migrate
+            let has_legacy_task = std::process::Command::new("schtasks")
+                .args(["/query", "/tn", "Freenet"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            has_legacy_task
+        }
+        Some(val) => !val.contains("run-wrapper"),
     };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Check if the task still uses the old-style "freenet network" command
-    // (without the run-wrapper). If so, update it.
-    let needs_update = stdout.contains("network")
-        && !stdout.contains("service run-wrapper")
-        && !stdout.contains("run-wrapper");
 
     if !needs_update {
         return Ok(());
     }
 
-    let exe_path_str = binary_path
-        .to_str()
-        .context("Executable path contains invalid UTF-8")?;
-
     if !quiet {
-        println!("Updating scheduled task to use run-wrapper for auto-update support...");
+        println!("Migrating Freenet autostart to registry Run key...");
     }
 
-    let status = std::process::Command::new("schtasks")
-        .args([
-            "/create",
-            "/tn",
-            "Freenet",
-            "/tr",
-            &format!("\"{}\" service run-wrapper", exe_path_str),
-            "/sc",
-            "onlogon",
-            "/rl",
-            "highest",
-            "/f",
-        ])
-        .status()
-        .context("Failed to update scheduled task")?;
+    // Write registry Run key
+    let (run_key, _) = hkcu
+        .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .context("Failed to open registry Run key")?;
+    run_key
+        .set_value("Freenet", &run_command)
+        .context("Failed to write Freenet registry entry")?;
 
-    if status.success() && !quiet {
-        println!("Scheduled task updated successfully.");
+    // Clean up legacy scheduled task (best-effort, may need admin)
+    drop(
+        std::process::Command::new("schtasks")
+            .args(["/delete", "/tn", "Freenet", "/f"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status(),
+    );
+
+    if !quiet {
+        println!("Freenet autostart migrated successfully.");
     }
 
     Ok(())
