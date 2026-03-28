@@ -360,6 +360,23 @@ fn run_wrapper(version: &str) -> Result<()> {
     }
 }
 
+/// Spawn `freenet update --quiet` and wait for it to complete.
+/// On Windows, uses `CREATE_NO_WINDOW` to avoid flashing a console window
+/// (the wrapper has already detached from the console via `FreeConsole`).
+fn spawn_update_command(exe_path: &Path) -> std::io::Result<std::process::ExitStatus> {
+    let mut cmd = std::process::Command::new(exe_path);
+    cmd.args(["update", "--quiet"]);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.status()
+}
+
 /// The core wrapper loop. Spawns `freenet network`, handles exit codes,
 /// and communicates with the tray icon (if present).
 fn run_wrapper_loop(
@@ -437,11 +454,21 @@ fn run_wrapper_loop(
                         }
                         super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
                         super::tray::TrayAction::CheckUpdate => {
-                            drop(
-                                std::process::Command::new(&exe_path)
-                                    .args(["update", "--check"])
-                                    .status(),
-                            );
+                            // Run the actual update (not just --check). If it
+                            // succeeds, kill the child so the wrapper restarts
+                            // it with the new binary.
+                            let updated = spawn_update_command(&exe_path)
+                                .map(|s| s.success())
+                                .unwrap_or(false);
+                            if updated {
+                                log_wrapper_event(
+                                    log_dir,
+                                    "Update installed via tray, restarting...",
+                                );
+                                drop(child.kill());
+                                drop(child.wait());
+                                break -1; // restart with new binary
+                            }
                         }
                         super::tray::TrayAction::OpenDashboard => {
                             drop(
@@ -484,9 +511,7 @@ fn run_wrapper_loop(
                 status_tx.send(WrapperStatus::Updating).ok();
             }
 
-            let ok = std::process::Command::new(&exe_path)
-                .args(["update", "--quiet"])
-                .status()
+            let ok = spawn_update_command(&exe_path)
                 .map(|s| s.success())
                 .unwrap_or(false);
 
