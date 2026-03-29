@@ -2656,6 +2656,14 @@ impl EventKind {
         }
     }
 
+    /// Returns true if this is an Update BroadcastEmitted event.
+    pub fn is_update_broadcast_emitted(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Update(UpdateEvent::BroadcastEmitted { .. })
+        )
+    }
+
     /// Returns router snapshot summary data for `RouterSnapshot` events.
     ///
     /// Returns `(failure_events, success_events, prediction_active)`.
