@@ -6,7 +6,7 @@
 //! from competing with retransmissions, breaking the congestion cascade
 //! that causes stream stalls. The cap is released after a successful ACK.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::simulation::{RealTime, TimeSource};
@@ -90,9 +90,12 @@ pub struct FixedRateController<T: TimeSource = RealTime> {
     /// Uses saturating arithmetic to handle edge cases.
     flightsize: AtomicUsize,
 
-    /// When true, cwnd is capped at flightsize instead of usize::MAX/2.
-    /// Set on loss/timeout, cleared on successful ACK.
-    loss_pause: AtomicBool,
+    /// When non-zero, cwnd is capped at this value + LOSS_PAUSE_MARGIN.
+    /// Set to the flightsize at loss/timeout time, reset to 0 on successful ACK.
+    /// Using AtomicUsize instead of AtomicBool so we capture the flightsize
+    /// at the moment of loss — this prevents the margin from sliding upward
+    /// as new packets are sent during recovery.
+    loss_pause_cwnd: AtomicUsize,
 
     /// Time source (for interface compatibility, not actually used).
     #[allow(dead_code)]
@@ -112,7 +115,7 @@ impl<T: TimeSource> FixedRateController<T> {
         Self {
             rate: config.rate_bytes_per_sec,
             flightsize: AtomicUsize::new(0),
-            loss_pause: AtomicBool::new(false),
+            loss_pause_cwnd: AtomicUsize::new(0),
             time_source,
         }
     }
@@ -133,7 +136,7 @@ impl<T: TimeSource> FixedRateController<T> {
     /// Clears the loss pause so new data can resume flowing.
     pub fn on_ack_without_rtt(&self, bytes_acked: usize) {
         // Clear the loss pause — an ACK means the path is working again.
-        self.loss_pause.store(false, Ordering::Release);
+        self.loss_pause_cwnd.store(0, Ordering::Release);
         // Saturating subtraction to handle edge cases
         self.flightsize
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -143,33 +146,33 @@ impl<T: TimeSource> FixedRateController<T> {
     }
 
     /// Called when packet loss is detected.
-    /// Activates the loss pause: cwnd is capped at current flightsize
-    /// until the next successful ACK, preventing new data from competing
-    /// with retransmissions.
+    /// Captures the current flightsize and caps cwnd at that level
+    /// (plus margin) until the next successful ACK.
     pub fn on_loss(&self) {
-        self.loss_pause.store(true, Ordering::Release);
+        let fs = self.flightsize.load(Ordering::Relaxed);
+        self.loss_pause_cwnd.store(fs.max(1), Ordering::Release);
     }
 
     /// Called when a retransmission timeout occurs.
     /// Activates the loss pause (same as on_loss).
     pub fn on_timeout(&self) {
-        self.loss_pause.store(true, Ordering::Release);
+        let fs = self.flightsize.load(Ordering::Relaxed);
+        self.loss_pause_cwnd.store(fs.max(1), Ordering::Release);
     }
 
     /// Returns the effective congestion window.
     ///
     /// Normally returns a very large value so cwnd never blocks (all rate
     /// limiting is done by the token bucket). When loss_pause is active,
-    /// returns `flightsize + LOSS_PAUSE_MARGIN` — this allows a trickle of
-    /// new data during recovery instead of a complete freeze. Without the
-    /// margin, `flightsize + packet_size <= cwnd` can never pass (since
-    /// cwnd == flightsize and packet_size > 0), causing a complete sending
-    /// stall until an ACK arrives. With 100ms ACK batching and multi-hop
-    /// piped streaming, this collapsed throughput from 1.25 MB/s to ~38 KB/s
-    /// in production. See #3702.
+    /// returns the flightsize captured at loss time + LOSS_PAUSE_MARGIN.
+    /// The captured value is fixed — it doesn't grow as new packets are
+    /// sent — so loss_pause genuinely restricts new data to at most
+    /// LOSS_PAUSE_MARGIN bytes beyond what was in flight at loss time.
+    /// The margin prevents a complete freeze (the original bug, #3702).
     pub fn current_cwnd(&self) -> usize {
-        if self.loss_pause.load(Ordering::Acquire) {
-            self.flightsize.load(Ordering::Relaxed) + LOSS_PAUSE_MARGIN
+        let paused_at = self.loss_pause_cwnd.load(Ordering::Acquire);
+        if paused_at > 0 {
+            paused_at + LOSS_PAUSE_MARGIN
         } else {
             usize::MAX / 2
         }
@@ -286,37 +289,39 @@ mod tests {
         let controller = FixedRateController::new(FixedRateConfig::default());
 
         controller.on_send(1000);
-        let flightsize_before = controller.flightsize();
+        let flightsize_at_loss = controller.flightsize();
 
         // Before loss: cwnd is large
         assert!(controller.current_cwnd() > 1_000_000_000);
 
-        // Loss activates pause: cwnd = flightsize + margin
+        // Loss captures flightsize and caps cwnd
         controller.on_loss();
-        assert_eq!(controller.flightsize(), flightsize_before);
         assert_eq!(
             controller.current_cwnd(),
-            flightsize_before + LOSS_PAUSE_MARGIN
+            flightsize_at_loss + LOSS_PAUSE_MARGIN
         );
 
-        // Timeout also activates pause
-        controller.on_timeout();
+        // Sending more data increases flightsize but NOT the cwnd cap
+        // (cwnd is frozen at the flightsize captured at loss time)
+        controller.on_send(2000);
+        assert_eq!(controller.flightsize(), 3000);
         assert_eq!(
             controller.current_cwnd(),
-            flightsize_before + LOSS_PAUSE_MARGIN
+            flightsize_at_loss + LOSS_PAUSE_MARGIN,
+            "cwnd must be frozen at loss-time flightsize, not current flightsize"
         );
 
         // ACK clears the pause and restores large cwnd
         controller.on_ack(Duration::from_millis(50), 500);
         assert!(controller.current_cwnd() > 1_000_000_000);
-        assert_eq!(controller.flightsize(), 500); // 1000 - 500
+        assert_eq!(controller.flightsize(), 2500); // 3000 - 500
     }
 
     /// Regression test for #3702: loss_pause must allow at least one packet
     /// through, otherwise the cwnd check `flightsize + packet_size <= cwnd`
     /// can never pass and the connection stalls completely.
     #[test]
-    fn test_loss_pause_allows_packet_through() {
+    fn test_loss_pause_allows_packet_then_blocks() {
         let controller = FixedRateController::new(FixedRateConfig::default());
         let packet_size = 1200; // MAX_PACKET_SIZE
 
@@ -326,12 +331,21 @@ mod tests {
         let flightsize = controller.flightsize();
         let cwnd = controller.current_cwnd();
 
-        // The margin must be large enough that at least one packet can be sent
+        // The margin must allow at least one packet through
         assert!(
             flightsize + packet_size <= cwnd,
             "loss_pause cwnd ({cwnd}) must allow at least one packet \
              (flightsize={flightsize}, packet_size={packet_size}). \
              Without margin, sending stalls completely. See #3702."
+        );
+
+        // But after sending enough to consume the margin, it blocks
+        controller.on_send(LOSS_PAUSE_MARGIN);
+        let new_flightsize = controller.flightsize();
+        assert!(
+            new_flightsize + packet_size > cwnd,
+            "After consuming the margin, loss_pause should block further sending \
+             (flightsize={new_flightsize}, cwnd={cwnd})"
         );
     }
 
