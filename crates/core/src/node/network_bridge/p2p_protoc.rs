@@ -4262,16 +4262,26 @@ impl P2pConnManager {
                     .await;
             }
             // Emit broadcast emitted telemetry (issue #3622)
-            // Best-effort: broadcasted_to = target count since actual delivery is async
+            //
+            // Production path limitations:
+            // - Transaction ID is synthetic (not from the original update operation).
+            //   BroadcastQueue creates its own TX per target, so this ID cannot be
+            //   correlated with downstream BroadcastReceived/BroadcastApplied events.
+            // - `broadcasted_to` = number of targets enqueued, not actual delivery
+            //   count. Actual sends are async via BroadcastQueue.
+            // - `broadcast_to` is empty to avoid cloning up to 512 PeerKeyLocations
+            //   purely for telemetry. The peer list can be reconstructed from
+            //   BroadcastReceived events on the receiving end.
             let update_tx =
                 crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+            let enqueued_count = target_result.targets.len();
             if let Some(log) = NetEventLog::update_broadcast_emitted(
                 &update_tx,
                 &op_manager.ring,
                 key,
-                target_result.targets.clone(),
-                target_result.targets.len(),
-                new_state.clone(),
+                Vec::new(),
+                enqueued_count,
+                new_state,
             ) {
                 self.bridge
                     .log_register
