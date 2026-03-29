@@ -2809,8 +2809,10 @@ impl Operation for GetOp {
                         }
 
                         if access_result.is_new {
-                            // First time hosting — cache the contract and announce
-                            if let Err(e) = op_manager
+                            // First time hosting — cache the contract, then announce only on success.
+                            // Mirrors the non-streaming "state differs" path which gates announce
+                            // on PutResponse { new_value: Ok(_) }.
+                            let put_ok = match op_manager
                                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
                                     key,
                                     state: state.clone(),
@@ -2819,25 +2821,73 @@ impl Operation for GetOp {
                                 })
                                 .await
                             {
-                                tracing::warn!(contract = %key, error = %e, "failed to cache contract via PutQuery");
-                            }
+                                Ok(ContractHandlerEvent::PutResponse {
+                                    new_value: Ok(_), ..
+                                }) => true,
+                                Ok(ContractHandlerEvent::PutResponse {
+                                    new_value: Err(err),
+                                    ..
+                                }) => {
+                                    tracing::warn!(
+                                        tx = %id, contract = %key, error = %err,
+                                        "Streaming GET: PutQuery rejected by executor"
+                                    );
+                                    false
+                                }
+                                Ok(other) => {
+                                    tracing::warn!(
+                                        tx = %id, contract = %key,
+                                        response = %other,
+                                        "Streaming GET: unexpected PutQuery response"
+                                    );
+                                    false
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        contract = %key, error = %e,
+                                        "failed to cache contract via PutQuery"
+                                    );
+                                    false
+                                }
+                            };
 
-                            tracing::debug!(tx = %id, %key, "Contract newly hosted (streaming)");
-                            super::announce_contract_hosted(op_manager, &key).await;
+                            if put_ok {
+                                tracing::debug!(tx = %id, %key, "Contract newly hosted (streaming)");
+                                super::announce_contract_hosted(op_manager, &key).await;
 
-                            let became_interested =
-                                op_manager.interest_manager.register_local_hosting(&key);
-                            let added = if became_interested { vec![key] } else { vec![] };
-                            if !added.is_empty() || !removed_contracts.is_empty() {
+                                let became_interested =
+                                    op_manager.interest_manager.register_local_hosting(&key);
+                                let added = if became_interested { vec![key] } else { vec![] };
+                                if !added.is_empty() || !removed_contracts.is_empty() {
+                                    super::broadcast_change_interests(
+                                        op_manager,
+                                        added,
+                                        removed_contracts,
+                                    )
+                                    .await;
+                                }
+
+                                // Auto-subscribe only if we successfully cached the contract.
+                                if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
+                                    if !op_manager.ring.is_subscribed(&key) {
+                                        let blocking = subscribe_requested && blocking_sub;
+                                        let child_tx = super::start_subscription_request(
+                                            op_manager, id, key, blocking,
+                                        );
+                                        tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming)");
+                                    }
+                                }
+                            } else if !removed_contracts.is_empty() {
                                 super::broadcast_change_interests(
                                     op_manager,
-                                    added,
+                                    vec![],
                                     removed_contracts,
                                 )
                                 .await;
                             }
                         } else {
-                            // Already hosting — still cache the (possibly updated) state
+                            // Already hosting — refresh state (fire-and-forget since we already
+                            // have a valid cached copy; failure just means we keep the old state).
                             if let Err(e) = op_manager
                                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
                                     key,
@@ -2847,7 +2897,7 @@ impl Operation for GetOp {
                                 })
                                 .await
                             {
-                                tracing::warn!(contract = %key, error = %e, "failed to cache contract via PutQuery");
+                                tracing::warn!(contract = %key, error = %e, "failed to refresh contract state via PutQuery");
                             }
 
                             tracing::debug!(tx = %id, %key, "Refreshed hosting status for already-hosted contract (streaming)");
@@ -2859,18 +2909,16 @@ impl Operation for GetOp {
                                 )
                                 .await;
                             }
-                        }
 
-                        // Auto-subscribe so subsequent GETs are served from local cache.
-                        // Only the original requester subscribes — relay peers cache
-                        // for durability but don't subscribe (no freshness obligation).
-                        if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
-                            if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
-                                let blocking = subscribe_requested && blocking_sub;
-                                let child_tx = super::start_subscription_request(
-                                    op_manager, id, key, blocking,
-                                );
-                                tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming)");
+                            // Auto-subscribe for already-hosted contracts that lost their subscription.
+                            if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
+                                if !op_manager.ring.is_subscribed(&key) {
+                                    let blocking = subscribe_requested && blocking_sub;
+                                    let child_tx = super::start_subscription_request(
+                                        op_manager, id, key, blocking,
+                                    );
+                                    tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming, re-subscribe)");
+                                }
                             }
                         }
                     }
