@@ -386,7 +386,12 @@ fn spawn_update_command(exe_path: &Path) -> std::io::Result<std::process::ExitSt
 /// Spawn a new wrapper process from the (possibly updated) binary on disk.
 /// Used after a successful tray-initiated update to re-exec the wrapper
 /// so the tray displays the correct new version.
-fn spawn_new_wrapper(exe_path: &Path, log_dir: &Path) {
+///
+/// Returns `true` if the new wrapper was spawned successfully (caller should
+/// exit to avoid two wrappers). Returns `false` on failure (caller should
+/// fall through to relaunch the child with the current wrapper instead of
+/// leaving the user with no running node).
+fn spawn_new_wrapper(exe_path: &Path, log_dir: &Path) -> bool {
     let mut cmd = std::process::Command::new(exe_path);
     cmd.args(["service", "run-wrapper"])
         .stdin(std::process::Stdio::null())
@@ -402,11 +407,17 @@ fn spawn_new_wrapper(exe_path: &Path, log_dir: &Path) {
     }
 
     match cmd.spawn() {
-        Ok(_) => log_wrapper_event(log_dir, "New wrapper process spawned"),
-        Err(e) => log_wrapper_event(
-            log_dir,
-            &format!("Failed to spawn new wrapper: {e}. Run 'freenet service start' manually."),
-        ),
+        Ok(_) => {
+            log_wrapper_event(log_dir, "New wrapper process spawned");
+            true
+        }
+        Err(e) => {
+            log_wrapper_event(
+                log_dir,
+                &format!("Failed to spawn new wrapper: {e}. Continuing with current wrapper."),
+            );
+            false
+        }
     }
 }
 
@@ -521,8 +532,13 @@ fn run_wrapper_loop(
                                     status_tx.send(WrapperStatus::UpdatedRestarting).ok();
                                     drop(child.kill());
                                     drop(child.wait());
-                                    spawn_new_wrapper(&exe_path, log_dir);
-                                    return Ok(());
+                                    if spawn_new_wrapper(&exe_path, log_dir) {
+                                        return Ok(());
+                                    }
+                                    // Spawn failed — fall through to relaunch child
+                                    // with the current (old) wrapper rather than
+                                    // leaving no node running.
+                                    break SENTINEL_RESTART;
                                 }
                                 Ok(_) => {
                                     // Exit code 2 = already up to date, or other
@@ -587,8 +603,12 @@ fn run_wrapper_loop(
                                             "Update installed while stopped, restarting wrapper...",
                                         );
                                         status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                                        spawn_new_wrapper(&exe_path, log_dir);
-                                        return Ok(());
+                                        if spawn_new_wrapper(&exe_path, log_dir) {
+                                            return Ok(());
+                                        }
+                                        // Spawn failed — exit stopped state and
+                                        // relaunch child with the current wrapper.
+                                        break;
                                     }
                                     Ok(_) => {
                                         log_wrapper_event(log_dir, "No update available");
@@ -659,8 +679,10 @@ fn run_wrapper_loop(
                     // Brief pause so the tray can display the message
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
-                spawn_new_wrapper(&exe_path, log_dir);
-                return Ok(());
+                if spawn_new_wrapper(&exe_path, log_dir) {
+                    return Ok(());
+                }
+                // Spawn failed — fall through to relaunch child with current wrapper.
             }
             WrapperAction::Exit => {
                 let reason = if exit_code == WRAPPER_EXIT_ALREADY_RUNNING {
