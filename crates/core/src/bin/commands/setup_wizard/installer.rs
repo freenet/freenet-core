@@ -85,29 +85,40 @@ pub fn run_install(progress: impl Fn(InstallProgress) + Send) -> Result<()> {
 
     // Step 5: Install service
     progress(InstallProgress::InstallingService);
-    let status = std::process::Command::new(&installed_exe)
+    let output = std::process::Command::new(&installed_exe)
         .args(["service", "install"])
-        .status()
+        .output()
         .context("Failed to run freenet service install")?;
-    if !status.success() {
-        return Err(anyhow::anyhow!(
-            "Service installation failed (exit code {}). You may need to run as Administrator.",
-            status.code().unwrap_or(-1)
-        ));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            format!("exit code {}", output.status.code().unwrap_or(-1))
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(anyhow::anyhow!("Service installation failed: {detail}"));
     }
 
     // Step 6: Start service
     progress(InstallProgress::LaunchingService);
-    let status = std::process::Command::new(&installed_exe)
+    let output = std::process::Command::new(&installed_exe)
         .args(["service", "start"])
-        .status()
+        .output()
         .context("Failed to start freenet service")?;
-    if !status.success() {
-        eprintln!(
-            "Warning: service start returned exit code {}",
-            status.code().unwrap_or(-1)
-        );
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            format!("exit code {}", output.status.code().unwrap_or(-1))
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(anyhow::anyhow!(
+            "Service failed to start: {detail}. Try running 'freenet service start' manually."
+        ));
     }
+
+    // Brief wait for the node to initialize before opening the dashboard
+    std::thread::sleep(std::time::Duration::from_secs(3));
 
     // Step 7: Open dashboard
     progress(InstallProgress::OpeningDashboard);

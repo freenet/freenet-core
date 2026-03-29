@@ -72,6 +72,8 @@ mod platform {
         let mut result = SetupResult::Cancelled;
         // Guard against double-click spawning multiple installer threads.
         let mut installing = false;
+        // Track the installer thread so we can join it before exiting.
+        let mut install_handle: Option<std::thread::JoinHandle<()>> = None;
 
         event_loop.run_return(|event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -81,6 +83,13 @@ mod platform {
                     event: WindowEvent::CloseRequested,
                     ..
                 } => {
+                    // If the installer is still running, wait for it to finish
+                    // before closing so we don't abandon a half-done install.
+                    if let Some(handle) = install_handle.take() {
+                        let _ = webview
+                            .evaluate_script("updateProgress(95, 'Finishing installation...')");
+                        handle.join().ok();
+                    }
                     *control_flow = ControlFlow::Exit;
                 }
 
@@ -91,7 +100,7 @@ mod platform {
                         }
                         installing = true;
                         let install_proxy = proxy.clone();
-                        std::thread::spawn(move || {
+                        let handle = std::thread::spawn(move || {
                             let cb_result = installer::run_install(|progress| {
                                 let _ = install_proxy.send_event(UiEvent::Progress(progress));
                             });
@@ -101,6 +110,7 @@ mod platform {
                                 ));
                             }
                         });
+                        install_handle = Some(handle);
                     }
                     "run_without" => {
                         result = SetupResult::RunWithout;
@@ -433,6 +443,8 @@ mod platform {
     document.getElementById('heading').textContent = 'Installation complete';
     document.getElementById('subtitle').style.display = 'none';
     document.getElementById('complete').style.display = 'block';
+    // Auto-close after 5 seconds so the user doesn't have to click Close
+    setTimeout(function() { window.ipc.postMessage('close'); }, 5000);
   }
 
   function showError(msg) {

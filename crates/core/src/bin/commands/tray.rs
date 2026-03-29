@@ -19,6 +19,10 @@ pub enum TrayAction {
     OpenDashboard,
     /// Kill the child process; the wrapper loop will relaunch it.
     Restart,
+    /// Stop the node but keep the tray running.
+    Stop,
+    /// Start the node (after a Stop).
+    Start,
     /// Run `freenet update --check` and report the result.
     CheckUpdate,
     /// Open the latest log file in the system viewer.
@@ -37,6 +41,11 @@ pub enum WrapperStatus {
     Updating,
     /// The node has stopped (wrapper is in backoff or exiting).
     Stopped,
+    /// Update check completed — already on the latest version.
+    UpToDate,
+    /// Update installed — wrapper will re-exec with the new binary.
+    /// The tray loop should exit so the process can terminate.
+    UpdatedRestarting,
 }
 
 // ── Windows + macOS implementation ──────────────────────────────────
@@ -121,6 +130,9 @@ mod platform {
         let status_item = MenuItem::new("Status: Starting...", false, None);
         let version_item = MenuItem::new(format!("Version: {version}"), false, None);
         let separator2 = PredefinedMenuItem::separator();
+        // Stop is enabled when running, Start is enabled when stopped
+        let stop_item = MenuItem::new("Stop", true, None);
+        let start_item = MenuItem::new("Start", false, None);
         let restart_item = MenuItem::new("Restart", true, None);
         let check_update = MenuItem::new("Check for Updates", true, None);
         let view_logs = MenuItem::new("View Logs", true, None);
@@ -132,6 +144,8 @@ mod platform {
         menu.append(&status_item).ok();
         menu.append(&version_item).ok();
         menu.append(&separator2).ok();
+        menu.append(&stop_item).ok();
+        menu.append(&start_item).ok();
         menu.append(&restart_item).ok();
         menu.append(&check_update).ok();
         menu.append(&view_logs).ok();
@@ -163,6 +177,8 @@ mod platform {
 
         // Capture menu item IDs for matching
         let open_dashboard_id = open_dashboard.id().clone();
+        let stop_id = stop_item.id().clone();
+        let start_id = start_item.id().clone();
         let restart_id = restart_item.id().clone();
         let check_update_id = check_update.id().clone();
         let view_logs_id = view_logs.id().clone();
@@ -181,6 +197,10 @@ mod platform {
                 let action = if event.id == open_dashboard_id {
                     open_url(DASHBOARD_URL);
                     None
+                } else if event.id == stop_id {
+                    Some(TrayAction::Stop)
+                } else if event.id == start_id {
+                    Some(TrayAction::Start)
                 } else if event.id == restart_id {
                     Some(TrayAction::Restart)
                 } else if event.id == check_update_id {
@@ -203,13 +223,32 @@ mod platform {
             if let Ok(status) = status_rx.try_recv() {
                 let status_text = match &status {
                     WrapperStatus::Running => "Running",
-                    WrapperStatus::Updating => "Updating...",
+                    WrapperStatus::Updating => "Checking for updates...",
                     WrapperStatus::Stopped => "Stopped",
+                    WrapperStatus::UpToDate => "Up to date",
+                    WrapperStatus::UpdatedRestarting => "Updated! Restarting...",
                 };
                 status_item.set_text(format!("Status: {status_text}"));
                 _tray
                     .set_tooltip(Some(format!("Freenet {version} - {status_text}")))
                     .ok();
+
+                // Toggle Start/Stop/Restart enabled state based on running status
+                let is_running = matches!(
+                    status,
+                    WrapperStatus::Running | WrapperStatus::UpToDate | WrapperStatus::Updating
+                );
+                stop_item.set_enabled(is_running);
+                start_item.set_enabled(!is_running);
+                restart_item.set_enabled(is_running);
+
+                // Exit the tray loop so the wrapper can re-exec with the new binary
+                if matches!(status, WrapperStatus::UpdatedRestarting) {
+                    // Brief pause so the user can see the "Updated!" message
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    action_tx.send(TrayAction::Quit).ok();
+                    break;
+                }
             }
 
             // Yield to avoid busy-spinning between iterations.
