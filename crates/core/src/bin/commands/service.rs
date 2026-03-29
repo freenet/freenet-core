@@ -457,17 +457,27 @@ fn run_wrapper_loop(
         cmd.arg("network");
 
         // On Windows, prevent a console window from appearing for the child process.
-        // The wrapper has already detached from the console via FreeConsole().
+        // The wrapper has already detached from the console via FreeConsole(),
+        // which invalidates the standard handles. We must explicitly set
+        // stdin/stdout to null to avoid inheriting the invalid handles
+        // (otherwise spawn fails with "The handle is invalid" os error 6).
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
         }
 
-        // Redirect stderr to a file for port-conflict detection
+        // Redirect stderr to a file for port-conflict detection.
+        // On Windows, stderr must also be explicitly set to avoid
+        // inheriting the invalid handle after FreeConsole().
         if let Some(stderr_file) = stderr_file {
             cmd.stderr(stderr_file);
+        } else {
+            #[cfg(target_os = "windows")]
+            cmd.stderr(std::process::Stdio::null());
         }
 
         // Use spawn + polling so we can handle tray actions while child runs
