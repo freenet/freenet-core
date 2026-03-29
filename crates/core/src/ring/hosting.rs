@@ -125,7 +125,7 @@ pub struct SubscribeResult {
 ///
 /// Contracts are hosted based on access patterns:
 /// - GET, PUT, SUBSCRIBE operations add contracts to the hosting cache
-/// - **All hosted contracts get subscription renewal** (the key fix)
+/// - Contracts with client or active subscriptions get renewal
 /// - Active subscriptions and client subscriptions prevent eviction
 /// - TTL protects recently accessed contracts from premature eviction
 pub(crate) struct HostingManager {
@@ -1396,6 +1396,26 @@ mod tests {
         // Add to hosting cache
         manager.record_contract_access(contract, 1000, AccessType::Put);
         assert!(manager.should_host(&contract));
+    }
+
+    /// Regression test for #3698: after restart, hosted-but-unsubscribed contracts
+    /// must NOT appear in the renewal list. Without subscriptions (lost on restart),
+    /// the GET handler must query the network rather than serve stale cached state.
+    #[test]
+    fn test_hosted_contract_not_in_renewal_after_restart() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(42);
+
+        // Simulate post-restart state: contract in hosting cache (restored from disk)
+        // but no subscriptions (in-memory only, lost on restart)
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        assert!(manager.is_hosting_contract(&contract));
+
+        // Must not appear in renewal list — no subscription to renew
+        assert!(
+            manager.contracts_needing_renewal().is_empty(),
+            "Hosted-only contract must NOT be in renewal list"
+        );
     }
 
     /// Regression test for #3340: is_receiving_updates must return false when

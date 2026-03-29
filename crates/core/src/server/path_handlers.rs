@@ -72,7 +72,7 @@ pub(super) async fn contract_home(
                 ContractRequest::Get {
                     key: instance_id,
                     return_contract_code: true,
-                    subscribe: false,
+                    subscribe: true,
                     blocking_subscribe: false,
                 }
                 .into(),
