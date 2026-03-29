@@ -1256,32 +1256,22 @@ async fn process_open_request(
                             .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
-                        // Hosted contracts have subscription renewal in progress
-                        // via the background recovery loop. Between restart and
-                        // renewal completion the state may be briefly stale, but
-                        // serving it is strictly better than a network GET (94%
-                        // failure rate — see #3356). Once the subscription is
-                        // re-established, updates will keep the cache current.
-                        let is_hosted = full_key
-                            .as_ref()
-                            .map(|k| op_manager.ring.is_hosting_contract(k))
-                            .unwrap_or(false);
-
                         // Return local cache if we have valid state AND EITHER:
                         // 1. No connections (isolated node - can only use local cache), OR
-                        // 2. Actively subscribed (cache is fresh via subscription updates), OR
-                        // 3. Contract is hosted (renewal in progress; may be briefly stale
-                        //    after restart, but network GETs are unreliable — see #3356)
-                        if local_satisfies_request
-                            && (connection_count == 0 || is_subscribed || is_hosted)
-                        {
+                        // 2. Actively subscribed (cache is fresh via subscription updates)
+                        //
+                        // Hosted-but-not-subscribed contracts are NOT short-circuited:
+                        // after restart, subscriptions are lost (in-memory only) so hosted
+                        // contracts would be served stale forever. The network GET path
+                        // has local_fallback so if the network is unreachable we still
+                        // return cached state, but we attempt a fresh fetch first.
+                        // See #3698.
+                        if local_satisfies_request && (connection_count == 0 || is_subscribed) {
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
 
-                            // Refresh hosting TTL on user GET — this is the
-                            // correct place to keep hosted contracts alive (not
-                            // in subscription renewal, which would create an
-                            // immortal-entry feedback loop).
+                            // Refresh hosting TTL on user GET
+                            let is_hosted = op_manager.ring.is_hosting_contract(&full_key);
                             if is_hosted {
                                 op_manager.ring.touch_hosting(&full_key);
                             }
