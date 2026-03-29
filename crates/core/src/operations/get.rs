@@ -2868,14 +2868,15 @@ impl Operation for GetOp {
                                 }
 
                                 // Auto-subscribe only if we successfully cached the contract.
-                                if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
-                                    if !op_manager.ring.is_subscribed(&key) {
-                                        let blocking = subscribe_requested && blocking_sub;
-                                        let child_tx = super::start_subscription_request(
-                                            op_manager, id, key, blocking,
-                                        );
-                                        tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming)");
-                                    }
+                                if crate::ring::AUTO_SUBSCRIBE_ON_GET
+                                    && is_original_requester
+                                    && !op_manager.ring.is_subscribed(&key)
+                                {
+                                    let blocking = subscribe_requested && blocking_sub;
+                                    let child_tx = super::start_subscription_request(
+                                        op_manager, id, key, blocking,
+                                    );
+                                    tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming)");
                                 }
                             } else if !removed_contracts.is_empty() {
                                 super::broadcast_change_interests(
@@ -2911,14 +2912,15 @@ impl Operation for GetOp {
                             }
 
                             // Auto-subscribe for already-hosted contracts that lost their subscription.
-                            if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
-                                if !op_manager.ring.is_subscribed(&key) {
-                                    let blocking = subscribe_requested && blocking_sub;
-                                    let child_tx = super::start_subscription_request(
-                                        op_manager, id, key, blocking,
-                                    );
-                                    tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming, re-subscribe)");
-                                }
+                            if crate::ring::AUTO_SUBSCRIBE_ON_GET
+                                && is_original_requester
+                                && !op_manager.ring.is_subscribed(&key)
+                            {
+                                let blocking = subscribe_requested && blocking_sub;
+                                let child_tx = super::start_subscription_request(
+                                    op_manager, id, key, blocking,
+                                );
+                                tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming, re-subscribe)");
                             }
                         }
                     }
