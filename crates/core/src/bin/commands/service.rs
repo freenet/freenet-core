@@ -377,6 +377,33 @@ fn spawn_update_command(exe_path: &Path) -> std::io::Result<std::process::ExitSt
     cmd.status()
 }
 
+/// Spawn a new wrapper process from the (possibly updated) binary on disk.
+/// Used after a successful tray-initiated update to re-exec the wrapper
+/// so the tray displays the correct new version.
+fn spawn_new_wrapper(exe_path: &Path, log_dir: &Path) {
+    let mut cmd = std::process::Command::new(exe_path);
+    cmd.args(["service", "run-wrapper"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    match cmd.spawn() {
+        Ok(_) => log_wrapper_event(log_dir, "New wrapper process spawned"),
+        Err(e) => log_wrapper_event(
+            log_dir,
+            &format!("Failed to spawn new wrapper: {e}. Run 'freenet service start' manually."),
+        ),
+    }
+}
+
 /// The core wrapper loop. Spawns `freenet network`, handles exit codes,
 /// and communicates with the tray icon (if present).
 fn run_wrapper_loop(
@@ -409,6 +436,15 @@ fn run_wrapper_loop(
 
         let mut cmd = std::process::Command::new(&exe_path);
         cmd.arg("network");
+
+        // On Windows, prevent a console window from appearing for the child process.
+        // The wrapper has already detached from the console via FreeConsole().
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
 
         // Redirect stderr to a file for port-conflict detection
         if let Some(stderr_file) = stderr_file {
@@ -452,41 +488,64 @@ fn run_wrapper_loop(
                             drop(child.wait());
                             break -1; // sentinel: skip exit-code handling, just relaunch
                         }
+                        super::tray::TrayAction::Stop => {
+                            log_wrapper_event(log_dir, "Stop requested via tray");
+                            drop(child.kill());
+                            drop(child.wait());
+                            break -2; // sentinel: enter stopped state
+                        }
+                        super::tray::TrayAction::Start => {
+                            // Ignored while child is running — Start is only
+                            // meaningful from the stopped state (handled below).
+                        }
                         super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
                         super::tray::TrayAction::CheckUpdate => {
                             // Run the actual update (not just --check). If it
-                            // succeeds (exit 0), kill the child so the wrapper
-                            // restarts it with the new binary. Exit 2 means
-                            // already up to date — no restart needed.
+                            // succeeds (exit 0), kill the child and re-exec the
+                            // wrapper so the tray shows the correct new version.
+                            // Exit 2 means already up to date — no restart needed.
                             #[cfg(any(target_os = "windows", target_os = "macos"))]
                             if let Some((_, status_tx)) = tray {
                                 status_tx.send(WrapperStatus::Updating).ok();
                             }
                             let result = spawn_update_command(&exe_path);
-                            #[cfg(any(target_os = "windows", target_os = "macos"))]
-                            if let Some((_, status_tx)) = tray {
-                                status_tx.send(WrapperStatus::Running).ok();
-                            }
                             match result {
                                 Ok(s) if s.success() => {
                                     log_wrapper_event(
                                         log_dir,
-                                        "Update installed via tray, restarting...",
+                                        "Update installed via tray, restarting wrapper...",
                                     );
+                                    // Tell the tray we're restarting (it will exit its loop)
+                                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                                    if let Some((_, status_tx)) = tray {
+                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                    }
                                     drop(child.kill());
                                     drop(child.wait());
-                                    break -1; // restart with new binary
+                                    // Spawn a new wrapper from the updated binary on disk.
+                                    // current_exe() returns the same path, which now points
+                                    // to the new binary after replace_binary().
+                                    spawn_new_wrapper(&exe_path, log_dir);
+                                    return Ok(());
                                 }
                                 Ok(_) => {
                                     // Exit code 2 = already up to date, or other
                                     // non-zero = update failed. Either way, no restart.
                                     log_wrapper_event(log_dir, "No update available");
+                                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                                    if let Some((_, status_tx)) = tray {
+                                        status_tx.send(WrapperStatus::UpToDate).ok();
+                                    }
                                 }
                                 Err(e) => {
                                     log_wrapper_event(
                                         log_dir,
                                         &format!("Update check failed: {e}"),
                                     );
+                                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                                    if let Some((_, status_tx)) = tray {
+                                        status_tx.send(WrapperStatus::Running).ok();
+                                    }
                                 }
                             }
                         }
@@ -507,6 +566,69 @@ fn run_wrapper_loop(
 
         // Restart sentinel from tray Restart action — skip exit code handling
         if exit_code == -1 {
+            continue;
+        }
+
+        // Stop sentinel — enter stopped state, wait for Start/Quit/Restart
+        if exit_code == -2 {
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            if let Some((_, status_tx)) = tray {
+                status_tx.send(WrapperStatus::Stopped).ok();
+            }
+
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            if let Some((action_rx, _)) = tray {
+                loop {
+                    if let Ok(action) = action_rx.try_recv() {
+                        match action {
+                            super::tray::TrayAction::Start
+                            | super::tray::TrayAction::Restart => {
+                                log_wrapper_event(log_dir, "Start requested via tray");
+                                break; // exit stopped loop, outer loop will relaunch
+                            }
+                            super::tray::TrayAction::Quit => {
+                                return Ok(());
+                            }
+                            super::tray::TrayAction::ViewLogs => {
+                                super::tray::open_log_file();
+                            }
+                            super::tray::TrayAction::CheckUpdate => {
+                                // Allow checking for updates even while stopped
+                                let result = spawn_update_command(&exe_path);
+                                match result {
+                                    Ok(s) if s.success() => {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            "Update installed while stopped, restarting wrapper...",
+                                        );
+                                        if let Some((_, status_tx)) = tray {
+                                            status_tx
+                                                .send(WrapperStatus::UpdatedRestarting)
+                                                .ok();
+                                        }
+                                        spawn_new_wrapper(&exe_path, log_dir);
+                                        return Ok(());
+                                    }
+                                    Ok(_) => {
+                                        log_wrapper_event(log_dir, "No update available");
+                                        if let Some((_, status_tx)) = tray {
+                                            status_tx.send(WrapperStatus::UpToDate).ok();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            &format!("Update check failed: {e}"),
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
             continue;
         }
 
@@ -550,8 +672,16 @@ fn run_wrapper_loop(
 
         match action {
             WrapperAction::Update => {
-                // Update succeeded — brief pause then relaunch
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                // Update succeeded — re-exec the wrapper so the tray shows
+                // the correct new version (compiled-in to the new binary).
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                if let Some((_, status_tx)) = tray {
+                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                    // Brief pause so the tray can display the message
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                spawn_new_wrapper(&exe_path, log_dir);
+                return Ok(());
             }
             WrapperAction::Exit => {
                 let reason = if exit_code == WRAPPER_EXIT_ALREADY_RUNNING {
