@@ -2653,6 +2653,14 @@ impl Operation for GetOp {
                     // Step 2: Check if we should pipe upstream BEFORE assembly
                     // This enables low-latency forwarding of responses
                     let is_original_requester = self.upstream_addr.is_none();
+
+                    // Extract subscription flags from state (needed for auto-subscribe after caching)
+                    let (subscribe_requested, blocking_sub) =
+                        if let Some(GetState::AwaitingResponse(data)) = &self.state {
+                            (data.subscribe, data.blocking_subscribe)
+                        } else {
+                            (false, false)
+                        };
                     let piping_started = if !is_original_requester {
                         let upstream_addr = self
                             .upstream_addr
@@ -2774,7 +2782,10 @@ impl Operation for GetOp {
                         None
                     };
 
-                    // Step 5: Cache the contract locally (same as regular Response)
+                    // Step 5: Cache the contract locally, announce hosting, and auto-subscribe.
+                    // This mirrors the non-streaming Response path — without it, the node
+                    // never registers as subscribed after a streaming GET, causing every
+                    // subsequent GET to hit the network instead of serving from local cache.
                     if let Some(state) = &value.state {
                         let contract_to_cache = if includes_contract {
                             value.contract.clone()
@@ -2782,11 +2793,23 @@ impl Operation for GetOp {
                             None
                         };
 
-                        // Check if we already have this contract
-                        let already_hosting = op_manager.ring.is_hosting_contract(&key);
+                        // Record access atomically — returns whether this is a newly-hosted contract
+                        let access_result =
+                            op_manager.ring.record_get_access(key, state.size() as u64);
 
-                        if !already_hosting {
-                            // Use put_query to cache the contract
+                        // Clean up interest tracking for evicted contracts
+                        let mut removed_contracts = Vec::new();
+                        for evicted_key in &access_result.evicted {
+                            if op_manager
+                                .interest_manager
+                                .unregister_local_hosting(evicted_key)
+                            {
+                                removed_contracts.push(*evicted_key);
+                            }
+                        }
+
+                        if access_result.is_new {
+                            // First time hosting — cache the contract and announce
                             if let Err(e) = op_manager
                                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
                                     key,
@@ -2798,11 +2821,58 @@ impl Operation for GetOp {
                             {
                                 tracing::warn!(contract = %key, error = %e, "failed to cache contract via PutQuery");
                             }
+
+                            tracing::debug!(tx = %id, %key, "Contract newly hosted (streaming)");
+                            super::announce_contract_hosted(op_manager, &key).await;
+
+                            let became_interested =
+                                op_manager.interest_manager.register_local_hosting(&key);
+                            let added = if became_interested { vec![key] } else { vec![] };
+                            if !added.is_empty() || !removed_contracts.is_empty() {
+                                super::broadcast_change_interests(
+                                    op_manager,
+                                    added,
+                                    removed_contracts,
+                                )
+                                .await;
+                            }
+                        } else {
+                            // Already hosting — still cache the (possibly updated) state
+                            if let Err(e) = op_manager
+                                .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                                    key,
+                                    state: state.clone(),
+                                    related_contracts: RelatedContracts::default(),
+                                    contract: contract_to_cache,
+                                })
+                                .await
+                            {
+                                tracing::warn!(contract = %key, error = %e, "failed to cache contract via PutQuery");
+                            }
+
+                            tracing::debug!(tx = %id, %key, "Refreshed hosting status for already-hosted contract (streaming)");
+                            if !removed_contracts.is_empty() {
+                                super::broadcast_change_interests(
+                                    op_manager,
+                                    vec![],
+                                    removed_contracts,
+                                )
+                                .await;
+                            }
                         }
 
-                        // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
-                        // This keeps the TTL/LRU position fresh for already-hosted contracts.
-                        op_manager.ring.record_get_access(key, state.size() as u64);
+                        // Auto-subscribe so subsequent GETs are served from local cache.
+                        // Only the original requester subscribes — relay peers cache
+                        // for durability but don't subscribe (no freshness obligation).
+                        if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
+                            if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
+                                let blocking = subscribe_requested && blocking_sub;
+                                let child_tx = super::start_subscription_request(
+                                    op_manager, id, key, blocking,
+                                );
+                                tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming)");
+                            }
+                        }
                     }
 
                     // Step 6: Emit telemetry
