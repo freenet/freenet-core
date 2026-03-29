@@ -1174,13 +1174,17 @@ mod tests {
 
         // Create a StreamHandle with a fragment already buffered so the
         // inactivity timeout (30s) doesn't fire before the cwnd timeout (20s).
+        // Fragment must be <= FRAGMENT_PAYLOAD_SIZE (1130 bytes).
         let stream_id = StreamId::next();
         let handle = StreamHandle::new(stream_id, 10_000);
         handle
-            .push_fragment(1, Bytes::from(vec![0u8; 1400]))
+            .push_fragment(1, Bytes::from(vec![0u8; 1000]))
             .unwrap();
 
-        // Stuck congestion controller (same pattern as send_stream test)
+        // Stuck congestion controller: flightsize is very large so even with
+        // LOSS_PAUSE_MARGIN the pipe can send a few packets but the receiver
+        // never ACKs (no ACK task running), so flightsize keeps growing until
+        // the margin is consumed and the cwnd wait times out.
         let congestion_controller = CongestionControlConfig::default().build_arc();
         congestion_controller.on_send(1_000_000);
         congestion_controller.on_timeout();
