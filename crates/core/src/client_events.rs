@@ -1256,6 +1256,16 @@ async fn process_open_request(
                             .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
+                        // Refresh hosting TTL on any user GET — keeps hosted
+                        // contracts alive regardless of whether we serve from
+                        // local cache or route through the network (which may
+                        // fall back to local cache via local_fallback).
+                        if let Some(ref fk) = full_key {
+                            if op_manager.ring.is_hosting_contract(fk) {
+                                op_manager.ring.touch_hosting(fk);
+                            }
+                        }
+
                         // Return local cache if we have valid state AND EITHER:
                         // 1. No connections (isolated node - can only use local cache), OR
                         // 2. Actively subscribed (cache is fresh via subscription updates)
@@ -1270,19 +1280,12 @@ async fn process_open_request(
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
 
-                            // Refresh hosting TTL on user GET
-                            let is_hosted = op_manager.ring.is_hosting_contract(&full_key);
-                            if is_hosted {
-                                op_manager.ring.touch_hosting(&full_key);
-                            }
-
                             tracing::debug!(
                                 client_id = %client_id,
                                 request_id = %request_id,
                                 peer = %peer_id,
                                 contract = %full_key,
                                 is_subscribed,
-                                is_hosted,
                                 connection_count,
                                 phase = "local_cache",
                                 "Returning locally cached contract state"
