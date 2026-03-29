@@ -595,6 +595,7 @@ fn run_wrapper_loop(
                             }
                             super::tray::TrayAction::CheckUpdate => {
                                 // Allow checking for updates even while stopped
+                                status_tx.send(WrapperStatus::Updating).ok();
                                 let result = spawn_update_command(&exe_path);
                                 match result {
                                     Ok(s) if s.success() => {
