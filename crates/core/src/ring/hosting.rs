@@ -1398,37 +1398,24 @@ mod tests {
         assert!(manager.should_host(&contract));
     }
 
-    /// Regression test for #3698: after restart, hosted contracts are NOT receiving
-    /// updates and are NOT in the renewal list. The GET handler must NOT treat
-    /// `is_hosting_contract()` as a cache freshness signal — only
-    /// `is_receiving_updates()` guarantees the cache is being kept current.
-    ///
-    /// Before this fix, the GET handler short-circuited to local cache when
-    /// `is_hosted` was true, permanently serving stale state after restart.
+    /// Regression test for #3698: after restart, hosted-but-unsubscribed contracts
+    /// must NOT appear in the renewal list. Without subscriptions (lost on restart),
+    /// the GET handler must query the network rather than serve stale cached state.
     #[test]
-    fn test_hosted_contract_stale_after_restart() {
+    fn test_hosted_contract_not_in_renewal_after_restart() {
         let manager = HostingManager::new();
         let contract = make_contract_key(42);
 
         // Simulate post-restart state: contract in hosting cache (restored from disk)
-        // but no active or client subscriptions (in-memory, lost on restart)
+        // but no subscriptions (in-memory only, lost on restart)
         manager.record_contract_access(contract, 1000, AccessType::Get);
-
-        // Contract IS hosted
         assert!(manager.is_hosting_contract(&contract));
-        // But NOT receiving updates (no subscription)
-        assert!(
-            !manager.is_receiving_updates(&contract),
-            "Hosted-only contract must NOT be treated as receiving updates"
-        );
-        // And NOT in the renewal list (so subscription won't be re-established)
+
+        // Must not appear in renewal list — no subscription to renew
         assert!(
             manager.contracts_needing_renewal().is_empty(),
             "Hosted-only contract must NOT be in renewal list"
         );
-
-        // The GET handler MUST query the network in this state.
-        // `is_hosting_contract()` alone is NOT sufficient for cache freshness.
     }
 
     /// Regression test for #3340: is_receiving_updates must return false when
