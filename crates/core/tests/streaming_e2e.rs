@@ -656,3 +656,103 @@ fn test_streaming_get_through_relay() {
         "Stored state bytes should match the original 1MB state after relay GET"
     );
 }
+
+/// Regression test for #3704: streaming GET path must trigger auto-subscribe
+/// and hosting announcement so that subsequent GETs are served from local cache.
+///
+/// Before the fix, the streaming GET completion path only called `record_get_access()`
+/// but skipped `announce_contract_hosted()` and `start_subscription_request()`, so
+/// `is_receiving_updates()` returned false and every subsequent GET hit the network.
+#[test]
+fn test_streaming_get_triggers_auto_subscribe() {
+    const SEED: u64 = 0xDE1A_0009_CAFE_F00D;
+    const NETWORK_NAME: &str = "streaming-get-auto-subscribe";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 100 * 1024; // 100KB, above streaming threshold
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 3, SEED, THRESHOLD));
+
+    let contract = SimOperation::create_test_contract(0xCC);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0xCC);
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+
+    let operations = vec![
+        // Gateway PUTs 100KB contract
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: large_state.clone(),
+                subscribe: true,
+            },
+        ),
+        // Node 2 GETs the contract (will be streamed since >1KB threshold).
+        // subscribe=false here — we're relying on AUTO_SUBSCRIBE_ON_GET to kick in.
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(120),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Streaming GET should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Verify the GET-requesting node has the contract state
+    let node2_label = NodeLabel::node(NETWORK_NAME, 2);
+    let node2_storage = result
+        .node_storages
+        .get(&node2_label)
+        .expect("node 2 should have a storage handle");
+    let node2_state = node2_storage.get_stored_state(&contract_key);
+    assert!(
+        node2_state.is_some(),
+        "Node 2 should have contract state after streaming GET"
+    );
+
+    // Key assertion: the GET-requesting node should be HOSTING the contract
+    // (i.e., announce_contract_hosted was called, not just record_get_access)
+    let node2_snapshot = result.topology_snapshots.iter().find(|s| {
+        s.contracts
+                .values()
+                .any(|c| c.contract_key == contract_key && c.is_hosting)
+                // Match by checking this is node 2's snapshot (not gateway)
+                && s.peer_addr.ip() != std::net::IpAddr::from([1u8, 0, 0, 1])
+    });
+
+    assert!(
+        node2_snapshot.is_some(),
+        "After streaming GET, the requesting node should be hosting the contract. \
+         Topology snapshots: {:#?}",
+        result
+            .topology_snapshots
+            .iter()
+            .map(|s| (
+                s.peer_addr,
+                s.contracts
+                    .values()
+                    .map(|c| (&c.contract_key, c.is_hosting, c.upstream.is_some()))
+                    .collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>()
+    );
+}
