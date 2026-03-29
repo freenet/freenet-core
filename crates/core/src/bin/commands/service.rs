@@ -157,6 +157,12 @@ impl ServiceCommand {
 const WRAPPER_EXIT_UPDATE_NEEDED: i32 = 42;
 const WRAPPER_EXIT_ALREADY_RUNNING: i32 = 43;
 
+/// Internal sentinel exit codes used by the wrapper loop (never from the child).
+/// Restart: skip exit-code handling and relaunch immediately.
+const SENTINEL_RESTART: i32 = -1;
+/// Stop: enter stopped state, wait for tray Start/Quit action.
+const SENTINEL_STOP: i32 = -2;
+
 /// Initial backoff delay after a crash (seconds).
 const WRAPPER_INITIAL_BACKOFF_SECS: u64 = 10;
 /// Maximum backoff delay (seconds).
@@ -474,7 +480,7 @@ fn run_wrapper_loop(
 
             // Process tray actions while child is running
             #[cfg(any(target_os = "windows", target_os = "macos"))]
-            if let Some((action_rx, _)) = tray {
+            if let Some((action_rx, status_tx)) = tray {
                 if let Ok(action) = action_rx.try_recv() {
                     match action {
                         super::tray::TrayAction::Quit => {
@@ -486,13 +492,13 @@ fn run_wrapper_loop(
                             log_wrapper_event(log_dir, "Restart requested via tray");
                             drop(child.kill());
                             drop(child.wait());
-                            break -1; // sentinel: skip exit-code handling, just relaunch
+                            break SENTINEL_RESTART;
                         }
                         super::tray::TrayAction::Stop => {
                             log_wrapper_event(log_dir, "Stop requested via tray");
                             drop(child.kill());
                             drop(child.wait());
-                            break -2; // sentinel: enter stopped state
+                            break SENTINEL_STOP;
                         }
                         super::tray::TrayAction::Start => {
                             // Ignored while child is running — Start is only
@@ -504,10 +510,7 @@ fn run_wrapper_loop(
                             // succeeds (exit 0), kill the child and re-exec the
                             // wrapper so the tray shows the correct new version.
                             // Exit 2 means already up to date — no restart needed.
-                            #[cfg(any(target_os = "windows", target_os = "macos"))]
-                            if let Some((_, status_tx)) = tray {
-                                status_tx.send(WrapperStatus::Updating).ok();
-                            }
+                            status_tx.send(WrapperStatus::Updating).ok();
                             let result = spawn_update_command(&exe_path);
                             match result {
                                 Ok(s) if s.success() => {
@@ -515,16 +518,9 @@ fn run_wrapper_loop(
                                         log_dir,
                                         "Update installed via tray, restarting wrapper...",
                                     );
-                                    // Tell the tray we're restarting (it will exit its loop)
-                                    #[cfg(any(target_os = "windows", target_os = "macos"))]
-                                    if let Some((_, status_tx)) = tray {
-                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                                    }
+                                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
                                     drop(child.kill());
                                     drop(child.wait());
-                                    // Spawn a new wrapper from the updated binary on disk.
-                                    // current_exe() returns the same path, which now points
-                                    // to the new binary after replace_binary().
                                     spawn_new_wrapper(&exe_path, log_dir);
                                     return Ok(());
                                 }
@@ -532,20 +528,14 @@ fn run_wrapper_loop(
                                     // Exit code 2 = already up to date, or other
                                     // non-zero = update failed. Either way, no restart.
                                     log_wrapper_event(log_dir, "No update available");
-                                    #[cfg(any(target_os = "windows", target_os = "macos"))]
-                                    if let Some((_, status_tx)) = tray {
-                                        status_tx.send(WrapperStatus::UpToDate).ok();
-                                    }
+                                    status_tx.send(WrapperStatus::UpToDate).ok();
                                 }
                                 Err(e) => {
                                     log_wrapper_event(
                                         log_dir,
                                         &format!("Update check failed: {e}"),
                                     );
-                                    #[cfg(any(target_os = "windows", target_os = "macos"))]
-                                    if let Some((_, status_tx)) = tray {
-                                        status_tx.send(WrapperStatus::Running).ok();
-                                    }
+                                    status_tx.send(WrapperStatus::Running).ok();
                                 }
                             }
                         }
@@ -565,24 +555,19 @@ fn run_wrapper_loop(
         };
 
         // Restart sentinel from tray Restart action — skip exit code handling
-        if exit_code == -1 {
+        if exit_code == SENTINEL_RESTART {
             continue;
         }
 
         // Stop sentinel — enter stopped state, wait for Start/Quit/Restart
-        if exit_code == -2 {
+        if exit_code == SENTINEL_STOP {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
-            if let Some((_, status_tx)) = tray {
+            if let Some((action_rx, status_tx)) = tray {
                 status_tx.send(WrapperStatus::Stopped).ok();
-            }
-
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            if let Some((action_rx, _)) = tray {
                 loop {
                     if let Ok(action) = action_rx.try_recv() {
                         match action {
-                            super::tray::TrayAction::Start
-                            | super::tray::TrayAction::Restart => {
+                            super::tray::TrayAction::Start | super::tray::TrayAction::Restart => {
                                 log_wrapper_event(log_dir, "Start requested via tray");
                                 break; // exit stopped loop, outer loop will relaunch
                             }
@@ -601,19 +586,13 @@ fn run_wrapper_loop(
                                             log_dir,
                                             "Update installed while stopped, restarting wrapper...",
                                         );
-                                        if let Some((_, status_tx)) = tray {
-                                            status_tx
-                                                .send(WrapperStatus::UpdatedRestarting)
-                                                .ok();
-                                        }
+                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
                                         spawn_new_wrapper(&exe_path, log_dir);
                                         return Ok(());
                                     }
                                     Ok(_) => {
                                         log_wrapper_event(log_dir, "No update available");
-                                        if let Some((_, status_tx)) = tray {
-                                            status_tx.send(WrapperStatus::UpToDate).ok();
-                                        }
+                                        status_tx.send(WrapperStatus::UpToDate).ok();
                                     }
                                     Err(e) => {
                                         log_wrapper_event(

@@ -234,10 +234,7 @@ mod platform {
                     .ok();
 
                 // Toggle Start/Stop/Restart enabled state based on running status
-                let is_running = matches!(
-                    status,
-                    WrapperStatus::Running | WrapperStatus::UpToDate
-                );
+                let is_running = matches!(status, WrapperStatus::Running | WrapperStatus::UpToDate);
                 stop_item.set_enabled(is_running);
                 start_item.set_enabled(!is_running);
                 restart_item.set_enabled(is_running);
