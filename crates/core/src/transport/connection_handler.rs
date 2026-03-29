@@ -1787,8 +1787,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             } else {
                 congestion_controller.current_rate(Duration::from_millis(100))
             };
+            // Capacity = 100ms worth of tokens at the configured rate.
+            // Previously 1MB, which allowed an immediate burst 800x larger
+            // than FixedRate's per-100ms budget, triggering loss. See #3702.
+            let bucket_capacity = (initial_rate / 10).max(8192);
             let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-                1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)
+                bucket_capacity,
                 initial_rate,
                 time_source.clone(),
             ));
@@ -2110,9 +2114,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     congestion_controller
                                                         .current_rate(Duration::from_millis(100))
                                                 };
+                                            let bucket_capacity = (initial_rate / 10).max(8192);
                                             let token_bucket =
                                                 Arc::new(TokenBucket::new_with_time_source(
-                                                    1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)
+                                                    bucket_capacity,
                                                     initial_rate,
                                                     time_source.clone(),
                                                 ));
@@ -2219,8 +2224,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 } else {
                                     congestion_controller.current_rate(Duration::from_millis(100))
                                 };
+                                let bucket_capacity = (initial_rate / 10).max(8192);
                                 let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-                                    1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)
+                                    bucket_capacity,
                                     initial_rate,
                                     time_source.clone(),
                                 ));
