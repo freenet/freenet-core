@@ -1303,10 +1303,13 @@ async fn process_open_request(
                                     )
                                     .await?;
                                 } else {
-                                    tracing::warn!(
+                                    // Expected for HTTP web endpoint which sets subscribe=true
+                                    // but has no notification channel. The subscription is
+                                    // handled at the node level, not the client level.
+                                    tracing::debug!(
                                         client_id = %client_id,
                                         contract = %full_key,
-                                        "GET with subscribe=true but no subscription_listener"
+                                        "GET with subscribe=true but no subscription_listener (expected for HTTP clients)"
                                     );
                                 }
                             }
