@@ -288,7 +288,9 @@ fn sleep_with_jitter_interruptible(
                     super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
                     super::tray::TrayAction::OpenDashboard
                     | super::tray::TrayAction::Restart
-                    | super::tray::TrayAction::CheckUpdate => {}
+                    | super::tray::TrayAction::CheckUpdate
+                    | super::tray::TrayAction::Stop
+                    | super::tray::TrayAction::Start => {}
                 }
             }
         }
