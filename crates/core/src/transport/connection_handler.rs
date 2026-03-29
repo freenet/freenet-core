@@ -2099,13 +2099,16 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 .unwrap_or_default()
                                                 .build_arc_with_time_source(time_source.clone());
 
-                                            // Initialize token bucket
-                                            // Use global bandwidth manager if configured
+                                            // Initialize token bucket at congestion controller's
+                                            // rate to avoid initial burst. See #3702.
                                             let initial_rate =
                                                 if let Some(ref global) = global_bandwidth {
                                                     global.register_connection()
+                                                } else if let Some(limit) = bandwidth_limit {
+                                                    limit
                                                 } else {
-                                                    bandwidth_limit.unwrap_or(10_000_000)
+                                                    congestion_controller
+                                                        .current_rate(Duration::from_millis(100))
                                                 };
                                             let token_bucket =
                                                 Arc::new(TokenBucket::new_with_time_source(
@@ -2207,12 +2210,14 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     .unwrap_or_default()
                                     .build_arc_with_time_source(time_source.clone());
 
-                                // Initialize token bucket
-                                // Use global bandwidth manager if configured
+                                // Initialize token bucket at congestion controller's
+                                // rate to avoid initial burst. See #3702.
                                 let initial_rate = if let Some(ref global) = global_bandwidth {
                                     global.register_connection()
+                                } else if let Some(limit) = bandwidth_limit {
+                                    limit
                                 } else {
-                                    bandwidth_limit.unwrap_or(10_000_000)
+                                    congestion_controller.current_rate(Duration::from_millis(100))
                                 };
                                 let token_bucket = Arc::new(TokenBucket::new_with_time_source(
                                     1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)

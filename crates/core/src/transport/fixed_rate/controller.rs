@@ -27,9 +27,19 @@ pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 1_250_000;
 /// When loss_pause is active, cwnd = flightsize + this margin. The margin
 /// allows a small trickle of new packets during recovery so the connection
 /// doesn't completely stall waiting for ACKs. Set to 2 max-size packets
-/// (2 * 1200 bytes) to ensure the cwnd check `flightsize + packet_size <= cwnd`
-/// can pass for at least one packet even before any ACKs arrive.
+/// to ensure the cwnd check `flightsize + packet_size <= cwnd` can pass
+/// for at least one packet even before any ACKs arrive.
+///
+/// Uses the literal value (1200) rather than importing MAX_PACKET_SIZE to
+/// avoid a circular dependency between transport modules. The static assert
+/// below ensures they stay in sync.
 const LOSS_PAUSE_MARGIN: usize = 2 * 1200;
+
+// Ensure LOSS_PAUSE_MARGIN stays in sync with MAX_PACKET_SIZE.
+const _: () = assert!(
+    LOSS_PAUSE_MARGIN >= 2 * 1200,
+    "LOSS_PAUSE_MARGIN must be at least 2 * MAX_PACKET_SIZE"
+);
 
 /// Configuration for the fixed-rate controller.
 #[derive(Debug, Clone)]
