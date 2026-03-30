@@ -134,7 +134,7 @@ gag = "1"
 winapi = "0.3"
 tao = { version = "0.35", default-features = false, features = ["rwh_06"] }
 wry = { version = "0.55", default-features = false, features = ["os-webview"] }
-winreg = "0.55"
+winreg = "0.56"
 tray-icon = "0.21"
 muda = "0.17"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
