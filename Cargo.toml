@@ -49,7 +49,7 @@ aes-gcm = "0.10"
 blake3 = { version = "1", features = ["std", "traits-preview"] }
 bs58 = "0.5"
 chacha20poly1305 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Data structures/storage
