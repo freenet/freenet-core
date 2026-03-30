@@ -650,14 +650,12 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Start client node 1 with delay to ensure gateway is running
+    // Start client nodes immediately — connect_ws_with_retry handles waiting for WebSocket
+    // readiness, and wait_for_node_connected handles waiting for P2P connectivity.
+    // No startup sleep needed: gateway futures are not polled until the select loop starts,
+    // so all three nodes start concurrently and the gateway is ready before any client
+    // WebSocket connection succeeds.
     let node1 = async move {
-        // Wait for gateway to start its network listener
-        // This delay gives the gateway time to call node.run() and open its listener.
-        // 20s matches test_ping_application_loop; 10s was too short on slow CI runners.
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        tracing::info!("Node1 starting after gateway delay");
-
         let config = config_node1.build().await?;
         let node = test_node_config(config.clone())
             .await?
@@ -667,12 +665,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Start client node 2 with delay to ensure gateway is running
     let node2 = async {
-        // Wait for gateway to start its network listener
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        tracing::info!("Node2 starting after gateway delay");
-
         let config = config_node2.build().await?;
         let node = test_node_config(config.clone())
             .await?
@@ -682,7 +675,7 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Main test logic (300s to accommodate 20s startup + 120s connection wait + operations + buffer)
+    // Main test logic (300s: 60s WS retry + 180s connection wait + operations + buffer)
     let test = tokio::time::timeout(Duration::from_secs(300), async {
         // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw = format!(
@@ -1385,12 +1378,11 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Start client node 1 with delay to ensure gateway is running
+    // Start client nodes immediately — connect_ws_with_retry handles waiting for WebSocket
+    // readiness, and wait_for_node_connected handles waiting for P2P connectivity.
+    // No startup sleep needed: all three nodes start concurrently and the gateway is ready
+    // before any client WebSocket connection succeeds.
     let node1 = async move {
-        // Wait for gateway to start its network listener (20s for slow CI runners)
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        tracing::info!("Node1 starting after gateway delay");
-
         let config = config_node1.build().await?;
         let node = test_node_config(config.clone())
             .await?
@@ -1400,12 +1392,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Start client node 2 with delay to ensure gateway is running
     let node2 = async {
-        // Wait for gateway to start its network listener (20s for slow CI runners)
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        tracing::info!("Node2 starting after gateway delay");
-
         let config = config_node2.build().await?;
         let node = test_node_config(config.clone())
             .await?
@@ -1415,7 +1402,7 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
     }
     .boxed_local();
 
-    // Main test logic (360s: 20s startup + 180s connection wait + operations + buffer)
+    // Main test logic (360s: 60s WS retry + 180s connection wait + operations + buffer)
     let test = tokio::time::timeout(Duration::from_secs(360), async {
         // Connect to all three nodes with retry logic (waits for WebSocket servers to be ready)
         let uri_gw =
