@@ -635,7 +635,8 @@ fn run_wrapper_loop(
                                     }
                                 }
                             }
-                            _ => {}
+                            super::tray::TrayAction::OpenDashboard
+                            | super::tray::TrayAction::Stop => {}
                         }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(250));

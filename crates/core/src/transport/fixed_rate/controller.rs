@@ -35,11 +35,9 @@ pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 1_250_000;
 /// below ensures they stay in sync.
 const LOSS_PAUSE_MARGIN: usize = 2 * 1200;
 
-// Ensure LOSS_PAUSE_MARGIN stays in sync with MAX_PACKET_SIZE.
-const _: () = assert!(
-    LOSS_PAUSE_MARGIN >= 2 * 1200,
-    "LOSS_PAUSE_MARGIN must be at least 2 * MAX_PACKET_SIZE"
-);
+// LOSS_PAUSE_MARGIN uses the literal 1200 rather than importing MAX_PACKET_SIZE
+// to avoid a circular dependency between transport modules. If MAX_PACKET_SIZE
+// ever changes, this constant must be updated manually to remain 2 * MAX_PACKET_SIZE.
 
 /// Configuration for the fixed-rate controller.
 #[derive(Debug, Clone)]

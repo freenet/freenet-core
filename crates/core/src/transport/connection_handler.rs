@@ -86,6 +86,20 @@ const GW_RAMP_PHASE2_RATE: u64 = 20;
 /// Peers with incompatible protocol versions are ignored for this duration.
 const OUTDATED_PEER_EXPIRY: Duration = Duration::from_secs(600);
 
+/// Window used to sample the congestion controller's current rate when
+/// initializing a token bucket. Must stay in sync with `MIN_BUCKET_CAPACITY_BYTES`:
+/// the bucket holds exactly one window's worth of tokens at the initial rate
+/// (`initial_rate / 10` == `initial_rate * TOKEN_BUCKET_WINDOW`).
+const TOKEN_BUCKET_WINDOW: Duration = Duration::from_millis(100);
+
+/// Minimum token bucket capacity in bytes (8 KiB floor).
+///
+/// Prevents the bucket from becoming so small that a single max-size packet
+/// (~1200 bytes) cannot be admitted, stalling connections at very low rates.
+/// 8 KiB (~6–7 max-size packets) provides enough headroom for burst handling
+/// without allowing large uncontrolled bursts.
+const MIN_BUCKET_CAPACITY_BYTES: usize = 8192;
+
 pub type SerializedMessage = Vec<u8>;
 
 type GatewayConnectionFuture<S, T> = BoxFuture<
@@ -1785,12 +1799,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             } else if let Some(limit) = bandwidth_limit {
                 limit
             } else {
-                congestion_controller.current_rate(Duration::from_millis(100))
+                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
             };
-            // Capacity = 100ms worth of tokens at the configured rate.
+            // Capacity = one TOKEN_BUCKET_WINDOW worth of tokens at the configured rate.
             // Previously 1MB, which allowed an immediate burst 800x larger
             // than FixedRate's per-100ms budget, triggering loss. See #3702.
-            let bucket_capacity = (initial_rate / 10).max(8192);
+            let bucket_capacity = (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
             let token_bucket = Arc::new(TokenBucket::new_with_time_source(
                 bucket_capacity,
                 initial_rate,
@@ -2112,9 +2126,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     limit
                                                 } else {
                                                     congestion_controller
-                                                        .current_rate(Duration::from_millis(100))
+                                                        .current_rate(TOKEN_BUCKET_WINDOW)
                                                 };
-                                            let bucket_capacity = (initial_rate / 10).max(8192);
+                                            let bucket_capacity =
+                                                (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                             let token_bucket =
                                                 Arc::new(TokenBucket::new_with_time_source(
                                                     bucket_capacity,
@@ -2222,9 +2237,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 } else if let Some(limit) = bandwidth_limit {
                                     limit
                                 } else {
-                                    congestion_controller.current_rate(Duration::from_millis(100))
+                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
                                 };
-                                let bucket_capacity = (initial_rate / 10).max(8192);
+                                let bucket_capacity =
+                                    (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                 let token_bucket = Arc::new(TokenBucket::new_with_time_source(
                                     bucket_capacity,
                                     initial_rate,

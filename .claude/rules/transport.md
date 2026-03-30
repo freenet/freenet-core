@@ -65,7 +65,7 @@ MUST:
 ```
 Per-connection mode (default):
   → Each connection gets independent limit
-  → Default: 10 MB/s
+  → Default: 10 Mbps (1,250,000 bytes/sec); see DEFAULT_RATE_BYTES_PER_SEC in fixed_rate/controller.rs
 
 Global pool mode:
   → total-bandwidth-limit enables this
