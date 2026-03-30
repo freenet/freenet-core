@@ -579,13 +579,8 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Fix topology optimizer for this 3-node test. With min_connections=1 (default) and
-    // 2 current connections, headroom=1, so deferred swap drops execute immediately when
-    // a "replacement connected" event fires (the swap attempt itself counts). Setting
-    // min_connections=2 on the gateway ensures headroom=0, blocking all deferred drops.
-    // The transient TTL is also extended to outlast the ~300s test timeout.
-    config_gw.network_api.min_connections = Some(2);
-    config_gw.network_api.max_connections = Some(2);
+    // Extend transient TTL to outlast the test operations (default 120s can expire
+    // entries during long operations in a 3-node ring).
     config_gw.network_api.transient_ttl_secs = Some(600);
     config_node1.network_api.transient_ttl_secs = Some(600);
     config_node2.network_api.transient_ttl_secs = Some(600);
@@ -1353,13 +1348,8 @@ async fn test_ping_application_loop() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Fix topology optimizer for this 3-node test. With min_connections=1 (default) and
-    // 2 current connections, headroom=1, so deferred swap drops execute immediately when
-    // a "replacement connected" event fires (the swap attempt itself counts). Setting
-    // min_connections=2 on the gateway ensures headroom=0, blocking all deferred drops.
-    // The transient TTL is also extended to outlast the ~300s test timeout.
-    config_gw.network_api.min_connections = Some(2);
-    config_gw.network_api.max_connections = Some(2);
+    // Extend transient TTL to outlast the test operations (default 120s can expire
+    // entries during long operations in a 3-node ring).
     config_gw.network_api.transient_ttl_secs = Some(600);
     config_node1.network_api.transient_ttl_secs = Some(600);
     config_node2.network_api.transient_ttl_secs = Some(600);

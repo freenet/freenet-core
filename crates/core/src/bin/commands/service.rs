@@ -635,6 +635,7 @@ fn run_wrapper_loop(
                                     }
                                 }
                             }
+                            // These actions are no-ops while the node is stopped.
                             super::tray::TrayAction::OpenDashboard
                             | super::tray::TrayAction::Stop => {}
                         }

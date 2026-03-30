@@ -139,15 +139,11 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         )
     };
 
-    // Fix topology optimizer for this 3-node test. The optimizer fires swaps freely when
-    // current_connections >= min_connections. With min_connections=1 (default) and 2
-    // current connections, headroom=1, so the deferred drop executes immediately when it
-    // sees a "replacement connected" (the swap attempt itself counts). By raising
-    // min_connections to exactly the number of client nodes (2), headroom=0, blocking
-    // all deferred drops. The transient TTL is also extended to 600s (well beyond the
-    // ~420s test budget) so entries can't expire independently.
-    config_gw.network_api.min_connections = Some(2);
-    config_gw.network_api.max_connections = Some(2);
+    // Extend transient TTL to outlast the test budget. In a 3-node ring the topology
+    // optimizer fires swaps (huge gaps are inevitable). The deferred swap drop mechanism
+    // fires when headroom = current_connections - min_connections > 0. With 120s transient
+    // TTL (matching 2×60s GET timeouts), connections can expire independently. Setting
+    // 600s prevents independent TTL expiry throughout the 420s test budget.
     config_gw.network_api.transient_ttl_secs = Some(600);
 
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();

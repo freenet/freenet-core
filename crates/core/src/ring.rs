@@ -2323,28 +2323,37 @@ impl Ring {
 
                 if !deferred_swap_drops.is_empty() {
                     let fresh_count = self.connection_manager.connection_count();
-                    let headroom =
-                        fresh_count.saturating_sub(self.connection_manager.min_connections);
-                    let to_drop = headroom.min(deferred_swap_drops.len());
-                    for (addr, _) in deferred_swap_drops.drain(..to_drop) {
-                        tracing::info!(
-                            peer = %addr,
-                            connections = fresh_count,
-                            "Executing deferred swap drop (replacement connected)"
-                        );
-                        notifier
-                            .notifications_sender
-                            .send(Either::Right(crate::message::NodeEvent::DropConnection(
-                                addr,
-                            )))
-                            .await
-                            .map_err(|error| {
-                                tracing::debug!(
-                                    ?error,
-                                    "Shutting down connection maintenance task"
-                                );
-                                error
-                            })?;
+                    let min_conn = self.connection_manager.min_connections;
+                    // Only execute a deferred drop if current connections exceed
+                    // min_connections + pending_drops — meaning a replacement has
+                    // actually connected. Without this check, drops fire as soon as
+                    // current > min (headroom > 0), which degrades small networks
+                    // where the replacement target location has no peer to connect to.
+                    let replacement_connected =
+                        fresh_count > min_conn.saturating_add(deferred_swap_drops.len());
+                    if replacement_connected {
+                        let headroom = fresh_count.saturating_sub(min_conn);
+                        let to_drop = headroom.min(deferred_swap_drops.len());
+                        for (addr, _) in deferred_swap_drops.drain(..to_drop) {
+                            tracing::info!(
+                                peer = %addr,
+                                connections = fresh_count,
+                                "Executing deferred swap drop (replacement connected)"
+                            );
+                            notifier
+                                .notifications_sender
+                                .send(Either::Right(crate::message::NodeEvent::DropConnection(
+                                    addr,
+                                )))
+                                .await
+                                .map_err(|error| {
+                                    tracing::debug!(
+                                        ?error,
+                                        "Shutting down connection maintenance task"
+                                    );
+                                    error
+                                })?;
+                        }
                     }
                 }
             }
