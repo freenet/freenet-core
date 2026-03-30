@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::simulation::{RealTime, TimeSource};
+use crate::transport::packet_data::MAX_PACKET_SIZE;
 
 /// Default rate: 10 Mbps in bytes/sec (10 * 1_000_000 / 8)
 ///
@@ -29,15 +30,11 @@ pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 1_250_000;
 /// doesn't completely stall waiting for ACKs. Set to 2 max-size packets
 /// to ensure the cwnd check `flightsize + packet_size <= cwnd` can pass
 /// for at least one packet even before any ACKs arrive.
-///
-/// Uses the literal value (1200) rather than importing MAX_PACKET_SIZE to
-/// avoid a circular dependency between transport modules. The static assert
-/// below ensures they stay in sync.
-const LOSS_PAUSE_MARGIN: usize = 2 * 1200;
+const LOSS_PAUSE_MARGIN: usize = 2 * MAX_PACKET_SIZE;
 
 // Ensure LOSS_PAUSE_MARGIN stays in sync with MAX_PACKET_SIZE.
 const _: () = assert!(
-    LOSS_PAUSE_MARGIN >= 2 * 1200,
+    LOSS_PAUSE_MARGIN >= 2 * MAX_PACKET_SIZE,
     "LOSS_PAUSE_MARGIN must be at least 2 * MAX_PACKET_SIZE"
 );
 
