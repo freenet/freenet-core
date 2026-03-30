@@ -13,6 +13,7 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0
 fail-fast = false
-# Long-running simulation takes ~2.5 min wall clock (1h virtual @ 25x Turmoil
-# acceleration). Allow 10 min per period with 2 periods = 20 min hard cap.
-slow-timeout = { period = "600s", terminate-after = 2 }
+# Long-running simulation tests can take 19+ min on shared CI runners
+# (test_get_reliability_with_latency: 100 nodes + fault injection).
+# Allow 15 min per period with 2 periods = 30 min hard cap.
+slow-timeout = { period = "900s", terminate-after = 2 }

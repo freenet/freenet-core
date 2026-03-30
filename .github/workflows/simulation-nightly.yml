@@ -233,7 +233,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: large-scale-simulation
-    if: failure()
+    if: failure() && needs.large-scale-simulation.result == 'failure'
+    continue-on-error: true
     steps:
       - name: Send failure message to Matrix
         env:

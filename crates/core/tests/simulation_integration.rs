@@ -7548,7 +7548,7 @@ fn test_get_reliability_diagnostic() {
             // Retry-storm: transactions with >10 request events (same tx hitting many peers)
             let retry_storms: Vec<_> = request_count_per_tx
                 .iter()
-                .filter(|(_, &count)| count > 10)
+                .filter(|&(_, &count)| count > 10)
                 .map(|(tx, count)| (tx.clone(), *count))
                 .collect();
 
