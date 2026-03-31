@@ -200,18 +200,58 @@ MUST:
 → Log for debugging (may indicate DoS attempt)
 ```
 
-## Related Contracts Rules
+## Related Contracts Rules (Depth=1)
 
-### WHEN a contract references other contracts
+### Design decisions
 
 ```
-Contracts can depend on other contracts (related_contracts).
+- Depth = 1 ONLY: A contract may request related contracts via
+  RequestRelated(ids). Those related contracts may NOT request
+  their own related contracts (no recursive resolution).
 
-MUST:
-  - Fetch related contracts before execution
-  - Handle missing related contracts (may not exist yet)
-  - Prevent circular dependencies (track visited set)
-  - Limit depth of related contract chain
+- One round only: validate_state is called, if it returns
+  RequestRelated(ids), we fetch those contracts and re-call
+  validate_state exactly once. If it returns RequestRelated again,
+  that's an error. Contracts must declare ALL dependencies in one call.
+
+- Limits: MAX_RELATED_CONTRACTS_PER_REQUEST = 10,
+  RELATED_FETCH_TIMEOUT = 10s. Self-reference is rejected.
+  Empty RequestRelated is rejected.
+
+- Network inbound upsert: Related contracts are fetched locally
+  during validation. If the related contract isn't already stored
+  locally, it will fail with MissingRelated. The sending node
+  already validated at depth=1, so this is acceptable. Network
+  fetch during broadcast processing is deferred to avoid
+  cascading backpressure (documented anti-pattern).
+```
+
+### WHEN a contract's validate_state returns RequestRelated
+
+```
+The fetch_related_for_validation helper handles this:
+  1. Reject empty request, self-reference, >10 contracts
+  2. Dedup requested IDs
+  3. Look up each locally (lookup_key + state_store.get)
+  4. Re-call validate_state with populated RelatedContracts
+  5. If second call returns RequestRelated → error (depth>1)
+
+This helper is used in:
+  - bridged_upsert_contract_state (new PUT validation)
+  - bridged_upsert_contract_state (post-merge validation)
+  - perform_contract_put (existing contract merge validation)
+  - get_updated_state (post-update validation)
+  - verify_and_store_contract (depth=1 simplified)
+```
+
+### Abuse prevention
+
+```
+- Circular deps: Impossible at depth=1 (A needs B, but B doesn't exist yet)
+- Iterative expansion: Blocked by one-round rule
+- Amplification: Bounded by 10 contracts × 50MB state limit
+- Self-reference: Explicitly checked and rejected
+- Repeated PUTs: After first PUT, related contracts cached locally
 ```
 
 ## Error Handling

@@ -4,6 +4,13 @@ use super::{
     OpRequestSender, RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
     StateStoreError, now_nanos,
 };
+
+/// Maximum number of related contracts a single validation can request.
+/// Bounds worst-case first-time cost: N GETs of up to 50MB each.
+const MAX_RELATED_CONTRACTS_PER_REQUEST: usize = 10;
+
+/// Timeout for fetching all related contracts during validation.
+const RELATED_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 use crate::node::OpManager;
 use crate::wasm_runtime::{
     BackendEngine, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE, RuntimeConfig, SharedModuleCache,
@@ -1068,15 +1075,27 @@ where
                 }
 
                 let result = self
-                    .runtime
-                    .validate_state(&key, &params, &incoming_state, &related_contracts)
-                    .map_err(|err| {
+                    .fetch_related_for_validation(
+                        &key,
+                        &params,
+                        &incoming_state,
+                        &related_contracts,
+                    )
+                    .await
+                    .inspect_err(|_| {
                         if remove_if_fail {
                             if let Err(e) = self.runtime.remove_contract(&key) {
                                 tracing::warn!(contract = %key, error = %e, "failed to remove contract after validation failure");
                             }
                         }
-                        ExecutorError::execution(err, None)
+                        // Clean up init_tracker so queued operations aren't left dangling
+                        if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
+                            tracing::warn!(
+                                contract = %key,
+                                dropped_operations = dropped_count,
+                                "Related contract validation failed, dropping queued operations"
+                            );
+                        }
                     })?;
                 match result {
                     ValidateResult::Valid => {
@@ -1222,21 +1241,21 @@ where
                         }
                         return Err(ExecutorError::request(StdContractError::invalid_put(key)));
                     }
-                    ValidateResult::RequestRelated(mut related) => {
+                    ValidateResult::RequestRelated(_) => {
+                        // fetch_related_for_validation resolves RequestRelated internally.
+                        // If this is reached, it indicates a logic error in the helper.
                         if let Some(dropped_count) = self.init_tracker.fail_initialization(&key) {
                             tracing::warn!(
                                 contract = %key,
                                 dropped_operations = dropped_count,
-                                "Missing related contracts, dropping queued operations"
+                                "Unexpected RequestRelated after fetch, dropping queued operations"
                             );
                         }
-                        if let Some(key) = related.pop() {
-                            return Err(ExecutorError::request(StdContractError::MissingRelated {
-                                key,
-                            }));
-                        } else {
-                            return Err(ExecutorError::internal_error());
-                        }
+                        return Err(ExecutorError::request(StdContractError::Put {
+                            key,
+                            cause: "unexpected RequestRelated after related contract resolution"
+                                .into(),
+                        }));
                     }
                 }
 
@@ -1375,9 +1394,8 @@ where
         }
 
         let result = self
-            .runtime
-            .validate_state(&key, &params, &updated_state, &related_contracts)
-            .map_err(|e| ExecutorError::execution(e, None))?;
+            .fetch_related_for_validation(&key, &params, &updated_state, &related_contracts)
+            .await?;
 
         if result != ValidateResult::Valid {
             return Err(Self::validation_error(key, result));
@@ -1847,9 +1865,176 @@ where
         }
     }
 
+    /// Validate a contract's state, automatically fetching related contracts if requested.
+    ///
+    /// Depth=1 only: the original contract may request related contract states via
+    /// `RequestRelated`. Those related contracts are fetched locally and
+    /// `validate_state` is called exactly once more. If the second call also returns
+    /// `RequestRelated`, that's an error — contracts must declare all dependencies in
+    /// one round.
+    ///
+    /// # Return value
+    /// On success, returns only `Valid` or `Invalid`, never `RequestRelated`.
+    /// `RequestRelated` is resolved internally or converted to an error.
+    ///
+    /// # Safety limits
+    /// - At most `MAX_RELATED_CONTRACTS_PER_REQUEST` (10) related contracts
+    /// - Self-reference (requesting own ID) is rejected
+    /// - Empty `RequestRelated` is rejected
+    /// - Overall timeout of `RELATED_FETCH_TIMEOUT` (10s)
+    async fn fetch_related_for_validation(
+        &mut self,
+        key: &ContractKey,
+        params: &Parameters<'_>,
+        state: &WrappedState,
+        initial_related: &RelatedContracts<'_>,
+    ) -> Result<ValidateResult, ExecutorError> {
+        let result = self
+            .runtime
+            .validate_state(key, params, state, initial_related)
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        let requested_ids = match result {
+            ValidateResult::Valid | ValidateResult::Invalid => return Ok(result),
+            ValidateResult::RequestRelated(ids) => ids,
+        };
+
+        // Reject empty requests
+        if requested_ids.is_empty() {
+            tracing::warn!(
+                contract = %key,
+                "Contract returned RequestRelated with empty list"
+            );
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: "contract requested related contracts but provided empty list".into(),
+            }));
+        }
+
+        // Reject self-reference
+        let self_id = key.id();
+        if requested_ids.iter().any(|id| id == self_id) {
+            tracing::warn!(
+                contract = %key,
+                "Contract requested its own state as a related contract"
+            );
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: "contract cannot request itself as a related contract".into(),
+            }));
+        }
+
+        // Dedup
+        let unique_ids: HashSet<ContractInstanceId> = requested_ids.into_iter().collect();
+
+        // Reject too many
+        if unique_ids.len() > MAX_RELATED_CONTRACTS_PER_REQUEST {
+            tracing::warn!(
+                contract = %key,
+                requested = unique_ids.len(),
+                limit = MAX_RELATED_CONTRACTS_PER_REQUEST,
+                "Contract requested too many related contracts"
+            );
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: format!(
+                    "contract requested {} related contracts, limit is {}",
+                    unique_ids.len(),
+                    MAX_RELATED_CONTRACTS_PER_REQUEST
+                )
+                .into(),
+            }));
+        }
+
+        tracing::debug!(
+            contract = %key,
+            related_count = unique_ids.len(),
+            "Fetching related contracts for validation"
+        );
+
+        // Fetch each related contract locally with overall timeout.
+        // Local lookup via lookup_key + state_store.get() is available on all executor
+        // types (Runtime, MockWasmRuntime). Network fetch is only available on
+        // Executor<Runtime> and happens automatically via GET auto-subscribe when
+        // the contract isn't found locally.
+        let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
+            HashMap::with_capacity(unique_ids.len());
+
+        let fetch_all = async {
+            for id in &unique_ids {
+                let full_key = self.bridged_lookup_key(id).ok_or_else(|| {
+                    ExecutorError::request(StdContractError::MissingRelated { key: *id })
+                })?;
+                let state = self.state_store.get(&full_key).await.map_err(|_| {
+                    ExecutorError::request(StdContractError::MissingRelated { key: *id })
+                })?;
+                related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+            }
+            Ok::<(), ExecutorError>(())
+        };
+
+        match tokio::time::timeout(RELATED_FETCH_TIMEOUT, fetch_all).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to fetch related contracts"
+                );
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    contract = %key,
+                    timeout_secs = RELATED_FETCH_TIMEOUT.as_secs(),
+                    fetched = related_map.len(),
+                    total = unique_ids.len(),
+                    "Timed out fetching related contracts"
+                );
+                return Err(ExecutorError::request(StdContractError::Put {
+                    key: *key,
+                    cause: "timed out fetching related contracts".into(),
+                }));
+            }
+        }
+
+        // Merge initial_related (caller-provided) with newly fetched states.
+        // The contract's first call saw initial_related; the second call should see
+        // both the original entries and the newly fetched ones.
+        let initial_owned = initial_related.clone().into_owned();
+        for (id, state) in initial_owned.states() {
+            if let Some(s) = state {
+                related_map
+                    .entry(*id)
+                    .or_insert_with(|| Some(s.clone().into_owned()));
+            }
+        }
+        let populated_related = RelatedContracts::from(related_map);
+        let retry_result = self
+            .runtime
+            .validate_state(key, params, state, &populated_related)
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        // If the contract requests more related contracts, that's depth>1 — reject
+        if let ValidateResult::RequestRelated(_) = &retry_result {
+            tracing::warn!(
+                contract = %key,
+                "Contract returned RequestRelated after related contracts were provided (depth>1 not supported)"
+            );
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: "contract requested additional related contracts after first round (depth=1 limit exceeded)".into(),
+            }));
+        }
+
+        Ok(retry_result)
+    }
+
+    /// Build an Update error for a non-Valid validation result.
+    ///
+    /// Used by UPDATE code paths. For PUT paths, use `validation_error_put`.
     fn validation_error(key: ContractKey, result: ValidateResult) -> ExecutorError {
         match result {
-            ValidateResult::Valid => unreachable!("called validation_error on Valid result"),
             ValidateResult::Invalid => {
                 ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
                     key,
@@ -1857,10 +2042,50 @@ where
                 })
             }
             ValidateResult::RequestRelated(_) => {
+                tracing::error!(
+                    contract = %key,
+                    "validation_error called with RequestRelated — expected only Invalid"
+                );
                 ExecutorError::request(freenet_stdlib::client_api::ContractError::Update {
                     key,
                     cause: "missing related contracts for validation".into(),
                 })
+            }
+            ValidateResult::Valid => {
+                tracing::error!(
+                    contract = %key,
+                    "validation_error called with Valid result — this is a bug"
+                );
+                ExecutorError::internal_error()
+            }
+        }
+    }
+
+    /// Build a Put error for a non-Valid validation result.
+    ///
+    /// Used by PUT code paths to preserve correct error semantics for callers.
+    fn validation_error_put(key: ContractKey, result: ValidateResult) -> ExecutorError {
+        match result {
+            ValidateResult::Invalid => ExecutorError::request(StdContractError::Put {
+                key,
+                cause: "invalid outcome state after merge".into(),
+            }),
+            ValidateResult::RequestRelated(_) => {
+                tracing::error!(
+                    contract = %key,
+                    "validation_error_put called with RequestRelated — expected only Invalid"
+                );
+                ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "missing related contracts for validation".into(),
+                })
+            }
+            ValidateResult::Valid => {
+                tracing::error!(
+                    contract = %key,
+                    "validation_error_put called with Valid result — this is a bug"
+                );
+                ExecutorError::internal_error()
             }
         }
     }
@@ -2614,25 +2839,12 @@ impl Executor<Runtime> {
                 }
             };
 
-            // Validate before persisting
-            match self
-                .runtime
-                .validate_state(&key, &params, &new_state, &RelatedContracts::default())
-                .map_err(|e| ExecutorError::execution(e, None))?
-            {
-                ValidateResult::Valid => {}
-                ValidateResult::Invalid => {
-                    return Err(ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "invalid outcome state after merge".into(),
-                    }));
-                }
-                ValidateResult::RequestRelated(_) => {
-                    return Err(ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "missing related contracts for validation".into(),
-                    }));
-                }
+            // Validate before persisting (fetch related contracts from network if needed)
+            let validate_result = self
+                .fetch_related_for_validation_network(&key, &params, &new_state, &related_contracts)
+                .await?;
+            if validate_result != ValidateResult::Valid {
+                return Err(Self::validation_error_put(key, validate_result));
             }
 
             // Commit locally
@@ -3010,13 +3222,15 @@ impl Executor<Runtime> {
             }
         };
 
-        // Validate before persisting or broadcasting.
-        // Empty RelatedContracts: this local-mode path passes related data as
-        // UpdateData entries to update_state rather than via RelatedContracts.
+        // Validate before persisting or broadcasting (fetch related contracts from network if needed).
         let result = self
-            .runtime
-            .validate_state(&key, parameters, &new_state, &RelatedContracts::default())
-            .map_err(|e| ExecutorError::execution(e, None))?;
+            .fetch_related_for_validation_network(
+                &key,
+                parameters,
+                &new_state,
+                &RelatedContracts::default(),
+            )
+            .await?;
 
         if result != ValidateResult::Valid {
             return Err(Self::validation_error(key, result));
@@ -3049,14 +3263,19 @@ impl Executor<Runtime> {
         Ok(State::from(state))
     }
 
+    /// Verify and store a contract with depth=1 related contract resolution.
+    ///
+    /// 1. Store the contract code in the runtime store
+    /// 2. Validate state (fetching related contracts if requested, one round only)
+    /// 3. If valid, persist to state_store
     async fn verify_and_store_contract(
         &mut self,
         state: WrappedState,
-        trying_container: ContractContainer,
-        mut related_contracts: RelatedContracts<'_>,
+        contract: ContractContainer,
+        related_contracts: RelatedContracts<'_>,
     ) -> Result<(), ExecutorError> {
-        let key = trying_container.key();
-        let params = trying_container.params();
+        let key = contract.key();
+        let params = contract.params();
         let state_hash = blake3::hash(state.as_ref());
 
         tracing::debug!(
@@ -3067,134 +3286,184 @@ impl Executor<Runtime> {
             "starting contract verification and storage"
         );
 
-        const DEPENDENCY_CYCLE_LIMIT_GUARD: usize = 100;
-        let mut iterations = 0;
-
-        let original_key = key;
-        let original_state = state.clone();
-        let original_params = params.clone();
-        let mut trying_key = key;
-        let mut trying_state = state;
-        let mut trying_params = params;
-        let mut trying_contract = Some(trying_container);
-
-        while iterations < DEPENDENCY_CYCLE_LIMIT_GUARD {
-            if let Some(contract) = trying_contract.take() {
-                tracing::debug!(
-                    contract = %trying_key,
-                    "storing contract in runtime store"
+        // Store contract code in runtime store
+        self.runtime
+            .contract_store
+            .store_contract(contract)
+            .map_err(|e| {
+                tracing::error!(
+                    contract = %key,
+                    error = %e,
+                    "failed to store contract in runtime"
                 );
-                // DEBUG: Log contract details before storing
-                tracing::debug!(
-                    "DEBUG PUT: verify_and_store_contract - key={}, key.code_hash={:?}, contract.key={}, contract.key.code_hash={:?}",
-                    key,
-                    key.code_hash(),
-                    contract.key(),
-                    contract.key().code_hash()
-                );
+                ExecutorError::other(e)
+            })?;
 
-                self.runtime
-                    .contract_store
-                    .store_contract(contract)
-                    .map_err(|e| {
-                        tracing::error!(
-                            contract = %trying_key,
-                            error = %e,
-                            "failed to store contract in runtime"
-                        );
-                        ExecutorError::other(e)
-                    })?;
-            }
-
-            let result = self
-                .runtime
-                .validate_state(
-                    &trying_key,
-                    &trying_params,
-                    &trying_state,
-                    &related_contracts,
-                )
-                .map_err(|err| {
-                    if let Err(e) = self.runtime.contract_store.remove_contract(&trying_key) {
-                        tracing::warn!(contract = %trying_key, error = %e, "failed to remove contract after validation failure");
-                    }
-                    ExecutorError::execution(err, None)
-                })?;
-
-            let is_valid = match result {
-                ValidateResult::Valid => true,
-                ValidateResult::Invalid => false,
-                ValidateResult::RequestRelated(related) => {
-                    iterations += 1;
-                    related_contracts.missing(related);
-                    for (id, related) in related_contracts.update() {
-                        if related.is_none() {
-                            match self.local_state_or_from_network(id, false).await? {
-                                Either::Left(state) => {
-                                    *related = Some(state.into());
-                                }
-                                Either::Right(result) => {
-                                    let Some(contract) = result.contract else {
-                                        return Err(ExecutorError::request(
-                                            RequestError::ContractError(
-                                                StdContractError::MissingRelated { key: *id },
-                                            ),
-                                        ));
-                                    };
-                                    trying_key = contract.key();
-                                    trying_params = contract.params();
-                                    trying_state = result.state;
-                                    trying_contract = Some(contract);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    continue;
+        // Validate with depth=1 related contract resolution.
+        //
+        // DEPTH PROTECTION: fetch_related_for_validation enforces depth=1 —
+        // if validate_state returns RequestRelated(ids), we fetch those contracts
+        // and retry exactly once. A second RequestRelated is rejected as an error.
+        // This prevents:
+        //   - Recursive depth (related contracts requesting their own related contracts)
+        //   - Amplification attacks (contract requesting new contracts on every retry)
+        //   - Self-reference (contract requesting its own state)
+        //   - Excessive fan-out (max 10 related contracts per request)
+        // See MAX_RELATED_CONTRACTS_PER_REQUEST and RELATED_FETCH_TIMEOUT constants.
+        let result = self
+            .fetch_related_for_validation_network(&key, &params, &state, &related_contracts)
+            .await
+            .inspect_err(|_| {
+                if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
+                    tracing::warn!(contract = %key, error = %e, "failed to remove contract after validation failure");
                 }
-            };
+            })?;
 
-            if !is_valid {
-                return Err(ExecutorError::request(StdContractError::Put {
-                    key: trying_key,
-                    cause: "not valid".into(),
-                }));
+        // fetch_related_for_validation resolves RequestRelated internally,
+        // so only Valid or Invalid are possible here.
+        if result != ValidateResult::Valid {
+            if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
+                tracing::warn!(contract = %key, error = %e, "failed to remove contract after invalid validation");
             }
-
-            tracing::debug!(
-                contract = %trying_key,
-                state_size = trying_state.as_ref().len(),
-                "storing contract state"
-            );
-            self.state_store
-                .store(trying_key, trying_state.clone(), trying_params.clone())
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        contract = %trying_key,
-                        error = %e,
-                        "failed to store contract state"
-                    );
-                    ExecutorError::other(e)
-                })?;
-            if trying_key != original_key {
-                trying_key = original_key;
-                trying_params = original_params.clone();
-                trying_state = original_state.clone();
-                continue;
-            }
-            break;
-        }
-        if iterations == DEPENDENCY_CYCLE_LIMIT_GUARD {
-            return Err(ExecutorError::request(StdContractError::MissingRelated {
-                key: *original_key.id(),
+            return Err(ExecutorError::request(StdContractError::Put {
+                key,
+                cause: "not valid".into(),
             }));
         }
+
+        tracing::debug!(
+            contract = %key,
+            state_size = state.as_ref().len(),
+            "storing contract state"
+        );
+        self.state_store
+            .store(key, state, params)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    contract = %key,
+                    error = %e,
+                    "failed to store contract state"
+                );
+                ExecutorError::other(e)
+            })?;
+
         Ok(())
     }
 }
 
 impl Executor<Runtime> {
+    /// Network-aware version of `fetch_related_for_validation`.
+    ///
+    /// Uses `local_state_or_from_network` to fetch related contracts, allowing
+    /// first-time publishes that depend on contracts not yet stored locally.
+    /// The base `fetch_related_for_validation` on the bridged impl only does
+    /// local lookups.
+    async fn fetch_related_for_validation_network(
+        &mut self,
+        key: &ContractKey,
+        params: &Parameters<'_>,
+        state: &WrappedState,
+        initial_related: &RelatedContracts<'_>,
+    ) -> Result<ValidateResult, ExecutorError> {
+        let result = self
+            .runtime
+            .validate_state(key, params, state, initial_related)
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        let requested_ids = match result {
+            ValidateResult::Valid | ValidateResult::Invalid => return Ok(result),
+            ValidateResult::RequestRelated(ids) => ids,
+        };
+
+        // Apply the same safety checks as the base helper
+        if requested_ids.is_empty() {
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: "contract requested related contracts but provided empty list".into(),
+            }));
+        }
+        let self_id = key.id();
+        if requested_ids.iter().any(|id| id == self_id) {
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: "contract cannot request itself as a related contract".into(),
+            }));
+        }
+        let unique_ids: HashSet<ContractInstanceId> = requested_ids.into_iter().collect();
+        if unique_ids.len() > MAX_RELATED_CONTRACTS_PER_REQUEST {
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: format!(
+                    "contract requested {} related contracts, limit is {}",
+                    unique_ids.len(),
+                    MAX_RELATED_CONTRACTS_PER_REQUEST
+                )
+                .into(),
+            }));
+        }
+
+        tracing::debug!(
+            contract = %key,
+            related_count = unique_ids.len(),
+            "Fetching related contracts (with network fallback) for validation"
+        );
+
+        let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
+            HashMap::with_capacity(unique_ids.len());
+
+        let fetch_all = async {
+            for id in &unique_ids {
+                match self.local_state_or_from_network(id, false).await? {
+                    Either::Left(state) => {
+                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                    }
+                    Either::Right(get_result) => {
+                        related_map
+                            .insert(*id, Some(State::from(get_result.state.as_ref().to_vec())));
+                    }
+                }
+            }
+            Ok::<(), ExecutorError>(())
+        };
+
+        match tokio::time::timeout(RELATED_FETCH_TIMEOUT, fetch_all).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                return Err(ExecutorError::request(StdContractError::Put {
+                    key: *key,
+                    cause: "timed out fetching related contracts".into(),
+                }));
+            }
+        }
+
+        // Merge initial_related with newly fetched states
+        let initial_owned = initial_related.clone().into_owned();
+        for (id, state) in initial_owned.states() {
+            if let Some(s) = state {
+                related_map
+                    .entry(*id)
+                    .or_insert_with(|| Some(s.clone().into_owned()));
+            }
+        }
+
+        let populated_related = RelatedContracts::from(related_map);
+        let retry_result = self
+            .runtime
+            .validate_state(key, params, state, &populated_related)
+            .map_err(|e| ExecutorError::execution(e, None))?;
+
+        if let ValidateResult::RequestRelated(_) = &retry_result {
+            return Err(ExecutorError::request(StdContractError::Put {
+                key: *key,
+                cause: "contract requested additional related contracts after first round (depth=1 limit exceeded)".into(),
+            }));
+        }
+
+        Ok(retry_result)
+    }
+
     async fn subscribe(&mut self, key: ContractKey) -> Result<(), ExecutorError> {
         if self.mode == OperationMode::Local {
             return Ok(());
