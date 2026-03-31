@@ -2323,10 +2323,13 @@ impl Ring {
 
                 if !deferred_swap_drops.is_empty() {
                     let fresh_count = self.connection_manager.connection_count();
-                    let headroom =
-                        fresh_count.saturating_sub(self.connection_manager.min_connections);
-                    let to_drop = headroom.min(deferred_swap_drops.len());
-                    for (addr, _) in deferred_swap_drops.drain(..to_drop) {
+                    let min_conn = self.connection_manager.min_connections;
+                    let n_to_drop = deferred_swap_drops_to_execute(
+                        fresh_count,
+                        min_conn,
+                        deferred_swap_drops.len(),
+                    );
+                    for (addr, _) in deferred_swap_drops.drain(..n_to_drop) {
                         tracing::info!(
                             peer = %addr,
                             connections = fresh_count,
@@ -2626,6 +2629,35 @@ fn calculate_allowed_connection_additions(
     available_capacity.min(requested)
 }
 
+/// Compute how many deferred swap-drops can be executed this tick.
+///
+/// A deferred drop is safe to execute only when a replacement peer has actually
+/// connected.  The guard: `current_connections > min_connections + pending_drops`
+/// — meaning we have at least one extra connection above what's needed to cover
+/// all pending drops plus the minimum.  Each drop we commit to reduces the
+/// effective count by one, so we re-evaluate per element.
+///
+/// Drops are sent as async events; `connection_count()` won't reflect them until
+/// the events are processed.  We track the decrement locally instead.
+fn deferred_swap_drops_to_execute(
+    current_connections: usize,
+    min_connections: usize,
+    pending_drops: usize,
+) -> usize {
+    let mut effective_count = current_connections;
+    let mut n_to_drop = 0usize;
+    for _ in 0..pending_drops {
+        let remaining_pending = pending_drops - n_to_drop;
+        if effective_count > min_connections.saturating_add(remaining_pending) {
+            n_to_drop += 1;
+            effective_count = effective_count.saturating_sub(1);
+        } else {
+            break;
+        }
+    }
+    n_to_drop
+}
+
 #[cfg(test)]
 mod max_concurrent_connections_tests {
     use super::calculate_max_concurrent_connections;
@@ -2813,6 +2845,91 @@ mod refresh_router_tests {
         let snapshot = router.read().snapshot();
         assert_eq!(snapshot.failure_events, 0);
         assert_eq!(snapshot.success_events, 0);
+    }
+}
+
+#[cfg(test)]
+mod deferred_swap_drop_tests {
+    use super::deferred_swap_drops_to_execute;
+
+    /// 3-node ring: current=2, min=1, pending=1.
+    /// The original bug: headroom = 2-1 = 1 > 0, so the old code fired the drop,
+    /// kicking the only other peer and leaving the node isolated.
+    /// Fixed: guard requires current > min + pending (2 > 1+1 = 2) → false.
+    #[test]
+    fn three_node_ring_no_drop_without_replacement() {
+        assert_eq!(deferred_swap_drops_to_execute(2, 1, 1), 0);
+    }
+
+    /// Replacement connected in a 3-node ring: current=3, min=1, pending=1.
+    /// 3 > 1+1=2 → true. One drop allowed.
+    #[test]
+    fn three_node_ring_drop_when_replacement_connected() {
+        assert_eq!(deferred_swap_drops_to_execute(3, 1, 1), 1);
+    }
+
+    /// At min_connections with no pending drops: current=10, min=10, pending=0.
+    /// No pending drops means nothing to execute.
+    #[test]
+    fn no_pending_drops_returns_zero() {
+        assert_eq!(deferred_swap_drops_to_execute(10, 10, 0), 0);
+    }
+
+    /// Large network, no replacements yet: current=12, min=10, pending=3.
+    /// 12 > 10+3=13 → false. None dropped.
+    #[test]
+    fn large_network_no_drop_without_replacement() {
+        assert_eq!(deferred_swap_drops_to_execute(12, 10, 3), 0);
+    }
+
+    /// Large network, exactly enough for one replacement: current=13, min=10, pending=3.
+    /// i=0: remaining=3, 13 > 13 → false. Still none.
+    #[test]
+    fn large_network_boundary_no_drop() {
+        assert_eq!(deferred_swap_drops_to_execute(13, 10, 3), 0);
+    }
+
+    /// Large network, one replacement connected: current=14, min=10, pending=3.
+    /// i=0: remaining=3, 14 > 13 → true (effective=13, n=1)
+    /// i=1: remaining=2, 13 > 12 → true (effective=12, n=2)
+    /// i=2: remaining=1, 12 > 11 → true (effective=11, n=3)
+    /// All 3 dropped; after drops effective=11 ≥ min=10.
+    #[test]
+    fn large_network_all_replacements_connected() {
+        assert_eq!(deferred_swap_drops_to_execute(14, 10, 3), 3);
+    }
+
+    /// current exactly at min with one pending: current=10, min=10, pending=1.
+    /// 10 > 10+1=11 → false. No drop.
+    #[test]
+    fn at_min_with_pending_no_drop() {
+        assert_eq!(deferred_swap_drops_to_execute(10, 10, 1), 0);
+    }
+
+    /// current = min + 1 with one pending: current=11, min=10, pending=1.
+    /// 11 > 11 → false. No drop (1 extra but still need the pending slot covered).
+    #[test]
+    fn one_above_min_with_pending_no_drop() {
+        assert_eq!(deferred_swap_drops_to_execute(11, 10, 1), 0);
+    }
+
+    /// current = min + 2 with one pending: current=12, min=10, pending=1.
+    /// 12 > 11 → true. One drop allowed.
+    #[test]
+    fn two_above_min_with_one_pending_drops_one() {
+        assert_eq!(deferred_swap_drops_to_execute(12, 10, 1), 1);
+    }
+
+    /// Overflow-safe: current=0, min=0, pending=0.
+    #[test]
+    fn all_zero_returns_zero() {
+        assert_eq!(deferred_swap_drops_to_execute(0, 0, 0), 0);
+    }
+
+    /// current < min (below minimum, e.g. still bootstrapping): no drops.
+    #[test]
+    fn below_min_connections_no_drop() {
+        assert_eq!(deferred_swap_drops_to_execute(5, 10, 2), 0);
     }
 }
 

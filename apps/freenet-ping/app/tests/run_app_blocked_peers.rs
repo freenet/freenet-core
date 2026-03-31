@@ -139,15 +139,9 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         )
     };
 
-    // Fix topology optimizer for this 3-node test. The optimizer fires swaps freely when
-    // current_connections >= min_connections. With min_connections=1 (default) and 2
-    // current connections, headroom=1, so the deferred drop executes immediately when it
-    // sees a "replacement connected" (the swap attempt itself counts). By raising
-    // min_connections to exactly the number of client nodes (2), headroom=0, blocking
-    // all deferred drops. The transient TTL is also extended to 600s (well beyond the
-    // ~420s test budget) so entries can't expire independently.
-    config_gw.network_api.min_connections = Some(2);
-    config_gw.network_api.max_connections = Some(2);
+    // Extend transient TTL to outlast the test budget. The default 120s TTL can expire
+    // transient connection entries independently of the deferred swap-drop mechanism,
+    // causing spurious connectivity loss during the 420s test budget.
     config_gw.network_api.transient_ttl_secs = Some(600);
 
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
@@ -164,6 +158,9 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         Some(node1_ip),
     )
     .await?;
+    // Client nodes can only reach the gateway (they block each other), so cap at 1
+    // connection. This prevents the topology optimizer from attempting a swap on
+    // a client node (can't drop your only connection) and keeps test state simple.
     config_node1.network_api.min_connections = Some(1);
     config_node1.network_api.max_connections = Some(1);
     config_node1.network_api.transient_ttl_secs = Some(600);
@@ -181,6 +178,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         Some(node2_ip),
     )
     .await?;
+    // Same rationale as Node1: can only reach gateway, cap at 1 connection.
     config_node2.network_api.min_connections = Some(1);
     config_node2.network_api.max_connections = Some(1);
     config_node2.network_api.transient_ttl_secs = Some(600);
