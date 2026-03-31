@@ -474,12 +474,26 @@ async fn download_checksums(url: &str) -> Result<Checksums> {
 
 fn verify_checksum(file_path: &Path, expected_hash: &str) -> Result<()> {
     use sha2::{Digest, Sha256};
+    use std::io::Read;
 
     let mut file = File::open(file_path).context("Failed to open file for checksum")?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).context("Failed to read file for checksum")?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .context("Failed to read file for checksum")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     let result = hasher.finalize();
-    let actual_hash = format!("{:x}", result);
+    let actual_hash = result.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        write!(s, "{:02x}", b).expect("writing to String is infallible");
+        s
+    });
 
     if actual_hash != expected_hash {
         anyhow::bail!(
