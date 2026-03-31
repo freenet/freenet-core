@@ -29,6 +29,9 @@ on:
       - 'LICENSE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/FUNDING.yml'
+  # Required by branch protection — merge queue expects this check to report.
+  # The job skips the actual review in merge_group context (PR was already reviewed).
+  merge_group:
 
 concurrency:
   group: claude-pr-review-${{ github.event.pull_request.number }}
@@ -39,13 +42,17 @@ jobs:
     name: Claude Rule Review
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # In merge_group: run but skip all steps (PR was already reviewed).
     # Skip draft PRs, release branches, and dependabot.
     # For label events, only run when the 'claude-review' label was added.
     if: |
-      !github.event.pull_request.draft &&
-      !startsWith(github.event.pull_request.head.ref, 'release/v') &&
-      !startsWith(github.event.pull_request.head.ref, 'dependabot/') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'claude-review')
+      github.event_name == 'merge_group' ||
+      (
+        !github.event.pull_request.draft &&
+        !startsWith(github.event.pull_request.head.ref, 'release/v') &&
+        !startsWith(github.event.pull_request.head.ref, 'dependabot/') &&
+        (github.event.action != 'labeled' || github.event.label.name == 'claude-review')
+      )
 
     permissions:
       contents: read
@@ -54,6 +61,7 @@ jobs:
 
     steps:
       - name: Checkout repository
+        if: github.event_name != 'merge_group'
         uses: actions/checkout@v6
         with:
           # Explicitly checkout the PR head so git diff sees the fork's changes.
@@ -63,6 +71,7 @@ jobs:
           fetch-depth: 0
 
       - name: Determine applicable rules
+        if: github.event_name != 'merge_group'
         id: rules
         run: |
           # Get changed files relative to the PR base
@@ -163,7 +172,7 @@ jobs:
 
       - name: Claude rule review
         id: review
-        if: steps.rules.outputs.skip != 'true'
+        if: github.event_name != 'merge_group' && steps.rules.outputs.skip != 'true'
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
@@ -242,7 +251,7 @@ jobs:
             No rule violations detected.
 
       - name: Post review comment
-        if: steps.rules.outputs.skip != 'true'
+        if: github.event_name != 'merge_group' && steps.rules.outputs.skip != 'true'
         uses: actions/github-script@v7
         with:
           script: |
