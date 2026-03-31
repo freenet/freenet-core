@@ -89,16 +89,20 @@ WHEN writing tests for any behavioral change:
 Test failed?
   → DO NOT delete the test
   → DO NOT comment it out without explanation
+  → Flaky tests are broken tests — investigate the root cause
 
-  Is it broken or flaky?
-    1. Add #[ignore] attribute
-    2. Add comment: // Ignored: [reason] #[issue-number]
-    3. Create GitHub issue for follow-up
+  Is it flaky (intermittent failure)?
+    → DO NOT add #[ignore], retries, or increased timeouts
+    → Investigate root cause: timing assumptions, shared state, race conditions
+    → Fix the underlying bug — the flaky test is telling you something
+    → See: flaky-tests.md global rule
 
-  Is it superseded by new semantics?
-    1. Add #[ignore] attribute
-    2. Add comment explaining the semantic change and referencing the PR
-    3. Keep as historical documentation
+  Is it broken by your change?
+    → Fix the test or fix your code — don't ignore it
+    → If the test expectations are genuinely wrong (new semantics):
+      1. Add #[ignore] attribute
+      2. Add comment explaining the semantic change and referencing the PR
+      3. Keep as historical documentation
 ```
 
 ### When running tests

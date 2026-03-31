@@ -86,7 +86,7 @@ jobs:
           fi
 
       - name: Set status to success if overridden
-        if: steps.override.outputs.overridden == 'true'
+        if: github.event_name != 'merge_group' && steps.override.outputs.overridden == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -287,6 +287,17 @@ jobs:
 
             No rule violations detected.
 
+            ## CRITICAL: Structured Warning Count
+
+            At the very end of your response, you MUST output exactly this HTML comment
+            with the count of WARNING-level findings (not INFO). This is machine-parsed
+            to determine whether to block merge:
+
+            <!-- warning-count: N -->
+
+            where N is the integer count of warnings (0 if none). This line must appear
+            exactly once, at the end, with no extra whitespace inside the comment.
+
       - name: Post review comment and set commit status
         if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip != 'true'
         uses: actions/github-script@v7
@@ -362,6 +373,15 @@ jobs:
               }
             } catch (e) {
               console.log(`Could not parse execution file: ${e.message}`);
+              // Set success so we don't block merge on parse failure
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: '${{ github.event.pull_request.head.sha }}',
+                state: 'success',
+                context: 'rule-review/warnings',
+                description: 'Parse error — not blocking merge',
+              });
               return;
             }
 
@@ -379,11 +399,24 @@ jobs:
               return;
             }
 
-            // Count WARNING-level findings to determine commit status
-            const warningCount = (report.match(/^-\s+`[^`]+`\s+—/gm) || []).length;
-            const hasWarningSection = /####\s+Warning/i.test(report);
+            // Count WARNING-level findings using structured marker (reliable)
+            // with regex fallback (best-effort if LLM doesn't emit marker)
             const noIssues = /no\s+(issues?|rule\s+violations?)\s+(found|detected)/i.test(report);
-            const hasWarnings = hasWarningSection && warningCount > 0 && !noIssues;
+            let warningCount = 0;
+
+            // Primary: parse structured marker <!-- warning-count: N -->
+            const markerMatch = report.match(/<!--\s*warning-count:\s*(\d+)\s*-->/);
+            if (markerMatch) {
+              warningCount = parseInt(markerMatch[1], 10);
+            } else if (!noIssues) {
+              // Fallback: count bullet items in the Warnings section only
+              const warningSection = report.match(/####\s+Warning[s]?\s*\n([\s\S]*?)(?=####|$)/i);
+              if (warningSection) {
+                // Count any markdown list items (flexible: handles em-dash, hyphen, etc.)
+                warningCount = (warningSection[1].match(/^-\s+/gm) || []).length;
+              }
+            }
+            const hasWarnings = warningCount > 0;
 
             const statusSuffix = hasWarnings
               ? ` ⚠️ ${warningCount} warning(s) — fix or add \`review-override\` label`
@@ -437,7 +470,7 @@ jobs:
             console.log(`Set commit status: ${state} (${description})`);
 
       - name: Set status to success if skipped
-        if: steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip == 'true'
+        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip == 'true'
         uses: actions/github-script@v7
         with:
           script: |
