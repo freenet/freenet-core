@@ -420,6 +420,61 @@ jobs:
             --test state_verification \
             --features simulation_tests,testing --profile ci
 
+      # fdev simulation tests: medium-scale network, fault tolerance, high latency.
+      # These use the direct runner (real tokio, simulated time) and complete in ~3 min.
+      # Moved from nightly to catch regressions on every PR.
+      - name: Build fdev
+        if: steps.release_check.outputs.is_release != 'true'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: cargo build -p fdev --release --locked
+
+      - name: fdev simulation tests (medium scale, fault tolerance, high latency)
+        if: steps.release_check.outputs.is_release != 'true'
+        env:
+          RUST_LOG: info,turmoil=warn
+        run: |
+          # Run all three in parallel — each uses unique network names and dynamic ports
+          target/release/fdev test \
+            --name "ci-medium-50" \
+            --seed 0xDEADBEEF \
+            --gateways 4 --nodes 46 --events 2000 \
+            --ring-max-htl 12 --max-connections 20 --min-connections 6 \
+            --latency-min 10 --latency-max 50 \
+            --min-success-rate 1.0 \
+            --print-summary --print-network-stats \
+            single-process &
+          PID1=$!
+
+          target/release/fdev test \
+            --name "ci-fault-loss" \
+            --seed 0xFA017001 \
+            --gateways 3 --nodes 27 --events 1000 \
+            --message-loss 0.15 \
+            --latency-min 10 --latency-max 50 \
+            --min-success-rate 0.80 \
+            --print-summary --print-network-stats \
+            single-process &
+          PID2=$!
+
+          target/release/fdev test \
+            --name "ci-high-latency" \
+            --seed 0x1A7E0C71 \
+            --gateways 2 --nodes 12 --events 500 \
+            --latency-min 50 --latency-max 200 \
+            --min-success-rate 0.95 \
+            --print-summary --print-network-stats \
+            single-process &
+          PID3=$!
+
+          # Wait for all and fail if any failed
+          FAILED=0
+          wait $PID1 || FAILED=1
+          wait $PID2 || FAILED=1
+          wait $PID3 || FAILED=1
+          exit $FAILED
+
   nat_validation:
     name: NAT Validation
     needs: fmt_check
