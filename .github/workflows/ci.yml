@@ -159,17 +159,37 @@ jobs:
           fi
 
           # 4. Deleted test functions (removed #[test] or #[tokio::test] lines)
+          # Check ALL Rust files for test additions/removals (not just crates/core/src/)
+          ALL_ADDED=$(git diff "$BASE"..."$HEAD" -- '**/*.rs' \
+            | grep '^+' | grep -v '^+++' || true)
+          ALL_ADDED_STRIPPED=$(echo "$ALL_ADDED" | sed 's|//.*||' || true)
+
           REMOVED=$(git diff "$BASE"..."$HEAD" -- 'crates/core/src/**/*.rs' 'crates/core/tests/**/*.rs' \
             | grep '^-' | grep -v '^---' || true)
           REMOVED_STRIPPED=$(echo "$REMOVED" | sed 's|//.*||' || true)
           if echo "$REMOVED_STRIPPED" | grep -qE '#\[(tokio::)?test\]'; then
-            # Check it wasn't just moved (also present in added lines)
+            # Check it wasn't just moved (also present in added lines across all files)
             REMOVED_TESTS=$(echo "$REMOVED_STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
-            ADDED_TESTS=$(echo "$STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
+            ADDED_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
             if [ "$REMOVED_TESTS" -gt "$ADDED_TESTS" ]; then
               ERRORS="$ERRORS
           ERROR: Test function(s) removed — tests must not be deleted (use #[ignore] with a tracking issue if broken)
           Removed $REMOVED_TESTS test(s), added $ADDED_TESTS test(s)"
+            fi
+          fi
+
+          # 5. fix: PRs must add at least one new test (check all Rust files, not just src/)
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          IS_FIX=$(echo "$PR_TITLE" | grep -ciE '^fix(\(.*\))?:' || true)
+          HAS_EXEMPT_LABEL=$(echo "${{ join(github.event.pull_request.labels.*.name, ',') }}" | grep -c 'test-exempt' || true)
+
+          if [ "$IS_FIX" -gt 0 ] && [ "$HAS_EXEMPT_LABEL" -eq 0 ]; then
+            NEW_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
+            if [ "$NEW_TESTS" -eq 0 ]; then
+              ERRORS="$ERRORS
+          ERROR: fix: PR must include at least one new regression test
+          Add a test that reproduces the bug (fails without fix, passes with fix).
+          If this fix genuinely cannot have a test, add the 'test-exempt' label with a justification comment."
             fi
           fi
 
