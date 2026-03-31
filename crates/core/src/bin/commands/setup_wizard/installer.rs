@@ -228,7 +228,7 @@ fn add_to_user_path(dir: &Path) -> Result<()> {
     let raw_val = env
         .get_raw_value("Path")
         .unwrap_or_else(|_| winreg::RegValue {
-            bytes: Vec::new(),
+            bytes: std::borrow::Cow::Owned(Vec::new()),
             vtype: REG_EXPAND_SZ,
         });
 
@@ -273,7 +273,7 @@ fn add_to_user_path(dir: &Path) -> Result<()> {
     env.set_raw_value(
         "Path",
         &winreg::RegValue {
-            bytes: new_bytes,
+            bytes: std::borrow::Cow::Owned(new_bytes),
             vtype: raw_val.vtype, // preserve original type
         },
     )?;
