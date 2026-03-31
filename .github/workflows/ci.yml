@@ -173,6 +173,21 @@ jobs:
             fi
           fi
 
+          # 5. fix: PRs must add at least one new test
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          IS_FIX=$(echo "$PR_TITLE" | grep -ciE '^fix(\(.*\))?:' || true)
+          HAS_EXEMPT_LABEL=$(echo "${{ join(github.event.pull_request.labels.*.name, ',') }}" | grep -c 'test-exempt' || true)
+
+          if [ "$IS_FIX" -gt 0 ] && [ "$HAS_EXEMPT_LABEL" -eq 0 ]; then
+            NEW_TESTS=$(echo "$STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
+            if [ "$NEW_TESTS" -eq 0 ]; then
+              ERRORS="$ERRORS
+          ERROR: fix: PR must include at least one new regression test
+          Add a test that reproduces the bug (fails without fix, passes with fix).
+          If this fix genuinely cannot have a test, add the 'test-exempt' label with a justification comment."
+            fi
+          fi
+
           if [ -n "$ERRORS" ]; then
             echo "::error::Rule lint failed — banned patterns found in new code"
             echo "$ERRORS"

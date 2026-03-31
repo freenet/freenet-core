@@ -25,6 +25,48 @@ Need fault injection?
   → YES: SimNetwork with FaultConfig
 ```
 
+## Test Coverage Requirements
+
+### Bug fixes (`fix:` PRs) MUST include regression tests
+
+```
+WHEN fixing a bug:
+  1. Write a test that REPRODUCES the bug BEFORE writing the fix
+  2. Verify the test FAILS without the fix
+  3. Apply the fix
+  4. Verify the test PASSES with the fix
+
+  The test must be specific enough that:
+  - It would catch this exact bug if reintroduced
+  - It documents the failure mode (name describes the scenario)
+  - Example: test_loss_pause_allows_packet_through, not test_loss_pause
+
+  CI will reject fix: PRs that don't add at least one new #[test] function.
+```
+
+### Edge cases and boundary conditions
+
+```
+WHEN writing tests for any behavioral change:
+  → Happy path is NECESSARY but NOT SUFFICIENT
+  → You MUST also test:
+
+  1. Boundary values (zero, one, max, overflow)
+  2. Error paths (what happens when it fails?)
+  3. Concurrent/racy scenarios (if async or multi-threaded)
+  4. Scale edge cases (empty collection, single element, at capacity)
+  5. State transitions (invalid states, repeated calls, out-of-order)
+
+  WRONG:
+    fn test_send_packet() { /* verify one packet sends */ }
+
+  CORRECT:
+    fn test_send_packet_at_cwnd_limit() { ... }
+    fn test_send_packet_during_loss_pause() { ... }
+    fn test_send_packet_zero_cwnd() { ... }
+    fn test_send_packet_after_recovery() { ... }
+```
+
 ## Trigger-Action Rules
 
 ### When writing new code in `crates/core/`

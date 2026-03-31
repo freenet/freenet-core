@@ -1,19 +1,23 @@
 name: Claude PR Rule Review
 
-# Advisory review: checks every PR against .claude/rules/ and posts findings
-# as a sticky comment. Non-blocking — does not gate merge.
+# Rule review: checks every PR against .claude/rules/ and posts findings
+# as a sticky comment. WARNING-level findings block merge via commit status.
 #
-# Critical patterns (banned APIs in crates/core/) are enforced by the
-# grep-based "Rule Lint" job in ci.yml, which hard-fails like clippy.
-# This AI review catches nuanced issues (missing jitter, fire-and-forget
-# spawns, etc.) that need human judgment.
+# Enforcement layers (defense-in-depth):
+# 1. Agent rules (.claude/rules/testing.md) — make agents write better code
+# 2. Rule Lint (ci.yml grep) — hard-fail on banned patterns + missing tests
+# 3. This review — AI catches nuanced issues, WARNINGs block merge
+# 4. Human review — final backstop
+#
+# To bypass: add 'review-override' label (requires maintainer, logged).
 #
 # Triggers:
 # - pull_request_target: runs for all PRs (including forks) with base-repo
 #   secrets available. Safe because we only read the diff — we never execute
 #   fork code (no cargo build/test on the PR head).
 # - labeled: re-run when a maintainer adds the 'claude-review' label, useful
-#   for fork PRs where the initial run may have been skipped.
+#   for fork PRs where the initial run may have been skipped. Also re-run
+#   when 'review-override' is added to update the commit status.
 #
 # Complements (does not replace):
 # - ci.yml: cargo fmt, clippy, tests, conventional commits, rule lint
@@ -51,13 +55,14 @@ jobs:
         !github.event.pull_request.draft &&
         !startsWith(github.event.pull_request.head.ref, 'release/v') &&
         !startsWith(github.event.pull_request.head.ref, 'dependabot/') &&
-        (github.event.action != 'labeled' || github.event.label.name == 'claude-review')
+        (github.event.action != 'labeled' || github.event.label.name == 'claude-review' || github.event.label.name == 'review-override')
       )
 
     permissions:
       contents: read
       pull-requests: write
       issues: write
+      statuses: write
 
     steps:
       - name: Checkout repository
@@ -70,8 +75,33 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
+      - name: Check review-override label
+        id: override
+        run: |
+          LABELS="${{ join(github.event.pull_request.labels.*.name, ',') }}"
+          if echo "$LABELS" | grep -q 'review-override'; then
+            echo "overridden=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "overridden=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set status to success if overridden
+        if: steps.override.outputs.overridden == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ github.event.pull_request.head.sha }}',
+              state: 'success',
+              context: 'rule-review/warnings',
+              description: 'Overridden by review-override label',
+              target_url: '${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+            });
+
       - name: Determine applicable rules
-        if: github.event_name != 'merge_group'
+        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true'
         id: rules
         run: |
           # Get changed files relative to the PR base
@@ -172,7 +202,7 @@ jobs:
 
       - name: Claude rule review
         id: review
-        if: github.event_name != 'merge_group' && steps.rules.outputs.skip != 'true'
+        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip != 'true'
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
@@ -211,7 +241,7 @@ jobs:
 
             ## Severity Levels
 
-            **WARNING** — Issues that should be addressed:
+            **WARNING** — Issues that BLOCK merge (must fix or get review-override label):
             - `.unwrap()` in new production code (not tests)
             - Fire-and-forget spawns without BackgroundTaskMonitor
             - Retry loops without jitter
@@ -219,6 +249,13 @@ jobs:
             - Cleanup exemptions without TTL or age threshold
             - Unguarded `biased;` in tokio::select!
             - Network send before `op_manager.push()` (push-before-send violation)
+            - **Missing edge-case tests**: if tests only cover the happy path and obvious
+              boundary conditions are untested (zero, overflow, error paths, concurrent
+              scenarios), flag as WARNING
+            - **fix: PR without regression test**: if a fix: PR doesn't include a test
+              that would catch the specific bug being fixed, flag as WARNING
+            - **Stale documentation**: if code changes invalidate existing docs/rules
+              in .claude/rules/ or AGENTS.md, flag as WARNING
 
             **INFO** — Style suggestions and minor improvements:
             - Missing doc comments on new public APIs
@@ -250,8 +287,8 @@ jobs:
 
             No rule violations detected.
 
-      - name: Post review comment
-        if: github.event_name != 'merge_group' && steps.rules.outputs.skip != 'true'
+      - name: Post review comment and set commit status
+        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip != 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -290,6 +327,16 @@ jobs:
                   body: warningBody,
                 });
               }
+              // Don't block merge because the review tool broke — set success
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: '${{ github.event.pull_request.head.sha }}',
+                state: 'success',
+                context: 'rule-review/warnings',
+                description: 'Review failed to run — not blocking merge',
+                target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+              });
               core.warning('Claude rule review failed — warning comment posted on PR');
               return;
             }
@@ -320,10 +367,28 @@ jobs:
 
             if (!report || report.trim().length === 0) {
               console.log('No report content found');
+              // Set success so we don't block merge
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: '${{ github.event.pull_request.head.sha }}',
+                state: 'success',
+                context: 'rule-review/warnings',
+                description: 'No report content — not blocking merge',
+              });
               return;
             }
 
-            const body = report + '\n\n---\n*Advisory review against `.claude/rules/`. Critical patterns are enforced by the Rule Lint CI job.*';
+            // Count WARNING-level findings to determine commit status
+            const warningCount = (report.match(/^-\s+`[^`]+`\s+—/gm) || []).length;
+            const hasWarningSection = /####\s+Warning/i.test(report);
+            const noIssues = /no\s+(issues?|rule\s+violations?)\s+(found|detected)/i.test(report);
+            const hasWarnings = hasWarningSection && warningCount > 0 && !noIssues;
+
+            const statusSuffix = hasWarnings
+              ? ` ⚠️ ${warningCount} warning(s) — fix or add \`review-override\` label`
+              : '';
+            const body = report + '\n\n---\n*Rule review against `.claude/rules/`. WARNING findings block merge.' + statusSuffix + '*';
 
             // Find and update existing sticky comment, or create new one
             const { data: comments } = await github.rest.issues.listComments({
@@ -353,3 +418,34 @@ jobs:
               });
               console.log('Created new review comment');
             }
+
+            // Set commit status based on warnings
+            const state = hasWarnings ? 'failure' : 'success';
+            const description = hasWarnings
+              ? `${warningCount} warning(s) found — fix or add review-override label`
+              : 'No warnings found';
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ github.event.pull_request.head.sha }}',
+              state,
+              context: 'rule-review/warnings',
+              description,
+              target_url: `${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}`
+            });
+            console.log(`Set commit status: ${state} (${description})`);
+
+      - name: Set status to success if skipped
+        if: steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ github.event.pull_request.head.sha }}',
+              state: 'success',
+              context: 'rule-review/warnings',
+              description: 'No relevant files changed',
+            });
