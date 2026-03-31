@@ -491,7 +491,7 @@ fn verify_checksum(file_path: &Path, expected_hash: &str) -> Result<()> {
     let result = hasher.finalize();
     let actual_hash = result.iter().fold(String::with_capacity(64), |mut s, b| {
         use std::fmt::Write;
-        write!(s, "{:02x}", b).unwrap();
+        write!(s, "{:02x}", b).expect("writing to String is infallible");
         s
     });
 
