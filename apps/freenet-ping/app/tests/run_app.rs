@@ -155,7 +155,7 @@ async fn collect_node_diagnostics(
                             if let Some(metrics) = &response.system_metrics {
                                 println!("Network metrics:");
                                 println!("  - Active connections: {}", metrics.active_connections);
-                                println!("  - Hosting contracts: {}", metrics.seeding_contracts);
+                                println!("  - Hosting contracts: {}", metrics.hosting_contracts);
                             }
 
                             println!("--- END {} DIAGNOSTICS ---", node_name.to_uppercase());
@@ -346,7 +346,7 @@ async fn test_node_diagnostics_query() -> anyhow::Result<()> {
 
                 if let Some(metrics) = &response.system_metrics {
                     println!("  - Active connections: {}", metrics.active_connections);
-                    println!("  - Hosting contracts: {}", metrics.seeding_contracts);
+                    println!("  - Hosting contracts: {}", metrics.hosting_contracts);
                 } else {
                     return Err(anyhow!("Gateway diagnostics missing system_metrics"));
                 }
@@ -401,7 +401,7 @@ async fn test_node_diagnostics_query() -> anyhow::Result<()> {
 
                 if let Some(metrics) = &response.system_metrics {
                     println!("  - Active connections: {}", metrics.active_connections);
-                    println!("  - Hosting contracts: {}", metrics.seeding_contracts);
+                    println!("  - Hosting contracts: {}", metrics.hosting_contracts);
                     println!("  - System metrics collection working");
                 }
             }

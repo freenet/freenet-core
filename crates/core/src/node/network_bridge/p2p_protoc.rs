@@ -1982,7 +1982,7 @@ impl P2pConnManager {
                                     );
                                     response.system_metrics = Some(SystemMetrics {
                                         active_connections: connected_peer_ids.len() as u32,
-                                        seeding_contracts: hosting_contracts,
+                                        hosting_contracts,
                                     });
                                 }
 
