@@ -42,7 +42,6 @@ fn homepage_html() -> String {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="5">
     <title>Freenet — Local Peer</title>
     <link rel="icon" type="image/svg+xml" href="{favicon}">
     <style>{CSS}</style>
@@ -1209,6 +1208,32 @@ document.addEventListener('DOMContentLoaded', function() {
     if (icon && document.documentElement.getAttribute('data-theme') === 'light') {
         icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
     }
+
+    /* Auto-refresh: fetch the page and swap dynamic content without a full reload.
+       Uses setTimeout chaining (not setInterval) so slow responses don't overlap. */
+    function scheduleRefresh() {
+        setTimeout(function() {
+            fetch(window.location.href).then(function(r) { return r.text(); }).then(function(html) {
+                var parser = new DOMParser();
+                var doc = parser.parseFromString(html, 'text/html');
+                var newMain = doc.querySelector('main');
+                var oldMain = document.querySelector('main');
+                if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
+                /* Update header elements (outside <main>) */
+                var newUp = doc.querySelector('.uptime');
+                var oldUp = document.querySelector('.uptime');
+                if (newUp && oldUp) oldUp.textContent = newUp.textContent;
+                var newBadge = doc.querySelector('.badge');
+                var oldBadge = document.querySelector('.badge');
+                if (newBadge && oldBadge) oldBadge.textContent = newBadge.textContent;
+                var newIcon = doc.querySelector('link[rel="icon"]');
+                var oldIcon = document.querySelector('link[rel="icon"]');
+                if (newIcon && oldIcon) oldIcon.setAttribute('href', newIcon.getAttribute('href'));
+            }).catch(function(e) { console.warn('Dashboard refresh failed:', e); })
+              .finally(scheduleRefresh);
+        }, 5000);
+    }
+    scheduleRefresh();
 });
 "##;
 
@@ -1449,7 +1474,6 @@ fn peer_detail_html(address_str: &str) -> String {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="5">
     <title>Peer {addr} — Freenet</title>
     <style>{CSS}{PEER_CSS}</style>
     <script>{JS}</script>
@@ -2190,5 +2214,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn no_meta_refresh_in_homepage() {
+        let html = homepage_html();
+        assert!(
+            !html.contains("http-equiv=\"refresh\""),
+            "meta refresh must not be present — JS partial update is used instead"
+        );
+    }
+
+    #[test]
+    fn no_meta_refresh_in_peer_detail() {
+        let html = peer_detail_html("127.0.0.1:31337");
+        assert!(
+            !html.contains("http-equiv=\"refresh\""),
+            "meta refresh must not be present — JS partial update is used instead"
+        );
+    }
+
+    #[test]
+    fn js_contains_auto_refresh() {
+        assert!(
+            JS.contains("scheduleRefresh"),
+            "JS constant must contain the auto-refresh scheduler"
+        );
     }
 }
