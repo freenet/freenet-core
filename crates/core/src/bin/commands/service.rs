@@ -467,9 +467,26 @@ const NETWORK_PROBE_ADDR: &str = "freenet.org:443";
 /// with no connectivity — gateway fetches fail, CONNECT handshakes timeout,
 /// and the node gets stuck with zombie transient connections. See #3716.
 ///
-/// Returns `true` if network is ready, `false` if timed out (we still try
-/// to start the node in that case — it has its own retry logic).
-fn wait_for_network_ready(log_dir: &Path) -> bool {
+/// Returns `true` if network is ready or timed out (we start the node
+/// either way). Returns `false` if the user requested Quit via the tray
+/// during the wait.
+///
+/// We probe our own domain because if it's unreachable, the gateway fetch
+/// will also fail — there's no point starting the node before we can reach
+/// the gateway index.
+///
+/// Note: On platforms with tray support, Quit actions are handled during
+/// the wait. Other tray actions (Start, ViewLogs, etc.) are deferred until
+/// the wrapper loop starts.
+fn wait_for_network_ready(
+    log_dir: &Path,
+    #[cfg(any(target_os = "windows", target_os = "macos"))] action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+) -> bool {
     use std::net::ToSocketAddrs;
 
     // Quick check — if DNS works immediately, skip the wait
@@ -489,6 +506,15 @@ fn wait_for_network_ready(log_dir: &Path) -> bool {
         std::thread::sleep(std::time::Duration::from_secs(
             NETWORK_READINESS_CHECK_INTERVAL_SECS,
         ));
+
+        // Allow the user to quit via the tray during the network wait
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some(rx) = action_rx {
+            if let Ok(super::tray::TrayAction::Quit) = rx.try_recv() {
+                return false;
+            }
+        }
+
         if NETWORK_PROBE_ADDR.to_socket_addrs().is_ok() {
             log_wrapper_event(log_dir, "Network is ready");
             return true;
@@ -499,7 +525,7 @@ fn wait_for_network_ready(log_dir: &Path) -> bool {
         log_dir,
         "Network readiness timeout — starting node anyway (it will retry internally)",
     );
-    false
+    true
 }
 
 /// The core wrapper loop. Spawns `freenet network`, handles exit codes,
@@ -525,7 +551,12 @@ fn run_wrapper_loop(
     // On first launch, wait for network connectivity before spawning the node.
     // This prevents the node from starting in a degraded state when the wrapper
     // is auto-started at login before the network stack is ready (see #3716).
-    wait_for_network_ready(log_dir);
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    if !wait_for_network_ready(log_dir, tray.map(|(rx, _)| rx)) {
+        return Ok(()); // User requested Quit during network wait
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    wait_for_network_ready(log_dir, None);
 
     loop {
         // Notify tray that we're starting
@@ -835,6 +866,10 @@ fn run_wrapper_loop(
                         // fall through to relaunch
                     }
                     BackoffInterrupt::CheckUpdate => {
+                        // The update logic is platform-gated (tray only on
+                        // Windows/macOS). On Linux this arm is unreachable
+                        // (action_rx is None), but we still reset failures
+                        // and relaunch unconditionally for consistency.
                         log_wrapper_event(log_dir, "Update check requested during backoff");
                         #[cfg(any(target_os = "windows", target_os = "macos"))]
                         if let Some((_, status_tx)) = tray {
