@@ -1140,12 +1140,19 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
     } else {
         match ProjectDirs::from("", "The Freenet Project Inc", "Freenet") {
             Some(ref dirs) => {
-                let data_dir = dirs.data_dir();
+                // Use data_local_dir (Local AppData on Windows) to match where
+                // the node actually stores data since #3739.
+                let data_dir = dirs.data_local_dir();
                 remove_if_exists("data", data_dir)?;
 
+                // Also clean up old Roaming path from before #3739
+                let old_roaming = dirs.data_dir();
+                if old_roaming != data_dir {
+                    remove_if_exists("data (legacy roaming)", old_roaming)?;
+                }
+
                 let config_dir = dirs.config_dir();
-                // On macOS, config_dir == data_dir; skip if already removed
-                if config_dir != data_dir {
+                if config_dir != data_dir && config_dir != old_roaming {
                     remove_if_exists("config", config_dir)?;
                 }
 

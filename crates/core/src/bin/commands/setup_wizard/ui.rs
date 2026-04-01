@@ -59,8 +59,13 @@ mod platform {
             window.set_outer_position(tao::dpi::PhysicalPosition::new(x, y));
         }
 
+        // Use a temp directory for WebView2 user data instead of the default
+        // (which creates <exe_name>.WebView2/ next to the executable). See #3740.
+        let webview2_data_dir = std::env::temp_dir().join("freenet-setup-webview2");
+        let mut web_context = wry::WebContext::new(Some(webview2_data_dir.clone()));
+
         let ipc_proxy = proxy.clone();
-        let webview = WebViewBuilder::new()
+        let webview = WebViewBuilder::new_with_web_context(&mut web_context)
             .with_html(SETUP_HTML)
             .with_ipc_handler(move |msg| {
                 let _ = ipc_proxy.send_event(UiEvent::Action(msg.body().to_string()));
@@ -160,6 +165,11 @@ mod platform {
                 _ => {}
             }
         });
+
+        // Drop the webview so WebView2 releases file locks on the data dir
+        drop(webview);
+        // Clean up the temporary WebView2 data directory
+        let _ = std::fs::remove_dir_all(&webview2_data_dir);
 
         Ok(result)
     }
