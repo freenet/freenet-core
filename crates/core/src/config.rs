@@ -445,7 +445,18 @@ impl ConfigArgs {
                 remotely_loaded_gateways
             }
         } else {
-            // When skip_load_from_network is set for a regular peer, use local gateways file
+            // Either skip_load_from_network is set (use local file only), or the
+            // remote fetch failed and we need to fall back to the local cache.
+            let remote_fetch_failed = !self.network_api.skip_load_from_network
+                && remotely_loaded_gateways.gateways.is_empty();
+
+            if remote_fetch_failed {
+                tracing::warn!(
+                    file = ?gateways_file,
+                    "Remote gateway fetch failed, falling back to local cache"
+                );
+            }
+
             let mut gateways = match File::open(&*gateways_file) {
                 Ok(mut file) => {
                     let mut content = String::new();
@@ -460,15 +471,24 @@ impl ConfigArgs {
                         && remotely_loaded_gateways.gateways.is_empty()
                         && !has_cli_gateways
                     {
+                        let hint = if remote_fetch_failed {
+                            "Cannot initialize node without gateways. \
+                             The remote gateway index could not be reached and no \
+                             local cache exists yet. Check your network connection \
+                             and firewall settings, then try again."
+                        } else {
+                            "Cannot initialize node without gateways"
+                        };
                         tracing::error!(
                             file = ?gateways_file,
                             error = %err,
-                            "Failed to read gateways file"
+                            remote_fetch_failed,
+                            "{hint}"
                         );
 
                         return Err(anyhow::Error::new(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
-                            "Cannot initialize node without gateways",
+                            hint,
                         )));
                     }
                     if remotely_loaded_gateways.gateways.is_empty() {
@@ -478,8 +498,6 @@ impl ConfigArgs {
                 }
             };
 
-            // If we have remotely loaded gateways but skip_load_from_network was not set,
-            // it means the remote fetch failed but we got default/inline gateways
             if !remotely_loaded_gateways.gateways.is_empty() {
                 gateways.merge_and_deduplicate(remotely_loaded_gateways);
             }
@@ -2437,7 +2455,21 @@ pub fn set_logger(
 }
 
 async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Result<Gateways> {
-    let response = reqwest::get(url).await?.error_for_status()?.text().await?;
+    // Use an explicit timeout so the node doesn't hang indefinitely when the
+    // network is unavailable (e.g., immediately after a Windows restart before
+    // the network stack is ready). See #3716, #3717.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     let mut gateways: Gateways = toml::from_str(&response)?;
     let mut base_url = reqwest::Url::parse(url)?;
     base_url.set_path("");
@@ -2446,7 +2478,11 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
     for gateway in &mut gateways.gateways {
         gateway.location = None; // always ignore any location from files if set, it should be derived from IP
         let public_key_url = base_url.join(&gateway.public_key_path.to_string_lossy())?;
-        let public_key_response = reqwest::get(public_key_url).await?.error_for_status()?;
+        let public_key_response = client
+            .get(public_key_url)
+            .send()
+            .await?
+            .error_for_status()?;
         let file_name = gateway
             .public_key_path
             .file_name()
