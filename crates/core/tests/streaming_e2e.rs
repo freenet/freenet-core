@@ -657,6 +657,95 @@ fn test_streaming_get_through_relay() {
     );
 }
 
+/// Regression test: 1MB streaming GET with packet loss.
+///
+/// This is the test that was missing and would have caught the loss_pause margin
+/// bug in v0.2.22. The existing tests covered:
+/// - 100KB streaming with 5% loss (too small for stall to manifest)
+/// - 1MB streaming GET without loss (no loss_pause triggered)
+///
+/// This test combines both: a 1MB transfer that triggers streaming, with 5%
+/// packet loss that triggers loss_pause recovery. With the old 2-packet margin,
+/// this test would timeout because the sender stalls for 20s per loss event.
+/// With the 50-packet margin, recovery completes quickly.
+#[test]
+fn test_streaming_get_1mb_with_packet_loss() {
+    use freenet::simulation::FaultConfig;
+
+    const SEED: u64 = 0xDE1A_000A_DEAD_BEEF;
+    const NETWORK_NAME: &str = "streaming-get-lossy-1mb";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 1024 * 1024; // 1MB — similar to River UI contract
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 4, SEED, THRESHOLD));
+
+    // 5% message loss — enough to trigger loss_pause during the ~833-packet transfer
+    let fault_config = FaultConfig::builder().message_loss_rate(0.05).build();
+    sim.with_fault_injection(fault_config);
+
+    let contract = SimOperation::create_test_contract(0xDF);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0xDF);
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+
+    let operations = vec![
+        // Gateway PUTs 1MB contract
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: large_state.clone(),
+                subscribe: false,
+            },
+        ),
+        // A different node GETs the contract — must relay through network
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300), // Generous timeout for lossy 1MB transfer
+        Duration::from_secs(120),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "1MB streaming GET with 5% packet loss should complete without stalling: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The GET-requesting node should have the correct 1MB state
+    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
+    let node3_storage = result
+        .node_storages
+        .get(&node3_label)
+        .expect("node 3 should have a storage handle");
+    let node3_state = node3_storage.get_stored_state(&contract_key);
+
+    assert!(
+        node3_state.is_some(),
+        "Node 3 should have 1MB contract state after streaming GET with packet loss"
+    );
+    let stored_bytes: Vec<u8> = node3_state.unwrap().as_ref().to_vec();
+    assert_eq!(
+        stored_bytes, large_state,
+        "Stored state bytes should match the original 1MB state despite packet loss"
+    );
+}
+
 /// Regression test for #3704: streaming GET path must trigger auto-subscribe
 /// and hosting announcement so that subsequent GETs are served from local cache.
 ///
