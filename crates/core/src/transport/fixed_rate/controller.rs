@@ -44,6 +44,12 @@ pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 1_250_000;
 /// cwnd timeouts/hour on the gateway, causing GET failures for users.
 const LOSS_PAUSE_MARGIN: usize = 50 * MAX_PACKET_SIZE;
 
+// Guard against future regressions to a dangerously small margin.
+const _: () = assert!(
+    LOSS_PAUSE_MARGIN >= 10 * MAX_PACKET_SIZE,
+    "LOSS_PAUSE_MARGIN must allow enough packets for reliable recovery under loss"
+);
+
 /// Configuration for the fixed-rate controller.
 #[derive(Debug, Clone)]
 pub struct FixedRateConfig {
@@ -168,10 +174,11 @@ impl<T: TimeSource> FixedRateController<T> {
     /// Normally returns a very large value so cwnd never blocks (all rate
     /// limiting is done by the token bucket). When loss_pause is active,
     /// returns the flightsize captured at loss time + LOSS_PAUSE_MARGIN.
-    /// The captured value is fixed — it doesn't grow as new packets are
-    /// sent — so loss_pause genuinely restricts new data to at most
-    /// LOSS_PAUSE_MARGIN bytes beyond what was in flight at loss time.
-    /// The margin prevents a complete freeze (the original bug, #3702).
+    /// The captured value is frozen per loss event, but note that successive
+    /// retransmission timeouts will re-capture at the current (higher)
+    /// flightsize, effectively sliding the cap upward. This is acceptable
+    /// because the token bucket is the real rate limiter for FixedRate;
+    /// loss_pause primarily prevents complete stalls, not rate reduction.
     pub fn current_cwnd(&self) -> usize {
         let paused_at = self.loss_pause_cwnd.load(Ordering::Acquire);
         if paused_at > 0 {
