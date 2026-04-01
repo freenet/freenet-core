@@ -1517,25 +1517,30 @@ impl ConfigPathsArgs {
         // If the old path has data and the new path doesn't, move it.
         #[cfg(target_os = "windows")]
         if self.data_dir.is_none() && id.is_none() {
-            if let Ok(dirs) = Self::default_dirs(None) {
-                if let either::Either::Left(ref proj) = dirs {
-                    let old_roaming = proj.data_dir().to_path_buf();
-                    if old_roaming != app_data_dir
-                        && old_roaming.join("contracts").exists()
-                        && !app_data_dir.join("contracts").exists()
-                    {
-                        tracing::info!(
-                            old = ?old_roaming,
-                            new = ?app_data_dir,
-                            "Migrating data from Roaming to Local AppData"
+            if let Ok(Either::Left(ref proj)) = Self::default_dirs(None) {
+                let old_roaming = proj.data_dir().to_path_buf();
+                if old_roaming != app_data_dir
+                    && old_roaming.join("contracts").exists()
+                    && !app_data_dir.join("contracts").exists()
+                {
+                    tracing::info!(
+                        old = ?old_roaming,
+                        new = ?app_data_dir,
+                        "Migrating data from Roaming to Local AppData"
+                    );
+                    // Ensure the parent directory exists before rename.
+                    // On a fresh Local AppData install, the intermediate dirs
+                    // (e.g., "The Freenet Project Inc/Freenet") won't exist yet.
+                    if let Some(parent) = app_data_dir.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = fs::rename(&old_roaming, &app_data_dir) {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to migrate data directory; starting fresh"
                         );
-                        if let Err(e) = fs::rename(&old_roaming, &app_data_dir) {
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to migrate data directory, copying instead"
-                            );
-                            // rename fails across drives; fall through to fresh start
-                        }
+                        // rename can fail across drives; a fresh start is fine
+                        // since the node will re-fetch contracts from the network.
                     }
                 }
             }

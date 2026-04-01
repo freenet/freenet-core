@@ -1151,6 +1151,8 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
                     remove_if_exists("data (legacy roaming)", old_roaming)?;
                 }
 
+                // Skip config_dir if it overlaps with either data path
+                // (e.g., on macOS config_dir == data_dir)
                 let config_dir = dirs.config_dir();
                 if config_dir != data_dir && config_dir != old_roaming {
                     remove_if_exists("config", config_dir)?;
