@@ -487,15 +487,36 @@ fn wait_for_network_ready(
         &std::sync::mpsc::Receiver<super::tray::TrayAction>,
     >,
 ) -> bool {
+    wait_for_network_ready_inner(
+        log_dir,
+        NETWORK_PROBE_ADDR,
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        action_rx,
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        _action_rx,
+    )
+}
+
+/// Inner implementation with configurable probe address for testing.
+fn wait_for_network_ready_inner(
+    log_dir: &Path,
+    probe_addr: &str,
+    #[cfg(any(target_os = "windows", target_os = "macos"))] action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+) -> bool {
     use std::net::ToSocketAddrs;
 
     // Note: `to_socket_addrs()` is a blocking OS resolver call that can take
-    // 15-30s on Windows when the network is down. The deadline check between
+    // 15-30s on Windows when the network is down. The iteration count between
     // calls means the total wait may exceed NETWORK_READINESS_TIMEOUT_SECS
     // in pathological cases. This is acceptable for a pre-startup wait.
 
     // Quick check — if DNS works immediately, skip the wait
-    if NETWORK_PROBE_ADDR.to_socket_addrs().is_ok() {
+    if probe_addr.to_socket_addrs().is_ok() {
         return true;
     }
 
@@ -507,9 +528,8 @@ fn wait_for_network_ready(
     let max_checks = NETWORK_READINESS_TIMEOUT_SECS / NETWORK_READINESS_CHECK_INTERVAL_SECS;
 
     for _ in 0..max_checks {
-        std::thread::sleep(std::time::Duration::from_secs(
-            NETWORK_READINESS_CHECK_INTERVAL_SECS,
-        ));
+        let jittered = jitter_secs(NETWORK_READINESS_CHECK_INTERVAL_SECS);
+        std::thread::sleep(std::time::Duration::from_secs(jittered.max(1)));
 
         // Allow the user to quit via the tray during the network wait
         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -519,7 +539,7 @@ fn wait_for_network_ready(
             }
         }
 
-        if NETWORK_PROBE_ADDR.to_socket_addrs().is_ok() {
+        if probe_addr.to_socket_addrs().is_ok() {
             log_wrapper_event(log_dir, "Network is ready");
             return true;
         }
@@ -2679,9 +2699,9 @@ mod tests {
     }
 
     /// Regression test for #3716: `wait_for_network_ready` must be
-    /// interruptible by a Quit action from the tray. Pre-loading Quit into
-    /// the channel before calling the function verifies it checks the channel
-    /// during the wait loop and returns `false` (= user wants to quit).
+    /// interruptible by a Quit action from the tray. Uses a non-resolvable
+    /// probe address to force entry into the retry loop, then verifies the
+    /// Quit action is consumed and returns `false`.
     #[test]
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn test_network_ready_quit_during_wait() {
@@ -2692,16 +2712,14 @@ mod tests {
         // Pre-load Quit so it's found on the first channel check
         tx.send(super::super::tray::TrayAction::Quit).unwrap();
 
-        // DNS will likely succeed immediately in CI (network is available),
-        // so this tests the quick-return path. To exercise the Quit path,
-        // we'd need DNS to fail — but the function structure guarantees the
-        // Quit check runs after each sleep in the retry loop. The important
-        // thing is that the function accepts and uses the action_rx parameter.
-        let result = wait_for_network_ready(tmp.path(), Some(&rx));
-        // If DNS resolved immediately, result is true (network ready).
-        // If DNS failed and Quit was consumed, result is false.
-        // Either way, the function returned without hanging — that's the fix.
-        let _ = result;
+        // Use a non-resolvable address to force the retry loop.
+        // The function should find the Quit action after the first sleep
+        // and return false without waiting for the full timeout.
+        let result = wait_for_network_ready_inner(tmp.path(), "nonexistent.invalid:1", Some(&rx));
+        assert!(
+            !result,
+            "Should return false when Quit is received during wait"
+        );
     }
 
     #[test]
