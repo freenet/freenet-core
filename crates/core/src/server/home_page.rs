@@ -2215,4 +2215,30 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn no_meta_refresh_in_homepage() {
+        let html = homepage_html();
+        assert!(
+            !html.contains("http-equiv=\"refresh\""),
+            "meta refresh must not be present — JS partial update is used instead"
+        );
+    }
+
+    #[test]
+    fn no_meta_refresh_in_peer_detail() {
+        let html = peer_detail_html("127.0.0.1:31337");
+        assert!(
+            !html.contains("http-equiv=\"refresh\""),
+            "meta refresh must not be present — JS partial update is used instead"
+        );
+    }
+
+    #[test]
+    fn js_contains_auto_refresh() {
+        assert!(
+            JS.contains("scheduleRefresh"),
+            "JS constant must contain the auto-refresh scheduler"
+        );
+    }
 }
