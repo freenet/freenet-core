@@ -1498,6 +1498,9 @@ impl ConfigPathsArgs {
     }
 
     pub fn build(self, id: Option<&str>) -> std::io::Result<ConfigPaths> {
+        // Used by the Windows migration block below; suppress warning on other platforms.
+        #[allow(unused_variables)]
+        let has_custom_data_dir = self.data_dir.is_some();
         let app_data_dir = self
             .data_dir
             .map(Ok::<_, std::io::Error>)
@@ -1506,8 +1509,46 @@ impl ConfigPathsArgs {
                 let Either::Left(defaults) = default_dirs else {
                     unreachable!("default_dirs should return Left if data_dir is None and id is not set for temp dir")
                 };
-                Ok(defaults.data_dir().to_path_buf())
+                // Use data_local_dir (Local AppData on Windows) instead of
+                // data_dir (Roaming AppData). Roaming syncs across domain-joined
+                // machines and is not appropriate for node data (contracts, DB).
+                // See #3739.
+                Ok(defaults.data_local_dir().to_path_buf())
             })?;
+        // Migrate data from old Roaming path to new Local path on Windows.
+        // Before #3739, data was stored in %APPDATA% (Roaming) by mistake.
+        // If the old path has data and the new path doesn't, move it.
+        #[cfg(target_os = "windows")]
+        if !has_custom_data_dir && id.is_none() {
+            if let Ok(Either::Left(ref proj)) = Self::default_dirs(None) {
+                let old_roaming = proj.data_dir().to_path_buf();
+                if old_roaming != app_data_dir
+                    && old_roaming.join("contracts").exists()
+                    && !app_data_dir.join("contracts").exists()
+                {
+                    tracing::info!(
+                        old = ?old_roaming,
+                        new = ?app_data_dir,
+                        "Migrating data from Roaming to Local AppData"
+                    );
+                    // Ensure the parent directory exists before rename.
+                    // On a fresh Local AppData install, the intermediate dirs
+                    // (e.g., "The Freenet Project Inc/Freenet") won't exist yet.
+                    if let Some(parent) = app_data_dir.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = fs::rename(&old_roaming, &app_data_dir) {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to migrate data directory; starting fresh"
+                        );
+                        // rename can fail across drives; a fresh start is fine
+                        // since the node will re-fetch contracts from the network.
+                    }
+                }
+            }
+        }
+
         let contracts_dir = app_data_dir.join("contracts");
         let delegates_dir = app_data_dir.join("delegates");
         let secrets_dir = app_data_dir.join("secrets");
