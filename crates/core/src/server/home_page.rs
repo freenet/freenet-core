@@ -42,7 +42,6 @@ fn homepage_html() -> String {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="5">
     <title>Freenet — Local Peer</title>
     <link rel="icon" type="image/svg+xml" href="{favicon}">
     <style>{CSS}</style>
@@ -1209,6 +1208,29 @@ document.addEventListener('DOMContentLoaded', function() {
     if (icon && document.documentElement.getAttribute('data-theme') === 'light') {
         icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
     }
+
+    /* Auto-refresh: fetch the page and swap dynamic content without a full reload */
+    setInterval(function() {
+        fetch(window.location.href).then(function(r) { return r.text(); }).then(function(html) {
+            var parser = new DOMParser();
+            var doc = parser.parseFromString(html, 'text/html');
+            var newMain = doc.querySelector('main');
+            var oldMain = document.querySelector('main');
+            if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
+            /* Update uptime */
+            var newUp = doc.querySelector('.uptime');
+            var oldUp = document.querySelector('.uptime');
+            if (newUp && oldUp) oldUp.textContent = newUp.textContent;
+            /* Update version badge */
+            var newBadge = doc.querySelector('.badge');
+            var oldBadge = document.querySelector('.badge');
+            if (newBadge && oldBadge) oldBadge.textContent = newBadge.textContent;
+            /* Update favicon */
+            var newIcon = doc.querySelector('link[rel="icon"]');
+            var oldIcon = document.querySelector('link[rel="icon"]');
+            if (newIcon && oldIcon) oldIcon.setAttribute('href', newIcon.getAttribute('href'));
+        }).catch(function() { /* network error — skip this cycle */ });
+    }, 5000);
 });
 "##;
 
@@ -1449,7 +1471,6 @@ fn peer_detail_html(address_str: &str) -> String {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="5">
     <title>Peer {addr} — Freenet</title>
     <style>{CSS}{PEER_CSS}</style>
     <script>{JS}</script>
