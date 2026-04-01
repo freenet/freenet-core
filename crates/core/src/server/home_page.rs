@@ -1209,28 +1209,31 @@ document.addEventListener('DOMContentLoaded', function() {
         icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
     }
 
-    /* Auto-refresh: fetch the page and swap dynamic content without a full reload */
-    setInterval(function() {
-        fetch(window.location.href).then(function(r) { return r.text(); }).then(function(html) {
-            var parser = new DOMParser();
-            var doc = parser.parseFromString(html, 'text/html');
-            var newMain = doc.querySelector('main');
-            var oldMain = document.querySelector('main');
-            if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
-            /* Update uptime */
-            var newUp = doc.querySelector('.uptime');
-            var oldUp = document.querySelector('.uptime');
-            if (newUp && oldUp) oldUp.textContent = newUp.textContent;
-            /* Update version badge */
-            var newBadge = doc.querySelector('.badge');
-            var oldBadge = document.querySelector('.badge');
-            if (newBadge && oldBadge) oldBadge.textContent = newBadge.textContent;
-            /* Update favicon */
-            var newIcon = doc.querySelector('link[rel="icon"]');
-            var oldIcon = document.querySelector('link[rel="icon"]');
-            if (newIcon && oldIcon) oldIcon.setAttribute('href', newIcon.getAttribute('href'));
-        }).catch(function() { /* network error — skip this cycle */ });
-    }, 5000);
+    /* Auto-refresh: fetch the page and swap dynamic content without a full reload.
+       Uses setTimeout chaining (not setInterval) so slow responses don't overlap. */
+    function scheduleRefresh() {
+        setTimeout(function() {
+            fetch(window.location.href).then(function(r) { return r.text(); }).then(function(html) {
+                var parser = new DOMParser();
+                var doc = parser.parseFromString(html, 'text/html');
+                var newMain = doc.querySelector('main');
+                var oldMain = document.querySelector('main');
+                if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
+                /* Update header elements (outside <main>) */
+                var newUp = doc.querySelector('.uptime');
+                var oldUp = document.querySelector('.uptime');
+                if (newUp && oldUp) oldUp.textContent = newUp.textContent;
+                var newBadge = doc.querySelector('.badge');
+                var oldBadge = document.querySelector('.badge');
+                if (newBadge && oldBadge) oldBadge.textContent = newBadge.textContent;
+                var newIcon = doc.querySelector('link[rel="icon"]');
+                var oldIcon = document.querySelector('link[rel="icon"]');
+                if (newIcon && oldIcon) oldIcon.setAttribute('href', newIcon.getAttribute('href'));
+            }).catch(function(e) { console.warn('Dashboard refresh failed:', e); })
+              .finally(scheduleRefresh);
+        }, 5000);
+    }
+    scheduleRefresh();
 });
 "##;
 
