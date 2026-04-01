@@ -26,17 +26,23 @@ pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 1_250_000;
 /// Margin added to cwnd during loss_pause recovery.
 ///
 /// When loss_pause is active, cwnd = flightsize + this margin. The margin
-/// allows a small trickle of new packets during recovery so the connection
-/// doesn't completely stall waiting for ACKs. Set to 2 max-size packets
-/// to ensure the cwnd check `flightsize + packet_size <= cwnd` can pass
-/// for at least one packet even before any ACKs arrive.
-const LOSS_PAUSE_MARGIN: usize = 2 * MAX_PACKET_SIZE;
-
-// Ensure LOSS_PAUSE_MARGIN stays in sync with MAX_PACKET_SIZE.
-const _: () = assert!(
-    LOSS_PAUSE_MARGIN >= 2 * MAX_PACKET_SIZE,
-    "LOSS_PAUSE_MARGIN must be at least 2 * MAX_PACKET_SIZE"
-);
+/// allows continued forward progress during recovery so a single loss event
+/// doesn't stall the entire stream. Any single ACK clears loss_pause
+/// entirely, so the margin just needs to sustain enough data flow for at
+/// least one ACK to arrive.
+///
+/// Set to 50 max-size packets (~60KB). At 5% packet loss, the probability
+/// of all 50 packets being lost is 0.05^50 ≈ 10^-65 — effectively zero.
+/// This guarantees at least one packet gets through to trigger an ACK,
+/// clearing the pause. The margin is still conservative: 60KB is well below
+/// the 125KB token bucket capacity, so loss_pause still restricts the
+/// sending rate during recovery.
+///
+/// Previously set to 2 packets (2400 bytes), which caused production stream
+/// stalls: if both trickle packets were lost, the sender blocked for the
+/// full 20s CWND_WAIT_TIMEOUT before aborting. This was observed as ~10
+/// cwnd timeouts/hour on the gateway, causing GET failures for users.
+const LOSS_PAUSE_MARGIN: usize = 50 * MAX_PACKET_SIZE;
 
 /// Configuration for the fixed-rate controller.
 #[derive(Debug, Clone)]
@@ -320,7 +326,7 @@ mod tests {
     #[test]
     fn test_loss_pause_allows_packet_then_blocks() {
         let controller = FixedRateController::new(FixedRateConfig::default());
-        let packet_size = 1200; // MAX_PACKET_SIZE
+        let packet_size = MAX_PACKET_SIZE;
 
         controller.on_send(5000);
         controller.on_loss();
@@ -336,13 +342,40 @@ mod tests {
              Without margin, sending stalls completely. See #3702."
         );
 
-        // But after sending enough to consume the margin, it blocks
+        // After consuming the full margin, it blocks
         controller.on_send(LOSS_PAUSE_MARGIN);
         let new_flightsize = controller.flightsize();
         assert!(
             new_flightsize + packet_size > cwnd,
             "After consuming the margin, loss_pause should block further sending \
              (flightsize={new_flightsize}, cwnd={cwnd})"
+        );
+    }
+
+    /// Regression test: with the old 2-packet margin, a single loss event during
+    /// a 1MB stream transfer could stall the sender for 20s (CWND_WAIT_TIMEOUT)
+    /// if both trickle packets were also lost. The 50-packet margin ensures that
+    /// even at 20% loss, the sender can sustain enough data flow for ACKs to
+    /// arrive and clear the pause.
+    #[test]
+    fn test_loss_pause_margin_sustains_progress_under_loss() {
+        let controller = FixedRateController::new(FixedRateConfig::default());
+
+        // Simulate a 1MB stream: 100KB already sent and in flight
+        let initial_flightsize = 100_000;
+        controller.on_send(initial_flightsize);
+        controller.on_timeout();
+
+        let cwnd = controller.current_cwnd();
+        let margin = cwnd - initial_flightsize;
+
+        // The margin should allow many packets, not just 2
+        let packets_allowed = margin / MAX_PACKET_SIZE;
+        assert!(
+            packets_allowed >= 20,
+            "loss_pause margin should allow at least 20 packets for recovery, \
+             got {packets_allowed} (margin={margin}B). A 2-packet margin caused \
+             production stream stalls when both trickle packets were lost."
         );
     }
 
