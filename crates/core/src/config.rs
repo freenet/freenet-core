@@ -1498,6 +1498,9 @@ impl ConfigPathsArgs {
     }
 
     pub fn build(self, id: Option<&str>) -> std::io::Result<ConfigPaths> {
+        // Used by the Windows migration block below; suppress warning on other platforms.
+        #[allow(unused_variables)]
+        let has_custom_data_dir = self.data_dir.is_some();
         let app_data_dir = self
             .data_dir
             .map(Ok::<_, std::io::Error>)
@@ -1516,7 +1519,7 @@ impl ConfigPathsArgs {
         // Before #3739, data was stored in %APPDATA% (Roaming) by mistake.
         // If the old path has data and the new path doesn't, move it.
         #[cfg(target_os = "windows")]
-        if self.data_dir.is_none() && id.is_none() {
+        if !has_custom_data_dir && id.is_none() {
             if let Ok(Either::Left(ref proj)) = Self::default_dirs(None) {
                 let old_roaming = proj.data_dir().to_path_buf();
                 if old_roaming != app_data_dir
