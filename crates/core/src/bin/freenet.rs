@@ -603,15 +603,22 @@ fn freenet_main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Service(cmd)) => {
-            let rt = tokio::runtime::Runtime::new()?;
-            let config = rt.block_on(cli.config.build())?;
+            // Build only ConfigPaths (directory layout) — not the full Config.
+            // Full Config triggers a remote gateway fetch which can fail on
+            // fresh installs or before the network is ready (see #3717).
+            // Only the `Report` subcommand actually needs ConfigPaths; other
+            // service commands (install, start, stop, etc.) don't use them at
+            // all, but we build paths unconditionally since it's cheap and
+            // infallible (just directory resolution + creation).
+            let config_paths =
+                std::sync::Arc::new(cli.config.config_paths.build(cli.config.id.as_deref())?);
 
             cmd.run(
                 build_info::VERSION,
                 build_info::GIT_COMMIT,
                 build_info::GIT_DIRTY,
                 build_info::BUILD_TIMESTAMP,
-                config.paths(),
+                config_paths,
             )
         }
         Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),

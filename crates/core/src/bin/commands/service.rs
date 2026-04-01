@@ -264,8 +264,22 @@ fn jitter_secs(secs: u64) -> u64 {
     (secs as f64 * factor) as u64
 }
 
+/// Result of a backoff sleep that was interrupted by a tray action.
+#[allow(dead_code)] // Variants are constructed only on platforms with tray support
+enum BackoffInterrupt {
+    /// Sleep completed without interruption.
+    Completed,
+    /// User requested quit.
+    Quit,
+    /// User requested start/restart — break out of backoff and relaunch.
+    Relaunch,
+    /// User requested a check for updates.
+    CheckUpdate,
+}
+
 /// Sleep for `secs` with ±20% jitter, interruptible via an optional action
-/// channel. Returns `true` if a Quit action was received during the sleep.
+/// channel. Handles `ViewLogs` and `OpenDashboard` inline. Returns the
+/// action that interrupted the sleep so the caller can handle it.
 /// Sleeps in 1-second chunks to remain responsive to tray actions.
 fn sleep_with_jitter_interruptible(
     secs: u64,
@@ -275,7 +289,7 @@ fn sleep_with_jitter_interruptible(
     #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
         &std::sync::mpsc::Receiver<super::tray::TrayAction>,
     >,
-) -> bool {
+) -> BackoffInterrupt {
     let jittered = jitter_secs(secs).max(1);
     for _ in 0..jittered {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -284,18 +298,34 @@ fn sleep_with_jitter_interruptible(
         if let Some(rx) = action_rx {
             if let Ok(action) = rx.try_recv() {
                 match action {
-                    super::tray::TrayAction::Quit => return true,
+                    super::tray::TrayAction::Quit => return BackoffInterrupt::Quit,
                     super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
-                    super::tray::TrayAction::OpenDashboard
-                    | super::tray::TrayAction::Restart
-                    | super::tray::TrayAction::CheckUpdate
-                    | super::tray::TrayAction::Stop
-                    | super::tray::TrayAction::Start => {}
+                    super::tray::TrayAction::OpenDashboard => {
+                        #[cfg(target_os = "windows")]
+                        drop(
+                            std::process::Command::new("cmd")
+                                .args(["/c", "start", DASHBOARD_URL])
+                                .spawn(),
+                        );
+                        #[cfg(target_os = "macos")]
+                        drop(
+                            std::process::Command::new("open")
+                                .arg(DASHBOARD_URL)
+                                .spawn(),
+                        );
+                    }
+                    super::tray::TrayAction::Start | super::tray::TrayAction::Restart => {
+                        return BackoffInterrupt::Relaunch;
+                    }
+                    super::tray::TrayAction::CheckUpdate => {
+                        return BackoffInterrupt::CheckUpdate;
+                    }
+                    super::tray::TrayAction::Stop => {} // already stopped/backing off
                 }
             }
         }
     }
-    false
+    BackoffInterrupt::Completed
 }
 
 /// Run the wrapper loop that manages a `freenet network` child process.
@@ -423,6 +453,53 @@ fn spawn_new_wrapper(exe_path: &Path, log_dir: &Path) -> bool {
     }
 }
 
+/// Maximum time to wait for network readiness at startup (seconds).
+const NETWORK_READINESS_TIMEOUT_SECS: u64 = 60;
+/// Interval between network readiness checks (seconds).
+const NETWORK_READINESS_CHECK_INTERVAL_SECS: u64 = 2;
+
+/// Wait for network connectivity before spawning the node.
+///
+/// On Windows, the registry Run key fires at user logon, which can be before
+/// the network stack is fully operational. Without this check, the node starts
+/// with no connectivity — gateway fetches fail, CONNECT handshakes timeout,
+/// and the node gets stuck with zombie transient connections. See #3716.
+///
+/// Returns `true` if network is ready, `false` if timed out (we still try
+/// to start the node in that case — it has its own retry logic).
+fn wait_for_network_ready(log_dir: &Path) -> bool {
+    use std::net::ToSocketAddrs;
+
+    // Quick check — if DNS works immediately, skip the wait
+    if "freenet.org:443".to_socket_addrs().is_ok() {
+        return true;
+    }
+
+    log_wrapper_event(
+        log_dir,
+        "Network not ready yet, waiting for connectivity...",
+    );
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(NETWORK_READINESS_TIMEOUT_SECS);
+
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(
+            NETWORK_READINESS_CHECK_INTERVAL_SECS,
+        ));
+        if "freenet.org:443".to_socket_addrs().is_ok() {
+            log_wrapper_event(log_dir, "Network is ready");
+            return true;
+        }
+    }
+
+    log_wrapper_event(
+        log_dir,
+        "Network readiness timeout — starting node anyway (it will retry internally)",
+    );
+    false
+}
+
 /// The core wrapper loop. Spawns `freenet network`, handles exit codes,
 /// and communicates with the tray icon (if present).
 fn run_wrapper_loop(
@@ -442,6 +519,11 @@ fn run_wrapper_loop(
     let exe_path = std::env::current_exe().context("Failed to get current executable")?;
 
     let mut state = WrapperState::new();
+
+    // On first launch, wait for network connectivity before spawning the node.
+    // This prevents the node from starting in a degraded state when the wrapper
+    // is auto-started at login before the network stack is ready (see #3716).
+    wait_for_network_ready(log_dir);
 
     loop {
         // Notify tray that we're starting
@@ -744,11 +826,53 @@ fn run_wrapper_loop(
                     &format!("Exited with code {exit_code}, restarting after {secs}s backoff..."),
                 );
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
-                let quit = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
+                let interrupt = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
                 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                let quit = sleep_with_jitter_interruptible(secs, None);
-                if quit {
-                    return Ok(());
+                let interrupt = sleep_with_jitter_interruptible(secs, None);
+                match interrupt {
+                    BackoffInterrupt::Quit => return Ok(()),
+                    BackoffInterrupt::Relaunch => {
+                        log_wrapper_event(log_dir, "Relaunch requested during backoff");
+                        state.consecutive_failures = 0;
+                        // fall through to relaunch
+                    }
+                    BackoffInterrupt::CheckUpdate => {
+                        log_wrapper_event(log_dir, "Update check requested during backoff");
+                        #[cfg(any(target_os = "windows", target_os = "macos"))]
+                        if let Some((_, status_tx)) = tray {
+                            status_tx.send(WrapperStatus::Updating).ok();
+                            let result = spawn_update_command(&exe_path);
+                            match result {
+                                Ok(s) if s.success() => {
+                                    log_wrapper_event(
+                                        log_dir,
+                                        "Update installed during backoff, restarting wrapper...",
+                                    );
+                                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                    if spawn_new_wrapper(&exe_path, log_dir) {
+                                        return Ok(());
+                                    }
+                                    // Spawn failed — relaunch with current wrapper
+                                }
+                                Ok(_) => {
+                                    log_wrapper_event(log_dir, "No update available");
+                                    status_tx.send(WrapperStatus::UpToDate).ok();
+                                }
+                                Err(e) => {
+                                    log_wrapper_event(
+                                        log_dir,
+                                        &format!("Update check failed: {e}"),
+                                    );
+                                    status_tx.send(WrapperStatus::Running).ok();
+                                }
+                            }
+                        }
+                        state.consecutive_failures = 0;
+                        // fall through to relaunch
+                    }
+                    BackoffInterrupt::Completed => {
+                        // Normal backoff completed, fall through to relaunch
+                    }
                 }
             }
         }
@@ -2451,6 +2575,75 @@ mod tests {
         let action = next_wrapper_action(&mut state, 1, true, None);
         assert_eq!(action, WrapperAction::KillAndRetry);
         assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
+    }
+
+    /// Regression test for #3716: tray actions (Start, Restart, CheckUpdate,
+    /// OpenDashboard) were silently dropped during backoff sleep. Verify that
+    /// the sleep function returns the correct interrupt for each action type.
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn test_backoff_sleep_handles_tray_actions() {
+        use std::sync::mpsc;
+
+        // Start/Restart should return Relaunch
+        {
+            let (tx, rx) = mpsc::channel();
+            tx.send(super::super::tray::TrayAction::Start).unwrap();
+            let result = sleep_with_jitter_interruptible(1, Some(&rx));
+            assert!(matches!(result, BackoffInterrupt::Relaunch));
+        }
+        {
+            let (tx, rx) = mpsc::channel();
+            tx.send(super::super::tray::TrayAction::Restart).unwrap();
+            let result = sleep_with_jitter_interruptible(1, Some(&rx));
+            assert!(matches!(result, BackoffInterrupt::Relaunch));
+        }
+
+        // CheckUpdate should return CheckUpdate
+        {
+            let (tx, rx) = mpsc::channel();
+            tx.send(super::super::tray::TrayAction::CheckUpdate)
+                .unwrap();
+            let result = sleep_with_jitter_interruptible(1, Some(&rx));
+            assert!(matches!(result, BackoffInterrupt::CheckUpdate));
+        }
+
+        // Quit should return Quit
+        {
+            let (tx, rx) = mpsc::channel();
+            tx.send(super::super::tray::TrayAction::Quit).unwrap();
+            let result = sleep_with_jitter_interruptible(1, Some(&rx));
+            assert!(matches!(result, BackoffInterrupt::Quit));
+        }
+
+        // No action should return Completed (use minimal sleep)
+        {
+            let (_tx, rx) = mpsc::channel();
+            let result = sleep_with_jitter_interruptible(1, Some(&rx));
+            assert!(matches!(result, BackoffInterrupt::Completed));
+        }
+    }
+
+    /// Regression test for #3717: `freenet service install` used to call
+    /// `config.build()` which triggered a remote gateway fetch. This fails
+    /// on fresh installs when the network isn't ready. Verify that
+    /// `ConfigPathsArgs::build()` succeeds independently without network.
+    #[test]
+    fn test_config_paths_build_succeeds_without_network() {
+        // Provide an explicit temp data dir to avoid the debug_assertions temp
+        // dir path (which hits an unreachable! in debug builds). In production
+        // (release builds), default_dirs returns ProjectDirs and works fine.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = freenet::config::ConfigPathsArgs {
+            config_dir: Some(tmp.path().join("config")),
+            data_dir: Some(tmp.path().join("data")),
+            ..Default::default()
+        };
+        let result = args.build(None);
+        assert!(
+            result.is_ok(),
+            "ConfigPathsArgs::build should succeed without network access"
+        );
     }
 
     #[test]
