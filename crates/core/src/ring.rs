@@ -1818,13 +1818,20 @@ impl Ring {
         const PEER_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(30);
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
+        /// Uses a shorter threshold initially (before first successful connection)
+        /// so that cold-start failures after OS restart recover faster (#3737).
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
+        const INITIAL_ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(30);
         /// Max time to hold a deferred swap drop before abandoning it.
         const DEFERRED_SWAP_DROP_TTL: Duration = Duration::from_secs(120);
         // Deferred swap drops: (addr, queued_at) using time_source for
         // deterministic simulation support.
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
         let mut zero_connections_since: Option<Instant> = None;
+        // Track whether we've ever had ring connections. Before the first
+        // successful connection, use a shorter isolation escalation threshold
+        // for faster recovery from cold-start failures (#3737).
+        let mut ever_had_connections = false;
 
         // Adaptive fast-tick backoff: increase the fast-tick interval when
         // connection count stops growing, to avoid hammering the network
@@ -2013,11 +2020,22 @@ impl Ring {
             // Expose to update check task for version mismatch decisions (#3204).
             crate::transport::set_open_connection_count(current_conn_count);
             if current_conn_count == 0 {
+                // Use shorter threshold before first successful connection so
+                // cold-start failures (e.g., after OS restart) recover in ~30s
+                // instead of ~120s. Once the node has connected at least once,
+                // use the steady-state threshold. See #3737.
+                let threshold = if ever_had_connections {
+                    ISOLATION_ESCALATION_THRESHOLD
+                } else {
+                    INITIAL_ISOLATION_ESCALATION_THRESHOLD
+                };
                 if let Some(since) = zero_connections_since {
-                    if since.elapsed() > ISOLATION_ESCALATION_THRESHOLD {
+                    if since.elapsed() > threshold {
                         tracing::warn!(
                             is_gateway,
                             isolated_for_secs = since.elapsed().as_secs(),
+                            threshold_secs = threshold.as_secs(),
+                            ever_connected = ever_had_connections,
                             "Node isolated with zero ring connections — resetting all backoff state"
                         );
                         reset_all_backoff();
@@ -2031,6 +2049,7 @@ impl Ring {
                     );
                 }
             } else if zero_connections_since.take().is_some() {
+                ever_had_connections = true;
                 tracing::info!(
                     connections = current_conn_count,
                     "Recovered from zero-connection state"
