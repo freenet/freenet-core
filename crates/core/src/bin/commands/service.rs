@@ -173,8 +173,21 @@ const WRAPPER_MAX_PORT_CONFLICT_KILLS: u32 = 3;
 const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
 
 /// Dashboard URL served by the local freenet node.
-#[allow(dead_code)] // Used on Windows (tray + wrapper loop)
+#[allow(dead_code)] // Used on Windows/macOS (tray + wrapper loop)
 pub(super) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
+
+/// Open a URL in the default browser (platform-specific).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn open_url_in_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    drop(
+        std::process::Command::new("cmd")
+            .args(["/c", "start", url])
+            .spawn(),
+    );
+    #[cfg(target_os = "macos")]
+    drop(std::process::Command::new("open").arg(url).spawn());
+}
 
 /// State for the wrapper backoff state machine.
 #[derive(Debug, Clone)]
@@ -301,18 +314,7 @@ fn sleep_with_jitter_interruptible(
                     super::tray::TrayAction::Quit => return BackoffInterrupt::Quit,
                     super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
                     super::tray::TrayAction::OpenDashboard => {
-                        #[cfg(target_os = "windows")]
-                        drop(
-                            std::process::Command::new("cmd")
-                                .args(["/c", "start", DASHBOARD_URL])
-                                .spawn(),
-                        );
-                        #[cfg(target_os = "macos")]
-                        drop(
-                            std::process::Command::new("open")
-                                .arg(DASHBOARD_URL)
-                                .spawn(),
-                        );
+                        open_url_in_browser(DASHBOARD_URL);
                     }
                     super::tray::TrayAction::Start | super::tray::TrayAction::Restart => {
                         return BackoffInterrupt::Relaunch;
@@ -329,8 +331,6 @@ fn sleep_with_jitter_interruptible(
 }
 
 /// Run the wrapper loop that manages a `freenet network` child process.
-///
-/// Compiled process wrapper that manages a `freenet network` child process.
 /// On Windows and macOS, shows a system tray / menu bar icon.
 /// On Linux, runs the wrapper loop directly (no tray).
 fn run_wrapper(version: &str) -> Result<()> {
@@ -457,6 +457,8 @@ fn spawn_new_wrapper(exe_path: &Path, log_dir: &Path) -> bool {
 const NETWORK_READINESS_TIMEOUT_SECS: u64 = 60;
 /// Interval between network readiness checks (seconds).
 const NETWORK_READINESS_CHECK_INTERVAL_SECS: u64 = 2;
+/// DNS probe target for network readiness checks.
+const NETWORK_PROBE_ADDR: &str = "freenet.org:443";
 
 /// Wait for network connectivity before spawning the node.
 ///
@@ -471,7 +473,7 @@ fn wait_for_network_ready(log_dir: &Path) -> bool {
     use std::net::ToSocketAddrs;
 
     // Quick check — if DNS works immediately, skip the wait
-    if "freenet.org:443".to_socket_addrs().is_ok() {
+    if NETWORK_PROBE_ADDR.to_socket_addrs().is_ok() {
         return true;
     }
 
@@ -487,7 +489,7 @@ fn wait_for_network_ready(log_dir: &Path) -> bool {
         std::thread::sleep(std::time::Duration::from_secs(
             NETWORK_READINESS_CHECK_INTERVAL_SECS,
         ));
-        if "freenet.org:443".to_socket_addrs().is_ok() {
+        if NETWORK_PROBE_ADDR.to_socket_addrs().is_ok() {
             log_wrapper_event(log_dir, "Network is ready");
             return true;
         }
@@ -650,11 +652,7 @@ fn run_wrapper_loop(
                             }
                         }
                         super::tray::TrayAction::OpenDashboard => {
-                            drop(
-                                std::process::Command::new("cmd")
-                                    .args(["/c", "start", DASHBOARD_URL])
-                                    .spawn(),
-                            );
+                            open_url_in_browser(DASHBOARD_URL);
                         }
                     }
                 }
@@ -2577,51 +2575,43 @@ mod tests {
         assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
     }
 
-    /// Regression test for #3716: tray actions (Start, Restart, CheckUpdate,
-    /// OpenDashboard) were silently dropped during backoff sleep. Verify that
-    /// the sleep function returns the correct interrupt for each action type.
+    /// Regression test for #3716: tray actions were silently dropped during
+    /// backoff sleep. Verify the sleep function maps each action correctly.
     #[test]
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn test_backoff_sleep_handles_tray_actions() {
+        use super::super::tray::TrayAction;
         use std::sync::mpsc;
 
-        // Start/Restart should return Relaunch
-        {
+        let send_and_check = |action: TrayAction| -> BackoffInterrupt {
             let (tx, rx) = mpsc::channel();
-            tx.send(super::super::tray::TrayAction::Start).unwrap();
-            let result = sleep_with_jitter_interruptible(1, Some(&rx));
-            assert!(matches!(result, BackoffInterrupt::Relaunch));
-        }
-        {
-            let (tx, rx) = mpsc::channel();
-            tx.send(super::super::tray::TrayAction::Restart).unwrap();
-            let result = sleep_with_jitter_interruptible(1, Some(&rx));
-            assert!(matches!(result, BackoffInterrupt::Relaunch));
-        }
+            tx.send(action).unwrap();
+            sleep_with_jitter_interruptible(1, Some(&rx))
+        };
 
-        // CheckUpdate should return CheckUpdate
-        {
-            let (tx, rx) = mpsc::channel();
-            tx.send(super::super::tray::TrayAction::CheckUpdate)
-                .unwrap();
-            let result = sleep_with_jitter_interruptible(1, Some(&rx));
-            assert!(matches!(result, BackoffInterrupt::CheckUpdate));
-        }
+        assert!(matches!(
+            send_and_check(TrayAction::Start),
+            BackoffInterrupt::Relaunch
+        ));
+        assert!(matches!(
+            send_and_check(TrayAction::Restart),
+            BackoffInterrupt::Relaunch
+        ));
+        assert!(matches!(
+            send_and_check(TrayAction::CheckUpdate),
+            BackoffInterrupt::CheckUpdate
+        ));
+        assert!(matches!(
+            send_and_check(TrayAction::Quit),
+            BackoffInterrupt::Quit
+        ));
 
-        // Quit should return Quit
-        {
-            let (tx, rx) = mpsc::channel();
-            tx.send(super::super::tray::TrayAction::Quit).unwrap();
-            let result = sleep_with_jitter_interruptible(1, Some(&rx));
-            assert!(matches!(result, BackoffInterrupt::Quit));
-        }
-
-        // No action should return Completed (use minimal sleep)
-        {
-            let (_tx, rx) = mpsc::channel();
-            let result = sleep_with_jitter_interruptible(1, Some(&rx));
-            assert!(matches!(result, BackoffInterrupt::Completed));
-        }
+        // No action: sleep completes normally
+        let (_tx, rx) = mpsc::channel::<TrayAction>();
+        assert!(matches!(
+            sleep_with_jitter_interruptible(1, Some(&rx)),
+            BackoffInterrupt::Completed
+        ));
     }
 
     /// Regression test for #3717: `freenet service install` used to call

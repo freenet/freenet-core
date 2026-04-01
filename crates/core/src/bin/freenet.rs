@@ -603,13 +603,9 @@ fn freenet_main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Service(cmd)) => {
-            // Build only ConfigPaths (directory layout) — not the full Config.
-            // Full Config triggers a remote gateway fetch which can fail on
-            // fresh installs or before the network is ready (see #3717).
-            // Only the `Report` subcommand actually needs ConfigPaths; other
-            // service commands (install, start, stop, etc.) don't use them at
-            // all, but we build paths unconditionally since it's cheap and
-            // infallible (just directory resolution + creation).
+            // Build only ConfigPaths (directory layout), not the full Config
+            // which triggers a remote gateway fetch that fails on fresh
+            // installs or before the network is ready (see #3717).
             let config_paths =
                 std::sync::Arc::new(cli.config.config_paths.build(cli.config.id.as_deref())?);
 
