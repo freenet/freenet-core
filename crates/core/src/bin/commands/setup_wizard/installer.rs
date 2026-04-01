@@ -100,31 +100,58 @@ pub fn run_install(progress: impl Fn(InstallProgress) + Send) -> Result<()> {
     }
 
     // Step 6: Start service
+    //
+    // Use Stdio::null() + .status() instead of .output() to prevent Windows
+    // handle inheritance. With .output(), the installer creates pipes that get
+    // inherited by the detached wrapper process (via CreateProcess's default
+    // bInheritHandles=TRUE). The wrapper runs forever, so the pipe handles
+    // never close, and .output() blocks indefinitely waiting for EOF.
     progress(InstallProgress::LaunchingService);
-    let output = std::process::Command::new(&installed_exe)
+    let status = std::process::Command::new(&installed_exe)
         .args(["service", "start"])
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
         .context("Failed to start freenet service")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = if stderr.trim().is_empty() {
-            format!("exit code {}", output.status.code().unwrap_or(-1))
-        } else {
-            stderr.trim().to_string()
-        };
+    if !status.success() {
         return Err(anyhow::anyhow!(
-            "Service failed to start: {detail}. Try running 'freenet service start' manually."
+            "Service failed to start (exit code {}). Try running 'freenet service start' manually.",
+            status.code().unwrap_or(-1)
         ));
     }
 
     // Brief wait for the node to initialize before opening the dashboard
     std::thread::sleep(std::time::Duration::from_secs(3));
 
-    // Step 7: Open dashboard
+    // Step 7: Open dashboard — use ShellExecuteW instead of cmd /c start
+    // because the installer may not have a proper console context.
     progress(InstallProgress::OpeningDashboard);
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        let url: Vec<u16> = OsStr::new(DASHBOARD_URL)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            winapi::um::shellapi::ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                url.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                winapi::um::winuser::SW_SHOWNORMAL,
+            );
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
     drop(
-        std::process::Command::new("cmd")
-            .args(["/c", "start", DASHBOARD_URL])
+        std::process::Command::new("open")
+            .arg(DASHBOARD_URL)
             .spawn(),
     );
 
