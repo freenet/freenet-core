@@ -174,37 +174,12 @@ const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
 
 /// Dashboard URL served by the local freenet node.
 #[allow(dead_code)] // Used on Windows/macOS (tray + wrapper loop)
-pub(super) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
+pub(crate) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 
 /// Open a URL in the default browser (platform-specific).
-///
-/// On Windows, uses `ShellExecuteW` instead of `cmd /c start` because the
-/// wrapper detaches from the console via `FreeConsole()` at startup. After
-/// that, `cmd.exe` has no console context and fails silently. `ShellExecuteW`
-/// is a Win32 GUI API that works without a console.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn open_url_in_browser(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-
-        let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
-        let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
-
-        unsafe {
-            winapi::um::shellapi::ShellExecuteW(
-                std::ptr::null_mut(),
-                operation.as_ptr(),
-                url_wide.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                winapi::um::winuser::SW_SHOWNORMAL,
-            );
-        }
-    }
-    #[cfg(target_os = "macos")]
-    drop(std::process::Command::new("open").arg(url).spawn());
+    super::open_url_in_browser(url);
 }
 
 /// State for the wrapper backoff state machine.

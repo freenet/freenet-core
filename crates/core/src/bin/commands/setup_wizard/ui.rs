@@ -83,12 +83,9 @@ mod platform {
                     event: WindowEvent::CloseRequested,
                     ..
                 } => {
-                    // Don't block the UI thread waiting for the installer to
-                    // finish — that causes the window to hang on "Finishing
-                    // installation..." if the installer thread is blocked
-                    // (e.g., waiting for a subprocess). The installer thread
-                    // will be killed when the process exits. Any already-started
-                    // service (detached wrapper) survives parent exit.
+                    // Don't join the installer thread — it may be blocked on a
+                    // subprocess, which would hang the window. The detached
+                    // service wrapper survives parent exit.
                     drop(install_handle.take());
                     *control_flow = ControlFlow::Exit;
                 }

@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use super::detection::get_install_dir;
+use crate::commands::service::DASHBOARD_URL;
 
 /// Progress updates sent from the installer thread to the UI.
 #[derive(Debug, Clone)]
@@ -23,9 +24,6 @@ pub enum InstallProgress {
     Complete,
     Error(String),
 }
-
-/// Dashboard URL served by the local freenet node.
-const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 
 /// Run the full installation, reporting progress via the callback.
 ///
@@ -124,36 +122,9 @@ pub fn run_install(progress: impl Fn(InstallProgress) + Send) -> Result<()> {
     // Brief wait for the node to initialize before opening the dashboard
     std::thread::sleep(std::time::Duration::from_secs(3));
 
-    // Step 7: Open dashboard — use ShellExecuteW instead of cmd /c start
-    // because the installer may not have a proper console context.
+    // Step 7: Open dashboard
     progress(InstallProgress::OpeningDashboard);
-    #[cfg(target_os = "windows")]
-    {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-
-        let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
-        let url: Vec<u16> = OsStr::new(DASHBOARD_URL)
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        unsafe {
-            winapi::um::shellapi::ShellExecuteW(
-                std::ptr::null_mut(),
-                operation.as_ptr(),
-                url.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                winapi::um::winuser::SW_SHOWNORMAL,
-            );
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    drop(
-        std::process::Command::new("open")
-            .arg(DASHBOARD_URL)
-            .spawn(),
-    );
+    crate::commands::open_url_in_browser(DASHBOARD_URL);
 
     progress(InstallProgress::Complete);
     Ok(())

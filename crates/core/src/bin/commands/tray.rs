@@ -99,17 +99,7 @@ mod platform {
 
     /// Open a URL in the default browser, platform-appropriately.
     fn open_url(url: &str) {
-        #[cfg(target_os = "windows")]
-        {
-            std::process::Command::new("cmd")
-                .args(["/c", "start", url])
-                .spawn()
-                .ok();
-        }
-        #[cfg(target_os = "macos")]
-        {
-            std::process::Command::new("open").arg(url).spawn().ok();
-        }
+        super::super::open_url_in_browser(url);
     }
 
     /// Run the tray icon event loop on the current thread (must be the main thread
