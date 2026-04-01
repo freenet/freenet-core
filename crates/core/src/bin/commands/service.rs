@@ -504,10 +504,9 @@ fn wait_for_network_ready(
         "Network not ready yet, waiting for connectivity...",
     );
 
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(NETWORK_READINESS_TIMEOUT_SECS);
+    let max_checks = NETWORK_READINESS_TIMEOUT_SECS / NETWORK_READINESS_CHECK_INTERVAL_SECS;
 
-    while std::time::Instant::now() < deadline {
+    for _ in 0..max_checks {
         std::thread::sleep(std::time::Duration::from_secs(
             NETWORK_READINESS_CHECK_INTERVAL_SECS,
         ));
