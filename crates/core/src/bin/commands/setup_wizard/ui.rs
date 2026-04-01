@@ -83,13 +83,10 @@ mod platform {
                     event: WindowEvent::CloseRequested,
                     ..
                 } => {
-                    // If the installer is still running, wait for it to finish
-                    // before closing so we don't abandon a half-done install.
-                    if let Some(handle) = install_handle.take() {
-                        let _ = webview
-                            .evaluate_script("updateProgress(95, 'Finishing installation...')");
-                        handle.join().ok();
-                    }
+                    // Don't join the installer thread — it may be blocked on a
+                    // subprocess, which would hang the window. The detached
+                    // service wrapper survives parent exit.
+                    drop(install_handle.take());
                     *control_flow = ControlFlow::Exit;
                 }
 

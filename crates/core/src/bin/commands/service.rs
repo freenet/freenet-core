@@ -174,19 +174,12 @@ const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
 
 /// Dashboard URL served by the local freenet node.
 #[allow(dead_code)] // Used on Windows/macOS (tray + wrapper loop)
-pub(super) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
+pub(crate) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 
 /// Open a URL in the default browser (platform-specific).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn open_url_in_browser(url: &str) {
-    #[cfg(target_os = "windows")]
-    drop(
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .spawn(),
-    );
-    #[cfg(target_os = "macos")]
-    drop(std::process::Command::new("open").arg(url).spawn());
+    super::open_url_in_browser(url);
 }
 
 /// State for the wrapper backoff state machine.
