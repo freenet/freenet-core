@@ -182,7 +182,7 @@ fn open_url_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
     drop(
         std::process::Command::new("cmd")
-            .args(["/c", "start", url])
+            .args(["/c", "start", "", url])
             .spawn(),
     );
     #[cfg(target_os = "macos")]
@@ -488,6 +488,11 @@ fn wait_for_network_ready(
     >,
 ) -> bool {
     use std::net::ToSocketAddrs;
+
+    // Note: `to_socket_addrs()` is a blocking OS resolver call that can take
+    // 15-30s on Windows when the network is down. The deadline check between
+    // calls means the total wait may exceed NETWORK_READINESS_TIMEOUT_SECS
+    // in pathological cases. This is acceptable for a pre-startup wait.
 
     // Quick check — if DNS works immediately, skip the wait
     if NETWORK_PROBE_ADDR.to_socket_addrs().is_ok() {
@@ -854,57 +859,60 @@ fn run_wrapper_loop(
                     log_dir,
                     &format!("Exited with code {exit_code}, restarting after {secs}s backoff..."),
                 );
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
-                let interrupt = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
-                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                let interrupt = sleep_with_jitter_interruptible(secs, None);
-                match interrupt {
-                    BackoffInterrupt::Quit => return Ok(()),
-                    BackoffInterrupt::Relaunch => {
-                        log_wrapper_event(log_dir, "Relaunch requested during backoff");
-                        state.consecutive_failures = 0;
-                        // fall through to relaunch
-                    }
-                    BackoffInterrupt::CheckUpdate => {
-                        // The update logic is platform-gated (tray only on
-                        // Windows/macOS). On Linux this arm is unreachable
-                        // (action_rx is None), but we still reset failures
-                        // and relaunch unconditionally for consistency.
-                        log_wrapper_event(log_dir, "Update check requested during backoff");
-                        #[cfg(any(target_os = "windows", target_os = "macos"))]
-                        if let Some((_, status_tx)) = tray {
-                            status_tx.send(WrapperStatus::Updating).ok();
-                            let result = spawn_update_command(&exe_path);
-                            match result {
-                                Ok(s) if s.success() => {
-                                    log_wrapper_event(
-                                        log_dir,
-                                        "Update installed during backoff, restarting wrapper...",
-                                    );
-                                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                                    if spawn_new_wrapper(&exe_path, log_dir) {
-                                        return Ok(());
+                // Loop: CheckUpdate resumes backoff; Relaunch/Quit/Completed break out.
+                loop {
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                    let interrupt = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
+                    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                    let interrupt = sleep_with_jitter_interruptible(secs, None);
+                    match interrupt {
+                        BackoffInterrupt::Quit => return Ok(()),
+                        BackoffInterrupt::Relaunch => {
+                            log_wrapper_event(log_dir, "Relaunch requested during backoff");
+                            state.consecutive_failures = 0;
+                            break; // relaunch
+                        }
+                        BackoffInterrupt::CheckUpdate => {
+                            // Run the update check. Only relaunch if an update
+                            // was actually installed; otherwise resume backoff.
+                            // This prevents users from defeating the crash
+                            // backoff by repeatedly clicking "Check for Updates".
+                            log_wrapper_event(log_dir, "Update check requested during backoff");
+                            #[cfg(any(target_os = "windows", target_os = "macos"))]
+                            if let Some((_, status_tx)) = tray {
+                                status_tx.send(WrapperStatus::Updating).ok();
+                                let result = spawn_update_command(&exe_path);
+                                match result {
+                                    Ok(s) if s.success() => {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            "Update installed during backoff, restarting wrapper...",
+                                        );
+                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                        if spawn_new_wrapper(&exe_path, log_dir) {
+                                            return Ok(());
+                                        }
+                                        // Spawn failed — relaunch with current wrapper
+                                        state.consecutive_failures = 0;
+                                        break;
                                     }
-                                    // Spawn failed — relaunch with current wrapper
-                                }
-                                Ok(_) => {
-                                    log_wrapper_event(log_dir, "No update available");
-                                    status_tx.send(WrapperStatus::UpToDate).ok();
-                                }
-                                Err(e) => {
-                                    log_wrapper_event(
-                                        log_dir,
-                                        &format!("Update check failed: {e}"),
-                                    );
-                                    status_tx.send(WrapperStatus::Running).ok();
+                                    Ok(_) => {
+                                        log_wrapper_event(log_dir, "No update available");
+                                        status_tx.send(WrapperStatus::UpToDate).ok();
+                                    }
+                                    Err(e) => {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            &format!("Update check failed: {e}"),
+                                        );
+                                        status_tx.send(WrapperStatus::Stopped).ok();
+                                    }
                                 }
                             }
+                            // No update installed — resume backoff
+                            continue;
                         }
-                        state.consecutive_failures = 0;
-                        // fall through to relaunch
-                    }
-                    BackoffInterrupt::Completed => {
-                        // Normal backoff completed, fall through to relaunch
+                        BackoffInterrupt::Completed => break, // normal backoff done
                     }
                 }
             }
