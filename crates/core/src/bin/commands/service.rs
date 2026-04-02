@@ -14,6 +14,63 @@ use std::sync::Arc;
 
 use super::report::ReportCommand;
 
+/// Tail log files with automatic rotation detection.
+///
+/// Spawns `tail -f` on the latest log file, then periodically checks (every 5s)
+/// whether a newer log file has appeared. When rotation occurs (e.g., hourly
+/// tracing-appender rotation), kills the old `tail` and starts a new one on
+/// the new file.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tail_with_rotation(log_dir: &Path, base_name: &str) -> Result<()> {
+    use std::time::Duration;
+
+    let mut current_log = find_latest_log_file(log_dir, base_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No log files found in: {}\nMake sure the service has been installed and started.",
+            log_dir.display()
+        )
+    })?;
+
+    println!("Following logs from: {}", current_log.display());
+    println!("Press Ctrl+C to stop.\n");
+
+    loop {
+        let mut child = std::process::Command::new("tail")
+            .arg("-f")
+            .arg(&current_log)
+            .spawn()
+            .context("Failed to spawn tail")?;
+
+        // Poll for newer log files every 5 seconds
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // tail exited (user Ctrl+C or error)
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                Ok(None) => {
+                    // tail still running, check for rotation
+                }
+                Err(e) => {
+                    anyhow::bail!("Error waiting on tail process: {e}");
+                }
+            }
+
+            std::thread::sleep(Duration::from_secs(5));
+
+            if let Some(newer_log) = find_latest_log_file(log_dir, base_name) {
+                if newer_log != current_log {
+                    println!("\n--- Log rotated to: {} ---\n", newer_log.display());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    current_log = newer_log;
+                    break; // break inner loop to spawn new tail
+                }
+            }
+        }
+    }
+}
+
 /// Find the latest log file in the given directory.
 /// Handles both static files (e.g., "freenet.log" from systemd) and
 /// rotated files (e.g., "freenet.2025-12-27.log" from tracing-appender).
@@ -1622,23 +1679,7 @@ fn service_logs(error_only: bool) -> Result<()> {
         "freenet"
     };
 
-    let log_file = find_latest_log_file(&log_dir, base_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No log files found in: {}\nMake sure the service has been installed and started.",
-            log_dir.display()
-        )
-    })?;
-
-    println!("Following logs from: {}", log_file.display());
-    println!("Press Ctrl+C to stop.\n");
-
-    let status = std::process::Command::new("tail")
-        .arg("-f")
-        .arg(&log_file)
-        .status()
-        .context("Failed to tail log file")?;
-
-    std::process::exit(status.code().unwrap_or(1));
+    tail_with_rotation(&log_dir, base_name)
 }
 
 // macOS implementation using launchd
@@ -1975,23 +2016,7 @@ fn service_logs(error_only: bool) -> Result<()> {
         "freenet"
     };
 
-    let log_file = find_latest_log_file(&log_dir, base_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No log files found in: {}\nMake sure the service has been installed and started.",
-            log_dir.display()
-        )
-    })?;
-
-    println!("Following logs from: {}", log_file.display());
-    println!("Press Ctrl+C to stop.\n");
-
-    let status = std::process::Command::new("tail")
-        .arg("-f")
-        .arg(&log_file)
-        .status()
-        .context("Failed to tail log file")?;
-
-    std::process::exit(status.code().unwrap_or(1));
+    tail_with_rotation(&log_dir, base_name)
 }
 
 // Windows implementation
@@ -2229,6 +2254,7 @@ fn restart_service(system: bool) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_logs(error_only: bool) -> Result<()> {
     use freenet::tracing::tracer::get_log_dir;
+    use std::time::Duration;
 
     let log_dir = get_log_dir().context(
         "Could not determine log directory. \
@@ -2244,36 +2270,25 @@ fn service_logs(error_only: bool) -> Result<()> {
     // Also check the wrapper log (now date-rotated: freenet-wrapper.YYYY-MM-DD.log)
     let wrapper_log = find_latest_log_file(&log_dir, "freenet-wrapper");
 
-    match find_latest_log_file(&log_dir, base_name) {
+    let mut current_log = match find_latest_log_file(&log_dir, base_name) {
         Some(log_path) => {
             println!("Log file: {}", log_path.display());
             if let Some(ref wl) = wrapper_log {
                 println!("Wrapper log: {}", wl.display());
             }
-            // Use PowerShell Get-Content -Wait to follow the log (like tail -f)
-            let status = std::process::Command::new("powershell")
-                .args([
-                    "-Command",
-                    &format!("Get-Content -Path '{}' -Tail 50 -Wait", log_path.display()),
-                ])
-                .status()
-                .context("Failed to open log file")?;
-            if !status.success() {
-                // Fallback: just open in notepad
-                drop(std::process::Command::new("notepad").arg(&log_path).spawn());
-            }
+            log_path
         }
         None => {
             if let Some(ref wl) = wrapper_log {
                 println!("No node logs found, showing wrapper log:");
-                drop(
-                    std::process::Command::new("powershell")
-                        .args([
-                            "-Command",
-                            &format!("Get-Content -Path '{}' -Tail 50 -Wait", wl.display()),
-                        ])
-                        .status(),
-                );
+                let status = std::process::Command::new("powershell")
+                    .args([
+                        "-Command",
+                        &format!("Get-Content -Path '{}' -Tail 50 -Wait", wl.display()),
+                    ])
+                    .status()
+                    .context("Failed to open wrapper log")?;
+                std::process::exit(status.code().unwrap_or(1));
             } else {
                 anyhow::bail!(
                     "No log files found in {}.\n\
@@ -2282,9 +2297,50 @@ fn service_logs(error_only: bool) -> Result<()> {
                 );
             }
         }
-    }
+    };
 
-    Ok(())
+    println!("Press Ctrl+C to stop.\n");
+
+    loop {
+        let mut child = std::process::Command::new("powershell")
+            .args([
+                "-Command",
+                &format!(
+                    "Get-Content -Path '{}' -Tail 50 -Wait",
+                    current_log.display()
+                ),
+            ])
+            .spawn()
+            .context("Failed to spawn PowerShell for log tailing")?;
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        // Fallback: open in notepad
+                        drop(std::process::Command::new("notepad").arg(&current_log).spawn());
+                    }
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    anyhow::bail!("Error waiting on PowerShell process: {e}");
+                }
+            }
+
+            std::thread::sleep(Duration::from_secs(5));
+
+            if let Some(newer_log) = find_latest_log_file(&log_dir, base_name) {
+                if newer_log != current_log {
+                    println!("\n--- Log rotated to: {} ---\n", newer_log.display());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    current_log = newer_log;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // Fallback for unsupported platforms
