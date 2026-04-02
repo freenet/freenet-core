@@ -2318,7 +2318,11 @@ fn service_logs(error_only: bool) -> Result<()> {
                 Ok(Some(status)) => {
                     if !status.success() {
                         // Fallback: open in notepad
-                        drop(std::process::Command::new("notepad").arg(&current_log).spawn());
+                        drop(
+                            std::process::Command::new("notepad")
+                                .arg(&current_log)
+                                .spawn(),
+                        );
                     }
                     std::process::exit(status.code().unwrap_or(1));
                 }
