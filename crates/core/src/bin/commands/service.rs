@@ -52,6 +52,8 @@ fn tail_with_rotation(log_dir: &Path, base_name: &str) -> Result<()> {
                     // tail still running, check for rotation
                 }
                 Err(e) => {
+                    drop(child.kill());
+                    drop(child.wait());
                     anyhow::bail!("Error waiting on tail process: {e}");
                 }
             }
@@ -61,8 +63,8 @@ fn tail_with_rotation(log_dir: &Path, base_name: &str) -> Result<()> {
             if let Some(newer_log) = find_latest_log_file(log_dir, base_name) {
                 if newer_log != current_log {
                     println!("\n--- Log rotated to: {} ---\n", newer_log.display());
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    drop(child.kill());
+                    drop(child.wait());
                     current_log = newer_log;
                     break; // break inner loop to spawn new tail
                 }
@@ -2328,6 +2330,8 @@ fn service_logs(error_only: bool) -> Result<()> {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    drop(child.kill());
+                    drop(child.wait());
                     anyhow::bail!("Error waiting on PowerShell process: {e}");
                 }
             }
@@ -2337,8 +2341,8 @@ fn service_logs(error_only: bool) -> Result<()> {
             if let Some(newer_log) = find_latest_log_file(&log_dir, base_name) {
                 if newer_log != current_log {
                     println!("\n--- Log rotated to: {} ---\n", newer_log.display());
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    drop(child.kill());
+                    drop(child.wait());
                     current_log = newer_log;
                     break;
                 }
@@ -2805,5 +2809,77 @@ mod tests {
 
         let result = find_latest_log_file(tmp.path(), "freenet");
         assert_eq!(result, Some(new));
+    }
+
+    #[test]
+    fn test_find_latest_log_file_skips_empty_static_file() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Empty static file should be skipped
+        fs::write(tmp.path().join("freenet.log"), "").unwrap();
+        // Rotated file with content should be found
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let rotated = tmp.path().join("freenet.2025-12-31.log");
+        fs::write(&rotated, "content").unwrap();
+
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(rotated));
+    }
+
+    #[test]
+    fn test_find_latest_log_file_no_matching_files() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // No files at all
+        assert_eq!(find_latest_log_file(tmp.path(), "freenet"), None);
+
+        // Unrelated files only
+        std::fs::write(tmp.path().join("other.log"), "data").unwrap();
+        assert_eq!(find_latest_log_file(tmp.path(), "freenet"), None);
+    }
+
+    #[test]
+    fn test_find_latest_log_file_static_wins_over_older_rotated() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Old rotated file
+        let rotated = tmp.path().join("freenet.2025-01-01.log");
+        fs::write(&rotated, "old").unwrap();
+
+        // Newer static file (e.g., from systemd)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let static_file = tmp.path().join("freenet.log");
+        fs::write(&static_file, "newer").unwrap();
+
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(static_file));
+    }
+
+    #[test]
+    fn test_find_latest_log_file_detects_rotation() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Simulate hour 14 log file
+        let hour14 = tmp.path().join("freenet.2025-12-31-14.log");
+        fs::write(&hour14, "hour 14 data").unwrap();
+
+        // Initially finds hour 14
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(hour14.clone()));
+
+        // Simulate rotation: hour 15 file appears with newer mtime
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let hour15 = tmp.path().join("freenet.2025-12-31-15.log");
+        fs::write(&hour15, "hour 15 data").unwrap();
+
+        // Now finds hour 15 — this is the rotation detection mechanism
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(hour15));
     }
 }
