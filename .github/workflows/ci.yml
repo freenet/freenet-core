@@ -123,6 +123,8 @@ jobs:
           fetch-depth: 0
 
       - name: Check for banned patterns in new code
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
@@ -179,7 +181,7 @@ jobs:
           fi
 
           # 5. fix: PRs must add at least one new test (check all Rust files, not just src/)
-          PR_TITLE="${{ github.event.pull_request.title }}"
+          # PR_TITLE is set via env: above to avoid shell injection from backticks in titles
           IS_FIX=$(echo "$PR_TITLE" | grep -ciE '^fix(\(.*\))?:' || true)
           HAS_EXEMPT_LABEL=$(echo "${{ join(github.event.pull_request.labels.*.name, ',') }}" | grep -c 'test-exempt' || true)
 
