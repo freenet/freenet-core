@@ -553,7 +553,7 @@ function freenetBridge(authToken) {
   // the iframe in sync when the user navigates via browser controls.
   function forwardHash() {
     if (location.hash) {
-      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash });
+      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 128) });
     }
   }
   iframe.addEventListener('load', forwardHash);
@@ -1108,6 +1108,10 @@ mod tests {
         assert!(
             SHELL_BRIDGE_JS.contains("hashchange"),
             "bridge JS must forward hash on manual URL fragment edits"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("if (location.hash)"),
+            "bridge JS must not forward empty hash to iframe"
         );
     }
 
