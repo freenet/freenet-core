@@ -442,6 +442,7 @@ function freenetBridge(authToken) {
   var MAX_CONNECTIONS = 32;
   var iframe = document.getElementById('app');
   var connections = new Map();
+  var lastClipboard = 0;
 
   function sendToIframe(msg) {
     iframe.contentWindow.postMessage(msg, '*');
@@ -465,6 +466,27 @@ function freenetBridge(authToken) {
         } catch(e) { return; }
         var link = document.querySelector('link[rel="icon"]');
         if (link) link.href = msg.href;
+      } else if (msg.type === 'hash' && typeof msg.hash === 'string') {
+        // Only allow # fragments — reject anything that could modify path/query.
+        // Note: replaceState (not pushState) is intentional — avoids polluting
+        // browser history with every in-app route change. This also means
+        // replaceState does NOT fire popstate or hashchange, preventing loops.
+        var h = msg.hash.slice(0, 1024);
+        if (h.length > 0 && h.charAt(0) === '#') {
+          history.replaceState(null, '', h);
+        }
+      } else if (msg.type === 'clipboard' && typeof msg.text === 'string') {
+        // Sandboxed iframes can't use navigator.clipboard due to permissions
+        // policy. Proxy clipboard writes through the trusted shell instead.
+        // Write-only — no readText proxy to prevent exfiltration.
+        // Rate-limited to 1 write/sec to prevent clipboard spam from
+        // malicious contracts. Requires transient user activation (browser
+        // enforced) — works when the iframe sends this in a click handler.
+        var now = Date.now();
+        if (now - lastClipboard >= 1000) {
+          lastClipboard = now;
+          try { navigator.clipboard.writeText(msg.text.slice(0, 2048)); } catch(e) {}
+        }
       }
       return;
     }
@@ -540,6 +562,18 @@ function freenetBridge(authToken) {
       }
     }
   });
+
+  // Forward the shell's hash to the iframe on load so deep links work.
+  // Also listen for browser back/forward navigation (popstate) to keep
+  // the iframe in sync when the user navigates via browser controls.
+  function forwardHash() {
+    if (location.hash) {
+      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 1024) });
+    }
+  }
+  iframe.addEventListener('load', forwardHash);
+  window.addEventListener('popstate', forwardHash);
+  window.addEventListener('hashchange', forwardHash);
 }
 "#;
 
@@ -1063,6 +1097,66 @@ mod tests {
         assert!(
             SHELL_BRIDGE_JS.contains("scheme !== 'https' && scheme !== 'data'"),
             "bridge JS must restrict favicon href to https/data schemes"
+        );
+        // Hash forwarding: iframe→shell must validate # prefix and truncate
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.type === 'hash'"),
+            "bridge JS must handle hash shell messages"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("h.charAt(0) === '#'"),
+            "bridge JS must require # prefix on hash values"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.hash.slice(0, 1024)"),
+            "bridge JS must truncate hash to 1024 chars"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("history.replaceState"),
+            "bridge JS must use replaceState (not pushState) to avoid polluting browser history"
+        );
+        assert!(
+            !SHELL_BRIDGE_JS.contains("history.pushState"),
+            "bridge JS must not use pushState — hash changes should replace, not push"
+        );
+        // Hash forwarding: shell→iframe on load for deep linking
+        assert!(
+            SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
+            "bridge JS must forward hash to iframe on load"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("popstate"),
+            "bridge JS must forward hash on browser back/forward"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("hashchange"),
+            "bridge JS must forward hash on manual URL fragment edits"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("if (location.hash)"),
+            "bridge JS must not forward empty hash to iframe"
+        );
+        // Clipboard proxy: shell writes to clipboard on behalf of sandboxed iframe
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.type === 'clipboard'"),
+            "bridge JS must handle clipboard shell messages"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("navigator.clipboard.writeText"),
+            "bridge JS must proxy clipboard writes through the shell"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.text.slice(0, 2048)"),
+            "bridge JS must truncate clipboard text to 2048 chars"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("lastClipboard"),
+            "bridge JS must rate-limit clipboard writes"
+        );
+        assert!(
+            !SHELL_BRIDGE_JS.contains("clipboard.readText")
+                && !SHELL_BRIDGE_JS.contains("clipboard.read("),
+            "bridge JS must be clipboard write-only — no read access"
         );
     }
 
