@@ -29,24 +29,12 @@ use super::streaming::StreamHandle;
 /// Maximum time to wait for congestion window space *per fragment* before aborting a stream
 /// transfer. Resets for each fragment, so a slow-but-progressing transfer won't time out.
 ///
-/// Derived from the receiver's STREAM_INACTIVITY_TIMEOUT minus a 10s margin, so the sender
-/// fails first with a diagnostic message rather than the receiver timing out silently.
+/// Must be shorter than STREAM_INACTIVITY_TIMEOUT (5s) so the sender fails first with a
+/// diagnostic message rather than the receiver timing out silently.
 ///
-/// This is intentionally longer than `PROGRESS_TIMEOUT` (7s) in the GC task:
-/// if a cwnd stall causes a GET to stall, the GC task fires first (launching
-/// a speculative retry on a different peer), then this timeout fires later
-/// (cleaning up the stuck send task). The layered recovery ensures the user
-/// gets a fast retry without waiting for the transport-level timeout.
-const CWND_WAIT_TIMEOUT: Duration = {
-    const MARGIN_SECS: u64 = 10;
-    const INACTIVITY_SECS: u64 = super::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs();
-    // Compile-time check: STREAM_INACTIVITY_TIMEOUT must exceed the margin.
-    assert!(
-        INACTIVITY_SECS > MARGIN_SECS,
-        "STREAM_INACTIVITY_TIMEOUT must be > 10s"
-    );
-    Duration::from_secs(INACTIVITY_SECS - MARGIN_SECS)
-};
+/// With STREAM_INACTIVITY_TIMEOUT at 5s, a 3s cwnd wait gives the sender 2s headroom
+/// to fail and report before the receiver's inactivity timeout fires.
+const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Stream payload type using zero-copy Bytes for efficient fragmentation.
 /// Using Bytes::slice() instead of Vec::split_off() eliminates per-fragment allocations.

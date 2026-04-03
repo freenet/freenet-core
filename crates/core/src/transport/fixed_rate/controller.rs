@@ -40,7 +40,7 @@ pub const DEFAULT_RATE_BYTES_PER_SEC: usize = 1_250_000;
 ///
 /// Previously set to 2 packets (2400 bytes), which caused production stream
 /// stalls: if both trickle packets were lost, the sender blocked for the
-/// full 20s CWND_WAIT_TIMEOUT before aborting. This was observed as ~10
+/// full CWND_WAIT_TIMEOUT before aborting. This was observed as ~10
 /// cwnd timeouts/hour on the gateway, causing GET failures for users.
 const LOSS_PAUSE_MARGIN: usize = 50 * MAX_PACKET_SIZE;
 
@@ -360,7 +360,7 @@ mod tests {
     }
 
     /// Regression test: with the old 2-packet margin, a single loss event during
-    /// a 1MB stream transfer could stall the sender for 20s (CWND_WAIT_TIMEOUT)
+    /// a 1MB stream transfer could stall the sender for the full CWND_WAIT_TIMEOUT
     /// if both trickle packets were also lost. The 50-packet margin ensures that
     /// even at 20% loss, the sender can sustain enough data flow for ACKs to
     /// arrive and clear the pause.
