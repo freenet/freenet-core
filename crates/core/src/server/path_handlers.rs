@@ -465,6 +465,13 @@ function freenetBridge(authToken) {
         } catch(e) { return; }
         var link = document.querySelector('link[rel="icon"]');
         if (link) link.href = msg.href;
+      } else if (msg.type === 'hash' && typeof msg.hash === 'string') {
+        // Only allow # fragments — reject anything that could modify path/query.
+        // Truncate to 128 chars to match the title length limit.
+        var h = msg.hash.slice(0, 128);
+        if (h.length > 0 && h.charAt(0) === '#') {
+          history.replaceState(null, '', h);
+        }
       }
       return;
     }
@@ -540,6 +547,17 @@ function freenetBridge(authToken) {
       }
     }
   });
+
+  // Forward the shell's hash to the iframe on load so deep links work.
+  // Also listen for browser back/forward navigation (popstate) to keep
+  // the iframe in sync when the user navigates via browser controls.
+  function forwardHash() {
+    if (location.hash) {
+      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash });
+    }
+  }
+  iframe.addEventListener('load', forwardHash);
+  window.addEventListener('popstate', forwardHash);
 }
 "#;
 
@@ -1063,6 +1081,28 @@ mod tests {
         assert!(
             SHELL_BRIDGE_JS.contains("scheme !== 'https' && scheme !== 'data'"),
             "bridge JS must restrict favicon href to https/data schemes"
+        );
+        // Hash forwarding: iframe→shell must validate # prefix and truncate
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.type === 'hash'"),
+            "bridge JS must handle hash shell messages"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("h.charAt(0) === '#'"),
+            "bridge JS must require # prefix on hash values"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.hash.slice(0, 128)"),
+            "bridge JS must truncate hash to 128 chars"
+        );
+        // Hash forwarding: shell→iframe on load for deep linking
+        assert!(
+            SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
+            "bridge JS must forward hash to iframe on load"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("popstate"),
+            "bridge JS must forward hash on browser back/forward"
         );
     }
 
