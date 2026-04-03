@@ -927,6 +927,30 @@ mod tests {
         );
     }
 
+    /// Regression test: the iframe must use data-src (not src) so JS can build
+    /// the final URL with the hash fragment before triggering the first load.
+    /// Previously, src was set in HTML and the hash was sent via postMessage on
+    /// the load event, but WASM apps hadn't registered their listener yet.
+    /// See: #3747 (comment)
+    #[tokio::test]
+    async fn shell_page_iframe_uses_data_src_for_deep_linking() {
+        let token = AuthToken::generate();
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+
+        // The iframe must NOT have a src attribute (which would trigger an
+        // immediate load before JS can append the hash fragment).
+        assert!(
+            !html.contains(r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" src="#),
+            "iframe must use data-src, not src, to avoid loading before JS appends the hash"
+        );
+        // The iframe must have data-src with the sandbox URL.
+        assert!(
+            html.contains("data-src=\"/"),
+            "iframe must have data-src attribute for JS to read"
+        );
+    }
+
     #[tokio::test]
     async fn shell_page_forwards_query_params_to_iframe() {
         let token = AuthToken::generate();
