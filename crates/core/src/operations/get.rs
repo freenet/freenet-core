@@ -2767,7 +2767,7 @@ impl Operation for GetOp {
                             let stalled_peer_info = retry_op.failure_routing_info();
 
                             match retry_op.retry_with_next_alternative(max_htl, &all_connected) {
-                                Ok((new_op, msg)) => {
+                                Ok((mut new_op, msg)) => {
                                     if let Some((peer, contract_location)) = stalled_peer_info {
                                         op_manager.ring.routing_finished(
                                             crate::router::RouteEvent {
@@ -2777,16 +2777,29 @@ impl Operation for GetOp {
                                             },
                                         );
                                     }
+                                    // Track speculative path to respect MAX_SPECULATIVE_PATHS
+                                    // cap, matching the GC task behavior.
+                                    new_op.speculative_paths += 1;
+                                    let target = match new_op.get_next_hop_addr() {
+                                        Some(addr) => addr,
+                                        None => {
+                                            tracing::error!(
+                                                tx = %id,
+                                                "Retry peer has no socket address"
+                                            );
+                                            return Err(OpError::StreamCancelled);
+                                        }
+                                    };
                                     tracing::info!(
                                         tx = %id,
                                         stream_id = %stream_id,
+                                        %target,
                                         error = %e,
                                         "Stream assembly failed, retrying GET with next peer"
                                     );
-                                    let target = new_op.get_next_hop_addr();
                                     return Ok(OperationResult::SendAndContinue {
                                         msg: NetMessage::from(msg),
-                                        next_hop: target,
+                                        next_hop: Some(target),
                                         state: OpEnum::Get(new_op),
                                         stream_data: None,
                                     });
