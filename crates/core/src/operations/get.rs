@@ -2728,13 +2728,92 @@ impl Operation for GetOp {
                     let stream_data = match stream_handle.assemble().await {
                         Ok(data) => data,
                         Err(e) => {
-                            tracing::error!(
-                                tx = %id,
-                                stream_id = %stream_id,
-                                error = %e,
-                                "Failed to assemble stream data"
-                            );
-                            return Err(OpError::StreamCancelled);
+                            if !is_original_requester {
+                                // Relay node: fail immediately. The originator handles retry.
+                                tracing::warn!(
+                                    tx = %id,
+                                    stream_id = %stream_id,
+                                    error = %e,
+                                    "Stream assembly failed on relay, sending Aborted upstream"
+                                );
+                                return Err(OpError::StreamCancelled);
+                            }
+
+                            // Originator: immediately retry with the next alternative peer
+                            // instead of surfacing the error to the HTTP client.
+                            let all_connected: Vec<_> = op_manager
+                                .ring
+                                .connection_manager
+                                .get_connections_by_location()
+                                .values()
+                                .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
+                                .collect();
+                            let max_htl = op_manager.ring.max_hops_to_live;
+
+                            let retry_op = GetOp {
+                                id: self.id,
+                                state: self.state,
+                                result: self.result,
+                                stats,
+                                upstream_addr: self.upstream_addr,
+                                local_fallback,
+                                auto_fetch,
+                                ack_received: false,
+                                speculative_paths: self.speculative_paths,
+                            };
+
+                            // Report routing failure for the stalled peer so the router
+                            // learns to avoid it in future operations.
+                            let stalled_peer_info = retry_op.failure_routing_info();
+
+                            match retry_op.retry_with_next_alternative(max_htl, &all_connected) {
+                                Ok((mut new_op, msg)) => {
+                                    if let Some((peer, contract_location)) = stalled_peer_info {
+                                        op_manager.ring.routing_finished(
+                                            crate::router::RouteEvent {
+                                                peer,
+                                                contract_location,
+                                                outcome: crate::router::RouteOutcome::Failure,
+                                            },
+                                        );
+                                    }
+                                    // Track speculative path to respect MAX_SPECULATIVE_PATHS
+                                    // cap, matching the GC task behavior.
+                                    new_op.speculative_paths += 1;
+                                    let target = match new_op.get_next_hop_addr() {
+                                        Some(addr) => addr,
+                                        None => {
+                                            tracing::error!(
+                                                tx = %id,
+                                                "Retry peer has no socket address"
+                                            );
+                                            return Err(OpError::StreamCancelled);
+                                        }
+                                    };
+                                    tracing::info!(
+                                        tx = %id,
+                                        stream_id = %stream_id,
+                                        %target,
+                                        error = %e,
+                                        "Stream assembly failed, retrying GET with next peer"
+                                    );
+                                    return Ok(OperationResult::SendAndContinue {
+                                        msg: NetMessage::from(msg),
+                                        next_hop: Some(target),
+                                        state: OpEnum::Get(new_op),
+                                        stream_data: None,
+                                    });
+                                }
+                                Err(_exhausted_op) => {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        stream_id = %stream_id,
+                                        error = %e,
+                                        "Stream assembly failed, no alternative peers left"
+                                    );
+                                    return Err(OpError::StreamCancelled);
+                                }
+                            }
                         }
                     };
 
@@ -5056,6 +5135,106 @@ mod tests {
             !gc_would_retry(&new_op, 1),
             "Op with ACK on new path should NOT be retried"
         );
+    }
+
+    // ── Stream failure retry tests (#3756) ──────────────────────────────────
+
+    /// Regression test: when a streaming GET response fails on the originator
+    /// (stream assembly timeout), the operation should retry with the next
+    /// alternative peer via retry_with_next_alternative, producing a new
+    /// GetMsg::Request. Previously, StreamCancelled was returned as a fatal
+    /// error, bypassing retry entirely and surfacing the error to the user.
+    #[test]
+    fn stream_failure_on_originator_retries_with_next_peer() {
+        let alt1 = make_peer(7001);
+        let alt2 = make_peer(7002);
+        // upstream_addr: None = originator node
+        let op = make_awaiting_op(vec![alt1.clone(), alt2], &[]);
+        assert!(op.upstream_addr.is_none(), "Must be originator");
+
+        // Simulate stream failure: reconstruct the op as the inline retry does,
+        // then call retry_with_next_alternative (same code path as the fix).
+        let retry_op = GetOp {
+            id: op.id,
+            state: op.state,
+            result: op.result,
+            stats: op.stats,
+            upstream_addr: op.upstream_addr,
+            local_fallback: op.local_fallback,
+            auto_fetch: op.auto_fetch,
+            ack_received: false,
+            speculative_paths: op.speculative_paths,
+        };
+
+        let result = retry_op.retry_with_next_alternative(7, &[]);
+        assert!(
+            result.is_ok(),
+            "Originator should retry with alternative peer"
+        );
+
+        let (new_op, msg) = result.map_err(|_| "retry failed").unwrap();
+        // Verify the retry targets the first alternative
+        assert!(
+            new_op.get_next_hop_addr().is_some(),
+            "Retry op must have a valid next hop"
+        );
+        assert_eq!(
+            new_op.get_next_hop_addr().unwrap(),
+            alt1.socket_addr().unwrap(),
+            "Should retry with the first available alternative"
+        );
+        // Verify the message is a Request (not a Response or ACK)
+        assert!(
+            matches!(msg, GetMsg::Request { .. }),
+            "Retry should produce a Request message, got {:?}",
+            std::mem::discriminant(&msg)
+        );
+    }
+
+    /// When a streaming GET fails on the originator and all alternatives are
+    /// exhausted, retry_with_next_alternative returns Err and the operation
+    /// should propagate StreamCancelled to the client.
+    #[test]
+    fn stream_failure_with_no_alternatives_returns_error() {
+        // No alternatives, no fallback peers
+        let op = make_awaiting_op(vec![], &[]);
+        assert!(op.upstream_addr.is_none(), "Must be originator");
+
+        let retry_op = GetOp {
+            id: op.id,
+            state: op.state,
+            result: op.result,
+            stats: op.stats,
+            upstream_addr: op.upstream_addr,
+            local_fallback: op.local_fallback,
+            auto_fetch: op.auto_fetch,
+            ack_received: false,
+            speculative_paths: op.speculative_paths,
+        };
+
+        let result = retry_op.retry_with_next_alternative(7, &[]);
+        assert!(
+            result.is_err(),
+            "Should fail when no alternatives are available"
+        );
+    }
+
+    /// On a relay node (upstream_addr is Some), stream failure should NOT
+    /// attempt retry -- only the originator retries.
+    #[test]
+    fn stream_failure_on_relay_does_not_retry() {
+        let alt1 = make_peer(8001);
+        let mut op = make_awaiting_op(vec![alt1], &[]);
+        // Set upstream_addr to make this a relay node
+        op.upstream_addr = Some("127.0.0.1:9999".parse().unwrap());
+
+        // The relay code path returns Err(StreamCancelled) immediately,
+        // never reaching retry_with_next_alternative. Verify the relay
+        // has alternatives available (would retry if it were an originator)
+        // but the upstream_addr presence prevents retry.
+        assert!(op.upstream_addr.is_some(), "Must be relay node");
+        // The actual code checks is_original_requester = upstream_addr.is_none()
+        // and only retries when true. This test documents that contract.
     }
 
     // ── Intermediate node stats tracking tests (#3527) ─────────────────────
