@@ -558,6 +558,7 @@ function freenetBridge(authToken) {
   }
   iframe.addEventListener('load', forwardHash);
   window.addEventListener('popstate', forwardHash);
+  window.addEventListener('hashchange', forwardHash);
 }
 "#;
 
@@ -1103,6 +1104,10 @@ mod tests {
         assert!(
             SHELL_BRIDGE_JS.contains("popstate"),
             "bridge JS must forward hash on browser back/forward"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("hashchange"),
+            "bridge JS must forward hash on manual URL fragment edits"
         );
     }
 
