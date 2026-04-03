@@ -1051,6 +1051,47 @@ mod tests {
         assert_eq!(result.unwrap().len(), total as usize);
     }
 
+    /// Regression test: a stream that receives some fragments then goes silent for longer
+    /// than STREAM_INACTIVITY_TIMEOUT (5s) must be killed with InactivityTimeout.
+    /// Previously this timeout was 30s, causing users to wait 30-40s before retry on
+    /// stalled streams. Production data showed p90 successful transfer completes in 673ms,
+    /// making 30s of silence conclusive evidence of a dead stream.
+    #[tokio::test]
+    async fn test_stalled_stream_killed_within_inactivity_timeout() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 5) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        tokio::time::pause();
+
+        // Deliver 2 of 5 fragments, then go silent (simulating a stalled sender).
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        handle
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        let start = tokio::time::Instant::now();
+        let result = handle.assemble().await;
+
+        // Must fail with InactivityTimeout, not hang for 30s.
+        assert!(
+            matches!(result, Err(StreamError::InactivityTimeout)),
+            "Stalled stream should be killed by inactivity timeout, got: {:?}",
+            result
+        );
+
+        // Verify the timeout fired at ~5s, not ~30s.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "Inactivity timeout should fire within ~5s, took {:?}",
+            elapsed
+        );
+    }
+
     #[tokio::test]
     async fn test_multiple_independent_streams() {
         use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;

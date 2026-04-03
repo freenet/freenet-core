@@ -36,6 +36,12 @@ use super::streaming::StreamHandle;
 /// to fail and report before the receiver's inactivity timeout fires.
 const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 
+// Compile-time guard: sender must fail before receiver so the failure is diagnostic.
+const _: () = assert!(
+    CWND_WAIT_TIMEOUT.as_secs() < super::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs(),
+    "CWND_WAIT_TIMEOUT must be shorter than STREAM_INACTIVITY_TIMEOUT"
+);
+
 /// Stream payload type using zero-copy Bytes for efficient fragmentation.
 /// Using Bytes::slice() instead of Vec::split_off() eliminates per-fragment allocations.
 pub(crate) type SerializedStream = Bytes;
