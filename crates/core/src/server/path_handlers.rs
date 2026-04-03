@@ -346,7 +346,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -443,6 +443,16 @@ function freenetBridge(authToken) {
   var iframe = document.getElementById('app');
   var connections = new Map();
   var lastClipboard = 0;
+
+  // Build iframe src from data-src, appending any URL hash for deep
+  // linking. Using data-src (not src) in the HTML means the iframe
+  // doesn't start loading until we set .src here, so there is exactly
+  // one load -- with the hash already in the URL.
+  var iframeSrc = iframe.getAttribute('data-src');
+  if (location.hash) {
+    iframeSrc += location.hash.slice(0, 1024);
+  }
+  iframe.src = iframeSrc;
 
   function sendToIframe(msg) {
     iframe.contentWindow.postMessage(msg, '*');
@@ -563,15 +573,13 @@ function freenetBridge(authToken) {
     }
   });
 
-  // Forward the shell's hash to the iframe on load so deep links work.
-  // Also listen for browser back/forward navigation (popstate) to keep
-  // the iframe in sync when the user navigates via browser controls.
+  // Forward runtime hash changes (browser back/forward, manual URL edits)
+  // via postMessage. By this point the WASM app's listener is active.
   function forwardHash() {
     if (location.hash) {
       sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 1024) });
     }
   }
-  iframe.addEventListener('load', forwardHash);
   window.addEventListener('popstate', forwardHash);
   window.addEventListener('hashchange', forwardHash);
 }
@@ -1119,10 +1127,18 @@ mod tests {
             !SHELL_BRIDGE_JS.contains("history.pushState"),
             "bridge JS must not use pushState — hash changes should replace, not push"
         );
-        // Hash forwarding: shell→iframe on load for deep linking
+        // Initial hash: built into iframe src from data-src for deep linking
         assert!(
-            SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
-            "bridge JS must forward hash to iframe on load"
+            SHELL_BRIDGE_JS.contains("iframe.getAttribute('data-src')"),
+            "bridge JS must read base URL from data-src attribute"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("iframe.src = iframeSrc"),
+            "bridge JS must set iframe src from data-src (single load, no race)"
+        );
+        assert!(
+            !SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
+            "bridge JS must NOT use load event for hash forwarding (race with WASM init)"
         );
         assert!(
             SHELL_BRIDGE_JS.contains("popstate"),
