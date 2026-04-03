@@ -2728,13 +2728,79 @@ impl Operation for GetOp {
                     let stream_data = match stream_handle.assemble().await {
                         Ok(data) => data,
                         Err(e) => {
-                            tracing::error!(
-                                tx = %id,
-                                stream_id = %stream_id,
-                                error = %e,
-                                "Failed to assemble stream data"
-                            );
-                            return Err(OpError::StreamCancelled);
+                            if !is_original_requester {
+                                // Relay node: fail immediately. The originator handles retry.
+                                tracing::warn!(
+                                    tx = %id,
+                                    stream_id = %stream_id,
+                                    error = %e,
+                                    "Stream assembly failed on relay, sending Aborted upstream"
+                                );
+                                return Err(OpError::StreamCancelled);
+                            }
+
+                            // Originator: immediately retry with the next alternative peer
+                            // instead of surfacing the error to the HTTP client.
+                            let all_connected: Vec<_> = op_manager
+                                .ring
+                                .connection_manager
+                                .get_connections_by_location()
+                                .values()
+                                .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
+                                .collect();
+                            let max_htl = op_manager.ring.max_hops_to_live;
+
+                            let retry_op = GetOp {
+                                id: self.id,
+                                state: self.state,
+                                result: self.result,
+                                stats,
+                                upstream_addr: self.upstream_addr,
+                                local_fallback,
+                                auto_fetch,
+                                ack_received: false,
+                                speculative_paths: self.speculative_paths,
+                            };
+
+                            // Report routing failure for the stalled peer so the router
+                            // learns to avoid it in future operations.
+                            let stalled_peer_info = retry_op.failure_routing_info();
+
+                            match retry_op.retry_with_next_alternative(max_htl, &all_connected) {
+                                Ok((new_op, msg)) => {
+                                    if let Some((peer, contract_location)) = stalled_peer_info {
+                                        op_manager.ring.routing_finished(
+                                            crate::router::RouteEvent {
+                                                peer,
+                                                contract_location,
+                                                outcome: crate::router::RouteOutcome::Failure,
+                                            },
+                                        );
+                                    }
+                                    tracing::info!(
+                                        tx = %id,
+                                        stream_id = %stream_id,
+                                        error = %e,
+                                        "Stream assembly failed, retrying GET with next peer"
+                                    );
+                                    let target = new_op.get_next_hop_addr();
+                                    return Ok(OperationResult::SendAndContinue {
+                                        msg: NetMessage::from(msg),
+                                        next_hop: target,
+                                        state: OpEnum::Get(new_op),
+                                        stream_data: None,
+                                    });
+                                }
+                                Err(_exhausted_op) => {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        stream_id = %stream_id,
+                                        error = %e,
+                                        "Stream assembly failed, no alternative peers left"
+                                    );
+                                    return Err(OpError::StreamCancelled);
+                                }
+                            }
                         }
                     };
 
