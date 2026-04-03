@@ -472,6 +472,11 @@ function freenetBridge(authToken) {
         if (h.length > 0 && h.charAt(0) === '#') {
           history.replaceState(null, '', h);
         }
+      } else if (msg.type === 'clipboard' && typeof msg.text === 'string') {
+        // Sandboxed iframes can't use navigator.clipboard due to permissions
+        // policy. Proxy clipboard writes through the trusted shell instead.
+        // Truncate to 2048 chars to prevent abuse via excessively large strings.
+        try { navigator.clipboard.writeText(msg.text.slice(0, 2048)); } catch(e) {}
       }
       return;
     }
@@ -1112,6 +1117,19 @@ mod tests {
         assert!(
             SHELL_BRIDGE_JS.contains("if (location.hash)"),
             "bridge JS must not forward empty hash to iframe"
+        );
+        // Clipboard proxy: shell writes to clipboard on behalf of sandboxed iframe
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.type === 'clipboard'"),
+            "bridge JS must handle clipboard shell messages"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("navigator.clipboard.writeText"),
+            "bridge JS must proxy clipboard writes through the shell"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.text.slice(0, 2048)"),
+            "bridge JS must truncate clipboard text to 2048 chars"
         );
     }
 
