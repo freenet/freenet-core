@@ -1536,7 +1536,8 @@ async fn process_open_request(
                         // Reject Subscribe if the contract WASM isn't cached locally.
                         // Without WASM, the node can't validate or apply updates,
                         // leading to a "subscribed but can't update" state.
-                        // Clients must PUT or GET (with return_contract_code=true) first.
+                        // Clients must PUT or GET first (any GET will cache WASM
+                        // internally regardless of return_contract_code, see #3757).
                         //
                         // Note: This only guards explicit ContractRequest::Subscribe.
                         // GET+subscribe=true and PUT+subscribe=true bypass this check
@@ -1566,12 +1567,12 @@ async fn process_open_request(
                                     request_id = %request_id,
                                     contract = %key,
                                     "Rejecting SUBSCRIBE: contract WASM not cached locally. \
-                                     PUT the contract or GET with return_contract_code=true first."
+                                     PUT the contract or GET the contract first."
                                 );
                                 return Err(Error::Node(format!(
                                     "Cannot subscribe to contract {key}: contract WASM/parameters \
-                                     not cached locally. PUT the contract or GET with \
-                                     return_contract_code=true before subscribing."
+                                     not cached locally. PUT the contract or GET the contract \
+                                     before subscribing."
                                 )));
                             }
                             Err(err) => {
