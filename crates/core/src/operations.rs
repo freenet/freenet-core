@@ -528,6 +528,7 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
 
 /// Establish subscription tree entries at a relay node during GET response forwarding.
 ///
+///
 /// When a GET with `subscribe=true` propagates back through relay nodes, each relay
 /// registers itself in the subscription tree. This eliminates the need for a separate
 /// SUBSCRIBE round-trip after GET completes. See #3760.
