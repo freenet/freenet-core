@@ -1266,26 +1266,37 @@ async fn process_open_request(
                             }
                         }
 
-                        // Return local cache if we have valid state AND EITHER:
-                        // 1. No connections (isolated node - can only use local cache), OR
-                        // 2. Actively subscribed (cache is fresh via subscription updates)
+                        // Check if we're actively hosting this contract.
+                        let is_hosted = full_key
+                            .as_ref()
+                            .map(|k| op_manager.ring.is_hosting_contract(k))
+                            .unwrap_or(false);
+
+                        // Return local cache if we have valid state AND any of:
+                        // 1. No connections (isolated node - can only use local cache)
+                        // 2. Actively subscribed (cache is kept fresh via updates)
+                        // 3. Hosting the contract (committed to keeping it current;
+                        //    subscription may be in progress or between renewals)
                         //
-                        // Hosted-but-not-subscribed contracts are NOT short-circuited:
-                        // after restart, subscriptions are lost (in-memory only) so hosted
-                        // contracts would be served stale forever. The network GET path
-                        // has local_fallback so if the network is unreachable we still
-                        // return cached state, but we attempt a fresh fetch first.
-                        // See #3698.
-                        if local_satisfies_request && (connection_count == 0 || is_subscribed) {
+                        // Hosting is sufficient because: a hosted contract was either
+                        // just fetched from the network (fresh) or loaded from disk at
+                        // startup (subscription renewal will refresh it). Without this,
+                        // every HTTP GET goes to the network even seconds after the
+                        // first load because the async subscribe sub-operation takes
+                        // 10-50s to complete, during which is_subscribed is false.
+                        if local_satisfies_request
+                            && (connection_count == 0 || is_subscribed || is_hosted)
+                        {
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
 
-                            tracing::debug!(
+                            tracing::info!(
                                 client_id = %client_id,
                                 request_id = %request_id,
                                 peer = %peer_id,
                                 contract = %full_key,
                                 is_subscribed,
+                                is_hosted,
                                 connection_count,
                                 phase = "local_cache",
                                 "Returning locally cached contract state"
