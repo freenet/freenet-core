@@ -8120,3 +8120,144 @@ fn test_get_reliability_with_churn() {
         );
     }
 }
+
+/// Test that GET with piggybacked subscription (#3760) delivers updates
+/// without a separate SUBSCRIBE operation.
+///
+/// Verifies the core optimization: when `AUTO_SUBSCRIBE_ON_GET=true`, the GET
+/// response path builds the subscription tree at relay nodes, so a subsequent
+/// UPDATE propagates to the GET requester without needing a separate SUBSCRIBE.
+///
+/// Topology: 1 gateway + 3 nodes.
+/// 1. Gateway PUTs contract
+/// 2. Nodes GET the contract (no explicit Subscribe)
+/// 3. Gateway sends UPDATE
+/// 4. Assert all nodes converge to the same state (update propagated)
+#[test_log::test]
+fn test_get_piggyback_subscription_delivers_updates() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x3760_CAFE_0001;
+    const NETWORK_NAME: &str = "get-piggyback-sub-test";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,  // 1 gateway
+            3,  // 3 regular nodes
+            7,  // max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0x37);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+
+    let initial_state = SimOperation::create_test_state(1);
+    let update_state = SimOperation::create_test_state(2);
+
+    let operations = vec![
+        // Step 1: Gateway puts contract with initial state and subscribes
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state,
+                subscribe: true,
+            },
+        ),
+        // Step 2: Nodes GET the contract -- NO explicit Subscribe.
+        // With AUTO_SUBSCRIBE_ON_GET=true, the GET wire message carries
+        // subscribe=true, and relay nodes build the subscription tree
+        // during response propagation (#3760).
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false, // Client says false, but AUTO_SUBSCRIBE_ON_GET forces true on wire
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+        // Step 3: Gateway updates -- should propagate to all nodes via
+        // the subscription tree built during GET response forwarding.
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: update_state,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(60),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete successfully: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+
+    tracing::info!(
+        "GET piggyback subscription convergence: {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len()
+    );
+
+    for diverged in &convergence.diverged {
+        tracing::error!(
+            "DIVERGED: {} - {} unique states across {} peers",
+            diverged.contract_key,
+            diverged.unique_state_count(),
+            diverged.peer_states.len()
+        );
+        for (peer, hash) in &diverged.peer_states {
+            tracing::error!("  peer {}: {}", peer, hash);
+        }
+    }
+
+    assert!(
+        convergence.is_converged(),
+        "GET piggyback subscription (#3760) REGRESSION: State divergence detected! \
+         Updates should propagate via subscription tree built during GET response forwarding. \
+         {} contracts converged, {} diverged. \
+         If this fails, the piggybacked subscription at relay nodes is not building a \
+         working subscription tree.",
+        convergence.converged.len(),
+        convergence.diverged.len()
+    );
+}
