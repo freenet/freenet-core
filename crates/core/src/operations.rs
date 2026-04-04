@@ -538,7 +538,18 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
 /// 3. Register the GET requester (downstream) as downstream subscriber
 /// 4. Announce that we host this contract (so neighbors send UPDATEs to us)
 ///
+/// Note: step 4 calls `announce_contract_hosted`, which the old GET relay path
+/// deliberately avoided ("relay peers should not advertise contracts they are not
+/// responsible for in the ring"). This is now correct because relay nodes
+/// participating in the subscription tree MUST receive UPDATEs to forward them
+/// downstream. Without the announcement, neighbors wouldn't include this relay
+/// in their broadcast targets.
+///
 /// Contract caching is handled separately by the caller (GET relay already does this).
+///
+/// Naming convention: GET's `upstream_addr` points toward the originator (response
+/// destination), which is the *downstream* direction in the subscription tree.
+/// `source_addr` is the response sender, *upstream* in subscription terms.
 pub(crate) async fn establish_subscription_at_relay(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -546,9 +557,12 @@ pub(crate) async fn establish_subscription_at_relay(
     upstream_response_addr: std::net::SocketAddr,
     downstream_requester_addr: std::net::SocketAddr,
 ) {
-    // 1. Mark self as subscribed
+    // 1. Mark self as subscribed (lease in active_subscriptions).
+    // Note: we do NOT call complete_subscription_request here because the relay
+    // never called mark_subscription_pending -- there's no pending request to complete,
+    // and record_success would add noise to the backoff tracker for contracts the relay
+    // has no independent subscription relationship with.
     op_manager.ring.subscribe(*key);
-    op_manager.ring.complete_subscription_request(key, true);
 
     // 2. Register upstream peer (response sender) as upstream interest source
     if let Some(upstream_pkl) = op_manager

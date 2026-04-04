@@ -461,6 +461,10 @@ struct AwaitingResponseData {
     retries: usize,
     current_hop: usize,
     subscribe: bool,
+    /// Retained for API compatibility but has no effect with piggybacked
+    /// subscriptions (#3760): the subscription tree is fully formed by the
+    /// time the GET response reaches the originator, so blocking behavior
+    /// is implicitly always satisfied.
     blocking_subscribe: bool,
     /// Peer we are currently trying to reach.
     /// Note: With connection-based routing, this is only used for state tracking,
@@ -2499,6 +2503,15 @@ impl Operation for GetOp {
                         // Establish subscription tree at this relay if the originator
                         // requested subscription. This piggybacks on the GET response
                         // path, eliminating the separate SUBSCRIBE round-trip (#3760).
+                        // Note: the contract cache write above is fire-and-forget
+                        // (GlobalExecutor::spawn), so announce_contract_hosted may
+                        // advertise the contract before the cache write completes.
+                        // This matches existing SUBSCRIBE behavior.
+                        //
+                        // Note on naming: GET's `upstream_addr` points toward the
+                        // originator, which is the *downstream* direction in the
+                        // subscription tree. `source_addr` is the response sender,
+                        // which is *upstream* in subscription terms.
                         if subscribe_requested {
                             if let (Some(response_addr), Some(requester_addr)) =
                                 (source_addr, self.upstream_addr)
@@ -2511,6 +2524,12 @@ impl Operation for GetOp {
                                     requester_addr,
                                 )
                                 .await;
+                            } else if source_addr.is_none() {
+                                tracing::warn!(
+                                    tx = %id,
+                                    contract = %key,
+                                    "Cannot establish subscription at relay: source_addr missing"
+                                );
                             }
                         }
 
@@ -2805,6 +2824,7 @@ impl Operation for GetOp {
 
                     // Establish subscription tree at this relay if requested (#3760).
                     // Done before stream assembly so the subscription is active ASAP.
+                    // See naming note above: GET upstream_addr = subscription downstream.
                     if !is_original_requester && subscribe_requested {
                         if let (Some(response_addr), Some(requester_addr)) =
                             (source_addr, self.upstream_addr)
@@ -2817,6 +2837,12 @@ impl Operation for GetOp {
                                 requester_addr,
                             )
                             .await;
+                        } else if source_addr.is_none() {
+                            tracing::warn!(
+                                tx = %id,
+                                contract = %key,
+                                "Cannot establish subscription at relay (streaming): source_addr missing"
+                            );
                         }
                     }
 
@@ -3574,8 +3600,17 @@ fn complete_originator_subscription(
         op_manager
             .interest_manager
             .register_peer_interest(key, peer_key, None, true);
+        tracing::debug!(tx = %tx, contract = %key, "subscription completed via GET piggyback{context}");
+    } else {
+        // sender_from_addr can be None for transient connections not yet in the ring.
+        // We still mark subscribed locally; the 2-minute renewal cycle will establish
+        // a full subscription tree via a standard SUBSCRIBE operation.
+        tracing::warn!(
+            tx = %tx,
+            contract = %key,
+            "GET piggyback{context}: upstream peer not in ring, subscription tree incomplete -- renewal will heal"
+        );
     }
-    tracing::debug!(tx = %tx, contract = %key, "subscription completed via GET piggyback{context}");
 }
 
 mod messages {
@@ -3628,6 +3663,8 @@ mod messages {
             /// When true, relay nodes establish subscription tree entries as the
             /// GET response propagates back, eliminating the need for a separate
             /// SUBSCRIBE round-trip. See #3760.
+            ///
+            /// Wire format change: requires MIN_COMPATIBLE_VERSION bump on release.
             subscribe: bool,
         },
         /// Response for a GET operation. Routed hop-by-hop back to originator.
