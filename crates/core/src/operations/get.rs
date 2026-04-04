@@ -47,10 +47,14 @@ pub(crate) fn start_op(
     let contract_location = Location::from(&instance_id);
     let id = Transaction::new::<GetMsg>();
     tracing::debug!(tx = %id, "Requesting get contract {instance_id} @ loc({contract_location})");
+    // Always fetch contract code from the network so the node can cache WASM
+    // for validation, subscription, and hosting. The client's return_contract_code
+    // preference only controls whether WASM is included in the client response.
+    // See issue #3757.
     let state = Some(GetState::PrepareRequest(PrepareRequestData {
         instance_id,
         id,
-        fetch_contract,
+        fetch_contract: true,
         subscribe,
         blocking_subscribe,
     }));
@@ -69,6 +73,7 @@ pub(crate) fn start_op(
         auto_fetch: false,
         ack_received: false,
         speculative_paths: 0,
+        client_return_code: fetch_contract,
     }
 }
 
@@ -82,10 +87,11 @@ pub(crate) fn start_op_with_id(
 ) -> GetOp {
     let contract_location = Location::from(&instance_id);
     tracing::debug!(tx = %id, "Requesting get contract {instance_id} @ loc({contract_location}) with existing transaction ID");
+    // Always fetch contract code from the network (see start_op and #3757)
     let state = Some(GetState::PrepareRequest(PrepareRequestData {
         instance_id,
         id,
-        fetch_contract,
+        fetch_contract: true,
         subscribe,
         blocking_subscribe,
     }));
@@ -104,6 +110,7 @@ pub(crate) fn start_op_with_id(
         auto_fetch: false,
         ack_received: false,
         speculative_paths: 0,
+        client_return_code: fetch_contract,
     }
 }
 
@@ -166,6 +173,7 @@ pub(crate) fn start_targeted_op(
         auto_fetch: true, // System-initiated, not a client request
         ack_received: false,
         speculative_paths: 0,
+        client_return_code: true, // Internal fetch, always include code
     };
 
     (op, msg)
@@ -255,6 +263,7 @@ pub(crate) async fn request_get(
                     auto_fetch: false,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: get_op.client_return_code,
                 };
 
                 op_manager.push(*id, OpEnum::Get(completed_op)).await?;
@@ -360,6 +369,7 @@ pub(crate) async fn request_get(
                 auto_fetch: get_op.auto_fetch,
                 ack_received: false,
                 speculative_paths: 0,
+                client_return_code: get_op.client_return_code,
             };
 
             // Emit get_request telemetry when initiating a GET operation
@@ -574,6 +584,11 @@ pub(crate) struct GetOp {
     /// Number of speculative parallel paths launched by the originator's GC task.
     /// Capped at MAX_SPECULATIVE_PATHS to bound network overhead.
     pub(crate) speculative_paths: u8,
+    /// Whether the client wants contract code in the response.
+    /// The node always fetches WASM from the network for internal caching,
+    /// but strips it from the client response when this is false.
+    /// See issue #3757.
+    client_return_code: bool,
 }
 
 impl GetOp {
@@ -744,6 +759,7 @@ impl GetOp {
                     auto_fetch: self.auto_fetch,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: self.client_return_code,
                 };
 
                 op_manager
@@ -813,6 +829,7 @@ impl GetOp {
                         auto_fetch: self.auto_fetch,
                         ack_received: false,
                         speculative_paths: 0,
+                        client_return_code: self.client_return_code,
                     };
 
                     op_manager
@@ -846,6 +863,7 @@ impl GetOp {
                     auto_fetch: false,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: self.client_return_code,
                 };
 
                 op_manager.push(self.id, OpEnum::Get(completed_op)).await?;
@@ -880,6 +898,7 @@ impl GetOp {
                     auto_fetch: false,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: self.client_return_code,
                 };
 
                 op_manager
@@ -924,6 +943,7 @@ impl GetOp {
                     auto_fetch: false,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: self.client_return_code,
                 };
                 op_manager.push(self.id, OpEnum::Get(failed_op)).await?;
                 return Ok(());
@@ -946,13 +966,24 @@ impl GetOp {
                 key,
                 state,
                 contract,
-            }) => Ok(HostResponse::ContractResponse(
-                freenet_stdlib::client_api::ContractResponse::GetResponse {
-                    key: *key,
-                    contract: contract.clone(),
-                    state: state.clone(),
-                },
-            )),
+            }) => {
+                // Strip contract code from client response when the client
+                // requested return_contract_code=false. The node still fetches
+                // and caches WASM internally for validation/subscription/hosting.
+                // See issue #3757.
+                let client_contract = if self.client_return_code {
+                    contract.clone()
+                } else {
+                    None
+                };
+                Ok(HostResponse::ContractResponse(
+                    freenet_stdlib::client_api::ContractResponse::GetResponse {
+                        key: *key,
+                        contract: client_contract,
+                        state: state.clone(),
+                    },
+                ))
+            }
             None => Err(ErrorKind::OperationError {
                 cause: "get didn't finish successfully".into(),
             }
@@ -1130,6 +1161,7 @@ impl Operation for GetOp {
                         auto_fetch: false,
                         ack_received: false,
                         speculative_paths: 0,
+                        client_return_code: true,
                     },
                     source_addr,
                 })
@@ -1254,6 +1286,7 @@ impl Operation for GetOp {
                             stream_data: None,
                             local_fallback: None,
                             auto_fetch: false,
+                            client_return_code: self.client_return_code,
                         });
                     } else {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
@@ -2084,6 +2117,7 @@ impl Operation for GetOp {
                                         auto_fetch: false,
                                         ack_received: false,
                                         speculative_paths: 0,
+                                        client_return_code: self.client_return_code,
                                     }),
                                 )
                                 .await?;
@@ -2608,6 +2642,7 @@ impl Operation for GetOp {
                                             auto_fetch: false,
                                             ack_received: false,
                                             speculative_paths: 0,
+                                            client_return_code: self.client_return_code,
                                         }),
                                     )
                                     .await
@@ -2639,6 +2674,7 @@ impl Operation for GetOp {
                                             auto_fetch: false,
                                             ack_received: false,
                                             speculative_paths: 0,
+                                            client_return_code: self.client_return_code,
                                         }),
                                     )
                                     .await
@@ -2760,6 +2796,7 @@ impl Operation for GetOp {
                                 auto_fetch,
                                 ack_received: false,
                                 speculative_paths: self.speculative_paths,
+                                client_return_code: self.client_return_code,
                             };
 
                             // Report routing failure for the stalled peer so the router
@@ -3125,6 +3162,7 @@ impl Operation for GetOp {
                         auto_fetch,
                         ack_received: true,
                         speculative_paths: self.speculative_paths,
+                        client_return_code: self.client_return_code,
                     })));
                 }
             }
@@ -3139,6 +3177,7 @@ impl Operation for GetOp {
                 auto_fetch,
                 stream_data,
                 local_fallback,
+                client_return_code: self.client_return_code,
             })
         })
     }
@@ -3175,6 +3214,7 @@ struct GetOpResult {
     auto_fetch: bool,
     stream_data: Option<(StreamId, bytes::Bytes)>,
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
+    client_return_code: bool,
 }
 
 fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
@@ -3188,6 +3228,7 @@ fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
         auto_fetch,
         stream_data,
         local_fallback,
+        client_return_code,
     } = params;
     // Determine the next hop for sending the message:
     // - For Response messages: route back to upstream_addr (who sent us the request)
@@ -3212,6 +3253,7 @@ fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
         auto_fetch,
         ack_received: false,
         speculative_paths: 0,
+        client_return_code,
     });
     let return_msg = msg.map(NetMessage::from);
     let op_state = output_op.map(OpEnum::Get);
@@ -3347,6 +3389,7 @@ async fn try_forward_or_return(
             stream_data: None,
             local_fallback,
             auto_fetch: false,
+            client_return_code: true,
         })
     } else if upstream_addr.is_some() {
         // No targets found — check for local fallback before returning NotFound
@@ -3367,6 +3410,7 @@ async fn try_forward_or_return(
                 stream_data: None,
                 local_fallback: None,
                 auto_fetch: false,
+                client_return_code: true,
             })
         } else {
             tracing::warn!(
@@ -3395,6 +3439,7 @@ async fn try_forward_or_return(
                 stream_data: None,
                 local_fallback: None,
                 auto_fetch: false,
+                client_return_code: true,
             })
         }
     } else {
@@ -3422,6 +3467,7 @@ async fn try_forward_or_return(
             stream_data: None,
             local_fallback: None,
             auto_fetch: false,
+            client_return_code: true,
         })
     }
 }
@@ -3621,7 +3667,7 @@ mod tests {
     use super::*;
     use crate::message::Transaction;
     use crate::operations::VisitedPeers;
-    use crate::operations::test_utils::make_contract_key;
+    use crate::operations::test_utils::{make_contract_key, make_test_contract};
 
     fn make_get_op(state: Option<GetState>, result: Option<GetResult>) -> GetOp {
         GetOp {
@@ -3634,6 +3680,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         }
     }
 
@@ -3722,6 +3769,77 @@ mod tests {
             result.is_err(),
             "to_host_result should return Err when result is None"
         );
+    }
+
+    /// Regression test for #3757: return_contract_code=false should strip contract
+    /// from client response but still cache WASM internally.
+    #[test]
+    fn get_op_to_host_result_strips_contract_when_client_return_code_false() {
+        let key = make_contract_key(1);
+        let result = GetResult {
+            key,
+            state: WrappedState::new(vec![1, 2, 3]),
+            contract: Some(make_test_contract(&[42u8; 100])),
+        };
+        let mut op = make_get_op(Some(GetState::Finished(FinishedData { key })), Some(result));
+
+        /// Extract the contract field from a to_host_result() GetResponse.
+        fn get_response_contract(op: &GetOp) -> Option<ContractContainer> {
+            let Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::GetResponse { contract, .. },
+            )) = op.to_host_result()
+            else {
+                panic!("Expected Ok(GetResponse)");
+            };
+            contract
+        }
+
+        op.client_return_code = true;
+        assert!(
+            get_response_contract(&op).is_some(),
+            "Contract should be included when client_return_code=true"
+        );
+
+        op.client_return_code = false;
+        assert!(
+            get_response_contract(&op).is_none(),
+            "Contract should be stripped when client_return_code=false"
+        );
+    }
+
+    /// Regression test for #3757: start_op and start_op_with_id should always
+    /// set fetch_contract=true internally, regardless of the client's preference.
+    #[test]
+    fn start_op_always_fetches_contract_code() {
+        let key = make_contract_key(1);
+        let instance_id = *key.id();
+
+        /// Assert that the operation's internal fetch_contract is always true
+        /// while client_return_code matches the caller's original request.
+        fn assert_fetch_state(op: &GetOp, expected_client_return: bool) {
+            let Some(GetState::PrepareRequest(data)) = &op.state else {
+                panic!("Expected PrepareRequest state");
+            };
+            assert!(
+                data.fetch_contract,
+                "Internal fetch_contract should always be true (#3757)"
+            );
+            assert_eq!(op.client_return_code, expected_client_return);
+        }
+
+        // start_op with fetch_contract=false
+        assert_fetch_state(&start_op(instance_id, false, false, false), false);
+        // start_op with fetch_contract=true
+        assert_fetch_state(&start_op(instance_id, true, false, false), true);
+
+        // start_op_with_id should behave identically
+        let tx = Transaction::new::<GetMsg>();
+        assert_fetch_state(
+            &start_op_with_id(instance_id, false, false, false, tx),
+            false,
+        );
+        let tx = Transaction::new::<GetMsg>();
+        assert_fetch_state(&start_op_with_id(instance_id, true, false, false, tx), true);
     }
 
     // Tests for outcome() method - partial coverage since full stats require complex setup
@@ -3992,6 +4110,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         match op.outcome() {
@@ -4019,6 +4138,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
         assert!(
             matches!(op_no_stats.outcome(), OpOutcome::Incomplete),
@@ -4047,6 +4167,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
         assert!(
             matches!(op_success.outcome(), OpOutcome::ContractOpSuccess { .. }),
@@ -4088,6 +4209,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         match op.outcome() {
@@ -4136,6 +4258,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         match op.outcome() {
@@ -4179,6 +4302,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         assert!(
@@ -4211,6 +4335,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         match op.outcome() {
@@ -4298,6 +4423,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         }
     }
 
@@ -4680,6 +4806,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
         assert!(!op.is_client_initiated());
     }
@@ -5164,6 +5291,7 @@ mod tests {
             auto_fetch: op.auto_fetch,
             ack_received: false,
             speculative_paths: op.speculative_paths,
+            client_return_code: true,
         };
 
         let result = retry_op.retry_with_next_alternative(7, &[]);
@@ -5210,6 +5338,7 @@ mod tests {
             auto_fetch: op.auto_fetch,
             ack_received: false,
             speculative_paths: op.speculative_paths,
+            client_return_code: true,
         };
 
         let result = retry_op.retry_with_next_alternative(7, &[]);
@@ -5252,6 +5381,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         }
     }
 
