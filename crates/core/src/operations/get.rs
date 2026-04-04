@@ -2269,7 +2269,8 @@ impl Operation for GetOp {
                                     &id,
                                     &sender_from_addr,
                                     "",
-                                );
+                                )
+                                .await;
                             }
                         } else {
                             // Only attempt to cache if we have the contract code.
@@ -2356,7 +2357,8 @@ impl Operation for GetOp {
                                                 &id,
                                                 &sender_from_addr,
                                                 "",
-                                            );
+                                            )
+                                            .await;
                                         }
                                     }
                                     ContractHandlerEvent::PutResponse {
@@ -3079,7 +3081,8 @@ impl Operation for GetOp {
                                         &id,
                                         &sender_from_addr,
                                         " (streaming)",
-                                    );
+                                    )
+                                    .await;
                                 }
                             } else if !removed_contracts.is_empty() {
                                 super::broadcast_change_interests(
@@ -3124,7 +3127,8 @@ impl Operation for GetOp {
                                     &id,
                                     &sender_from_addr,
                                     " (streaming, re-subscribe)",
-                                );
+                                )
+                                .await;
                             }
                         }
                     }
@@ -3583,10 +3587,12 @@ fn notify_get_failed(op_manager: &OpManager, tx: Transaction, reason: &str) {
 /// Complete subscription at the originator node via GET piggyback (#3760).
 ///
 /// The subscription tree was already built by relay nodes during GET response
-/// propagation. This function performs only the local registration at the
-/// originator: mark subscribed, and register the upstream peer as an interest
-/// source so UPDATEs flow back through the same path.
-fn complete_originator_subscription(
+/// propagation. This function performs the local registration at the originator:
+/// 1. Mark subscribed (lease in active_subscriptions)
+/// 2. Register the upstream peer as an interest source
+/// 3. Register local interest so ChangeInterests from peers are processed
+/// 4. Announce contract hosted so neighbors send UPDATEs
+async fn complete_originator_subscription(
     op_manager: &OpManager,
     key: &ContractKey,
     tx: &Transaction,
@@ -3595,6 +3601,19 @@ fn complete_originator_subscription(
 ) {
     op_manager.ring.subscribe(*key);
     op_manager.ring.complete_subscription_request(key, true);
+
+    // Register local interest so that ChangeInterests from peers get properly
+    // processed. Without this, has_local_interest() returns false and the
+    // ChangeInterests handler ignores peer interest registrations, breaking
+    // update propagation. Mirrors the SUBSCRIBE originator path (subscribe.rs:1625).
+    let became_interested = op_manager.interest_manager.add_local_client(key);
+    if became_interested {
+        super::broadcast_change_interests(op_manager, vec![*key], vec![]).await;
+    }
+
+    // Announce that we host this contract so neighbors include us in broadcast targets.
+    super::announce_contract_hosted(op_manager, key).await;
+
     if let Some(upstream_pkl) = sender_from_addr.as_ref() {
         let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
         op_manager
