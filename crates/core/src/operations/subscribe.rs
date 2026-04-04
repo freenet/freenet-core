@@ -1065,7 +1065,7 @@ async fn notify_abort_failure(
 /// avoids NAT timing window failures) or falls back to an address lookup. If a key
 /// is found, records the peer in both the downstream subscriber list and the interest
 /// manager so UPDATE broadcasts reach them immediately.
-async fn register_downstream_subscriber(
+pub(crate) async fn register_downstream_subscriber(
     op_manager: &OpManager,
     key: &ContractKey,
     requester_addr: std::net::SocketAddr,
