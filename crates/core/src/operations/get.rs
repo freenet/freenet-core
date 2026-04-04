@@ -2163,11 +2163,11 @@ impl Operation for GetOp {
                     let is_original_requester = self.upstream_addr.is_none();
 
                     // Check if subscription was requested
-                    let (subscribe_requested, _blocking_sub) =
+                    let subscribe_requested =
                         if let Some(GetState::AwaitingResponse(data)) = &self.state {
-                            (data.subscribe, data.blocking_subscribe)
+                            data.subscribe
                         } else {
-                            (false, false)
+                            false
                         };
 
                     // Always cache contracts we encounter - LRU will handle eviction
@@ -2259,26 +2259,17 @@ impl Operation for GetOp {
                                 }
                             }
 
-                            // Complete subscription at the originator. The subscription
-                            // tree was already built by relay nodes during GET response
-                            // propagation (subscribe piggybacking, #3760). We just need
-                            // local registration.
                             if subscribe_requested
                                 && is_original_requester
                                 && (access_result.is_new || !op_manager.ring.is_subscribed(&key))
                             {
-                                op_manager.ring.subscribe(key);
-                                op_manager.ring.complete_subscription_request(&key, true);
-                                // Register upstream peer as interest source
-                                if let Some(upstream_pkl) = sender_from_addr.as_ref() {
-                                    let peer_key = crate::ring::interest::PeerKey::from(
-                                        upstream_pkl.pub_key.clone(),
-                                    );
-                                    op_manager
-                                        .interest_manager
-                                        .register_peer_interest(&key, peer_key, None, true);
-                                }
-                                tracing::debug!(tx = %id, contract = %key, "subscription completed via GET piggyback");
+                                complete_originator_subscription(
+                                    op_manager,
+                                    &key,
+                                    &id,
+                                    &sender_from_addr,
+                                    "",
+                                );
                             }
                         } else {
                             // Only attempt to cache if we have the contract code.
@@ -2354,25 +2345,18 @@ impl Operation for GetOp {
                                             }
                                         }
 
-                                        // Complete subscription at the originator via piggyback (#3760).
                                         if subscribe_requested
                                             && is_original_requester
                                             && (access_result.is_new
                                                 || !op_manager.ring.is_subscribed(&key))
                                         {
-                                            op_manager.ring.subscribe(key);
-                                            op_manager
-                                                .ring
-                                                .complete_subscription_request(&key, true);
-                                            if let Some(upstream_pkl) = sender_from_addr.as_ref() {
-                                                let peer_key = crate::ring::interest::PeerKey::from(
-                                                    upstream_pkl.pub_key.clone(),
-                                                );
-                                                op_manager.interest_manager.register_peer_interest(
-                                                    &key, peer_key, None, true,
-                                                );
-                                            }
-                                            tracing::debug!(tx = %id, contract = %key, "subscription completed via GET piggyback");
+                                            complete_originator_subscription(
+                                                op_manager,
+                                                &key,
+                                                &id,
+                                                &sender_from_addr,
+                                                "",
+                                            );
                                         }
                                     }
                                     ContractHandlerEvent::PutResponse {
@@ -2754,11 +2738,11 @@ impl Operation for GetOp {
                     let is_original_requester = self.upstream_addr.is_none();
 
                     // Extract subscription flags from state (needed for auto-subscribe after caching)
-                    let (subscribe_requested, _blocking_sub) =
+                    let subscribe_requested =
                         if let Some(GetState::AwaitingResponse(data)) = &self.state {
-                            (data.subscribe, data.blocking_subscribe)
+                            data.subscribe
                         } else {
-                            (false, false)
+                            false
                         };
                     let piping_started = if !is_original_requester {
                         let upstream_addr = self
@@ -3063,22 +3047,17 @@ impl Operation for GetOp {
                                     .await;
                                 }
 
-                                // Complete subscription at the originator via piggyback (#3760).
                                 if subscribe_requested
                                     && is_original_requester
                                     && !op_manager.ring.is_subscribed(&key)
                                 {
-                                    op_manager.ring.subscribe(key);
-                                    op_manager.ring.complete_subscription_request(&key, true);
-                                    if let Some(upstream_pkl) = sender_from_addr.as_ref() {
-                                        let peer_key = crate::ring::interest::PeerKey::from(
-                                            upstream_pkl.pub_key.clone(),
-                                        );
-                                        op_manager
-                                            .interest_manager
-                                            .register_peer_interest(&key, peer_key, None, true);
-                                    }
-                                    tracing::debug!(tx = %id, contract = %key, "subscription completed via GET piggyback (streaming)");
+                                    complete_originator_subscription(
+                                        op_manager,
+                                        &key,
+                                        &id,
+                                        &sender_from_addr,
+                                        " (streaming)",
+                                    );
                                 }
                             } else if !removed_contracts.is_empty() {
                                 super::broadcast_change_interests(
@@ -3113,22 +3092,17 @@ impl Operation for GetOp {
                                 .await;
                             }
 
-                            // Re-subscribe for already-hosted contracts that lost subscription (#3760).
                             if subscribe_requested
                                 && is_original_requester
                                 && !op_manager.ring.is_subscribed(&key)
                             {
-                                op_manager.ring.subscribe(key);
-                                op_manager.ring.complete_subscription_request(&key, true);
-                                if let Some(upstream_pkl) = sender_from_addr.as_ref() {
-                                    let peer_key = crate::ring::interest::PeerKey::from(
-                                        upstream_pkl.pub_key.clone(),
-                                    );
-                                    op_manager
-                                        .interest_manager
-                                        .register_peer_interest(&key, peer_key, None, true);
-                                }
-                                tracing::debug!(tx = %id, contract = %key, "subscription completed via GET piggyback (streaming, re-subscribe)");
+                                complete_originator_subscription(
+                                    op_manager,
+                                    &key,
+                                    &id,
+                                    &sender_from_addr,
+                                    " (streaming, re-subscribe)",
+                                );
                             }
                         }
                     }
@@ -3582,6 +3556,30 @@ fn notify_get_failed(op_manager: &OpManager, tx: Transaction, reason: &str) {
         }
         .into()),
     );
+}
+
+/// Complete subscription at the originator node via GET piggyback (#3760).
+///
+/// The subscription tree was already built by relay nodes during GET response
+/// propagation. This function performs only the local registration at the
+/// originator: mark subscribed, and register the upstream peer as an interest
+/// source so UPDATEs flow back through the same path.
+fn complete_originator_subscription(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    tx: &Transaction,
+    sender_from_addr: &Option<PeerKeyLocation>,
+    context: &str,
+) {
+    op_manager.ring.subscribe(*key);
+    op_manager.ring.complete_subscription_request(key, true);
+    if let Some(upstream_pkl) = sender_from_addr.as_ref() {
+        let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
+        op_manager
+            .interest_manager
+            .register_peer_interest(key, peer_key, None, true);
+    }
+    tracing::debug!(tx = %tx, contract = %key, "subscription completed via GET piggyback{context}");
 }
 
 mod messages {
