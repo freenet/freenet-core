@@ -51,15 +51,11 @@ pub(crate) fn start_op(
     // for validation, subscription, and hosting. The client's return_contract_code
     // preference only controls whether WASM is included in the client response.
     // See issue #3757.
-    //
-    // When AUTO_SUBSCRIBE_ON_GET is enabled, always request subscription on the wire
-    // so relay nodes build the subscription tree during GET response propagation (#3760).
-    let wire_subscribe = subscribe || crate::ring::AUTO_SUBSCRIBE_ON_GET;
     let state = Some(GetState::PrepareRequest(PrepareRequestData {
         instance_id,
         id,
         fetch_contract: true,
-        subscribe: wire_subscribe,
+        subscribe,
         blocking_subscribe,
     }));
     GetOp {
