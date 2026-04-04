@@ -1942,9 +1942,8 @@ async fn process_open_request(
                             callback: tx,
                         }
                     }
-                    freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo => {
+                    freenet_stdlib::client_api::NodeQuery::NeighborHostingInfo => {
                         // TODO: Implement neighbor hosting info query
-                        // Note: ProximityCacheInfo is defined in freenet-stdlib; rename there separately
                         tracing::warn!(
                             client_id = %client_id,
                             request_id = %request_id,

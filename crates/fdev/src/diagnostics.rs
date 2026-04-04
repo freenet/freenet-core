@@ -177,7 +177,7 @@ async fn diagnostics_inner(
     if let Some(metrics) = &response.system_metrics {
         println!("📊 System Metrics:");
         println!("  Active connections: {}", metrics.active_connections);
-        println!("  Hosting contracts: {}", metrics.seeding_contracts);
+        println!("  Hosting contracts: {}", metrics.hosting_contracts);
         println!();
     }
 
