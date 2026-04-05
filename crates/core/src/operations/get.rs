@@ -2250,32 +2250,15 @@ impl Operation for GetOp {
                                 }
                             }
 
-                            // Auto-subscribe to receive updates for this contract.
-                            // Only the original requester subscribes — relay peers cache
-                            // for durability but don't subscribe (no freshness obligation).
+                            // Auto-subscribe: piggyback or fallback
                             if crate::ring::AUTO_SUBSCRIBE_ON_GET
                                 && is_original_requester
                                 && (access_result.is_new || !op_manager.ring.is_subscribed(&key))
                             {
-                                if subscribe_requested {
-                                    // Subscription tree was built by relays on response path.
-                                    // Complete locally instead of spawning a separate SUBSCRIBE.
-                                    super::complete_piggyback_subscription(
-                                        op_manager,
-                                        &key,
-                                        &id,
-                                        &sender_from_addr,
-                                    )
-                                    .await;
-                                } else {
-                                    // Wire message didn't carry subscribe flag (old peer or
-                                    // non-subscribe GET). Fall back to separate SUBSCRIBE.
-                                    let blocking = blocking_sub;
-                                    let child_tx = super::start_subscription_request(
-                                        op_manager, id, key, blocking,
-                                    );
-                                    tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (fallback)");
-                                }
+                                super::auto_subscribe_on_get_response(
+                                    op_manager, &key, &id, &sender_from_addr,
+                                    subscribe_requested, blocking_sub, "non-streaming",
+                                ).await;
                             }
                         } else {
                             // Only attempt to cache if we have the contract code.
@@ -2361,21 +2344,10 @@ impl Operation for GetOp {
                                             && (access_result.is_new
                                                 || !op_manager.ring.is_subscribed(&key))
                                         {
-                                            if subscribe_requested {
-                                                super::complete_piggyback_subscription(
-                                                    op_manager,
-                                                    &key,
-                                                    &id,
-                                                    &sender_from_addr,
-                                                )
-                                                .await;
-                                            } else {
-                                                let blocking = blocking_sub;
-                                                let child_tx = super::start_subscription_request(
-                                                    op_manager, id, key, blocking,
-                                                );
-                                                tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (fallback)");
-                                            }
+                                            super::auto_subscribe_on_get_response(
+                                                op_manager, &key, &id, &sender_from_addr,
+                                                subscribe_requested, blocking_sub, "non-streaming, put-path",
+                                            ).await;
                                         }
                                     }
                                     ContractHandlerEvent::PutResponse {
@@ -3076,21 +3048,10 @@ impl Operation for GetOp {
                                     && is_original_requester
                                     && !op_manager.ring.is_subscribed(&key)
                                 {
-                                    if subscribe_requested {
-                                        super::complete_piggyback_subscription(
-                                            op_manager,
-                                            &key,
-                                            &id,
-                                            &sender_from_addr,
-                                        )
-                                        .await;
-                                    } else {
-                                        let blocking = blocking_sub;
-                                        let child_tx = super::start_subscription_request(
-                                            op_manager, id, key, blocking,
-                                        );
-                                        tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming, fallback)");
-                                    }
+                                    super::auto_subscribe_on_get_response(
+                                        op_manager, &key, &id, &sender_from_addr,
+                                        subscribe_requested, blocking_sub, "streaming",
+                                    ).await;
                                 }
                             } else if !removed_contracts.is_empty() {
                                 super::broadcast_change_interests(
@@ -3130,21 +3091,10 @@ impl Operation for GetOp {
                                 && is_original_requester
                                 && !op_manager.ring.is_subscribed(&key)
                             {
-                                if subscribe_requested {
-                                    super::complete_piggyback_subscription(
-                                        op_manager,
-                                        &key,
-                                        &id,
-                                        &sender_from_addr,
-                                    )
-                                    .await;
-                                } else {
-                                    let blocking = blocking_sub;
-                                    let child_tx = super::start_subscription_request(
-                                        op_manager, id, key, blocking,
-                                    );
-                                    tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming, re-subscribe, fallback)");
-                                }
+                                super::auto_subscribe_on_get_response(
+                                    op_manager, &key, &id, &sender_from_addr,
+                                    subscribe_requested, blocking_sub, "streaming, re-subscribe",
+                                ).await;
                             }
                         }
                     }

@@ -528,14 +528,13 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
 
 /// Set up subscription forwarding at a relay node during GET response propagation.
 ///
-/// Unlike `establish_subscription_at_relay` from #3762, this does NOT call
-/// `ring.subscribe()` or `announce_contract_hosted()`. Relay nodes only set up
-/// forwarding (upstream/downstream registration) -- they are not subscribers
-/// themselves. This prevents the subscription storm that caused #3762 to be reverted.
+/// Relay nodes only set up forwarding (upstream/downstream registration) -- they
+/// do NOT call `ring.subscribe()` or `announce_contract_hosted()`, which would
+/// cause a subscription storm.
 ///
-/// The relay registers:
-/// 1. Upstream peer (response sender) as interest source -- so Unsubscribe messages route correctly
-/// 2. Downstream peer (GET requester) as downstream subscriber -- so UPDATE broadcasts propagate
+/// Registers:
+/// 1. Upstream peer (response sender) as interest source for Unsubscribe routing
+/// 2. Downstream peer (GET requester) as downstream subscriber for UPDATE propagation
 pub(crate) async fn setup_subscription_forwarding_at_relay(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -617,6 +616,29 @@ pub(crate) async fn complete_piggyback_subscription(
             contract = %key,
             "GET piggyback: upstream peer not in ring, subscription tree incomplete -- renewal will heal"
         );
+    }
+}
+
+/// Auto-subscribe at the originator: use piggybacked subscription if available,
+/// otherwise fall back to a separate SUBSCRIBE operation.
+///
+/// Called from GET response handling when `AUTO_SUBSCRIBE_ON_GET` is enabled and
+/// the originator is not yet subscribed. Consolidates the piggyback-or-fallback
+/// logic that appears in both streaming and non-streaming response paths.
+pub(crate) async fn auto_subscribe_on_get_response(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    tx: &crate::message::Transaction,
+    sender_from_addr: &Option<crate::ring::PeerKeyLocation>,
+    subscribe_requested: bool,
+    blocking_sub: bool,
+    path_label: &str,
+) {
+    if subscribe_requested {
+        complete_piggyback_subscription(op_manager, key, tx, sender_from_addr).await;
+    } else {
+        let child_tx = start_subscription_request(op_manager, *tx, *key, blocking_sub);
+        tracing::debug!(tx = %tx, %child_tx, blocking = %blocking_sub, "started subscription ({path_label}, fallback)");
     }
 }
 
