@@ -68,6 +68,16 @@ async fn create_hosting_metadata_table(pool: &SqlitePool) -> Result<(), SqlDbErr
     )
     .execute(pool)
     .await?;
+
+    // Migrate existing databases: add local_client_access column if missing.
+    // CREATE TABLE IF NOT EXISTS won't alter an existing table's schema.
+    // Ignore the error if the column already exists.
+    let _ = sqlx::query(
+        "ALTER TABLE hosting_metadata ADD COLUMN local_client_access INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
+
     Ok(())
 }
 
