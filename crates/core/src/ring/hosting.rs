@@ -819,24 +819,15 @@ impl HostingManager {
             }
         }
 
-        // 3. Hosted contracts without an active subscription.
-        // After restart, subscriptions are lost (in-memory only) but hosted
-        // contracts are loaded from disk. Since hosted contracts are served
-        // from local cache (#3761), they must be subscribed to stay fresh.
-        // Without this, hosted-but-unsubscribed contracts serve stale state
-        // indefinitely after restart (the #3698 staleness bug).
-        let now_check = self.time_source.now();
-        let hosted_keys = self.hosting_cache.read().iter().collect::<Vec<_>>();
-        for key in hosted_keys {
-            let has_active = self
-                .active_subscriptions
-                .get(&key)
-                .map(|expires_at| *expires_at > now_check)
-                .unwrap_or(false);
-            if !has_active {
-                needs_renewal_set.insert(key);
-            }
-        }
+        // NOTE: Hosted-only contracts (no client subscription, no active
+        // subscription) are intentionally excluded from renewal. Including
+        // them caused subscription storms (#3546) -- relay-cached contracts
+        // loaded from disk were all subscribed, overwhelming the network.
+        // The `is_hosted` shortcut in the GET handler (#3761) provides
+        // fast local cache for same-session access. For post-restart
+        // freshness, the subscription piggyback on GET response (#3762)
+        // establishes subscriptions quickly when a contract is first
+        // accessed by the local user.
 
         // Convert set to vec and sort for deterministic return order
         let mut result: Vec<ContractKey> = needs_renewal_set.into_iter().collect();
@@ -1417,12 +1408,8 @@ mod tests {
         assert!(manager.should_host(&contract));
     }
 
-    // Superseded: #3761 serves hosted contracts from local cache, so they MUST
-    // be subscribed to stay fresh. The old test asserted hosted-only contracts
-    // were excluded from renewal (the #3546/#3698 policy). That policy is now
-    // reversed: hosted contracts without subscriptions ARE included in renewal
-    // to prevent serving stale state after restart.
-    #[ignore]
+    /// Regression test for #3546: hosted-only contracts must NOT be in the
+    /// renewal list. Including them caused subscription storms (#3763 incident).
     #[test]
     fn test_hosted_contract_not_in_renewal_after_restart() {
         let manager = HostingManager::new();
@@ -1432,27 +1419,6 @@ mod tests {
         assert!(
             manager.contracts_needing_renewal().is_empty(),
             "Hosted-only contract must NOT be in renewal list"
-        );
-    }
-
-    /// After restart, hosted contracts have no active subscription (in-memory only).
-    /// Since #3761 serves hosted contracts from local cache, they must be included
-    /// in the renewal list so the subscription system refreshes them.
-    #[test]
-    fn test_hosted_contract_included_in_renewal_after_restart() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(42);
-
-        // Simulate post-restart: contract in hosting cache, no subscriptions
-        manager.record_contract_access(contract, 1000, AccessType::Get);
-        assert!(manager.is_hosting_contract(&contract));
-        assert!(!manager.is_subscribed(&contract));
-
-        // Must appear in renewal list to get re-subscribed
-        let needs_renewal = manager.contracts_needing_renewal();
-        assert!(
-            needs_renewal.contains(&contract),
-            "Hosted contract without subscription must be in renewal list"
         );
     }
 
@@ -1492,15 +1458,18 @@ mod tests {
         assert!(manager.is_receiving_updates(&contract));
     }
 
-    // Superseded: #3761 serves hosted contracts from local cache, so they must
-    // be subscribed to stay fresh. Hosted-only contracts are now included in
-    // the renewal list.
-    #[ignore]
     #[test]
     fn test_contracts_needing_renewal_excludes_hosted_only() {
         let manager = HostingManager::new();
         let contract = make_contract_key(1);
+
+        // Add to hosting cache (simulating GET operation)
         manager.record_contract_access(contract, 1000, AccessType::Get);
+
+        // Hosted-only contracts should NOT be renewed -- subscribing to all
+        // hosted contracts causes subscription storms (#3546). The local
+        // cache shortcut (#3761) handles same-session freshness, and the
+        // subscription piggyback (#3762) handles post-GET subscription.
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
             !needs_renewal.contains(&contract),
@@ -1508,30 +1477,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_contracts_needing_renewal_includes_hosted() {
-        let manager = HostingManager::new();
-        let contract = make_contract_key(1);
-
-        // Add to hosting cache (simulating GET operation)
-        manager.record_contract_access(contract, 1000, AccessType::Get);
-
-        // Hosted contracts must be renewed to keep local cache fresh (#3761)
-        let needs_renewal = manager.contracts_needing_renewal();
-        assert!(
-            needs_renewal.contains(&contract),
-            "Hosted contract should be in renewal list"
-        );
-
-        // Client subscription also triggers renewal (unchanged)
-        let client_id = crate::client_events::ClientId::next();
-        manager.add_client_subscription(contract.id(), client_id);
-        let needs_renewal = manager.contracts_needing_renewal();
-        assert!(
-            needs_renewal.contains(&contract),
-            "Contract with client subscription should need renewal"
-        );
-    }
+    // Removed: test_contracts_needing_renewal_includes_hosted was added in #3763
+    // but caused subscription storms. Hosted-only contracts must NOT be renewed.
+    // The exclusion test (test_contracts_needing_renewal_excludes_hosted_only)
+    // covers the correct behavior.
 
     // Superseded: startup revalidation window removed in #3546 to prevent
     // subscription accumulation storms. Hosted-only contracts are no longer
@@ -1634,38 +1583,38 @@ mod tests {
     /// renew_subscriptions_task (MAX_RECOVERY_ATTEMPTS_PER_INTERVAL = 10)
     /// prevents subscription storms by processing at most 10 per cycle.
     #[test]
-    fn test_hosted_contracts_renewed_at_scale() {
+    fn test_hosted_contracts_not_renewed_at_scale() {
         let manager = HostingManager::new();
 
-        // Simulate 200 contracts loaded from disk after restart
+        // Simulate 200 relay-cached contracts loaded from disk
         for i in 0..200u8 {
             let contract = make_contract_key(i);
             manager.record_contract_access(contract, 1000, AccessType::Get);
         }
         assert_eq!(manager.hosting_contracts_count(), 200);
 
-        // All 200 should appear in renewal list (batch limiting happens
-        // in the renewal task, not in contracts_needing_renewal)
+        // None should appear in renewal list -- subscribing to all hosted
+        // contracts causes subscription storms (#3546, confirmed in #3763).
         let needs_renewal = manager.contracts_needing_renewal();
-        assert_eq!(
-            needs_renewal.len(),
-            200,
-            "All hosted contracts should be in renewal list"
+        assert!(
+            needs_renewal.is_empty(),
+            "200 hosted-only contracts should NOT be in renewal list, found {}",
+            needs_renewal.len()
         );
 
-        // Subscribe to 2 -- they should still be in the list
+        // Subscribe to exactly 2 (simulating River client)
         let client_id = crate::client_events::ClientId::next();
         let contract_a = make_contract_key(42);
         let contract_b = make_contract_key(99);
         manager.add_client_subscription(contract_a.id(), client_id);
         manager.add_client_subscription(contract_b.id(), client_id);
 
-        // Still 200 (client subscription doesn't change hosted status)
+        // Only those 2 should need renewal
         let needs_renewal = manager.contracts_needing_renewal();
         assert_eq!(
             needs_renewal.len(),
-            200,
-            "All 200 hosted contracts should still need renewal, found {}",
+            2,
+            "Only 2 client-subscribed contracts should need renewal, found {}",
             needs_renewal.len()
         );
         assert!(needs_renewal.contains(&contract_a));
