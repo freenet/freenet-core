@@ -49,7 +49,6 @@ pub struct HostingMetadata {
     /// Code hash of the contract (needed to reconstruct ContractKey)
     pub code_hash: [u8; 32],
     /// Whether this contract was accessed by a local client (HTTP/WebSocket).
-    /// Distinguishes locally-requested contracts from relay-cached ones.
     pub local_client_access: bool,
 }
 
@@ -873,5 +872,52 @@ mod tests {
         // Verify database file was created
         let db_path = temp_dir.path().join("db");
         assert!(db_path.exists(), "Database file should exist");
+    }
+
+    /// Round-trip test: to_bytes -> from_bytes preserves all fields.
+    #[test]
+    fn test_hosting_metadata_roundtrip() {
+        let metadata = HostingMetadata::new(1234567890, 1, 4096, [0xAB; 32], true);
+        let bytes = metadata.to_bytes();
+        let restored = HostingMetadata::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.last_access_ms, 1234567890);
+        assert_eq!(restored.access_type, 1);
+        assert_eq!(restored.size_bytes, 4096);
+        assert_eq!(restored.code_hash, [0xAB; 32]);
+        assert!(restored.local_client_access);
+
+        // Also test with local_client_access = false
+        let metadata2 = HostingMetadata::new(9999, 0, 100, [0x01; 32], false);
+        let restored2 = HostingMetadata::from_bytes(&metadata2.to_bytes()).unwrap();
+        assert!(!restored2.local_client_access);
+    }
+
+    /// Backward compatibility: 49-byte legacy entries (pre-local_client_access)
+    /// should deserialize with local_client_access = false.
+    #[test]
+    fn test_hosting_metadata_legacy_49_byte_compat() {
+        // Build a legacy 49-byte entry manually
+        let mut legacy = [0u8; 49];
+        legacy[0..8].copy_from_slice(&1000u64.to_le_bytes());
+        legacy[8] = 0; // GET
+        legacy[9..17].copy_from_slice(&512u64.to_le_bytes());
+        legacy[17..49].copy_from_slice(&[0xCC; 32]);
+
+        let restored = HostingMetadata::from_bytes(&legacy).unwrap();
+        assert_eq!(restored.last_access_ms, 1000);
+        assert_eq!(restored.access_type, 0);
+        assert_eq!(restored.size_bytes, 512);
+        assert_eq!(restored.code_hash, [0xCC; 32]);
+        assert!(
+            !restored.local_client_access,
+            "Legacy 49-byte entries must default to local_client_access=false"
+        );
+    }
+
+    /// Entries shorter than 49 bytes should fail to deserialize.
+    #[test]
+    fn test_hosting_metadata_too_short() {
+        assert!(HostingMetadata::from_bytes(&[0u8; 48]).is_none());
+        assert!(HostingMetadata::from_bytes(&[]).is_none());
     }
 }

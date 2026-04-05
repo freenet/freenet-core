@@ -2182,8 +2182,7 @@ impl Operation for GetOp {
                             let access_result =
                                 op_manager.ring.record_get_access(key, value.size() as u64);
 
-                            // Mark as locally accessed if this is the originator node (#3769).
-                            // This distinguishes local client requests from relay traffic.
+                            // Mark locally-accessed for subscription renewal (#3769)
                             if is_original_requester {
                                 op_manager.ring.mark_local_client_access(&key);
                             }

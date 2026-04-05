@@ -67,10 +67,8 @@ pub struct HostedContract {
     pub last_accessed: Instant,
     /// Type of the last access
     pub access_type: AccessType,
-    /// Whether this contract was accessed by a local client (HTTP/WebSocket).
-    /// Distinguishes "contracts the local user cares about" from "contracts
-    /// this node cached while relaying for other peers." Only contracts with
-    /// this flag get subscription renewal and trusted local-cache serving.
+    /// Whether a local client (HTTP/WebSocket) accessed this contract.
+    /// Only flagged contracts get subscription renewal and local-cache serving.
     pub local_client_access: bool,
 }
 
@@ -202,10 +200,7 @@ impl<T: TimeSource> HostingCache<T> {
     }
 
     /// Mark a contract as accessed by a local client (HTTP/WebSocket).
-    ///
-    /// This distinguishes locally-requested contracts from relay-cached ones,
-    /// enabling safe subscription renewal and trusted local-cache serving.
-    /// Only sets the flag if the contract is already in the cache.
+    /// No-op if the contract is not in the cache.
     pub fn mark_local_client_access(&mut self, key: &ContractKey) {
         if let Some(existing) = self.contracts.get_mut(key) {
             existing.local_client_access = true;

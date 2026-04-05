@@ -1694,9 +1694,6 @@ impl Ring {
     }
 
     /// Mark a contract as accessed by a local client (HTTP/WebSocket).
-    ///
-    /// Distinguishes locally-requested contracts from relay-cached ones,
-    /// enabling safe subscription renewal and trusted local-cache serving.
     pub fn mark_local_client_access(&self, key: &ContractKey) {
         self.hosting_manager.mark_local_client_access(key)
     }

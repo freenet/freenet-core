@@ -1256,10 +1256,7 @@ async fn process_open_request(
                             .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
-                        // Mark as locally accessed and refresh hosting TTL on any
-                        // user GET. This distinguishes locally-requested contracts
-                        // from relay-cached ones, enabling safe subscription
-                        // renewal after restart (#3769).
+                        // Mark as locally accessed (#3769) and refresh hosting TTL.
                         if let Some(ref fk) = full_key {
                             op_manager.ring.mark_local_client_access(fk);
                             if op_manager.ring.is_hosting_contract(fk) {
@@ -1267,11 +1264,8 @@ async fn process_open_request(
                             }
                         }
 
-                        // Check if we're actively hosting this contract AND
-                        // it was accessed by a local client. The local_client_access
-                        // flag (#3769) distinguishes locally-requested contracts from
-                        // relay-cached ones. Without this check, stale relay-cached
-                        // state could be served after restart.
+                        // Serve from local cache only if the local user requested
+                        // this contract (not just relay-cached).
                         let is_locally_hosted = full_key
                             .as_ref()
                             .map(|k| {
@@ -1281,17 +1275,9 @@ async fn process_open_request(
                             .unwrap_or(false);
 
                         // Return local cache if we have valid state AND any of:
-                        // 1. No connections (isolated node - can only use local cache)
-                        // 2. Actively subscribed (cache is kept fresh via updates)
-                        // 3. Hosting with local client access (committed to keeping it
-                        //    current; subscription may be in progress or between renewals)
-                        //
-                        // Local-client hosting is sufficient because: a locally-accessed
-                        // contract was either just fetched from the network (fresh) or
-                        // loaded from disk at startup with its subscription being renewed.
-                        // Without this, every HTTP GET goes to the network even seconds
-                        // after the first load because the async subscribe sub-operation
-                        // takes 10-50s to complete, during which is_subscribed is false.
+                        // 1. No connections (isolated node)
+                        // 2. Actively subscribed (cache kept fresh via updates)
+                        // 3. Locally hosted (subscription may be in progress)
                         if local_satisfies_request
                             && (connection_count == 0 || is_subscribed || is_locally_hosted)
                         {
