@@ -526,6 +526,100 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
     }
 }
 
+/// Set up subscription forwarding at a relay node during GET response propagation.
+///
+/// Unlike `establish_subscription_at_relay` from #3762, this does NOT call
+/// `ring.subscribe()` or `announce_contract_hosted()`. Relay nodes only set up
+/// forwarding (upstream/downstream registration) -- they are not subscribers
+/// themselves. This prevents the subscription storm that caused #3762 to be reverted.
+///
+/// The relay registers:
+/// 1. Upstream peer (response sender) as interest source -- so Unsubscribe messages route correctly
+/// 2. Downstream peer (GET requester) as downstream subscriber -- so UPDATE broadcasts propagate
+pub(crate) async fn setup_subscription_forwarding_at_relay(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    tx: &crate::message::Transaction,
+    upstream_response_addr: std::net::SocketAddr,
+    downstream_requester_addr: std::net::SocketAddr,
+) {
+    // Register upstream peer (response sender) as interest source
+    if let Some(upstream_pkl) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(upstream_response_addr)
+    {
+        let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
+        op_manager
+            .interest_manager
+            .register_peer_interest(key, peer_key, None, true);
+    }
+
+    // Register downstream peer (GET requester) as downstream subscriber
+    subscribe::register_downstream_subscriber(
+        op_manager,
+        key,
+        downstream_requester_addr,
+        None,
+        None,
+        tx,
+        " (relay, piggybacked on GET response)",
+    )
+    .await;
+
+    tracing::debug!(
+        tx = %tx,
+        contract = %key,
+        upstream = %upstream_response_addr,
+        downstream = %downstream_requester_addr,
+        "Set up subscription forwarding at relay via GET piggyback"
+    );
+}
+
+/// Complete subscription at the originator node via GET piggyback.
+///
+/// The subscription tree was built by relay nodes during GET response propagation.
+/// This function performs the local registration at the originator:
+/// 1. Mark subscribed (lease in active_subscriptions)
+/// 2. Register the upstream peer as an interest source
+/// 3. Register local interest so ChangeInterests from peers are processed
+/// 4. Announce contract hosted so neighbors send UPDATEs
+pub(crate) async fn complete_piggyback_subscription(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    tx: &crate::message::Transaction,
+    sender_from_addr: &Option<crate::ring::PeerKeyLocation>,
+) {
+    op_manager.ring.subscribe(*key);
+    op_manager.ring.complete_subscription_request(key, true);
+
+    // Register local interest so ChangeInterests from peers get properly processed.
+    let became_interested = op_manager.interest_manager.add_local_client(key);
+    if became_interested {
+        broadcast_change_interests(op_manager, vec![*key], vec![]).await;
+    }
+
+    // Announce that we host this contract so neighbors include us in broadcast targets.
+    announce_contract_hosted(op_manager, key).await;
+
+    if let Some(upstream_pkl) = sender_from_addr.as_ref() {
+        let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
+        op_manager
+            .interest_manager
+            .register_peer_interest(key, peer_key, None, true);
+        tracing::debug!(tx = %tx, contract = %key, "Subscription completed via GET piggyback");
+    } else {
+        // sender_from_addr can be None for transient connections not yet in the ring.
+        // Subscription is still marked locally; the 2-minute renewal cycle will
+        // establish a full subscription tree via a standard SUBSCRIBE operation.
+        tracing::warn!(
+            tx = %tx,
+            contract = %key,
+            "GET piggyback: upstream peer not in ring, subscription tree incomplete -- renewal will heal"
+        );
+    }
+}
+
 /// Broadcast ChangeInterests message to all connected peers.
 ///
 /// Called when local interest in contracts changes (gained or lost).
