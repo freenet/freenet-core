@@ -754,4 +754,45 @@ mod tests {
         assert!(keys.contains(&key2));
         assert!(keys.contains(&key3));
     }
+
+    /// Age gate: has_recent_local_client_access returns false after the
+    /// max_age window expires. This is the TTL enforcement for the cleanup
+    /// exemption rule (AGENTS.md).
+    #[test]
+    fn test_local_client_access_age_gate_expiry() {
+        let lease = Duration::from_secs(480); // SUBSCRIPTION_LEASE_DURATION
+        let (mut cache, time) = make_cache(10000, Duration::from_secs(60));
+        let key = make_key(1);
+
+        cache.record_access(key, 100, AccessType::Get);
+        cache.mark_local_client_access(&key);
+
+        // Immediately after marking: recent access is true
+        assert!(cache.has_local_client_access(&key));
+        assert!(cache.has_recent_local_client_access(&key, lease));
+
+        // Advance time just under the lease -- still recent
+        time.advance_time(lease - Duration::from_secs(1));
+        assert!(cache.has_recent_local_client_access(&key, lease));
+
+        // Advance past the lease -- no longer recent
+        time.advance_time(Duration::from_secs(2));
+        assert!(
+            !cache.has_recent_local_client_access(&key, lease),
+            "Contract should exit renewal after lease expires"
+        );
+
+        // The flag itself is still set (sticky)
+        assert!(
+            cache.has_local_client_access(&key),
+            "Flag should remain sticky even after age gate expires"
+        );
+
+        // Re-marking refreshes the timestamp
+        cache.mark_local_client_access(&key);
+        assert!(
+            cache.has_recent_local_client_access(&key, lease),
+            "Re-marking should refresh the age gate"
+        );
+    }
 }

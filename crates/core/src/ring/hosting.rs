@@ -668,11 +668,14 @@ impl HostingManager {
     /// local-cache serving. Persists to disk so it survives restarts.
     pub fn mark_local_client_access(&self, key: &ContractKey) {
         let already_set = self.hosting_cache.read().has_local_client_access(key);
+
+        // Always refresh the timestamp (keeps the age gate alive) even if
+        // the flag is already set. Only skip disk persistence for the flag.
+        self.hosting_cache.write().mark_local_client_access(key);
+
         if already_set {
             return;
         }
-
-        self.hosting_cache.write().mark_local_client_access(key);
 
         // Persist the updated flag to disk
         if let Some(storage) = self.storage.read().as_ref() {
