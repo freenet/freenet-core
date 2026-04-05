@@ -991,7 +991,7 @@ where
         config: &Config,
         db: Storage,
     ) -> Result<(ContractStore, DelegateStore, SecretsStore), anyhow::Error> {
-        const MAX_SIZE: i64 = 10 * 1024 * 1024;
+        const MAX_SIZE: u64 = 10 * 1024 * 1024;
 
         let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE, db.clone())?;
         let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE, db.clone())?;
