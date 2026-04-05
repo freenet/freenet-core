@@ -156,7 +156,6 @@ pub(crate) fn start_targeted_op(
         fetch_contract: true,
         htl: max_hops_to_live,
         visited,
-        subscribe: false, // Targeted ops (auto-fetch) don't need subscription
     };
 
     let op = GetOp {
@@ -355,7 +354,6 @@ pub(crate) async fn request_get(
                 fetch_contract,
                 htl: op_manager.ring.max_hops_to_live,
                 visited,
-                subscribe,
             };
 
             let op = GetOp {
@@ -461,10 +459,6 @@ struct AwaitingResponseData {
     retries: usize,
     current_hop: usize,
     subscribe: bool,
-    /// Retained for API compatibility but has no effect with piggybacked
-    /// subscriptions (#3760): the subscription tree is fully formed by the
-    /// time the GET response reaches the originator, so blocking behavior
-    /// is implicitly always satisfied.
     blocking_subscribe: bool,
     /// Peer we are currently trying to reach.
     /// Note: With connection-based routing, this is only used for state tracking,
@@ -753,7 +747,6 @@ impl GetOp {
                     fetch_contract,
                     htl: current_hop,
                     visited,
-                    subscribe,
                 };
 
                 let op = GetOp {
@@ -824,7 +817,6 @@ impl GetOp {
                         fetch_contract,
                         htl: current_hop,
                         visited: new_visited,
-                        subscribe,
                     };
 
                     let op = GetOp {
@@ -1064,7 +1056,6 @@ impl GetOp {
                 let next_target = data.alternatives.remove(0);
                 let instance_id = data.instance_id;
                 let fetch_contract = data.fetch_contract;
-                let subscribe = data.subscribe;
                 if let Some(addr) = next_target.socket_addr() {
                     data.tried_peers.insert(addr);
                     // Mark in bloom filter so downstream peers won't forward back,
@@ -1103,7 +1094,6 @@ impl GetOp {
                     fetch_contract,
                     htl: retry_htl,
                     visited,
-                    subscribe,
                 };
 
                 Ok((self, msg))
@@ -1219,7 +1209,6 @@ impl Operation for GetOp {
                     fetch_contract,
                     htl,
                     visited,
-                    subscribe: msg_subscribe,
                 } => {
                     // Handle GET request - either initial or forwarded
                     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
@@ -1227,7 +1216,6 @@ impl Operation for GetOp {
                     let id = *id;
                     let instance_id = *instance_id;
                     let fetch_contract = *fetch_contract;
-                    let msg_subscribe = *msg_subscribe;
 
                     // Use sender_from_addr for logging (falls back to source_addr if lookup fails)
                     let sender_display = sender_from_addr
@@ -1401,32 +1389,13 @@ impl Operation for GetOp {
                                 "GET: contract found locally"
                             );
 
-                            // Register the GET requester as a downstream subscriber.
-                            // When subscribe is requested, do the full subscription tree
-                            // setup (this is the hosting peer -- root of the subscription
-                            // tree). Otherwise, just register basic interest for update
-                            // broadcasts (critical for partitioned topologies).
+                            // Register the GET requester's interest in this contract so that
+                            // update broadcasts include them as a target. This is critical for
+                            // partitioned topologies: the requester's auto-subscribe may route
+                            // to a blocked peer instead of back to us, so we register interest
+                            // proactively when serving the GET response.
                             if let Some(upstream_addr) = self.upstream_addr {
-                                if msg_subscribe {
-                                    // Full subscription setup: register requester as
-                                    // downstream subscriber so UPDATEs propagate to them
-                                    super::subscribe::register_downstream_subscriber(
-                                        op_manager,
-                                        &key,
-                                        upstream_addr,
-                                        None,
-                                        None,
-                                        &id,
-                                        " (hosting peer, piggybacked on GET)",
-                                    )
-                                    .await;
-                                    tracing::debug!(
-                                        tx = %id,
-                                        contract = %key,
-                                        requester = %upstream_addr,
-                                        "Registered GET requester as downstream subscriber (hosting peer)"
-                                    );
-                                } else if let Some(pkl) = op_manager
+                                if let Some(pkl) = op_manager
                                     .ring
                                     .connection_manager
                                     .get_peer_by_addr(upstream_addr)
@@ -1634,7 +1603,6 @@ impl Operation for GetOp {
                                 stats,
                                 self.upstream_addr,
                                 local_fallback,
-                                msg_subscribe,
                             )
                             .await;
                         }
@@ -1717,7 +1685,6 @@ impl Operation for GetOp {
                                     fetch_contract,
                                     htl: current_hop,
                                     visited: visited.clone(),
-                                    subscribe,
                                 });
 
                                 // Update state with the new alternative being tried
@@ -1778,7 +1745,6 @@ impl Operation for GetOp {
                                         fetch_contract,
                                         htl: current_hop,
                                         visited: new_visited.clone(),
-                                        subscribe,
                                     });
 
                                     // Reset for new round of attempts
@@ -2163,11 +2129,11 @@ impl Operation for GetOp {
                     let is_original_requester = self.upstream_addr.is_none();
 
                     // Check if subscription was requested
-                    let subscribe_requested =
+                    let (subscribe_requested, blocking_sub) =
                         if let Some(GetState::AwaitingResponse(data)) = &self.state {
-                            data.subscribe
+                            (data.subscribe, data.blocking_subscribe)
                         } else {
-                            false
+                            (false, false)
                         };
 
                     // Always cache contracts we encounter - LRU will handle eviction
@@ -2259,18 +2225,18 @@ impl Operation for GetOp {
                                 }
                             }
 
-                            if subscribe_requested
-                                && is_original_requester
-                                && (access_result.is_new || !op_manager.ring.is_subscribed(&key))
-                            {
-                                complete_originator_subscription(
-                                    op_manager,
-                                    &key,
-                                    &id,
-                                    &sender_from_addr,
-                                    "",
-                                )
-                                .await;
+                            // Auto-subscribe to receive updates for this contract.
+                            // Only the original requester subscribes — relay peers cache
+                            // for durability but don't subscribe (no freshness obligation).
+                            if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
+                                // Only start new subscription if not already subscribed
+                                if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
+                                    let blocking = subscribe_requested && blocking_sub;
+                                    let child_tx = super::start_subscription_request(
+                                        op_manager, id, key, blocking,
+                                    );
+                                    tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription");
+                                }
                             }
                         } else {
                             // Only attempt to cache if we have the contract code.
@@ -2346,19 +2312,22 @@ impl Operation for GetOp {
                                             }
                                         }
 
-                                        if subscribe_requested
+                                        // Auto-subscribe to receive updates for this contract.
+                                        // Only the original requester subscribes — relay peers cache
+                                        // for durability but don't subscribe (no freshness obligation).
+                                        if crate::ring::AUTO_SUBSCRIBE_ON_GET
                                             && is_original_requester
-                                            && (access_result.is_new
-                                                || !op_manager.ring.is_subscribed(&key))
                                         {
-                                            complete_originator_subscription(
-                                                op_manager,
-                                                &key,
-                                                &id,
-                                                &sender_from_addr,
-                                                "",
-                                            )
-                                            .await;
+                                            // Only start new subscription if not already subscribed
+                                            if access_result.is_new
+                                                || !op_manager.ring.is_subscribed(&key)
+                                            {
+                                                let blocking = subscribe_requested && blocking_sub;
+                                                let child_tx = super::start_subscription_request(
+                                                    op_manager, id, key, blocking,
+                                                );
+                                                tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription");
+                                            }
                                         }
                                     }
                                     ContractHandlerEvent::PutResponse {
@@ -2465,9 +2434,10 @@ impl Operation for GetOp {
                         });
                     } else {
                         // Forward response to upstream. Opportunistically cache contract
-                        // code so this relay peer can serve future GET requests.
-                        // If subscribe was requested, also establish subscription tree
-                        // entries (see #3760).
+                        // code so this relay peer can serve future GET requests with
+                        // fetch_contract=true. We don't call announce_contract_hosted()
+                        // here because relay peers should not advertise contracts they
+                        // are not responsible for in the ring.
                         tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
                         if let Some(code) = contract {
                             if !op_manager.ring.is_hosting_contract(&key) {
@@ -2501,40 +2471,6 @@ impl Operation for GetOp {
                                 });
                             }
                         }
-
-                        // Establish subscription tree at this relay if the originator
-                        // requested subscription. This piggybacks on the GET response
-                        // path, eliminating the separate SUBSCRIBE round-trip (#3760).
-                        // Note: the contract cache write above is fire-and-forget
-                        // (GlobalExecutor::spawn), so announce_contract_hosted may
-                        // advertise the contract before the cache write completes.
-                        // This matches existing SUBSCRIBE behavior.
-                        //
-                        // Note on naming: GET's `upstream_addr` points toward the
-                        // originator, which is the *downstream* direction in the
-                        // subscription tree. `source_addr` is the response sender,
-                        // which is *upstream* in subscription terms.
-                        if subscribe_requested {
-                            if let (Some(response_addr), Some(requester_addr)) =
-                                (source_addr, self.upstream_addr)
-                            {
-                                super::establish_subscription_at_relay(
-                                    op_manager,
-                                    &key,
-                                    &id,
-                                    response_addr,
-                                    requester_addr,
-                                )
-                                .await;
-                            } else if source_addr.is_none() {
-                                tracing::warn!(
-                                    tx = %id,
-                                    contract = %key,
-                                    "Cannot establish subscription at relay: source_addr missing"
-                                );
-                            }
-                        }
-
                         new_state = None;
                         // Check if the response payload exceeds the streaming
                         // threshold.  When it does, convert to ResponseStreaming
@@ -2755,11 +2691,11 @@ impl Operation for GetOp {
                     let is_original_requester = self.upstream_addr.is_none();
 
                     // Extract subscription flags from state (needed for auto-subscribe after caching)
-                    let subscribe_requested =
+                    let (subscribe_requested, blocking_sub) =
                         if let Some(GetState::AwaitingResponse(data)) = &self.state {
-                            data.subscribe
+                            (data.subscribe, data.blocking_subscribe)
                         } else {
-                            false
+                            (false, false)
                         };
                     let piping_started = if !is_original_requester {
                         let upstream_addr = self
@@ -2823,30 +2759,6 @@ impl Operation for GetOp {
                     } else {
                         false
                     };
-
-                    // Establish subscription tree at this relay if requested (#3760).
-                    // Done before stream assembly so the subscription is active ASAP.
-                    // See naming note above: GET upstream_addr = subscription downstream.
-                    if !is_original_requester && subscribe_requested {
-                        if let (Some(response_addr), Some(requester_addr)) =
-                            (source_addr, self.upstream_addr)
-                        {
-                            super::establish_subscription_at_relay(
-                                op_manager,
-                                &key,
-                                &id,
-                                response_addr,
-                                requester_addr,
-                            )
-                            .await;
-                        } else if source_addr.is_none() {
-                            tracing::warn!(
-                                tx = %id,
-                                contract = %key,
-                                "Cannot establish subscription at relay (streaming): source_addr missing"
-                            );
-                        }
-                    }
 
                     // Step 3: Wait for stream to complete and assemble data (for local caching)
                     let stream_data = match stream_handle.assemble().await {
@@ -3071,18 +2983,16 @@ impl Operation for GetOp {
                                     .await;
                                 }
 
-                                if subscribe_requested
+                                // Auto-subscribe only if we successfully cached the contract.
+                                if crate::ring::AUTO_SUBSCRIBE_ON_GET
                                     && is_original_requester
                                     && !op_manager.ring.is_subscribed(&key)
                                 {
-                                    complete_originator_subscription(
-                                        op_manager,
-                                        &key,
-                                        &id,
-                                        &sender_from_addr,
-                                        " (streaming)",
-                                    )
-                                    .await;
+                                    let blocking = subscribe_requested && blocking_sub;
+                                    let child_tx = super::start_subscription_request(
+                                        op_manager, id, key, blocking,
+                                    );
+                                    tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming)");
                                 }
                             } else if !removed_contracts.is_empty() {
                                 super::broadcast_change_interests(
@@ -3117,18 +3027,16 @@ impl Operation for GetOp {
                                 .await;
                             }
 
-                            if subscribe_requested
+                            // Auto-subscribe for already-hosted contracts that lost their subscription.
+                            if crate::ring::AUTO_SUBSCRIBE_ON_GET
                                 && is_original_requester
                                 && !op_manager.ring.is_subscribed(&key)
                             {
-                                complete_originator_subscription(
-                                    op_manager,
-                                    &key,
-                                    &id,
-                                    &sender_from_addr,
-                                    " (streaming, re-subscribe)",
-                                )
-                                .await;
+                                let blocking = subscribe_requested && blocking_sub;
+                                let child_tx = super::start_subscription_request(
+                                    op_manager, id, key, blocking,
+                                );
+                                tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription (streaming, re-subscribe)");
                             }
                         }
                     }
@@ -3377,7 +3285,6 @@ async fn try_forward_or_return(
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
-    subscribe: bool,
 ) -> Result<OperationResult, OpError> {
     tracing::warn!(
         tx = %id,
@@ -3445,10 +3352,9 @@ async fn try_forward_or_return(
             tried_peers.insert(addr);
         }
 
-        // Forwarding nodes preserve the subscribe flag from the originator
-        // so relay nodes can establish the subscription tree on the response path.
-        // blocking_subscribe is a client-side preference that only applies to the
-        // originator node.
+        // Forwarding nodes always use non-blocking subscriptions:
+        // blocking_subscribe is a client-side preference that only
+        // applies to the originator node.
         build_op_result(GetOpResult {
             id,
             state: Some(GetState::AwaitingResponse(AwaitingResponseData {
@@ -3457,7 +3363,7 @@ async fn try_forward_or_return(
                 retries: 0,
                 fetch_contract,
                 current_hop: new_htl,
-                subscribe,
+                subscribe: false,
                 blocking_subscribe: false,
                 next_hop: target.clone(),
                 tried_peers,
@@ -3471,7 +3377,6 @@ async fn try_forward_or_return(
                 fetch_contract,
                 htl: new_htl,
                 visited: new_visited,
-                subscribe,
             }),
             result: None,
             // Track the forward target so timeouts report to
@@ -3584,54 +3489,6 @@ fn notify_get_failed(op_manager: &OpManager, tx: Transaction, reason: &str) {
     );
 }
 
-/// Complete subscription at the originator node via GET piggyback (#3760).
-///
-/// The subscription tree was already built by relay nodes during GET response
-/// propagation. This function performs the local registration at the originator:
-/// 1. Mark subscribed (lease in active_subscriptions)
-/// 2. Register the upstream peer as an interest source
-/// 3. Register local interest so ChangeInterests from peers are processed
-/// 4. Announce contract hosted so neighbors send UPDATEs
-async fn complete_originator_subscription(
-    op_manager: &OpManager,
-    key: &ContractKey,
-    tx: &Transaction,
-    sender_from_addr: &Option<PeerKeyLocation>,
-    context: &str,
-) {
-    op_manager.ring.subscribe(*key);
-    op_manager.ring.complete_subscription_request(key, true);
-
-    // Register local interest so that ChangeInterests from peers get properly
-    // processed. Without this, has_local_interest() returns false and the
-    // ChangeInterests handler ignores peer interest registrations, breaking
-    // update propagation. Mirrors the SUBSCRIBE originator path (subscribe.rs:1625).
-    let became_interested = op_manager.interest_manager.add_local_client(key);
-    if became_interested {
-        super::broadcast_change_interests(op_manager, vec![*key], vec![]).await;
-    }
-
-    // Announce that we host this contract so neighbors include us in broadcast targets.
-    super::announce_contract_hosted(op_manager, key).await;
-
-    if let Some(upstream_pkl) = sender_from_addr.as_ref() {
-        let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
-        op_manager
-            .interest_manager
-            .register_peer_interest(key, peer_key, None, true);
-        tracing::debug!(tx = %tx, contract = %key, "subscription completed via GET piggyback{context}");
-    } else {
-        // sender_from_addr can be None for transient connections not yet in the ring.
-        // We still mark subscribed locally; the 2-minute renewal cycle will establish
-        // a full subscription tree via a standard SUBSCRIBE operation.
-        tracing::warn!(
-            tx = %tx,
-            contract = %key,
-            "GET piggyback{context}: upstream peer not in ring, subscription tree incomplete -- renewal will heal"
-        );
-    }
-}
-
 mod messages {
     use std::fmt::Display;
 
@@ -3679,12 +3536,6 @@ mod messages {
             htl: usize,
             /// Bloom filter tracking visited peers to prevent loops.
             visited: super::super::VisitedPeers,
-            /// When true, relay nodes establish subscription tree entries as the
-            /// GET response propagates back, eliminating the need for a separate
-            /// SUBSCRIBE round-trip. See #3760.
-            ///
-            /// Wire format change: requires MIN_COMPATIBLE_VERSION bump on release.
-            subscribe: bool,
         },
         /// Response for a GET operation. Routed hop-by-hop back to originator.
         /// Uses instance_id for routing (always available from the request).
@@ -4016,7 +3867,6 @@ mod tests {
             fetch_contract: false,
             htl: 5,
             visited: VisitedPeers::new(&tx),
-            subscribe: false,
         };
         assert_eq!(*msg.id(), tx, "id() should return the transaction ID");
     }
@@ -4030,7 +3880,6 @@ mod tests {
             fetch_contract: false,
             htl: 5,
             visited: VisitedPeers::new(&tx),
-            subscribe: false,
         };
         let display = format!("{}", msg);
         assert!(
