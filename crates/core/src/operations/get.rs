@@ -5530,12 +5530,15 @@ mod tests {
         assert_eq!(loc, contract_location);
     }
 
-    /// Backward compatibility: GetMsg::Request without subscribe field
-    /// deserializes with subscribe=false (old peers don't send it).
+    /// Round-trip serialization: subscribe field is preserved through bincode.
+    /// Note: bincode uses positional encoding, so #[serde(default)] does NOT
+    /// provide backward compat with older binaries missing the field. Wire
+    /// compat is handled by MIN_COMPATIBLE_VERSION + auto-update at handshake.
     #[test]
-    fn test_get_msg_subscribe_backward_compat() {
+    fn test_get_msg_subscribe_roundtrip() {
         use freenet_stdlib::prelude::ContractInstanceId;
 
+        // subscribe=true round-trips correctly
         let msg = GetMsg::Request {
             id: Transaction::new::<GetMsg>(),
             instance_id: ContractInstanceId::new([1; 32]),
@@ -5544,8 +5547,6 @@ mod tests {
             visited: VisitedPeers::default(),
             subscribe: true,
         };
-
-        // Round-trip: serialize with subscribe=true, deserialize, verify
         let bytes = bincode::serialize(&msg).unwrap();
         let restored: GetMsg = bincode::deserialize(&bytes).unwrap();
         match restored {
@@ -5553,8 +5554,8 @@ mod tests {
             _ => panic!("expected Request"),
         }
 
-        // Simulate old peer: serialize without subscribe field by using false
-        let msg_old = GetMsg::Request {
+        // subscribe=false round-trips correctly
+        let msg_false = GetMsg::Request {
             id: Transaction::new::<GetMsg>(),
             instance_id: ContractInstanceId::new([2; 32]),
             fetch_contract: true,
@@ -5562,15 +5563,10 @@ mod tests {
             visited: VisitedPeers::default(),
             subscribe: false,
         };
-        let bytes_old = bincode::serialize(&msg_old).unwrap();
-        let restored_old: GetMsg = bincode::deserialize(&bytes_old).unwrap();
-        match restored_old {
-            GetMsg::Request { subscribe, .. } => {
-                assert!(
-                    !subscribe,
-                    "Old-format messages should default subscribe to false"
-                );
-            }
+        let bytes_false = bincode::serialize(&msg_false).unwrap();
+        let restored_false: GetMsg = bincode::deserialize(&bytes_false).unwrap();
+        match restored_false {
+            GetMsg::Request { subscribe, .. } => assert!(!subscribe),
             _ => panic!("expected Request"),
         }
     }
