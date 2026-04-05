@@ -26,7 +26,7 @@ impl ContractStore {
     /// - contracts_dir: directory where contract WASM files are stored
     /// - max_size: max size in bytes of the contracts being cached
     /// - db: ReDb storage for persistent index
-    pub fn new(contracts_dir: PathBuf, max_size: i64, db: Storage) -> RuntimeResult<Self> {
+    pub fn new(contracts_dir: PathBuf, max_size: u64, db: Storage) -> RuntimeResult<Self> {
         std::fs::create_dir_all(&contracts_dir).map_err(|err| {
             tracing::error!("error creating contract dir: {err}");
             err
@@ -51,10 +51,10 @@ impl ContractStore {
 
         Ok(Self {
             contract_cache: MokaCache::builder()
-                .max_capacity(max_size as u64)
+                .max_capacity(max_size)
                 .weigher(
                     |_key: &CodeHash, value: &Arc<ContractCode<'static>>| -> u32 {
-                        value.data().len() as u32
+                        value.data().len().try_into().unwrap_or(u32::MAX)
                     },
                 )
                 .build(),
@@ -163,6 +163,9 @@ impl ContractStore {
 
     pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let contract_hash = *key.code_hash();
+
+        // Invalidate cache to prevent serving "ghost" contracts. See issue #3487.
+        self.contract_cache.invalidate(&contract_hash);
 
         // Remove from ReDb index
         self.db
@@ -576,6 +579,44 @@ mod test {
             compile_result.is_ok(),
             "Contract should compile successfully without 'converting wat' error. Error: {:?}",
             compile_result.err()
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for issue #3487: removed contracts must not be served from cache.
+    ///
+    /// Before the fix, remove_contract() deleted from disk and index but did not
+    /// invalidate the cache, so fetch_contract() could still return "ghost" contracts.
+    #[tokio::test]
+    async fn test_remove_contract_invalidates_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![5, 6, 7])),
+            [0, 1].as_ref().into(),
+        );
+        let key = *contract.key();
+        let params: Parameters = [0, 1].as_ref().into();
+        let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract));
+
+        // Store and verify fetchable
+        store.store_contract(container)?;
+        assert!(
+            store.fetch_contract(&key, &params).is_some(),
+            "Contract should be fetchable after store"
+        );
+
+        // Remove contract
+        store.remove_contract(&key)?;
+
+        // Must NOT be fetchable from cache
+        assert!(
+            store.fetch_contract(&key, &params).is_none(),
+            "Removed contract must not be served from cache (ghost contract)"
         );
 
         Ok(())

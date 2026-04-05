@@ -93,7 +93,9 @@ where
     pub fn new(store: S, max_size: u32) -> Result<Self, StateStoreError> {
         let cache = MokaCache::builder()
             .max_capacity(max_size as u64)
-            .weigher(|_key: &ContractKey, value: &WrappedState| -> u32 { value.size() as u32 })
+            .weigher(|_key: &ContractKey, value: &WrappedState| -> u32 {
+                value.size().try_into().unwrap_or(u32::MAX)
+            })
             .build();
         Ok(Self {
             state_mem_cache: Some(cache),
@@ -148,13 +150,16 @@ where
                 .ok_or_else(|| StateStoreError::MissingContract(*key))?;
         }
 
-        // Update memory cache first (if enabled) to prevent race condition
-        if let Some(cache) = &self.state_mem_cache {
-            cache.insert(*key, state.clone());
-        }
+        // Persist first, then cache. If persist fails, the cache must not
+        // hold data that was never written to disk. See issue #3487.
+        self.store
+            .store(*key, state.clone())
+            .await
+            .map_err(Into::into)?;
 
-        // Then update persistent store
-        self.store.store(*key, state).await.map_err(Into::into)?;
+        if let Some(cache) = &self.state_mem_cache {
+            cache.insert(*key, state);
+        }
         Ok(())
     }
 
@@ -178,17 +183,20 @@ where
             });
         }
 
-        // Update memory cache first (if enabled) to prevent race condition
-        if let Some(cache) = &self.state_mem_cache {
-            cache.insert(key, state.clone());
-        }
-
-        // Then update persistent stores
-        self.store.store(key, state).await.map_err(Into::into)?;
+        // Persist first, then cache. If persist fails, the cache must not
+        // hold data that was never written to disk. See issue #3487.
+        self.store
+            .store(key, state.clone())
+            .await
+            .map_err(Into::into)?;
         self.store
             .store_params(key, params.clone())
             .await
             .map_err(Into::into)?;
+
+        if let Some(cache) = &self.state_mem_cache {
+            cache.insert(key, state);
+        }
         Ok(())
     }
 
@@ -804,5 +812,70 @@ mod tests {
         // ensure_params fills the gap
         store.ensure_params(key, params.clone()).await.unwrap();
         assert_eq!(store.get_params(&key).await.unwrap(), Some(params));
+    }
+
+    // ============ Cache Coherence on Failure (issue #3487) ============
+
+    /// Regression test for issue #3487: failed store must not leave stale data in cache.
+    ///
+    /// Before the fix, cache was populated before persist. If persist failed,
+    /// subsequent reads would return the "phantom" data from cache.
+    #[tokio::test]
+    async fn test_cached_store_failure_does_not_leave_stale_cache() {
+        let mock_storage = MockStateStorage::new();
+        mock_storage.fail_next_stores(1);
+
+        let mut store = StateStore::new(mock_storage, 10_000).unwrap();
+
+        let key = make_test_key();
+        let state = make_test_state(&[1, 2, 3]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Store should fail
+        let result = store.store(key, state, params).await;
+        assert!(result.is_err());
+
+        // Cache must NOT serve the failed state
+        let get_result = store.get(&key).await;
+        assert!(
+            matches!(get_result, Err(StateStoreError::MissingContract(_))),
+            "Cache should not serve data that was never persisted, got {:?}",
+            get_result
+        );
+    }
+
+    /// Regression test for issue #3487: failed update must not corrupt cached state.
+    ///
+    /// After a successful store followed by a failed update, reads must return
+    /// the last successfully persisted state, not the failed update's data.
+    #[tokio::test]
+    async fn test_cached_update_failure_preserves_original_state() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new(mock_storage.clone(), 10_000).unwrap();
+
+        let key = make_test_key();
+        let original_state = make_test_state(&[1, 2, 3]);
+        let bad_update = make_test_state(&[9, 9, 9]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Store original state successfully
+        store
+            .store(key, original_state.clone(), params)
+            .await
+            .unwrap();
+
+        // Configure failure for update
+        mock_storage.fail_next_stores(1);
+
+        // Update should fail
+        let result = store.update(&key, bad_update).await;
+        assert!(result.is_err());
+
+        // Cache must still serve the original (last persisted) state
+        let retrieved = store.get(&key).await.unwrap();
+        assert_eq!(
+            retrieved, original_state,
+            "Cache should serve last persisted state after failed update"
+        );
     }
 }
