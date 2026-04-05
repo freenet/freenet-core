@@ -2182,6 +2182,12 @@ impl Operation for GetOp {
                             let access_result =
                                 op_manager.ring.record_get_access(key, value.size() as u64);
 
+                            // Mark as locally accessed if this is the originator node (#3769).
+                            // This distinguishes local client requests from relay traffic.
+                            if is_original_requester {
+                                op_manager.ring.mark_local_client_access(&key);
+                            }
+
                             // Clean up interest tracking for evicted contracts (always, even if already hosting)
                             let mut removed_contracts = Vec::new();
                             for evicted_key in &access_result.evicted {
@@ -2267,6 +2273,10 @@ impl Operation for GetOp {
                                         let access_result = op_manager
                                             .ring
                                             .record_get_access(key, value.size() as u64);
+
+                                        if is_original_requester {
+                                            op_manager.ring.mark_local_client_access(&key);
+                                        }
 
                                         // Clean up interest tracking for evicted contracts (always, even if already hosting)
                                         let mut removed_contracts = Vec::new();
@@ -2912,6 +2922,10 @@ impl Operation for GetOp {
                         // Record access atomically — returns whether this is a newly-hosted contract
                         let access_result =
                             op_manager.ring.record_get_access(key, state.size() as u64);
+
+                        if is_original_requester {
+                            op_manager.ring.mark_local_client_access(&key);
+                        }
 
                         // Clean up interest tracking for evicted contracts
                         let mut removed_contracts = Vec::new();

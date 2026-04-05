@@ -1256,36 +1256,44 @@ async fn process_open_request(
                             .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
-                        // Refresh hosting TTL on any user GET — keeps hosted
-                        // contracts alive regardless of whether we serve from
-                        // local cache or route through the network (which may
-                        // fall back to local cache via local_fallback).
+                        // Mark as locally accessed and refresh hosting TTL on any
+                        // user GET. This distinguishes locally-requested contracts
+                        // from relay-cached ones, enabling safe subscription
+                        // renewal after restart (#3769).
                         if let Some(ref fk) = full_key {
+                            op_manager.ring.mark_local_client_access(fk);
                             if op_manager.ring.is_hosting_contract(fk) {
                                 op_manager.ring.touch_hosting(fk);
                             }
                         }
 
-                        // Check if we're actively hosting this contract.
-                        let is_hosted = full_key
+                        // Check if we're actively hosting this contract AND
+                        // it was accessed by a local client. The local_client_access
+                        // flag (#3769) distinguishes locally-requested contracts from
+                        // relay-cached ones. Without this check, stale relay-cached
+                        // state could be served after restart.
+                        let is_locally_hosted = full_key
                             .as_ref()
-                            .map(|k| op_manager.ring.is_hosting_contract(k))
+                            .map(|k| {
+                                op_manager.ring.is_hosting_contract(k)
+                                    && op_manager.ring.has_local_client_access(k)
+                            })
                             .unwrap_or(false);
 
                         // Return local cache if we have valid state AND any of:
                         // 1. No connections (isolated node - can only use local cache)
                         // 2. Actively subscribed (cache is kept fresh via updates)
-                        // 3. Hosting the contract (committed to keeping it current;
-                        //    subscription may be in progress or between renewals)
+                        // 3. Hosting with local client access (committed to keeping it
+                        //    current; subscription may be in progress or between renewals)
                         //
-                        // Hosting is sufficient because: a hosted contract was either
-                        // just fetched from the network (fresh) or loaded from disk at
-                        // startup (subscription renewal will refresh it). Without this,
-                        // every HTTP GET goes to the network even seconds after the
-                        // first load because the async subscribe sub-operation takes
-                        // 10-50s to complete, during which is_subscribed is false.
+                        // Local-client hosting is sufficient because: a locally-accessed
+                        // contract was either just fetched from the network (fresh) or
+                        // loaded from disk at startup with its subscription being renewed.
+                        // Without this, every HTTP GET goes to the network even seconds
+                        // after the first load because the async subscribe sub-operation
+                        // takes 10-50s to complete, during which is_subscribed is false.
                         if local_satisfies_request
-                            && (connection_count == 0 || is_subscribed || is_hosted)
+                            && (connection_count == 0 || is_subscribed || is_locally_hosted)
                         {
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
@@ -1296,7 +1304,7 @@ async fn process_open_request(
                                 peer = %peer_id,
                                 contract = %full_key,
                                 is_subscribed,
-                                is_hosted,
+                                is_locally_hosted,
                                 connection_count,
                                 phase = "local_cache",
                                 "Returning locally cached contract state"

@@ -67,6 +67,11 @@ pub struct HostedContract {
     pub last_accessed: Instant,
     /// Type of the last access
     pub access_type: AccessType,
+    /// Whether this contract was accessed by a local client (HTTP/WebSocket).
+    /// Distinguishes "contracts the local user cares about" from "contracts
+    /// this node cached while relaying for other peers." Only contracts with
+    /// this flag get subscription renewal and trusted local-cache serving.
+    pub local_client_access: bool,
 }
 
 /// Unified hosting cache that combines byte-budget LRU with TTL protection.
@@ -183,6 +188,7 @@ impl<T: TimeSource> HostingCache<T> {
                 size_bytes,
                 last_accessed: now,
                 access_type,
+                local_client_access: false,
             };
             self.contracts.insert(key, contract);
             self.lru_order.push_back(key);
@@ -193,6 +199,25 @@ impl<T: TimeSource> HostingCache<T> {
                 evicted,
             }
         }
+    }
+
+    /// Mark a contract as accessed by a local client (HTTP/WebSocket).
+    ///
+    /// This distinguishes locally-requested contracts from relay-cached ones,
+    /// enabling safe subscription renewal and trusted local-cache serving.
+    /// Only sets the flag if the contract is already in the cache.
+    pub fn mark_local_client_access(&mut self, key: &ContractKey) {
+        if let Some(existing) = self.contracts.get_mut(key) {
+            existing.local_client_access = true;
+        }
+    }
+
+    /// Check if a contract was accessed by a local client.
+    pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
+        self.contracts
+            .get(key)
+            .map(|c| c.local_client_access)
+            .unwrap_or(false)
     }
 
     /// Touch/refresh a contract's timestamp without adding it if missing.
@@ -319,6 +344,7 @@ impl<T: TimeSource> HostingCache<T> {
         size_bytes: u64,
         access_type: AccessType,
         last_access_age: Duration,
+        local_client_access: bool,
     ) {
         // Skip if already loaded (shouldn't happen, but defensive)
         if self.contracts.contains_key(&key) {
@@ -333,6 +359,7 @@ impl<T: TimeSource> HostingCache<T> {
             size_bytes,
             last_accessed,
             access_type,
+            local_client_access,
         };
 
         self.contracts.insert(key, contract);

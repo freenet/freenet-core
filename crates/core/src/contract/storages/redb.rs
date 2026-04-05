@@ -48,29 +48,41 @@ pub struct HostingMetadata {
     pub size_bytes: u64,
     /// Code hash of the contract (needed to reconstruct ContractKey)
     pub code_hash: [u8; 32],
+    /// Whether this contract was accessed by a local client (HTTP/WebSocket).
+    /// Distinguishes locally-requested contracts from relay-cached ones.
+    pub local_client_access: bool,
 }
 
 impl HostingMetadata {
-    pub fn new(last_access_ms: u64, access_type: u8, size_bytes: u64, code_hash: [u8; 32]) -> Self {
+    pub fn new(
+        last_access_ms: u64,
+        access_type: u8,
+        size_bytes: u64,
+        code_hash: [u8; 32],
+        local_client_access: bool,
+    ) -> Self {
         Self {
             last_access_ms,
             access_type,
             size_bytes,
             code_hash,
+            local_client_access,
         }
     }
 
-    /// Serialize to bytes: [last_access_ms: 8][access_type: 1][size_bytes: 8][code_hash: 32] = 49 bytes
-    pub fn to_bytes(&self) -> [u8; 49] {
-        let mut buf = [0u8; 49];
+    /// Serialize to bytes: [last_access_ms: 8][access_type: 1][size_bytes: 8][code_hash: 32][local_client_access: 1] = 50 bytes
+    pub fn to_bytes(&self) -> [u8; 50] {
+        let mut buf = [0u8; 50];
         buf[0..8].copy_from_slice(&self.last_access_ms.to_le_bytes());
         buf[8] = self.access_type;
         buf[9..17].copy_from_slice(&self.size_bytes.to_le_bytes());
         buf[17..49].copy_from_slice(&self.code_hash);
+        buf[49] = u8::from(self.local_client_access);
         buf
     }
 
-    /// Deserialize from bytes
+    /// Deserialize from bytes. Backward-compatible: 49-byte entries
+    /// from before the local_client_access field default to false.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 49 {
             return None;
@@ -79,11 +91,13 @@ impl HostingMetadata {
         let access_type = bytes[8];
         let size_bytes = u64::from_le_bytes(bytes[9..17].try_into().ok()?);
         let code_hash: [u8; 32] = bytes[17..49].try_into().ok()?;
+        let local_client_access = bytes.get(49).copied().unwrap_or(0) != 0;
         Some(Self {
             last_access_ms,
             access_type,
             size_bytes,
             code_hash,
+            local_client_access,
         })
     }
 }
@@ -716,7 +730,15 @@ impl StateStorage for ReDb {
             // Default to PUT access type (1) since we're storing state
             // Store the code hash so we can reconstruct ContractKey on load
             let code_hash: [u8; 32] = **key.code_hash();
-            let metadata = HostingMetadata::new(now_ms, 1, state_size, code_hash);
+            // Preserve existing local_client_access flag on update
+            let existing_local = tbl
+                .get(key.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|v| HostingMetadata::from_bytes(v.value()))
+                .map(|m| m.local_client_access)
+                .unwrap_or(false);
+            let metadata = HostingMetadata::new(now_ms, 1, state_size, code_hash, existing_local);
             tbl.insert(key.as_bytes(), metadata.to_bytes().as_slice())?;
         }
 

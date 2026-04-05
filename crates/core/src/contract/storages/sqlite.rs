@@ -20,15 +20,24 @@ pub struct HostingMetadata {
     pub size_bytes: u64,
     /// Code hash of the contract (needed to reconstruct ContractKey)
     pub code_hash: [u8; 32],
+    /// Whether this contract was accessed by a local client (HTTP/WebSocket).
+    pub local_client_access: bool,
 }
 
 impl HostingMetadata {
-    pub fn new(last_access_ms: u64, access_type: u8, size_bytes: u64, code_hash: [u8; 32]) -> Self {
+    pub fn new(
+        last_access_ms: u64,
+        access_type: u8,
+        size_bytes: u64,
+        code_hash: [u8; 32],
+        local_client_access: bool,
+    ) -> Self {
         Self {
             last_access_ms,
             access_type,
             size_bytes,
             code_hash,
+            local_client_access,
         }
     }
 }
@@ -53,7 +62,8 @@ async fn create_hosting_metadata_table(pool: &SqlitePool) -> Result<(), SqlDbErr
             last_access_ms  INTEGER NOT NULL,
             access_type     INTEGER NOT NULL,
             size_bytes      INTEGER NOT NULL,
-            code_hash       BLOB NOT NULL
+            code_hash       BLOB NOT NULL,
+            local_client_access INTEGER NOT NULL DEFAULT 0
         )",
     )
     .execute(pool)
@@ -100,19 +110,21 @@ impl Pool {
         metadata: HostingMetadata,
     ) -> Result<(), SqlDbError> {
         sqlx::query(
-            "INSERT INTO hosting_metadata (contract, last_access_ms, access_type, size_bytes, code_hash)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO hosting_metadata (contract, last_access_ms, access_type, size_bytes, code_hash, local_client_access)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT(contract) DO UPDATE SET
                 last_access_ms = excluded.last_access_ms,
                 access_type = excluded.access_type,
                 size_bytes = excluded.size_bytes,
-                code_hash = excluded.code_hash",
+                code_hash = excluded.code_hash,
+                local_client_access = MAX(hosting_metadata.local_client_access, excluded.local_client_access)",
         )
         .bind(key.as_bytes())
         .bind(metadata.last_access_ms as i64)
         .bind(metadata.access_type as i32)
         .bind(metadata.size_bytes as i64)
         .bind(metadata.code_hash.as_slice())
+        .bind(i32::from(metadata.local_client_access))
         .execute(&self.0)
         .await?;
         Ok(())
@@ -124,7 +136,7 @@ impl Pool {
         key: &ContractKey,
     ) -> Result<Option<HostingMetadata>, SqlDbError> {
         match sqlx::query(
-            "SELECT last_access_ms, access_type, size_bytes, code_hash FROM hosting_metadata WHERE contract = ?",
+            "SELECT last_access_ms, access_type, size_bytes, code_hash, local_client_access FROM hosting_metadata WHERE contract = ?",
         )
         .bind(key.as_bytes())
         .map(|row: SqliteRow| {
@@ -138,6 +150,7 @@ impl Pool {
                 row.get::<i32, _>("access_type") as u8,
                 row.get::<i64, _>("size_bytes") as u64,
                 code_hash,
+                row.get::<i32, _>("local_client_access") != 0,
             )
         })
         .fetch_one(&self.0)
@@ -163,7 +176,7 @@ impl Pool {
         &self,
     ) -> Result<Vec<(Vec<u8>, HostingMetadata)>, SqlDbError> {
         let rows = sqlx::query(
-            "SELECT contract, last_access_ms, access_type, size_bytes, code_hash FROM hosting_metadata",
+            "SELECT contract, last_access_ms, access_type, size_bytes, code_hash, local_client_access FROM hosting_metadata",
         )
         .map(|row: SqliteRow| {
             let contract: Vec<u8> = row.get("contract");
@@ -177,6 +190,7 @@ impl Pool {
                 row.get::<i32, _>("access_type") as u8,
                 row.get::<i64, _>("size_bytes") as u64,
                 code_hash,
+                row.get::<i32, _>("local_client_access") != 0,
             );
             (contract, metadata)
         })
@@ -235,7 +249,7 @@ impl StateStorage for Pool {
         // Default to PUT access type (1) since we're storing state
         // Store the code hash so we can reconstruct ContractKey on load
         let code_hash: [u8; 32] = **key.code_hash();
-        let metadata = HostingMetadata::new(now_ms, 1, state_size, code_hash);
+        let metadata = HostingMetadata::new(now_ms, 1, state_size, code_hash, false);
         self.store_hosting_metadata(&key, metadata).await?;
 
         Ok(())

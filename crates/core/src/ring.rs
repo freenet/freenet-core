@@ -1693,6 +1693,19 @@ impl Ring {
         self.hosting_manager.touch_hosting(key)
     }
 
+    /// Mark a contract as accessed by a local client (HTTP/WebSocket).
+    ///
+    /// Distinguishes locally-requested contracts from relay-cached ones,
+    /// enabling safe subscription renewal and trusted local-cache serving.
+    pub fn mark_local_client_access(&self, key: &ContractKey) {
+        self.hosting_manager.mark_local_client_access(key)
+    }
+
+    /// Check if a contract was accessed by a local client.
+    pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
+        self.hosting_manager.has_local_client_access(key)
+    }
+
     /// Sweep for expired entries in the hosting cache.
     ///
     /// Returns contracts evicted from this cache. Contracts with client
