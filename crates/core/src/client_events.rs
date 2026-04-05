@@ -1390,10 +1390,16 @@ async fn process_open_request(
                                     "Starting new GET network operation"
                                 );
 
+                                // When AUTO_SUBSCRIBE_ON_GET is enabled, piggyback
+                                // subscription on the GET wire message so relay nodes
+                                // build the subscription tree during response
+                                // propagation (#3760).
+                                let wire_subscribe =
+                                    subscribe || crate::ring::AUTO_SUBSCRIBE_ON_GET;
                                 let op = get::start_op_with_id(
                                     key,
                                     return_contract_code,
-                                    subscribe,
+                                    wire_subscribe,
                                     blocking_subscribe,
                                     transaction_id,
                                 );
@@ -1474,11 +1480,14 @@ async fn process_open_request(
                                 "Contract not found locally, starting direct GET operation (legacy mode)"
                             );
 
-                            // Legacy mode: direct operation without deduplication
+                            // Legacy mode: direct operation without deduplication.
+                            // When AUTO_SUBSCRIBE_ON_GET is enabled, piggyback
+                            // subscription on the wire message (#3760).
+                            let wire_subscribe = subscribe || crate::ring::AUTO_SUBSCRIBE_ON_GET;
                             let op = get::start_op(
                                 key,
                                 return_contract_code,
-                                subscribe,
+                                wire_subscribe,
                                 blocking_subscribe,
                             );
                             let op_id = op.id;

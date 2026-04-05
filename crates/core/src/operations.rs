@@ -526,6 +526,81 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
     }
 }
 
+/// Establish subscription tree entries at a relay node during GET response forwarding.
+///
+///
+/// When a GET with `subscribe=true` propagates back through relay nodes, each relay
+/// registers itself in the subscription tree. This eliminates the need for a separate
+/// SUBSCRIBE round-trip after GET completes. See #3760.
+///
+/// The relay performs the same registrations that the SUBSCRIBE Response handler does:
+/// 1. Mark self as subscribed (lease in `active_subscriptions`)
+/// 2. Register the response sender (upstream) as upstream interest source
+/// 3. Register the GET requester (downstream) as downstream subscriber
+/// 4. Announce that we host this contract (so neighbors send UPDATEs to us)
+///
+/// Note: step 4 calls `announce_contract_hosted`, which the old GET relay path
+/// deliberately avoided ("relay peers should not advertise contracts they are not
+/// responsible for in the ring"). This is now correct because relay nodes
+/// participating in the subscription tree MUST receive UPDATEs to forward them
+/// downstream. Without the announcement, neighbors wouldn't include this relay
+/// in their broadcast targets.
+///
+/// Contract caching is handled separately by the caller (GET relay already does this).
+///
+/// Naming convention: GET's `upstream_addr` points toward the originator (response
+/// destination), which is the *downstream* direction in the subscription tree.
+/// `source_addr` is the response sender, *upstream* in subscription terms.
+pub(crate) async fn establish_subscription_at_relay(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    tx: &crate::message::Transaction,
+    upstream_response_addr: std::net::SocketAddr,
+    downstream_requester_addr: std::net::SocketAddr,
+) {
+    // 1. Mark self as subscribed (lease in active_subscriptions).
+    // Note: we do NOT call complete_subscription_request here because the relay
+    // never called mark_subscription_pending -- there's no pending request to complete,
+    // and record_success would add noise to the backoff tracker for contracts the relay
+    // has no independent subscription relationship with.
+    op_manager.ring.subscribe(*key);
+
+    // 2. Register upstream peer (response sender) as upstream interest source
+    if let Some(upstream_pkl) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(upstream_response_addr)
+    {
+        let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
+        op_manager
+            .interest_manager
+            .register_peer_interest(key, peer_key, None, true);
+    }
+
+    // 3. Register downstream peer (GET requester) as downstream subscriber
+    subscribe::register_downstream_subscriber(
+        op_manager,
+        key,
+        downstream_requester_addr,
+        None, // No pre-resolved pub key; will be resolved from addr
+        None,
+        tx,
+        " (piggybacked on GET response)",
+    )
+    .await;
+
+    // 4. Announce that we host this contract
+    announce_contract_hosted(op_manager, key).await;
+
+    tracing::debug!(
+        tx = %tx,
+        contract = %key,
+        upstream = %upstream_response_addr,
+        downstream = %downstream_requester_addr,
+        "Established subscription tree entry at relay via GET piggyback"
+    );
+}
+
 /// Broadcast ChangeInterests message to all connected peers.
 ///
 /// Called when local interest in contracts changes (gained or lost).
