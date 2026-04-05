@@ -552,6 +552,13 @@ pub(crate) async fn setup_subscription_forwarding_at_relay(
         op_manager
             .interest_manager
             .register_peer_interest(key, peer_key, None, true);
+    } else {
+        tracing::debug!(
+            tx = %tx,
+            contract = %key,
+            upstream = %upstream_response_addr,
+            "Piggyback relay: upstream peer not in ring, skipping interest registration"
+        );
     }
 
     // Register downstream peer (GET requester) as downstream subscriber

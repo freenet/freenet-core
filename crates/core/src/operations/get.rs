@@ -2256,9 +2256,15 @@ impl Operation for GetOp {
                                 && (access_result.is_new || !op_manager.ring.is_subscribed(&key))
                             {
                                 super::auto_subscribe_on_get_response(
-                                    op_manager, &key, &id, &sender_from_addr,
-                                    subscribe_requested, blocking_sub, "non-streaming",
-                                ).await;
+                                    op_manager,
+                                    &key,
+                                    &id,
+                                    &sender_from_addr,
+                                    subscribe_requested,
+                                    blocking_sub,
+                                    "non-streaming",
+                                )
+                                .await;
                             }
                         } else {
                             // Only attempt to cache if we have the contract code.
@@ -2345,9 +2351,15 @@ impl Operation for GetOp {
                                                 || !op_manager.ring.is_subscribed(&key))
                                         {
                                             super::auto_subscribe_on_get_response(
-                                                op_manager, &key, &id, &sender_from_addr,
-                                                subscribe_requested, blocking_sub, "non-streaming, put-path",
-                                            ).await;
+                                                op_manager,
+                                                &key,
+                                                &id,
+                                                &sender_from_addr,
+                                                subscribe_requested,
+                                                blocking_sub,
+                                                "non-streaming, put-path",
+                                            )
+                                            .await;
                                         }
                                     }
                                     ContractHandlerEvent::PutResponse {
@@ -3049,9 +3061,15 @@ impl Operation for GetOp {
                                     && !op_manager.ring.is_subscribed(&key)
                                 {
                                     super::auto_subscribe_on_get_response(
-                                        op_manager, &key, &id, &sender_from_addr,
-                                        subscribe_requested, blocking_sub, "streaming",
-                                    ).await;
+                                        op_manager,
+                                        &key,
+                                        &id,
+                                        &sender_from_addr,
+                                        subscribe_requested,
+                                        blocking_sub,
+                                        "streaming",
+                                    )
+                                    .await;
                                 }
                             } else if !removed_contracts.is_empty() {
                                 super::broadcast_change_interests(
@@ -3092,9 +3110,15 @@ impl Operation for GetOp {
                                 && !op_manager.ring.is_subscribed(&key)
                             {
                                 super::auto_subscribe_on_get_response(
-                                    op_manager, &key, &id, &sender_from_addr,
-                                    subscribe_requested, blocking_sub, "streaming, re-subscribe",
-                                ).await;
+                                    op_manager,
+                                    &key,
+                                    &id,
+                                    &sender_from_addr,
+                                    subscribe_requested,
+                                    blocking_sub,
+                                    "streaming, re-subscribe",
+                                )
+                                .await;
                             }
                         }
                     }
@@ -5504,5 +5528,50 @@ mod tests {
         let (peer, loc) = op.failure_routing_info().expect("should have routing info");
         assert_eq!(peer, target);
         assert_eq!(loc, contract_location);
+    }
+
+    /// Backward compatibility: GetMsg::Request without subscribe field
+    /// deserializes with subscribe=false (old peers don't send it).
+    #[test]
+    fn test_get_msg_subscribe_backward_compat() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let msg = GetMsg::Request {
+            id: Transaction::new::<GetMsg>(),
+            instance_id: ContractInstanceId::new([1; 32]),
+            fetch_contract: true,
+            htl: 10,
+            visited: VisitedPeers::default(),
+            subscribe: true,
+        };
+
+        // Round-trip: serialize with subscribe=true, deserialize, verify
+        let bytes = bincode::serialize(&msg).unwrap();
+        let restored: GetMsg = bincode::deserialize(&bytes).unwrap();
+        match restored {
+            GetMsg::Request { subscribe, .. } => assert!(subscribe),
+            _ => panic!("expected Request"),
+        }
+
+        // Simulate old peer: serialize without subscribe field by using false
+        let msg_old = GetMsg::Request {
+            id: Transaction::new::<GetMsg>(),
+            instance_id: ContractInstanceId::new([2; 32]),
+            fetch_contract: true,
+            htl: 10,
+            visited: VisitedPeers::default(),
+            subscribe: false,
+        };
+        let bytes_old = bincode::serialize(&msg_old).unwrap();
+        let restored_old: GetMsg = bincode::deserialize(&bytes_old).unwrap();
+        match restored_old {
+            GetMsg::Request { subscribe, .. } => {
+                assert!(
+                    !subscribe,
+                    "Old-format messages should default subscribe to false"
+                );
+            }
+            _ => panic!("expected Request"),
+        }
     }
 }
