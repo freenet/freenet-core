@@ -70,6 +70,10 @@ pub struct HostedContract {
     /// Whether a local client (HTTP/WebSocket) accessed this contract.
     /// Only flagged contracts get subscription renewal and local-cache serving.
     pub local_client_access: bool,
+    /// When the local client last accessed this contract. Age-gates the renewal:
+    /// contracts not accessed locally within SUBSCRIPTION_LEASE_DURATION stop
+    /// being renewed (AGENTS.md cleanup exemption rule). None = never locally accessed.
+    pub local_client_last_access: Option<Instant>,
 }
 
 /// Unified hosting cache that combines byte-budget LRU with TTL protection.
@@ -187,6 +191,7 @@ impl<T: TimeSource> HostingCache<T> {
                 last_accessed: now,
                 access_type,
                 local_client_access: false,
+                local_client_last_access: None,
             };
             self.contracts.insert(key, contract);
             self.lru_order.push_back(key);
@@ -204,6 +209,7 @@ impl<T: TimeSource> HostingCache<T> {
     pub fn mark_local_client_access(&mut self, key: &ContractKey) {
         if let Some(existing) = self.contracts.get_mut(key) {
             existing.local_client_access = true;
+            existing.local_client_last_access = Some(self.time_source.now());
         }
     }
 
@@ -212,6 +218,21 @@ impl<T: TimeSource> HostingCache<T> {
         self.contracts
             .get(key)
             .map(|c| c.local_client_access)
+            .unwrap_or(false)
+    }
+
+    /// Check if a contract was accessed by a local client within the given duration.
+    /// Returns false if never locally accessed or if the access is too old.
+    pub fn has_recent_local_client_access(
+        &self,
+        key: &ContractKey,
+        max_age: std::time::Duration,
+    ) -> bool {
+        let now = self.time_source.now();
+        self.contracts
+            .get(key)
+            .and_then(|c| c.local_client_last_access)
+            .map(|t| now.saturating_duration_since(t) < max_age)
             .unwrap_or(false)
     }
 
@@ -350,11 +371,17 @@ impl<T: TimeSource> HostingCache<T> {
         let now = self.time_source.now();
         let last_accessed = now.checked_sub(last_access_age).unwrap_or(now);
 
+        // Locally-accessed contracts loaded from disk get one renewal window
+        // (set to "now") so they can re-establish subscriptions after restart.
+        // If the user doesn't access them again, the age gate expires naturally.
+        let local_client_last_access = if local_client_access { Some(now) } else { None };
+
         let contract = HostedContract {
             size_bytes,
             last_accessed,
             access_type,
             local_client_access,
+            local_client_last_access,
         };
 
         self.contracts.insert(key, contract);

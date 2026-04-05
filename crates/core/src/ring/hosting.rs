@@ -874,13 +874,16 @@ impl HostingManager {
         }
 
         // 3. Locally-accessed hosted contracts without active subscription.
-        // Only contracts marked by local clients are renewed (#3769);
+        // Only contracts recently marked by local clients are renewed (#3769);
         // relay-cached contracts are excluded to prevent storms (#3763).
+        // The age gate (SUBSCRIPTION_LEASE_DURATION) ensures contracts stop
+        // being renewed if the local user hasn't accessed them recently,
+        // satisfying the cleanup exemption rule (AGENTS.md).
         {
             let cache = self.hosting_cache.read();
             let now = self.time_source.now();
             for key in cache.iter() {
-                if cache.has_local_client_access(&key)
+                if cache.has_recent_local_client_access(&key, SUBSCRIPTION_LEASE_DURATION)
                     && !self
                         .active_subscriptions
                         .get(&key)
