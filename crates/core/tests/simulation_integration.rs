@@ -3284,9 +3284,25 @@ fn test_subscription_broadcast_propagation() {
         peer_states
     );
 
+    // Verify BroadcastEmitted telemetry events were produced (#3622)
+    let broadcast_emitted_count: usize = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.iter()
+            .filter(|log| log.kind.is_update_broadcast_emitted())
+            .count()
+    });
+
+    assert!(
+        broadcast_emitted_count > 0,
+        "Expected at least one UpdateEvent::BroadcastEmitted telemetry event, got 0. \
+         This means the emission wiring from #3622 is broken."
+    );
+
     tracing::info!(
-        "test_subscription_broadcast_propagation PASSED: {} peers converged to same state",
-        peer_states.len()
+        "test_subscription_broadcast_propagation PASSED: {} peers converged to same state, \
+         {} BroadcastEmitted events",
+        peer_states.len(),
+        broadcast_emitted_count
     );
 }
 
