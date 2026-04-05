@@ -644,8 +644,11 @@ pub(crate) async fn auto_subscribe_on_get_response(
     if subscribe_requested {
         complete_piggyback_subscription(op_manager, key, tx, sender_from_addr).await;
     } else {
-        let child_tx = start_subscription_request(op_manager, *tx, *key, blocking_sub);
-        tracing::debug!(tx = %tx, %child_tx, blocking = %blocking_sub, "started subscription ({path_label}, fallback)");
+        // Only block if the client explicitly requested both subscribe AND blocking.
+        // Plain GETs with AUTO_SUBSCRIBE_ON_GET should not be delayed by subscription.
+        let blocking = subscribe_requested && blocking_sub;
+        let child_tx = start_subscription_request(op_manager, *tx, *key, blocking);
+        tracing::debug!(tx = %tx, %child_tx, %blocking, "started subscription ({path_label}, fallback)");
     }
 }
 
