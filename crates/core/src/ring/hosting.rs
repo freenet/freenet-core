@@ -11,10 +11,11 @@
 //! into a single `HostingCache` that serves as the source of truth for which contracts
 //! this peer is hosting.
 //!
-//! 1. **Hosting ≠ subscription renewal**: Hosted contracts are cached locally but
-//!    only contracts with active client subscriptions or downstream subscribers
-//!    get their subscriptions renewed. Contracts persisted to disk without active
-//!    interest serve as a recovery mechanism (last-resort data source) only.
+//! 1. **Hosting ≠ automatic subscription renewal**: Hosted contracts are cached
+//!    locally but only contracts with active client subscriptions, downstream
+//!    subscribers, OR the `local_client_access` flag (#3769) get their
+//!    subscriptions renewed. Relay-cached contracts (no local interest) serve
+//!    as a recovery mechanism (last-resort data source) only.
 //!
 //! 2. **Subscriptions are lease-based**: Active subscriptions have a lease that expires
 //!    unless renewed. Clients must re-subscribe periodically (every ~2 minutes).
@@ -24,7 +25,7 @@
 //! ## Data Flow
 //!
 //! - GET/PUT/SUBSCRIBE operations add contracts to the hosting cache
-//! - Only client-subscribed contracts get subscription renewal via `contracts_needing_renewal()`
+//! - Only locally-accessed or client-subscribed contracts get subscription renewal via `contracts_needing_renewal()`
 //! - Active subscriptions prevent eviction from the hosting cache
 //! - TTL protects recently accessed contracts from premature eviction
 
@@ -562,7 +563,14 @@ impl HostingManager {
                     AccessType::Subscribe => 2,
                 };
                 let code_hash: [u8; 32] = **key.code_hash();
-                let metadata = HostingMetadata::new(now_ms, access_type_u8, size_bytes, code_hash);
+                let local_client = self.hosting_cache.read().has_local_client_access(&key);
+                let metadata = HostingMetadata::new(
+                    now_ms,
+                    access_type_u8,
+                    size_bytes,
+                    code_hash,
+                    local_client,
+                );
                 if let Err(e) = storage.store_hosting_metadata(&key, metadata) {
                     tracing::warn!(
                         contract = %key,
@@ -652,6 +660,55 @@ impl HostingManager {
     /// subscriptions expire (leaving stale state).
     pub fn is_receiving_updates(&self, contract: &ContractKey) -> bool {
         self.is_subscribed(contract) || self.has_client_subscriptions(contract.id())
+    }
+
+    /// Mark a contract as accessed by a local client (HTTP/WebSocket).
+    ///
+    /// Only contracts with this flag get subscription renewal and trusted
+    /// local-cache serving. Persists to disk so it survives restarts.
+    pub fn mark_local_client_access(&self, key: &ContractKey) {
+        let already_set = self.hosting_cache.read().has_local_client_access(key);
+
+        // Always refresh the timestamp (keeps the age gate alive) even if
+        // the flag is already set. Only skip disk persistence for the flag.
+        self.hosting_cache.write().mark_local_client_access(key);
+
+        if already_set {
+            return;
+        }
+
+        // Persist the updated flag to disk
+        if let Some(storage) = self.storage.read().as_ref() {
+            #[cfg(feature = "redb")]
+            {
+                if let Ok(Some(mut metadata)) = storage.get_hosting_metadata(key) {
+                    metadata.local_client_access = true;
+                    if let Err(e) = storage.store_hosting_metadata(key, metadata) {
+                        tracing::warn!(
+                            contract = %key,
+                            error = %e,
+                            "Failed to persist local_client_access flag"
+                        );
+                    }
+                }
+            }
+            #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+            {
+                // Sqlite persistence is deferred to the next state store call,
+                // which uses MAX() to preserve the flag (see store_hosting_metadata).
+                tracing::trace!(
+                    contract = %key,
+                    "Sqlite local_client_access persistence deferred to state store"
+                );
+            }
+        }
+
+        debug!(%key, "Marked contract as locally accessed by client");
+    }
+
+    /// Check if a contract was accessed by a local client.
+    pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
+        self.hosting_cache.read().has_local_client_access(key)
     }
 
     /// Touch a contract in the hosting cache (refresh TTL without adding).
@@ -819,15 +876,27 @@ impl HostingManager {
             }
         }
 
-        // NOTE: Hosted-only contracts (no client subscription, no active
-        // subscription) are intentionally excluded from renewal. Including
-        // them caused subscription storms (#3546) -- relay-cached contracts
-        // loaded from disk were all subscribed, overwhelming the network.
-        // The `is_hosted` shortcut in the GET handler (#3761) provides
-        // fast local cache for same-session access. For post-restart
-        // freshness, the subscription piggyback on GET response (#3762)
-        // establishes subscriptions quickly when a contract is first
-        // accessed by the local user.
+        // 3. Locally-accessed hosted contracts without active subscription.
+        // Only contracts recently marked by local clients are renewed (#3769);
+        // relay-cached contracts are excluded to prevent storms (#3763).
+        // The age gate (SUBSCRIPTION_LEASE_DURATION) ensures contracts stop
+        // being renewed if the local user hasn't accessed them recently,
+        // satisfying the cleanup exemption rule (AGENTS.md).
+        {
+            let cache = self.hosting_cache.read();
+            let now = self.time_source.now();
+            for key in cache.iter() {
+                if cache.has_recent_local_client_access(&key, SUBSCRIPTION_LEASE_DURATION)
+                    && !self
+                        .active_subscriptions
+                        .get(&key)
+                        .map(|e| *e > now)
+                        .unwrap_or(false)
+                {
+                    needs_renewal_set.insert(key);
+                }
+            }
+        }
 
         // Convert set to vec and sort for deterministic return order
         let mut result: Vec<ContractKey> = needs_renewal_set.into_iter().collect();
@@ -979,7 +1048,13 @@ impl HostingManager {
                 let age_ms = now_ms.saturating_sub(metadata.last_access_ms);
                 let age = std::time::Duration::from_millis(age_ms);
 
-                cache.load_persisted_entry(key, metadata.size_bytes, access_type, age);
+                cache.load_persisted_entry(
+                    key,
+                    metadata.size_bytes,
+                    access_type,
+                    age,
+                    metadata.local_client_access,
+                );
                 loaded += 1;
             }
         }
@@ -1013,13 +1088,13 @@ impl HostingManager {
                 // Get state size for the hosting cache
                 let size_bytes = storage.get_state_size(&key).unwrap_or(Some(0)).unwrap_or(0);
 
-                // Add to hosting cache as if it was just accessed via GET
-                // Use current time as last_access since we don't have historical data
+                // Legacy contracts don't have local_client_access info
                 cache.load_persisted_entry(
                     key,
                     size_bytes,
                     cache::AccessType::Get,
                     std::time::Duration::ZERO,
+                    false,
                 );
 
                 // Persist hosting metadata so future restarts don't need migration
@@ -1029,6 +1104,7 @@ impl HostingManager {
                     0, // GET access type
                     size_bytes,
                     code_hash_bytes,
+                    false,
                 );
                 if let Err(e) = storage.store_hosting_metadata(&key, metadata) {
                     tracing::warn!(
@@ -1124,7 +1200,13 @@ impl HostingManager {
                 let age_ms = now_ms.saturating_sub(metadata.last_access_ms);
                 let age = std::time::Duration::from_millis(age_ms);
 
-                cache.load_persisted_entry(key, metadata.size_bytes, access_type, age);
+                cache.load_persisted_entry(
+                    key,
+                    metadata.size_bytes,
+                    access_type,
+                    age,
+                    metadata.local_client_access,
+                );
                 loaded += 1;
             }
         }
@@ -1161,12 +1243,12 @@ impl HostingManager {
                     .unwrap_or(Some(0))
                     .unwrap_or(0);
 
-                // Add to hosting cache as if it was just accessed via GET
                 cache.load_persisted_entry(
                     key,
                     size_bytes,
                     cache::AccessType::Get,
                     std::time::Duration::ZERO,
+                    false,
                 );
 
                 // Persist hosting metadata so future restarts don't need migration
@@ -1176,6 +1258,7 @@ impl HostingManager {
                     0, // GET access type
                     size_bytes,
                     code_hash_bytes,
+                    false,
                 );
                 if let Err(e) = storage.store_hosting_metadata(&key, metadata).await {
                     tracing::warn!(
@@ -2215,5 +2298,198 @@ mod tests {
             !interest.has_local_interest(&contract),
             "downstream_subscriber_count should be 0 after syncing with TTL expiry"
         );
+    }
+
+    // =========================================================================
+    // Local Client Access Tests (#3769)
+    // =========================================================================
+
+    /// Core test for #3769: locally-accessed contracts should be included in
+    /// renewal, but relay-cached contracts should NOT.
+    #[test]
+    fn test_local_client_access_enables_renewal() {
+        let manager = HostingManager::new();
+        let local_contract = make_contract_key(1);
+        let relay_contract = make_contract_key(2);
+
+        // Both contracts get hosted via GET
+        manager.record_contract_access(local_contract, 1000, AccessType::Get);
+        manager.record_contract_access(relay_contract, 1000, AccessType::Get);
+
+        // Only the local one gets marked as locally accessed
+        manager.mark_local_client_access(&local_contract);
+
+        let needs_renewal = manager.contracts_needing_renewal();
+
+        assert!(
+            needs_renewal.contains(&local_contract),
+            "Locally-accessed contract should be in renewal list"
+        );
+        assert!(
+            !needs_renewal.contains(&relay_contract),
+            "Relay-cached contract should NOT be in renewal list"
+        );
+    }
+
+    /// Relay-only contracts at scale should not cause subscription storms.
+    /// Regression test for #3763/#3765 (the subscription storm incident).
+    #[test]
+    fn test_relay_cached_contracts_not_renewed_at_scale() {
+        let manager = HostingManager::new();
+
+        // Simulate 200 relay-cached contracts (no local_client_access)
+        for i in 0..200u8 {
+            let contract = make_contract_key(i);
+            manager.record_contract_access(contract, 1000, AccessType::Get);
+        }
+
+        // Mark only 2 as locally accessed (simulating River user)
+        let local_a = make_contract_key(42);
+        let local_b = make_contract_key(99);
+        manager.mark_local_client_access(&local_a);
+        manager.mark_local_client_access(&local_b);
+
+        let needs_renewal = manager.contracts_needing_renewal();
+        assert_eq!(
+            needs_renewal.len(),
+            2,
+            "Only 2 locally-accessed contracts should need renewal, found {}",
+            needs_renewal.len()
+        );
+        assert!(needs_renewal.contains(&local_a));
+        assert!(needs_renewal.contains(&local_b));
+    }
+
+    /// Locally-accessed contracts with active subscriptions should not be
+    /// double-counted in the renewal list.
+    #[test]
+    fn test_local_client_access_with_active_subscription_no_duplicate() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.mark_local_client_access(&contract);
+        manager.subscribe(contract);
+
+        let needs_renewal = manager.contracts_needing_renewal();
+        // The contract has an active subscription that isn't expiring yet,
+        // and local_client_access. It should not appear (subscription is fresh).
+        assert!(
+            !needs_renewal.contains(&contract),
+            "Contract with fresh active subscription should not need renewal"
+        );
+    }
+
+    /// Marking and querying unknown contracts should be no-ops (no panic).
+    #[test]
+    fn test_local_client_access_unknown_contract() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+
+        assert!(!manager.has_local_client_access(&contract));
+        manager.mark_local_client_access(&contract); // no-op, not in cache
+        assert!(!manager.has_local_client_access(&contract));
+    }
+
+    /// The local_client_access flag should be sticky -- once set, it should
+    /// persist even after the contract's access type changes.
+    #[test]
+    fn test_local_client_access_sticky_across_access_type_changes() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(1);
+
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.mark_local_client_access(&contract);
+        assert!(manager.has_local_client_access(&contract));
+
+        // Refresh via a relay PUT -- should NOT clear the local flag
+        manager.record_contract_access(contract, 1000, AccessType::Put);
+        assert!(
+            manager.has_local_client_access(&contract),
+            "local_client_access should persist across access type changes"
+        );
+    }
+
+    /// Simulate restart: contracts loaded from disk with local_client_access
+    /// should appear in contracts_needing_renewal().
+    #[test]
+    fn test_local_client_access_survives_restart_via_load() {
+        let manager = HostingManager::new();
+
+        // Simulate loading from disk with local_client_access=true
+        {
+            let mut cache = manager.hosting_cache.write();
+            cache.load_persisted_entry(
+                make_contract_key(1),
+                1000,
+                cache::AccessType::Get,
+                std::time::Duration::from_secs(10),
+                true, // locally accessed before restart
+            );
+            cache.load_persisted_entry(
+                make_contract_key(2),
+                1000,
+                cache::AccessType::Get,
+                std::time::Duration::from_secs(10),
+                false, // relay-cached
+            );
+            cache.finalize_loading();
+        }
+
+        let needs_renewal = manager.contracts_needing_renewal();
+        assert!(
+            needs_renewal.contains(&make_contract_key(1)),
+            "Locally-accessed contract loaded from disk should be renewed"
+        );
+        assert!(
+            !needs_renewal.contains(&make_contract_key(2)),
+            "Relay-cached contract loaded from disk should NOT be renewed"
+        );
+    }
+
+    /// When a locally-accessed contract is evicted and re-added via relay,
+    /// the local_client_access flag should be cleared (relay doesn't set it).
+    #[test]
+    fn test_eviction_clears_local_client_access() {
+        // Small budget to force eviction
+        let manager = HostingManager::new();
+        // Override with a tiny cache
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                200,                       // tiny budget: room for ~2 contracts at 100 bytes
+                std::time::Duration::ZERO, // no TTL protection
+                crate::util::time_source::InstantTimeSrc::new(),
+            );
+        }
+
+        let contract_a = make_contract_key(1);
+        let contract_b = make_contract_key(2);
+        let contract_c = make_contract_key(3);
+
+        // Add A (locally accessed) and B
+        manager.record_contract_access(contract_a, 100, AccessType::Get);
+        manager.mark_local_client_access(&contract_a);
+        manager.record_contract_access(contract_b, 100, AccessType::Get);
+
+        assert!(manager.has_local_client_access(&contract_a));
+
+        // Add C -- should evict A (oldest in LRU)
+        manager.record_contract_access(contract_c, 100, AccessType::Get);
+        assert!(
+            !manager.is_hosting_contract(&contract_a),
+            "contract_a should have been evicted"
+        );
+
+        // Re-add A via relay (no mark_local_client_access)
+        manager.record_contract_access(contract_a, 100, AccessType::Get);
+        assert!(
+            !manager.has_local_client_access(&contract_a),
+            "Re-added via relay should NOT have local_client_access"
+        );
+
+        // After local client re-accesses, flag is restored
+        manager.mark_local_client_access(&contract_a);
+        assert!(manager.has_local_client_access(&contract_a));
     }
 }
