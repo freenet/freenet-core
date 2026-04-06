@@ -314,14 +314,17 @@ impl Router {
                     contract_location: event.contract_location,
                     result: 0.0,
                 });
-                let transfer_rate_event = IsotonicEvent {
-                    contract_location: event.contract_location,
-                    peer: event.peer,
-                    result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
-                };
-                self.mean_transfer_size.add(payload_size as f64);
-
-                self.transfer_rate_estimator.add_event(transfer_rate_event);
+                // Only feed transfer rate estimator when there's actual payload data.
+                // Operations like SUBSCRIBE report payload_size=0 and
+                // payload_transfer_time=ZERO, which would produce NaN (0/0).
+                if payload_size > 0 && !payload_transfer_time.is_zero() {
+                    self.mean_transfer_size.add(payload_size as f64);
+                    self.transfer_rate_estimator.add_event(IsotonicEvent {
+                        contract_location: event.contract_location,
+                        peer: event.peer,
+                        result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
+                    });
+                }
             }
             RouteOutcome::SuccessUntimed | RouteOutcome::Failure => {
                 let result = if matches!(event.outcome, RouteOutcome::Failure) {
@@ -2306,5 +2309,32 @@ mod tests {
             [untried_a, untried_b].into_iter().collect();
         assert!(untried_set.contains(selected[0]));
         assert!(untried_set.contains(selected[1]));
+    }
+
+    /// Verify that zero-payload events (from SUBSCRIBE) don't produce NaN
+    /// in the transfer rate estimator (0 / 0 = NaN would poison regression).
+    #[test]
+    fn test_zero_payload_event_does_not_poison_transfer_rate() {
+        let mut router = Router::new(&[]);
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        // Simulate a subscribe success: non-zero response time, zero payload
+        router.add_event(RouteEvent {
+            peer: peer.clone(),
+            contract_location,
+            outcome: RouteOutcome::Success {
+                time_to_response_start: std::time::Duration::from_millis(50),
+                payload_size: 0,
+                payload_transfer_time: std::time::Duration::ZERO,
+            },
+        });
+
+        // The failure estimator should have the event (result=0.0 for success)
+        assert_eq!(router.failure_estimator.len(), 1);
+        // The response time estimator should have it
+        assert_eq!(router.response_start_time_estimator.len(), 1);
+        // The transfer rate estimator should NOT have it (skipped to avoid NaN)
+        assert_eq!(router.transfer_rate_estimator.len(), 0);
     }
 }

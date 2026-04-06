@@ -3,6 +3,7 @@ use crate::{message::Transaction, ring::PeerKeyLocation, util::Contains};
 use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::time::Instant;
 
 /// Helper to create PeerKeyLocation with a random peer
 fn random_peer() -> PeerKeyLocation {
@@ -814,6 +815,7 @@ fn test_subscribe_failure_outcome() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -847,23 +849,25 @@ fn test_subscribe_failure_outcome() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
     };
     match op_completed.outcome() {
-        OpOutcome::ContractOpSuccessUntimed {
+        OpOutcome::ContractOpSuccess {
             target_peer: peer,
             contract_location: loc,
+            ..
         } => {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        OpOutcome::ContractOpSuccess { .. }
+        OpOutcome::ContractOpSuccessUntimed { .. }
         | OpOutcome::ContractOpFailure { .. }
         | OpOutcome::Incomplete
         | OpOutcome::Irrelevant => {
-            panic!("Expected ContractOpSuccessUntimed for completed subscribe with stats")
+            panic!("Expected ContractOpSuccess for completed subscribe with stats")
         }
     }
 
@@ -893,6 +897,7 @@ fn test_subscribe_failure_outcome() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -906,7 +911,11 @@ fn test_subscribe_failure_outcome() {
 
 // ============ Outcome variant tests (following put.rs pattern) ============
 
-/// Completed subscribe with stats → ContractOpSuccessUntimed (validates stats wiring fix).
+// Superseded: subscribe outcome now returns ContractOpSuccess with timing data
+// instead of ContractOpSuccessUntimed. The new behavior is tested by
+// test_subscribe_failure_outcome and completed_subscribe_reports_success.
+// See PR #3778.
+#[ignore]
 #[test]
 fn test_subscribe_outcome_success_untimed_with_stats() {
     use crate::operations::OpOutcome;
@@ -926,6 +935,7 @@ fn test_subscribe_outcome_success_untimed_with_stats() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -938,10 +948,7 @@ fn test_subscribe_outcome_success_untimed_with_stats() {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        other @ OpOutcome::ContractOpSuccess { .. }
-        | other @ OpOutcome::ContractOpFailure { .. }
-        | other @ OpOutcome::Incomplete
-        | other @ OpOutcome::Irrelevant => {
+        other => {
             panic!("Expected ContractOpSuccessUntimed, got {other:?}")
         }
     }
@@ -986,6 +993,7 @@ fn test_subscribe_outcome_failure_with_stats() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -1025,7 +1033,7 @@ fn test_subscribe_outcome_incomplete_without_stats() {
 
 /// Simulate the subscribe operation lifecycle: stats are set when we find a
 /// forwarding peer, then state transitions to Completed → outcome should be
-/// SuccessUntimed.
+/// ContractOpSuccess with timing.
 #[test]
 fn test_subscribe_stats_lifecycle() {
     let target_peer = PeerKeyLocation::random();
@@ -1060,6 +1068,7 @@ fn test_subscribe_stats_lifecycle() {
     op.stats = Some(super::SubscribeStats {
         target_peer: target_peer.clone(),
         contract_location,
+        request_sent_at: Instant::now(),
     });
     // Not finalized → ContractOpFailure
     match op.outcome() {
@@ -1081,18 +1090,19 @@ fn test_subscribe_stats_lifecycle() {
     // Step 3: Operation completes
     op.state = SubscribeState::Completed(super::CompletedData { key: contract_key });
     match op.outcome() {
-        OpOutcome::ContractOpSuccessUntimed {
+        OpOutcome::ContractOpSuccess {
             target_peer: peer,
             contract_location: loc,
+            ..
         } => {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        OpOutcome::ContractOpSuccess { .. }
+        OpOutcome::ContractOpSuccessUntimed { .. }
         | OpOutcome::ContractOpFailure { .. }
         | OpOutcome::Incomplete
         | OpOutcome::Irrelevant => {
-            panic!("Expected ContractOpSuccessUntimed for completed subscribe with stats")
+            panic!("Expected ContractOpSuccess for completed subscribe with stats")
         }
     }
 }
@@ -1116,24 +1126,26 @@ fn test_subscribe_renewal_reports_outcome() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
     };
-    // Renewal should still report success
+    // Renewal should still report success with timing
     match op.outcome() {
-        OpOutcome::ContractOpSuccessUntimed {
+        OpOutcome::ContractOpSuccess {
             target_peer: peer,
             contract_location: loc,
+            ..
         } => {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        OpOutcome::ContractOpSuccess { .. }
+        OpOutcome::ContractOpSuccessUntimed { .. }
         | OpOutcome::ContractOpFailure { .. }
         | OpOutcome::Incomplete
         | OpOutcome::Irrelevant => {
-            panic!("Expected ContractOpSuccessUntimed for renewal subscribe")
+            panic!("Expected ContractOpSuccess for renewal subscribe")
         }
     }
 }
@@ -1749,6 +1761,7 @@ fn intermediate_forward_with_stats_reports_failure() {
         Some(SubscribeStats {
             target_peer,
             contract_location,
+            request_sent_at: Instant::now(),
         }),
     );
 
@@ -1789,16 +1802,33 @@ fn completed_subscribe_reports_success() {
         stats: Some(SubscribeStats {
             target_peer,
             contract_location,
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
     };
 
     assert!(op.finalized());
-    assert!(matches!(
-        op.outcome(),
-        OpOutcome::ContractOpSuccessUntimed { .. }
-    ));
+    match op.outcome() {
+        OpOutcome::ContractOpSuccess {
+            first_response_time,
+            payload_size,
+            payload_transfer_time,
+            ..
+        } => {
+            assert!(
+                first_response_time >= std::time::Duration::ZERO,
+                "response time should be non-negative"
+            );
+            assert_eq!(payload_size, 0, "subscribes have no payload");
+            assert_eq!(
+                payload_transfer_time,
+                std::time::Duration::ZERO,
+                "subscribes have no transfer"
+            );
+        }
+        other => panic!("Expected ContractOpSuccess, got {other:?}"),
+    }
 }
 
 // ── Subscribe retry tests ──────────────────────────────────────────────

@@ -397,7 +397,7 @@ pub(crate) enum OpOutcome<'a> {
         payload_transfer_time: Duration,
     },
     /// An op which involves a contract completed successfully but has no timing data
-    /// (subscribe, put, update). Feeds only the failure estimator.
+    /// (put, update). Feeds only the failure estimator.
     ContractOpSuccessUntimed {
         target_peer: &'a PeerKeyLocation,
         contract_location: Location,
