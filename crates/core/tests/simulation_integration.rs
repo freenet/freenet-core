@@ -6258,24 +6258,23 @@ fn test_gateway_version_probe_fires() {
 
     drop(rt);
 
-    // 30 virtual seconds at 1s spacing; probe interval is 10s in test mode.
-    sim.run_simulation_direct::<rand::rngs::SmallRng>(
-        SEED,
-        3,                      // max_contract_num
-        30,                     // iterations
-        Duration::from_secs(1), // event_wait
-    )
-    .expect("Simulation with gateway version probe should complete without panic");
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(SEED, 3, 30, Duration::from_secs(1))
+        .expect("Simulation should complete without panic");
 
     let rt = create_runtime();
-    let event_count = rt.block_on(async {
+    let connect_events = rt.block_on(async {
         let logs = logs_handle.lock().await;
-        logs.len()
+        logs.iter()
+            .filter(|log| log.kind.variant_name() == "Connect")
+            .count()
     });
 
-    assert!(event_count > 0, "Simulation should produce events, got 0");
-
-    tracing::info!("GATEWAY VERSION PROBE TEST PASSED: {} events", event_count);
+    // Bootstrap alone produces ~6 CONNECTs (3 nodes × min_connections=2).
+    // Version probes (10s interval, 30s sim) push this well above 10.
+    assert!(
+        connect_events > 10,
+        "Expected version probe CONNECTs beyond bootstrap, got {connect_events}"
+    );
 }
 
 // =============================================================================
