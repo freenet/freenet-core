@@ -364,6 +364,9 @@ pub(crate) async fn request_get(
                 result: None,
                 stats: get_op.stats.map(|mut s| {
                     s.next_peer = Some(target.clone());
+                    let now = Instant::now();
+                    s.first_response_time = Some((now, None));
+                    s.transfer_time = Some((now, None));
                     s
                 }),
                 upstream_addr: get_op.upstream_addr,
@@ -1075,8 +1078,12 @@ impl GetOp {
                 );
                 // Update stats to point to the new target so timeouts/failures
                 // are reported against the correct peer (#3527).
+                // Reset timing for the new attempt.
                 if let Some(ref mut s) = self.stats {
                     s.next_peer = Some(next_target.clone());
+                    let now = Instant::now();
+                    s.first_response_time = Some((now, None));
+                    s.transfer_time = Some((now, None));
                 }
                 data.next_hop = next_target;
                 data.attempts_at_hop += 1;
@@ -2148,6 +2155,20 @@ impl Operation for GetOp {
                     // Check if this is the original requester (no upstream to forward to)
                     let is_original_requester = self.upstream_addr.is_none();
 
+                    // Record response timing for the originator (non-streaming:
+                    // response + payload arrive together, so both timers end now)
+                    if is_original_requester {
+                        let now = Instant::now();
+                        if let Some(ref mut s) = stats {
+                            if let Some((_, ref mut end)) = s.first_response_time {
+                                *end = Some(now);
+                            }
+                            if let Some((_, ref mut end)) = s.transfer_time {
+                                *end = Some(now);
+                            }
+                        }
+                    }
+
                     // Check if subscription was requested
                     let (subscribe_requested, blocking_sub) =
                         if let Some(GetState::AwaitingResponse(data)) = &self.state {
@@ -2741,6 +2762,16 @@ impl Operation for GetOp {
                     // This enables low-latency forwarding of responses
                     let is_original_requester = self.upstream_addr.is_none();
 
+                    // Record first-response timing for originator (streaming metadata arrived;
+                    // transfer_time ends later after stream assembly completes)
+                    if is_original_requester {
+                        if let Some(ref mut s) = stats {
+                            if let Some((_, ref mut end)) = s.first_response_time {
+                                *end = Some(Instant::now());
+                            }
+                        }
+                    }
+
                     // Extract subscription flags from state (needed for auto-subscribe after caching)
                     let (subscribe_requested, blocking_sub) =
                         if let Some(GetState::AwaitingResponse(data)) = &self.state {
@@ -2921,6 +2952,15 @@ impl Operation for GetOp {
                             }
                         }
                     };
+
+                    // Record transfer-complete timing for originator (stream fully assembled)
+                    if is_original_requester {
+                        if let Some(ref mut s) = stats {
+                            if let Some((_, ref mut end)) = s.transfer_time {
+                                *end = Some(Instant::now());
+                            }
+                        }
+                    }
 
                     tracing::debug!(
                         tx = %id,
