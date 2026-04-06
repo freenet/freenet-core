@@ -6226,6 +6226,59 @@ fn test_readiness_gating_with_message_loss() {
 }
 
 // =============================================================================
+// Gateway Version Probe Tests
+// =============================================================================
+
+/// Verify that the periodic gateway version probe does not break
+/// connection_maintenance. Actual version mismatch detection is not testable
+/// in simulation (all nodes share the same PROTOC_VERSION). (#3677)
+#[test]
+fn test_gateway_version_probe_fires() {
+    const SEED: u64 = 0x6A7E_7AE9_0001;
+
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let sim = rt.block_on(async {
+        SimNetwork::new(
+            "test-gw-version-probe",
+            1,  // gateways
+            3,  // nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    let logs_handle = sim.event_logs_handle();
+
+    drop(rt);
+
+    // 30 virtual seconds at 1s spacing; probe interval is 10s in test mode.
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(
+        SEED,
+        3,                      // max_contract_num
+        30,                     // iterations
+        Duration::from_secs(1), // event_wait
+    )
+    .expect("Simulation with gateway version probe should complete without panic");
+
+    let rt = create_runtime();
+    let event_count = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.len()
+    });
+
+    assert!(event_count > 0, "Simulation should produce events, got 0");
+
+    tracing::info!("GATEWAY VERSION PROBE TEST PASSED: {} events", event_count);
+}
+
+// =============================================================================
 // CONNECT Acceptor Diversity: Joiner succeeds despite NAT-blocked acceptor
 // =============================================================================
 

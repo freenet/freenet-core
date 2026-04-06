@@ -1835,6 +1835,14 @@ impl Ring {
         const INITIAL_ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(30);
         /// Max time to hold a deferred swap drop before abandoning it.
         const DEFERRED_SWAP_DROP_TTL: Duration = Duration::from_secs(120);
+
+        /// How often to probe a gateway for version discovery (#3677).
+        #[cfg(not(test))]
+        const GATEWAY_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(4 * 3600);
+        #[cfg(test)]
+        const GATEWAY_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+        const GATEWAY_PROBE_JITTER_FACTOR: f64 = 0.2;
+
         // Deferred swap drops: (addr, queued_at) using time_source for
         // deterministic simulation support.
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
@@ -1843,6 +1851,12 @@ impl Ring {
         // successful connection, use a shorter isolation escalation threshold
         // for faster recovery from cold-start failures (#3737).
         let mut ever_had_connections = false;
+
+        // Gateway version probe: random initial delay to prevent thundering herd.
+        // The loop guard (`!is_gateway`) ensures gateways never probe themselves.
+        let initial_probe_delay_secs =
+            GlobalRng::random_u64() % GATEWAY_VERSION_PROBE_INTERVAL.as_secs();
+        let mut next_gateway_probe = Instant::now() + Duration::from_secs(initial_probe_delay_secs);
 
         // Adaptive fast-tick backoff: increase the fast-tick interval when
         // connection count stops growing, to avoid hammering the network
@@ -2065,6 +2079,34 @@ impl Ring {
                     connections = current_conn_count,
                     "Recovered from zero-connection state"
                 );
+            }
+
+            // Periodic gateway version probe: initiate a CONNECT to a gateway so the
+            // transport handshake exchanges version info, even when the ring is full (#3677).
+            if !is_gateway && Instant::now() >= next_gateway_probe {
+                if !op_manager.configured_gateways.is_empty() {
+                    let gw_index =
+                        GlobalRng::random_u64() as usize % op_manager.configured_gateways.len();
+                    let gateway = &op_manager.configured_gateways[gw_index];
+
+                    if let Err(e) =
+                        crate::operations::connect::gateway_version_probe(gateway, &op_manager)
+                            .await
+                    {
+                        tracing::debug!(
+                            error = %e,
+                            gateway = %gateway,
+                            "Gateway version probe failed, will retry next cycle"
+                        );
+                    }
+                }
+
+                let base_secs = GATEWAY_VERSION_PROBE_INTERVAL.as_secs() as f64;
+                let jitter_range = base_secs * GATEWAY_PROBE_JITTER_FACTOR;
+                let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
+                let jittered_secs = base_secs + jitter_range * (2.0 * uniform_01 - 1.0);
+                next_gateway_probe =
+                    Instant::now() + Duration::from_secs_f64(jittered_secs.max(1.0));
             }
 
             // Gateway bootstrap fallback: at zero connections, acquire_new always

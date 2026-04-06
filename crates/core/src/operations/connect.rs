@@ -2457,6 +2457,41 @@ pub(crate) async fn join_ring_request(
         // Bootstrap mode: target own location with jitter after failures.
         apply_bootstrap_jitter(base_location)
     };
+    send_gateway_connect(gateway, gateway_addr, op_manager, own, desired_location).await
+}
+
+/// Initiate a CONNECT to a gateway for version discovery (#3677).
+///
+/// Skips `should_accept()` so the probe runs even when the ring is full.
+/// The transport handshake exchanges version info via `report_peer_version()`
+/// / `signal_urgent_update()`. Called periodically from `connection_maintenance`.
+#[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
+pub(crate) async fn gateway_version_probe(
+    gateway: &PeerKeyLocation,
+    op_manager: &OpManager,
+) -> Result<(), OpError> {
+    use crate::node::ConnectionError;
+
+    let gateway_addr = gateway.socket_addr().ok_or_else(|| {
+        tracing::error!(phase = "error", "Gateway address not found");
+        OpError::ConnError(ConnectionError::LocationUnknown)
+    })?;
+
+    let own = op_manager.ring.connection_manager.own_location();
+    let desired_location = own.location().unwrap_or_else(Location::random);
+
+    send_gateway_connect(gateway, gateway_addr, op_manager, own, desired_location).await
+}
+
+/// Shared CONNECT initiation: build operation, emit telemetry, send via `notify_op_change`.
+/// On failure, cleans up in-transit reservations so subsequent attempts are not blocked.
+async fn send_gateway_connect(
+    gateway: &PeerKeyLocation,
+    gateway_addr: std::net::SocketAddr,
+    op_manager: &OpManager,
+    own: PeerKeyLocation,
+    desired_location: Location,
+) -> Result<(), OpError> {
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -2469,10 +2504,11 @@ pub(crate) async fn join_ring_request(
     tracing::debug!(
         failed = failed_addrs.len(),
         connected = connected_addrs.len(),
-        "connect: pre-populating bloom filter with excluded peer addresses"
+        "pre-populating bloom filter with excluded peer addresses"
     );
     let mut exclude_addrs = failed_addrs;
     exclude_addrs.extend(connected_addrs);
+
     let (tx, mut op, msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
@@ -2483,7 +2519,6 @@ pub(crate) async fn join_ring_request(
         &exclude_addrs,
     );
 
-    // Emit telemetry for initial connect request sent
     if let Some(event) = NetEventLog::connect_request_sent(
         &tx,
         &op_manager.ring,
@@ -2503,7 +2538,7 @@ pub(crate) async fn join_ring_request(
         tx = %tx,
         target_connections,
         ttl,
-        "Attempting network connect"
+        "Initiating gateway connect"
     );
 
     if let Err(e) = op_manager
@@ -2513,8 +2548,7 @@ pub(crate) async fn join_ring_request(
         )
         .await
     {
-        // Clean up the reservation that should_accept() created, so the bootstrap
-        // loop doesn't think this gateway is still "connected/pending" (#3244).
+        // Clean up the reservation so subsequent attempts are not blocked (#3244).
         op_manager
             .ring
             .connection_manager
