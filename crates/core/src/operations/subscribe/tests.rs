@@ -1815,7 +1815,10 @@ fn completed_subscribe_reports_success() {
             payload_transfer_time,
             ..
         } => {
-            // Subscribe operations carry no payload -- timing is response-only
+            assert!(
+                first_response_time >= std::time::Duration::ZERO,
+                "response time should be non-negative"
+            );
             assert_eq!(payload_size, 0, "subscribes have no payload");
             assert_eq!(
                 payload_transfer_time,
