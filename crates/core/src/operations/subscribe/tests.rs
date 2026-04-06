@@ -1765,7 +1765,23 @@ fn completed_subscribe_reports_success() {
     };
 
     assert!(op.finalized());
-    assert!(matches!(op.outcome(), OpOutcome::ContractOpSuccess { .. }));
+    match op.outcome() {
+        OpOutcome::ContractOpSuccess {
+            first_response_time,
+            payload_size,
+            payload_transfer_time,
+            ..
+        } => {
+            // Subscribe operations carry no payload -- timing is response-only
+            assert_eq!(payload_size, 0, "subscribes have no payload");
+            assert_eq!(
+                payload_transfer_time,
+                std::time::Duration::ZERO,
+                "subscribes have no transfer"
+            );
+        }
+        other => panic!("Expected ContractOpSuccess, got {other:?}"),
+    }
 }
 
 // ── Subscribe retry tests ──────────────────────────────────────────────
