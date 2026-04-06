@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Instant;
 
 use either::Either;
 
@@ -463,7 +464,7 @@ pub(crate) async fn request_subscribe(
         stats: Some(SubscribeStats {
             target_peer: target.clone(),
             contract_location: Location::from(instance_id),
-            request_sent_at: std::time::Instant::now(),
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -543,7 +544,7 @@ struct SubscribeStats {
     target_peer: crate::ring::PeerKeyLocation,
     contract_location: Location,
     /// When the subscribe request was sent; used to compute response time.
-    request_sent_at: std::time::Instant,
+    request_sent_at: Instant,
 }
 
 pub(crate) struct SubscribeOp {
@@ -735,7 +736,7 @@ impl SubscribeOp {
                 self.stats = Some(SubscribeStats {
                     target_peer: next_target,
                     contract_location: Location::from(&instance_id),
-                    request_sent_at: std::time::Instant::now(),
+                    request_sent_at: Instant::now(),
                 });
 
                 // Reduce HTL on each retry, floored at MIN_RETRY_HTL (#3570).
@@ -1505,7 +1506,7 @@ impl Operation for SubscribeOp {
                             stats: Some(SubscribeStats {
                                 target_peer: next_hop.clone(),
                                 contract_location: Location::from(instance_id),
-                                request_sent_at: std::time::Instant::now(),
+                                request_sent_at: Instant::now(),
                             }),
                             ack_received: false,
                             speculative_paths: 0,

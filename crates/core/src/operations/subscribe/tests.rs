@@ -3,6 +3,7 @@ use crate::{message::Transaction, ring::PeerKeyLocation, util::Contains};
 use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::time::Instant;
 
 /// Helper to create PeerKeyLocation with a random peer
 fn random_peer() -> PeerKeyLocation {
@@ -814,7 +815,7 @@ fn test_subscribe_failure_outcome() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
-            request_sent_at: std::time::Instant::now(),
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -848,7 +849,7 @@ fn test_subscribe_failure_outcome() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
-            request_sent_at: std::time::Instant::now(),
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -896,7 +897,7 @@ fn test_subscribe_failure_outcome() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
-            request_sent_at: std::time::Instant::now(),
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -934,7 +935,7 @@ fn test_subscribe_outcome_success_untimed_with_stats() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
-            request_sent_at: std::time::Instant::now(),
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -992,7 +993,7 @@ fn test_subscribe_outcome_failure_with_stats() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
-            request_sent_at: std::time::Instant::now(),
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -1067,7 +1068,7 @@ fn test_subscribe_stats_lifecycle() {
     op.stats = Some(super::SubscribeStats {
         target_peer: target_peer.clone(),
         contract_location,
-        request_sent_at: std::time::Instant::now(),
+        request_sent_at: Instant::now(),
     });
     // Not finalized → ContractOpFailure
     match op.outcome() {
@@ -1125,7 +1126,7 @@ fn test_subscribe_renewal_reports_outcome() {
         stats: Some(super::SubscribeStats {
             target_peer: target_peer.clone(),
             contract_location,
-            request_sent_at: std::time::Instant::now(),
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -1760,7 +1761,7 @@ fn intermediate_forward_with_stats_reports_failure() {
         Some(SubscribeStats {
             target_peer,
             contract_location,
-            request_sent_at: std::time::Instant::now(),
+            request_sent_at: Instant::now(),
         }),
     );
 
@@ -1801,7 +1802,7 @@ fn completed_subscribe_reports_success() {
         stats: Some(SubscribeStats {
             target_peer,
             contract_location,
-            request_sent_at: std::time::Instant::now(),
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
