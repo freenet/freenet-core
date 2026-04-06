@@ -773,7 +773,30 @@ impl Display for NodeEvent {
                 )
             }
             NodeEvent::SendInterestMessage { target, message } => {
-                write!(f, "SendInterestMessage (to: {target}, msg: {message:?})")
+                let msg_summary = match message {
+                    InterestMessage::Interests { hashes } => {
+                        format!("Interests({} hashes)", hashes.len())
+                    }
+                    InterestMessage::Summaries { entries } => {
+                        format!("Summaries({} entries)", entries.len())
+                    }
+                    InterestMessage::ChangeInterests { added, removed } => {
+                        format!(
+                            "ChangeInterests(+{} -{} hashes)",
+                            added.len(),
+                            removed.len()
+                        )
+                    }
+                    InterestMessage::ResyncRequest { key } => {
+                        format!("ResyncRequest({key})")
+                    }
+                    InterestMessage::ResyncResponse {
+                        key, state_bytes, ..
+                    } => {
+                        format!("ResyncResponse({key}, {} bytes)", state_bytes.len())
+                    }
+                };
+                write!(f, "SendInterestMessage (to: {target}, {msg_summary})")
             }
             NodeEvent::BroadcastStateChange { key, .. } => {
                 write!(f, "BroadcastStateChange (contract: {key})")

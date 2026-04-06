@@ -698,7 +698,7 @@ impl RelayState {
                 if let Some(uphill_peer) = uphill_hop {
                     let dist =
                         ring_distance(uphill_peer.location(), Some(self.request.desired_location));
-                    tracing::info!(
+                    tracing::debug!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         uphill_budget = self.request.uphill_budget,
@@ -1670,7 +1670,7 @@ impl Operation for ConnectOp {
                             id: self.id,
                             desired_location: payload.desired_location,
                         };
-                        tracing::info!(
+                        tracing::debug!(
                             tx = %self.id,
                             desired_location = %payload.desired_location,
                             upstream = %upstream_addr,
@@ -1902,7 +1902,7 @@ impl Operation for ConnectOp {
                             self.record_forward_outcome(fwd, desired, true);
                         }
 
-                        tracing::info!(
+                        tracing::debug!(
                             tx = %self.id,
                             upstream_addr = %upstream_addr,
                             acceptor_pub_key = %payload.acceptor.pub_key(),
@@ -2035,7 +2035,7 @@ impl Operation for ConnectOp {
                         if let Some((peer, forward_req)) = retry_actions.forward {
                             // Found a different uphill peer — forward to it
                             self.recency.insert(peer.clone(), now);
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %self.id,
                                 failed_peer = ?failed_peer,
                                 retry_peer = %peer.pub_key(),
@@ -2070,7 +2070,7 @@ impl Operation for ConnectOp {
                                 .await?;
                         } else {
                             // No more uphill peers and can't accept — forward rejection upstream
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %self.id,
                                 upstream_addr = %upstream_addr,
                                 failed_peer = ?failed_peer,
@@ -2130,7 +2130,7 @@ impl Operation for ConnectOp {
                                         id: self.id,
                                         failed_acceptor_addr: *failed_acceptor_addr,
                                     };
-                                    tracing::info!(
+                                    tracing::debug!(
                                         tx = %self.id,
                                         forwarded_to_addr = %fwd_addr,
                                         failed_acceptor = %failed_acceptor_addr,
@@ -2188,7 +2188,7 @@ impl Operation for ConnectOp {
 
                         if let Some((peer, forward_req)) = retry_actions.forward {
                             self.recency.insert(peer.clone(), now);
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %self.id,
                                 failed_acceptor = %failed_acceptor_addr,
                                 retry_peer = %peer.pub_key(),
@@ -2222,7 +2222,7 @@ impl Operation for ConnectOp {
                                 .await?;
                         } else {
                             // No options — propagate ConnectFailed upstream
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %self.id,
                                 upstream_addr = %upstream_addr,
                                 failed_acceptor = %failed_acceptor_addr,

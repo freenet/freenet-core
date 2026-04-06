@@ -575,7 +575,7 @@ impl OpManager {
     // Useful when we want to notify connection attempts, or other events that do not require any
     // network communication with other nodes.
     pub async fn notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
-        tracing::info!(event = %msg, "notify_node_event: queuing node event");
+        tracing::debug!(event = %msg, "notify_node_event: queuing node event");
         match tokio::time::timeout(
             Self::NOTIFICATION_SEND_TIMEOUT,
             self.to_event_listener
