@@ -5620,4 +5620,113 @@ mod tests {
             _ => panic!("expected Request"),
         }
     }
+
+    // ============ Timer methods regression tests ============
+
+    /// Verify start_timers() sets both timing fields and record_*_end() completes them,
+    /// producing a ContractOpSuccess with non-zero durations.
+    #[test]
+    fn test_get_stats_timer_methods_produce_valid_timing() {
+        use crate::ring::{Location, PeerKeyLocation};
+        use std::time::Duration;
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let mut stats = GetStats {
+            next_peer: Some(target_peer.clone()),
+            contract_location,
+            first_response_time: None,
+            transfer_time: None,
+        };
+
+        // start_timers sets both to (now, None)
+        stats.start_timers();
+        assert!(stats.first_response_time.is_some());
+        assert!(stats.transfer_time.is_some());
+        assert!(stats.first_response_time.unwrap().1.is_none());
+        assert!(stats.transfer_time.unwrap().1.is_none());
+
+        // Simulate some work
+        std::thread::sleep(Duration::from_millis(1));
+
+        // record_response_end completes first_response_time
+        stats.record_response_end();
+        assert!(stats.first_response_time.unwrap().1.is_some());
+        assert!(stats.transfer_time.unwrap().1.is_none()); // transfer still open
+
+        std::thread::sleep(Duration::from_millis(1));
+
+        // record_transfer_end completes transfer_time
+        stats.record_transfer_end();
+        assert!(stats.transfer_time.unwrap().1.is_some());
+
+        // Verify the outcome produces ContractOpSuccess with non-zero durations
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: None,
+            result: Some(GetResult {
+                key: make_contract_key(99),
+                state: WrappedState::new(vec![1, 2, 3]),
+                contract: None,
+            }),
+            stats: Some(Box::new(stats)),
+            upstream_addr: None,
+            local_fallback: None,
+            auto_fetch: false,
+            ack_received: false,
+            speculative_paths: 0,
+            client_return_code: true,
+        };
+
+        match op.outcome() {
+            OpOutcome::ContractOpSuccess {
+                first_response_time,
+                payload_transfer_time,
+                ..
+            } => {
+                assert!(
+                    first_response_time > Duration::ZERO,
+                    "first_response_time should be positive, got {first_response_time:?}"
+                );
+                assert!(
+                    payload_transfer_time > Duration::ZERO,
+                    "payload_transfer_time should be positive, got {payload_transfer_time:?}"
+                );
+                assert!(
+                    payload_transfer_time >= first_response_time,
+                    "transfer should take at least as long as response"
+                );
+            }
+            other => panic!("Expected ContractOpSuccess, got {other:?}"),
+        }
+    }
+
+    /// Verify start_timers resets previous timing (as happens on retry).
+    #[test]
+    fn test_get_stats_start_timers_resets_on_retry() {
+        let mut stats = GetStats {
+            next_peer: None,
+            contract_location: Location::random(),
+            first_response_time: None,
+            transfer_time: None,
+        };
+
+        stats.start_timers();
+        let first_start = stats.first_response_time.unwrap().0;
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        // Simulate retry: start_timers again
+        stats.start_timers();
+        let second_start = stats.first_response_time.unwrap().0;
+
+        assert!(
+            second_start > first_start,
+            "Retry should reset timers to a later instant"
+        );
+        // End timestamps should be cleared on retry
+        assert!(stats.first_response_time.unwrap().1.is_none());
+        assert!(stats.transfer_time.unwrap().1.is_none());
+    }
 }
