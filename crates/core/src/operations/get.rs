@@ -364,9 +364,7 @@ pub(crate) async fn request_get(
                 result: None,
                 stats: get_op.stats.map(|mut s| {
                     s.next_peer = Some(target.clone());
-                    let now = Instant::now();
-                    s.first_response_time = Some((now, None));
-                    s.transfer_time = Some((now, None));
+                    s.start_timers();
                     s
                 }),
                 upstream_addr: get_op.upstream_addr,
@@ -547,6 +545,29 @@ struct GetStats {
     first_response_time: Option<(Instant, Option<Instant>)>,
     /// (start, end)
     transfer_time: Option<(Instant, Option<Instant>)>,
+}
+
+impl GetStats {
+    /// Start both response and transfer timers for a new attempt.
+    fn start_timers(&mut self) {
+        let now = Instant::now();
+        self.first_response_time = Some((now, None));
+        self.transfer_time = Some((now, None));
+    }
+
+    /// Record the end time for first_response_time.
+    fn record_response_end(&mut self) {
+        if let Some((_, ref mut end)) = self.first_response_time {
+            *end = Some(Instant::now());
+        }
+    }
+
+    /// Record the end time for transfer_time.
+    fn record_transfer_end(&mut self) {
+        if let Some((_, ref mut end)) = self.transfer_time {
+            *end = Some(Instant::now());
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1081,9 +1102,7 @@ impl GetOp {
                 // Reset timing for the new attempt.
                 if let Some(ref mut s) = self.stats {
                     s.next_peer = Some(next_target.clone());
-                    let now = Instant::now();
-                    s.first_response_time = Some((now, None));
-                    s.transfer_time = Some((now, None));
+                    s.start_timers();
                 }
                 data.next_hop = next_target;
                 data.attempts_at_hop += 1;
@@ -2158,14 +2177,9 @@ impl Operation for GetOp {
                     // Record response timing for the originator (non-streaming:
                     // response + payload arrive together, so both timers end now)
                     if is_original_requester {
-                        let now = Instant::now();
                         if let Some(ref mut s) = stats {
-                            if let Some((_, ref mut end)) = s.first_response_time {
-                                *end = Some(now);
-                            }
-                            if let Some((_, ref mut end)) = s.transfer_time {
-                                *end = Some(now);
-                            }
+                            s.record_response_end();
+                            s.record_transfer_end();
                         }
                     }
 
@@ -2766,9 +2780,7 @@ impl Operation for GetOp {
                     // transfer_time ends later after stream assembly completes)
                     if is_original_requester {
                         if let Some(ref mut s) = stats {
-                            if let Some((_, ref mut end)) = s.first_response_time {
-                                *end = Some(Instant::now());
-                            }
+                            s.record_response_end();
                         }
                     }
 
@@ -2956,9 +2968,7 @@ impl Operation for GetOp {
                     // Record transfer-complete timing for originator (stream fully assembled)
                     if is_original_requester {
                         if let Some(ref mut s) = stats {
-                            if let Some((_, ref mut end)) = s.transfer_time {
-                                *end = Some(Instant::now());
-                            }
+                            s.record_transfer_end();
                         }
                     }
 
