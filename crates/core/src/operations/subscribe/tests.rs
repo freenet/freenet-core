@@ -910,6 +910,49 @@ fn test_subscribe_failure_outcome() {
 
 // ============ Outcome variant tests (following put.rs pattern) ============
 
+// Superseded: subscribe outcome now returns ContractOpSuccess with timing data
+// instead of ContractOpSuccessUntimed. The new behavior is tested by
+// test_subscribe_failure_outcome and completed_subscribe_reports_success.
+// See PR #3778.
+#[ignore]
+#[test]
+fn test_subscribe_outcome_success_untimed_with_stats() {
+    use crate::operations::OpOutcome;
+    use crate::ring::{Location, PeerKeyLocation};
+
+    let instance_id = ContractInstanceId::new([40u8; 32]);
+    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([41u8; 32]));
+    let target_peer = PeerKeyLocation::random();
+    let contract_location = Location::random();
+
+    let op = SubscribeOp {
+        id: Transaction::new::<SubscribeMsg>(),
+        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
+        requester_addr: None,
+        requester_pub_key: None,
+        is_renewal: false,
+        stats: Some(super::SubscribeStats {
+            target_peer: target_peer.clone(),
+            contract_location,
+            request_sent_at: std::time::Instant::now(),
+        }),
+        ack_received: false,
+        speculative_paths: 0,
+    };
+    match op.outcome() {
+        OpOutcome::ContractOpSuccessUntimed {
+            target_peer: peer,
+            contract_location: loc,
+        } => {
+            assert_eq!(*peer, target_peer);
+            assert_eq!(loc, contract_location);
+        }
+        other => {
+            panic!("Expected ContractOpSuccessUntimed, got {other:?}")
+        }
+    }
+}
+
 /// Completed subscribe without stats → Irrelevant (intermediate node, no originator stats).
 #[test]
 fn test_subscribe_outcome_irrelevant_without_stats() {
