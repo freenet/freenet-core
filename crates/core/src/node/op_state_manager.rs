@@ -1239,6 +1239,7 @@ fn report_timeout_failure(
         peer: peer.clone(),
         contract_location,
         outcome: crate::router::RouteOutcome::Failure,
+        op_type: None,
     });
     tracing::info!(
         tx = %tx,
@@ -1630,6 +1631,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                                 peer,
                                                 contract_location,
                                                 outcome: crate::router::RouteOutcome::Failure,
+                                                op_type: Some(crate::node::network_status::OpType::Get),
                                             });
                                         }
                                         let msg = crate::message::NetMessage::from(msg);
@@ -1786,6 +1788,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                                 peer,
                                                 contract_location,
                                                 outcome: crate::router::RouteOutcome::Failure,
+                                                op_type: Some(crate::node::network_status::OpType::Subscribe),
                                             });
                                         }
                                         let msg = crate::message::NetMessage::from(msg);
@@ -1896,6 +1899,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                                 peer,
                                                 contract_location,
                                                 outcome: crate::router::RouteOutcome::Failure,
+                                                op_type: Some(crate::node::network_status::OpType::Put),
                                             });
                                         }
                                         let msg = crate::message::NetMessage::from(msg);

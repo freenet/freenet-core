@@ -741,8 +741,9 @@ impl Ring {
             // Try to include connect forward estimator data
             if let Some(op_manager) = ring.upgrade_op_manager() {
                 let cfe = op_manager.connect_forward_estimator.read();
-                let (curve, events, adjustments) = cfe.snapshot();
+                let (curve, data_range, events, adjustments) = cfe.snapshot();
                 snapshot.connect_forward_curve = Some(curve);
+                snapshot.connect_forward_data_range = Some(data_range);
                 snapshot.connect_forward_events = Some(events);
                 snapshot.connect_forward_peer_adjustments = Some(adjustments);
             }
@@ -2823,6 +2824,7 @@ mod refresh_router_tests {
                     payload_size: 1000,
                     payload_transfer_time: Duration::from_millis(100),
                 },
+                op_type: None,
             })
             .collect()
     }

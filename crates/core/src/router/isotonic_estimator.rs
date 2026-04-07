@@ -174,13 +174,46 @@ impl IsotonicEstimator {
         self.global_regression.len()
     }
 
-    /// Extract the global regression curve as `(x, y)` pairs, sorted by x.
-    pub(crate) fn curve_points(&self) -> Vec<(f64, f64)> {
-        self.global_regression
-            .get_points_sorted()
-            .into_iter()
-            .map(|p| (*p.x(), *p.y()))
-            .collect()
+    /// Return the x-range of actual regression data points, or (0, 0) if empty.
+    pub(crate) fn data_x_range(&self) -> (f64, f64) {
+        let sorted = self.global_regression.get_points_sorted();
+        if sorted.is_empty() {
+            return (0.0, 0.0);
+        }
+        (*sorted.first().unwrap().x(), *sorted.last().unwrap().x())
+    }
+
+    /// Sample the regression's `interpolate()` across the full distance range [0, 0.5],
+    /// clamping outputs to `[y_clamp_min, y_clamp_max]`. This produces the actual
+    /// predictions the estimator would make, including centroid-based extrapolation
+    /// beyond the data range.
+    ///
+    /// Returns `(sampled_points, data_x_min, data_x_max)` where `data_x_min/max`
+    /// are the bounds of the actual regression data (for distinguishing interpolation
+    /// from extrapolation in charts).
+    pub(crate) fn sampled_curve(
+        &self,
+        y_clamp_min: f64,
+        y_clamp_max: f64,
+        num_samples: usize,
+    ) -> (Vec<(f64, f64)>, f64, f64) {
+        let sorted = self.global_regression.get_points_sorted();
+        if sorted.is_empty() {
+            return (Vec::new(), 0.0, 0.0);
+        }
+
+        let data_x_min = *sorted.first().unwrap().x();
+        let data_x_max = *sorted.last().unwrap().x();
+
+        let mut points = Vec::with_capacity(num_samples);
+        for i in 0..num_samples {
+            let x = (i as f64 / (num_samples - 1) as f64) * 0.5;
+            if let Some(y) = self.global_regression.interpolate(x) {
+                points.push((x, y.clamp(y_clamp_min, y_clamp_max)));
+            }
+        }
+
+        (points, data_x_min, data_x_max)
     }
 }
 

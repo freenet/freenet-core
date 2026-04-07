@@ -573,13 +573,10 @@ async fn report_result(
             // in case more cases want to be handled when feeding information to the OpManager
 
             // Record operation result for dashboard stats
-            {
-                use crate::node::network_status;
-                let (op_type, success) =
-                    classify_op_outcome(op_res.id().transaction_type(), op_res.outcome());
-                if let Some(op_type) = op_type {
-                    network_status::record_op_result(op_type, success);
-                }
+            let (classified_op_type, classified_success) =
+                classify_op_outcome(op_res.id().transaction_type(), op_res.outcome());
+            if let Some(op_type) = classified_op_type {
+                network_status::record_op_result(op_type, classified_success);
             }
 
             let route_event = match op_res.outcome() {
@@ -597,6 +594,7 @@ async fn report_result(
                         payload_size,
                         payload_transfer_time,
                     },
+                    op_type: classified_op_type,
                 }),
                 OpOutcome::ContractOpSuccessUntimed {
                     target_peer,
@@ -605,6 +603,7 @@ async fn report_result(
                     peer: target_peer.clone(),
                     contract_location,
                     outcome: RouteOutcome::SuccessUntimed,
+                    op_type: classified_op_type,
                 }),
                 OpOutcome::ContractOpFailure {
                     target_peer,
@@ -613,6 +612,7 @@ async fn report_result(
                     peer: target_peer.clone(),
                     contract_location,
                     outcome: RouteOutcome::Failure,
+                    op_type: classified_op_type,
                 }),
                 OpOutcome::Incomplete | OpOutcome::Irrelevant => None,
             };

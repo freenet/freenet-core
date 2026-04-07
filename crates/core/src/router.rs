@@ -2,11 +2,15 @@ mod isotonic_estimator;
 mod routing_predictor;
 mod util;
 
+use std::collections::HashMap;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
 use crate::config::GlobalRng;
+use crate::node::network_status::OpType;
 use crate::ring::{Distance, Location, PeerKeyLocation};
 pub(crate) use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use util::{Mean, TransferSpeed};
 
 // ==================== Telemetry types ====================
@@ -68,6 +72,21 @@ impl From<RoutingPrediction> for RoutingPredictionInfo {
     }
 }
 
+/// Per-operation-type estimator curves for the dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) struct PerOpCurves {
+    pub failure_curve: Vec<(f64, f64)>,
+    pub failure_data_range: (f64, f64),
+    pub failure_events: usize,
+    pub response_time_curve: Vec<(f64, f64)>,
+    pub response_time_data_range: (f64, f64),
+    pub response_time_events: usize,
+    pub transfer_rate_curve: Vec<(f64, f64)>,
+    pub transfer_rate_data_range: (f64, f64),
+    pub transfer_rate_events: usize,
+}
+
 /// Periodic snapshot of the router model state for telemetry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
@@ -80,16 +99,26 @@ pub(crate) struct RouterSnapshotInfo {
     pub consider_n_closest_peers: usize,
     pub peers_with_failure_adjustments: usize,
     pub peers_with_response_adjustments: usize,
-    /// PAV regression curve: Vec of (distance, failure_probability)
+    /// PAV regression curve sampled across [0, 0.5], clamped to [0, 1].
     pub failure_curve: Vec<(f64, f64)>,
-    /// PAV regression curve: Vec of (distance, response_time_secs)
+    /// X-range of actual regression data for the failure estimator.
+    pub failure_data_range: (f64, f64),
+    /// PAV regression curve sampled across [0, 0.5], clamped to [0, inf).
     pub response_time_curve: Vec<(f64, f64)>,
-    /// PAV regression curve: Vec of (distance, bytes_per_sec)
+    /// X-range of actual regression data for the response time estimator.
+    pub response_time_data_range: (f64, f64),
+    /// PAV regression curve sampled across [0, 0.5], clamped to [0, inf).
     pub transfer_rate_curve: Vec<(f64, f64)>,
-    /// Connect forward estimator curve, if available
+    /// X-range of actual regression data for the transfer rate estimator.
+    pub transfer_rate_data_range: (f64, f64),
+    /// Connect forward estimator curve sampled across [0, 0.5], clamped to [0, 1].
     pub connect_forward_curve: Option<Vec<(f64, f64)>>,
+    /// X-range of actual regression data for the connect forward estimator.
+    pub connect_forward_data_range: Option<(f64, f64)>,
     pub connect_forward_events: Option<usize>,
     pub connect_forward_peer_adjustments: Option<usize>,
+    /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
+    pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics
     pub renegade_failure_events: usize,
     pub renegade_response_time_events: usize,
@@ -127,6 +156,12 @@ pub(crate) struct Router {
     failure_estimator: IsotonicEstimator,
     mean_transfer_size: Mean,
     consider_n_closest_peers: usize,
+    /// Per-operation-type failure estimators (telemetry/dashboard only).
+    per_op_failure: HashMap<OpType, IsotonicEstimator>,
+    /// Per-operation-type response time estimators (telemetry/dashboard only).
+    per_op_response_time: HashMap<OpType, IsotonicEstimator>,
+    /// Per-operation-type transfer rate estimators (telemetry/dashboard only).
+    per_op_transfer_rate: HashMap<OpType, IsotonicEstimator>,
     /// Renegade-ML predictor for peer × contract interaction patterns.
     /// Complements the isotonic estimators by detecting targeted attacks
     /// and per-peer behavior that varies by contract location.
@@ -145,6 +180,9 @@ impl Clone for Router {
             failure_estimator: self.failure_estimator.clone(),
             mean_transfer_size: self.mean_transfer_size,
             consider_n_closest_peers: self.consider_n_closest_peers,
+            per_op_failure: self.per_op_failure.clone(),
+            per_op_response_time: self.per_op_response_time.clone(),
+            per_op_transfer_rate: self.per_op_transfer_rate.clone(),
             renegade_predictor: routing_predictor::RoutingPredictor::new(RENEGADE_MAX_OBSERVATIONS),
         }
     }
@@ -253,6 +291,53 @@ impl Router {
 
         renegade_predictor.finish_batch();
 
+        // Build per-op-type estimators from history
+        let mut per_op_failure: HashMap<OpType, Vec<IsotonicEvent>> = HashMap::new();
+        let mut per_op_response_time: HashMap<OpType, Vec<IsotonicEvent>> = HashMap::new();
+        let mut per_op_transfer_rate: HashMap<OpType, Vec<IsotonicEvent>> = HashMap::new();
+
+        for event in history {
+            if let Some(op_type) = event.op_type {
+                let failure_result = match event.outcome {
+                    RouteOutcome::Success { .. } | RouteOutcome::SuccessUntimed => 0.0,
+                    RouteOutcome::Failure => 1.0,
+                };
+                per_op_failure
+                    .entry(op_type)
+                    .or_default()
+                    .push(IsotonicEvent {
+                        peer: event.peer.clone(),
+                        contract_location: event.contract_location,
+                        result: failure_result,
+                    });
+                if let RouteOutcome::Success {
+                    time_to_response_start,
+                    payload_size,
+                    payload_transfer_time,
+                } = event.outcome
+                {
+                    per_op_response_time
+                        .entry(op_type)
+                        .or_default()
+                        .push(IsotonicEvent {
+                            peer: event.peer.clone(),
+                            contract_location: event.contract_location,
+                            result: time_to_response_start.as_secs_f64(),
+                        });
+                    if payload_size > 0 && !payload_transfer_time.is_zero() {
+                        per_op_transfer_rate
+                            .entry(op_type)
+                            .or_default()
+                            .push(IsotonicEvent {
+                                peer: event.peer.clone(),
+                                contract_location: event.contract_location,
+                                result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
+                            });
+                    }
+                }
+            }
+        }
+
         Router {
             // Positive because we expect time to increase as distance increases
             response_start_time_estimator: IsotonicEstimator::new(
@@ -268,6 +353,18 @@ impl Router {
             ),
             mean_transfer_size,
             consider_n_closest_peers: 5,
+            per_op_failure: per_op_failure
+                .into_iter()
+                .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Positive)))
+                .collect(),
+            per_op_response_time: per_op_response_time
+                .into_iter()
+                .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Positive)))
+                .collect(),
+            per_op_transfer_rate: per_op_transfer_rate
+                .into_iter()
+                .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Negative)))
+                .collect(),
             renegade_predictor,
         }
     }
@@ -280,6 +377,7 @@ impl Router {
 
     pub fn add_event(&mut self, event: RouteEvent) {
         let was_below_threshold = !self.has_sufficient_routing_events();
+        let op_type = event.op_type;
 
         // Feed renegade predictor (before isotonic, which moves event.peer)
         let distance = event
@@ -297,7 +395,7 @@ impl Router {
             renegade_outcome,
         );
 
-        // Feed isotonic estimators
+        // Feed global isotonic estimators
         match event.outcome {
             RouteOutcome::Success {
                 time_to_response_start,
@@ -314,6 +412,31 @@ impl Router {
                     contract_location: event.contract_location,
                     result: 0.0,
                 });
+
+                // Per-op-type estimators
+                if let Some(ot) = op_type {
+                    self.per_op_response_time
+                        .entry(ot)
+                        .or_insert_with(|| {
+                            IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive)
+                        })
+                        .add_event(IsotonicEvent {
+                            peer: event.peer.clone(),
+                            contract_location: event.contract_location,
+                            result: time_to_response_start.as_secs_f64(),
+                        });
+                    self.per_op_failure
+                        .entry(ot)
+                        .or_insert_with(|| {
+                            IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive)
+                        })
+                        .add_event(IsotonicEvent {
+                            peer: event.peer.clone(),
+                            contract_location: event.contract_location,
+                            result: 0.0,
+                        });
+                }
+
                 // Only feed transfer rate estimator when there's actual payload data.
                 // Operations like SUBSCRIBE report payload_size=0 and
                 // payload_transfer_time=ZERO, which would produce NaN (0/0).
@@ -321,9 +444,21 @@ impl Router {
                     self.mean_transfer_size.add(payload_size as f64);
                     self.transfer_rate_estimator.add_event(IsotonicEvent {
                         contract_location: event.contract_location,
-                        peer: event.peer,
+                        peer: event.peer.clone(),
                         result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
                     });
+                    if let Some(ot) = op_type {
+                        self.per_op_transfer_rate
+                            .entry(ot)
+                            .or_insert_with(|| {
+                                IsotonicEstimator::new(std::iter::empty(), EstimatorType::Negative)
+                            })
+                            .add_event(IsotonicEvent {
+                                contract_location: event.contract_location,
+                                peer: event.peer,
+                                result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
+                            });
+                    }
                 }
             }
             RouteOutcome::SuccessUntimed | RouteOutcome::Failure => {
@@ -333,10 +468,22 @@ impl Router {
                     0.0
                 };
                 self.failure_estimator.add_event(IsotonicEvent {
-                    peer: event.peer,
+                    peer: event.peer.clone(),
                     contract_location: event.contract_location,
                     result,
                 });
+                if let Some(ot) = op_type {
+                    self.per_op_failure
+                        .entry(ot)
+                        .or_insert_with(|| {
+                            IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive)
+                        })
+                        .add_event(IsotonicEvent {
+                            peer: event.peer,
+                            contract_location: event.contract_location,
+                            result,
+                        });
+                }
             }
         }
 
@@ -632,11 +779,61 @@ impl Router {
                 .response_start_time_estimator
                 .peer_adjustments
                 .len(),
-            failure_curve: self.failure_estimator.curve_points(),
-            response_time_curve: self.response_start_time_estimator.curve_points(),
-            transfer_rate_curve: self.transfer_rate_estimator.curve_points(),
+            failure_curve: {
+                let (p, _, _) = self.failure_estimator.sampled_curve(0.0, 1.0, 50);
+                p
+            },
+            failure_data_range: self.failure_estimator.data_x_range(),
+            response_time_curve: {
+                let (p, _, _) =
+                    self.response_start_time_estimator
+                        .sampled_curve(0.0, f64::INFINITY, 50);
+                p
+            },
+            response_time_data_range: self.response_start_time_estimator.data_x_range(),
+            transfer_rate_curve: {
+                let (p, _, _) = self
+                    .transfer_rate_estimator
+                    .sampled_curve(0.0, f64::INFINITY, 50);
+                p
+            },
+            transfer_rate_data_range: self.transfer_rate_estimator.data_x_range(),
+            per_op_curves: {
+                let mut curves = HashMap::new();
+                // Collect all op types that have any data
+                let mut op_types: std::collections::HashSet<OpType> =
+                    std::collections::HashSet::new();
+                op_types.extend(self.per_op_failure.keys());
+                op_types.extend(self.per_op_response_time.keys());
+                op_types.extend(self.per_op_transfer_rate.keys());
+
+                for ot in op_types {
+                    let mut c = PerOpCurves::default();
+                    if let Some(est) = self.per_op_failure.get(&ot) {
+                        let (p, _, _) = est.sampled_curve(0.0, 1.0, 50);
+                        c.failure_curve = p;
+                        c.failure_data_range = est.data_x_range();
+                        c.failure_events = est.len();
+                    }
+                    if let Some(est) = self.per_op_response_time.get(&ot) {
+                        let (p, _, _) = est.sampled_curve(0.0, f64::INFINITY, 50);
+                        c.response_time_curve = p;
+                        c.response_time_data_range = est.data_x_range();
+                        c.response_time_events = est.len();
+                    }
+                    if let Some(est) = self.per_op_transfer_rate.get(&ot) {
+                        let (p, _, _) = est.sampled_curve(0.0, f64::INFINITY, 50);
+                        c.transfer_rate_curve = p;
+                        c.transfer_rate_data_range = est.data_x_range();
+                        c.transfer_rate_events = est.len();
+                    }
+                    curves.insert(ot.as_str().to_string(), c);
+                }
+                curves
+            },
             // Populated by Ring which has access to both Router and OpManager
             connect_forward_curve: None,
+            connect_forward_data_range: None,
             connect_forward_events: None,
             connect_forward_peer_adjustments: None,
             // Renegade predictor diagnostics
@@ -732,6 +929,9 @@ pub(crate) struct RouteEvent {
     pub peer: PeerKeyLocation,
     pub contract_location: Location,
     pub outcome: RouteOutcome,
+    /// Which operation produced this event. None when the operation type is unknown
+    /// (e.g., generic timeout handler).
+    pub op_type: Option<crate::node::network_status::OpType>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -818,6 +1018,7 @@ mod tests {
                 } else {
                     RouteOutcome::Failure
                 },
+                op_type: None,
             };
             events.push(event);
         }
@@ -1091,6 +1292,7 @@ mod tests {
                     payload_size: 1000,
                     payload_transfer_time: Duration::from_millis(10),
                 },
+                op_type: None,
             });
         }
 
@@ -1100,6 +1302,7 @@ mod tests {
                 peer: peer_b.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
 
@@ -1133,6 +1336,7 @@ mod tests {
                     payload_size: 1000,
                     payload_transfer_time: Duration::from_millis(10),
                 },
+                op_type: None,
             })
             .collect();
 
@@ -1152,6 +1356,7 @@ mod tests {
                     payload_size: 1000,
                     payload_transfer_time: Duration::from_millis(10),
                 },
+                op_type: None,
             })
             .collect();
 
@@ -1180,6 +1385,7 @@ mod tests {
                     payload_size: 1000,
                     payload_transfer_time: Duration::from_millis(10),
                 },
+                op_type: None,
             });
         }
 
@@ -1189,6 +1395,7 @@ mod tests {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
 
@@ -1214,6 +1421,7 @@ mod tests {
                 peer: peers[i % peers.len()].clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             })
             .collect();
 
@@ -1255,6 +1463,7 @@ mod tests {
             peer: peer.clone(),
             contract_location,
             outcome: RouteOutcome::SuccessUntimed,
+            op_type: None,
         });
 
         // failure_estimator should have 1 event (success = 0.0)
@@ -1281,6 +1490,7 @@ mod tests {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             });
         }
         assert_eq!(router.failure_estimator.len(), 50);
@@ -1301,11 +1511,13 @@ mod tests {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             })
             .chain((0..20).map(|_| RouteEvent {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             }))
             .collect();
 
@@ -1335,6 +1547,7 @@ mod tests {
                 peer: good_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             });
         }
 
@@ -1344,6 +1557,7 @@ mod tests {
                 peer: bad_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
 
@@ -1392,6 +1606,7 @@ mod tests {
                 peer: peers[i % peers.len()].clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             });
         }
 
@@ -1401,6 +1616,7 @@ mod tests {
                 peer: peers[i % peers.len()].clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
 
@@ -1414,6 +1630,7 @@ mod tests {
                     payload_size: 1000,
                     payload_transfer_time: Duration::from_millis(10),
                 },
+                op_type: None,
             });
         }
 
@@ -1449,6 +1666,7 @@ mod tests {
             peer: target_peer.clone(),
             contract_location,
             outcome: RouteOutcome::SuccessUntimed,
+            op_type: None,
         };
 
         let mut router = Router::new(&[]);
@@ -1476,6 +1694,7 @@ mod tests {
             peer: target_peer.clone(),
             contract_location,
             outcome: RouteOutcome::SuccessUntimed,
+            op_type: None,
         };
 
         let mut router = Router::new(&[]);
@@ -1505,6 +1724,7 @@ mod tests {
             peer: peer.clone(),
             contract_location,
             outcome: RouteOutcome::Failure,
+            op_type: None,
         });
         assert_eq!(
             router.failure_estimator.len(),
@@ -1518,6 +1738,7 @@ mod tests {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
         assert_eq!(router.failure_estimator.len(), 60);
@@ -1553,6 +1774,7 @@ mod tests {
                 payload_size: 1000,
                 payload_transfer_time: Duration::from_millis(10),
             },
+            op_type: None,
         });
 
         assert_eq!(
@@ -1586,6 +1808,7 @@ mod tests {
                 peer: peers[i % peers.len()].clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             })
             .collect();
 
@@ -1606,6 +1829,7 @@ mod tests {
                     payload_size: 1000,
                     payload_transfer_time: Duration::from_millis(10),
                 },
+                op_type: None,
             });
         }
 
@@ -1653,6 +1877,7 @@ mod tests {
                     payload_size: 2000,
                     payload_transfer_time: Duration::from_millis(5),
                 },
+                op_type: None,
             });
         }
         for _ in 0..15 {
@@ -1660,6 +1885,7 @@ mod tests {
                 peer: close_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             });
         }
         for _ in 0..2 {
@@ -1667,6 +1893,7 @@ mod tests {
                 peer: close_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
 
@@ -1681,6 +1908,7 @@ mod tests {
                     payload_size: 2000,
                     payload_transfer_time: Duration::from_millis(15),
                 },
+                op_type: None,
             });
         }
         for _ in 0..10 {
@@ -1688,6 +1916,7 @@ mod tests {
                 peer: mid_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             });
         }
         for _ in 0..5 {
@@ -1695,6 +1924,7 @@ mod tests {
                 peer: mid_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
 
@@ -1705,6 +1935,7 @@ mod tests {
                 peer: far_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             });
         }
         for _ in 0..15 {
@@ -1712,6 +1943,7 @@ mod tests {
                 peer: far_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
 
@@ -1760,11 +1992,13 @@ mod tests {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             })
             .chain((0..20).map(|_| RouteEvent {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             }))
             .chain((0..5).map(|_| RouteEvent {
                 peer: peer.clone(),
@@ -1774,6 +2008,7 @@ mod tests {
                     payload_size: 1500,
                     payload_transfer_time: Duration::from_millis(8),
                 },
+                op_type: None,
             }))
             .collect();
 
@@ -1819,6 +2054,7 @@ mod tests {
                 peer: reliable_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             });
         }
 
@@ -1828,6 +2064,7 @@ mod tests {
                 peer: flaky_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             });
         }
         for _ in 0..15 {
@@ -1835,6 +2072,7 @@ mod tests {
                 peer: flaky_peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
 
@@ -1885,6 +2123,7 @@ mod tests {
                 peer: peer.clone(),
                 contract_location: near_contract,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             });
         }
 
@@ -1894,6 +2133,7 @@ mod tests {
                 peer: peer.clone(),
                 contract_location: far_contract,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             });
         }
 
@@ -1938,6 +2178,7 @@ mod tests {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
+                op_type: None,
             })
             .collect();
 
@@ -2004,6 +2245,7 @@ mod tests {
                         peer: peers[i % peers.len()].clone(),
                         contract_location,
                         outcome,
+                        op_type: None,
                     })
                     .collect();
 
@@ -2061,6 +2303,7 @@ mod tests {
                         peer: good_peer.clone(),
                         contract_location,
                         outcome: RouteOutcome::SuccessUntimed,
+                        op_type: None,
                     });
                 }
 
@@ -2070,6 +2313,7 @@ mod tests {
                         peer: bad_peer.clone(),
                         contract_location,
                         outcome: RouteOutcome::Failure,
+                        op_type: None,
                     });
                 }
 
@@ -2113,6 +2357,7 @@ mod tests {
                         peer: peer.clone(),
                         contract_location,
                         outcome,
+                        op_type: None,
                     })
                     .collect();
 
@@ -2158,6 +2403,7 @@ mod tests {
                         peer: peer.clone(),
                         contract_location,
                         outcome: RouteOutcome::SuccessUntimed,
+                        op_type: None,
                     })
                     .collect();
 
@@ -2186,6 +2432,7 @@ mod tests {
                         peer: peers[i % peers.len()].clone(),
                         contract_location,
                         outcome,
+                        op_type: None,
                     })
                     .collect();
 
@@ -2232,6 +2479,7 @@ mod tests {
                 peer: failed_peer.clone(),
                 contract_location: target,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             })
             .collect();
 
@@ -2288,6 +2536,7 @@ mod tests {
                 peer: tried_peer.clone(),
                 contract_location: target,
                 outcome: RouteOutcome::Failure,
+                op_type: None,
             })
             .collect();
 
@@ -2328,6 +2577,7 @@ mod tests {
                 payload_size: 0,
                 payload_transfer_time: std::time::Duration::ZERO,
             },
+            op_type: None,
         });
 
         // The failure estimator should have the event (result=0.0 for success)

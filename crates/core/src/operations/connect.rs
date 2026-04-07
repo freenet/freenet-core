@@ -448,10 +448,14 @@ impl ConnectForwardEstimator {
             .map(|p| p.clamp(0.0, 1.0))
     }
 
-    /// Return the PAV curve points, event count, and peer adjustment count for telemetry.
-    pub(crate) fn snapshot(&self) -> (Vec<(f64, f64)>, usize, usize) {
+    /// Return the sampled PAV curve, data range, event count, and peer adjustment count.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn snapshot(&self) -> (Vec<(f64, f64)>, (f64, f64), usize, usize) {
+        let (curve, _, _) = self.estimator.sampled_curve(0.0, 1.0, 50);
+        let data_range = self.estimator.data_x_range();
         (
-            self.estimator.curve_points(),
+            curve,
+            data_range,
             self.estimator.len(),
             self.estimator.peer_adjustments.len(),
         )
@@ -3028,9 +3032,9 @@ mod tests {
             },
         );
 
-        let (_, events_before, _) = estimator.read().snapshot();
+        let (_, _, events_before, _) = estimator.read().snapshot();
         op.expire_forward_attempts(Instant::now());
-        let (_, events_after, _) = estimator.read().snapshot();
+        let (_, _, events_after, _) = estimator.read().snapshot();
 
         assert!(op.forward_attempts.is_empty());
         assert!(
