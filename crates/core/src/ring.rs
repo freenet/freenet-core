@@ -1835,6 +1835,14 @@ impl Ring {
         const INITIAL_ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(30);
         /// Max time to hold a deferred swap drop before abandoning it.
         const DEFERRED_SWAP_DROP_TTL: Duration = Duration::from_secs(120);
+
+        /// How often to probe a gateway for version discovery (#3677).
+        #[cfg(not(test))]
+        const GATEWAY_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(4 * 3600);
+        #[cfg(test)]
+        const GATEWAY_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+        const GATEWAY_PROBE_JITTER_FACTOR: f64 = 0.2;
+
         // Deferred swap drops: (addr, queued_at) using time_source for
         // deterministic simulation support.
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
@@ -1843,6 +1851,12 @@ impl Ring {
         // successful connection, use a shorter isolation escalation threshold
         // for faster recovery from cold-start failures (#3737).
         let mut ever_had_connections = false;
+
+        // Gateway version probe: random initial delay to prevent thundering herd.
+        // The loop guard (`!is_gateway`) ensures gateways never probe themselves.
+        let initial_probe_delay_secs =
+            GlobalRng::random_u64() % GATEWAY_VERSION_PROBE_INTERVAL.as_secs();
+        let mut next_gateway_probe = Instant::now() + Duration::from_secs(initial_probe_delay_secs);
 
         // Adaptive fast-tick backoff: increase the fast-tick interval when
         // connection count stops growing, to avoid hammering the network
@@ -2065,6 +2079,41 @@ impl Ring {
                     connections = current_conn_count,
                     "Recovered from zero-connection state"
                 );
+            }
+
+            // Periodic gateway version probe: initiate a CONNECT to a gateway so the
+            // transport handshake exchanges version info, even when the ring is full (#3677).
+            //
+            // The combined predicate (`!is_gateway && !configured_gateways.is_empty() &&
+            // now >= next_probe`) is extracted into `should_probe_gateway` so each branch
+            // is unit-testable. Without the empty-gateways guard merged into the same
+            // condition, the index/modulo on the next line would panic.
+            if should_probe_gateway(
+                is_gateway,
+                !op_manager.configured_gateways.is_empty(),
+                Instant::now(),
+                next_gateway_probe,
+            ) {
+                let gw_index =
+                    GlobalRng::random_u64() as usize % op_manager.configured_gateways.len();
+                let gateway = &op_manager.configured_gateways[gw_index];
+
+                if let Err(e) =
+                    crate::operations::connect::gateway_version_probe(gateway, &op_manager).await
+                {
+                    tracing::debug!(
+                        error = %e,
+                        gateway = %gateway,
+                        "Gateway version probe failed, will retry next cycle"
+                    );
+                }
+
+                let base_secs = GATEWAY_VERSION_PROBE_INTERVAL.as_secs() as f64;
+                let jitter_range = base_secs * GATEWAY_PROBE_JITTER_FACTOR;
+                let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
+                let jittered_secs = base_secs + jitter_range * (2.0 * uniform_01 - 1.0);
+                next_gateway_probe =
+                    Instant::now() + Duration::from_secs_f64(jittered_secs.max(1.0));
             }
 
             // Gateway bootstrap fallback: at zero connections, acquire_new always
@@ -2686,6 +2735,78 @@ fn deferred_swap_drops_to_execute(
         }
     }
     n_to_drop
+}
+
+/// Predicate controlling when `connection_maintenance` fires a gateway version probe.
+///
+/// Extracted as a free function so each branch (gateway role, empty configuration,
+/// timing) can be exercised in unit tests without standing up an `OpManager`. The
+/// caller relies on `has_configured_gateways` to gate the modulo-indexing into
+/// `op_manager.configured_gateways` — flipping that flag at the call site (rather
+/// than inside this function) keeps the borrow of the gateway slice local to the
+/// caller.
+#[inline]
+fn should_probe_gateway(
+    is_gateway: bool,
+    has_configured_gateways: bool,
+    now: Instant,
+    next_probe: Instant,
+) -> bool {
+    !is_gateway && has_configured_gateways && now >= next_probe
+}
+
+#[cfg(test)]
+mod gateway_version_probe_predicate_tests {
+    use super::should_probe_gateway;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn fires_on_non_gateway_with_configured_gateways_at_due_time() {
+        let now = Instant::now();
+        let next_probe = now - Duration::from_secs(1);
+        assert!(should_probe_gateway(false, true, now, next_probe));
+    }
+
+    #[test]
+    fn skipped_when_running_as_gateway() {
+        // Gateways must never probe themselves — they are the destination, not
+        // the originator. This is the protection that keeps the gateway loop
+        // from generating phantom CONNECTs.
+        let now = Instant::now();
+        let next_probe = now - Duration::from_secs(1);
+        assert!(!should_probe_gateway(true, true, now, next_probe));
+    }
+
+    #[test]
+    fn skipped_when_no_gateways_are_configured() {
+        // The empty-gateways case is the boundary that previously sat in an
+        // inner `if` and was unreachable from any test. Merging it into the
+        // predicate makes the modulo-indexing in the caller structurally safe.
+        let now = Instant::now();
+        let next_probe = now - Duration::from_secs(1);
+        assert!(!should_probe_gateway(false, false, now, next_probe));
+    }
+
+    #[test]
+    fn skipped_before_due_time() {
+        let now = Instant::now();
+        let next_probe = now + Duration::from_secs(60);
+        assert!(!should_probe_gateway(false, true, now, next_probe));
+    }
+
+    #[test]
+    fn fires_at_exact_due_time_boundary() {
+        // `>=` semantics: a now equal to next_probe should fire, not skip.
+        let now = Instant::now();
+        assert!(should_probe_gateway(false, true, now, now));
+    }
+
+    #[test]
+    fn gateway_with_no_configured_gateways_is_still_skipped() {
+        let now = Instant::now();
+        assert!(!should_probe_gateway(true, false, now, now));
+    }
 }
 
 #[cfg(test)]

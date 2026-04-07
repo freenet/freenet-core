@@ -6226,6 +6226,75 @@ fn test_readiness_gating_with_message_loss() {
 }
 
 // =============================================================================
+// Gateway Version Probe Tests
+// =============================================================================
+
+/// Verify that the periodic gateway version probe does not break
+/// connection_maintenance. Actual version mismatch detection is not testable
+/// in simulation (all nodes share the same PROTOC_VERSION). (#3677)
+#[test]
+fn test_gateway_version_probe_fires() {
+    const SEED: u64 = 0x6A7E_7AE9_0001;
+
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let sim = rt.block_on(async {
+        SimNetwork::new(
+            "test-gw-version-probe",
+            1,  // gateways
+            3,  // nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    let logs_handle = sim.event_logs_handle();
+
+    drop(rt);
+
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(SEED, 3, 30, Duration::from_secs(1))
+        .expect("Simulation should complete without panic");
+
+    let rt = create_runtime();
+    let unique_connect_txs = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        // Count distinct Connect transactions, not raw events. Each CONNECT op
+        // emits multiple log entries (sent/received/accepted) that share a Tx.
+        // Counting unique Tx values gives us the number of *operations*, which
+        // is what the probe code path actually generates.
+        let mut seen = std::collections::HashSet::new();
+        for log in logs.iter() {
+            if log.kind.variant_name() == "Connect" {
+                seen.insert(log.tx);
+            }
+        }
+        seen.len()
+    });
+
+    // Bootstrap baseline: each of the 3 non-gateway nodes initiates an initial
+    // CONNECT to the gateway, so the bootstrap floor is 3 unique transactions.
+    // (Bootstrap may also retry on failure, but that just adds to the floor.)
+    //
+    // Probe budget: cfg(test) sets GATEWAY_VERSION_PROBE_INTERVAL to 10s with
+    // a random initial delay in [0, 10)s and ±20% jitter per cycle. Over 30s
+    // of sim time, each non-gateway can fire 1–3 probes, so 3 nodes contribute
+    // an additional 3–9 unique CONNECT transactions on top of bootstrap.
+    //
+    // Asserting > 6 (bootstrap floor + at least one probe per node) is robust
+    // against the random initial delay while still proving probes fire.
+    assert!(
+        unique_connect_txs > 6,
+        "Expected bootstrap (~3) + at least 4 probe CONNECTs, got {unique_connect_txs}"
+    );
+}
+
+// =============================================================================
 // CONNECT Acceptor Diversity: Joiner succeeds despite NAT-blocked acceptor
 // =============================================================================
 
