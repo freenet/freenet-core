@@ -2235,42 +2235,22 @@ mod tests {
             false,
         );
 
-        // Simulate what handle_interest_sync_message does:
-        // Compare peer B's reported summary with our own
-        let their_summary = Some(stale_summary);
-        let is_stale = our_summary
-            .as_ref()
-            .iter()
-            .zip(their_summary.as_ref().map(|s| s.as_ref()).unwrap_or(&[]))
-            .any(|(a, b)| a != b)
-            || our_summary.as_ref().len()
-                != their_summary
-                    .as_ref()
-                    .map(|s| s.as_ref().len())
-                    .unwrap_or(0);
+        // Use the same stale-detection logic as production (node.rs):
+        // zip both Option<StateSummary> and compare bytes.
+        let peer_b_summary = manager.get_peer_summary(&contract, &peer_b);
+        let is_stale = Some(&our_summary)
+            .zip(peer_b_summary.as_ref())
+            .is_some_and(|(ours, theirs)| ours.as_ref() != theirs.as_ref());
         assert!(is_stale, "Peer B should be detected as stale");
 
-        // Verify peer A is NOT stale
-        let peer_a_summary = manager.get_peer_summary(&contract, &peer_a);
-        let peer_a_stale = peer_a_summary
-            .as_ref()
-            .map(|theirs| theirs.as_ref() != our_summary.as_ref())
-            .unwrap_or(false);
-        assert!(
-            !peer_a_stale,
-            "Peer A should NOT be stale -- it has our current summary"
-        );
-
-        // Verify peer C is NOT stale
-        let peer_c_summary = manager.get_peer_summary(&contract, &peer_c);
-        let peer_c_stale = peer_c_summary
-            .as_ref()
-            .map(|theirs| theirs.as_ref() != our_summary.as_ref())
-            .unwrap_or(false);
-        assert!(
-            !peer_c_stale,
-            "Peer C should NOT be stale -- it has our current summary"
-        );
+        // Peers A and C have our current summary and should NOT be stale
+        for (label, peer) in [("A", &peer_a), ("C", &peer_c)] {
+            let summary = manager.get_peer_summary(&contract, peer);
+            let stale = Some(&our_summary)
+                .zip(summary.as_ref())
+                .is_some_and(|(ours, theirs)| ours.as_ref() != theirs.as_ref());
+            assert!(!stale, "Peer {label} should NOT be stale");
+        }
 
         // The fix (#3791): only peer B needs a state sync, not all 3 peers.
         // Before the fix, BroadcastStateChange would send to all 3 peers.
