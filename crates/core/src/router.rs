@@ -620,8 +620,17 @@ impl Router {
         }
 
         let expected_total_time = if time_estimate.is_some() && transfer_estimate.is_some() {
+            // Guard against NaN from 0.0/0.0 (mean_transfer_size with no samples
+            // divided by zero xfer_speed). Use a large finite fallback so the peer
+            // sorts last but doesn't poison the comparator's total ordering.
+            let transfer_time = if xfer_speed > 0.0 {
+                let t = self.mean_transfer_size.compute() / xfer_speed;
+                if t.is_finite() { t } else { f64::MAX / 2.0 }
+            } else {
+                f64::MAX / 2.0
+            };
             time_to_response_start
-                + (self.mean_transfer_size.compute() / xfer_speed)
+                + transfer_time
                 + (time_to_response_start * failure_estimate * failure_cost_multiplier)
         } else {
             failure_estimate * failure_cost_multiplier
@@ -729,9 +738,7 @@ impl Router {
             scored.sort_by(|a, b| {
                 let time_a = a.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
                 let time_b = b.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
-                time_a
-                    .partial_cmp(&time_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                time_a.total_cmp(&time_b)
             });
 
             let strategy = if fallback_count == 0 {
@@ -2708,5 +2715,90 @@ mod tests {
                 .get(&OpType::Subscribe)
                 .is_none()
         );
+    }
+
+    /// Regression test for crash: "user-provided comparison function does not
+    /// correctly implement a total order" in refresh_router.
+    ///
+    /// When `mean_transfer_size` has no samples (count=0), `compute()` returns
+    /// NaN (0.0/0.0). If `xfer_speed` is also 0, the division NaN/0.0 stays NaN.
+    /// `partial_cmp` on NaN returns `None`, and `unwrap_or(Equal)` breaks
+    /// transitivity, causing Rust's sort to panic.
+    #[test]
+    fn sort_does_not_panic_with_nan_expected_total_time() {
+        // Simulate the sort that happens in select_k_best_peers_with_telemetry
+        // with NaN values that would have triggered the old partial_cmp panic.
+        let mut scored: Vec<(usize, f64, Option<f64>)> = vec![
+            (0, 0.1, Some(1.0)),
+            (1, 0.2, Some(f64::NAN)), // NaN from division by zero
+            (2, 0.3, Some(0.5)),
+            (3, 0.4, None),           // No prediction
+            (4, 0.5, Some(f64::NAN)), // Another NaN
+            (5, 0.6, Some(2.0)),
+        ];
+
+        // This is the fixed sort using total_cmp (NaN sorts after +Inf)
+        scored.sort_by(|a, b| {
+            let time_a = a.2.unwrap_or(f64::MAX);
+            let time_b = b.2.unwrap_or(f64::MAX);
+            time_a.total_cmp(&time_b)
+        });
+
+        // Non-NaN values should be sorted correctly
+        let non_nan_times: Vec<f64> = scored
+            .iter()
+            .filter_map(|s| s.2)
+            .filter(|t| !t.is_nan())
+            .collect();
+        for w in non_nan_times.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "non-NaN values should be sorted: {} > {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// Verify that `predict_routing_outcome` never produces NaN in
+    /// `expected_total_time`, even when transfer speed is zero.
+    #[test]
+    fn predict_routing_outcome_no_nan_with_zero_transfer_speed() {
+        let peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        // Build events where the peer has zero transfer speed
+        let events: Vec<RouteEvent> = (0..50)
+            .map(|i| {
+                let outcome = if i % 3 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: std::time::Duration::from_millis(50),
+                        payload_size: 0, // zero payload -> zero transfer speed
+                        payload_transfer_time: std::time::Duration::from_millis(0),
+                    }
+                };
+                RouteEvent {
+                    peer: peer.clone(),
+                    contract_location,
+                    outcome,
+                    op_type: None,
+                }
+            })
+            .collect();
+
+        let router = Router::new(&events);
+
+        match router.predict_routing_outcome(&peer, contract_location) {
+            Ok(pred) => {
+                assert!(
+                    pred.expected_total_time.is_finite(),
+                    "expected_total_time must be finite, got {}",
+                    pred.expected_total_time
+                );
+            }
+            Err(_) => {} // Not enough data is acceptable
+        }
     }
 }
