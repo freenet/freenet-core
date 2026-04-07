@@ -678,6 +678,14 @@ pub(crate) enum NodeEvent {
         key: ContractKey,
         new_state: WrappedState,
     },
+    /// Send state to a specific peer that reported a stale summary.
+    /// Unlike BroadcastStateChange (which fans out to ALL subscribers),
+    /// this targets only the peer that needs catching up.
+    SyncStateToPeer {
+        key: ContractKey,
+        new_state: WrappedState,
+        target: SocketAddr,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -800,6 +808,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::BroadcastStateChange { key, .. } => {
                 write!(f, "BroadcastStateChange (contract: {key})")
+            }
+            NodeEvent::SyncStateToPeer { key, target, .. } => {
+                write!(f, "SyncStateToPeer (contract: {key}, target: {target})")
             }
         }
     }
