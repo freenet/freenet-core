@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.3.196"
+version = "0.3.197"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -44,7 +44,7 @@ reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 http = { workspace = true }
 
 # internal
-freenet = { path = "../core", version = "0.2.33", features = ["testing"] }
+freenet = { path = "../core", version = "0.2.34", features = ["testing"] }
 freenet-stdlib = { workspace = true }
 
 [features]
