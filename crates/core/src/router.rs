@@ -779,24 +779,17 @@ impl Router {
                 .response_start_time_estimator
                 .peer_adjustments
                 .len(),
-            failure_curve: {
-                let (p, _, _) = self.failure_estimator.sampled_curve(0.0, 1.0, 50);
-                p
-            },
+            failure_curve: self.failure_estimator.sampled_curve(0.0, 1.0, 50),
             failure_data_range: self.failure_estimator.data_x_range(),
-            response_time_curve: {
-                let (p, _, _) =
-                    self.response_start_time_estimator
-                        .sampled_curve(0.0, f64::INFINITY, 50);
-                p
-            },
+            response_time_curve: self.response_start_time_estimator.sampled_curve(
+                0.0,
+                f64::INFINITY,
+                50,
+            ),
             response_time_data_range: self.response_start_time_estimator.data_x_range(),
-            transfer_rate_curve: {
-                let (p, _, _) = self
-                    .transfer_rate_estimator
-                    .sampled_curve(0.0, f64::INFINITY, 50);
-                p
-            },
+            transfer_rate_curve: self
+                .transfer_rate_estimator
+                .sampled_curve(0.0, f64::INFINITY, 50),
             transfer_rate_data_range: self.transfer_rate_estimator.data_x_range(),
             per_op_curves: {
                 let mut curves = HashMap::new();
@@ -810,19 +803,19 @@ impl Router {
                 for ot in op_types {
                     let mut c = PerOpCurves::default();
                     if let Some(est) = self.per_op_failure.get(&ot) {
-                        let (p, _, _) = est.sampled_curve(0.0, 1.0, 50);
+                        let p = est.sampled_curve(0.0, 1.0, 50);
                         c.failure_curve = p;
                         c.failure_data_range = est.data_x_range();
                         c.failure_events = est.len();
                     }
                     if let Some(est) = self.per_op_response_time.get(&ot) {
-                        let (p, _, _) = est.sampled_curve(0.0, f64::INFINITY, 50);
+                        let p = est.sampled_curve(0.0, f64::INFINITY, 50);
                         c.response_time_curve = p;
                         c.response_time_data_range = est.data_x_range();
                         c.response_time_events = est.len();
                     }
                     if let Some(est) = self.per_op_transfer_rate.get(&ot) {
-                        let (p, _, _) = est.sampled_curve(0.0, f64::INFINITY, 50);
+                        let p = est.sampled_curve(0.0, f64::INFINITY, 50);
                         c.transfer_rate_curve = p;
                         c.transfer_rate_data_range = est.data_x_range();
                         c.transfer_rate_events = est.len();
@@ -2586,5 +2579,134 @@ mod tests {
         assert_eq!(router.response_start_time_estimator.len(), 1);
         // The transfer rate estimator should NOT have it (skipped to avoid NaN)
         assert_eq!(router.transfer_rate_estimator.len(), 0);
+    }
+
+    #[test]
+    fn test_per_op_type_estimators_populated_via_add_event() {
+        let mut router = Router::new(&[]);
+        let peer = PeerKeyLocation::random();
+        let contract = Location::random();
+
+        // Add a GET success event
+        router.add_event(RouteEvent {
+            peer: peer.clone(),
+            contract_location: contract,
+            outcome: RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(100),
+                payload_size: 5000,
+                payload_transfer_time: Duration::from_millis(50),
+            },
+            op_type: Some(OpType::Get),
+        });
+
+        // Add a PUT failure event
+        router.add_event(RouteEvent {
+            peer: peer.clone(),
+            contract_location: contract,
+            outcome: RouteOutcome::Failure,
+            op_type: Some(OpType::Put),
+        });
+
+        // Add an event with no op_type (should only go to global)
+        router.add_event(RouteEvent {
+            peer: peer.clone(),
+            contract_location: contract,
+            outcome: RouteOutcome::Failure,
+            op_type: None,
+        });
+
+        // Global estimator has all 3 events
+        assert_eq!(router.failure_estimator.len(), 3);
+
+        // Per-op failure: GET has 1 (success=0.0), PUT has 1 (failure=1.0)
+        assert_eq!(router.per_op_failure.get(&OpType::Get).unwrap().len(), 1);
+        assert_eq!(router.per_op_failure.get(&OpType::Put).unwrap().len(), 1);
+        assert!(router.per_op_failure.get(&OpType::Subscribe).is_none());
+
+        // Per-op response time: only GET (timed success)
+        assert_eq!(
+            router.per_op_response_time.get(&OpType::Get).unwrap().len(),
+            1
+        );
+        assert!(router.per_op_response_time.get(&OpType::Put).is_none());
+
+        // Per-op transfer rate: only GET (has payload data)
+        assert_eq!(
+            router.per_op_transfer_rate.get(&OpType::Get).unwrap().len(),
+            1
+        );
+        assert!(router.per_op_transfer_rate.get(&OpType::Put).is_none());
+
+        // Snapshot should have per-op curves
+        let snap = router.snapshot();
+        assert!(snap.per_op_curves.contains_key("GET"));
+        assert!(snap.per_op_curves.contains_key("PUT"));
+        assert!(!snap.per_op_curves.contains_key("SUBSCRIBE"));
+
+        let get_curves = &snap.per_op_curves["GET"];
+        assert!(get_curves.failure_events > 0);
+        assert!(get_curves.response_time_events > 0);
+        assert!(get_curves.transfer_rate_events > 0);
+
+        let put_curves = &snap.per_op_curves["PUT"];
+        assert!(put_curves.failure_events > 0);
+        assert_eq!(put_curves.response_time_events, 0);
+        assert_eq!(put_curves.transfer_rate_events, 0);
+    }
+
+    #[test]
+    fn test_per_op_type_estimators_populated_via_history() {
+        let peer = PeerKeyLocation::random();
+        let contract = Location::random();
+
+        let history = vec![
+            RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(100),
+                    payload_size: 5000,
+                    payload_transfer_time: Duration::from_millis(50),
+                },
+                op_type: Some(OpType::Get),
+            },
+            RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::SuccessUntimed,
+                op_type: Some(OpType::Subscribe),
+            },
+        ];
+
+        let router = Router::new(&history);
+
+        // GET should have failure + response_time + transfer_rate
+        assert_eq!(router.per_op_failure.get(&OpType::Get).unwrap().len(), 1);
+        assert_eq!(
+            router.per_op_response_time.get(&OpType::Get).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            router.per_op_transfer_rate.get(&OpType::Get).unwrap().len(),
+            1
+        );
+
+        // SUBSCRIBE should have failure only (SuccessUntimed)
+        assert_eq!(
+            router.per_op_failure.get(&OpType::Subscribe).unwrap().len(),
+            1
+        );
+        assert!(
+            router
+                .per_op_response_time
+                .get(&OpType::Subscribe)
+                .is_none()
+        );
+        assert!(
+            router
+                .per_op_transfer_rate
+                .get(&OpType::Subscribe)
+                .is_none()
+        );
     }
 }

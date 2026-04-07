@@ -451,7 +451,7 @@ impl ConnectForwardEstimator {
     /// Return the sampled PAV curve, data range, event count, and peer adjustment count.
     #[allow(clippy::type_complexity)]
     pub(crate) fn snapshot(&self) -> (Vec<(f64, f64)>, (f64, f64), usize, usize) {
-        let (curve, _, _) = self.estimator.sampled_curve(0.0, 1.0, 50);
+        let curve = self.estimator.sampled_curve(0.0, 1.0, 50);
         let data_range = self.estimator.data_x_range();
         (
             curve,

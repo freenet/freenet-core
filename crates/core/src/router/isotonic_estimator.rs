@@ -191,19 +191,16 @@ impl IsotonicEstimator {
     /// Returns `(sampled_points, data_x_min, data_x_max)` where `data_x_min/max`
     /// are the bounds of the actual regression data (for distinguishing interpolation
     /// from extrapolation in charts).
+    /// Requires `num_samples >= 2` to produce a meaningful curve.
     pub(crate) fn sampled_curve(
         &self,
         y_clamp_min: f64,
         y_clamp_max: f64,
         num_samples: usize,
-    ) -> (Vec<(f64, f64)>, f64, f64) {
-        let sorted = self.global_regression.get_points_sorted();
-        if sorted.is_empty() {
-            return (Vec::new(), 0.0, 0.0);
+    ) -> Vec<(f64, f64)> {
+        if num_samples < 2 || self.global_regression.get_points_sorted().is_empty() {
+            return Vec::new();
         }
-
-        let data_x_min = *sorted.first().unwrap().x();
-        let data_x_max = *sorted.last().unwrap().x();
 
         let mut points = Vec::with_capacity(num_samples);
         for i in 0..num_samples {
@@ -213,7 +210,7 @@ impl IsotonicEstimator {
             }
         }
 
-        (points, data_x_min, data_x_max)
+        points
     }
 }
 
@@ -541,5 +538,94 @@ mod tests {
         contract_location: Location,
     ) -> IsotonicEvent {
         simulate_request(peer, contract_location, |d| (100.0 - d).powf(0.5))
+    }
+
+    #[test]
+    fn test_sampled_curve_empty_estimator() {
+        let estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
+        let curve = estimator.sampled_curve(0.0, 1.0, 50);
+        assert!(
+            curve.is_empty(),
+            "Empty estimator should produce empty curve"
+        );
+        assert_eq!(estimator.data_x_range(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn test_sampled_curve_clamping() {
+        // Create an ascending estimator where extrapolation could exceed [0, 1]
+        let peer = PeerKeyLocation::random();
+        let events: Vec<IsotonicEvent> = (0..50)
+            .map(|i| {
+                let x = i as f64 / 100.0; // distances 0.0 to 0.49
+                IsotonicEvent {
+                    peer: peer.clone(),
+                    contract_location: Location::new(x),
+                    result: x * 3.0, // values 0.0 to 1.47 -- will exceed 1.0 clamp
+                }
+            })
+            .collect();
+        let estimator = IsotonicEstimator::new(events, EstimatorType::Positive);
+        let curve = estimator.sampled_curve(0.0, 1.0, 50);
+
+        assert!(!curve.is_empty());
+        for &(_, y) in &curve {
+            assert!(y >= 0.0, "y should be >= 0, got {y}");
+            assert!(y <= 1.0, "y should be <= 1.0 (clamped), got {y}");
+        }
+    }
+
+    #[test]
+    fn test_sampled_curve_covers_full_range() {
+        let peer = PeerKeyLocation::random();
+        let events: Vec<IsotonicEvent> = (0..20)
+            .map(|i| IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: Location::new(0.1 + i as f64 * 0.01),
+                result: i as f64,
+            })
+            .collect();
+        let estimator = IsotonicEstimator::new(events, EstimatorType::Positive);
+        let curve = estimator.sampled_curve(0.0, f64::INFINITY, 50);
+
+        assert_eq!(curve.len(), 50);
+        // First point should be at x=0.0, last at x=0.5
+        assert!((curve[0].0 - 0.0).abs() < 1e-10);
+        assert!((curve[49].0 - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_data_x_range_reflects_actual_data() {
+        let peer = PeerKeyLocation::random();
+        let events: Vec<IsotonicEvent> = vec![
+            IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: Location::new(0.1),
+                result: 1.0,
+            },
+            IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: Location::new(0.3),
+                result: 2.0,
+            },
+        ];
+        let estimator = IsotonicEstimator::new(events, EstimatorType::Positive);
+        let (lo, hi) = estimator.data_x_range();
+
+        // Data range should approximately match the distances we fed in
+        // (exact values depend on PeerKeyLocation's random location)
+        assert!(lo >= 0.0 && lo <= 0.5);
+        assert!(hi >= lo);
+        assert!(hi <= 0.5);
+    }
+
+    #[test]
+    fn test_sampled_curve_guard_against_low_samples() {
+        let estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
+        // num_samples < 2 should return empty without panicking
+        let curve = estimator.sampled_curve(0.0, 1.0, 0);
+        assert!(curve.is_empty());
+        let curve = estimator.sampled_curve(0.0, 1.0, 1);
+        assert!(curve.is_empty());
     }
 }
