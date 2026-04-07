@@ -2460,6 +2460,22 @@ pub(crate) async fn join_ring_request(
     send_gateway_connect(gateway, gateway_addr, op_manager, own, desired_location).await
 }
 
+/// Resolve the socket address of a gateway selected for a version probe.
+///
+/// Extracted from [`gateway_version_probe`] so the failure mode (gateway with
+/// no known address) is unit-testable without an `OpManager`. Caller logs the
+/// failure at debug level and retries on the next maintenance cycle.
+pub(crate) fn resolve_probe_gateway_addr(
+    gateway: &PeerKeyLocation,
+) -> Result<std::net::SocketAddr, OpError> {
+    use crate::node::ConnectionError;
+
+    gateway.socket_addr().ok_or_else(|| {
+        tracing::error!(phase = "error", "Gateway address not found");
+        OpError::ConnError(ConnectionError::LocationUnknown)
+    })
+}
+
 /// Initiate a CONNECT to a gateway for version discovery (#3677).
 ///
 /// Skips `should_accept()` so the probe runs even when the ring is full.
@@ -2470,12 +2486,7 @@ pub(crate) async fn gateway_version_probe(
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
-    use crate::node::ConnectionError;
-
-    let gateway_addr = gateway.socket_addr().ok_or_else(|| {
-        tracing::error!(phase = "error", "Gateway address not found");
-        OpError::ConnError(ConnectionError::LocationUnknown)
-    })?;
+    let gateway_addr = resolve_probe_gateway_addr(gateway)?;
 
     let own = op_manager.ring.connection_manager.own_location();
     let desired_location = own.location().unwrap_or_else(Location::random);
@@ -2945,6 +2956,36 @@ mod tests {
     use super::*;
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn resolve_probe_gateway_addr_returns_known_socket() {
+        let pub_key = TransportKeypair::new().public().clone();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        let gateway = PeerKeyLocation::new(pub_key, addr);
+
+        let resolved = resolve_probe_gateway_addr(&gateway).expect("known address resolves");
+        assert_eq!(resolved, addr);
+    }
+
+    #[test]
+    fn resolve_probe_gateway_addr_errors_on_unknown_address() {
+        // The probe loop in connection_maintenance treats this Err as a debug
+        // log + continue. The structural guarantee here is that we never call
+        // send_gateway_connect with a placeholder address — we surface the
+        // error before any network state is mutated.
+        let pub_key = TransportKeypair::new().public().clone();
+        let gateway = PeerKeyLocation::with_unknown_addr(pub_key);
+
+        let err =
+            resolve_probe_gateway_addr(&gateway).expect_err("unknown address must fail to resolve");
+        assert!(
+            matches!(
+                err,
+                OpError::ConnError(crate::node::ConnectionError::LocationUnknown)
+            ),
+            "expected LocationUnknown, got {err:?}"
+        );
+    }
 
     struct TestRelayContext {
         self_loc: PeerKeyLocation,

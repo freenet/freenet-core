@@ -6262,18 +6262,35 @@ fn test_gateway_version_probe_fires() {
         .expect("Simulation should complete without panic");
 
     let rt = create_runtime();
-    let connect_events = rt.block_on(async {
+    let unique_connect_txs = rt.block_on(async {
         let logs = logs_handle.lock().await;
-        logs.iter()
-            .filter(|log| log.kind.variant_name() == "Connect")
-            .count()
+        // Count distinct Connect transactions, not raw events. Each CONNECT op
+        // emits multiple log entries (sent/received/accepted) that share a Tx.
+        // Counting unique Tx values gives us the number of *operations*, which
+        // is what the probe code path actually generates.
+        let mut seen = std::collections::HashSet::new();
+        for log in logs.iter() {
+            if log.kind.variant_name() == "Connect" {
+                seen.insert(log.tx);
+            }
+        }
+        seen.len()
     });
 
-    // Bootstrap alone produces ~6 CONNECTs (3 nodes × min_connections=2).
-    // Version probes (10s interval, 30s sim) push this well above 10.
+    // Bootstrap baseline: each of the 3 non-gateway nodes initiates an initial
+    // CONNECT to the gateway, so the bootstrap floor is 3 unique transactions.
+    // (Bootstrap may also retry on failure, but that just adds to the floor.)
+    //
+    // Probe budget: cfg(test) sets GATEWAY_VERSION_PROBE_INTERVAL to 10s with
+    // a random initial delay in [0, 10)s and ±20% jitter per cycle. Over 30s
+    // of sim time, each non-gateway can fire 1–3 probes, so 3 nodes contribute
+    // an additional 3–9 unique CONNECT transactions on top of bootstrap.
+    //
+    // Asserting > 6 (bootstrap floor + at least one probe per node) is robust
+    // against the random initial delay while still proving probes fire.
     assert!(
-        connect_events > 10,
-        "Expected version probe CONNECTs beyond bootstrap, got {connect_events}"
+        unique_connect_txs > 6,
+        "Expected bootstrap (~3) + at least 4 probe CONNECTs, got {unique_connect_txs}"
     );
 }
 
