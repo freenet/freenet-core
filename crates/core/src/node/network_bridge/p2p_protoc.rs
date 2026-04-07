@@ -2158,6 +2158,14 @@ impl P2pConnManager {
                                 ctx.handle_broadcast_state_change(&op_manager, key, new_state)
                                     .await;
                             }
+                            NodeEvent::SyncStateToPeer {
+                                key,
+                                new_state,
+                                target,
+                            } => {
+                                ctx.handle_sync_state_to_peer(&op_manager, key, new_state, target)
+                                    .await;
+                            }
                         },
                     }
                 }
@@ -4270,6 +4278,54 @@ impl P2pConnManager {
                 key,
                 new_state,
                 target_result,
+            )
+            .await;
+        }
+    }
+
+    /// Send state to a specific peer that reported a stale summary.
+    ///
+    /// Unlike `handle_broadcast_state_change` which fans out to ALL subscribers,
+    /// this targets only the peer that needs catching up. Used by the interest
+    /// sync summary-mismatch handler to avoid O(peers^2) broadcast storms.
+    async fn handle_sync_state_to_peer(
+        &mut self,
+        op_manager: &Arc<OpManager>,
+        key: freenet_stdlib::prelude::ContractKey,
+        new_state: freenet_stdlib::prelude::WrappedState,
+        target_addr: std::net::SocketAddr,
+    ) {
+        let target = op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_addr(target_addr);
+        let Some(target) = target else {
+            tracing::debug!(
+                contract = %key,
+                peer = %target_addr,
+                "SyncStateToPeer: peer not found in connection manager, skipping"
+            );
+            return;
+        };
+
+        tracing::debug!(
+            contract = %key,
+            peer = %target_addr,
+            "SyncStateToPeer: sending state to stale peer"
+        );
+
+        #[cfg(not(feature = "simulation_tests"))]
+        {
+            self.broadcast_queue.enqueue(key, target, new_state).await;
+        }
+        #[cfg(feature = "simulation_tests")]
+        {
+            broadcast_queue::broadcast_to_single_peer(
+                &self.bridge,
+                op_manager,
+                key,
+                new_state,
+                target,
             )
             .await;
         }
