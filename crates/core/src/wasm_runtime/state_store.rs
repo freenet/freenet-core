@@ -93,8 +93,19 @@ where
     pub fn new(store: S, max_size: u32) -> Result<Self, StateStoreError> {
         let cache = MokaCache::builder()
             .max_capacity(max_size as u64)
-            .weigher(|_key: &ContractKey, value: &WrappedState| -> u32 {
-                value.size().try_into().unwrap_or(u32::MAX)
+            .weigher(|key: &ContractKey, value: &WrappedState| -> u32 {
+                // Saturate to u32::MAX on overflow as moka recommends. This
+                // should be unreachable in practice (MAX_STATE_SIZE is 50 MiB),
+                // so a hit here indicates a bug elsewhere — log it loudly.
+                u32::try_from(value.size()).unwrap_or_else(|_| {
+                    tracing::warn!(
+                        contract = %key,
+                        size_bytes = value.size(),
+                        "State size exceeds u32::MAX in cache weigher; saturating. \
+                         This should be impossible — MAX_STATE_SIZE enforcement is broken."
+                    );
+                    u32::MAX
+                })
             })
             .build();
         Ok(Self {
@@ -185,6 +196,13 @@ where
 
         // Persist first, then cache. If persist fails, the cache must not
         // hold data that was never written to disk. See issue #3487.
+        //
+        // Partial-failure window: if `store_params` fails after `store`
+        // succeeds, the on-disk state will be orphaned (state without
+        // params) and the cache will not be populated. This is strictly
+        // better than the pre-fix behavior (which could cache phantom
+        // state on any persist failure), but a transactional fix is
+        // tracked separately.
         self.store
             .store(key, state.clone())
             .await

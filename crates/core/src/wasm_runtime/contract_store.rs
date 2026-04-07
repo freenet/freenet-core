@@ -53,8 +53,20 @@ impl ContractStore {
             contract_cache: MokaCache::builder()
                 .max_capacity(max_size)
                 .weigher(
-                    |_key: &CodeHash, value: &Arc<ContractCode<'static>>| -> u32 {
-                        value.data().len().try_into().unwrap_or(u32::MAX)
+                    |key: &CodeHash, value: &Arc<ContractCode<'static>>| -> u32 {
+                        // Saturate to u32::MAX on overflow as moka recommends.
+                        // A contract WASM module larger than 4 GiB would indicate
+                        // a bug in upstream size validation — log it loudly.
+                        let len = value.data().len();
+                        u32::try_from(len).unwrap_or_else(|_| {
+                            tracing::warn!(
+                                code_hash = %key,
+                                size_bytes = len,
+                                "Contract code exceeds u32::MAX in cache weigher; \
+                                 saturating. This should be impossible."
+                            );
+                            u32::MAX
+                        })
                     },
                 )
                 .build(),
