@@ -4320,7 +4320,7 @@ impl P2pConnManager {
         }
         #[cfg(feature = "simulation_tests")]
         {
-            broadcast_queue::broadcast_to_single_peer(
+            super::broadcast_queue::broadcast_to_single_peer(
                 &self.bridge,
                 op_manager,
                 key,
