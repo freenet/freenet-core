@@ -1207,11 +1207,39 @@ function toggleTheme() {
     }
 }
 
+/* Tab switching for per-operation-type charts */
+function switchTab(el) {
+    var tabId = el.getAttribute('data-tab');
+    /* Deactivate all tabs and panels in this group */
+    var group = el.closest('.tab-group');
+    if (!group) return;
+    group.querySelectorAll('.tab-label').forEach(function(t) { t.classList.remove('tab-active'); });
+    group.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('tab-panel-active'); });
+    /* Activate selected */
+    el.classList.add('tab-active');
+    var panel = group.querySelector('#panel-' + tabId);
+    if (panel) panel.classList.add('tab-panel-active');
+    /* Remember active tab for auto-refresh persistence */
+    try { sessionStorage.setItem('activeOpTab', tabId); } catch(e) {}
+}
+
 document.addEventListener('DOMContentLoaded', function() {
     var icon = document.getElementById('theme-icon');
     if (icon && document.documentElement.getAttribute('data-theme') === 'light') {
         icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
     }
+
+    /* Restore active tab after page load / auto-refresh */
+    function restoreTab() {
+        try {
+            var saved = sessionStorage.getItem('activeOpTab');
+            if (saved) {
+                var tab = document.querySelector('.tab-label[data-tab="' + saved + '"]');
+                if (tab) switchTab(tab);
+            }
+        } catch(e) {}
+    }
+    restoreTab();
 
     /* Auto-refresh: fetch the page and swap dynamic content without a full reload.
        Uses setTimeout chaining (not setInterval) so slow responses don't overlap. */
@@ -1233,6 +1261,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 var newIcon = doc.querySelector('link[rel="icon"]');
                 var oldIcon = document.querySelector('link[rel="icon"]');
                 if (newIcon && oldIcon) oldIcon.setAttribute('href', newIcon.getAttribute('href'));
+                /* Restore tab selection after content swap */
+                restoreTab();
             }).catch(function(e) { console.warn('Dashboard refresh failed:', e); })
               .finally(scheduleRefresh);
         }, 5000);
@@ -1381,53 +1411,159 @@ fn peer_detail_html(address_str: &str) -> String {
         r#"<div class="card"><h2>Routing Model</h2><p class="empty">Router data not available</p></div>"#.to_string()
     };
 
-    // Build SVG charts
+    // Build SVG charts with per-operation-type tabs
     let charts = if let Some(ref rs) = router_snapshot {
-        let failure_chart = build_estimator_chart(
-            "Failure Probability",
-            &rs.failure_curve,
-            peer_routing
-                .as_ref()
-                .and_then(|pr| pr.failure_adjustment.map(|(m, _)| m)),
-            peer.location,
-            "0.0",
-            "1.0",
-        );
-        let response_chart = build_estimator_chart(
-            "Response Time (s)",
-            &rs.response_time_curve,
-            peer_routing
-                .as_ref()
-                .and_then(|pr| pr.response_time_adjustment.map(|(m, _)| m)),
-            peer.location,
-            "0",
-            "auto",
-        );
-        let transfer_chart = build_estimator_chart(
-            "Transfer Rate (B/s)",
-            &rs.transfer_rate_curve,
-            peer_routing
-                .as_ref()
-                .and_then(|pr| pr.transfer_rate_adjustment.map(|(m, _)| m)),
-            peer.location,
-            "auto",
-            "0",
-        );
+        let fail_adj = peer_routing
+            .as_ref()
+            .and_then(|pr| pr.failure_adjustment.map(|(m, _)| m));
+        let rt_adj = peer_routing
+            .as_ref()
+            .and_then(|pr| pr.response_time_adjustment.map(|(m, _)| m));
+        let xfer_adj = peer_routing
+            .as_ref()
+            .and_then(|pr| pr.transfer_rate_adjustment.map(|(m, _)| m));
+        let ploc = peer.location;
+
+        // Build tab content for each operation type
+        let tab_names = ["All", "GET", "PUT", "UPDATE", "SUBSCRIBE"];
+        let mut tab_labels = String::new();
+        let mut tab_panels = String::new();
+
+        for (i, &tab_name) in tab_names.iter().enumerate() {
+            let tab_id = tab_name.to_lowercase().replace(' ', "-");
+
+            // Get curves for this tab
+            let (f_curve, f_range, rt_curve, rt_range, xfer_curve, xfer_range, event_count) =
+                if tab_name == "All" {
+                    (
+                        rs.failure_curve.as_slice(),
+                        rs.failure_data_range,
+                        rs.response_time_curve.as_slice(),
+                        rs.response_time_data_range,
+                        rs.transfer_rate_curve.as_slice(),
+                        rs.transfer_rate_data_range,
+                        rs.failure_events,
+                    )
+                } else if let Some(c) = rs.per_op_curves.get(tab_name) {
+                    (
+                        c.failure_curve.as_slice(),
+                        c.failure_data_range,
+                        c.response_time_curve.as_slice(),
+                        c.response_time_data_range,
+                        c.transfer_rate_curve.as_slice(),
+                        c.transfer_rate_data_range,
+                        c.failure_events,
+                    )
+                } else {
+                    (
+                        &[][..],
+                        (0.0, 0.0),
+                        &[][..],
+                        (0.0, 0.0),
+                        &[][..],
+                        (0.0, 0.0),
+                        0,
+                    )
+                };
+
+            // Tab label with event count badge
+            let count_badge = if event_count > 0 {
+                format!(r#" <span class="tab-count">{event_count}</span>"#)
+            } else {
+                String::new()
+            };
+            let dim_class = if event_count == 0 && tab_name != "All" {
+                " tab-dim"
+            } else {
+                ""
+            };
+            let active_class = if i == 0 { " tab-active" } else { "" };
+            write!(
+                tab_labels,
+                r#"<span class="tab-label{dim}{active}" data-tab="{id}" onclick="switchTab(this)">{name}{badge}</span>"#,
+                id = tab_id, dim = dim_class, active = active_class, name = tab_name, badge = count_badge,
+            ).ok();
+
+            // Tab panel content
+            let mut panel_content = String::new();
+            if event_count == 0 && tab_name != "All" {
+                write!(
+                    panel_content,
+                    r#"<div class="empty-chart">No routing events for {name} operations yet</div>"#,
+                    name = tab_name,
+                )
+                .ok();
+            } else {
+                // Only show charts that have data
+                if !f_curve.is_empty() {
+                    panel_content.push_str(&build_estimator_chart(
+                        "Failure Probability",
+                        f_curve,
+                        f_range,
+                        if tab_name == "All" { fail_adj } else { None },
+                        ploc,
+                        "0.0",
+                        "1.0",
+                    ));
+                }
+                if !rt_curve.is_empty() {
+                    panel_content.push_str(&build_estimator_chart(
+                        "Response Time (s)",
+                        rt_curve,
+                        rt_range,
+                        if tab_name == "All" { rt_adj } else { None },
+                        ploc,
+                        "0",
+                        "auto",
+                    ));
+                }
+                if !xfer_curve.is_empty() {
+                    panel_content.push_str(&build_estimator_chart(
+                        "Transfer Rate (B/s)",
+                        xfer_curve,
+                        xfer_range,
+                        if tab_name == "All" { xfer_adj } else { None },
+                        ploc,
+                        "auto",
+                        "0",
+                    ));
+                }
+                if panel_content.is_empty() {
+                    write!(
+                        panel_content,
+                        r#"<div class="empty-chart">Awaiting routing events</div>"#,
+                    )
+                    .ok();
+                }
+            }
+
+            let panel_active = if i == 0 { " tab-panel-active" } else { "" };
+            write!(
+                tab_panels,
+                r#"<div class="tab-panel{active}" id="panel-{id}">{content}</div>"#,
+                active = panel_active,
+                id = tab_id,
+                content = panel_content,
+            )
+            .ok();
+        }
+
         format!(
             r#"<div class="card">
-                <h2>PAV Regression Curves</h2>
+                <h2>Routing Predictions</h2>
                 <p class="chart-legend">
-                    <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Global curve</span>
-                    <span class="chart-key"><span class="chart-dot chart-dot-peer"></span> Peer-adjusted curve</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Global model</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-peer"></span> Peer-adjusted</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-loc"></span> Peer location</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-ext"></span> Extrapolated</span>
                 </p>
-                {failure_chart}
-                {response_chart}
-                {transfer_chart}
+                <div class="tab-group">
+                    <div class="tab-bar">{tab_labels}</div>
+                    {tab_panels}
+                </div>
             </div>"#,
-            failure_chart = failure_chart,
-            response_chart = response_chart,
-            transfer_chart = transfer_chart,
+            tab_labels = tab_labels,
+            tab_panels = tab_panels,
         )
     } else {
         String::new()
@@ -1521,9 +1657,13 @@ fn peer_detail_html(address_str: &str) -> String {
 }
 
 /// Build an SVG chart showing a PAV regression curve with optional per-peer adjustment.
+///
+/// `data_range` is `(data_x_min, data_x_max)` -- the x-range of actual regression data.
+/// Points outside this range are extrapolated by the PAV crate and drawn as dashed lines.
 fn build_estimator_chart(
     title: &str,
     curve_points: &[(f64, f64)],
+    data_range: (f64, f64),
     peer_adjustment: Option<f64>,
     peer_location: Option<f64>,
     y_min_hint: &str,
@@ -1662,33 +1802,39 @@ fn build_estimator_chart(
         .ok();
     }
 
-    // Global curve (blue line with linear interpolation)
-    if curve_points.len() >= 2 {
-        let mut path = String::new();
-        for (i, (x, y)) in curve_points.iter().enumerate() {
-            let sx = to_svg_x(*x);
-            let sy = to_svg_y(*y);
-            if i == 0 {
-                write!(path, "M{sx:.1},{sy:.1}").ok();
+    // Helper: draw a curve with solid line in data range and dashed outside.
+    // `points` are (x, y) pairs; `adj` is an optional y-offset for peer adjustment.
+    let draw_curve = |svg: &mut String, points: &[(f64, f64)], adj: f64, color: &str| {
+        if points.len() < 2 {
+            return;
+        }
+        let (data_lo, data_hi) = data_range;
+
+        // Split points into segments: extrapolated-left, data, extrapolated-right
+        let mut left_ext = Vec::new();
+        let mut data_seg = Vec::new();
+        let mut right_ext = Vec::new();
+
+        for &(x, y) in points {
+            let y = y + adj;
+            if x < data_lo - 0.001 {
+                left_ext.push((x, y));
+            } else if x > data_hi + 0.001 {
+                right_ext.push((x, y));
             } else {
-                write!(path, " L{sx:.1},{sy:.1}").ok();
+                data_seg.push((x, y));
             }
         }
-        write!(
-            svg,
-            r#"<path d="{path}" fill="none" stroke="var(--accent-primary)" stroke-width="2" opacity="0.8"/>"#,
-            path = path,
-        )
-        .ok();
-    }
 
-    // Peer-adjusted curve (green line with linear interpolation)
-    if let Some(adj) = peer_adjustment {
-        if curve_points.len() >= 2 {
+        // Draw left extrapolation (dashed) -- include first data point for continuity
+        if !left_ext.is_empty() {
+            if let Some(&first_data) = data_seg.first() {
+                left_ext.push(first_data);
+            }
             let mut path = String::new();
-            for (i, (x, y)) in curve_points.iter().enumerate() {
+            for (i, (x, y)) in left_ext.iter().enumerate() {
                 let sx = to_svg_x(*x);
-                let sy = to_svg_y(y + adj);
+                let sy = to_svg_y(*y);
                 if i == 0 {
                     write!(path, "M{sx:.1},{sy:.1}").ok();
                 } else {
@@ -1697,11 +1843,72 @@ fn build_estimator_chart(
             }
             write!(
                 svg,
-                "<path d=\"{path}\" fill=\"none\" stroke=\"#34d399\" stroke-width=\"2\" opacity=\"0.8\"/>",
+                r#"<path d="{path}" fill="none" stroke="{color}" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.5"/>"#,
+                path = path, color = color,
+            ).ok();
+        }
+
+        // Draw data range (solid)
+        if data_seg.len() >= 2 {
+            let mut path = String::new();
+            for (i, (x, y)) in data_seg.iter().enumerate() {
+                let sx = to_svg_x(*x);
+                let sy = to_svg_y(*y);
+                if i == 0 {
+                    write!(path, "M{sx:.1},{sy:.1}").ok();
+                } else {
+                    write!(path, " L{sx:.1},{sy:.1}").ok();
+                }
+            }
+            write!(
+                svg,
+                r#"<path d="{path}" fill="none" stroke="{color}" stroke-width="2" opacity="0.8"/>"#,
                 path = path,
+                color = color,
+            )
+            .ok();
+        } else if data_seg.len() == 1 {
+            // Single data point -- draw as a dot
+            let (x, y) = data_seg[0];
+            write!(
+                svg,
+                r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="3" fill="{color}" opacity="0.8"/>"#,
+                cx = to_svg_x(x),
+                cy = to_svg_y(y),
+                color = color,
             )
             .ok();
         }
+
+        // Draw right extrapolation (dashed) -- include last data point for continuity
+        if !right_ext.is_empty() {
+            if let Some(&last_data) = data_seg.last() {
+                right_ext.insert(0, last_data);
+            }
+            let mut path = String::new();
+            for (i, (x, y)) in right_ext.iter().enumerate() {
+                let sx = to_svg_x(*x);
+                let sy = to_svg_y(*y);
+                if i == 0 {
+                    write!(path, "M{sx:.1},{sy:.1}").ok();
+                } else {
+                    write!(path, " L{sx:.1},{sy:.1}").ok();
+                }
+            }
+            write!(
+                svg,
+                r#"<path d="{path}" fill="none" stroke="{color}" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.5"/>"#,
+                path = path, color = color,
+            ).ok();
+        }
+    };
+
+    // Global curve (blue)
+    draw_curve(&mut svg, curve_points, 0.0, "var(--accent-primary)");
+
+    // Peer-adjusted curve (green)
+    if let Some(adj) = peer_adjustment {
+        draw_curve(&mut svg, curve_points, adj, "#34d399");
     }
 
     // Peer location marker (vertical dashed line)
@@ -1957,6 +2164,59 @@ a.header-title {
 .chart-dot-global { background: var(--accent-primary); }
 .chart-dot-peer { background: #34d399; }
 .chart-dot-loc { background: #fbbf24; }
+.chart-dot-ext {
+    background: transparent;
+    border: 2px dashed var(--accent-primary);
+    width: 8px;
+    height: 8px;
+}
+/* Tabs */
+.tab-group { margin-top: 0.5rem; }
+.tab-bar {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 0.75rem;
+    overflow-x: auto;
+}
+.tab-label {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-secondary);
+    padding: 0.4rem 0.75rem;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+.tab-label:hover { color: var(--text-primary); }
+.tab-label.tab-dim { color: var(--text-muted); }
+.tab-label.tab-dim:hover { color: var(--text-secondary); }
+.tab-label.tab-active {
+    color: var(--accent-primary);
+    border-bottom-color: var(--accent-primary);
+}
+.tab-count {
+    font-size: 0.65rem;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    padding: 0.05rem 0.35rem;
+    border-radius: 8px;
+    min-width: 1.2em;
+    text-align: center;
+}
+.tab-label.tab-active .tab-count {
+    background: rgba(0, 127, 255, 0.15);
+    color: var(--accent-primary);
+}
+.tab-panel { display: none; }
+.tab-panel.tab-panel-active { display: block; }
 .empty-chart {
     display: flex;
     align-items: center;

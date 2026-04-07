@@ -2922,6 +2922,9 @@ impl Operation for GetOp {
                                                 peer,
                                                 contract_location,
                                                 outcome: crate::router::RouteOutcome::Failure,
+                                                op_type: Some(
+                                                    crate::node::network_status::OpType::Get,
+                                                ),
                                             },
                                         );
                                     }

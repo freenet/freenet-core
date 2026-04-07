@@ -117,12 +117,31 @@ impl NatStats {
     }
 }
 
-/// Operation type for recording results.
+/// Operation type for recording results and per-operation routing telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum OpType {
     Get,
     Put,
     Update,
     Subscribe,
+}
+
+impl OpType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OpType::Get => "GET",
+            OpType::Put => "PUT",
+            OpType::Update => "UPDATE",
+            OpType::Subscribe => "SUBSCRIBE",
+        }
+    }
+}
+
+impl std::fmt::Display for OpType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A recorded failure when connecting to a gateway.
