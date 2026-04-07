@@ -427,37 +427,40 @@ jobs:
         if: steps.release_check.outputs.is_release != 'true'
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Run simulation tests
+      # Build the simulation test binaries and fdev up-front in one cargo
+      # invocation so they share a single compile of freenet/deps. Then the
+      # next two steps can run their *tests* in parallel without contending
+      # for the cargo target-dir lock.
+      - name: Build simulation tests and fdev
         if: steps.release_check.outputs.is_release != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Run all test files gated on simulation_tests feature:
-        # simulation_integration, simulation_smoke, streaming_e2e, state_verification
         run: |
-          cargo nextest run -p freenet --locked \
+          cargo nextest run -p freenet --locked --no-run \
             --test simulation_integration \
             --test simulation_smoke \
             --test streaming_e2e \
             --test state_verification \
             --features simulation_tests,testing --profile ci
+          cargo build -p fdev --release --locked
 
-      # fdev simulation tests: medium-scale network, fault tolerance, high latency.
-      # These use the direct runner (real tokio, simulated time) and complete in ~3 min.
-      # Moved from nightly to catch regressions on every PR.
-      - name: Build fdev
-        if: steps.release_check.outputs.is_release != 'true'
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        run: cargo build -p fdev --release --locked
-
-      - name: fdev simulation tests (medium scale, fault tolerance, high latency)
+      - name: Run simulation tests (nextest + fdev in parallel)
         if: steps.release_check.outputs.is_release != 'true'
         env:
           RUST_LOG: info,turmoil=warn
         run: |
-          # Run all three in parallel — each uses unique network names and dynamic ports
+          # Nextest simulation tests (already built above with --no-run).
+          cargo nextest run -p freenet --locked \
+            --test simulation_integration \
+            --test simulation_smoke \
+            --test streaming_e2e \
+            --test state_verification \
+            --features simulation_tests,testing --profile ci &
+          NEXTEST_PID=$!
+
+          # fdev simulation tests run in parallel with nextest above.
+          # Each fdev invocation uses unique network names and dynamic ports.
           target/release/fdev test \
             --name "ci-medium-50" \
             --seed 0xDEADBEEF \
@@ -507,6 +510,7 @@ jobs:
 
           # Wait for all and fail if any failed
           FAILED=0
+          wait $NEXTEST_PID || FAILED=1
           wait $PID1 || FAILED=1
           wait $PID2 || FAILED=1
           wait $PID3 || FAILED=1
