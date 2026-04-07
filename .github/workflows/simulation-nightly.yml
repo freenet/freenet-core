@@ -1,10 +1,9 @@
 name: Simulation Tests (Nightly)
 
 # Long-running and large-scale simulation tests too slow for PR CI.
-# Medium-scale fdev tests (50 nodes, fault tolerance, high latency) now
-# run in the main CI workflow. This workflow covers:
+# Medium-scale fdev tests (50 nodes, fault tolerance, high latency, churn
+# resilience) now run in the main CI workflow. This workflow covers:
 #   - Nightly-gated nextest tests (1h virtual time, 250-contract scale)
-#   - Churn resilience (crash/recovery cycles)
 #   - Large scale (500 nodes, 10000 events)
 
 on:
@@ -108,22 +107,6 @@ jobs:
             --test-threads 1 \
             --no-capture \
             --profile nightly
-
-      # Churn resilience test - tests network behavior under node crashes/restarts
-      - name: Churn resilience test (20 nodes, 10% crash rate)
-        run: |
-          echo "Running churn resilience simulation (500 events, 10% crash rate)"
-          target/release/fdev test \
-            --name "nightly-churn-20" \
-            --seed 0xC102FEED \
-            --gateways 2 --nodes 18 --events 500 \
-            --ring-max-htl 10 --max-connections 15 --min-connections 4 \
-            --latency-min 10 --latency-max 50 \
-            --churn-rate 0.1 --churn-recovery-delay-ms 3000 \
-            --churn-permanent-rate 0.05 --churn-tick-ms 5000 \
-            --min-success-rate 0.80 \
-            --print-summary --print-network-stats \
-            single-process
 
       # Large scale test (500 nodes) - uses direct runner (no turmoil overhead)
       # With simulation-mode timer optimizations (~5x fewer timer firings),

@@ -490,11 +490,27 @@ jobs:
             single-process &
           PID3=$!
 
+          # Churn resilience: tests network behavior under node crashes/restarts.
+          # Only takes a few seconds, so cheap to run on every PR.
+          target/release/fdev test \
+            --name "ci-churn-20" \
+            --seed 0xC102FEED \
+            --gateways 2 --nodes 18 --events 500 \
+            --ring-max-htl 10 --max-connections 15 --min-connections 4 \
+            --latency-min 10 --latency-max 50 \
+            --churn-rate 0.1 --churn-recovery-delay-ms 3000 \
+            --churn-permanent-rate 0.05 --churn-tick-ms 5000 \
+            --min-success-rate 0.80 \
+            --print-summary --print-network-stats \
+            single-process &
+          PID4=$!
+
           # Wait for all and fail if any failed
           FAILED=0
           wait $PID1 || FAILED=1
           wait $PID2 || FAILED=1
           wait $PID3 || FAILED=1
+          wait $PID4 || FAILED=1
           exit $FAILED
 
   nat_validation:
