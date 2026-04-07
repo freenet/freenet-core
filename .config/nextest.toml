@@ -9,6 +9,12 @@ fail-fast = false
 # Terminate tests that hang (2 periods of 120s = 4 min max per test).
 slow-timeout = { period = "120s", terminate-after = 2 }
 
+# Interest renewal runs a full simulation with contract operations and needs
+# extra time when competing with parallel fdev tests for CPU (#3792).
+[[profile.ci.overrides]]
+filter = "test(test_interest_renewal)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0
