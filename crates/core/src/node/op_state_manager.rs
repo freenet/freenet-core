@@ -1235,11 +1235,22 @@ fn report_timeout_failure(
     peer: crate::ring::PeerKeyLocation,
     contract_location: crate::ring::Location,
 ) {
+    let op_type = match tx.transaction_type() {
+        crate::message::TransactionType::Get => Some(crate::node::network_status::OpType::Get),
+        crate::message::TransactionType::Put => Some(crate::node::network_status::OpType::Put),
+        crate::message::TransactionType::Update => {
+            Some(crate::node::network_status::OpType::Update)
+        }
+        crate::message::TransactionType::Subscribe => {
+            Some(crate::node::network_status::OpType::Subscribe)
+        }
+        crate::message::TransactionType::Connect => None,
+    };
     ring.routing_finished(crate::router::RouteEvent {
         peer: peer.clone(),
         contract_location,
         outcome: crate::router::RouteOutcome::Failure,
-        op_type: None,
+        op_type,
     });
     tracing::info!(
         tx = %tx,
