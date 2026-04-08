@@ -1178,19 +1178,6 @@ mod tests {
     /// - Proximity-based state push via SyncStateToPeer
     ///
     /// But it must NOT be used as a source of broadcast targets.
-    /// Regression test for #3797: proximity cache must NOT be used for broadcast targeting.
-    ///
-    /// Before this fix, `get_broadcast_targets_update()` collected targets from both
-    /// the proximity cache and the interest manager, causing ~36 targets per broadcast
-    /// when ~26 would suffice (95%+ overlap). This caused 90:1 upload/download ratios
-    /// on hub nodes and 17+ GB/hr outbound at the gateway.
-    ///
-    /// The proximity cache remains useful for:
-    /// - Initial state sync via HostingAnnounce/InterestSync
-    /// - Detecting overlapping contracts with neighbors
-    /// - Proximity-based state push via SyncStateToPeer
-    ///
-    /// But it must NOT be used as a source of broadcast targets.
     #[test]
     fn test_proximity_cache_not_used_for_broadcast_targets() {
         use crate::ring::interest::{InterestManager, PeerKey};

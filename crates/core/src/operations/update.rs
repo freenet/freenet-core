@@ -1473,6 +1473,8 @@ impl OpManager {
         let is_local_update_initiator = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
 
         let mut targets: HashSet<PeerKeyLocation> = HashSet::new();
+        // Always 0 since proximity cache is no longer resolved for broadcast
+        // targeting (#3797). Field kept for telemetry schema stability.
         let proximity_resolve_failed: usize = 0;
         let mut interest_resolve_failed: usize = 0;
         let mut skipped_self: usize = 0;
