@@ -614,7 +614,7 @@ mod tests {
 
         // Data range should approximately match the distances we fed in
         // (exact values depend on PeerKeyLocation's random location)
-        assert!(lo >= 0.0 && lo <= 0.5);
+        assert!((0.0..=0.5).contains(&lo));
         assert!(hi >= lo);
         assert!(hi <= 0.5);
     }
