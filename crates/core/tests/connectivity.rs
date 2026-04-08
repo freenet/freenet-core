@@ -570,13 +570,14 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
         Err(_) => bail!("Timeout waiting for GET response"),
     }
 
-    // Test UPDATE propagation via proximity cache (issue #2294 regression test).
+    // Test UPDATE propagation via subscription tree (issue #2294 regression test).
     // At this point:
-    // - Peer1 hosted the contract via PUT, sent HostingAnnounce to neighbors
-    // - Peer2 hosted the contract via GET, sent HostingAnnounce to neighbors
-    // - Both peers should have each other in neighbor_hosting.neighbors_with_contract()
-    // - UPDATE from peer1 should route to peer2 via neighbor hosting, not ring routing
-    tracing::info!("Testing UPDATE propagation via neighbor hosting");
+    // - Peer1 hosted the contract via PUT
+    // - Peer2 hosted the contract via GET
+    // - Peer2 subscribes below, registering in the interest manager
+    // - UPDATE from peer1 should broadcast to peer2 via the interest manager
+    //   (proximity cache is no longer used for broadcast targeting, see #3797)
+    tracing::info!("Testing UPDATE propagation via subscription tree");
 
     // Explicitly subscribe peer2 to receive update notifications
     make_subscribe(&mut client2, contract_key).await?;
