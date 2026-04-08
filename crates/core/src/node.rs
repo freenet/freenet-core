@@ -573,13 +573,10 @@ async fn report_result(
             // in case more cases want to be handled when feeding information to the OpManager
 
             // Record operation result for dashboard stats
-            {
-                use crate::node::network_status;
-                let (op_type, success) =
-                    classify_op_outcome(op_res.id().transaction_type(), op_res.outcome());
-                if let Some(op_type) = op_type {
-                    network_status::record_op_result(op_type, success);
-                }
+            let (classified_op_type, classified_success) =
+                classify_op_outcome(op_res.id().transaction_type(), op_res.outcome());
+            if let Some(op_type) = classified_op_type {
+                network_status::record_op_result(op_type, classified_success);
             }
 
             let route_event = match op_res.outcome() {
@@ -597,6 +594,7 @@ async fn report_result(
                         payload_size,
                         payload_transfer_time,
                     },
+                    op_type: classified_op_type,
                 }),
                 OpOutcome::ContractOpSuccessUntimed {
                     target_peer,
@@ -605,6 +603,7 @@ async fn report_result(
                     peer: target_peer.clone(),
                     contract_location,
                     outcome: RouteOutcome::SuccessUntimed,
+                    op_type: classified_op_type,
                 }),
                 OpOutcome::ContractOpFailure {
                     target_peer,
@@ -613,6 +612,7 @@ async fn report_result(
                     peer: target_peer.clone(),
                     contract_location,
                     outcome: RouteOutcome::Failure,
+                    op_type: classified_op_type,
                 }),
                 OpOutcome::Incomplete | OpOutcome::Irrelevant => None,
             };
@@ -1085,19 +1085,20 @@ where
                         tracing::debug!(
                             contract = %key,
                             peer = %source_pub_key,
-                            "Proximity cache overlap — broadcasting state to ensure neighbor is current"
+                            "Proximity cache overlap — syncing state to neighbor"
                         );
                         if let Err(e) = op_manager
-                            .notify_node_event(NodeEvent::BroadcastStateChange {
+                            .notify_node_event(NodeEvent::SyncStateToPeer {
                                 key,
                                 new_state: state,
+                                target: source,
                             })
                             .await
                         {
                             tracing::warn!(
                                 contract = %instance_id,
                                 error = %e,
-                                "Failed to emit BroadcastStateChange for proximity sync"
+                                "Failed to emit SyncStateToPeer for proximity sync"
                             );
                         }
                     }
@@ -1347,9 +1348,11 @@ async fn handle_interest_sync_message(
             // Update peer summaries and detect stale peers (#3221).
             //
             // Compare each peer summary with our own before storing it. If they
-            // differ, the peer missed an earlier broadcast. Emitting
-            // BroadcastStateChange triggers the existing broadcast path which
-            // computes deltas and sends state only to peers with stale summaries.
+            // differ, the peer missed an earlier broadcast. We send state only
+            // to the specific peer that reported the stale summary via
+            // SyncStateToPeer (not BroadcastStateChange which fans out to ALL
+            // subscribers). This avoids O(peers^2) broadcast storms where N
+            // peers each trigger a full fan-out broadcast. See #3791.
             //
             // Both sides may detect the same mismatch (A sees B is stale, B sees
             // A is stale). This is safe: the contract's merge semantics (CRDTs
@@ -1401,31 +1404,35 @@ async fn handle_interest_sync_message(
                 }
             }
 
-            // Push current state to stale peers via the existing broadcast path
+            // Send current state only to the specific peer that reported a stale
+            // summary. Previously this emitted BroadcastStateChange which fanned
+            // out to ALL subscribers (~28 peers), causing O(peers^2) traffic when
+            // many peers reported mismatches within the same heartbeat cycle.
             for contract in stale_contracts {
                 let Some(state) = get_contract_state(op_manager, &contract).await else {
                     tracing::trace!(
                         contract = %contract,
-                        "Skipping stale-peer broadcast — no local state available"
+                        "Skipping stale-peer sync — no local state available"
                     );
                     continue;
                 };
                 tracing::info!(
                     contract = %contract,
-                    detected_via = %source,
-                    "Summary mismatch in interest sync — broadcasting to all stale peers"
+                    stale_peer = %source,
+                    "Summary mismatch in interest sync — syncing state to stale peer"
                 );
                 if let Err(e) = op_manager
-                    .notify_node_event(NodeEvent::BroadcastStateChange {
+                    .notify_node_event(NodeEvent::SyncStateToPeer {
                         key: contract,
                         new_state: state,
+                        target: source,
                     })
                     .await
                 {
                     tracing::warn!(
                         contract = %contract,
                         error = %e,
-                        "Failed to emit BroadcastStateChange for stale peer correction"
+                        "Failed to emit SyncStateToPeer for stale peer correction"
                     );
                 }
             }

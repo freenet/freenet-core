@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use super::detection::get_install_dir;
+use crate::commands::service::DASHBOARD_URL;
 
 /// Progress updates sent from the installer thread to the UI.
 #[derive(Debug, Clone)]
@@ -23,9 +24,6 @@ pub enum InstallProgress {
     Complete,
     Error(String),
 }
-
-/// Dashboard URL served by the local freenet node.
-const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 
 /// Run the full installation, reporting progress via the callback.
 ///
@@ -85,37 +83,48 @@ pub fn run_install(progress: impl Fn(InstallProgress) + Send) -> Result<()> {
 
     // Step 5: Install service
     progress(InstallProgress::InstallingService);
-    let status = std::process::Command::new(&installed_exe)
+    let output = std::process::Command::new(&installed_exe)
         .args(["service", "install"])
-        .status()
+        .output()
         .context("Failed to run freenet service install")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            format!("exit code {}", output.status.code().unwrap_or(-1))
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(anyhow::anyhow!("Service installation failed: {detail}"));
+    }
+
+    // Step 6: Start service
+    //
+    // Use Stdio::null() + .status() instead of .output() to prevent Windows
+    // handle inheritance. With .output(), the installer creates pipes that get
+    // inherited by the detached wrapper process (via CreateProcess's default
+    // bInheritHandles=TRUE). The wrapper runs forever, so the pipe handles
+    // never close, and .output() blocks indefinitely waiting for EOF.
+    progress(InstallProgress::LaunchingService);
+    let status = std::process::Command::new(&installed_exe)
+        .args(["service", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("Failed to start freenet service")?;
     if !status.success() {
         return Err(anyhow::anyhow!(
-            "Service installation failed (exit code {}). You may need to run as Administrator.",
+            "Service failed to start (exit code {}). Try running 'freenet service start' manually.",
             status.code().unwrap_or(-1)
         ));
     }
 
-    // Step 6: Start service
-    progress(InstallProgress::LaunchingService);
-    let status = std::process::Command::new(&installed_exe)
-        .args(["service", "start"])
-        .status()
-        .context("Failed to start freenet service")?;
-    if !status.success() {
-        eprintln!(
-            "Warning: service start returned exit code {}",
-            status.code().unwrap_or(-1)
-        );
-    }
+    // Brief wait for the node to initialize before opening the dashboard
+    std::thread::sleep(std::time::Duration::from_secs(3));
 
     // Step 7: Open dashboard
     progress(InstallProgress::OpeningDashboard);
-    drop(
-        std::process::Command::new("cmd")
-            .args(["/c", "start", DASHBOARD_URL])
-            .spawn(),
-    );
+    crate::commands::open_url_in_browser(DASHBOARD_URL);
 
     progress(InstallProgress::Complete);
     Ok(())
@@ -217,7 +226,7 @@ fn add_to_user_path(dir: &Path) -> Result<()> {
     let raw_val = env
         .get_raw_value("Path")
         .unwrap_or_else(|_| winreg::RegValue {
-            bytes: Vec::new(),
+            bytes: std::borrow::Cow::Owned(Vec::new()),
             vtype: REG_EXPAND_SZ,
         });
 
@@ -262,7 +271,7 @@ fn add_to_user_path(dir: &Path) -> Result<()> {
     env.set_raw_value(
         "Path",
         &winreg::RegValue {
-            bytes: new_bytes,
+            bytes: std::borrow::Cow::Owned(new_bytes),
             vtype: raw_val.vtype, // preserve original type
         },
     )?;

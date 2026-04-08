@@ -7,24 +7,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use freenet::{server::serve_client_api, test_utils::test_ip_for_node};
-use freenet_stdlib::client_api::WebApi;
+use freenet::server::serve_client_api;
 use futures::FutureExt;
 use tokio::{select, time::timeout};
 use tracing::{Instrument, Level, span};
 
 use common::{
-    base_node_test_config_with_ip, connect_async_with_config, gw_config_from_path_with_ip,
-    test_node_config, ws_config,
+    allocate_test_node_block, base_node_test_config_with_ip, connect_ws_with_retry,
+    gw_config_from_path_with_ip, test_ip_for_node, test_node_config, wait_for_node_connected,
 };
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_connection_timing() -> anyhow::Result<()> {
     println!("🔧 Testing connection timing with 2 nodes");
 
-    // Use unique IPs for each node to ensure unique ring locations
-    let gw_ip = test_ip_for_node(0);
-    let node1_ip = test_ip_for_node(1);
+    // Use unique IPs for each node to avoid collisions with parallel tests
+    let base_node_idx = allocate_test_node_block(2);
+    let gw_ip = test_ip_for_node(base_node_idx);
+    let node1_ip = test_ip_for_node(base_node_idx + 1);
 
     // Setup only 2 nodes to minimize complexity
     let network_socket_gw = TcpListener::bind(SocketAddr::new(gw_ip.into(), 0))?;
@@ -68,7 +68,8 @@ async fn test_connection_timing() -> anyhow::Result<()> {
     std::mem::drop(ws_api_port_socket_gw);
     std::mem::drop(ws_api_port_socket_node1);
 
-    // Start nodes
+    // Start both nodes immediately — no startup sleep needed.
+    // connect_ws_with_retry polls until the WebSocket server is ready.
     let gateway_future = async {
         let config = config_gw.build().await?;
         let node = test_node_config(config.clone())
@@ -92,38 +93,30 @@ async fn test_connection_timing() -> anyhow::Result<()> {
     .boxed_local();
 
     let test = timeout(Duration::from_secs(60), async {
-        println!("⏳ Waiting for nodes to start (10s)...");
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
-        // Simple ping test - just establish websocket connections
-        println!("📡 Testing WebSocket connections...");
-
-        let ws_start = Instant::now();
+        // Connect with retry logic — polls until WebSocket server accepts
         let uri_gw =
             format!("ws://{gw_ip}:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
-        let (stream_gw, _) = connect_async_with_config(&uri_gw, Some(ws_config()), false).await?;
-        let _client_gw = WebApi::start(stream_gw);
+        let uri_node1 = format!(
+            "ws://{node1_ip}:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
+        );
+
+        let ws_start = Instant::now();
+        let mut _client_gw = connect_ws_with_retry(&uri_gw, "Gateway", 30).await?;
         println!(
             "   ✓ Gateway WebSocket connected in {}ms",
             ws_start.elapsed().as_millis()
         );
 
         let ws_start = Instant::now();
-        let uri_node1 = format!(
-            "ws://{node1_ip}:{ws_api_port_node1}/v1/contract/command?encodingProtocol=native"
-        );
-        let (stream_node1, _) =
-            connect_async_with_config(&uri_node1, Some(ws_config()), false).await?;
-        let _client_node1 = WebApi::start(stream_node1);
+        let mut client_node1 = connect_ws_with_retry(&uri_node1, "Node1", 30).await?;
         println!(
             "   ✓ Node1 WebSocket connected in {}ms",
             ws_start.elapsed().as_millis()
         );
 
-        // Now wait and watch for UDP connection attempts
-        println!("\n⏳ Waiting 20s to observe P2P connection establishment...");
-        tokio::time::sleep(Duration::from_secs(20)).await;
-
+        // Poll until Node1 has at least 1 ring connection to the gateway
+        println!("\n⏳ Waiting for P2P connection establishment...");
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 30).await?;
         println!("✅ Test completed - check logs for connection timing");
         Ok::<_, anyhow::Error>(())
     })

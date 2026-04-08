@@ -1,8 +1,10 @@
 name: Simulation Tests (Nightly)
 
-# Large-scale simulation tests that are too slow for regular CI.
-# Standard simulation tests (sim_network, simulation_integration, etc.)
-# already run on every PR via the main CI workflow.
+# Long-running and large-scale simulation tests too slow for PR CI.
+# Medium-scale fdev tests (50 nodes, fault tolerance, high latency, churn
+# resilience) now run in the main CI workflow. This workflow covers:
+#   - Nightly-gated nextest tests (1h virtual time, 250-contract scale)
+#   - Large scale (500 nodes, 10000 events)
 
 on:
   schedule:
@@ -29,7 +31,7 @@ jobs:
   large-scale-simulation:
     name: Large Scale Simulation
     runs-on: ubicloud-standard-16
-    timeout-minutes: 120
+    timeout-minutes: 150
 
     env:
       RUST_LOG: info,turmoil=warn
@@ -76,82 +78,18 @@ jobs:
       - name: Build fdev
         run: cargo build -p fdev --release
 
-      # Medium scale test (50 nodes, 2000 events)
-      # Expects 100% success rate and 100% convergence
-      # Virtual time: 2000 events × 200ms (turmoil default) = 400s
-      - name: Medium scale test (50 nodes, seed 0xDEADBEEF)
-        run: |
-          echo "Running medium scale simulation (50 nodes, 2000 events)"
-          target/release/fdev test \
-            --name "nightly-medium-50" \
-            --seed 0xDEADBEEF \
-            --gateways 4 \
-            --nodes 46 \
-            --events 2000 \
-            --ring-max-htl 12 \
-            --max-connections 20 \
-            --min-connections 6 \
-            --latency-min 10 \
-            --latency-max 50 \
-            --min-success-rate 1.0 \
-            --print-summary \
-            --print-network-stats \
-            single-process
-
-      # Medium scale with different seed (explores different code paths)
+      # Medium scale with alternate seed (explores different code paths).
+      # The primary seed (0xDEADBEEF) runs in PR CI; this covers a second path.
       - name: Medium scale test (50 nodes, seed 0xCAFEBABE)
         run: |
-          echo "Running medium scale simulation with alternate seed (2000 events)"
           target/release/fdev test \
             --name "nightly-medium-50-alt" \
             --seed 0xCAFEBABE \
-            --gateways 4 \
-            --nodes 46 \
-            --events 2000 \
-            --ring-max-htl 12 \
-            --max-connections 20 \
-            --min-connections 6 \
-            --latency-min 10 \
-            --latency-max 50 \
+            --gateways 4 --nodes 46 --events 2000 \
+            --ring-max-htl 12 --max-connections 20 --min-connections 6 \
+            --latency-min 10 --latency-max 50 \
             --min-success-rate 1.0 \
-            --print-summary \
-            --print-network-stats \
-            single-process
-
-      # Fault tolerance test with aggressive message loss
-      # Success rate can be <100% due to message loss, but convergence must be 100%
-      - name: Fault tolerance test (15% message loss)
-        run: |
-          echo "Running fault tolerance simulation with 15% message loss (1000 events)"
-          target/release/fdev test \
-            --name "nightly-fault-loss" \
-            --seed 0xFA017001 \
-            --gateways 3 \
-            --nodes 27 \
-            --events 1000 \
-            --message-loss 0.15 \
-            --latency-min 10 \
-            --latency-max 50 \
-            --min-success-rate 0.80 \
-            --print-summary \
-            --print-network-stats \
-            single-process
-
-      # High latency test - tests behavior under sustained high latency conditions
-      - name: High latency test (50-200ms latency)
-        run: |
-          echo "Running high latency simulation (500 events)"
-          target/release/fdev test \
-            --name "nightly-high-latency" \
-            --seed 0x1A7E0C71 \
-            --gateways 2 \
-            --nodes 12 \
-            --events 500 \
-            --latency-min 50 \
-            --latency-max 200 \
-            --min-success-rate 0.95 \
-            --print-summary \
-            --print-network-stats \
+            --print-summary --print-network-stats \
             single-process
 
       # Nightly-gated simulation tests (long-running, high-scale regression tests)
@@ -169,22 +107,6 @@ jobs:
             --test-threads 1 \
             --no-capture \
             --profile nightly
-
-      # Churn resilience test - tests network behavior under node crashes/restarts
-      - name: Churn resilience test (20 nodes, 10% crash rate)
-        run: |
-          echo "Running churn resilience simulation (500 events, 10% crash rate)"
-          target/release/fdev test \
-            --name "nightly-churn-20" \
-            --seed 0xC102FEED \
-            --gateways 2 --nodes 18 --events 500 \
-            --ring-max-htl 10 --max-connections 15 --min-connections 4 \
-            --latency-min 10 --latency-max 50 \
-            --churn-rate 0.1 --churn-recovery-delay-ms 3000 \
-            --churn-permanent-rate 0.05 --churn-tick-ms 5000 \
-            --min-success-rate 0.80 \
-            --print-summary --print-network-stats \
-            single-process
 
       # Large scale test (500 nodes) - uses direct runner (no turmoil overhead)
       # With simulation-mode timer optimizations (~5x fewer timer firings),
@@ -233,7 +155,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: large-scale-simulation
-    if: failure()
+    if: failure() && needs.large-scale-simulation.result == 'failure'
+    continue-on-error: true
     steps:
       - name: Send failure message to Matrix
         env:

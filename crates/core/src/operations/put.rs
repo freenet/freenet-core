@@ -524,6 +524,11 @@ impl Operation for PutOp {
                             .ring
                             .host_contract(key, value.size() as u64, crate::ring::AccessType::Put)
                             .evicted;
+
+                        if is_originator {
+                            op_manager.ring.mark_local_client_access(&key);
+                        }
+
                         super::announce_contract_hosted(op_manager, &key).await;
 
                         // Clean up interest tracking for evicted contracts
@@ -1207,6 +1212,11 @@ impl Operation for PutOp {
                             .ring
                             .host_contract(key, value.size() as u64, crate::ring::AccessType::Put)
                             .evicted;
+
+                        if is_originator {
+                            op_manager.ring.mark_local_client_access(&key);
+                        }
+
                         super::announce_contract_hosted(op_manager, &key).await;
 
                         let mut removed_contracts = Vec::new();

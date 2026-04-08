@@ -311,8 +311,8 @@ async fn test_subscribe_failure_notifies_client(ctx: &mut TestContext) -> TestRe
 
 /// Subscribe without prior PUT is rejected immediately with a descriptive error.
 ///
-/// When a client subscribes to a contract that hasn't been PUT or GET'd (with
-/// return_contract_code=true), the node lacks the WASM needed to validate updates.
+/// When a client subscribes to a contract that hasn't been PUT or GET'd,
+/// the node lacks the WASM needed to validate updates.
 /// The Subscribe must be rejected fast (not after a network timeout).
 ///
 /// Regression test for #3601.

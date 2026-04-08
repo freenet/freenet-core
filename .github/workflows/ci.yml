@@ -123,6 +123,8 @@ jobs:
           fetch-depth: 0
 
       - name: Check for banned patterns in new code
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
@@ -159,17 +161,37 @@ jobs:
           fi
 
           # 4. Deleted test functions (removed #[test] or #[tokio::test] lines)
+          # Check ALL Rust files for test additions/removals (not just crates/core/src/)
+          ALL_ADDED=$(git diff "$BASE"..."$HEAD" -- '**/*.rs' \
+            | grep '^+' | grep -v '^+++' || true)
+          ALL_ADDED_STRIPPED=$(echo "$ALL_ADDED" | sed 's|//.*||' || true)
+
           REMOVED=$(git diff "$BASE"..."$HEAD" -- 'crates/core/src/**/*.rs' 'crates/core/tests/**/*.rs' \
             | grep '^-' | grep -v '^---' || true)
           REMOVED_STRIPPED=$(echo "$REMOVED" | sed 's|//.*||' || true)
           if echo "$REMOVED_STRIPPED" | grep -qE '#\[(tokio::)?test\]'; then
-            # Check it wasn't just moved (also present in added lines)
+            # Check it wasn't just moved (also present in added lines across all files)
             REMOVED_TESTS=$(echo "$REMOVED_STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
-            ADDED_TESTS=$(echo "$STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
+            ADDED_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
             if [ "$REMOVED_TESTS" -gt "$ADDED_TESTS" ]; then
               ERRORS="$ERRORS
           ERROR: Test function(s) removed — tests must not be deleted (use #[ignore] with a tracking issue if broken)
           Removed $REMOVED_TESTS test(s), added $ADDED_TESTS test(s)"
+            fi
+          fi
+
+          # 5. fix: PRs must add at least one new test (check all Rust files, not just src/)
+          # PR_TITLE is set via env: above to avoid shell injection from backticks in titles
+          IS_FIX=$(echo "$PR_TITLE" | grep -ciE '^fix(\(.*\))?:' || true)
+          HAS_EXEMPT_LABEL=$(echo "${{ join(github.event.pull_request.labels.*.name, ',') }}" | grep -c 'test-exempt' || true)
+
+          if [ "$IS_FIX" -gt 0 ] && [ "$HAS_EXEMPT_LABEL" -eq 0 ]; then
+            NEW_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE '#\[(tokio::)?test\]' || true)
+            if [ "$NEW_TESTS" -eq 0 ]; then
+              ERRORS="$ERRORS
+          ERROR: fix: PR must include at least one new regression test
+          Add a test that reproduces the bug (fails without fix, passes with fix).
+          If this fix genuinely cannot have a test, add the 'test-exempt' label with a justification comment."
             fi
           fi
 
@@ -405,20 +427,95 @@ jobs:
         if: steps.release_check.outputs.is_release != 'true'
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Run simulation tests
+      # Build the simulation test binaries and fdev up-front in one cargo
+      # invocation so they share a single compile of freenet/deps. Then the
+      # next two steps can run their *tests* in parallel without contending
+      # for the cargo target-dir lock.
+      - name: Build simulation tests and fdev
         if: steps.release_check.outputs.is_release != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        # Run all test files gated on simulation_tests feature:
-        # simulation_integration, simulation_smoke, streaming_e2e, state_verification
         run: |
-          cargo nextest run -p freenet --locked \
+          cargo nextest run -p freenet --locked --no-run \
             --test simulation_integration \
             --test simulation_smoke \
             --test streaming_e2e \
             --test state_verification \
             --features simulation_tests,testing --profile ci
+          cargo build -p fdev --release --locked
+
+      - name: Run simulation tests (nextest + fdev in parallel)
+        if: steps.release_check.outputs.is_release != 'true'
+        env:
+          RUST_LOG: info,turmoil=warn
+        run: |
+          # Nextest simulation tests (already built above with --no-run).
+          cargo nextest run -p freenet --locked \
+            --test simulation_integration \
+            --test simulation_smoke \
+            --test streaming_e2e \
+            --test state_verification \
+            --features simulation_tests,testing --profile ci &
+          NEXTEST_PID=$!
+
+          # fdev simulation tests run in parallel with nextest above.
+          # Each fdev invocation uses unique network names and dynamic ports.
+          target/release/fdev test \
+            --name "ci-medium-50" \
+            --seed 0xDEADBEEF \
+            --gateways 4 --nodes 46 --events 2000 \
+            --ring-max-htl 12 --max-connections 20 --min-connections 6 \
+            --latency-min 10 --latency-max 50 \
+            --min-success-rate 1.0 \
+            --print-summary --print-network-stats \
+            single-process &
+          PID1=$!
+
+          target/release/fdev test \
+            --name "ci-fault-loss" \
+            --seed 0xFA017001 \
+            --gateways 3 --nodes 27 --events 1000 \
+            --message-loss 0.15 \
+            --latency-min 10 --latency-max 50 \
+            --min-success-rate 0.80 \
+            --print-summary --print-network-stats \
+            single-process &
+          PID2=$!
+
+          target/release/fdev test \
+            --name "ci-high-latency" \
+            --seed 0x1A7E0C71 \
+            --gateways 2 --nodes 12 --events 500 \
+            --latency-min 50 --latency-max 200 \
+            --min-success-rate 0.95 \
+            --print-summary --print-network-stats \
+            single-process &
+          PID3=$!
+
+          # Churn resilience: tests network behavior under node crashes/restarts.
+          # Only takes a few seconds, so cheap to run on every PR.
+          target/release/fdev test \
+            --name "ci-churn-20" \
+            --seed 0xC102FEED \
+            --gateways 2 --nodes 18 --events 500 \
+            --ring-max-htl 10 --max-connections 15 --min-connections 4 \
+            --latency-min 10 --latency-max 50 \
+            --churn-rate 0.1 --churn-recovery-delay-ms 3000 \
+            --churn-permanent-rate 0.05 --churn-tick-ms 5000 \
+            --min-success-rate 0.80 \
+            --print-summary --print-network-stats \
+            single-process &
+          PID4=$!
+
+          # Wait for all and fail if any failed
+          FAILED=0
+          wait $NEXTEST_PID || FAILED=1
+          wait $PID1 || FAILED=1
+          wait $PID2 || FAILED=1
+          wait $PID3 || FAILED=1
+          wait $PID4 || FAILED=1
+          exit $FAILED
 
   nat_validation:
     name: NAT Validation

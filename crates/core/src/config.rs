@@ -445,7 +445,18 @@ impl ConfigArgs {
                 remotely_loaded_gateways
             }
         } else {
-            // When skip_load_from_network is set for a regular peer, use local gateways file
+            // Either skip_load_from_network is set (use local file only), or the
+            // remote fetch failed and we need to fall back to the local cache.
+            let remote_fetch_failed = !self.network_api.skip_load_from_network
+                && remotely_loaded_gateways.gateways.is_empty();
+
+            if remote_fetch_failed {
+                tracing::warn!(
+                    file = ?gateways_file,
+                    "Remote gateway fetch failed, falling back to local cache"
+                );
+            }
+
             let mut gateways = match File::open(&*gateways_file) {
                 Ok(mut file) => {
                     let mut content = String::new();
@@ -460,15 +471,24 @@ impl ConfigArgs {
                         && remotely_loaded_gateways.gateways.is_empty()
                         && !has_cli_gateways
                     {
+                        let hint = if remote_fetch_failed {
+                            "Cannot initialize node without gateways. \
+                             The remote gateway index could not be reached and no \
+                             local cache exists yet. Check your network connection \
+                             and firewall settings, then try again."
+                        } else {
+                            "Cannot initialize node without gateways"
+                        };
                         tracing::error!(
                             file = ?gateways_file,
                             error = %err,
-                            "Failed to read gateways file"
+                            remote_fetch_failed,
+                            "{hint}"
                         );
 
                         return Err(anyhow::Error::new(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
-                            "Cannot initialize node without gateways",
+                            hint,
                         )));
                     }
                     if remotely_loaded_gateways.gateways.is_empty() {
@@ -478,8 +498,6 @@ impl ConfigArgs {
                 }
             };
 
-            // If we have remotely loaded gateways but skip_load_from_network was not set,
-            // it means the remote fetch failed but we got default/inline gateways
             if !remotely_loaded_gateways.gateways.is_empty() {
                 gateways.merge_and_deduplicate(remotely_loaded_gateways);
             }
@@ -1480,6 +1498,9 @@ impl ConfigPathsArgs {
     }
 
     pub fn build(self, id: Option<&str>) -> std::io::Result<ConfigPaths> {
+        // Used by the Windows migration block below; suppress warning on other platforms.
+        #[allow(unused_variables)]
+        let has_custom_data_dir = self.data_dir.is_some();
         let app_data_dir = self
             .data_dir
             .map(Ok::<_, std::io::Error>)
@@ -1488,8 +1509,46 @@ impl ConfigPathsArgs {
                 let Either::Left(defaults) = default_dirs else {
                     unreachable!("default_dirs should return Left if data_dir is None and id is not set for temp dir")
                 };
-                Ok(defaults.data_dir().to_path_buf())
+                // Use data_local_dir (Local AppData on Windows) instead of
+                // data_dir (Roaming AppData). Roaming syncs across domain-joined
+                // machines and is not appropriate for node data (contracts, DB).
+                // See #3739.
+                Ok(defaults.data_local_dir().to_path_buf())
             })?;
+        // Migrate data from old Roaming path to new Local path on Windows.
+        // Before #3739, data was stored in %APPDATA% (Roaming) by mistake.
+        // If the old path has data and the new path doesn't, move it.
+        #[cfg(target_os = "windows")]
+        if !has_custom_data_dir && id.is_none() {
+            if let Ok(Either::Left(ref proj)) = Self::default_dirs(None) {
+                let old_roaming = proj.data_dir().to_path_buf();
+                if old_roaming != app_data_dir
+                    && old_roaming.join("contracts").exists()
+                    && !app_data_dir.join("contracts").exists()
+                {
+                    tracing::info!(
+                        old = ?old_roaming,
+                        new = ?app_data_dir,
+                        "Migrating data from Roaming to Local AppData"
+                    );
+                    // Ensure the parent directory exists before rename.
+                    // On a fresh Local AppData install, the intermediate dirs
+                    // (e.g., "The Freenet Project Inc/Freenet") won't exist yet.
+                    if let Some(parent) = app_data_dir.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = fs::rename(&old_roaming, &app_data_dir) {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to migrate data directory; starting fresh"
+                        );
+                        // rename can fail across drives; a fresh start is fine
+                        // since the node will re-fetch contracts from the network.
+                    }
+                }
+            }
+        }
+
         let contracts_dir = app_data_dir.join("contracts");
         let delegates_dir = app_data_dir.join("delegates");
         let secrets_dir = app_data_dir.join("secrets");
@@ -2437,7 +2496,21 @@ pub fn set_logger(
 }
 
 async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Result<Gateways> {
-    let response = reqwest::get(url).await?.error_for_status()?.text().await?;
+    // Use an explicit timeout so the node doesn't hang indefinitely when the
+    // network is unavailable (e.g., immediately after a Windows restart before
+    // the network stack is ready). See #3716, #3717.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     let mut gateways: Gateways = toml::from_str(&response)?;
     let mut base_url = reqwest::Url::parse(url)?;
     base_url.set_path("");
@@ -2446,7 +2519,11 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
     for gateway in &mut gateways.gateways {
         gateway.location = None; // always ignore any location from files if set, it should be derived from IP
         let public_key_url = base_url.join(&gateway.public_key_path.to_string_lossy())?;
-        let public_key_response = reqwest::get(public_key_url).await?.error_for_status()?;
+        let public_key_response = client
+            .get(public_key_url)
+            .send()
+            .await?
+            .error_for_status()?;
         let file_name = gateway
             .public_key_path
             .file_name()

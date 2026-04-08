@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.16"
+version = "0.2.36"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -13,7 +13,7 @@ readme = "README.md"
 # Minimum compatible protocol version. Peers older than this are rejected.
 # Updated by scripts/release.sh during releases. The env var
 # FREENET_MIN_COMPATIBLE_VERSION overrides this at build time.
-min-compatible-version = "0.2.15"
+min-compatible-version = "0.2.35"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
@@ -115,13 +115,13 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, features = ["sysinfoapi", "wincon", "winuser"] }
+winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "winuser"] }
 serde = { workspace = true }
 zip = { workspace = true }
 tray-icon = { workspace = true }
 muda = { workspace = true }
-native-windows-gui = { workspace = true }
-native-windows-derive = { workspace = true }
+tao = { workspace = true }
+wry = { workspace = true }
 winreg = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

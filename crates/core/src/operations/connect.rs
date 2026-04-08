@@ -448,10 +448,14 @@ impl ConnectForwardEstimator {
             .map(|p| p.clamp(0.0, 1.0))
     }
 
-    /// Return the PAV curve points, event count, and peer adjustment count for telemetry.
-    pub(crate) fn snapshot(&self) -> (Vec<(f64, f64)>, usize, usize) {
+    /// Return the sampled PAV curve, data range, event count, and peer adjustment count.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn snapshot(&self) -> (Vec<(f64, f64)>, (f64, f64), usize, usize) {
+        let curve = self.estimator.sampled_curve(0.0, 1.0, 50);
+        let data_range = self.estimator.data_x_range();
         (
-            self.estimator.curve_points(),
+            curve,
+            data_range,
             self.estimator.len(),
             self.estimator.peer_adjustments.len(),
         )
@@ -698,7 +702,7 @@ impl RelayState {
                 if let Some(uphill_peer) = uphill_hop {
                     let dist =
                         ring_distance(uphill_peer.location(), Some(self.request.desired_location));
-                    tracing::info!(
+                    tracing::debug!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         uphill_budget = self.request.uphill_budget,
@@ -1670,7 +1674,7 @@ impl Operation for ConnectOp {
                             id: self.id,
                             desired_location: payload.desired_location,
                         };
-                        tracing::info!(
+                        tracing::debug!(
                             tx = %self.id,
                             desired_location = %payload.desired_location,
                             upstream = %upstream_addr,
@@ -1902,7 +1906,7 @@ impl Operation for ConnectOp {
                             self.record_forward_outcome(fwd, desired, true);
                         }
 
-                        tracing::info!(
+                        tracing::debug!(
                             tx = %self.id,
                             upstream_addr = %upstream_addr,
                             acceptor_pub_key = %payload.acceptor.pub_key(),
@@ -2035,7 +2039,7 @@ impl Operation for ConnectOp {
                         if let Some((peer, forward_req)) = retry_actions.forward {
                             // Found a different uphill peer — forward to it
                             self.recency.insert(peer.clone(), now);
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %self.id,
                                 failed_peer = ?failed_peer,
                                 retry_peer = %peer.pub_key(),
@@ -2070,7 +2074,7 @@ impl Operation for ConnectOp {
                                 .await?;
                         } else {
                             // No more uphill peers and can't accept — forward rejection upstream
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %self.id,
                                 upstream_addr = %upstream_addr,
                                 failed_peer = ?failed_peer,
@@ -2130,7 +2134,7 @@ impl Operation for ConnectOp {
                                         id: self.id,
                                         failed_acceptor_addr: *failed_acceptor_addr,
                                     };
-                                    tracing::info!(
+                                    tracing::debug!(
                                         tx = %self.id,
                                         forwarded_to_addr = %fwd_addr,
                                         failed_acceptor = %failed_acceptor_addr,
@@ -2188,7 +2192,7 @@ impl Operation for ConnectOp {
 
                         if let Some((peer, forward_req)) = retry_actions.forward {
                             self.recency.insert(peer.clone(), now);
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %self.id,
                                 failed_acceptor = %failed_acceptor_addr,
                                 retry_peer = %peer.pub_key(),
@@ -2222,7 +2226,7 @@ impl Operation for ConnectOp {
                                 .await?;
                         } else {
                             // No options — propagate ConnectFailed upstream
-                            tracing::info!(
+                            tracing::debug!(
                                 tx = %self.id,
                                 upstream_addr = %upstream_addr,
                                 failed_acceptor = %failed_acceptor_addr,
@@ -2453,6 +2457,52 @@ pub(crate) async fn join_ring_request(
         // Bootstrap mode: target own location with jitter after failures.
         apply_bootstrap_jitter(base_location)
     };
+    send_gateway_connect(gateway, gateway_addr, op_manager, own, desired_location).await
+}
+
+/// Resolve the socket address of a gateway selected for a version probe.
+///
+/// Extracted from [`gateway_version_probe`] so the failure mode (gateway with
+/// no known address) is unit-testable without an `OpManager`. Caller logs the
+/// failure at debug level and retries on the next maintenance cycle.
+pub(crate) fn resolve_probe_gateway_addr(
+    gateway: &PeerKeyLocation,
+) -> Result<std::net::SocketAddr, OpError> {
+    use crate::node::ConnectionError;
+
+    gateway.socket_addr().ok_or_else(|| {
+        tracing::error!(phase = "error", "Gateway address not found");
+        OpError::ConnError(ConnectionError::LocationUnknown)
+    })
+}
+
+/// Initiate a CONNECT to a gateway for version discovery (#3677).
+///
+/// Skips `should_accept()` so the probe runs even when the ring is full.
+/// The transport handshake exchanges version info via `report_peer_version()`
+/// / `signal_urgent_update()`. Called periodically from `connection_maintenance`.
+#[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
+pub(crate) async fn gateway_version_probe(
+    gateway: &PeerKeyLocation,
+    op_manager: &OpManager,
+) -> Result<(), OpError> {
+    let gateway_addr = resolve_probe_gateway_addr(gateway)?;
+
+    let own = op_manager.ring.connection_manager.own_location();
+    let desired_location = own.location().unwrap_or_else(Location::random);
+
+    send_gateway_connect(gateway, gateway_addr, op_manager, own, desired_location).await
+}
+
+/// Shared CONNECT initiation: build operation, emit telemetry, send via `notify_op_change`.
+/// On failure, cleans up in-transit reservations so subsequent attempts are not blocked.
+async fn send_gateway_connect(
+    gateway: &PeerKeyLocation,
+    gateway_addr: std::net::SocketAddr,
+    op_manager: &OpManager,
+    own: PeerKeyLocation,
+    desired_location: Location,
+) -> Result<(), OpError> {
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -2465,10 +2515,11 @@ pub(crate) async fn join_ring_request(
     tracing::debug!(
         failed = failed_addrs.len(),
         connected = connected_addrs.len(),
-        "connect: pre-populating bloom filter with excluded peer addresses"
+        "pre-populating bloom filter with excluded peer addresses"
     );
     let mut exclude_addrs = failed_addrs;
     exclude_addrs.extend(connected_addrs);
+
     let (tx, mut op, msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
@@ -2479,7 +2530,6 @@ pub(crate) async fn join_ring_request(
         &exclude_addrs,
     );
 
-    // Emit telemetry for initial connect request sent
     if let Some(event) = NetEventLog::connect_request_sent(
         &tx,
         &op_manager.ring,
@@ -2499,7 +2549,7 @@ pub(crate) async fn join_ring_request(
         tx = %tx,
         target_connections,
         ttl,
-        "Attempting network connect"
+        "Initiating gateway connect"
     );
 
     if let Err(e) = op_manager
@@ -2509,8 +2559,7 @@ pub(crate) async fn join_ring_request(
         )
         .await
     {
-        // Clean up the reservation that should_accept() created, so the bootstrap
-        // loop doesn't think this gateway is still "connected/pending" (#3244).
+        // Clean up the reservation so subsequent attempts are not blocked (#3244).
         op_manager
             .ring
             .connection_manager
@@ -2908,6 +2957,36 @@ mod tests {
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    #[test]
+    fn resolve_probe_gateway_addr_returns_known_socket() {
+        let pub_key = TransportKeypair::new().public().clone();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        let gateway = PeerKeyLocation::new(pub_key, addr);
+
+        let resolved = resolve_probe_gateway_addr(&gateway).expect("known address resolves");
+        assert_eq!(resolved, addr);
+    }
+
+    #[test]
+    fn resolve_probe_gateway_addr_errors_on_unknown_address() {
+        // The probe loop in connection_maintenance treats this Err as a debug
+        // log + continue. The structural guarantee here is that we never call
+        // send_gateway_connect with a placeholder address — we surface the
+        // error before any network state is mutated.
+        let pub_key = TransportKeypair::new().public().clone();
+        let gateway = PeerKeyLocation::with_unknown_addr(pub_key);
+
+        let err =
+            resolve_probe_gateway_addr(&gateway).expect_err("unknown address must fail to resolve");
+        assert!(
+            matches!(
+                err,
+                OpError::ConnError(crate::node::ConnectionError::LocationUnknown)
+            ),
+            "expected LocationUnknown, got {err:?}"
+        );
+    }
+
     struct TestRelayContext {
         self_loc: PeerKeyLocation,
         accept: bool,
@@ -3028,9 +3107,9 @@ mod tests {
             },
         );
 
-        let (_, events_before, _) = estimator.read().snapshot();
+        let (_, _, events_before, _) = estimator.read().snapshot();
         op.expire_forward_attempts(Instant::now());
-        let (_, events_after, _) = estimator.read().snapshot();
+        let (_, _, events_after, _) = estimator.read().snapshot();
 
         assert!(op.forward_attempts.is_empty());
         assert!(

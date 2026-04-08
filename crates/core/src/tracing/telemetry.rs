@@ -1610,11 +1610,16 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "peers_with_failure_adjustments": snapshot.peers_with_failure_adjustments,
                 "peers_with_response_adjustments": snapshot.peers_with_response_adjustments,
                 "failure_curve": snapshot.failure_curve,
+                "failure_data_range": snapshot.failure_data_range,
                 "response_time_curve": snapshot.response_time_curve,
+                "response_time_data_range": snapshot.response_time_data_range,
                 "transfer_rate_curve": snapshot.transfer_rate_curve,
+                "transfer_rate_data_range": snapshot.transfer_rate_data_range,
                 "connect_forward_curve": snapshot.connect_forward_curve,
+                "connect_forward_data_range": snapshot.connect_forward_data_range,
                 "connect_forward_events": snapshot.connect_forward_events,
                 "connect_forward_peer_adjustments": snapshot.connect_forward_peer_adjustments,
+                "per_op_curves": snapshot.per_op_curves,
             })
         }
     }

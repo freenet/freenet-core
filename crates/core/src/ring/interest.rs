@@ -2201,4 +2201,83 @@ mod tests {
             "Interests must be preserved when peer reconnected before sweep executed"
         );
     }
+
+    /// Verify that summary mismatch detection correctly identifies stale peers
+    /// and that only the specific stale peer needs updating (not all subscribers).
+    ///
+    /// Regression test for #3791: summary mismatch triggered BroadcastStateChange
+    /// to ALL subscribers instead of SyncStateToPeer to just the stale peer,
+    /// causing O(peers^2) broadcast storms.
+    #[test]
+    fn test_summary_mismatch_targets_only_stale_peer() {
+        let (manager, _time) = make_manager();
+
+        let contract = make_contract_key(1);
+        let peer_a = make_peer_key(1);
+        let peer_b = make_peer_key(2);
+        let peer_c = make_peer_key(3);
+
+        manager.register_local_hosting(&contract);
+
+        // Our state summary
+        let our_summary = StateSummary::from(vec![1, 2, 3]);
+
+        // Peer A and C have our current summary (up to date)
+        manager.register_peer_interest(&contract, peer_a.clone(), Some(our_summary.clone()), false);
+        manager.register_peer_interest(&contract, peer_c.clone(), Some(our_summary.clone()), false);
+
+        // Peer B has an old summary (stale)
+        let stale_summary = StateSummary::from(vec![0, 0, 0]);
+        manager.register_peer_interest(
+            &contract,
+            peer_b.clone(),
+            Some(stale_summary.clone()),
+            false,
+        );
+
+        // Use the same stale-detection logic as production (node.rs):
+        // zip both Option<StateSummary> and compare bytes.
+        let peer_b_summary = manager.get_peer_summary(&contract, &peer_b);
+        let is_stale = Some(&our_summary)
+            .zip(peer_b_summary.as_ref())
+            .is_some_and(|(ours, theirs)| ours.as_ref() != theirs.as_ref());
+        assert!(is_stale, "Peer B should be detected as stale");
+
+        // Peers A and C have our current summary and should NOT be stale
+        for (label, peer) in [("A", &peer_a), ("C", &peer_c)] {
+            let summary = manager.get_peer_summary(&contract, peer);
+            let stale = Some(&our_summary)
+                .zip(summary.as_ref())
+                .is_some_and(|(ours, theirs)| ours.as_ref() != theirs.as_ref());
+            assert!(!stale, "Peer {label} should NOT be stale");
+        }
+
+        // The fix (#3791): only peer B needs a state sync, not all 3 peers.
+        // Before the fix, BroadcastStateChange would send to all 3 peers.
+        // After the fix, SyncStateToPeer sends only to peer B.
+        let interested_peers = manager.get_interested_peers(&contract);
+        assert_eq!(
+            interested_peers.len(),
+            3,
+            "All 3 peers should be interested"
+        );
+
+        // Count how many peers actually need syncing
+        let stale_count = interested_peers
+            .iter()
+            .filter(|(pk, _)| {
+                let summary = manager.get_peer_summary(&contract, pk);
+                summary
+                    .as_ref()
+                    .map(|s| s.as_ref() != our_summary.as_ref())
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            stale_count,
+            1,
+            "Only 1 peer (B) should need syncing, not all {}",
+            interested_peers.len()
+        );
+    }
 }

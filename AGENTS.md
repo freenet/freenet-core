@@ -29,6 +29,22 @@
 3. Check .claude/rules/git-workflow.md for PR requirements
 ```
 
+### WHEN fixing a bug (fix: PRs)
+
+```
+EVERY bug fix MUST include a regression test.
+
+1. Write a test that reproduces the bug FIRST
+2. Verify it FAILS without the fix
+3. Apply the fix
+4. Verify the test PASSES
+
+CI enforces this: fix: PRs without new test functions are rejected.
+
+Also: don't just test the happy path. Test edge cases and boundary
+conditions. See .claude/rules/testing.md for specifics.
+```
+
 ### WHEN a test fails
 
 ```

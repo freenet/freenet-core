@@ -15,7 +15,7 @@ const REG_FILE_VERSION: u8 = 1;
 
 pub struct DelegateStore {
     delegates_dir: PathBuf,
-    delegate_cache: MokaCache<CodeHash, DelegateCode<'static>>,
+    delegate_cache: MokaCache<CodeHash, Arc<DelegateCode<'static>>>,
     /// In-memory index: DelegateKey -> CodeHash
     /// Populated from .reg files + ReDb on startup and kept in sync.
     key_to_code_part: Arc<DashMap<DelegateKey, CodeHash>>,
@@ -28,7 +28,7 @@ impl DelegateStore {
     /// - delegates_dir: directory where delegate WASM files and .reg records are stored
     /// - max_size: max size in bytes of the delegates being cached
     /// - db: ReDb storage for persistent index
-    pub fn new(delegates_dir: PathBuf, max_size: i64, db: Storage) -> RuntimeResult<Self> {
+    pub fn new(delegates_dir: PathBuf, max_size: u64, db: Storage) -> RuntimeResult<Self> {
         std::fs::create_dir_all(&delegates_dir).map_err(|err| {
             tracing::error!("error creating delegate dir: {err}");
             err
@@ -117,10 +117,24 @@ impl DelegateStore {
 
         Ok(Self {
             delegate_cache: MokaCache::builder()
-                .max_capacity(max_size as u64)
-                .weigher(|_key: &CodeHash, value: &DelegateCode<'static>| -> u32 {
-                    value.as_ref().len() as u32
-                })
+                .max_capacity(max_size)
+                .weigher(
+                    |key: &CodeHash, value: &Arc<DelegateCode<'static>>| -> u32 {
+                        // Saturate to u32::MAX on overflow as moka recommends.
+                        // A delegate WASM module larger than 4 GiB would indicate
+                        // a bug in upstream size validation — log it loudly.
+                        let len = value.as_ref().as_ref().len();
+                        u32::try_from(len).unwrap_or_else(|_| {
+                            tracing::warn!(
+                                code_hash = %key,
+                                size_bytes = len,
+                                "Delegate code exceeds u32::MAX in cache weigher; \
+                                 saturating. This should be impossible."
+                            );
+                            u32::MAX
+                        })
+                    },
+                )
                 .build(),
             delegates_dir,
             key_to_code_part,
@@ -135,7 +149,7 @@ impl DelegateStore {
         params: &Parameters<'_>,
     ) -> Option<Delegate<'static>> {
         if let Some(delegate_code) = self.delegate_cache.get(key.code_hash()) {
-            return Some(Delegate::from((&delegate_code, params)).into_owned());
+            return Some(Delegate::from((&*delegate_code, params)).into_owned());
         }
         self.key_to_code_part.get(key).and_then(|code_hash_entry| {
             let code_hash = *code_hash_entry.value();
@@ -158,7 +172,8 @@ impl DelegateStore {
             };
             tracing::debug!("loaded `{key}` from path");
             let delegate = Delegate::from((&delegate_code, &params.clone().into_owned()));
-            self.delegate_cache.insert(*key.code_hash(), delegate_code);
+            self.delegate_cache
+                .insert(*key.code_hash(), Arc::new(delegate_code));
             Some(delegate)
         })
     }
@@ -214,7 +229,7 @@ impl DelegateStore {
         // Early return if file exists on disk - but ensure index and .reg are updated
         if let Ok((code, _ver)) = DelegateCode::load_versioned_from_path(delegate_path.as_path()) {
             self.ensure_index_entry(key, code_hash, &params)?;
-            self.delegate_cache.insert(*code_hash, code);
+            self.delegate_cache.insert(*code_hash, Arc::new(code));
             return Ok(());
         }
 
@@ -239,7 +254,7 @@ impl DelegateStore {
         self.key_to_code_part.insert(key.clone(), *code_hash);
 
         self.delegate_cache
-            .insert(*code_hash, delegate.code().clone().into_owned());
+            .insert(*code_hash, Arc::new(delegate.code().clone().into_owned()));
 
         Ok(())
     }

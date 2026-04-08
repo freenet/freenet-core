@@ -575,7 +575,7 @@ impl OpManager {
     // Useful when we want to notify connection attempts, or other events that do not require any
     // network communication with other nodes.
     pub async fn notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
-        tracing::info!(event = %msg, "notify_node_event: queuing node event");
+        tracing::debug!(event = %msg, "notify_node_event: queuing node event");
         match tokio::time::timeout(
             Self::NOTIFICATION_SEND_TIMEOUT,
             self.to_event_listener
@@ -1235,10 +1235,22 @@ fn report_timeout_failure(
     peer: crate::ring::PeerKeyLocation,
     contract_location: crate::ring::Location,
 ) {
+    let op_type = match tx.transaction_type() {
+        crate::message::TransactionType::Get => Some(crate::node::network_status::OpType::Get),
+        crate::message::TransactionType::Put => Some(crate::node::network_status::OpType::Put),
+        crate::message::TransactionType::Update => {
+            Some(crate::node::network_status::OpType::Update)
+        }
+        crate::message::TransactionType::Subscribe => {
+            Some(crate::node::network_status::OpType::Subscribe)
+        }
+        crate::message::TransactionType::Connect => None,
+    };
     ring.routing_finished(crate::router::RouteEvent {
         peer: peer.clone(),
         contract_location,
         outcome: crate::router::RouteOutcome::Failure,
+        op_type,
     });
     tracing::info!(
         tx = %tx,
@@ -1630,6 +1642,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                                 peer,
                                                 contract_location,
                                                 outcome: crate::router::RouteOutcome::Failure,
+                                                op_type: Some(crate::node::network_status::OpType::Get),
                                             });
                                         }
                                         let msg = crate::message::NetMessage::from(msg);
@@ -1786,6 +1799,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                                 peer,
                                                 contract_location,
                                                 outcome: crate::router::RouteOutcome::Failure,
+                                                op_type: Some(crate::node::network_status::OpType::Subscribe),
                                             });
                                         }
                                         let msg = crate::message::NetMessage::from(msg);
@@ -1896,6 +1910,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                                 peer,
                                                 contract_location,
                                                 outcome: crate::router::RouteOutcome::Failure,
+                                                op_type: Some(crate::node::network_status::OpType::Put),
                                             });
                                         }
                                         let msg = crate::message::NetMessage::from(msg);

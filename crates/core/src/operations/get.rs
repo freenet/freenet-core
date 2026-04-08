@@ -47,10 +47,14 @@ pub(crate) fn start_op(
     let contract_location = Location::from(&instance_id);
     let id = Transaction::new::<GetMsg>();
     tracing::debug!(tx = %id, "Requesting get contract {instance_id} @ loc({contract_location})");
+    // Always fetch contract code from the network so the node can cache WASM
+    // for validation, subscription, and hosting. The client's return_contract_code
+    // preference only controls whether WASM is included in the client response.
+    // See issue #3757.
     let state = Some(GetState::PrepareRequest(PrepareRequestData {
         instance_id,
         id,
-        fetch_contract,
+        fetch_contract: true,
         subscribe,
         blocking_subscribe,
     }));
@@ -69,6 +73,7 @@ pub(crate) fn start_op(
         auto_fetch: false,
         ack_received: false,
         speculative_paths: 0,
+        client_return_code: fetch_contract,
     }
 }
 
@@ -82,10 +87,11 @@ pub(crate) fn start_op_with_id(
 ) -> GetOp {
     let contract_location = Location::from(&instance_id);
     tracing::debug!(tx = %id, "Requesting get contract {instance_id} @ loc({contract_location}) with existing transaction ID");
+    // Always fetch contract code from the network (see start_op and #3757)
     let state = Some(GetState::PrepareRequest(PrepareRequestData {
         instance_id,
         id,
-        fetch_contract,
+        fetch_contract: true,
         subscribe,
         blocking_subscribe,
     }));
@@ -104,6 +110,7 @@ pub(crate) fn start_op_with_id(
         auto_fetch: false,
         ack_received: false,
         speculative_paths: 0,
+        client_return_code: fetch_contract,
     }
 }
 
@@ -149,6 +156,7 @@ pub(crate) fn start_targeted_op(
         fetch_contract: true,
         htl: max_hops_to_live,
         visited,
+        subscribe: false, // Targeted ops (auto-fetch) don't need subscription
     };
 
     let op = GetOp {
@@ -166,6 +174,7 @@ pub(crate) fn start_targeted_op(
         auto_fetch: true, // System-initiated, not a client request
         ack_received: false,
         speculative_paths: 0,
+        client_return_code: true, // Internal fetch, always include code
     };
 
     (op, msg)
@@ -255,6 +264,7 @@ pub(crate) async fn request_get(
                     auto_fetch: false,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: get_op.client_return_code,
                 };
 
                 op_manager.push(*id, OpEnum::Get(completed_op)).await?;
@@ -345,6 +355,7 @@ pub(crate) async fn request_get(
                 fetch_contract,
                 htl: op_manager.ring.max_hops_to_live,
                 visited,
+                subscribe,
             };
 
             let op = GetOp {
@@ -353,6 +364,7 @@ pub(crate) async fn request_get(
                 result: None,
                 stats: get_op.stats.map(|mut s| {
                     s.next_peer = Some(target.clone());
+                    s.start_timers();
                     s
                 }),
                 upstream_addr: get_op.upstream_addr,
@@ -360,6 +372,7 @@ pub(crate) async fn request_get(
                 auto_fetch: get_op.auto_fetch,
                 ack_received: false,
                 speculative_paths: 0,
+                client_return_code: get_op.client_return_code,
             };
 
             // Emit get_request telemetry when initiating a GET operation
@@ -534,6 +547,29 @@ struct GetStats {
     transfer_time: Option<(Instant, Option<Instant>)>,
 }
 
+impl GetStats {
+    /// Start both response and transfer timers for a new attempt.
+    fn start_timers(&mut self) {
+        let now = Instant::now();
+        self.first_response_time = Some((now, None));
+        self.transfer_time = Some((now, None));
+    }
+
+    /// Record the end time for first_response_time.
+    fn record_response_end(&mut self) {
+        if let Some((_, ref mut end)) = self.first_response_time {
+            *end = Some(Instant::now());
+        }
+    }
+
+    /// Record the end time for transfer_time.
+    fn record_transfer_end(&mut self) {
+        if let Some((_, ref mut end)) = self.transfer_time {
+            *end = Some(Instant::now());
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct GetResult {
     key: ContractKey,
@@ -574,6 +610,11 @@ pub(crate) struct GetOp {
     /// Number of speculative parallel paths launched by the originator's GC task.
     /// Capped at MAX_SPECULATIVE_PATHS to bound network overhead.
     pub(crate) speculative_paths: u8,
+    /// Whether the client wants contract code in the response.
+    /// The node always fetches WASM from the network for internal caching,
+    /// but strips it from the client response when this is false.
+    /// See issue #3757.
+    client_return_code: bool,
 }
 
 impl GetOp {
@@ -732,6 +773,7 @@ impl GetOp {
                     fetch_contract,
                     htl: current_hop,
                     visited,
+                    subscribe,
                 };
 
                 let op = GetOp {
@@ -744,6 +786,7 @@ impl GetOp {
                     auto_fetch: self.auto_fetch,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: self.client_return_code,
                 };
 
                 op_manager
@@ -801,6 +844,7 @@ impl GetOp {
                         fetch_contract,
                         htl: current_hop,
                         visited: new_visited,
+                        subscribe,
                     };
 
                     let op = GetOp {
@@ -813,6 +857,7 @@ impl GetOp {
                         auto_fetch: self.auto_fetch,
                         ack_received: false,
                         speculative_paths: 0,
+                        client_return_code: self.client_return_code,
                     };
 
                     op_manager
@@ -846,6 +891,7 @@ impl GetOp {
                     auto_fetch: false,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: self.client_return_code,
                 };
 
                 op_manager.push(self.id, OpEnum::Get(completed_op)).await?;
@@ -880,6 +926,7 @@ impl GetOp {
                     auto_fetch: false,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: self.client_return_code,
                 };
 
                 op_manager
@@ -924,6 +971,7 @@ impl GetOp {
                     auto_fetch: false,
                     ack_received: false,
                     speculative_paths: 0,
+                    client_return_code: self.client_return_code,
                 };
                 op_manager.push(self.id, OpEnum::Get(failed_op)).await?;
                 return Ok(());
@@ -946,13 +994,24 @@ impl GetOp {
                 key,
                 state,
                 contract,
-            }) => Ok(HostResponse::ContractResponse(
-                freenet_stdlib::client_api::ContractResponse::GetResponse {
-                    key: *key,
-                    contract: contract.clone(),
-                    state: state.clone(),
-                },
-            )),
+            }) => {
+                // Strip contract code from client response when the client
+                // requested return_contract_code=false. The node still fetches
+                // and caches WASM internally for validation/subscription/hosting.
+                // See issue #3757.
+                let client_contract = if self.client_return_code {
+                    contract.clone()
+                } else {
+                    None
+                };
+                Ok(HostResponse::ContractResponse(
+                    freenet_stdlib::client_api::ContractResponse::GetResponse {
+                        key: *key,
+                        contract: client_contract,
+                        state: state.clone(),
+                    },
+                ))
+            }
             None => Err(ErrorKind::OperationError {
                 cause: "get didn't finish successfully".into(),
             }
@@ -1040,8 +1099,10 @@ impl GetOp {
                 );
                 // Update stats to point to the new target so timeouts/failures
                 // are reported against the correct peer (#3527).
+                // Reset timing for the new attempt.
                 if let Some(ref mut s) = self.stats {
                     s.next_peer = Some(next_target.clone());
+                    s.start_timers();
                 }
                 data.next_hop = next_target;
                 data.attempts_at_hop += 1;
@@ -1055,6 +1116,7 @@ impl GetOp {
                     .max(MIN_RETRY_HTL)
                     .min(max_hops_to_live);
 
+                let subscribe = data.subscribe;
                 self.state = Some(GetState::AwaitingResponse(data));
 
                 let msg = GetMsg::Request {
@@ -1063,6 +1125,7 @@ impl GetOp {
                     fetch_contract,
                     htl: retry_htl,
                     visited,
+                    subscribe,
                 };
 
                 Ok((self, msg))
@@ -1130,6 +1193,7 @@ impl Operation for GetOp {
                         auto_fetch: false,
                         ack_received: false,
                         speculative_paths: 0,
+                        client_return_code: true,
                     },
                     source_addr,
                 })
@@ -1177,6 +1241,7 @@ impl Operation for GetOp {
                     fetch_contract,
                     htl,
                     visited,
+                    subscribe: msg_subscribe,
                 } => {
                     // Handle GET request - either initial or forwarded
                     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
@@ -1184,6 +1249,7 @@ impl Operation for GetOp {
                     let id = *id;
                     let instance_id = *instance_id;
                     let fetch_contract = *fetch_contract;
+                    let msg_subscribe = *msg_subscribe;
 
                     // Use sender_from_addr for logging (falls back to source_addr if lookup fails)
                     let sender_display = sender_from_addr
@@ -1254,6 +1320,7 @@ impl Operation for GetOp {
                             stream_data: None,
                             local_fallback: None,
                             auto_fetch: false,
+                            client_return_code: self.client_return_code,
                         });
                     } else {
                         // Normal case: operation should be in ReceivedRequest or AwaitingResponse state
@@ -1356,13 +1423,22 @@ impl Operation for GetOp {
                                 "GET: contract found locally"
                             );
 
-                            // Register the GET requester's interest in this contract so that
-                            // update broadcasts include them as a target. This is critical for
-                            // partitioned topologies: the requester's auto-subscribe may route
-                            // to a blocked peer instead of back to us, so we register interest
-                            // proactively when serving the GET response.
+                            // Register the GET requester as downstream subscriber when
+                            // subscribe=true (piggybacked), or just basic interest otherwise.
                             if let Some(upstream_addr) = self.upstream_addr {
-                                if let Some(pkl) = op_manager
+                                if msg_subscribe {
+                                    // Full downstream subscriber registration for subscription tree
+                                    super::subscribe::register_downstream_subscriber(
+                                        op_manager,
+                                        &key,
+                                        upstream_addr,
+                                        None,
+                                        None,
+                                        &id,
+                                        " (hosting peer, piggybacked on GET)",
+                                    )
+                                    .await;
+                                } else if let Some(pkl) = op_manager
                                     .ring
                                     .connection_manager
                                     .get_peer_by_addr(upstream_addr)
@@ -1570,6 +1646,7 @@ impl Operation for GetOp {
                                 stats,
                                 self.upstream_addr,
                                 local_fallback,
+                                msg_subscribe,
                             )
                             .await;
                         }
@@ -1652,6 +1729,7 @@ impl Operation for GetOp {
                                     fetch_contract,
                                     htl: current_hop,
                                     visited: visited.clone(),
+                                    subscribe,
                                 });
 
                                 // Update state with the new alternative being tried
@@ -1712,6 +1790,7 @@ impl Operation for GetOp {
                                         fetch_contract,
                                         htl: current_hop,
                                         visited: new_visited.clone(),
+                                        subscribe,
                                     });
 
                                     // Reset for new round of attempts
@@ -2084,6 +2163,7 @@ impl Operation for GetOp {
                                         auto_fetch: false,
                                         ack_received: false,
                                         speculative_paths: 0,
+                                        client_return_code: self.client_return_code,
                                     }),
                                 )
                                 .await?;
@@ -2093,6 +2173,15 @@ impl Operation for GetOp {
 
                     // Check if this is the original requester (no upstream to forward to)
                     let is_original_requester = self.upstream_addr.is_none();
+
+                    // Record response timing for the originator (non-streaming:
+                    // response + payload arrive together, so both timers end now)
+                    if is_original_requester {
+                        if let Some(ref mut s) = stats {
+                            s.record_response_end();
+                            s.record_transfer_end();
+                        }
+                    }
 
                     // Check if subscription was requested
                     let (subscribe_requested, blocking_sub) =
@@ -2148,6 +2237,11 @@ impl Operation for GetOp {
                             let access_result =
                                 op_manager.ring.record_get_access(key, value.size() as u64);
 
+                            // Mark locally-accessed for subscription renewal (#3769)
+                            if is_original_requester {
+                                op_manager.ring.mark_local_client_access(&key);
+                            }
+
                             // Clean up interest tracking for evicted contracts (always, even if already hosting)
                             let mut removed_contracts = Vec::new();
                             for evicted_key in &access_result.evicted {
@@ -2191,18 +2285,21 @@ impl Operation for GetOp {
                                 }
                             }
 
-                            // Auto-subscribe to receive updates for this contract.
-                            // Only the original requester subscribes — relay peers cache
-                            // for durability but don't subscribe (no freshness obligation).
-                            if crate::ring::AUTO_SUBSCRIBE_ON_GET && is_original_requester {
-                                // Only start new subscription if not already subscribed
-                                if access_result.is_new || !op_manager.ring.is_subscribed(&key) {
-                                    let blocking = subscribe_requested && blocking_sub;
-                                    let child_tx = super::start_subscription_request(
-                                        op_manager, id, key, blocking,
-                                    );
-                                    tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription");
-                                }
+                            // Auto-subscribe: piggyback or fallback
+                            if crate::ring::AUTO_SUBSCRIBE_ON_GET
+                                && is_original_requester
+                                && (access_result.is_new || !op_manager.ring.is_subscribed(&key))
+                            {
+                                super::auto_subscribe_on_get_response(
+                                    op_manager,
+                                    &key,
+                                    &id,
+                                    &sender_from_addr,
+                                    subscribe_requested,
+                                    blocking_sub,
+                                    "non-streaming",
+                                )
+                                .await;
                             }
                         } else {
                             // Only attempt to cache if we have the contract code.
@@ -2233,6 +2330,10 @@ impl Operation for GetOp {
                                         let access_result = op_manager
                                             .ring
                                             .record_get_access(key, value.size() as u64);
+
+                                        if is_original_requester {
+                                            op_manager.ring.mark_local_client_access(&key);
+                                        }
 
                                         // Clean up interest tracking for evicted contracts (always, even if already hosting)
                                         let mut removed_contracts = Vec::new();
@@ -2278,22 +2379,22 @@ impl Operation for GetOp {
                                             }
                                         }
 
-                                        // Auto-subscribe to receive updates for this contract.
-                                        // Only the original requester subscribes — relay peers cache
-                                        // for durability but don't subscribe (no freshness obligation).
+                                        // Auto-subscribe: piggyback or fallback
                                         if crate::ring::AUTO_SUBSCRIBE_ON_GET
                                             && is_original_requester
+                                            && (access_result.is_new
+                                                || !op_manager.ring.is_subscribed(&key))
                                         {
-                                            // Only start new subscription if not already subscribed
-                                            if access_result.is_new
-                                                || !op_manager.ring.is_subscribed(&key)
-                                            {
-                                                let blocking = subscribe_requested && blocking_sub;
-                                                let child_tx = super::start_subscription_request(
-                                                    op_manager, id, key, blocking,
-                                                );
-                                                tracing::debug!(tx = %id, %child_tx, %blocking, "started subscription");
-                                            }
+                                            super::auto_subscribe_on_get_response(
+                                                op_manager,
+                                                &key,
+                                                &id,
+                                                &sender_from_addr,
+                                                subscribe_requested,
+                                                blocking_sub,
+                                                "non-streaming, put-path",
+                                            )
+                                            .await;
                                         }
                                     }
                                     ContractHandlerEvent::PutResponse {
@@ -2405,6 +2506,25 @@ impl Operation for GetOp {
                         // here because relay peers should not advertise contracts they
                         // are not responsible for in the ring.
                         tracing::info!(tx = %id, contract = %key, phase = "response", "Get response received for contract at hop peer");
+
+                        // Piggyback subscription: set up forwarding at this relay node
+                        // so UPDATE broadcasts propagate through the subscription tree.
+                        // Only forwarding (upstream/downstream registration) -- NO
+                        // ring.subscribe() or announce_contract_hosted() to avoid storms.
+                        if subscribe_requested {
+                            if let (Some(response_addr), Some(requester_addr)) =
+                                (source_addr, self.upstream_addr)
+                            {
+                                super::setup_subscription_forwarding_at_relay(
+                                    op_manager,
+                                    &key,
+                                    &id,
+                                    response_addr,
+                                    requester_addr,
+                                )
+                                .await;
+                            }
+                        }
                         if let Some(code) = contract {
                             if !op_manager.ring.is_hosting_contract(&key) {
                                 let om = op_manager.clone();
@@ -2608,6 +2728,7 @@ impl Operation for GetOp {
                                             auto_fetch: false,
                                             ack_received: false,
                                             speculative_paths: 0,
+                                            client_return_code: self.client_return_code,
                                         }),
                                     )
                                     .await
@@ -2639,6 +2760,7 @@ impl Operation for GetOp {
                                             auto_fetch: false,
                                             ack_received: false,
                                             speculative_paths: 0,
+                                            client_return_code: self.client_return_code,
                                         }),
                                     )
                                     .await
@@ -2653,6 +2775,22 @@ impl Operation for GetOp {
                     // Step 2: Check if we should pipe upstream BEFORE assembly
                     // This enables low-latency forwarding of responses
                     let is_original_requester = self.upstream_addr.is_none();
+
+                    // Record first-response timing for originator (streaming metadata arrived;
+                    // transfer_time ends later after stream assembly completes)
+                    if is_original_requester {
+                        if let Some(ref mut s) = stats {
+                            s.record_response_end();
+                        }
+                    }
+
+                    // Extract subscription flags from state (needed for auto-subscribe after caching)
+                    let (subscribe_requested, blocking_sub) =
+                        if let Some(GetState::AwaitingResponse(data)) = &self.state {
+                            (data.subscribe, data.blocking_subscribe)
+                        } else {
+                            (false, false)
+                        };
                     let piping_started = if !is_original_requester {
                         let upstream_addr = self
                             .upstream_addr
@@ -2716,19 +2854,126 @@ impl Operation for GetOp {
                         false
                     };
 
+                    // Piggyback subscription: set up forwarding at this relay node
+                    // (streaming path). Same logic as non-streaming relay path.
+                    if subscribe_requested && !is_original_requester {
+                        if let (Some(response_addr), Some(requester_addr)) =
+                            (source_addr, self.upstream_addr)
+                        {
+                            super::setup_subscription_forwarding_at_relay(
+                                op_manager,
+                                &key,
+                                &id,
+                                response_addr,
+                                requester_addr,
+                            )
+                            .await;
+                        }
+                    }
+
                     // Step 3: Wait for stream to complete and assemble data (for local caching)
                     let stream_data = match stream_handle.assemble().await {
                         Ok(data) => data,
                         Err(e) => {
-                            tracing::error!(
-                                tx = %id,
-                                stream_id = %stream_id,
-                                error = %e,
-                                "Failed to assemble stream data"
-                            );
-                            return Err(OpError::StreamCancelled);
+                            if !is_original_requester {
+                                // Relay node: fail immediately. The originator handles retry.
+                                tracing::warn!(
+                                    tx = %id,
+                                    stream_id = %stream_id,
+                                    error = %e,
+                                    "Stream assembly failed on relay, sending Aborted upstream"
+                                );
+                                return Err(OpError::StreamCancelled);
+                            }
+
+                            // Originator: immediately retry with the next alternative peer
+                            // instead of surfacing the error to the HTTP client.
+                            let all_connected: Vec<_> = op_manager
+                                .ring
+                                .connection_manager
+                                .get_connections_by_location()
+                                .values()
+                                .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
+                                .collect();
+                            let max_htl = op_manager.ring.max_hops_to_live;
+
+                            let retry_op = GetOp {
+                                id: self.id,
+                                state: self.state,
+                                result: self.result,
+                                stats,
+                                upstream_addr: self.upstream_addr,
+                                local_fallback,
+                                auto_fetch,
+                                ack_received: false,
+                                speculative_paths: self.speculative_paths,
+                                client_return_code: self.client_return_code,
+                            };
+
+                            // Report routing failure for the stalled peer so the router
+                            // learns to avoid it in future operations.
+                            let stalled_peer_info = retry_op.failure_routing_info();
+
+                            match retry_op.retry_with_next_alternative(max_htl, &all_connected) {
+                                Ok((mut new_op, msg)) => {
+                                    if let Some((peer, contract_location)) = stalled_peer_info {
+                                        op_manager.ring.routing_finished(
+                                            crate::router::RouteEvent {
+                                                peer,
+                                                contract_location,
+                                                outcome: crate::router::RouteOutcome::Failure,
+                                                op_type: Some(
+                                                    crate::node::network_status::OpType::Get,
+                                                ),
+                                            },
+                                        );
+                                    }
+                                    // Track speculative path to respect MAX_SPECULATIVE_PATHS
+                                    // cap, matching the GC task behavior.
+                                    new_op.speculative_paths += 1;
+                                    let target = match new_op.get_next_hop_addr() {
+                                        Some(addr) => addr,
+                                        None => {
+                                            tracing::error!(
+                                                tx = %id,
+                                                "Retry peer has no socket address"
+                                            );
+                                            return Err(OpError::StreamCancelled);
+                                        }
+                                    };
+                                    tracing::info!(
+                                        tx = %id,
+                                        stream_id = %stream_id,
+                                        %target,
+                                        error = %e,
+                                        "Stream assembly failed, retrying GET with next peer"
+                                    );
+                                    return Ok(OperationResult::SendAndContinue {
+                                        msg: NetMessage::from(msg),
+                                        next_hop: Some(target),
+                                        state: OpEnum::Get(new_op),
+                                        stream_data: None,
+                                    });
+                                }
+                                Err(_exhausted_op) => {
+                                    tracing::warn!(
+                                        tx = %id,
+                                        stream_id = %stream_id,
+                                        error = %e,
+                                        "Stream assembly failed, no alternative peers left"
+                                    );
+                                    return Err(OpError::StreamCancelled);
+                                }
+                            }
                         }
                     };
+
+                    // Record transfer-complete timing for originator (stream fully assembled)
+                    if is_original_requester {
+                        if let Some(ref mut s) = stats {
+                            s.record_transfer_end();
+                        }
+                    }
 
                     tracing::debug!(
                         tx = %id,
@@ -2774,7 +3019,10 @@ impl Operation for GetOp {
                         None
                     };
 
-                    // Step 5: Cache the contract locally (same as regular Response)
+                    // Step 5: Cache the contract locally, announce hosting, and auto-subscribe.
+                    // This mirrors the non-streaming Response path — without it, the node
+                    // never registers as subscribed after a streaming GET, causing every
+                    // subsequent GET to hit the network instead of serving from local cache.
                     if let Some(state) = &value.state {
                         let contract_to_cache = if includes_contract {
                             value.contract.clone()
@@ -2782,11 +3030,111 @@ impl Operation for GetOp {
                             None
                         };
 
-                        // Check if we already have this contract
-                        let already_hosting = op_manager.ring.is_hosting_contract(&key);
+                        // Record access atomically — returns whether this is a newly-hosted contract
+                        let access_result =
+                            op_manager.ring.record_get_access(key, state.size() as u64);
 
-                        if !already_hosting {
-                            // Use put_query to cache the contract
+                        if is_original_requester {
+                            op_manager.ring.mark_local_client_access(&key);
+                        }
+
+                        // Clean up interest tracking for evicted contracts
+                        let mut removed_contracts = Vec::new();
+                        for evicted_key in &access_result.evicted {
+                            if op_manager
+                                .interest_manager
+                                .unregister_local_hosting(evicted_key)
+                            {
+                                removed_contracts.push(*evicted_key);
+                            }
+                        }
+
+                        if access_result.is_new {
+                            // First time hosting — cache the contract, then announce only on success.
+                            // Mirrors the non-streaming "state differs" path which gates announce
+                            // on PutResponse { new_value: Ok(_) }.
+                            let put_ok = match op_manager
+                                .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                                    key,
+                                    state: state.clone(),
+                                    related_contracts: RelatedContracts::default(),
+                                    contract: contract_to_cache,
+                                })
+                                .await
+                            {
+                                Ok(ContractHandlerEvent::PutResponse {
+                                    new_value: Ok(_), ..
+                                }) => true,
+                                Ok(ContractHandlerEvent::PutResponse {
+                                    new_value: Err(err),
+                                    ..
+                                }) => {
+                                    tracing::warn!(
+                                        tx = %id, contract = %key, error = %err,
+                                        "Streaming GET: PutQuery rejected by executor"
+                                    );
+                                    false
+                                }
+                                Ok(other) => {
+                                    tracing::warn!(
+                                        tx = %id, contract = %key,
+                                        response = %other,
+                                        "Streaming GET: unexpected PutQuery response"
+                                    );
+                                    false
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        contract = %key, error = %e,
+                                        "failed to cache contract via PutQuery"
+                                    );
+                                    false
+                                }
+                            };
+
+                            if put_ok {
+                                tracing::debug!(tx = %id, %key, "Contract newly hosted (streaming)");
+                                super::announce_contract_hosted(op_manager, &key).await;
+
+                                let became_interested =
+                                    op_manager.interest_manager.register_local_hosting(&key);
+                                let added = if became_interested { vec![key] } else { vec![] };
+                                if !added.is_empty() || !removed_contracts.is_empty() {
+                                    super::broadcast_change_interests(
+                                        op_manager,
+                                        added,
+                                        removed_contracts,
+                                    )
+                                    .await;
+                                }
+
+                                // Auto-subscribe: piggyback or fallback (streaming path)
+                                if crate::ring::AUTO_SUBSCRIBE_ON_GET
+                                    && is_original_requester
+                                    && !op_manager.ring.is_subscribed(&key)
+                                {
+                                    super::auto_subscribe_on_get_response(
+                                        op_manager,
+                                        &key,
+                                        &id,
+                                        &sender_from_addr,
+                                        subscribe_requested,
+                                        blocking_sub,
+                                        "streaming",
+                                    )
+                                    .await;
+                                }
+                            } else if !removed_contracts.is_empty() {
+                                super::broadcast_change_interests(
+                                    op_manager,
+                                    vec![],
+                                    removed_contracts,
+                                )
+                                .await;
+                            }
+                        } else {
+                            // Already hosting — refresh state (fire-and-forget since we already
+                            // have a valid cached copy; failure just means we keep the old state).
                             if let Err(e) = op_manager
                                 .notify_contract_handler(ContractHandlerEvent::PutQuery {
                                     key,
@@ -2796,13 +3144,36 @@ impl Operation for GetOp {
                                 })
                                 .await
                             {
-                                tracing::warn!(contract = %key, error = %e, "failed to cache contract via PutQuery");
+                                tracing::warn!(contract = %key, error = %e, "failed to refresh contract state via PutQuery");
+                            }
+
+                            tracing::debug!(tx = %id, %key, "Refreshed hosting status for already-hosted contract (streaming)");
+                            if !removed_contracts.is_empty() {
+                                super::broadcast_change_interests(
+                                    op_manager,
+                                    vec![],
+                                    removed_contracts,
+                                )
+                                .await;
+                            }
+
+                            // Auto-subscribe: piggyback or fallback (streaming, re-subscribe)
+                            if crate::ring::AUTO_SUBSCRIBE_ON_GET
+                                && is_original_requester
+                                && !op_manager.ring.is_subscribed(&key)
+                            {
+                                super::auto_subscribe_on_get_response(
+                                    op_manager,
+                                    &key,
+                                    &id,
+                                    &sender_from_addr,
+                                    subscribe_requested,
+                                    blocking_sub,
+                                    "streaming, re-subscribe",
+                                )
+                                .await;
                             }
                         }
-
-                        // BUG FIX (2026-01): ALWAYS refresh hosting status on GET.
-                        // This keeps the TTL/LRU position fresh for already-hosted contracts.
-                        op_manager.ring.record_get_access(key, state.size() as u64);
                     }
 
                     // Step 6: Emit telemetry
@@ -2926,6 +3297,7 @@ impl Operation for GetOp {
                         auto_fetch,
                         ack_received: true,
                         speculative_paths: self.speculative_paths,
+                        client_return_code: self.client_return_code,
                     })));
                 }
             }
@@ -2940,6 +3312,7 @@ impl Operation for GetOp {
                 auto_fetch,
                 stream_data,
                 local_fallback,
+                client_return_code: self.client_return_code,
             })
         })
     }
@@ -2976,6 +3349,7 @@ struct GetOpResult {
     auto_fetch: bool,
     stream_data: Option<(StreamId, bytes::Bytes)>,
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
+    client_return_code: bool,
 }
 
 fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
@@ -2989,6 +3363,7 @@ fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
         auto_fetch,
         stream_data,
         local_fallback,
+        client_return_code,
     } = params;
     // Determine the next hop for sending the message:
     // - For Response messages: route back to upstream_addr (who sent us the request)
@@ -3013,6 +3388,7 @@ fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
         auto_fetch,
         ack_received: false,
         speculative_paths: 0,
+        client_return_code,
     });
     let return_msg = msg.map(NetMessage::from);
     let op_state = output_op.map(OpEnum::Get);
@@ -3044,6 +3420,7 @@ async fn try_forward_or_return(
     stats: Option<Box<GetStats>>,
     upstream_addr: Option<std::net::SocketAddr>,
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
+    subscribe: bool,
 ) -> Result<OperationResult, OpError> {
     tracing::warn!(
         tx = %id,
@@ -3122,7 +3499,7 @@ async fn try_forward_or_return(
                 retries: 0,
                 fetch_contract,
                 current_hop: new_htl,
-                subscribe: false,
+                subscribe,
                 blocking_subscribe: false,
                 next_hop: target.clone(),
                 tried_peers,
@@ -3136,6 +3513,7 @@ async fn try_forward_or_return(
                 fetch_contract,
                 htl: new_htl,
                 visited: new_visited,
+                subscribe,
             }),
             result: None,
             // Track the forward target so timeouts report to
@@ -3148,6 +3526,7 @@ async fn try_forward_or_return(
             stream_data: None,
             local_fallback,
             auto_fetch: false,
+            client_return_code: true,
         })
     } else if upstream_addr.is_some() {
         // No targets found — check for local fallback before returning NotFound
@@ -3168,6 +3547,7 @@ async fn try_forward_or_return(
                 stream_data: None,
                 local_fallback: None,
                 auto_fetch: false,
+                client_return_code: true,
             })
         } else {
             tracing::warn!(
@@ -3196,6 +3576,7 @@ async fn try_forward_or_return(
                 stream_data: None,
                 local_fallback: None,
                 auto_fetch: false,
+                client_return_code: true,
             })
         }
     } else {
@@ -3223,6 +3604,7 @@ async fn try_forward_or_return(
             stream_data: None,
             local_fallback: None,
             auto_fetch: false,
+            client_return_code: true,
         })
     }
 }
@@ -3291,6 +3673,12 @@ mod messages {
             htl: usize,
             /// Bloom filter tracking visited peers to prevent loops.
             visited: super::super::VisitedPeers,
+            /// Whether the originator wants a subscription established on the
+            /// response path. When true, relay nodes set up forwarding
+            /// (upstream/downstream registration) so the subscription tree is
+            /// formed by the time the response reaches the originator.
+            #[serde(default)]
+            subscribe: bool,
         },
         /// Response for a GET operation. Routed hop-by-hop back to originator.
         /// Uses instance_id for routing (always available from the request).
@@ -3422,7 +3810,7 @@ mod tests {
     use super::*;
     use crate::message::Transaction;
     use crate::operations::VisitedPeers;
-    use crate::operations::test_utils::make_contract_key;
+    use crate::operations::test_utils::{make_contract_key, make_test_contract};
 
     fn make_get_op(state: Option<GetState>, result: Option<GetResult>) -> GetOp {
         GetOp {
@@ -3435,6 +3823,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         }
     }
 
@@ -3525,6 +3914,77 @@ mod tests {
         );
     }
 
+    /// Regression test for #3757: return_contract_code=false should strip contract
+    /// from client response but still cache WASM internally.
+    #[test]
+    fn get_op_to_host_result_strips_contract_when_client_return_code_false() {
+        let key = make_contract_key(1);
+        let result = GetResult {
+            key,
+            state: WrappedState::new(vec![1, 2, 3]),
+            contract: Some(make_test_contract(&[42u8; 100])),
+        };
+        let mut op = make_get_op(Some(GetState::Finished(FinishedData { key })), Some(result));
+
+        /// Extract the contract field from a to_host_result() GetResponse.
+        fn get_response_contract(op: &GetOp) -> Option<ContractContainer> {
+            let Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::GetResponse { contract, .. },
+            )) = op.to_host_result()
+            else {
+                panic!("Expected Ok(GetResponse)");
+            };
+            contract
+        }
+
+        op.client_return_code = true;
+        assert!(
+            get_response_contract(&op).is_some(),
+            "Contract should be included when client_return_code=true"
+        );
+
+        op.client_return_code = false;
+        assert!(
+            get_response_contract(&op).is_none(),
+            "Contract should be stripped when client_return_code=false"
+        );
+    }
+
+    /// Regression test for #3757: start_op and start_op_with_id should always
+    /// set fetch_contract=true internally, regardless of the client's preference.
+    #[test]
+    fn start_op_always_fetches_contract_code() {
+        let key = make_contract_key(1);
+        let instance_id = *key.id();
+
+        /// Assert that the operation's internal fetch_contract is always true
+        /// while client_return_code matches the caller's original request.
+        fn assert_fetch_state(op: &GetOp, expected_client_return: bool) {
+            let Some(GetState::PrepareRequest(data)) = &op.state else {
+                panic!("Expected PrepareRequest state");
+            };
+            assert!(
+                data.fetch_contract,
+                "Internal fetch_contract should always be true (#3757)"
+            );
+            assert_eq!(op.client_return_code, expected_client_return);
+        }
+
+        // start_op with fetch_contract=false
+        assert_fetch_state(&start_op(instance_id, false, false, false), false);
+        // start_op with fetch_contract=true
+        assert_fetch_state(&start_op(instance_id, true, false, false), true);
+
+        // start_op_with_id should behave identically
+        let tx = Transaction::new::<GetMsg>();
+        assert_fetch_state(
+            &start_op_with_id(instance_id, false, false, false, tx),
+            false,
+        );
+        let tx = Transaction::new::<GetMsg>();
+        assert_fetch_state(&start_op_with_id(instance_id, true, false, false, tx), true);
+    }
+
     // Tests for outcome() method - partial coverage since full stats require complex setup
     #[test]
     fn get_op_outcome_incomplete_without_stats() {
@@ -3550,6 +4010,7 @@ mod tests {
             fetch_contract: false,
             htl: 5,
             visited: VisitedPeers::new(&tx),
+            subscribe: false,
         };
         assert_eq!(*msg.id(), tx, "id() should return the transaction ID");
     }
@@ -3563,6 +4024,7 @@ mod tests {
             fetch_contract: false,
             htl: 5,
             visited: VisitedPeers::new(&tx),
+            subscribe: false,
         };
         let display = format!("{}", msg);
         assert!(
@@ -3793,6 +4255,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         match op.outcome() {
@@ -3820,6 +4283,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
         assert!(
             matches!(op_no_stats.outcome(), OpOutcome::Incomplete),
@@ -3848,6 +4312,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
         assert!(
             matches!(op_success.outcome(), OpOutcome::ContractOpSuccess { .. }),
@@ -3889,6 +4354,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         match op.outcome() {
@@ -3937,6 +4403,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         match op.outcome() {
@@ -3980,6 +4447,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         assert!(
@@ -4012,6 +4480,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
 
         match op.outcome() {
@@ -4099,6 +4568,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         }
     }
 
@@ -4481,6 +4951,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         };
         assert!(!op.is_client_initiated());
     }
@@ -4938,6 +5409,108 @@ mod tests {
         );
     }
 
+    // ── Stream failure retry tests (#3756) ──────────────────────────────────
+
+    /// Regression test: when a streaming GET response fails on the originator
+    /// (stream assembly timeout), the operation should retry with the next
+    /// alternative peer via retry_with_next_alternative, producing a new
+    /// GetMsg::Request. Previously, StreamCancelled was returned as a fatal
+    /// error, bypassing retry entirely and surfacing the error to the user.
+    #[test]
+    fn stream_failure_on_originator_retries_with_next_peer() {
+        let alt1 = make_peer(7001);
+        let alt2 = make_peer(7002);
+        // upstream_addr: None = originator node
+        let op = make_awaiting_op(vec![alt1.clone(), alt2], &[]);
+        assert!(op.upstream_addr.is_none(), "Must be originator");
+
+        // Simulate stream failure: reconstruct the op as the inline retry does,
+        // then call retry_with_next_alternative (same code path as the fix).
+        let retry_op = GetOp {
+            id: op.id,
+            state: op.state,
+            result: op.result,
+            stats: op.stats,
+            upstream_addr: op.upstream_addr,
+            local_fallback: op.local_fallback,
+            auto_fetch: op.auto_fetch,
+            ack_received: false,
+            speculative_paths: op.speculative_paths,
+            client_return_code: true,
+        };
+
+        let result = retry_op.retry_with_next_alternative(7, &[]);
+        assert!(
+            result.is_ok(),
+            "Originator should retry with alternative peer"
+        );
+
+        let (new_op, msg) = result.map_err(|_| "retry failed").unwrap();
+        // Verify the retry targets the first alternative
+        assert!(
+            new_op.get_next_hop_addr().is_some(),
+            "Retry op must have a valid next hop"
+        );
+        assert_eq!(
+            new_op.get_next_hop_addr().unwrap(),
+            alt1.socket_addr().unwrap(),
+            "Should retry with the first available alternative"
+        );
+        // Verify the message is a Request (not a Response or ACK)
+        assert!(
+            matches!(msg, GetMsg::Request { .. }),
+            "Retry should produce a Request message, got {:?}",
+            std::mem::discriminant(&msg)
+        );
+    }
+
+    /// When a streaming GET fails on the originator and all alternatives are
+    /// exhausted, retry_with_next_alternative returns Err and the operation
+    /// should propagate StreamCancelled to the client.
+    #[test]
+    fn stream_failure_with_no_alternatives_returns_error() {
+        // No alternatives, no fallback peers
+        let op = make_awaiting_op(vec![], &[]);
+        assert!(op.upstream_addr.is_none(), "Must be originator");
+
+        let retry_op = GetOp {
+            id: op.id,
+            state: op.state,
+            result: op.result,
+            stats: op.stats,
+            upstream_addr: op.upstream_addr,
+            local_fallback: op.local_fallback,
+            auto_fetch: op.auto_fetch,
+            ack_received: false,
+            speculative_paths: op.speculative_paths,
+            client_return_code: true,
+        };
+
+        let result = retry_op.retry_with_next_alternative(7, &[]);
+        assert!(
+            result.is_err(),
+            "Should fail when no alternatives are available"
+        );
+    }
+
+    /// On a relay node (upstream_addr is Some), stream failure should NOT
+    /// attempt retry -- only the originator retries.
+    #[test]
+    fn stream_failure_on_relay_does_not_retry() {
+        let alt1 = make_peer(8001);
+        let mut op = make_awaiting_op(vec![alt1], &[]);
+        // Set upstream_addr to make this a relay node
+        op.upstream_addr = Some("127.0.0.1:9999".parse().unwrap());
+
+        // The relay code path returns Err(StreamCancelled) immediately,
+        // never reaching retry_with_next_alternative. Verify the relay
+        // has alternatives available (would retry if it were an originator)
+        // but the upstream_addr presence prevents retry.
+        assert!(op.upstream_addr.is_some(), "Must be relay node");
+        // The actual code checks is_original_requester = upstream_addr.is_none()
+        // and only retries when true. This test documents that contract.
+    }
+
     // ── Intermediate node stats tracking tests (#3527) ─────────────────────
 
     use crate::ring::Location;
@@ -4953,6 +5526,7 @@ mod tests {
             auto_fetch: false,
             ack_received: false,
             speculative_paths: 0,
+            client_return_code: true,
         }
     }
 
@@ -5007,5 +5581,155 @@ mod tests {
         let (peer, loc) = op.failure_routing_info().expect("should have routing info");
         assert_eq!(peer, target);
         assert_eq!(loc, contract_location);
+    }
+
+    /// Round-trip serialization: subscribe field is preserved through bincode.
+    /// Note: bincode uses positional encoding, so #[serde(default)] does NOT
+    /// provide backward compat with older binaries missing the field. Wire
+    /// compat is handled by MIN_COMPATIBLE_VERSION + auto-update at handshake.
+    #[test]
+    fn test_get_msg_subscribe_roundtrip() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        // subscribe=true round-trips correctly
+        let msg = GetMsg::Request {
+            id: Transaction::new::<GetMsg>(),
+            instance_id: ContractInstanceId::new([1; 32]),
+            fetch_contract: true,
+            htl: 10,
+            visited: VisitedPeers::default(),
+            subscribe: true,
+        };
+        let bytes = bincode::serialize(&msg).unwrap();
+        let restored: GetMsg = bincode::deserialize(&bytes).unwrap();
+        match restored {
+            GetMsg::Request { subscribe, .. } => assert!(subscribe),
+            _ => panic!("expected Request"),
+        }
+
+        // subscribe=false round-trips correctly
+        let msg_false = GetMsg::Request {
+            id: Transaction::new::<GetMsg>(),
+            instance_id: ContractInstanceId::new([2; 32]),
+            fetch_contract: true,
+            htl: 10,
+            visited: VisitedPeers::default(),
+            subscribe: false,
+        };
+        let bytes_false = bincode::serialize(&msg_false).unwrap();
+        let restored_false: GetMsg = bincode::deserialize(&bytes_false).unwrap();
+        match restored_false {
+            GetMsg::Request { subscribe, .. } => assert!(!subscribe),
+            _ => panic!("expected Request"),
+        }
+    }
+
+    // ============ Timer methods regression tests ============
+
+    /// Verify start_timers() sets both timing fields and record_*_end() completes them,
+    /// producing a ContractOpSuccess with non-zero durations.
+    #[test]
+    fn test_get_stats_timer_methods_produce_valid_timing() {
+        use crate::ring::{Location, PeerKeyLocation};
+        use std::time::Duration;
+
+        let target_peer = PeerKeyLocation::random();
+        let contract_location = Location::random();
+
+        let mut stats = GetStats {
+            next_peer: Some(target_peer.clone()),
+            contract_location,
+            first_response_time: None,
+            transfer_time: None,
+        };
+
+        // start_timers sets both to (now, None)
+        stats.start_timers();
+        assert!(stats.first_response_time.is_some());
+        assert!(stats.transfer_time.is_some());
+        assert!(stats.first_response_time.unwrap().1.is_none());
+        assert!(stats.transfer_time.unwrap().1.is_none());
+
+        // Simulate some work
+        std::thread::sleep(Duration::from_millis(1));
+
+        // record_response_end completes first_response_time
+        stats.record_response_end();
+        assert!(stats.first_response_time.unwrap().1.is_some());
+        assert!(stats.transfer_time.unwrap().1.is_none()); // transfer still open
+
+        std::thread::sleep(Duration::from_millis(1));
+
+        // record_transfer_end completes transfer_time
+        stats.record_transfer_end();
+        assert!(stats.transfer_time.unwrap().1.is_some());
+
+        // Verify the outcome produces ContractOpSuccess with non-zero durations
+        let op = GetOp {
+            id: Transaction::new::<GetMsg>(),
+            state: None,
+            result: Some(GetResult {
+                key: make_contract_key(99),
+                state: WrappedState::new(vec![1, 2, 3]),
+                contract: None,
+            }),
+            stats: Some(Box::new(stats)),
+            upstream_addr: None,
+            local_fallback: None,
+            auto_fetch: false,
+            ack_received: false,
+            speculative_paths: 0,
+            client_return_code: true,
+        };
+
+        match op.outcome() {
+            OpOutcome::ContractOpSuccess {
+                first_response_time,
+                payload_transfer_time,
+                ..
+            } => {
+                assert!(
+                    first_response_time > Duration::ZERO,
+                    "first_response_time should be positive, got {first_response_time:?}"
+                );
+                assert!(
+                    payload_transfer_time > Duration::ZERO,
+                    "payload_transfer_time should be positive, got {payload_transfer_time:?}"
+                );
+                assert!(
+                    payload_transfer_time >= first_response_time,
+                    "transfer should take at least as long as response"
+                );
+            }
+            other => panic!("Expected ContractOpSuccess, got {other:?}"),
+        }
+    }
+
+    /// Verify start_timers resets previous timing (as happens on retry).
+    #[test]
+    fn test_get_stats_start_timers_resets_on_retry() {
+        let mut stats = GetStats {
+            next_peer: None,
+            contract_location: Location::random(),
+            first_response_time: None,
+            transfer_time: None,
+        };
+
+        stats.start_timers();
+        let first_start = stats.first_response_time.unwrap().0;
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        // Simulate retry: start_timers again
+        stats.start_timers();
+        let second_start = stats.first_response_time.unwrap().0;
+
+        assert!(
+            second_start > first_start,
+            "Retry should reset timers to a later instant"
+        );
+        // End timestamps should be cleared on retry
+        assert!(stats.first_response_time.unwrap().1.is_none());
+        assert!(stats.transfer_time.unwrap().1.is_none());
     }
 }

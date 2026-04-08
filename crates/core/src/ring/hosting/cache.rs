@@ -67,6 +67,13 @@ pub struct HostedContract {
     pub last_accessed: Instant,
     /// Type of the last access
     pub access_type: AccessType,
+    /// Whether a local client (HTTP/WebSocket) accessed this contract.
+    /// Only flagged contracts get subscription renewal and local-cache serving.
+    pub local_client_access: bool,
+    /// When the local client last accessed this contract. Age-gates the renewal:
+    /// contracts not accessed locally within SUBSCRIPTION_LEASE_DURATION stop
+    /// being renewed (AGENTS.md cleanup exemption rule). None = never locally accessed.
+    pub local_client_last_access: Option<Instant>,
 }
 
 /// Unified hosting cache that combines byte-budget LRU with TTL protection.
@@ -183,6 +190,8 @@ impl<T: TimeSource> HostingCache<T> {
                 size_bytes,
                 last_accessed: now,
                 access_type,
+                local_client_access: false,
+                local_client_last_access: None,
             };
             self.contracts.insert(key, contract);
             self.lru_order.push_back(key);
@@ -193,6 +202,38 @@ impl<T: TimeSource> HostingCache<T> {
                 evicted,
             }
         }
+    }
+
+    /// Mark a contract as accessed by a local client (HTTP/WebSocket).
+    /// No-op if the contract is not in the cache.
+    pub fn mark_local_client_access(&mut self, key: &ContractKey) {
+        if let Some(existing) = self.contracts.get_mut(key) {
+            existing.local_client_access = true;
+            existing.local_client_last_access = Some(self.time_source.now());
+        }
+    }
+
+    /// Check if a contract was accessed by a local client.
+    pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
+        self.contracts
+            .get(key)
+            .map(|c| c.local_client_access)
+            .unwrap_or(false)
+    }
+
+    /// Check if a contract was accessed by a local client within the given duration.
+    /// Returns false if never locally accessed or if the access is too old.
+    pub fn has_recent_local_client_access(
+        &self,
+        key: &ContractKey,
+        max_age: std::time::Duration,
+    ) -> bool {
+        let now = self.time_source.now();
+        self.contracts
+            .get(key)
+            .and_then(|c| c.local_client_last_access)
+            .map(|t| now.saturating_duration_since(t) < max_age)
+            .unwrap_or(false)
     }
 
     /// Touch/refresh a contract's timestamp without adding it if missing.
@@ -319,6 +360,7 @@ impl<T: TimeSource> HostingCache<T> {
         size_bytes: u64,
         access_type: AccessType,
         last_access_age: Duration,
+        local_client_access: bool,
     ) {
         // Skip if already loaded (shouldn't happen, but defensive)
         if self.contracts.contains_key(&key) {
@@ -329,10 +371,17 @@ impl<T: TimeSource> HostingCache<T> {
         let now = self.time_source.now();
         let last_accessed = now.checked_sub(last_access_age).unwrap_or(now);
 
+        // Locally-accessed contracts loaded from disk get one renewal window
+        // (set to "now") so they can re-establish subscriptions after restart.
+        // If the user doesn't access them again, the age gate expires naturally.
+        let local_client_last_access = if local_client_access { Some(now) } else { None };
+
         let contract = HostedContract {
             size_bytes,
             last_accessed,
             access_type,
+            local_client_access,
+            local_client_last_access,
         };
 
         self.contracts.insert(key, contract);
@@ -704,5 +753,46 @@ mod tests {
         assert!(keys.contains(&key1));
         assert!(keys.contains(&key2));
         assert!(keys.contains(&key3));
+    }
+
+    /// Age gate: has_recent_local_client_access returns false after the
+    /// max_age window expires. This is the TTL enforcement for the cleanup
+    /// exemption rule (AGENTS.md).
+    #[test]
+    fn test_local_client_access_age_gate_expiry() {
+        let lease = Duration::from_secs(480); // SUBSCRIPTION_LEASE_DURATION
+        let (mut cache, time) = make_cache(10000, Duration::from_secs(60));
+        let key = make_key(1);
+
+        cache.record_access(key, 100, AccessType::Get);
+        cache.mark_local_client_access(&key);
+
+        // Immediately after marking: recent access is true
+        assert!(cache.has_local_client_access(&key));
+        assert!(cache.has_recent_local_client_access(&key, lease));
+
+        // Advance time just under the lease -- still recent
+        time.advance_time(lease - Duration::from_secs(1));
+        assert!(cache.has_recent_local_client_access(&key, lease));
+
+        // Advance past the lease -- no longer recent
+        time.advance_time(Duration::from_secs(2));
+        assert!(
+            !cache.has_recent_local_client_access(&key, lease),
+            "Contract should exit renewal after lease expires"
+        );
+
+        // The flag itself is still set (sticky)
+        assert!(
+            cache.has_local_client_access(&key),
+            "Flag should remain sticky even after age gate expires"
+        );
+
+        // Re-marking refreshes the timestamp
+        cache.mark_local_client_access(&key);
+        assert!(
+            cache.has_recent_local_client_access(&key, lease),
+            "Re-marking should refresh the age gate"
+        );
     }
 }

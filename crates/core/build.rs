@@ -8,9 +8,8 @@ fn main() {
     emit_min_compatible_version();
 
     // On Windows, embed an application manifest that declares ComCtl32 v6
-    // dependency. Without this, native-windows-gui crashes at startup with
-    // "GetWindowSubclass Entry Point Not Found" because Windows loads the
-    // legacy ComCtl32 v5 by default. Also embeds the Freenet icon.
+    // dependency. Required by tray-icon/muda for modern Common Controls
+    // (context menus, tooltips). Also embeds the Freenet icon.
     //
     // Uses #[cfg] to gate on the host OS. The winres crate is only available
     // as a build-dependency on Windows hosts (cfg(windows) in Cargo.toml).

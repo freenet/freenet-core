@@ -1261,9 +1261,10 @@ announce_to_river() {
         return 0
     fi
 
-    # Check if riverctl is available
-    if ! command -v riverctl &> /dev/null; then
-        echo "  ⚠️  riverctl not found, skipping River announcement"
+    # Check if river repo is available (we use cargo run, not installed binary)
+    local RIVER_DIR="$HOME/code/freenet/river/main"
+    if [[ ! -d "$RIVER_DIR/cli" ]]; then
+        echo "  ⚠️  River repo not found at $RIVER_DIR, skipping River announcement"
         return 0
     fi
 
@@ -1321,13 +1322,23 @@ if current_key != key_bytes:
     local announcement="Freenet v$VERSION released! https://github.com/freenet/freenet-core/releases/tag/v$VERSION"
 
     echo -n "  Sending announcement to River... "
-    if timeout 60 riverctl message send "$ROOM_OWNER_VK" "$announcement" 2>/dev/null; then
-        echo "✓"
-        mark_completed "RIVER_ANNOUNCED"
+    # IMPORTANT: Must use `cargo run -p riverctl` from the river repo, NOT the installed
+    # `riverctl` binary. The installed binary embeds room_contract.wasm at install time,
+    # which becomes stale when the contract WASM changes. The repo version uses a build
+    # script that copies the current WASM from ui/public/contracts/ at build time.
+    local RIVER_DIR="$HOME/code/freenet/river/main"
+    if [[ -d "$RIVER_DIR" ]]; then
+        if (cd "$RIVER_DIR" && timeout 60 cargo run -p riverctl -- message send "$ROOM_OWNER_VK" "$announcement" 2>/dev/null); then
+            echo "✓"
+            mark_completed "RIVER_ANNOUNCED"
+        else
+            echo "✗"
+            echo "  ⚠️  Failed to send River announcement (non-critical)"
+            echo "     Manual: cd $RIVER_DIR && cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
+        fi
     else
-        echo "✗"
-        echo "  ⚠️  Failed to send River announcement (non-critical)"
-        echo "     Manual: riverctl message send $ROOM_OWNER_VK \"$announcement\""
+        echo "⚠️  River repo not found at $RIVER_DIR"
+        echo "     Manual: cd <river-repo> && cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
     fi
 }
 

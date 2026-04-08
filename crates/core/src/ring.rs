@@ -741,8 +741,9 @@ impl Ring {
             // Try to include connect forward estimator data
             if let Some(op_manager) = ring.upgrade_op_manager() {
                 let cfe = op_manager.connect_forward_estimator.read();
-                let (curve, events, adjustments) = cfe.snapshot();
+                let (curve, data_range, events, adjustments) = cfe.snapshot();
                 snapshot.connect_forward_curve = Some(curve);
+                snapshot.connect_forward_data_range = Some(data_range);
                 snapshot.connect_forward_events = Some(events);
                 snapshot.connect_forward_peer_adjustments = Some(adjustments);
             }
@@ -1693,6 +1694,16 @@ impl Ring {
         self.hosting_manager.touch_hosting(key)
     }
 
+    /// Mark a contract as accessed by a local client (HTTP/WebSocket).
+    pub fn mark_local_client_access(&self, key: &ContractKey) {
+        self.hosting_manager.mark_local_client_access(key)
+    }
+
+    /// Check if a contract was accessed by a local client.
+    pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
+        self.hosting_manager.has_local_client_access(key)
+    }
+
     /// Sweep for expired entries in the hosting cache.
     ///
     /// Returns contracts evicted from this cache. Contracts with client
@@ -1818,13 +1829,34 @@ impl Ring {
         const PEER_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(30);
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         /// Duration of zero ring connections before escalating recovery.
+        /// Uses a shorter threshold initially (before first successful connection)
+        /// so that cold-start failures after OS restart recover faster (#3737).
         const ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(120);
+        const INITIAL_ISOLATION_ESCALATION_THRESHOLD: Duration = Duration::from_secs(30);
         /// Max time to hold a deferred swap drop before abandoning it.
         const DEFERRED_SWAP_DROP_TTL: Duration = Duration::from_secs(120);
+
+        /// How often to probe a gateway for version discovery (#3677).
+        #[cfg(not(test))]
+        const GATEWAY_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(4 * 3600);
+        #[cfg(test)]
+        const GATEWAY_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+        const GATEWAY_PROBE_JITTER_FACTOR: f64 = 0.2;
+
         // Deferred swap drops: (addr, queued_at) using time_source for
         // deterministic simulation support.
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
         let mut zero_connections_since: Option<Instant> = None;
+        // Track whether we've ever had ring connections. Before the first
+        // successful connection, use a shorter isolation escalation threshold
+        // for faster recovery from cold-start failures (#3737).
+        let mut ever_had_connections = false;
+
+        // Gateway version probe: random initial delay to prevent thundering herd.
+        // The loop guard (`!is_gateway`) ensures gateways never probe themselves.
+        let initial_probe_delay_secs =
+            GlobalRng::random_u64() % GATEWAY_VERSION_PROBE_INTERVAL.as_secs();
+        let mut next_gateway_probe = Instant::now() + Duration::from_secs(initial_probe_delay_secs);
 
         // Adaptive fast-tick backoff: increase the fast-tick interval when
         // connection count stops growing, to avoid hammering the network
@@ -2013,11 +2045,22 @@ impl Ring {
             // Expose to update check task for version mismatch decisions (#3204).
             crate::transport::set_open_connection_count(current_conn_count);
             if current_conn_count == 0 {
+                // Use shorter threshold before first successful connection so
+                // cold-start failures (e.g., after OS restart) recover in ~30s
+                // instead of ~120s. Once the node has connected at least once,
+                // use the steady-state threshold. See #3737.
+                let threshold = if ever_had_connections {
+                    ISOLATION_ESCALATION_THRESHOLD
+                } else {
+                    INITIAL_ISOLATION_ESCALATION_THRESHOLD
+                };
                 if let Some(since) = zero_connections_since {
-                    if since.elapsed() > ISOLATION_ESCALATION_THRESHOLD {
+                    if since.elapsed() > threshold {
                         tracing::warn!(
                             is_gateway,
                             isolated_for_secs = since.elapsed().as_secs(),
+                            threshold_secs = threshold.as_secs(),
+                            ever_connected = ever_had_connections,
                             "Node isolated with zero ring connections — resetting all backoff state"
                         );
                         reset_all_backoff();
@@ -2031,10 +2074,46 @@ impl Ring {
                     );
                 }
             } else if zero_connections_since.take().is_some() {
+                ever_had_connections = true;
                 tracing::info!(
                     connections = current_conn_count,
                     "Recovered from zero-connection state"
                 );
+            }
+
+            // Periodic gateway version probe: initiate a CONNECT to a gateway so the
+            // transport handshake exchanges version info, even when the ring is full (#3677).
+            //
+            // The combined predicate (`!is_gateway && !configured_gateways.is_empty() &&
+            // now >= next_probe`) is extracted into `should_probe_gateway` so each branch
+            // is unit-testable. Without the empty-gateways guard merged into the same
+            // condition, the index/modulo on the next line would panic.
+            if should_probe_gateway(
+                is_gateway,
+                !op_manager.configured_gateways.is_empty(),
+                Instant::now(),
+                next_gateway_probe,
+            ) {
+                let gw_index =
+                    GlobalRng::random_u64() as usize % op_manager.configured_gateways.len();
+                let gateway = &op_manager.configured_gateways[gw_index];
+
+                if let Err(e) =
+                    crate::operations::connect::gateway_version_probe(gateway, &op_manager).await
+                {
+                    tracing::debug!(
+                        error = %e,
+                        gateway = %gateway,
+                        "Gateway version probe failed, will retry next cycle"
+                    );
+                }
+
+                let base_secs = GATEWAY_VERSION_PROBE_INTERVAL.as_secs() as f64;
+                let jitter_range = base_secs * GATEWAY_PROBE_JITTER_FACTOR;
+                let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
+                let jittered_secs = base_secs + jitter_range * (2.0 * uniform_01 - 1.0);
+                next_gateway_probe =
+                    Instant::now() + Duration::from_secs_f64(jittered_secs.max(1.0));
             }
 
             // Gateway bootstrap fallback: at zero connections, acquire_new always
@@ -2323,10 +2402,13 @@ impl Ring {
 
                 if !deferred_swap_drops.is_empty() {
                     let fresh_count = self.connection_manager.connection_count();
-                    let headroom =
-                        fresh_count.saturating_sub(self.connection_manager.min_connections);
-                    let to_drop = headroom.min(deferred_swap_drops.len());
-                    for (addr, _) in deferred_swap_drops.drain(..to_drop) {
+                    let min_conn = self.connection_manager.min_connections;
+                    let n_to_drop = deferred_swap_drops_to_execute(
+                        fresh_count,
+                        min_conn,
+                        deferred_swap_drops.len(),
+                    );
+                    for (addr, _) in deferred_swap_drops.drain(..n_to_drop) {
                         tracing::info!(
                             peer = %addr,
                             connections = fresh_count,
@@ -2626,6 +2708,107 @@ fn calculate_allowed_connection_additions(
     available_capacity.min(requested)
 }
 
+/// Compute how many deferred swap-drops can be executed this tick.
+///
+/// A deferred drop is safe to execute only when a replacement peer has actually
+/// connected.  The guard: `current_connections > min_connections + pending_drops`
+/// — meaning we have at least one extra connection above what's needed to cover
+/// all pending drops plus the minimum.  Each drop we commit to reduces the
+/// effective count by one, so we re-evaluate per element.
+///
+/// Drops are sent as async events; `connection_count()` won't reflect them until
+/// the events are processed.  We track the decrement locally instead.
+fn deferred_swap_drops_to_execute(
+    current_connections: usize,
+    min_connections: usize,
+    pending_drops: usize,
+) -> usize {
+    let mut effective_count = current_connections;
+    let mut n_to_drop = 0usize;
+    for _ in 0..pending_drops {
+        let remaining_pending = pending_drops - n_to_drop;
+        if effective_count > min_connections.saturating_add(remaining_pending) {
+            n_to_drop += 1;
+            effective_count = effective_count.saturating_sub(1);
+        } else {
+            break;
+        }
+    }
+    n_to_drop
+}
+
+/// Predicate controlling when `connection_maintenance` fires a gateway version probe.
+///
+/// Extracted as a free function so each branch (gateway role, empty configuration,
+/// timing) can be exercised in unit tests without standing up an `OpManager`. The
+/// caller relies on `has_configured_gateways` to gate the modulo-indexing into
+/// `op_manager.configured_gateways` — flipping that flag at the call site (rather
+/// than inside this function) keeps the borrow of the gateway slice local to the
+/// caller.
+#[inline]
+fn should_probe_gateway(
+    is_gateway: bool,
+    has_configured_gateways: bool,
+    now: Instant,
+    next_probe: Instant,
+) -> bool {
+    !is_gateway && has_configured_gateways && now >= next_probe
+}
+
+#[cfg(test)]
+mod gateway_version_probe_predicate_tests {
+    use super::should_probe_gateway;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn fires_on_non_gateway_with_configured_gateways_at_due_time() {
+        let now = Instant::now();
+        let next_probe = now - Duration::from_secs(1);
+        assert!(should_probe_gateway(false, true, now, next_probe));
+    }
+
+    #[test]
+    fn skipped_when_running_as_gateway() {
+        // Gateways must never probe themselves — they are the destination, not
+        // the originator. This is the protection that keeps the gateway loop
+        // from generating phantom CONNECTs.
+        let now = Instant::now();
+        let next_probe = now - Duration::from_secs(1);
+        assert!(!should_probe_gateway(true, true, now, next_probe));
+    }
+
+    #[test]
+    fn skipped_when_no_gateways_are_configured() {
+        // The empty-gateways case is the boundary that previously sat in an
+        // inner `if` and was unreachable from any test. Merging it into the
+        // predicate makes the modulo-indexing in the caller structurally safe.
+        let now = Instant::now();
+        let next_probe = now - Duration::from_secs(1);
+        assert!(!should_probe_gateway(false, false, now, next_probe));
+    }
+
+    #[test]
+    fn skipped_before_due_time() {
+        let now = Instant::now();
+        let next_probe = now + Duration::from_secs(60);
+        assert!(!should_probe_gateway(false, true, now, next_probe));
+    }
+
+    #[test]
+    fn fires_at_exact_due_time_boundary() {
+        // `>=` semantics: a now equal to next_probe should fire, not skip.
+        let now = Instant::now();
+        assert!(should_probe_gateway(false, true, now, now));
+    }
+
+    #[test]
+    fn gateway_with_no_configured_gateways_is_still_skipped() {
+        let now = Instant::now();
+        assert!(!should_probe_gateway(true, false, now, now));
+    }
+}
+
 #[cfg(test)]
 mod max_concurrent_connections_tests {
     use super::calculate_max_concurrent_connections;
@@ -2762,6 +2945,7 @@ mod refresh_router_tests {
                     payload_size: 1000,
                     payload_transfer_time: Duration::from_millis(100),
                 },
+                op_type: None,
             })
             .collect()
     }
@@ -2813,6 +2997,91 @@ mod refresh_router_tests {
         let snapshot = router.read().snapshot();
         assert_eq!(snapshot.failure_events, 0);
         assert_eq!(snapshot.success_events, 0);
+    }
+}
+
+#[cfg(test)]
+mod deferred_swap_drop_tests {
+    use super::deferred_swap_drops_to_execute;
+
+    /// 3-node ring: current=2, min=1, pending=1.
+    /// The original bug: headroom = 2-1 = 1 > 0, so the old code fired the drop,
+    /// kicking the only other peer and leaving the node isolated.
+    /// Fixed: guard requires current > min + pending (2 > 1+1 = 2) → false.
+    #[test]
+    fn three_node_ring_no_drop_without_replacement() {
+        assert_eq!(deferred_swap_drops_to_execute(2, 1, 1), 0);
+    }
+
+    /// Replacement connected in a 3-node ring: current=3, min=1, pending=1.
+    /// 3 > 1+1=2 → true. One drop allowed.
+    #[test]
+    fn three_node_ring_drop_when_replacement_connected() {
+        assert_eq!(deferred_swap_drops_to_execute(3, 1, 1), 1);
+    }
+
+    /// At min_connections with no pending drops: current=10, min=10, pending=0.
+    /// No pending drops means nothing to execute.
+    #[test]
+    fn no_pending_drops_returns_zero() {
+        assert_eq!(deferred_swap_drops_to_execute(10, 10, 0), 0);
+    }
+
+    /// Large network, no replacements yet: current=12, min=10, pending=3.
+    /// 12 > 10+3=13 → false. None dropped.
+    #[test]
+    fn large_network_no_drop_without_replacement() {
+        assert_eq!(deferred_swap_drops_to_execute(12, 10, 3), 0);
+    }
+
+    /// Large network, exactly enough for one replacement: current=13, min=10, pending=3.
+    /// i=0: remaining=3, 13 > 13 → false. Still none.
+    #[test]
+    fn large_network_boundary_no_drop() {
+        assert_eq!(deferred_swap_drops_to_execute(13, 10, 3), 0);
+    }
+
+    /// Large network, one replacement connected: current=14, min=10, pending=3.
+    /// i=0: remaining=3, 14 > 13 → true (effective=13, n=1)
+    /// i=1: remaining=2, 13 > 12 → true (effective=12, n=2)
+    /// i=2: remaining=1, 12 > 11 → true (effective=11, n=3)
+    /// All 3 dropped; after drops effective=11 ≥ min=10.
+    #[test]
+    fn large_network_all_replacements_connected() {
+        assert_eq!(deferred_swap_drops_to_execute(14, 10, 3), 3);
+    }
+
+    /// current exactly at min with one pending: current=10, min=10, pending=1.
+    /// 10 > 10+1=11 → false. No drop.
+    #[test]
+    fn at_min_with_pending_no_drop() {
+        assert_eq!(deferred_swap_drops_to_execute(10, 10, 1), 0);
+    }
+
+    /// current = min + 1 with one pending: current=11, min=10, pending=1.
+    /// 11 > 11 → false. No drop (1 extra but still need the pending slot covered).
+    #[test]
+    fn one_above_min_with_pending_no_drop() {
+        assert_eq!(deferred_swap_drops_to_execute(11, 10, 1), 0);
+    }
+
+    /// current = min + 2 with one pending: current=12, min=10, pending=1.
+    /// 12 > 11 → true. One drop allowed.
+    #[test]
+    fn two_above_min_with_one_pending_drops_one() {
+        assert_eq!(deferred_swap_drops_to_execute(12, 10, 1), 1);
+    }
+
+    /// Overflow-safe: current=0, min=0, pending=0.
+    #[test]
+    fn all_zero_returns_zero() {
+        assert_eq!(deferred_swap_drops_to_execute(0, 0, 0), 0);
+    }
+
+    /// current < min (below minimum, e.g. still bootstrapping): no drops.
+    #[test]
+    fn below_min_connections_no_drop() {
+        assert_eq!(deferred_swap_drops_to_execute(5, 10, 2), 0);
     }
 }
 

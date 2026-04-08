@@ -678,6 +678,14 @@ pub(crate) enum NodeEvent {
         key: ContractKey,
         new_state: WrappedState,
     },
+    /// Send state to a specific peer that reported a stale summary.
+    /// Unlike BroadcastStateChange (which fans out to ALL subscribers),
+    /// this targets only the peer that needs catching up.
+    SyncStateToPeer {
+        key: ContractKey,
+        new_state: WrappedState,
+        target: SocketAddr,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -773,10 +781,36 @@ impl Display for NodeEvent {
                 )
             }
             NodeEvent::SendInterestMessage { target, message } => {
-                write!(f, "SendInterestMessage (to: {target}, msg: {message:?})")
+                let msg_summary = match message {
+                    InterestMessage::Interests { hashes } => {
+                        format!("Interests({} hashes)", hashes.len())
+                    }
+                    InterestMessage::Summaries { entries } => {
+                        format!("Summaries({} entries)", entries.len())
+                    }
+                    InterestMessage::ChangeInterests { added, removed } => {
+                        format!(
+                            "ChangeInterests(+{} -{} hashes)",
+                            added.len(),
+                            removed.len()
+                        )
+                    }
+                    InterestMessage::ResyncRequest { key } => {
+                        format!("ResyncRequest({key})")
+                    }
+                    InterestMessage::ResyncResponse {
+                        key, state_bytes, ..
+                    } => {
+                        format!("ResyncResponse({key}, {} bytes)", state_bytes.len())
+                    }
+                };
+                write!(f, "SendInterestMessage (to: {target}, {msg_summary})")
             }
             NodeEvent::BroadcastStateChange { key, .. } => {
                 write!(f, "BroadcastStateChange (contract: {key})")
+            }
+            NodeEvent::SyncStateToPeer { key, target, .. } => {
+                write!(f, "SyncStateToPeer (contract: {key}, target: {target})")
             }
         }
     }
@@ -1051,5 +1085,66 @@ mod tests {
         let deserialized: DeltaOrFullState =
             bincode::deserialize(&serialized).expect("deserialize failed");
         assert!(matches!(deserialized, DeltaOrFullState::FullState(ref bytes) if bytes.is_empty()));
+    }
+
+    /// Verify SendInterestMessage Display produces compact output instead of
+    /// dumping the full payload. This prevents regression to the 565KB-per-line
+    /// log spam that caused 346MB/hr of gateway logs.
+    #[test]
+    fn test_send_interest_message_display_is_compact() {
+        use std::net::SocketAddr;
+
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        // Summaries with large payload should show count, not bytes
+        let summaries = NodeEvent::SendInterestMessage {
+            target: addr,
+            message: InterestMessage::Summaries {
+                entries: vec![
+                    SummaryEntry {
+                        hash: 123,
+                        summary_bytes: Some(vec![0u8; 10_000]),
+                    },
+                    SummaryEntry {
+                        hash: 456,
+                        summary_bytes: Some(vec![0u8; 10_000]),
+                    },
+                ],
+            },
+        };
+        let display = format!("{summaries}");
+        assert!(
+            display.len() < 200,
+            "Display should be compact, got {} bytes: {display}",
+            display.len()
+        );
+        assert!(
+            display.contains("Summaries(2 entries)"),
+            "Should show entry count: {display}"
+        );
+
+        // Interests should show hash count
+        let interests = NodeEvent::SendInterestMessage {
+            target: addr,
+            message: InterestMessage::Interests {
+                hashes: vec![1, 2, 3, 4, 5],
+            },
+        };
+        let display = format!("{interests}");
+        assert!(display.contains("Interests(5 hashes)"), "{display}");
+
+        // ChangeInterests should show added/removed counts
+        let changes = NodeEvent::SendInterestMessage {
+            target: addr,
+            message: InterestMessage::ChangeInterests {
+                added: vec![1, 2],
+                removed: vec![3],
+            },
+        };
+        let display = format!("{changes}");
+        assert!(
+            display.contains("ChangeInterests(+2 -1 hashes)"),
+            "{display}"
+        );
     }
 }

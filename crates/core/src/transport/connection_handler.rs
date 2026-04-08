@@ -30,7 +30,7 @@ use version_cmp::PROTOC_VERSION;
 
 use super::{
     Socket, TransportError,
-    congestion_control::CongestionControlConfig,
+    congestion_control::{CongestionControl, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
     fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
@@ -85,6 +85,20 @@ const GW_RAMP_PHASE2_RATE: u64 = 20;
 /// Duration to keep outdated peer entries before cleanup.
 /// Peers with incompatible protocol versions are ignored for this duration.
 const OUTDATED_PEER_EXPIRY: Duration = Duration::from_secs(600);
+
+/// Window used to sample the congestion controller's current rate when
+/// initializing a token bucket. Must stay in sync with `MIN_BUCKET_CAPACITY_BYTES`:
+/// the bucket holds exactly one window's worth of tokens at the initial rate
+/// (`initial_rate / 10` == `initial_rate * TOKEN_BUCKET_WINDOW`).
+const TOKEN_BUCKET_WINDOW: Duration = Duration::from_millis(100);
+
+/// Minimum token bucket capacity in bytes (8 KiB floor).
+///
+/// Prevents the bucket from becoming so small that a single max-size packet
+/// (~1200 bytes) cannot be admitted, stalling connections at very low rates.
+/// 8 KiB (~6–7 max-size packets) provides enough headroom for burst handling
+/// without allowing large uncontrolled bursts.
+const MIN_BUCKET_CAPACITY_BYTES: usize = 8192;
 
 pub type SerializedMessage = Vec<u8>;
 
@@ -1774,15 +1788,25 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 .unwrap_or_default()
                 .build_arc_with_time_source(time_source.clone());
 
-            // Initialize token bucket for smooth packet pacing
-            // Use global bandwidth manager if configured, otherwise fall back to per-connection limit
+            // Initialize token bucket for smooth packet pacing.
+            // Use global bandwidth manager if configured, otherwise use the
+            // congestion controller's configured rate. Previously defaulted to
+            // 10 MB/s which is 8x higher than FixedRate's 1.25 MB/s — the
+            // initial burst triggered packet loss and immediate loss_pause,
+            // collapsing throughput. See #3702.
             let initial_rate = if let Some(ref global) = global_bandwidth {
                 global.register_connection()
+            } else if let Some(limit) = bandwidth_limit {
+                limit
             } else {
-                bandwidth_limit.unwrap_or(10_000_000) // 10 MB/s default
+                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
             };
+            // Capacity = one TOKEN_BUCKET_WINDOW worth of tokens at the configured rate.
+            // Previously 1MB, which allowed an immediate burst 800x larger
+            // than FixedRate's per-100ms budget, triggering loss. See #3702.
+            let bucket_capacity = (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
             let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-                1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)
+                bucket_capacity,
                 initial_rate,
                 time_source.clone(),
             ));
@@ -2093,17 +2117,22 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 .unwrap_or_default()
                                                 .build_arc_with_time_source(time_source.clone());
 
-                                            // Initialize token bucket
-                                            // Use global bandwidth manager if configured
+                                            // Initialize token bucket at congestion controller's
+                                            // rate to avoid initial burst. See #3702.
                                             let initial_rate =
                                                 if let Some(ref global) = global_bandwidth {
                                                     global.register_connection()
+                                                } else if let Some(limit) = bandwidth_limit {
+                                                    limit
                                                 } else {
-                                                    bandwidth_limit.unwrap_or(10_000_000)
+                                                    congestion_controller
+                                                        .current_rate(TOKEN_BUCKET_WINDOW)
                                                 };
+                                            let bucket_capacity =
+                                                (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                             let token_bucket =
                                                 Arc::new(TokenBucket::new_with_time_source(
-                                                    1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)
+                                                    bucket_capacity,
                                                     initial_rate,
                                                     time_source.clone(),
                                                 ));
@@ -2201,15 +2230,19 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     .unwrap_or_default()
                                     .build_arc_with_time_source(time_source.clone());
 
-                                // Initialize token bucket
-                                // Use global bandwidth manager if configured
+                                // Initialize token bucket at congestion controller's
+                                // rate to avoid initial burst. See #3702.
                                 let initial_rate = if let Some(ref global) = global_bandwidth {
                                     global.register_connection()
+                                } else if let Some(limit) = bandwidth_limit {
+                                    limit
                                 } else {
-                                    bandwidth_limit.unwrap_or(10_000_000)
+                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
                                 };
+                                let bucket_capacity =
+                                    (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                 let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-                                    1_000_000, // capacity = 1 MB burst (prevents token starvation on localhost)
+                                    bucket_capacity,
                                     initial_rate,
                                     time_source.clone(),
                                 ));

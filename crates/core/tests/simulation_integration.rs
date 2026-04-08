@@ -6242,6 +6242,75 @@ fn test_readiness_gating_with_message_loss() {
 }
 
 // =============================================================================
+// Gateway Version Probe Tests
+// =============================================================================
+
+/// Verify that the periodic gateway version probe does not break
+/// connection_maintenance. Actual version mismatch detection is not testable
+/// in simulation (all nodes share the same PROTOC_VERSION). (#3677)
+#[test]
+fn test_gateway_version_probe_fires() {
+    const SEED: u64 = 0x6A7E_7AE9_0001;
+
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let sim = rt.block_on(async {
+        SimNetwork::new(
+            "test-gw-version-probe",
+            1,  // gateways
+            3,  // nodes
+            7,  // ring_max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    let logs_handle = sim.event_logs_handle();
+
+    drop(rt);
+
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(SEED, 3, 30, Duration::from_secs(1))
+        .expect("Simulation should complete without panic");
+
+    let rt = create_runtime();
+    let unique_connect_txs = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        // Count distinct Connect transactions, not raw events. Each CONNECT op
+        // emits multiple log entries (sent/received/accepted) that share a Tx.
+        // Counting unique Tx values gives us the number of *operations*, which
+        // is what the probe code path actually generates.
+        let mut seen = std::collections::HashSet::new();
+        for log in logs.iter() {
+            if log.kind.variant_name() == "Connect" {
+                seen.insert(log.tx);
+            }
+        }
+        seen.len()
+    });
+
+    // Bootstrap baseline: each of the 3 non-gateway nodes initiates an initial
+    // CONNECT to the gateway, so the bootstrap floor is 3 unique transactions.
+    // (Bootstrap may also retry on failure, but that just adds to the floor.)
+    //
+    // Probe budget: cfg(test) sets GATEWAY_VERSION_PROBE_INTERVAL to 10s with
+    // a random initial delay in [0, 10)s and ±20% jitter per cycle. Over 30s
+    // of sim time, each non-gateway can fire 1–3 probes, so 3 nodes contribute
+    // an additional 3–9 unique CONNECT transactions on top of bootstrap.
+    //
+    // Asserting > 6 (bootstrap floor + at least one probe per node) is robust
+    // against the random initial delay while still proving probes fire.
+    assert!(
+        unique_connect_txs > 6,
+        "Expected bootstrap (~3) + at least 4 probe CONNECTs, got {unique_connect_txs}"
+    );
+}
+
+// =============================================================================
 // CONNECT Acceptor Diversity: Joiner succeeds despite NAT-blocked acceptor
 // =============================================================================
 
@@ -7564,7 +7633,7 @@ fn test_get_reliability_diagnostic() {
             // Retry-storm: transactions with >10 request events (same tx hitting many peers)
             let retry_storms: Vec<_> = request_count_per_tx
                 .iter()
-                .filter(|(_, &count)| count > 10)
+                .filter(|&(_, &count)| count > 10)
                 .map(|(tx, count)| (tx.clone(), *count))
                 .collect();
 
@@ -8135,4 +8204,426 @@ fn test_get_reliability_with_churn() {
             total_outcomes
         );
     }
+}
+
+/// Nightly: 50-node topology formation with strict connectivity assertions.
+///
+/// Verifies that a 50-node network converges to `min_connections` within 1 virtual hour.
+/// Uses the Direct Runner for scale (50+ nodes) and determinism.
+///
+/// **Assertions (per testing.md realism requirements):**
+/// 1. Median connections >= `min_connections` (strict, not min-1)
+/// 2. >= 90% of nodes reach `min_connections`
+/// 3. >= 80% of nodes have non-gateway peer connections
+#[cfg(feature = "nightly_tests")]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_nightly_50_node_topology_formation() {
+    use freenet::dev_tool::NodeLabel;
+
+    const SEED: u64 = 0x3511_5000_0001;
+    const NETWORK_NAME: &str = "nightly-50-topology";
+    const GATEWAYS: usize = 4;
+    const NODES: usize = 50;
+    const RING_MAX_HTL: usize = 10;
+    const RND_IF_HTL_ABOVE: usize = 5;
+    const MAX_CONN: usize = 20;
+    const MIN_CONN: usize = 10;
+    const VIRTUAL_DURATION: Duration = Duration::from_secs(3600); // 1 hour
+
+    tracing::info!("=== Nightly: 50-Node Topology Formation ===");
+
+    setup_deterministic_state(SEED);
+
+    let mut sim = SimNetwork::new(
+        NETWORK_NAME,
+        GATEWAYS,
+        NODES,
+        RING_MAX_HTL,
+        RND_IF_HTL_ABOVE,
+        MAX_CONN,
+        MIN_CONN,
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 0, 0)
+        .await;
+
+    tracing::info!("Running 1 virtual hour of topology formation...");
+    let_network_run(&mut sim, VIRTUAL_DURATION).await;
+
+    // Collect per-node connection counts
+    let mut node_counts: Vec<usize> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.connection_count(&label)
+        })
+        .collect();
+    node_counts.sort_unstable();
+
+    let num_sampled = node_counts.len();
+    assert!(num_sampled > 0, "No connection managers available");
+
+    let median_conn = node_counts[num_sampled / 2];
+    let nodes_above_min = node_counts.iter().filter(|&&c| c >= MIN_CONN).count();
+    let fraction_above_min = nodes_above_min as f64 / num_sampled as f64;
+
+    tracing::info!("Connection counts: {:?}", node_counts);
+    tracing::info!(
+        "Median={}, nodes at min_connections={}/{} ({:.0}%)",
+        median_conn,
+        nodes_above_min,
+        num_sampled,
+        fraction_above_min * 100.0
+    );
+
+    // Check non-gateway peer connections
+    let connectivity = sim.node_connectivity();
+    let mut nodes_with_peer_connections = 0usize;
+    for (label, (_key, conns)) in &connectivity {
+        if !label.is_gateway() && conns.keys().any(|peer| !peer.is_gateway()) {
+            nodes_with_peer_connections += 1;
+        }
+    }
+    let peer_conn_fraction = nodes_with_peer_connections as f64 / NODES as f64;
+
+    tracing::info!(
+        "Nodes with non-gateway peer connections: {}/{} ({:.0}%)",
+        nodes_with_peer_connections,
+        NODES,
+        peer_conn_fraction * 100.0
+    );
+
+    // ASSERTION 1: Median connections >= min_connections (strict).
+    // With 50 nodes and 1 hour, the network must fully converge.
+    assert!(
+        median_conn >= MIN_CONN,
+        "Topology formation stall: median={} < min_connections={}. \
+         Counts: {:?}. Seed: 0x{:X}",
+        median_conn,
+        MIN_CONN,
+        node_counts,
+        SEED
+    );
+
+    // ASSERTION 2: >= 90% of nodes reach min_connections (per testing.md).
+    assert!(
+        fraction_above_min >= 0.90,
+        "Only {:.0}% of nodes reached min_connections (expected >= 90%). \
+         {}/{} nodes. Counts: {:?}. Seed: 0x{:X}",
+        fraction_above_min * 100.0,
+        nodes_above_min,
+        num_sampled,
+        node_counts,
+        SEED
+    );
+
+    // ASSERTION 3: >= 80% of nodes have non-gateway peer connections.
+    assert!(
+        peer_conn_fraction >= 0.80,
+        "Only {:.0}% of nodes have non-gateway peer connections (expected >= 80%). \
+         CONNECT forwarding is insufficient. Seed: 0x{:X}",
+        peer_conn_fraction * 100.0,
+        SEED
+    );
+
+    tracing::info!(
+        "PASSED: median={}, above_min={:.0}%, peer_conns={:.0}%",
+        median_conn,
+        fraction_above_min * 100.0,
+        peer_conn_fraction * 100.0
+    );
+}
+
+/// Nightly: Connection growth rate checkpoints — monotonic growth toward `min_connections`.
+///
+/// Measures connection counts at 5m, 15m, 30m, 60m virtual time and asserts that
+/// median connections grow monotonically. Catches growth plateaus and stalls that
+/// are invisible in short-duration CI tests.
+///
+/// **Assertions:**
+/// 1. Median connections at each checkpoint >= previous checkpoint (monotonic growth)
+/// 2. Final median >= `min_connections`
+/// 3. No checkpoint after 5m has median = 0 (no network collapse)
+#[cfg(feature = "nightly_tests")]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_nightly_connection_growth_checkpoints() {
+    use freenet::dev_tool::NodeLabel;
+
+    const SEED: u64 = 0x3511_6C8E_0002;
+    const NETWORK_NAME: &str = "nightly-growth-checkpoints";
+    const GATEWAYS: usize = 4;
+    const NODES: usize = 50;
+    const RING_MAX_HTL: usize = 10;
+    const RND_IF_HTL_ABOVE: usize = 5;
+    const MAX_CONN: usize = 20;
+    const MIN_CONN: usize = 10;
+
+    // Checkpoint intervals (cumulative seconds from start)
+    const CHECKPOINTS_SECS: [u64; 4] = [300, 900, 1800, 3600]; // 5m, 15m, 30m, 60m
+
+    tracing::info!("=== Nightly: Connection Growth Checkpoints ===");
+
+    setup_deterministic_state(SEED);
+
+    let mut sim = SimNetwork::new(
+        NETWORK_NAME,
+        GATEWAYS,
+        NODES,
+        RING_MAX_HTL,
+        RND_IF_HTL_ABOVE,
+        MAX_CONN,
+        MIN_CONN,
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 0, 0)
+        .await;
+
+    let mut checkpoint_medians: Vec<(u64, usize)> = Vec::new();
+    let mut elapsed_so_far = 0u64;
+
+    for &target_secs in &CHECKPOINTS_SECS {
+        let delta = target_secs - elapsed_so_far;
+        let_network_run(&mut sim, Duration::from_secs(delta)).await;
+        elapsed_so_far = target_secs;
+
+        let mut counts: Vec<usize> = (0..NODES)
+            .filter_map(|i| {
+                let label = NodeLabel::node(NETWORK_NAME, i);
+                sim.connection_count(&label)
+            })
+            .collect();
+        counts.sort_unstable();
+
+        let median = if counts.is_empty() {
+            0
+        } else {
+            counts[counts.len() / 2]
+        };
+
+        tracing::info!(
+            "Checkpoint @{}m: median={}, counts={:?}",
+            target_secs / 60,
+            median,
+            counts
+        );
+
+        // No total network collapse after the bootstrap phase.
+        assert!(
+            median > 0 || elapsed_so_far <= 300,
+            "Network collapse at checkpoint @{}m: median=0. Counts: {:?}. Seed: 0x{:X}",
+            target_secs / 60,
+            counts,
+            SEED
+        );
+
+        checkpoint_medians.push((target_secs, median));
+    }
+
+    // Monotonic growth — each checkpoint median >= previous.
+    for window in checkpoint_medians.windows(2) {
+        let (prev_t, prev_median) = window[0];
+        let (curr_t, curr_median) = window[1];
+        assert!(
+            curr_median >= prev_median,
+            "Connection growth stalled between @{}m (median={}) and @{}m (median={}). \
+             Growth must be monotonic. Seed: 0x{:X}",
+            prev_t / 60,
+            prev_median,
+            curr_t / 60,
+            curr_median,
+            SEED
+        );
+    }
+
+    // Final checkpoint median >= min_connections.
+    let (_, final_median) = checkpoint_medians.last().unwrap();
+    assert!(
+        *final_median >= MIN_CONN,
+        "Final median={} < min_connections={} after 60 virtual minutes. \
+         Checkpoints: {:?}. Seed: 0x{:X}",
+        final_median,
+        MIN_CONN,
+        checkpoint_medians,
+        SEED
+    );
+
+    tracing::info!("PASSED: checkpoints={:?}", checkpoint_medians);
+}
+
+/// Nightly: Fault injection and recovery speed — network self-heals within bounded time.
+///
+/// Three phases:
+/// 1. **Convergence** (30 virtual min): Let network form connections normally.
+/// 2. **Fault injection** (5 virtual min): 20% message loss simulating NAT failures.
+/// 3. **Recovery** (25 virtual min): Remove faults, verify network recovers.
+///
+/// **Assertions:**
+/// 1. Pre-fault median >= `min_connections` (network converged)
+/// 2. No death spiral during faults (median > 0)
+/// 3. Post-recovery median >= pre-fault median - 1 (bounded recovery)
+/// 4. < 5% nodes isolated after recovery
+#[cfg(feature = "nightly_tests")]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn test_nightly_fault_recovery_speed() {
+    use freenet::dev_tool::NodeLabel;
+    use freenet::simulation::FaultConfig;
+
+    const SEED: u64 = 0x3511_FA17_0003;
+    const NETWORK_NAME: &str = "nightly-fault-recovery";
+    const GATEWAYS: usize = 4;
+    const NODES: usize = 50;
+    const RING_MAX_HTL: usize = 10;
+    const RND_IF_HTL_ABOVE: usize = 5;
+    const MAX_CONN: usize = 20;
+    const MIN_CONN: usize = 10;
+
+    tracing::info!("=== Nightly: Fault Recovery Speed ===");
+
+    setup_deterministic_state(SEED);
+
+    let mut sim = SimNetwork::new(
+        NETWORK_NAME,
+        GATEWAYS,
+        NODES,
+        RING_MAX_HTL,
+        RND_IF_HTL_ABOVE,
+        MAX_CONN,
+        MIN_CONN,
+        SEED,
+    )
+    .await;
+
+    sim.with_start_backoff(Duration::from_millis(50));
+
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 0, 0)
+        .await;
+
+    // ── Phase 1: Convergence (30 virtual minutes, no faults) ──────────────────
+    tracing::info!("Phase 1: Convergence — 30 virtual minutes, no faults");
+    let_network_run(&mut sim, Duration::from_secs(1800)).await;
+
+    let mut pre_fault_counts: Vec<usize> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.connection_count(&label)
+        })
+        .collect();
+    pre_fault_counts.sort_unstable();
+    let pre_fault_median = pre_fault_counts[pre_fault_counts.len() / 2];
+
+    tracing::info!(
+        "Phase 1 done: median={}, counts={:?}",
+        pre_fault_median,
+        pre_fault_counts
+    );
+
+    // Network must converge before we inject faults.
+    assert!(
+        pre_fault_median >= MIN_CONN,
+        "Network did not converge before fault injection: median={} < min_connections={}. \
+         Counts: {:?}. Seed: 0x{:X}",
+        pre_fault_median,
+        MIN_CONN,
+        pre_fault_counts,
+        SEED
+    );
+
+    // ── Phase 2: Fault injection (5 virtual minutes, 20% message loss) ────────
+    tracing::info!("Phase 2: Fault injection — 20% message loss for 5 virtual minutes");
+    sim.with_fault_injection(FaultConfig::builder().message_loss_rate(0.20).build());
+
+    let_network_run(&mut sim, Duration::from_secs(300)).await;
+
+    let mut during_fault_counts: Vec<usize> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.connection_count(&label)
+        })
+        .collect();
+    during_fault_counts.sort_unstable();
+    let during_fault_median = during_fault_counts[during_fault_counts.len() / 2];
+
+    tracing::info!(
+        "Phase 2 done: median={}, counts={:?}",
+        during_fault_median,
+        during_fault_counts
+    );
+
+    // No death spiral — network didn't collapse under faults.
+    assert!(
+        during_fault_median > 0,
+        "Death spiral: median connections dropped to 0 during 20% message loss. \
+         Counts: {:?}. Seed: 0x{:X}",
+        during_fault_counts,
+        SEED
+    );
+
+    // ── Phase 3: Recovery (25 virtual minutes, faults cleared) ────────────────
+    tracing::info!("Phase 3: Recovery — faults cleared, 25 virtual minutes");
+    sim.clear_fault_injection();
+
+    let_network_run(&mut sim, Duration::from_secs(1500)).await;
+
+    let mut post_recovery_counts: Vec<usize> = (0..NODES)
+        .filter_map(|i| {
+            let label = NodeLabel::node(NETWORK_NAME, i);
+            sim.connection_count(&label)
+        })
+        .collect();
+    post_recovery_counts.sort_unstable();
+
+    let post_recovery_median = post_recovery_counts[post_recovery_counts.len() / 2];
+    let isolated_count = post_recovery_counts.iter().filter(|&&c| c == 0).count();
+    let fraction_isolated = isolated_count as f64 / NODES as f64;
+
+    tracing::info!(
+        "Phase 3 done: median={}, isolated={}/{} ({:.0}%), counts={:?}",
+        post_recovery_median,
+        isolated_count,
+        NODES,
+        fraction_isolated * 100.0,
+        post_recovery_counts
+    );
+
+    // Recovery to near pre-fault levels.
+    // Allow 1 connection of slack for topology churn during the fault period.
+    assert!(
+        post_recovery_median >= pre_fault_median.saturating_sub(1),
+        "Incomplete recovery: post_recovery_median={} < pre_fault_median={} - 1. \
+         Pre-fault: {:?}, Post-recovery: {:?}. Seed: 0x{:X}",
+        post_recovery_median,
+        pre_fault_median,
+        pre_fault_counts,
+        post_recovery_counts,
+        SEED
+    );
+
+    // < 5% nodes isolated after recovery.
+    assert!(
+        fraction_isolated < 0.05,
+        "{:.0}% of nodes isolated after recovery (threshold: 5%). \
+         Counts: {:?}. Seed: 0x{:X}",
+        fraction_isolated * 100.0,
+        post_recovery_counts,
+        SEED
+    );
+
+    tracing::info!(
+        "PASSED: pre_fault_median={}, during_fault_median={}, post_recovery_median={}, \
+         isolated={:.0}%",
+        pre_fault_median,
+        during_fault_median,
+        post_recovery_median,
+        fraction_isolated * 100.0
+    );
 }

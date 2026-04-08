@@ -14,6 +14,65 @@ use std::sync::Arc;
 
 use super::report::ReportCommand;
 
+/// Tail log files with automatic rotation detection.
+///
+/// Spawns `tail -f` on the latest log file, then periodically checks (every 5s)
+/// whether a newer log file has appeared. When rotation occurs (e.g., hourly
+/// tracing-appender rotation), kills the old `tail` and starts a new one on
+/// the new file.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tail_with_rotation(log_dir: &Path, base_name: &str) -> Result<()> {
+    use std::time::Duration;
+
+    let mut current_log = find_latest_log_file(log_dir, base_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No log files found in: {}\nMake sure the service has been installed and started.",
+            log_dir.display()
+        )
+    })?;
+
+    println!("Following logs from: {}", current_log.display());
+    println!("Press Ctrl+C to stop.\n");
+
+    loop {
+        let mut child = std::process::Command::new("tail")
+            .arg("-f")
+            .arg(&current_log)
+            .spawn()
+            .context("Failed to spawn tail")?;
+
+        // Poll for newer log files every 5 seconds
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // tail exited (user Ctrl+C or error)
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                Ok(None) => {
+                    // tail still running, check for rotation
+                }
+                Err(e) => {
+                    drop(child.kill());
+                    drop(child.wait());
+                    anyhow::bail!("Error waiting on tail process: {e}");
+                }
+            }
+
+            std::thread::sleep(Duration::from_secs(5));
+
+            if let Some(newer_log) = find_latest_log_file(log_dir, base_name) {
+                if newer_log != current_log {
+                    println!("\n--- Log rotated to: {} ---\n", newer_log.display());
+                    drop(child.kill());
+                    drop(child.wait());
+                    current_log = newer_log;
+                    break; // break inner loop to spawn new tail
+                }
+            }
+        }
+    }
+}
+
 /// Find the latest log file in the given directory.
 /// Handles both static files (e.g., "freenet.log" from systemd) and
 /// rotated files (e.g., "freenet.2025-12-27.log" from tracing-appender).
@@ -157,6 +216,12 @@ impl ServiceCommand {
 const WRAPPER_EXIT_UPDATE_NEEDED: i32 = 42;
 const WRAPPER_EXIT_ALREADY_RUNNING: i32 = 43;
 
+/// Internal sentinel exit codes used by the wrapper loop (never from the child).
+/// Restart: skip exit-code handling and relaunch immediately.
+const SENTINEL_RESTART: i32 = -1;
+/// Stop: enter stopped state, wait for tray Start/Quit action.
+const SENTINEL_STOP: i32 = -2;
+
 /// Initial backoff delay after a crash (seconds).
 const WRAPPER_INITIAL_BACKOFF_SECS: u64 = 10;
 /// Maximum backoff delay (seconds).
@@ -167,8 +232,14 @@ const WRAPPER_MAX_PORT_CONFLICT_KILLS: u32 = 3;
 const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
 
 /// Dashboard URL served by the local freenet node.
-#[allow(dead_code)] // Used on Windows (tray + wrapper loop)
-pub(super) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
+#[allow(dead_code)] // Used on Windows/macOS (tray + wrapper loop)
+pub(crate) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
+
+/// Open a URL in the default browser (platform-specific).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn open_url_in_browser(url: &str) {
+    super::open_url_in_browser(url);
+}
 
 /// State for the wrapper backoff state machine.
 #[derive(Debug, Clone)]
@@ -258,8 +329,22 @@ fn jitter_secs(secs: u64) -> u64 {
     (secs as f64 * factor) as u64
 }
 
+/// Result of a backoff sleep that was interrupted by a tray action.
+#[allow(dead_code)] // Variants are constructed only on platforms with tray support
+enum BackoffInterrupt {
+    /// Sleep completed without interruption.
+    Completed,
+    /// User requested quit.
+    Quit,
+    /// User requested start/restart — break out of backoff and relaunch.
+    Relaunch,
+    /// User requested a check for updates.
+    CheckUpdate,
+}
+
 /// Sleep for `secs` with ±20% jitter, interruptible via an optional action
-/// channel. Returns `true` if a Quit action was received during the sleep.
+/// channel. Handles `ViewLogs` and `OpenDashboard` inline. Returns the
+/// action that interrupted the sleep so the caller can handle it.
 /// Sleeps in 1-second chunks to remain responsive to tray actions.
 fn sleep_with_jitter_interruptible(
     secs: u64,
@@ -269,7 +354,7 @@ fn sleep_with_jitter_interruptible(
     #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
         &std::sync::mpsc::Receiver<super::tray::TrayAction>,
     >,
-) -> bool {
+) -> BackoffInterrupt {
     let jittered = jitter_secs(secs).max(1);
     for _ in 0..jittered {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -278,21 +363,26 @@ fn sleep_with_jitter_interruptible(
         if let Some(rx) = action_rx {
             if let Ok(action) = rx.try_recv() {
                 match action {
-                    super::tray::TrayAction::Quit => return true,
+                    super::tray::TrayAction::Quit => return BackoffInterrupt::Quit,
                     super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
-                    super::tray::TrayAction::OpenDashboard
-                    | super::tray::TrayAction::Restart
-                    | super::tray::TrayAction::CheckUpdate => {}
+                    super::tray::TrayAction::OpenDashboard => {
+                        open_url_in_browser(DASHBOARD_URL);
+                    }
+                    super::tray::TrayAction::Start | super::tray::TrayAction::Restart => {
+                        return BackoffInterrupt::Relaunch;
+                    }
+                    super::tray::TrayAction::CheckUpdate => {
+                        return BackoffInterrupt::CheckUpdate;
+                    }
+                    super::tray::TrayAction::Stop => {} // already stopped/backing off
                 }
             }
         }
     }
-    false
+    BackoffInterrupt::Completed
 }
 
 /// Run the wrapper loop that manages a `freenet network` child process.
-///
-/// Compiled process wrapper that manages a `freenet network` child process.
 /// On Windows and macOS, shows a system tray / menu bar icon.
 /// On Linux, runs the wrapper loop directly (no tray).
 fn run_wrapper(version: &str) -> Result<()> {
@@ -360,6 +450,160 @@ fn run_wrapper(version: &str) -> Result<()> {
     }
 }
 
+/// Spawn `freenet update --quiet` and wait for it to complete.
+/// On Windows, uses `CREATE_NO_WINDOW` to avoid flashing a console window
+/// (the wrapper has already detached from the console via `FreeConsole`).
+fn spawn_update_command(exe_path: &Path) -> std::io::Result<std::process::ExitStatus> {
+    let mut cmd = std::process::Command::new(exe_path);
+    cmd.args(["update", "--quiet"]);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.status()
+}
+
+/// Spawn a new wrapper process from the (possibly updated) binary on disk.
+/// Used after a successful tray-initiated update to re-exec the wrapper
+/// so the tray displays the correct new version.
+///
+/// Returns `true` if the new wrapper was spawned successfully (caller should
+/// exit to avoid two wrappers). Returns `false` on failure (caller should
+/// fall through to relaunch the child with the current wrapper instead of
+/// leaving the user with no running node).
+fn spawn_new_wrapper(exe_path: &Path, log_dir: &Path) -> bool {
+    let mut cmd = std::process::Command::new(exe_path);
+    cmd.args(["service", "run-wrapper"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    match cmd.spawn() {
+        Ok(_) => {
+            log_wrapper_event(log_dir, "New wrapper process spawned");
+            true
+        }
+        Err(e) => {
+            log_wrapper_event(
+                log_dir,
+                &format!("Failed to spawn new wrapper: {e}. Continuing with current wrapper."),
+            );
+            false
+        }
+    }
+}
+
+/// Maximum time to wait for network readiness at startup (seconds).
+const NETWORK_READINESS_TIMEOUT_SECS: u64 = 60;
+/// Interval between network readiness checks (seconds).
+const NETWORK_READINESS_CHECK_INTERVAL_SECS: u64 = 2;
+/// DNS probe target for network readiness checks.
+const NETWORK_PROBE_ADDR: &str = "freenet.org:443";
+
+/// Wait for network connectivity before spawning the node.
+///
+/// On Windows, the registry Run key fires at user logon, which can be before
+/// the network stack is fully operational. Without this check, the node starts
+/// with no connectivity — gateway fetches fail, CONNECT handshakes timeout,
+/// and the node gets stuck with zombie transient connections. See #3716.
+///
+/// Returns `true` if network is ready or timed out (we start the node
+/// either way). Returns `false` if the user requested Quit via the tray
+/// during the wait.
+///
+/// We probe our own domain because if it's unreachable, the gateway fetch
+/// will also fail — there's no point starting the node before we can reach
+/// the gateway index.
+///
+/// Note: On platforms with tray support, Quit actions are handled during
+/// the wait. Other tray actions (Start, ViewLogs, etc.) are deferred until
+/// the wrapper loop starts.
+fn wait_for_network_ready(
+    log_dir: &Path,
+    #[cfg(any(target_os = "windows", target_os = "macos"))] action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+) -> bool {
+    wait_for_network_ready_inner(
+        log_dir,
+        NETWORK_PROBE_ADDR,
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        action_rx,
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        _action_rx,
+    )
+}
+
+/// Inner implementation with configurable probe address for testing.
+fn wait_for_network_ready_inner(
+    log_dir: &Path,
+    probe_addr: &str,
+    #[cfg(any(target_os = "windows", target_os = "macos"))] action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
+        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
+    >,
+) -> bool {
+    use std::net::ToSocketAddrs;
+
+    // Note: `to_socket_addrs()` is a blocking OS resolver call that can take
+    // 15-30s on Windows when the network is down. The iteration count between
+    // calls means the total wait may exceed NETWORK_READINESS_TIMEOUT_SECS
+    // in pathological cases. This is acceptable for a pre-startup wait.
+
+    // Quick check — if DNS works immediately, skip the wait
+    if probe_addr.to_socket_addrs().is_ok() {
+        return true;
+    }
+
+    log_wrapper_event(
+        log_dir,
+        "Network not ready yet, waiting for connectivity...",
+    );
+
+    let max_checks = NETWORK_READINESS_TIMEOUT_SECS / NETWORK_READINESS_CHECK_INTERVAL_SECS;
+
+    for _ in 0..max_checks {
+        let jittered = jitter_secs(NETWORK_READINESS_CHECK_INTERVAL_SECS);
+        std::thread::sleep(std::time::Duration::from_secs(jittered.max(1)));
+
+        // Allow the user to quit via the tray during the network wait
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some(rx) = action_rx {
+            if let Ok(super::tray::TrayAction::Quit) = rx.try_recv() {
+                return false;
+            }
+        }
+
+        if probe_addr.to_socket_addrs().is_ok() {
+            log_wrapper_event(log_dir, "Network is ready");
+            return true;
+        }
+    }
+
+    log_wrapper_event(
+        log_dir,
+        "Network readiness timeout — starting node anyway (it will retry internally)",
+    );
+    true
+}
+
 /// The core wrapper loop. Spawns `freenet network`, handles exit codes,
 /// and communicates with the tray icon (if present).
 fn run_wrapper_loop(
@@ -380,6 +624,16 @@ fn run_wrapper_loop(
 
     let mut state = WrapperState::new();
 
+    // On first launch, wait for network connectivity before spawning the node.
+    // This prevents the node from starting in a degraded state when the wrapper
+    // is auto-started at login before the network stack is ready (see #3716).
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    if !wait_for_network_ready(log_dir, tray.map(|(rx, _)| rx)) {
+        return Ok(()); // User requested Quit during network wait
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    wait_for_network_ready(log_dir, None);
+
     loop {
         // Notify tray that we're starting
         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -393,9 +647,28 @@ fn run_wrapper_loop(
         let mut cmd = std::process::Command::new(&exe_path);
         cmd.arg("network");
 
-        // Redirect stderr to a file for port-conflict detection
+        // On Windows, prevent a console window from appearing for the child process.
+        // The wrapper has already detached from the console via FreeConsole(),
+        // which invalidates the standard handles. We must explicitly set
+        // stdin/stdout to null to avoid inheriting the invalid handles
+        // (otherwise spawn fails with "The handle is invalid" os error 6).
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
+        }
+
+        // Redirect stderr to a file for port-conflict detection.
+        // On Windows, stderr must also be explicitly set to avoid
+        // inheriting the invalid handle after FreeConsole().
         if let Some(stderr_file) = stderr_file {
             cmd.stderr(stderr_file);
+        } else {
+            #[cfg(target_os = "windows")]
+            cmd.stderr(std::process::Stdio::null());
         }
 
         // Use spawn + polling so we can handle tray actions while child runs
@@ -421,7 +694,7 @@ fn run_wrapper_loop(
 
             // Process tray actions while child is running
             #[cfg(any(target_os = "windows", target_os = "macos"))]
-            if let Some((action_rx, _)) = tray {
+            if let Some((action_rx, status_tx)) = tray {
                 if let Ok(action) = action_rx.try_recv() {
                     match action {
                         super::tray::TrayAction::Quit => {
@@ -433,22 +706,60 @@ fn run_wrapper_loop(
                             log_wrapper_event(log_dir, "Restart requested via tray");
                             drop(child.kill());
                             drop(child.wait());
-                            break -1; // sentinel: skip exit-code handling, just relaunch
+                            break SENTINEL_RESTART;
+                        }
+                        super::tray::TrayAction::Stop => {
+                            log_wrapper_event(log_dir, "Stop requested via tray");
+                            drop(child.kill());
+                            drop(child.wait());
+                            break SENTINEL_STOP;
+                        }
+                        super::tray::TrayAction::Start => {
+                            // Ignored while child is running — Start is only
+                            // meaningful from the stopped state (handled below).
                         }
                         super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
                         super::tray::TrayAction::CheckUpdate => {
-                            drop(
-                                std::process::Command::new(&exe_path)
-                                    .args(["update", "--check"])
-                                    .status(),
-                            );
+                            // Run the actual update (not just --check). If it
+                            // succeeds (exit 0), kill the child and re-exec the
+                            // wrapper so the tray shows the correct new version.
+                            // Exit 2 means already up to date — no restart needed.
+                            status_tx.send(WrapperStatus::Updating).ok();
+                            let result = spawn_update_command(&exe_path);
+                            match result {
+                                Ok(s) if s.success() => {
+                                    log_wrapper_event(
+                                        log_dir,
+                                        "Update installed via tray, restarting wrapper...",
+                                    );
+                                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                    drop(child.kill());
+                                    drop(child.wait());
+                                    if spawn_new_wrapper(&exe_path, log_dir) {
+                                        return Ok(());
+                                    }
+                                    // Spawn failed — fall through to relaunch child
+                                    // with the current (old) wrapper rather than
+                                    // leaving no node running.
+                                    break SENTINEL_RESTART;
+                                }
+                                Ok(_) => {
+                                    // Exit code 2 = already up to date, or other
+                                    // non-zero = update failed. Either way, no restart.
+                                    log_wrapper_event(log_dir, "No update available");
+                                    status_tx.send(WrapperStatus::UpToDate).ok();
+                                }
+                                Err(e) => {
+                                    log_wrapper_event(
+                                        log_dir,
+                                        &format!("Update check failed: {e}"),
+                                    );
+                                    status_tx.send(WrapperStatus::Running).ok();
+                                }
+                            }
                         }
                         super::tray::TrayAction::OpenDashboard => {
-                            drop(
-                                std::process::Command::new("cmd")
-                                    .args(["/c", "start", DASHBOARD_URL])
-                                    .spawn(),
-                            );
+                            open_url_in_browser(DASHBOARD_URL);
                         }
                     }
                 }
@@ -459,7 +770,66 @@ fn run_wrapper_loop(
         };
 
         // Restart sentinel from tray Restart action — skip exit code handling
-        if exit_code == -1 {
+        if exit_code == SENTINEL_RESTART {
+            continue;
+        }
+
+        // Stop sentinel — enter stopped state, wait for Start/Quit/Restart
+        if exit_code == SENTINEL_STOP {
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            if let Some((action_rx, status_tx)) = tray {
+                status_tx.send(WrapperStatus::Stopped).ok();
+                loop {
+                    if let Ok(action) = action_rx.try_recv() {
+                        match action {
+                            super::tray::TrayAction::Start | super::tray::TrayAction::Restart => {
+                                log_wrapper_event(log_dir, "Start requested via tray");
+                                break; // exit stopped loop, outer loop will relaunch
+                            }
+                            super::tray::TrayAction::Quit => {
+                                return Ok(());
+                            }
+                            super::tray::TrayAction::ViewLogs => {
+                                super::tray::open_log_file();
+                            }
+                            super::tray::TrayAction::CheckUpdate => {
+                                // Allow checking for updates even while stopped
+                                status_tx.send(WrapperStatus::Updating).ok();
+                                let result = spawn_update_command(&exe_path);
+                                match result {
+                                    Ok(s) if s.success() => {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            "Update installed while stopped, restarting wrapper...",
+                                        );
+                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                        if spawn_new_wrapper(&exe_path, log_dir) {
+                                            return Ok(());
+                                        }
+                                        // Spawn failed — exit stopped state and
+                                        // relaunch child with the current wrapper.
+                                        break;
+                                    }
+                                    Ok(_) => {
+                                        log_wrapper_event(log_dir, "No update available");
+                                        status_tx.send(WrapperStatus::UpToDate).ok();
+                                    }
+                                    Err(e) => {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            &format!("Update check failed: {e}"),
+                                        );
+                                    }
+                                }
+                            }
+                            // These actions are no-ops while the node is stopped.
+                            super::tray::TrayAction::OpenDashboard
+                            | super::tray::TrayAction::Stop => {}
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
             continue;
         }
 
@@ -484,9 +854,7 @@ fn run_wrapper_loop(
                 status_tx.send(WrapperStatus::Updating).ok();
             }
 
-            let ok = std::process::Command::new(&exe_path)
-                .args(["update", "--quiet"])
-                .status()
+            let ok = spawn_update_command(&exe_path)
                 .map(|s| s.success())
                 .unwrap_or(false);
 
@@ -505,8 +873,18 @@ fn run_wrapper_loop(
 
         match action {
             WrapperAction::Update => {
-                // Update succeeded — brief pause then relaunch
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                // Update succeeded — re-exec the wrapper so the tray shows
+                // the correct new version (compiled-in to the new binary).
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                if let Some((_, status_tx)) = tray {
+                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                    // Brief pause so the tray can display the message
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                if spawn_new_wrapper(&exe_path, log_dir) {
+                    return Ok(());
+                }
+                // Spawn failed — fall through to relaunch child with current wrapper.
             }
             WrapperAction::Exit => {
                 let reason = if exit_code == WRAPPER_EXIT_ALREADY_RUNNING {
@@ -552,12 +930,61 @@ fn run_wrapper_loop(
                     log_dir,
                     &format!("Exited with code {exit_code}, restarting after {secs}s backoff..."),
                 );
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
-                let quit = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
-                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                let quit = sleep_with_jitter_interruptible(secs, None);
-                if quit {
-                    return Ok(());
+                // Loop: CheckUpdate resumes backoff; Relaunch/Quit/Completed break out.
+                loop {
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                    let interrupt = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
+                    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                    let interrupt = sleep_with_jitter_interruptible(secs, None);
+                    match interrupt {
+                        BackoffInterrupt::Quit => return Ok(()),
+                        BackoffInterrupt::Relaunch => {
+                            log_wrapper_event(log_dir, "Relaunch requested during backoff");
+                            state.consecutive_failures = 0;
+                            break; // relaunch
+                        }
+                        BackoffInterrupt::CheckUpdate => {
+                            // Run the update check. Only relaunch if an update
+                            // was actually installed; otherwise resume backoff.
+                            // This prevents users from defeating the crash
+                            // backoff by repeatedly clicking "Check for Updates".
+                            log_wrapper_event(log_dir, "Update check requested during backoff");
+                            #[cfg(any(target_os = "windows", target_os = "macos"))]
+                            if let Some((_, status_tx)) = tray {
+                                status_tx.send(WrapperStatus::Updating).ok();
+                                let result = spawn_update_command(&exe_path);
+                                match result {
+                                    Ok(s) if s.success() => {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            "Update installed during backoff, restarting wrapper...",
+                                        );
+                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                        if spawn_new_wrapper(&exe_path, log_dir) {
+                                            return Ok(());
+                                        }
+                                        // Spawn failed — relaunch with current wrapper
+                                        state.consecutive_failures = 0;
+                                        break;
+                                    }
+                                    Ok(_) => {
+                                        log_wrapper_event(log_dir, "No update available");
+                                        status_tx.send(WrapperStatus::UpToDate).ok();
+                                    }
+                                    Err(e) => {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            &format!("Update check failed: {e}"),
+                                        );
+                                        status_tx.send(WrapperStatus::Stopped).ok();
+                                    }
+                                }
+                            }
+                            // No update installed — resume backoff
+                            continue;
+                        }
+                        BackoffInterrupt::Completed => break, // normal backoff done
+                    }
                 }
             }
         }
@@ -772,12 +1199,21 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
     } else {
         match ProjectDirs::from("", "The Freenet Project Inc", "Freenet") {
             Some(ref dirs) => {
-                let data_dir = dirs.data_dir();
+                // Use data_local_dir (Local AppData on Windows) to match where
+                // the node actually stores data since #3739.
+                let data_dir = dirs.data_local_dir();
                 remove_if_exists("data", data_dir)?;
 
+                // Also clean up old Roaming path from before #3739
+                let old_roaming = dirs.data_dir();
+                if old_roaming != data_dir {
+                    remove_if_exists("data (legacy roaming)", old_roaming)?;
+                }
+
+                // Skip config_dir if it overlaps with either data path
+                // (e.g., on macOS config_dir == data_dir)
                 let config_dir = dirs.config_dir();
-                // On macOS, config_dir == data_dir; skip if already removed
-                if config_dir != data_dir {
+                if config_dir != data_dir && config_dir != old_roaming {
                     remove_if_exists("config", config_dir)?;
                 }
 
@@ -1245,23 +1681,7 @@ fn service_logs(error_only: bool) -> Result<()> {
         "freenet"
     };
 
-    let log_file = find_latest_log_file(&log_dir, base_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No log files found in: {}\nMake sure the service has been installed and started.",
-            log_dir.display()
-        )
-    })?;
-
-    println!("Following logs from: {}", log_file.display());
-    println!("Press Ctrl+C to stop.\n");
-
-    let status = std::process::Command::new("tail")
-        .arg("-f")
-        .arg(&log_file)
-        .status()
-        .context("Failed to tail log file")?;
-
-    std::process::exit(status.code().unwrap_or(1));
+    tail_with_rotation(&log_dir, base_name)
 }
 
 // macOS implementation using launchd
@@ -1598,23 +2018,7 @@ fn service_logs(error_only: bool) -> Result<()> {
         "freenet"
     };
 
-    let log_file = find_latest_log_file(&log_dir, base_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No log files found in: {}\nMake sure the service has been installed and started.",
-            log_dir.display()
-        )
-    })?;
-
-    println!("Following logs from: {}", log_file.display());
-    println!("Press Ctrl+C to stop.\n");
-
-    let status = std::process::Command::new("tail")
-        .arg("-f")
-        .arg(&log_file)
-        .status()
-        .context("Failed to tail log file")?;
-
-    std::process::exit(status.code().unwrap_or(1));
+    tail_with_rotation(&log_dir, base_name)
 }
 
 // Windows implementation
@@ -1852,6 +2256,7 @@ fn restart_service(system: bool) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_logs(error_only: bool) -> Result<()> {
     use freenet::tracing::tracer::get_log_dir;
+    use std::time::Duration;
 
     let log_dir = get_log_dir().context(
         "Could not determine log directory. \
@@ -1867,36 +2272,25 @@ fn service_logs(error_only: bool) -> Result<()> {
     // Also check the wrapper log (now date-rotated: freenet-wrapper.YYYY-MM-DD.log)
     let wrapper_log = find_latest_log_file(&log_dir, "freenet-wrapper");
 
-    match find_latest_log_file(&log_dir, base_name) {
+    let mut current_log = match find_latest_log_file(&log_dir, base_name) {
         Some(log_path) => {
             println!("Log file: {}", log_path.display());
             if let Some(ref wl) = wrapper_log {
                 println!("Wrapper log: {}", wl.display());
             }
-            // Use PowerShell Get-Content -Wait to follow the log (like tail -f)
-            let status = std::process::Command::new("powershell")
-                .args([
-                    "-Command",
-                    &format!("Get-Content -Path '{}' -Tail 50 -Wait", log_path.display()),
-                ])
-                .status()
-                .context("Failed to open log file")?;
-            if !status.success() {
-                // Fallback: just open in notepad
-                drop(std::process::Command::new("notepad").arg(&log_path).spawn());
-            }
+            log_path
         }
         None => {
             if let Some(ref wl) = wrapper_log {
                 println!("No node logs found, showing wrapper log:");
-                drop(
-                    std::process::Command::new("powershell")
-                        .args([
-                            "-Command",
-                            &format!("Get-Content -Path '{}' -Tail 50 -Wait", wl.display()),
-                        ])
-                        .status(),
-                );
+                let status = std::process::Command::new("powershell")
+                    .args([
+                        "-Command",
+                        &format!("Get-Content -Path '{}' -Tail 50 -Wait", wl.display()),
+                    ])
+                    .status()
+                    .context("Failed to open wrapper log")?;
+                std::process::exit(status.code().unwrap_or(1));
             } else {
                 anyhow::bail!(
                     "No log files found in {}.\n\
@@ -1905,9 +2299,56 @@ fn service_logs(error_only: bool) -> Result<()> {
                 );
             }
         }
-    }
+    };
 
-    Ok(())
+    println!("Press Ctrl+C to stop.\n");
+
+    loop {
+        let mut child = std::process::Command::new("powershell")
+            .args([
+                "-Command",
+                &format!(
+                    "Get-Content -Path '{}' -Tail 50 -Wait",
+                    current_log.display()
+                ),
+            ])
+            .spawn()
+            .context("Failed to spawn PowerShell for log tailing")?;
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        // Fallback: open in notepad
+                        drop(
+                            std::process::Command::new("notepad")
+                                .arg(&current_log)
+                                .spawn(),
+                        );
+                    }
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    drop(child.kill());
+                    drop(child.wait());
+                    anyhow::bail!("Error waiting on PowerShell process: {e}");
+                }
+            }
+
+            std::thread::sleep(Duration::from_secs(5));
+
+            if let Some(newer_log) = find_latest_log_file(&log_dir, base_name) {
+                if newer_log != current_log {
+                    println!("\n--- Log rotated to: {} ---\n", newer_log.display());
+                    drop(child.kill());
+                    drop(child.wait());
+                    current_log = newer_log;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // Fallback for unsupported platforms
@@ -2262,6 +2703,91 @@ mod tests {
         assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
     }
 
+    /// Regression test for #3716: tray actions were silently dropped during
+    /// backoff sleep. Verify the sleep function maps each action correctly.
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn test_backoff_sleep_handles_tray_actions() {
+        use super::super::tray::TrayAction;
+        use std::sync::mpsc;
+
+        let send_and_check = |action: TrayAction| -> BackoffInterrupt {
+            let (tx, rx) = mpsc::channel();
+            tx.send(action).unwrap();
+            sleep_with_jitter_interruptible(1, Some(&rx))
+        };
+
+        assert!(matches!(
+            send_and_check(TrayAction::Start),
+            BackoffInterrupt::Relaunch
+        ));
+        assert!(matches!(
+            send_and_check(TrayAction::Restart),
+            BackoffInterrupt::Relaunch
+        ));
+        assert!(matches!(
+            send_and_check(TrayAction::CheckUpdate),
+            BackoffInterrupt::CheckUpdate
+        ));
+        assert!(matches!(
+            send_and_check(TrayAction::Quit),
+            BackoffInterrupt::Quit
+        ));
+
+        // No action: sleep completes normally
+        let (_tx, rx) = mpsc::channel::<TrayAction>();
+        assert!(matches!(
+            sleep_with_jitter_interruptible(1, Some(&rx)),
+            BackoffInterrupt::Completed
+        ));
+    }
+
+    /// Regression test for #3717: `freenet service install` used to call
+    /// `config.build()` which triggered a remote gateway fetch. This fails
+    /// on fresh installs when the network isn't ready. Verify that
+    /// `ConfigPathsArgs::build()` succeeds independently without network.
+    #[test]
+    fn test_config_paths_build_succeeds_without_network() {
+        // Provide an explicit temp data dir to avoid the debug_assertions temp
+        // dir path (which hits an unreachable! in debug builds). In production
+        // (release builds), default_dirs returns ProjectDirs and works fine.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = freenet::config::ConfigPathsArgs {
+            config_dir: Some(tmp.path().join("config")),
+            data_dir: Some(tmp.path().join("data")),
+            ..Default::default()
+        };
+        let result = args.build(None);
+        assert!(
+            result.is_ok(),
+            "ConfigPathsArgs::build should succeed without network access"
+        );
+    }
+
+    /// Regression test for #3716: `wait_for_network_ready` must be
+    /// interruptible by a Quit action from the tray. Uses a non-resolvable
+    /// probe address to force entry into the retry loop, then verifies the
+    /// Quit action is consumed and returns `false`.
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn test_network_ready_quit_during_wait() {
+        use std::sync::mpsc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel::<super::super::tray::TrayAction>();
+        // Pre-load Quit so it's found on the first channel check
+        tx.send(super::super::tray::TrayAction::Quit).unwrap();
+
+        // Use a non-resolvable address to force the retry loop.
+        // The function should find the Quit action after the first sleep
+        // and return false without waiting for the full timeout.
+        let result = wait_for_network_ready_inner(tmp.path(), "nonexistent.invalid:1", Some(&rx));
+        assert!(
+            !result,
+            "Should return false when Quit is received during wait"
+        );
+    }
+
     #[test]
     fn test_find_latest_log_file_picks_newest() {
         use std::fs;
@@ -2283,5 +2809,77 @@ mod tests {
 
         let result = find_latest_log_file(tmp.path(), "freenet");
         assert_eq!(result, Some(new));
+    }
+
+    #[test]
+    fn test_find_latest_log_file_skips_empty_static_file() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Empty static file should be skipped
+        fs::write(tmp.path().join("freenet.log"), "").unwrap();
+        // Rotated file with content should be found
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let rotated = tmp.path().join("freenet.2025-12-31.log");
+        fs::write(&rotated, "content").unwrap();
+
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(rotated));
+    }
+
+    #[test]
+    fn test_find_latest_log_file_no_matching_files() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // No files at all
+        assert_eq!(find_latest_log_file(tmp.path(), "freenet"), None);
+
+        // Unrelated files only
+        std::fs::write(tmp.path().join("other.log"), "data").unwrap();
+        assert_eq!(find_latest_log_file(tmp.path(), "freenet"), None);
+    }
+
+    #[test]
+    fn test_find_latest_log_file_static_wins_over_older_rotated() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Old rotated file
+        let rotated = tmp.path().join("freenet.2025-01-01.log");
+        fs::write(&rotated, "old").unwrap();
+
+        // Newer static file (e.g., from systemd)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let static_file = tmp.path().join("freenet.log");
+        fs::write(&static_file, "newer").unwrap();
+
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(static_file));
+    }
+
+    #[test]
+    fn test_find_latest_log_file_detects_rotation() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Simulate hour 14 log file
+        let hour14 = tmp.path().join("freenet.2025-12-31-14.log");
+        fs::write(&hour14, "hour 14 data").unwrap();
+
+        // Initially finds hour 14
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(hour14.clone()));
+
+        // Simulate rotation: hour 15 file appears with newer mtime
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let hour15 = tmp.path().join("freenet.2025-12-31-15.log");
+        fs::write(&hour15, "hour 15 data").unwrap();
+
+        // Now finds hour 15 — this is the rotation detection mechanism
+        let result = find_latest_log_file(tmp.path(), "freenet");
+        assert_eq!(result, Some(hour15));
     }
 }

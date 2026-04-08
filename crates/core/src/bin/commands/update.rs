@@ -15,6 +15,10 @@ use super::service::{generate_system_service_file, generate_user_service_file};
 
 const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
 
+/// Exit code returned when the binary is already up to date (no update performed).
+/// Used by the service wrapper to avoid unnecessary restarts.
+pub const EXIT_CODE_ALREADY_UP_TO_DATE: i32 = 2;
+
 #[derive(Args, Debug, Clone)]
 pub struct UpdateCommand {
     /// Only check if an update is available without installing
@@ -59,7 +63,9 @@ impl UpdateCommand {
             if !self.quiet {
                 println!("You are already running the latest version.");
             }
-            return Ok(());
+            // Exit with a distinct code so the service wrapper knows no update
+            // was performed and can skip the unnecessary restart.
+            std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
         }
 
         if self.check {
@@ -253,6 +259,43 @@ impl UpdateCommand {
                     }
                 }
             }
+
+            #[cfg(target_os = "windows")]
+            {
+                if is_windows_wrapper_running() {
+                    println!("Restarting Freenet service...");
+                    // Kill old wrapper + child processes (excluding ourselves),
+                    // then start a new wrapper with the updated binary.
+                    let our_pid = std::process::id().to_string();
+                    Command::new("taskkill")
+                        .args([
+                            "/f",
+                            "/im",
+                            "freenet.exe",
+                            "/fi",
+                            &format!("PID ne {}", our_pid),
+                        ])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .ok();
+                    // Brief pause to ensure the old process is fully stopped
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let status = Command::new(&current_exe)
+                        .args(["service", "start"])
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => println!("Service restarted successfully."),
+                        Ok(_) => eprintln!(
+                            "Warning: Failed to restart service. Run 'freenet service start' manually."
+                        ),
+                        Err(e) => eprintln!(
+                            "Warning: Failed to restart service: {}. Run 'freenet service start' manually.",
+                            e
+                        ),
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -431,12 +474,26 @@ async fn download_checksums(url: &str) -> Result<Checksums> {
 
 fn verify_checksum(file_path: &Path, expected_hash: &str) -> Result<()> {
     use sha2::{Digest, Sha256};
+    use std::io::Read;
 
     let mut file = File::open(file_path).context("Failed to open file for checksum")?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).context("Failed to read file for checksum")?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .context("Failed to read file for checksum")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     let result = hasher.finalize();
-    let actual_hash = format!("{:x}", result);
+    let actual_hash = result.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        write!(s, "{:02x}", b).expect("writing to String is infallible");
+        s
+    });
 
     if actual_hash != expected_hash {
         anyhow::bail!(
@@ -1033,5 +1090,18 @@ fn is_launchd_service_active() -> bool {
         .args(["list", "org.freenet.node"])
         .status()
         .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_wrapper_running() -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/fi", "imagename eq freenet.exe", "/fo", "csv", "/nh"])
+        .output()
+        .map(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            // Check that there's another freenet.exe besides ourselves
+            stdout.matches("freenet.exe").count() > 1
+        })
         .unwrap_or(false)
 }

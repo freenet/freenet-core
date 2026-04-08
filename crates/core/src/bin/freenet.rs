@@ -603,15 +603,18 @@ fn freenet_main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Service(cmd)) => {
-            let rt = tokio::runtime::Runtime::new()?;
-            let config = rt.block_on(cli.config.build())?;
+            // Build only ConfigPaths (directory layout), not the full Config
+            // which triggers a remote gateway fetch that fails on fresh
+            // installs or before the network is ready (see #3717).
+            let config_paths =
+                std::sync::Arc::new(cli.config.config_paths.build(cli.config.id.as_deref())?);
 
             cmd.run(
                 build_info::VERSION,
                 build_info::GIT_COMMIT,
                 build_info::GIT_DIRTY,
                 build_info::BUILD_TIMESTAMP,
-                config.paths(),
+                config_paths,
             )
         }
         Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
@@ -630,7 +633,10 @@ fn freenet_main() -> anyhow::Result<()> {
             if cli.config.version {
                 return run_node(cli.config);
             }
-            // On Windows, if not installed, show setup wizard before starting
+            // On Windows, if not installed, show setup wizard before starting.
+            // If already installed, start the background service (with tray icon)
+            // instead of running in console mode — this is what users expect when
+            // double-clicking freenet.exe or running it from the command line.
             if commands::setup_wizard::maybe_show_setup_wizard()? {
                 return Ok(());
             }

@@ -118,7 +118,7 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
     };
 
     // Configure gateway
-    let (config_gw, preset_cfg_gw, config_gw_info) = {
+    let (mut config_gw, preset_cfg_gw, config_gw_info) = {
         let (cfg, preset) = base_node_test_config_with_ip(
             true,
             vec![],
@@ -139,10 +139,15 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         )
     };
 
+    // Extend transient TTL to outlast the test budget. The default 120s TTL can expire
+    // transient connection entries independently of the deferred swap-drop mechanism,
+    // causing spurious connectivity loss during the 420s test budget.
+    config_gw.network_api.transient_ttl_secs = Some(600);
+
     let ws_api_port_gw = config_gw.ws_api.ws_api_port.unwrap();
 
     // Configure Node1 (blocks Node2)
-    let (config_node1, preset_cfg_node1) = base_node_test_config_with_ip(
+    let (mut config_node1, preset_cfg_node1) = base_node_test_config_with_ip(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
         Some(node1_network_port),
@@ -153,10 +158,16 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         Some(node1_ip),
     )
     .await?;
+    // Client nodes can only reach the gateway (they block each other), so cap at 1
+    // connection. This prevents the topology optimizer from attempting a swap on
+    // a client node (can't drop your only connection) and keeps test state simple.
+    config_node1.network_api.min_connections = Some(1);
+    config_node1.network_api.max_connections = Some(1);
+    config_node1.network_api.transient_ttl_secs = Some(600);
     let ws_api_port_node1 = config_node1.ws_api.ws_api_port.unwrap();
 
     // Configure Node2 (blocks Node1)
-    let (config_node2, preset_cfg_node2) = base_node_test_config_with_ip(
+    let (mut config_node2, preset_cfg_node2) = base_node_test_config_with_ip(
         false,
         vec![serde_json::to_string(&config_gw_info)?],
         Some(node2_network_port),
@@ -167,6 +178,10 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         Some(node2_ip),
     )
     .await?;
+    // Same rationale as Node1: can only reach gateway, cap at 1 connection.
+    config_node2.network_api.min_connections = Some(1);
+    config_node2.network_api.max_connections = Some(1);
+    config_node2.network_api.transient_ttl_secs = Some(600);
     let ws_api_port_node2 = config_node2.ws_api.ws_api_port.unwrap();
 
     tracing::info!("Gateway data dir: {:?}", preset_cfg_gw.temp_dir.path());

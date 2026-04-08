@@ -72,7 +72,7 @@ pub(super) async fn contract_home(
                 ContractRequest::Get {
                     key: instance_id,
                     return_contract_code: true,
-                    subscribe: false,
+                    subscribe: true,
                     blocking_subscribe: false,
                 }
                 .into(),
@@ -346,7 +346,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -442,6 +442,17 @@ function freenetBridge(authToken) {
   var MAX_CONNECTIONS = 32;
   var iframe = document.getElementById('app');
   var connections = new Map();
+  var lastClipboard = 0;
+
+  // Build iframe src from data-src, appending any URL hash for deep
+  // linking. Using data-src (not src) in the HTML means the iframe
+  // doesn't start loading until we set .src here, so there is exactly
+  // one load -- with the hash already in the URL.
+  var iframeSrc = iframe.getAttribute('data-src');
+  if (location.hash) {
+    iframeSrc += location.hash.slice(0, 1024);
+  }
+  iframe.src = iframeSrc;
 
   function sendToIframe(msg) {
     iframe.contentWindow.postMessage(msg, '*');
@@ -465,6 +476,27 @@ function freenetBridge(authToken) {
         } catch(e) { return; }
         var link = document.querySelector('link[rel="icon"]');
         if (link) link.href = msg.href;
+      } else if (msg.type === 'hash' && typeof msg.hash === 'string') {
+        // Only allow # fragments — reject anything that could modify path/query.
+        // Note: replaceState (not pushState) is intentional — avoids polluting
+        // browser history with every in-app route change. This also means
+        // replaceState does NOT fire popstate or hashchange, preventing loops.
+        var h = msg.hash.slice(0, 1024);
+        if (h.length > 0 && h.charAt(0) === '#') {
+          history.replaceState(null, '', h);
+        }
+      } else if (msg.type === 'clipboard' && typeof msg.text === 'string') {
+        // Sandboxed iframes can't use navigator.clipboard due to permissions
+        // policy. Proxy clipboard writes through the trusted shell instead.
+        // Write-only — no readText proxy to prevent exfiltration.
+        // Rate-limited to 1 write/sec to prevent clipboard spam from
+        // malicious contracts. Requires transient user activation (browser
+        // enforced) — works when the iframe sends this in a click handler.
+        var now = Date.now();
+        if (now - lastClipboard >= 1000) {
+          lastClipboard = now;
+          try { navigator.clipboard.writeText(msg.text.slice(0, 2048)); } catch(e) {}
+        }
       }
       return;
     }
@@ -540,6 +572,16 @@ function freenetBridge(authToken) {
       }
     }
   });
+
+  // Forward runtime hash changes (browser back/forward, manual URL edits)
+  // via postMessage. By this point the WASM app's listener is active.
+  function forwardHash() {
+    if (location.hash) {
+      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 1024) });
+    }
+  }
+  window.addEventListener('popstate', forwardHash);
+  window.addEventListener('hashchange', forwardHash);
 }
 "#;
 
@@ -885,6 +927,30 @@ mod tests {
         );
     }
 
+    /// Regression test: the iframe must use data-src (not src) so JS can build
+    /// the final URL with the hash fragment before triggering the first load.
+    /// Previously, src was set in HTML and the hash was sent via postMessage on
+    /// the load event, but WASM apps hadn't registered their listener yet.
+    /// See: #3747 (comment)
+    #[tokio::test]
+    async fn shell_page_iframe_uses_data_src_for_deep_linking() {
+        let token = AuthToken::generate();
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+
+        // The iframe must NOT have a src attribute (which would trigger an
+        // immediate load before JS can append the hash fragment).
+        assert!(
+            !html.contains(r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" src="#),
+            "iframe must use data-src, not src, to avoid loading before JS appends the hash"
+        );
+        // The iframe must have data-src with the sandbox URL.
+        assert!(
+            html.contains("data-src=\"/"),
+            "iframe must have data-src attribute for JS to read"
+        );
+    }
+
     #[tokio::test]
     async fn shell_page_forwards_query_params_to_iframe() {
         let token = AuthToken::generate();
@@ -1063,6 +1129,74 @@ mod tests {
         assert!(
             SHELL_BRIDGE_JS.contains("scheme !== 'https' && scheme !== 'data'"),
             "bridge JS must restrict favicon href to https/data schemes"
+        );
+        // Hash forwarding: iframe→shell must validate # prefix and truncate
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.type === 'hash'"),
+            "bridge JS must handle hash shell messages"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("h.charAt(0) === '#'"),
+            "bridge JS must require # prefix on hash values"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.hash.slice(0, 1024)"),
+            "bridge JS must truncate hash to 1024 chars"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("history.replaceState"),
+            "bridge JS must use replaceState (not pushState) to avoid polluting browser history"
+        );
+        assert!(
+            !SHELL_BRIDGE_JS.contains("history.pushState"),
+            "bridge JS must not use pushState — hash changes should replace, not push"
+        );
+        // Initial hash: built into iframe src from data-src for deep linking
+        assert!(
+            SHELL_BRIDGE_JS.contains("iframe.getAttribute('data-src')"),
+            "bridge JS must read base URL from data-src attribute"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("iframe.src = iframeSrc"),
+            "bridge JS must set iframe src from data-src (single load, no race)"
+        );
+        assert!(
+            !SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
+            "bridge JS must NOT use load event for hash forwarding (race with WASM init)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("popstate"),
+            "bridge JS must forward hash on browser back/forward"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("hashchange"),
+            "bridge JS must forward hash on manual URL fragment edits"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("if (location.hash)"),
+            "bridge JS must not forward empty hash to iframe"
+        );
+        // Clipboard proxy: shell writes to clipboard on behalf of sandboxed iframe
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.type === 'clipboard'"),
+            "bridge JS must handle clipboard shell messages"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("navigator.clipboard.writeText"),
+            "bridge JS must proxy clipboard writes through the shell"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.text.slice(0, 2048)"),
+            "bridge JS must truncate clipboard text to 2048 chars"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("lastClipboard"),
+            "bridge JS must rate-limit clipboard writes"
+        );
+        assert!(
+            !SHELL_BRIDGE_JS.contains("clipboard.readText")
+                && !SHELL_BRIDGE_JS.contains("clipboard.read("),
+            "bridge JS must be clipboard write-only — no read access"
         );
     }
 

@@ -1256,43 +1256,41 @@ async fn process_open_request(
                             .map(|k| op_manager.ring.is_receiving_updates(k))
                             .unwrap_or(false);
 
-                        // Hosted contracts have subscription renewal in progress
-                        // via the background recovery loop. Between restart and
-                        // renewal completion the state may be briefly stale, but
-                        // serving it is strictly better than a network GET (94%
-                        // failure rate — see #3356). Once the subscription is
-                        // re-established, updates will keep the cache current.
-                        let is_hosted = full_key
+                        // Mark as locally accessed (#3769) and refresh hosting TTL.
+                        if let Some(ref fk) = full_key {
+                            op_manager.ring.mark_local_client_access(fk);
+                            if op_manager.ring.is_hosting_contract(fk) {
+                                op_manager.ring.touch_hosting(fk);
+                            }
+                        }
+
+                        // Serve from local cache only if the local user requested
+                        // this contract (not just relay-cached).
+                        let is_locally_hosted = full_key
                             .as_ref()
-                            .map(|k| op_manager.ring.is_hosting_contract(k))
+                            .map(|k| {
+                                op_manager.ring.is_hosting_contract(k)
+                                    && op_manager.ring.has_local_client_access(k)
+                            })
                             .unwrap_or(false);
 
-                        // Return local cache if we have valid state AND EITHER:
-                        // 1. No connections (isolated node - can only use local cache), OR
-                        // 2. Actively subscribed (cache is fresh via subscription updates), OR
-                        // 3. Contract is hosted (renewal in progress; may be briefly stale
-                        //    after restart, but network GETs are unreliable — see #3356)
+                        // Return local cache if we have valid state AND any of:
+                        // 1. No connections (isolated node)
+                        // 2. Actively subscribed (cache kept fresh via updates)
+                        // 3. Locally hosted (subscription may be in progress)
                         if local_satisfies_request
-                            && (connection_count == 0 || is_subscribed || is_hosted)
+                            && (connection_count == 0 || is_subscribed || is_locally_hosted)
                         {
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
 
-                            // Refresh hosting TTL on user GET — this is the
-                            // correct place to keep hosted contracts alive (not
-                            // in subscription renewal, which would create an
-                            // immortal-entry feedback loop).
-                            if is_hosted {
-                                op_manager.ring.touch_hosting(&full_key);
-                            }
-
-                            tracing::debug!(
+                            tracing::info!(
                                 client_id = %client_id,
                                 request_id = %request_id,
                                 peer = %peer_id,
                                 contract = %full_key,
                                 is_subscribed,
-                                is_hosted,
+                                is_locally_hosted,
                                 connection_count,
                                 phase = "local_cache",
                                 "Returning locally cached contract state"
@@ -1310,10 +1308,13 @@ async fn process_open_request(
                                     )
                                     .await?;
                                 } else {
-                                    tracing::warn!(
+                                    // Expected for HTTP web endpoint which sets subscribe=true
+                                    // but has no notification channel. The subscription is
+                                    // handled at the node level, not the client level.
+                                    tracing::debug!(
                                         client_id = %client_id,
                                         contract = %full_key,
-                                        "GET with subscribe=true but no subscription_listener"
+                                        "GET with subscribe=true but no subscription_listener (expected for HTTP clients)"
                                     );
                                 }
                             }
@@ -1540,7 +1541,8 @@ async fn process_open_request(
                         // Reject Subscribe if the contract WASM isn't cached locally.
                         // Without WASM, the node can't validate or apply updates,
                         // leading to a "subscribed but can't update" state.
-                        // Clients must PUT or GET (with return_contract_code=true) first.
+                        // Clients must PUT or GET first (any GET will cache WASM
+                        // internally regardless of return_contract_code, see #3757).
                         //
                         // Note: This only guards explicit ContractRequest::Subscribe.
                         // GET+subscribe=true and PUT+subscribe=true bypass this check
@@ -1570,12 +1572,12 @@ async fn process_open_request(
                                     request_id = %request_id,
                                     contract = %key,
                                     "Rejecting SUBSCRIBE: contract WASM not cached locally. \
-                                     PUT the contract or GET with return_contract_code=true first."
+                                     PUT the contract or GET the contract first."
                                 );
                                 return Err(Error::Node(format!(
                                     "Cannot subscribe to contract {key}: contract WASM/parameters \
-                                     not cached locally. PUT the contract or GET with \
-                                     return_contract_code=true before subscribing."
+                                     not cached locally. PUT the contract or GET the contract \
+                                     before subscribing."
                                 )));
                             }
                             Err(err) => {
@@ -1945,9 +1947,8 @@ async fn process_open_request(
                             callback: tx,
                         }
                     }
-                    freenet_stdlib::client_api::NodeQuery::ProximityCacheInfo => {
+                    freenet_stdlib::client_api::NodeQuery::NeighborHostingInfo => {
                         // TODO: Implement neighbor hosting info query
-                        // Note: ProximityCacheInfo is defined in freenet-stdlib; rename there separately
                         tracing::warn!(
                             client_id = %client_id,
                             request_id = %request_id,

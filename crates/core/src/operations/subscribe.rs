@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Instant;
 
 use either::Either;
 
@@ -463,6 +464,7 @@ pub(crate) async fn request_subscribe(
         stats: Some(SubscribeStats {
             target_peer: target.clone(),
             contract_location: Location::from(instance_id),
+            request_sent_at: Instant::now(),
         }),
         ack_received: false,
         speculative_paths: 0,
@@ -541,6 +543,8 @@ async fn complete_local_subscription(
 struct SubscribeStats {
     target_peer: crate::ring::PeerKeyLocation,
     contract_location: Location,
+    /// When the subscribe request was sent; used to compute response time.
+    request_sent_at: Instant,
 }
 
 pub(crate) struct SubscribeOp {
@@ -584,11 +588,14 @@ impl SubscribeOp {
 
     pub(super) fn outcome(&self) -> OpOutcome<'_> {
         if self.finalized() {
-            // Subscribe succeeded — report as untimed success if we have stats
             if let Some(ref stats) = self.stats {
-                return OpOutcome::ContractOpSuccessUntimed {
+                let response_time = stats.request_sent_at.elapsed();
+                return OpOutcome::ContractOpSuccess {
                     target_peer: &stats.target_peer,
                     contract_location: stats.contract_location,
+                    first_response_time: response_time,
+                    payload_size: 0,
+                    payload_transfer_time: std::time::Duration::ZERO,
                 };
             }
             return OpOutcome::Irrelevant;
@@ -725,10 +732,11 @@ impl SubscribeOp {
                     "Subscribe retrying with alternative peer after timeout"
                 );
 
-                // Update stats for the new target
+                // Update stats for the new target (reset timing for new attempt)
                 self.stats = Some(SubscribeStats {
                     target_peer: next_target,
                     contract_location: Location::from(&instance_id),
+                    request_sent_at: Instant::now(),
                 });
 
                 // Reduce HTL on each retry, floored at MIN_RETRY_HTL (#3570).
@@ -1065,7 +1073,7 @@ async fn notify_abort_failure(
 /// avoids NAT timing window failures) or falls back to an address lookup. If a key
 /// is found, records the peer in both the downstream subscriber list and the interest
 /// manager so UPDATE broadcasts reach them immediately.
-async fn register_downstream_subscriber(
+pub(crate) async fn register_downstream_subscriber(
     op_manager: &OpManager,
     key: &ContractKey,
     requester_addr: std::net::SocketAddr,
@@ -1498,6 +1506,7 @@ impl Operation for SubscribeOp {
                             stats: Some(SubscribeStats {
                                 target_peer: next_hop.clone(),
                                 contract_location: Location::from(instance_id),
+                                request_sent_at: Instant::now(),
                             }),
                             ack_received: false,
                             speculative_paths: 0,

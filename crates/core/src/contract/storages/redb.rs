@@ -48,29 +48,40 @@ pub struct HostingMetadata {
     pub size_bytes: u64,
     /// Code hash of the contract (needed to reconstruct ContractKey)
     pub code_hash: [u8; 32],
+    /// Whether this contract was accessed by a local client (HTTP/WebSocket).
+    pub local_client_access: bool,
 }
 
 impl HostingMetadata {
-    pub fn new(last_access_ms: u64, access_type: u8, size_bytes: u64, code_hash: [u8; 32]) -> Self {
+    pub fn new(
+        last_access_ms: u64,
+        access_type: u8,
+        size_bytes: u64,
+        code_hash: [u8; 32],
+        local_client_access: bool,
+    ) -> Self {
         Self {
             last_access_ms,
             access_type,
             size_bytes,
             code_hash,
+            local_client_access,
         }
     }
 
-    /// Serialize to bytes: [last_access_ms: 8][access_type: 1][size_bytes: 8][code_hash: 32] = 49 bytes
-    pub fn to_bytes(&self) -> [u8; 49] {
-        let mut buf = [0u8; 49];
+    /// Serialize to bytes: [last_access_ms: 8][access_type: 1][size_bytes: 8][code_hash: 32][local_client_access: 1] = 50 bytes
+    pub fn to_bytes(&self) -> [u8; 50] {
+        let mut buf = [0u8; 50];
         buf[0..8].copy_from_slice(&self.last_access_ms.to_le_bytes());
         buf[8] = self.access_type;
         buf[9..17].copy_from_slice(&self.size_bytes.to_le_bytes());
         buf[17..49].copy_from_slice(&self.code_hash);
+        buf[49] = u8::from(self.local_client_access);
         buf
     }
 
-    /// Deserialize from bytes
+    /// Deserialize from bytes. Backward-compatible: 49-byte entries
+    /// from before the local_client_access field default to false.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 49 {
             return None;
@@ -79,11 +90,13 @@ impl HostingMetadata {
         let access_type = bytes[8];
         let size_bytes = u64::from_le_bytes(bytes[9..17].try_into().ok()?);
         let code_hash: [u8; 32] = bytes[17..49].try_into().ok()?;
+        let local_client_access = bytes.get(49).copied().unwrap_or(0) != 0;
         Some(Self {
             last_access_ms,
             access_type,
             size_bytes,
             code_hash,
+            local_client_access,
         })
     }
 }
@@ -716,7 +729,15 @@ impl StateStorage for ReDb {
             // Default to PUT access type (1) since we're storing state
             // Store the code hash so we can reconstruct ContractKey on load
             let code_hash: [u8; 32] = **key.code_hash();
-            let metadata = HostingMetadata::new(now_ms, 1, state_size, code_hash);
+            // Preserve existing local_client_access flag on update
+            let existing_local = tbl
+                .get(key.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|v| HostingMetadata::from_bytes(v.value()))
+                .map(|m| m.local_client_access)
+                .unwrap_or(false);
+            let metadata = HostingMetadata::new(now_ms, 1, state_size, code_hash, existing_local);
             tbl.insert(key.as_bytes(), metadata.to_bytes().as_slice())?;
         }
 
@@ -851,5 +872,52 @@ mod tests {
         // Verify database file was created
         let db_path = temp_dir.path().join("db");
         assert!(db_path.exists(), "Database file should exist");
+    }
+
+    /// Round-trip test: to_bytes -> from_bytes preserves all fields.
+    #[test]
+    fn test_hosting_metadata_roundtrip() {
+        let metadata = HostingMetadata::new(1234567890, 1, 4096, [0xAB; 32], true);
+        let bytes = metadata.to_bytes();
+        let restored = HostingMetadata::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.last_access_ms, 1234567890);
+        assert_eq!(restored.access_type, 1);
+        assert_eq!(restored.size_bytes, 4096);
+        assert_eq!(restored.code_hash, [0xAB; 32]);
+        assert!(restored.local_client_access);
+
+        // Also test with local_client_access = false
+        let metadata2 = HostingMetadata::new(9999, 0, 100, [0x01; 32], false);
+        let restored2 = HostingMetadata::from_bytes(&metadata2.to_bytes()).unwrap();
+        assert!(!restored2.local_client_access);
+    }
+
+    /// Backward compatibility: 49-byte legacy entries (pre-local_client_access)
+    /// should deserialize with local_client_access = false.
+    #[test]
+    fn test_hosting_metadata_legacy_49_byte_compat() {
+        // Build a legacy 49-byte entry manually
+        let mut legacy = [0u8; 49];
+        legacy[0..8].copy_from_slice(&1000u64.to_le_bytes());
+        legacy[8] = 0; // GET
+        legacy[9..17].copy_from_slice(&512u64.to_le_bytes());
+        legacy[17..49].copy_from_slice(&[0xCC; 32]);
+
+        let restored = HostingMetadata::from_bytes(&legacy).unwrap();
+        assert_eq!(restored.last_access_ms, 1000);
+        assert_eq!(restored.access_type, 0);
+        assert_eq!(restored.size_bytes, 512);
+        assert_eq!(restored.code_hash, [0xCC; 32]);
+        assert!(
+            !restored.local_client_access,
+            "Legacy 49-byte entries must default to local_client_access=false"
+        );
+    }
+
+    /// Entries shorter than 49 bytes should fail to deserialize.
+    #[test]
+    fn test_hosting_metadata_too_short() {
+        assert!(HostingMetadata::from_bytes(&[0u8; 48]).is_none());
+        assert!(HostingMetadata::from_bytes(&[]).is_none());
     }
 }

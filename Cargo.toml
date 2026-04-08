@@ -13,7 +13,7 @@ members = [
 [workspace.dependencies]
 # Core utilities
 ahash = "0.8"
-boot-time = "0.1.2"
+boot-time = "0.1.3"
 anyhow = "1"
 arrayvec = { version = "0.7", features = ["serde"] }
 bincode = "1"
@@ -25,7 +25,7 @@ event-listener = "5"
 hex = "0.4"
 parking_lot = "0.12"
 pav_regression = "0.7.0"
-renegade-ml = "0.2.0"
+renegade-ml = "0.3.3"
 pin-project = "1"
 thiserror = "2"
 ulid = { version = "1.1", features = ["serde"] }
@@ -49,14 +49,14 @@ aes-gcm = "0.10"
 blake3 = { version = "1", features = ["std", "traits-preview"] }
 bs58 = "0.5"
 chacha20poly1305 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Data structures/storage
 crossbeam = "0.8"
 dashmap = "6.1"
 lru = "0.16.3"
-redb = "3"
+redb = "4"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
 moka = { version = "0.12", features = ["sync"] }
 
@@ -132,15 +132,15 @@ tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_support
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 gag = "1"
 winapi = "0.3"
-native-windows-gui = "1.0"
-native-windows-derive = "1.0"
-winreg = "0.55"
-tray-icon = "0.21"
+tao = { version = "0.35", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.55", default-features = false, features = ["os-webview"] }
+winreg = "0.56"
+tray-icon = "0.22"
 muda = "0.17"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-freenet-stdlib = "0.3.5"
+freenet-stdlib = "0.4.0"
 
 [profile.dev.package."*"]
 opt-level = 3
