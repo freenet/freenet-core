@@ -8239,7 +8239,11 @@ async fn test_nightly_50_node_topology_formation() {
     tracing::info!("Running 1 virtual hour of topology formation...");
     let_network_run(&mut sim, VIRTUAL_DURATION).await;
 
-    // Collect per-node connection counts
+    // Collect per-node connection counts. `connection_count` returns `Option`
+    // and `filter_map` may drop nodes whose ConnectionManager is briefly
+    // unavailable; this matches the baseline `test_connection_growth_stall_regression`
+    // pattern. Percentages are computed against the sampled population, same
+    // as the baseline test.
     let mut node_counts: Vec<usize> = (0..NODES)
         .filter_map(|i| {
             let label = NodeLabel::node(NETWORK_NAME, i);
@@ -8412,14 +8416,17 @@ async fn test_nightly_connection_growth_checkpoints() {
         checkpoint_medians.push((target_secs, median));
     }
 
-    // Monotonic growth — each checkpoint median >= previous.
+    // Near-monotonic growth — each checkpoint median is within 1 connection of
+    // the previous. Topology-aware pruning legitimately trades a single
+    // connection for distribution quality, so a transient -1 dip is healthy
+    // behavior, not a stall.
     for window in checkpoint_medians.windows(2) {
         let (prev_t, prev_median) = window[0];
         let (curr_t, curr_median) = window[1];
         assert!(
-            curr_median >= prev_median,
-            "Connection growth stalled between @{}m (median={}) and @{}m (median={}). \
-             Growth must be monotonic. Seed: 0x{:X}",
+            curr_median + 1 >= prev_median,
+            "Connection growth regressed > 1 between @{}m (median={}) and @{}m (median={}). \
+             Growth must be near-monotonic. Seed: 0x{:X}",
             prev_t / 60,
             prev_median,
             curr_t / 60,
@@ -8503,6 +8510,11 @@ async fn test_nightly_fault_recovery_speed() {
         })
         .collect();
     pre_fault_counts.sort_unstable();
+    assert!(
+        !pre_fault_counts.is_empty(),
+        "Phase 1: no connection managers available. Seed: 0x{:X}",
+        SEED
+    );
     let pre_fault_median = pre_fault_counts[pre_fault_counts.len() / 2];
 
     tracing::info!(
@@ -8535,6 +8547,14 @@ async fn test_nightly_fault_recovery_speed() {
         })
         .collect();
     during_fault_counts.sort_unstable();
+    assert_eq!(
+        during_fault_counts.len(),
+        NODES,
+        "Phase 2: expected connection managers for all {} nodes, got {}. Seed: 0x{:X}",
+        NODES,
+        during_fault_counts.len(),
+        SEED
+    );
     let during_fault_median = during_fault_counts[during_fault_counts.len() / 2];
 
     tracing::info!(
@@ -8543,11 +8563,19 @@ async fn test_nightly_fault_recovery_speed() {
         during_fault_counts
     );
 
-    // No death spiral — network didn't collapse under faults.
+    // Resilience under load: 20% message loss must not push the median below
+    // half of MIN_CONN. The previous `> 0` bar was degenerate (a single peer
+    // surviving on the median node would pass), so it could not detect a
+    // partial death spiral. Half-of-min is the smallest threshold strict
+    // enough to fail on real cascade collapse but loose enough to tolerate
+    // brief pruning during a 5-minute fault window.
+    let during_fault_floor = MIN_CONN / 2;
     assert!(
-        during_fault_median > 0,
-        "Death spiral: median connections dropped to 0 during 20% message loss. \
+        during_fault_median >= during_fault_floor,
+        "Connection collapse under load: during_fault_median={} < MIN_CONN/2={}. \
          Counts: {:?}. Seed: 0x{:X}",
+        during_fault_median,
+        during_fault_floor,
         during_fault_counts,
         SEED
     );
@@ -8565,6 +8593,14 @@ async fn test_nightly_fault_recovery_speed() {
         })
         .collect();
     post_recovery_counts.sort_unstable();
+    assert_eq!(
+        post_recovery_counts.len(),
+        NODES,
+        "Phase 3: expected connection managers for all {} nodes, got {}. Seed: 0x{:X}",
+        NODES,
+        post_recovery_counts.len(),
+        SEED
+    );
 
     let post_recovery_median = post_recovery_counts[post_recovery_counts.len() / 2];
     let isolated_count = post_recovery_counts.iter().filter(|&&c| c == 0).count();
@@ -8579,14 +8615,18 @@ async fn test_nightly_fault_recovery_speed() {
         post_recovery_counts
     );
 
-    // Recovery to near pre-fault levels.
-    // Allow 1 connection of slack for topology churn during the fault period.
+    // Recovery to near pre-fault levels AND back above MIN_CONN. Without the
+    // MIN_CONN floor, `pre_fault_median.saturating_sub(1)` could allow the
+    // post-recovery median to fall below the documented success criterion
+    // (e.g. pre=10, post=9 would silently pass).
+    let recovery_floor = pre_fault_median.saturating_sub(1).max(MIN_CONN);
     assert!(
-        post_recovery_median >= pre_fault_median.saturating_sub(1),
-        "Incomplete recovery: post_recovery_median={} < pre_fault_median={} - 1. \
+        post_recovery_median >= recovery_floor,
+        "Incomplete recovery: post_recovery_median={} < floor={} \
+         (max(pre_fault_median - 1, MIN_CONN)). \
          Pre-fault: {:?}, Post-recovery: {:?}. Seed: 0x{:X}",
         post_recovery_median,
-        pre_fault_median,
+        recovery_floor,
         pre_fault_counts,
         post_recovery_counts,
         SEED
