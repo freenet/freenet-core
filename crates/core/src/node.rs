@@ -2462,4 +2462,202 @@ mod tests {
             assert!(!success);
         }
     }
+
+    /// Regression test for #3791: `handle_interest_sync_message` must emit
+    /// `SyncStateToPeer` (targeted to the stale peer) rather than
+    /// `BroadcastStateChange` (which fans out to ALL subscribers) when a
+    /// summary mismatch is detected during interest sync.
+    ///
+    /// This test calls `handle_interest_sync_message` directly with a real
+    /// `OpManager` and a fake contract handler, then inspects the notification
+    /// channel to confirm:
+    ///   - Exactly one `SyncStateToPeer` event targeting the stale peer's address
+    ///   - No `BroadcastStateChange` events
+    ///
+    /// If the node.rs fix were reverted, `BroadcastStateChange` would be emitted
+    /// and this test would fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_summary_mismatch_emits_sync_to_peer_not_broadcast() {
+        use crate::config::{ConfigArgs, NetworkArgs};
+        use crate::contract::handler::{
+            ContractHandlerEvent, StoreResponse, contract_handler_channel,
+        };
+        use crate::contract::OperationMode;
+        use crate::message::{InterestMessage, SummaryEntry};
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use crate::node::network_bridge::{
+            EventLoopNotificationsReceiver, event_loop_notification_channel,
+        };
+        use crate::ring::connection_manager::ConnectionManager;
+        use crate::ring::interest::contract_hash;
+        use crate::transport::TransportKeypair;
+        use freenet_stdlib::prelude::{
+            CodeHash, ContractInstanceId, ContractKey, StateSummary, WrappedState,
+        };
+        use tokio::time::{Duration, timeout};
+
+        // Build a minimal NodeConfig using the same pattern as testing_impl.rs
+        let config_args = ConfigArgs {
+            id: Some("test-summary-mismatch".to_string()),
+            mode: Some(OperationMode::Local),
+            network_api: NetworkArgs {
+                streaming_threshold: Some(usize::MAX),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = NodeConfig::new(config_args.build().await.unwrap())
+            .await
+            .unwrap();
+
+        // Create the notification channel — we will read from it to check emitted events
+        let (notification_receiver, notification_sender) = event_loop_notification_channel();
+        // Create the contract handler channel — we will respond from a spawned task
+        let (ops_ch_channel, mut ch_handler, _) = contract_handler_channel();
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+
+        let task_monitor = BackgroundTaskMonitor::new();
+        let connection_manager = ConnectionManager::new(&config);
+
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_sender,
+                ops_ch_channel,
+                &config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager.clone(),
+                result_router_tx,
+                &task_monitor,
+            )
+            .unwrap(),
+        );
+
+        // Register the stale peer in the connection manager so get_peer_key_from_addr
+        // can resolve its address → PeerKey (required for interest manager lookup).
+        let stale_peer_addr: SocketAddr =
+            "127.0.0.1:30001".parse().expect("valid addr");
+        let stale_peer_keypair = TransportKeypair::new();
+        let stale_peer_pub_key = stale_peer_keypair.public().clone();
+        connection_manager.add_connection(
+            Location::new(0.2),
+            stale_peer_addr,
+            stale_peer_pub_key,
+            false,
+        );
+
+        // Register local hosting interest so has_local_interest() returns true
+        // and lookup_by_hash() finds the contract.
+        let contract_key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([42u8; 32]),
+            CodeHash::new([43u8; 32]),
+        );
+        op_manager.interest_manager.register_local_hosting(&contract_key);
+
+        let our_summary = StateSummary::from(vec![1, 2, 3]);
+        // A different summary → the peer will be detected as stale
+        let their_stale_summary = StateSummary::from(vec![0, 0, 0]);
+        let our_state = WrappedState::new(vec![1, 2, 3]);
+        let hash = contract_hash(&contract_key);
+
+        // Spawn a fake contract handler that responds to exactly the two queries
+        // handle_interest_sync_message issues:
+        //   1. GetSummaryQuery → our current summary (to detect the mismatch)
+        //   2. GetQuery       → the current state (to send to the stale peer)
+        let our_summary_for_handler = our_summary.clone();
+        let our_state_for_handler = our_state.clone();
+        let contract_key_for_handler = contract_key;
+        let handler_task = tokio::spawn(async move {
+            for _ in 0..2usize {
+                match timeout(
+                    Duration::from_millis(500),
+                    ch_handler.recv_from_sender(),
+                )
+                .await
+                {
+                    Ok(Ok((id, ContractHandlerEvent::GetSummaryQuery { key }))) => {
+                        let _ = ch_handler
+                            .send_to_sender(
+                                id,
+                                ContractHandlerEvent::GetSummaryResponse {
+                                    key,
+                                    summary: Ok(our_summary_for_handler.clone()),
+                                },
+                            )
+                            .await;
+                    }
+                    Ok(Ok((id, ContractHandlerEvent::GetQuery { .. }))) => {
+                        let _ = ch_handler
+                            .send_to_sender(
+                                id,
+                                ContractHandlerEvent::GetResponse {
+                                    key: Some(contract_key_for_handler),
+                                    response: Ok(StoreResponse {
+                                        state: Some(our_state_for_handler.clone()),
+                                        contract: None,
+                                    }),
+                                },
+                            )
+                            .await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Send a Summaries message from the stale peer — their summary differs from ours
+        let message = InterestMessage::Summaries {
+            entries: vec![SummaryEntry::from_summary(hash, Some(&their_stale_summary))],
+        };
+        handle_interest_sync_message(&op_manager, stale_peer_addr, message).await;
+
+        // Wait for the fake handler to finish responding
+        let _ = timeout(Duration::from_secs(1), handler_task).await;
+
+        // Drain the notification channel and tally event types
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = notification_receiver;
+
+        let mut sync_to_peer_targets = Vec::new();
+        let mut broadcast_count = 0usize;
+        loop {
+            match timeout(
+                Duration::from_millis(50),
+                notifications_receiver.recv(),
+            )
+            .await
+            {
+                Ok(Some(Either::Right(NodeEvent::SyncStateToPeer { target, .. }))) => {
+                    sync_to_peer_targets.push(target);
+                }
+                Ok(Some(Either::Right(NodeEvent::BroadcastStateChange { .. }))) => {
+                    broadcast_count += 1;
+                }
+                // Channel empty (timeout) or closed — we're done
+                _ => break,
+            }
+        }
+
+        // The fix (#3791): only the specific stale peer gets synced.
+        // Before the fix, BroadcastStateChange was emitted, targeting all subscribers.
+        assert_eq!(
+            sync_to_peer_targets.len(),
+            1,
+            "Expected exactly 1 SyncStateToPeer, got {}: {:?}",
+            sync_to_peer_targets.len(),
+            sync_to_peer_targets,
+        );
+        assert_eq!(
+            sync_to_peer_targets[0],
+            stale_peer_addr,
+            "SyncStateToPeer must target the stale peer, not another address"
+        );
+        assert_eq!(
+            broadcast_count,
+            0,
+            "BroadcastStateChange must NOT be emitted for summary mismatches — \
+             that would be a regression of #3791 (O(N×fan-out) broadcast storm)"
+        );
+    }
 }
