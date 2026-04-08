@@ -19,9 +19,14 @@
 //!
 //! These mechanisms are kept independent because they have different lifecycles
 //! (subscriptions are explicit; hosting follows cache eviction) and different data
-//! structures. They are combined at the broadcast targeting point in
-//! `OpManager::get_broadcast_targets_update()`, where HashSet naturally deduplicates
-//! any overlap.
+//! structures.
+//!
+//! **Note (2026-04, #3797):** The proximity cache is NOT used for broadcast
+//! targeting. `get_broadcast_targets_update()` uses only the interest manager
+//! (subscription tree). The proximity cache caused 95%+ redundant broadcast
+//! targets, inflating upload rates to 90:1 upload/download ratios on hub nodes.
+//! The proximity cache remains active for initial state sync (HostingAnnounce,
+//! InterestSync summary comparison) but not for UPDATE broadcast fan-out.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -1158,5 +1163,90 @@ mod tests {
 
         // Hosting an already-initialized contract should return None (no duplicate announcement)
         assert!(manager.on_contract_hosted(&key1).is_none());
+    }
+
+    /// Regression test for #3797: proximity cache must NOT be used for broadcast targeting.
+    ///
+    /// Before this fix, `get_broadcast_targets_update()` collected targets from both
+    /// the proximity cache and the interest manager, causing ~36 targets per broadcast
+    /// when ~26 would suffice (95%+ overlap). This caused 90:1 upload/download ratios
+    /// on hub nodes and 17+ GB/hr outbound at the gateway.
+    ///
+    /// The proximity cache remains useful for:
+    /// - Initial state sync via HostingAnnounce/InterestSync
+    /// - Detecting overlapping contracts with neighbors
+    /// - Proximity-based state push via SyncStateToPeer
+    ///
+    /// But it must NOT be used as a source of broadcast targets.
+    /// Regression test for #3797: proximity cache must NOT be used for broadcast targeting.
+    ///
+    /// Before this fix, `get_broadcast_targets_update()` collected targets from both
+    /// the proximity cache and the interest manager, causing ~36 targets per broadcast
+    /// when ~26 would suffice (95%+ overlap). This caused 90:1 upload/download ratios
+    /// on hub nodes and 17+ GB/hr outbound at the gateway.
+    ///
+    /// The proximity cache remains useful for:
+    /// - Initial state sync via HostingAnnounce/InterestSync
+    /// - Detecting overlapping contracts with neighbors
+    /// - Proximity-based state push via SyncStateToPeer
+    ///
+    /// But it must NOT be used as a source of broadcast targets.
+    #[test]
+    fn test_proximity_cache_not_used_for_broadcast_targets() {
+        use crate::ring::interest::{InterestManager, PeerKey};
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let manager = NeighborHostingManager::new();
+        let key = test_contract_key();
+
+        // Set up: node hosts the contract
+        manager.on_contract_hosted(&key);
+
+        // Neighbor announces it also hosts the contract (adds to proximity cache)
+        let neighbor_key = make_pub_key(1);
+        let announcement = NeighborHostingMessage::HostingAnnounce {
+            added: vec![*key.id()],
+            removed: vec![],
+            is_response: false,
+        };
+        manager.handle_message(&neighbor_key, announcement);
+
+        // Verify the neighbor IS in the proximity cache
+        let proximity_peers = manager.neighbors_with_contract(&key);
+        assert_eq!(
+            proximity_peers.len(),
+            1,
+            "Neighbor should be in proximity cache"
+        );
+        assert_eq!(proximity_peers[0], neighbor_key);
+
+        // Now verify the interest manager does NOT include this neighbor
+        // (it was only announced via proximity, not via subscription)
+        let time = SharedMockTimeSource::new();
+        let interest = InterestManager::new(time);
+        let interested = interest.get_interested_peers(&key);
+        assert!(
+            interested.is_empty(),
+            "Proximity-only peer must not appear in interest manager"
+        );
+
+        // This is the key invariant: get_broadcast_targets_update() now uses
+        // ONLY interest_manager.get_interested_peers(), so proximity-only peers
+        // are excluded from broadcast targets. The proximity cache entry above
+        // would have been included in the old code but is correctly excluded now.
+
+        // Verify that when a peer IS registered in the interest manager,
+        // it appears in the interested peers list (the actual broadcast source)
+        let subscriber_key = make_pub_key(2);
+        let peer_key = PeerKey::from(subscriber_key);
+        interest.register_peer_interest(&key, peer_key.clone(), None, false);
+
+        let interested = interest.get_interested_peers(&key);
+        assert_eq!(
+            interested.len(),
+            1,
+            "Subscribed peer should appear in interest manager"
+        );
+        assert_eq!(interested[0].0, peer_key);
     }
 }

@@ -1450,14 +1450,18 @@ impl OpManager {
     /// - When sender equals our own address (local UPDATE initiation), we include ourselves
     ///   in neighbor hosting targets if we're hosting the contract
     ///
-    /// # Hybrid Architecture (2026-01 Refactor)
+    /// # Architecture (2026-04 Refactor, Issue #3797)
     ///
-    /// Updates are propagated via TWO sources:
-    /// 1. Neighbor hosting: peers who have announced they host this contract (fast, local knowledge)
-    /// 2. Interest manager: peers who have expressed interest via the Interest/Summary protocol
+    /// Updates are propagated via the **interest manager only** (subscription tree).
+    /// The proximity cache (neighbor hosting) is NOT used for broadcast targeting
+    /// because it overlaps 95%+ with the interest manager and causes O(N)
+    /// amplification at hub nodes. The proximity cache count is still logged
+    /// for diagnostics.
     ///
-    /// This hybrid approach ensures updates reach all interested peers even if HostingAnnounce
-    /// messages haven't fully propagated yet.
+    /// Previously (2026-01), both proximity cache and interest manager were used
+    /// as broadcast sources ("hybrid approach"). Gateway telemetry showed this
+    /// produced ~36 targets per broadcast when ~26 would suffice, causing
+    /// 17+ GB/hr outbound at the gateway. See #3797 for production evidence.
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
@@ -1469,45 +1473,18 @@ impl OpManager {
         let is_local_update_initiator = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
 
         let mut targets: HashSet<PeerKeyLocation> = HashSet::new();
-        let mut proximity_resolve_failed: usize = 0;
+        let proximity_resolve_failed: usize = 0;
         let mut interest_resolve_failed: usize = 0;
         let mut skipped_self: usize = 0;
         let mut skipped_sender: usize = 0;
 
-        // Source 1: Proximity cache (peers who announced they seed this contract)
-        // Returns TransportPublicKey (stable identity), resolve to PeerKeyLocation via pub_key lookup
-        let proximity_pub_keys = self.neighbor_hosting.neighbors_with_contract(key);
-        let proximity_found = proximity_pub_keys.len();
+        // Proximity cache: only counted for diagnostics, NOT used as broadcast targets.
+        // The subscription tree (interest manager) already covers all peers that need
+        // updates. Including proximity targets caused 90:1 upload/download ratios on
+        // nodes with many neighbors hosting popular contracts. See #3797.
+        let proximity_found = self.neighbor_hosting.neighbors_with_contract(key).len();
 
-        for pub_key in proximity_pub_keys {
-            // Resolve pub_key to PeerKeyLocation (which includes current address)
-            if let Some(pkl) = self.ring.connection_manager.get_peer_by_pub_key(&pub_key) {
-                // Skip sender to avoid echo (unless we're the originator)
-                if let Some(pkl_addr) = pkl.socket_addr() {
-                    if &pkl_addr == sender && !is_local_update_initiator {
-                        skipped_sender += 1;
-                        continue;
-                    }
-                    // Skip ourselves if not local originator
-                    if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
-                        skipped_self += 1;
-                        continue;
-                    }
-                }
-                targets.insert(pkl);
-            } else {
-                proximity_resolve_failed += 1;
-                tracing::warn!(
-                    contract = %format!("{:.8}", key),
-                    proximity_neighbor = %pub_key,
-                    is_local = is_local_update_initiator,
-                    phase = "target_lookup_failed",
-                    "Proximity cache neighbor not found in connection manager"
-                );
-            }
-        }
-
-        // Source 2: Interest manager (peers who expressed interest via protocol)
+        // Interest manager (subscription tree): the sole source of broadcast targets.
         let interested_peers = self.interest_manager.get_interested_peers(key);
         let interest_found = interested_peers.len();
 
@@ -1559,7 +1536,7 @@ impl OpManager {
                     .collect::<Vec<_>>()
                     .join(","),
                 count = result.len(),
-                proximity_sources = proximity_found,
+                proximity_skipped = proximity_found,
                 interest_sources = interest_found,
                 phase = "broadcast",
                 "UPDATE_PROPAGATION"
@@ -1569,7 +1546,7 @@ impl OpManager {
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
                 self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
-                proximity_sources = proximity_found,
+                proximity_skipped = proximity_found,
                 interest_sources = interest_found,
                 phase = "warning",
                 "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate further"
