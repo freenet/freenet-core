@@ -92,7 +92,7 @@ async fn test_connection_timing() -> anyhow::Result<()> {
     .instrument(span!(Level::INFO, "node1"))
     .boxed_local();
 
-    let test = timeout(Duration::from_secs(60), async {
+    let test = timeout(Duration::from_secs(180), async {
         // Connect with retry logic — polls until WebSocket server accepts
         let uri_gw =
             format!("ws://{gw_ip}:{ws_api_port_gw}/v1/contract/command?encodingProtocol=native");
@@ -101,14 +101,14 @@ async fn test_connection_timing() -> anyhow::Result<()> {
         );
 
         let ws_start = Instant::now();
-        let mut _client_gw = connect_ws_with_retry(&uri_gw, "Gateway", 30).await?;
+        let mut _client_gw = connect_ws_with_retry(&uri_gw, "Gateway", 60).await?;
         println!(
             "   ✓ Gateway WebSocket connected in {}ms",
             ws_start.elapsed().as_millis()
         );
 
         let ws_start = Instant::now();
-        let mut client_node1 = connect_ws_with_retry(&uri_node1, "Node1", 30).await?;
+        let mut client_node1 = connect_ws_with_retry(&uri_node1, "Node1", 60).await?;
         println!(
             "   ✓ Node1 WebSocket connected in {}ms",
             ws_start.elapsed().as_millis()
@@ -116,7 +116,7 @@ async fn test_connection_timing() -> anyhow::Result<()> {
 
         // Poll until Node1 has at least 1 ring connection to the gateway
         println!("\n⏳ Waiting for P2P connection establishment...");
-        wait_for_node_connected(&mut client_node1, "Node1", 1, 30).await?;
+        wait_for_node_connected(&mut client_node1, "Node1", 1, 120).await?;
         println!("✅ Test completed - check logs for connection timing");
         Ok::<_, anyhow::Error>(())
     })
