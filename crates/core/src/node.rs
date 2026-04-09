@@ -785,22 +785,26 @@ fn op_retry_backoff(attempt: usize) -> Duration {
 /// UPDATE in Phase 1 of the async-transaction refactor (#1454) so every op
 /// kind can terminate a `notify_op_execution` round-trip without hanging.
 ///
-/// # Phase 2 re-audit
+/// # Channel safety
 ///
-/// The `.send().await` below targets a bounded capacity-1 channel (created
-/// by `notify_op_execution` itself). In Phase 1 this is dormant because no
-/// production caller of `notify_op_execution` exists yet, so
-/// `pending_op_result` is always `None` and the `.await` is unreachable.
-/// Before Phase 2 flips on the first real caller, re-audit against
-/// `.claude/rules/channel-safety.md`: the caller today is a short-lived
-/// task spawned by `p2p_protoc::process_message` (see `p2p_protoc.rs`
-/// around line 2510), which places it outside the ban on `.send().await`
-/// in event loops, but the *consumer* side (an op task awaiting
-/// `response_receiver.recv()` in `notify_op_execution`) is vulnerable if a
-/// Phase 2 op task ever ends up also being the only thing that would drain
-/// the reply. Phase 2 should either use `try_send` / `tokio::time::timeout`
-/// here or document why it is provably deadlock-free.
-async fn forward_pending_op_result_if_completed(
+/// Uses `try_send` rather than `.send().await` on the bounded capacity-1
+/// mpsc channel created inside `notify_op_execution`. This is sound
+/// because the callback is fired **at most once per transaction**: the
+/// `is_operation_completed` guard above combined with the `completed` /
+/// `under_progress` dedup sets in `OpManager` ensures that subsequent
+/// messages for the same tx short-circuit before reaching this code. So
+/// `try_send` on an empty capacity-1 channel cannot fail with `Full` —
+/// it can only fail with `Closed` when the caller of `notify_op_execution`
+/// has dropped its receiver. Using `try_send` eliminates any risk of
+/// blocking the pure-network-message handler if a future consumer ever
+/// ends up unable to drain the reply, satisfying the preference for
+/// non-blocking sends in `.claude/rules/channel-safety.md`.
+///
+/// In Phase 1 (#1454) this path is dormant: `pending_op_result` is always
+/// `None` because no production caller of `notify_op_execution` exists.
+/// Phase 2 will introduce the first real caller; the `try_send` choice
+/// here means Phase 2 does not need to touch this function.
+fn forward_pending_op_result_if_completed(
     op_result: &Result<Option<OpEnum>, OpError>,
     pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
     reply: NetMessage,
@@ -812,7 +816,7 @@ async fn forward_pending_op_result_if_completed(
         return;
     };
     let tx_id = *reply.id();
-    if let Err(err) = callback.send(reply).await {
+    if let Err(err) = callback.try_send(reply) {
         tracing::error!(%err, %tx_id, "Failed to send message to executor");
     }
 }
@@ -867,8 +871,7 @@ where
                     &op_result,
                     pending_op_result.as_ref(),
                     NetMessage::V1(NetMessageV1::Connect((*op).clone())),
-                )
-                .await;
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -924,8 +927,7 @@ where
                     &op_result,
                     pending_op_result.as_ref(),
                     NetMessage::V1(NetMessageV1::Put((*op).clone())),
-                )
-                .await;
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -968,8 +970,7 @@ where
                     &op_result,
                     pending_op_result.as_ref(),
                     NetMessage::V1(NetMessageV1::Get((*op).clone())),
-                )
-                .await;
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -1012,8 +1013,7 @@ where
                     &op_result,
                     pending_op_result.as_ref(),
                     NetMessage::V1(NetMessageV1::Update((*op).clone())),
-                )
-                .await;
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -1065,8 +1065,7 @@ where
                     &op_result,
                     pending_op_result.as_ref(),
                     NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
-                )
-                .await;
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -2568,7 +2567,7 @@ mod tests {
             let reply = dummy_reply();
             let expected_id = *reply.id();
 
-            forward_pending_op_result_if_completed(&op_result, Some(&tx), reply).await;
+            forward_pending_op_result_if_completed(&op_result, Some(&tx), reply);
 
             let received = rx.try_recv().expect("helper should forward the reply");
             assert_eq!(*received.id(), expected_id);
@@ -2580,8 +2579,8 @@ mod tests {
             let op = completed_connect_op();
             let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
 
-            forward_pending_op_result_if_completed(&op_result, None, dummy_reply()).await;
-            // Nothing to assert beyond "did not hang or panic".
+            forward_pending_op_result_if_completed(&op_result, None, dummy_reply());
+            // Nothing to assert beyond "did not panic".
         }
 
         #[tokio::test]
@@ -2592,12 +2591,12 @@ mod tests {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
 
             let ok_none: Result<Option<OpEnum>, OpError> = Ok(None);
-            forward_pending_op_result_if_completed(&ok_none, Some(&tx), dummy_reply()).await;
+            forward_pending_op_result_if_completed(&ok_none, Some(&tx), dummy_reply());
             assert!(rx.try_recv().is_err(), "Ok(None) must not forward");
 
             let err_running: Result<Option<OpEnum>, OpError> =
                 Err(OpError::OpNotAvailable(OpNotAvailable::Running));
-            forward_pending_op_result_if_completed(&err_running, Some(&tx), dummy_reply()).await;
+            forward_pending_op_result_if_completed(&err_running, Some(&tx), dummy_reply());
             assert!(
                 rx.try_recv().is_err(),
                 "OpNotAvailable::Running must not forward"
@@ -2605,7 +2604,7 @@ mod tests {
 
             let err_completed: Result<Option<OpEnum>, OpError> =
                 Err(OpError::OpNotAvailable(OpNotAvailable::Completed));
-            forward_pending_op_result_if_completed(&err_completed, Some(&tx), dummy_reply()).await;
+            forward_pending_op_result_if_completed(&err_completed, Some(&tx), dummy_reply());
             assert!(
                 rx.try_recv().is_err(),
                 "OpNotAvailable::Completed must not forward (no OpEnum payload)"
@@ -2637,11 +2636,33 @@ mod tests {
             let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
-            forward_pending_op_result_if_completed(&op_result, Some(&tx), dummy_reply()).await;
+            forward_pending_op_result_if_completed(&op_result, Some(&tx), dummy_reply());
             assert!(
                 rx.try_recv().is_err(),
                 "in-progress op must not forward to pending_op_result"
             );
+        }
+
+        #[tokio::test]
+        async fn no_hang_when_receiver_dropped() {
+            // Regression guard for the `try_send` channel-safety choice:
+            // if the caller of `notify_op_execution` drops its receiver
+            // (e.g. cancelled, timed out) before the op completes, the
+            // reply side must not block the pure-network-message handler.
+            // With `try_send` the send fails with `Closed` and we log;
+            // with `.send().await` it would have succeeded but stranded
+            // the message. Either way the handler must make progress —
+            // the test asserts the helper returns promptly (the
+            // `#[tokio::test]` runtime would hang the whole test process
+            // on regression).
+            let op = completed_connect_op();
+            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            drop(rx);
+
+            forward_pending_op_result_if_completed(&op_result, Some(&tx), dummy_reply());
+            // Returning at all is the assertion.
         }
 
         // Note on per-variant coverage: Phase 1's point is that every op

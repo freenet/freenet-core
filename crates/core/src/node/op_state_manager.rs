@@ -718,9 +718,14 @@ impl OpManager {
     ///
     /// `response_receiver.recv()` has no timeout. If the caller of
     /// `notify_op_execution` is also the only task that would drive the op
-    /// to completion, this will deadlock. Phase 2 must either guarantee
-    /// that property structurally or add a timeout (see
-    /// `.claude/rules/channel-safety.md`).
+    /// to completion, this will deadlock. The reply side
+    /// (`node::forward_pending_op_result_if_completed`) uses `try_send`
+    /// against this capacity-1 channel so it can never block the
+    /// pure-network-message handler; the remaining risk is strictly on
+    /// the caller side (the task awaiting below). Phase 2 must guarantee
+    /// that the awaiting task is not the sole driver of completion, or
+    /// add an explicit timeout around `response_receiver.recv()`
+    /// (see `.claude/rules/channel-safety.md`).
     #[allow(dead_code)] // FIXME: enable async sub-transactions
     pub async fn notify_op_execution(&self, msg: NetMessage) -> Result<NetMessage, OpError> {
         let (response_sender, mut response_receiver): (
