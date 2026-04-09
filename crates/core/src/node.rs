@@ -1945,21 +1945,21 @@ fn get_peer_key_from_addr(
         .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()))
 }
 
-/// Attempts to subscribe to a contract
+/// Attempts to subscribe to a contract. Thin wrapper around
+/// [`subscribe_with_id`] that allocates a fresh transaction.
 #[allow(dead_code)]
 pub async fn subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
 ) -> Result<Transaction, OpError> {
-    // Client-initiated subscriptions are never renewals
-    subscribe_with_id(op_manager, instance_id, client_id, None, false).await
+    subscribe_with_id(op_manager, instance_id, client_id, None).await
 }
 
 /// Attempts to subscribe to a contract with a specific transaction ID (for deduplication).
 ///
-/// Since #1454 Phase 2b, this function is the entry point for client-initiated
-/// SUBSCRIBE only — it spawns a task-per-tx driver via
+/// Since #1454 Phase 2b, this function is the entry point for
+/// **client-initiated** SUBSCRIBE only — it spawns a task-per-tx driver via
 /// [`crate::operations::subscribe::start_client_subscribe`] rather than going
 /// through the legacy `request_subscribe` + `handle_op_result` re-entry loop.
 ///
@@ -1968,6 +1968,14 @@ pub async fn subscribe(
 /// executor/WASM-initiated path (`contract::executor::SubscribeContract::resume_op`)
 /// all call `subscribe::request_subscribe` directly and bypass this function,
 /// so they continue on the legacy path unchanged.
+///
+/// The legacy `is_renewal` parameter has been removed in Phase 2b: no live
+/// caller passes `true`, and the task-per-tx path does not carry renewal
+/// jitter / spam-prevention semantics (those are owned by
+/// `ring::connection_maintenance` and are load-bearing there). Accepting
+/// `is_renewal=true` here would silently route a renewal through the wrong
+/// code path — removing the parameter makes the misuse a compile error
+/// instead of a runtime footgun (review finding L1).
 ///
 /// # Parameters
 ///
@@ -1978,25 +1986,12 @@ pub async fn subscribe(
 /// - `transaction_id`: The client-visible transaction id. If `None`, a fresh
 ///   one is allocated — currently only the dead-code wrapper `subscribe()`
 ///   does this.
-/// - `is_renewal`: Historical parameter. All live call sites pass `false`.
-///   Phase 2b's task-per-tx path is scoped to client-initiated (non-renewal)
-///   subscribes; if a future caller passes `true` through this function the
-///   debug assert below will fire during development so the renewal case
-///   can be re-evaluated (it belongs on the legacy path with jitter +
-///   spam-prevention handling).
 pub async fn subscribe_with_id(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
     transaction_id: Option<Transaction>,
-    is_renewal: bool,
 ) -> Result<Transaction, OpError> {
-    debug_assert!(
-        !is_renewal,
-        "subscribe_with_id is client-initiated-only since #1454 Phase 2b; \
-         renewal callers must go through ring::connection_maintenance directly"
-    );
-
     let client_tx = match transaction_id {
         Some(id) => id,
         None => Transaction::new::<subscribe::SubscribeMsg>(),
@@ -2860,6 +2855,63 @@ mod tests {
             assert!(
                 taken,
                 "callback present but receiver dropped → bypass still taken"
+            );
+        }
+
+        /// Pin the bypass call site. Without this regression guard a
+        /// future refactor could delete the
+        /// `try_forward_task_per_tx_reply` invocation in the SUBSCRIBE
+        /// branch of `handle_pure_network_message_v1` and the unit tests
+        /// on the helper itself would still pass — because unit coverage
+        /// on the helper only proves the helper works, not that it's
+        /// wired in. Integration (simulation) failures would catch it
+        /// eventually but as end-to-end hangs, which is a noisy signal.
+        ///
+        /// This test reads the `node.rs` source at compile time via
+        /// `include_str!` and asserts that the SUBSCRIBE branch of
+        /// `handle_pure_network_message_v1` invokes
+        /// `try_forward_task_per_tx_reply` before running
+        /// `handle_op_request`. A refactor that deletes the bypass call
+        /// will fail this test at the unit-test level (review finding
+        /// Testing #1).
+        ///
+        /// If the match arm structure changes (e.g. SUBSCRIBE branch
+        /// moves or is renamed), the string patterns below need to be
+        /// updated to match. That's a load-bearing but intentional
+        /// coupling — the whole point is to fail loudly when the wiring
+        /// changes so the change is noticed.
+        #[test]
+        fn bypass_is_wired_into_subscribe_branch_regression_guard() {
+            // Full file text, read at compile time.
+            const SOURCE: &str = include_str!("node.rs");
+
+            // Locate the SUBSCRIBE branch of handle_pure_network_message_v1.
+            let subscribe_branch_anchor = "NetMessageV1::Subscribe(ref op) => {";
+            let branch_start = SOURCE.find(subscribe_branch_anchor).expect(
+                "SUBSCRIBE branch of handle_pure_network_message_v1 not found; \
+                         the match arm has been renamed or moved — update this regression guard",
+            );
+
+            // Slice a window large enough to contain the branch body up
+            // to (and including) the first `handle_op_request` call.
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<subscribe::SubscribeOp, _>")
+                .expect("SUBSCRIBE branch no longer calls handle_op_request — update guard")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+
+            // The bypass helper MUST be invoked BEFORE the legacy
+            // handle_op_request call. If this assertion fails, either:
+            //   (a) the bypass was removed (regression — re-add it), or
+            //   (b) the branch was restructured (update this guard).
+            assert!(
+                window.contains("try_forward_task_per_tx_reply("),
+                "SUBSCRIBE branch no longer calls try_forward_task_per_tx_reply \
+                 before handle_op_request. This is the bypass Phase 2b (#1454) \
+                 added to prevent task-per-tx callers from hanging on replies \
+                 that load_or_init would drop as OpNotPresent. Either restore \
+                 the bypass invocation or update this regression guard if the \
+                 branch has been legitimately refactored."
             );
         }
 

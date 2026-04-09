@@ -135,35 +135,52 @@ async fn run_client_subscribe(
     instance_id: ContractInstanceId,
     client_tx: Transaction,
 ) {
-    let outcome = match drive_client_subscribe(op_manager.clone(), instance_id, client_tx).await {
-        Ok(result) => result,
-        Err(err) => {
-            tracing::warn!(
-                tx = %client_tx,
-                contract = %instance_id,
-                error = %err,
-                "subscribe (task-per-tx): task failed"
-            );
-            Err(ErrorKind::OperationError {
-                cause: format!("subscribe failed: {err}").into(),
-            }
-            .into())
-        }
-    };
-
-    deliver_result(&op_manager, client_tx, outcome);
+    let outcome = drive_client_subscribe(op_manager.clone(), instance_id, client_tx).await;
+    deliver_outcome(&op_manager, client_tx, instance_id, outcome);
 }
 
-/// The inner driver: returns `Ok(HostResult)` where the `HostResult` itself
-/// may be `Ok(Subscribed)` or `Err(...)` depending on how the subscribe
-/// terminated. Returning `Err(OpError)` from this function is reserved for
-/// genuine infrastructure failures (e.g., executor channel closed) that
-/// can't be expressed as a client-facing error.
+/// Outcome of the driver, carrying an explicit signal for "local completion
+/// already published to the router, no follow-up `result_router_tx` send
+/// needed". Using an enum here instead of piggybacking on `OpManager::is_completed`
+/// makes the skip condition explicit and unshareable with any other path
+/// that might happen to mark the same tx completed (review finding M3).
+#[derive(Debug)]
+enum DriverOutcome {
+    /// The driver produced a `HostResult` that must be published via
+    /// `result_router_tx`.
+    Publish(HostResult),
+    /// Local completion already published via
+    /// `NodeEvent::LocalSubscribeComplete` inside
+    /// `complete_local_subscription`. The driver must NOT publish a
+    /// second result for this tx — doing so would duplicate the
+    /// `HostResponse::ContractResponse(SubscribeResponse)` the
+    /// `LocalSubscribeComplete` handler already pushed.
+    SkipAlreadyDelivered,
+    /// A genuine infrastructure failure escaped the driver loop
+    /// (e.g., executor channel closed, unexpected reply variant).
+    /// `deliver_outcome` converts this into a synthesized client error.
+    InfrastructureError(OpError),
+}
+
+/// The inner driver: returns a [`DriverOutcome`] describing how the
+/// subscribe terminated and whether the delivery side-effect has already
+/// been applied.
 async fn drive_client_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_tx: Transaction,
-) -> Result<HostResult, OpError> {
+) -> DriverOutcome {
+    match drive_client_subscribe_inner(&op_manager, instance_id, client_tx).await {
+        Ok(outcome) => outcome,
+        Err(err) => DriverOutcome::InfrastructureError(err),
+    }
+}
+
+async fn drive_client_subscribe_inner(
+    op_manager: &Arc<OpManager>,
+    instance_id: ContractInstanceId,
+    client_tx: Transaction,
+) -> Result<DriverOutcome, OpError> {
     // Decide: local-completion, give up, or send to the network.
     // `prepare_initial_request` uses `client_tx` for its visited-peers
     // bloom filter seed and telemetry; this is fine because the bloom
@@ -171,7 +188,7 @@ async fn drive_client_subscribe(
     // the client-visible tx (matching legacy behaviour for the first
     // attempt).
     let initial = prepare_initial_request(
-        &op_manager,
+        op_manager,
         client_tx,
         instance_id,
         /* is_renewal */ false,
@@ -182,18 +199,18 @@ async fn drive_client_subscribe(
         InitialRequest::LocallyComplete { key } => {
             // Local completion reuses the existing helper. It publishes
             // via `NodeEvent::LocalSubscribeComplete` → `result_router_tx`,
-            // so this path does NOT deliver a second time through
-            // `deliver_result` — return with a sentinel that skips delivery.
-            complete_local_subscription(&op_manager, client_tx, key, /* is_renewal */ false)
-                .await?;
-            return Ok(locally_completed_marker(key));
+            // so the driver MUST NOT deliver a second time — return
+            // `SkipAlreadyDelivered` to explicitly signal that to
+            // `deliver_outcome`.
+            complete_local_subscription(op_manager, client_tx, key, /* is_renewal */ false).await?;
+            return Ok(DriverOutcome::SkipAlreadyDelivered);
         }
         InitialRequest::NoHostingPeers => {
-            return Ok(Err(ErrorKind::OperationError {
+            return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: format!("no remote peers available for subscription to {instance_id}")
                     .into(),
             }
-            .into()));
+            .into())));
         }
         InitialRequest::PeerNotJoined => {
             return Err(RingError::PeerNotJoined.into());
@@ -214,17 +231,22 @@ async fn drive_client_subscribe(
         "subscribe (task-per-tx): initial target selected, entering retry loop"
     );
 
-    // Initial state for the retry loop. The first attempt uses the target
-    // returned by `prepare_initial_request`; subsequent attempts pull from
-    // `advance_to_next_peer`. `target_peer` is bound for its side effect
-    // of selecting the initial address only and is not used beyond the
-    // first iteration.
-    let _ = target_peer;
+    // Initial state for the retry loop. The first iteration uses
+    // `target_peer` (as the current target) from `prepare_initial_request`;
+    // subsequent attempts pull from `advance_to_next_peer`.
+    //
+    // `prepare_initial_request` has already emitted a
+    // `NetEventLog::subscribe_request` event keyed on `client_tx` for the
+    // first attempt (mirroring legacy behaviour). Subsequent attempts
+    // re-emit inside the loop using the per-attempt tx so retries are
+    // visible in the event log (review finding L4).
     let mut tried_peers: HashSet<std::net::SocketAddr> = HashSet::new();
     tried_peers.insert(target_addr);
     let mut retries: usize = 0;
     let mut attempts_at_hop: usize = 1;
+    let mut current_target: PeerKeyLocation = target_peer;
     let mut current_target_addr: std::net::SocketAddr = target_addr;
+    let mut is_first_attempt = true;
 
     loop {
         // Fresh attempt tx: single-use-per-tx for send_and_await.
@@ -238,6 +260,26 @@ async fn drive_client_subscribe(
             attempts_at_hop,
             "subscribe (task-per-tx): sending attempt"
         );
+
+        // Per-attempt telemetry (review finding L4). `prepare_initial_request`
+        // emits the first-attempt event on `client_tx`; every retry after
+        // that emits on the fresh `attempt_tx` so the event log captures
+        // the full retry chain.
+        if !is_first_attempt {
+            if let Some(event) = crate::tracing::NetEventLog::subscribe_request(
+                &attempt_tx,
+                &op_manager.ring,
+                instance_id,
+                current_target.clone(),
+                htl,
+            ) {
+                op_manager
+                    .ring
+                    .register_events(either::Either::Left(event))
+                    .await;
+            }
+        }
+        is_first_attempt = false;
 
         let request = SubscribeMsg::Request {
             id: attempt_tx,
@@ -262,7 +304,13 @@ async fn drive_client_subscribe(
         // error, timeout) because the inserted callback slot is keyed
         // only on `attempt_tx` — its lifetime matches the attempt, not
         // the reply classification.
-        op_manager.release_pending_op_slot(attempt_tx);
+        //
+        // `release_pending_op_slot` uses a timeout-wrapped `send().await`
+        // rather than `try_send` so the cleanup survives transient
+        // notification-channel backpressure (review finding M1). We are
+        // inside a spawned task, not an event loop, so `send().await` is
+        // within the channel-safety rules.
+        op_manager.release_pending_op_slot(attempt_tx).await;
 
         let reply = match round_trip {
             Ok(Ok(reply)) => reply,
@@ -278,7 +326,7 @@ async fn drive_client_subscribe(
                 // wire-level NotFound here — from "should we retry on a
                 // different peer?" the answer is the same.
                 match advance_to_next_peer(
-                    &op_manager,
+                    op_manager,
                     &instance_id,
                     &mut visited,
                     &mut tried_peers,
@@ -288,19 +336,20 @@ async fn drive_client_subscribe(
                 )
                 .await
                 {
-                    Some((_next_target, next_addr)) => {
+                    Some((next_target, next_addr)) => {
+                        current_target = next_target;
                         current_target_addr = next_addr;
                         continue;
                     }
                     None => {
-                        return Ok(Err(ErrorKind::OperationError {
+                        return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                             cause: format!(
                                 "subscribe to {instance_id} failed after {} rounds (last peer error: {err})",
                                 retries + 1
                             )
                             .into(),
                         }
-                        .into()));
+                        .into())));
                     }
                 }
             }
@@ -312,7 +361,7 @@ async fn drive_client_subscribe(
                     "subscribe (task-per-tx): attempt timed out after OPERATION_TTL; trying next peer"
                 );
                 match advance_to_next_peer(
-                    &op_manager,
+                    op_manager,
                     &instance_id,
                     &mut visited,
                     &mut tried_peers,
@@ -322,19 +371,20 @@ async fn drive_client_subscribe(
                 )
                 .await
                 {
-                    Some((_next_target, next_addr)) => {
+                    Some((next_target, next_addr)) => {
+                        current_target = next_target;
                         current_target_addr = next_addr;
                         continue;
                     }
                     None => {
-                        return Ok(Err(ErrorKind::OperationError {
+                        return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                             cause: format!(
                                 "subscribe to {instance_id} timed out after {} rounds",
                                 retries + 1
                             )
                             .into(),
                         }
-                        .into()));
+                        .into())));
                     }
                 }
             }
@@ -349,12 +399,12 @@ async fn drive_client_subscribe(
                     contract = %key,
                     "subscribe (task-per-tx): subscribed"
                 );
-                return Ok(Ok(HostResponse::ContractResponse(
+                return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                     ContractResponse::SubscribeResponse {
                         key,
                         subscribed: true,
                     },
-                )));
+                ))));
             }
             ReplyClass::NotFound => {
                 tracing::debug!(
@@ -363,7 +413,7 @@ async fn drive_client_subscribe(
                     "subscribe (task-per-tx): NotFound, trying next peer"
                 );
                 match advance_to_next_peer(
-                    &op_manager,
+                    op_manager,
                     &instance_id,
                     &mut visited,
                     &mut tried_peers,
@@ -373,18 +423,19 @@ async fn drive_client_subscribe(
                 )
                 .await
                 {
-                    Some((_next_target, next_addr)) => {
+                    Some((next_target, next_addr)) => {
+                        current_target = next_target;
                         current_target_addr = next_addr;
                         continue;
                     }
                     None => {
-                        return Ok(Err(ErrorKind::OperationError {
+                        return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                             cause: format!(
                                 "contract {instance_id} not found after exhaustive search"
                             )
                             .into(),
                         }
-                        .into()));
+                        .into())));
                     }
                 }
             }
@@ -513,50 +564,57 @@ async fn advance_to_next_peer(
     None
 }
 
-/// Sentinel indicating local completion has already been published via
-/// `NodeEvent::LocalSubscribeComplete`. The caller uses this to skip a
-/// second delivery through `result_router_tx`.
-fn locally_completed_marker(key: freenet_stdlib::prelude::ContractKey) -> HostResult {
-    // The value here is what `complete_local_subscription` → `p2p_protoc`
-    // delivers to the router internally. We mirror it so
-    // `deliver_result`'s debug log is accurate, but the marker flag below
-    // is what actually suppresses the second send.
-    Ok(HostResponse::ContractResponse(
-        ContractResponse::SubscribeResponse {
-            key,
-            subscribed: true,
-        },
-    ))
-}
-
-/// Publish `result` to `result_router_tx` keyed by `client_tx`, unless the
-/// result was produced by the local-completion path (which already
-/// published via `NodeEvent::LocalSubscribeComplete`).
+/// Publish the driver's outcome to the client, routing on the explicit
+/// [`DriverOutcome`] variant rather than inferring delivery state from
+/// [`OpManager::is_completed`].
 ///
-/// Uses [`OpManager::send_client_result`] so both the router publish and
-/// the follow-up `TransactionCompleted(client_tx)` notification (for
-/// `tx_to_client` cleanup in `p2p_protoc`) happen in one place.
-///
-/// We distinguish "already published locally" from "needs network publish"
-/// by checking whether the op was already marked completed:
-/// `complete_local_subscription` calls `op_manager.completed(tx)`, so a
-/// second `result_router_tx` send would be redundant and could race with
-/// the one from `p2p_protoc`. The `is_completed` guard is conservative —
-/// if in doubt we skip the second publish because the client cache in
-/// `SessionActor` tolerates missing results better than duplicates.
-fn deliver_result(op_manager: &OpManager, client_tx: Transaction, result: HostResult) {
-    // Skip publish if the local-completion path already marked this tx as
-    // completed. This handles both the standalone-node branch and the
-    // peer-not-joined-but-contract-available branch of
-    // `prepare_initial_request`.
-    if op_manager.is_completed(&client_tx) {
-        tracing::debug!(
-            tx = %client_tx,
-            "subscribe (task-per-tx): local completion already published; skipping result_router_tx"
-        );
-        return;
+/// - [`DriverOutcome::Publish`] routes the contained `HostResult` through
+///   [`OpManager::send_client_result`], which both pushes to
+///   `result_router_tx` and emits `NodeEvent::TransactionCompleted(client_tx)`
+///   so `p2p_protoc`'s `tx_to_client` table is reclaimed.
+/// - [`DriverOutcome::SkipAlreadyDelivered`] is a deliberate no-op:
+///   `complete_local_subscription` has already delivered the result via
+///   `NodeEvent::LocalSubscribeComplete`, and a second send would
+///   publish a duplicate `HostResponse::ContractResponse(SubscribeResponse)`
+///   to the client.
+/// - [`DriverOutcome::InfrastructureError`] is converted into a
+///   synthesized client-facing `HostResult::Err` and then published via
+///   `send_client_result`. This path is for errors that do not fit the
+///   user-visible error shape (e.g., `OpError::NotificationError` from
+///   `send_and_await`) — everything else the driver builds an explicit
+///   `DriverOutcome::Publish(Err(...))` for.
+fn deliver_outcome(
+    op_manager: &OpManager,
+    client_tx: Transaction,
+    instance_id: ContractInstanceId,
+    outcome: DriverOutcome,
+) {
+    match outcome {
+        DriverOutcome::Publish(result) => {
+            op_manager.send_client_result(client_tx, result);
+        }
+        DriverOutcome::SkipAlreadyDelivered => {
+            tracing::debug!(
+                tx = %client_tx,
+                "subscribe (task-per-tx): local completion already published; \
+                 skipping result_router_tx"
+            );
+        }
+        DriverOutcome::InfrastructureError(err) => {
+            tracing::warn!(
+                tx = %client_tx,
+                contract = %instance_id,
+                error = %err,
+                "subscribe (task-per-tx): infrastructure error; \
+                 publishing synthesized client error"
+            );
+            let synthesized: HostResult = Err(ErrorKind::OperationError {
+                cause: format!("subscribe failed: {err}").into(),
+            }
+            .into());
+            op_manager.send_client_result(client_tx, synthesized);
+        }
     }
-    op_manager.send_client_result(client_tx, result);
 }
 
 #[cfg(test)]

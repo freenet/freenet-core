@@ -45,11 +45,17 @@ Key decision points:
 
 ```
 Each file is a state machine:
-  connect.rs → CONNECT operation
-  get.rs     → GET operation
-  put.rs     → PUT operation
-  update.rs  → UPDATE operation
-  subscribe.rs → SUBSCRIBE operation
+  connect.rs    → CONNECT operation
+  get.rs        → GET operation
+  put.rs        → PUT operation
+  update.rs     → UPDATE operation
+  subscribe.rs  → SUBSCRIBE operation (legacy state-machine path)
+
+Plus task-per-transaction drivers from #1454 Phase 2b onwards:
+  subscribe/op_ctx_task.rs → client-initiated SUBSCRIBE driver
+    (first production consumer of `OpCtx::send_and_await`;
+     bypasses OpManager.ops.subscribe DashMap entirely and
+     owns retry state in task locals)
 ```
 
 ## Module Map

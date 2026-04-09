@@ -1707,14 +1707,14 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            // Start dedicated operation for this client AFTER registration
-                            // is_renewal: false - client-initiated subscriptions are new
+                            // Start dedicated operation for this client AFTER registration.
+                            // `subscribe_with_id` is client-initiated-only since #1454 Phase 2b;
+                            // no `is_renewal` parameter.
                             let _result_tx = crate::node::subscribe_with_id(
                                 op_manager.clone(),
                                 key,
                                 None, // No legacy registration
                                 Some(tx),
-                                false,
                             )
                             .await
                             .inspect_err(|err| {
@@ -1758,26 +1758,21 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            // is_renewal: false - client-initiated subscriptions are new
-                            crate::node::subscribe_with_id(
-                                op_manager.clone(),
-                                key,
-                                None,
-                                Some(tx),
-                                false,
-                            )
-                            .await
-                            .inspect_err(|err| {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %tx,
-                                    contract = %key,
-                                    error = %err,
-                                    phase = "error",
-                                    "SUBSCRIBE operation failed"
-                                );
-                            })?;
+                            // `subscribe_with_id` is client-initiated-only since #1454 Phase 2b;
+                            // no `is_renewal` parameter.
+                            crate::node::subscribe_with_id(op_manager.clone(), key, None, Some(tx))
+                                .await
+                                .inspect_err(|err| {
+                                    tracing::error!(
+                                        client_id = %client_id,
+                                        request_id = %request_id,
+                                        tx = %tx,
+                                        contract = %key,
+                                        error = %err,
+                                        phase = "error",
+                                        "SUBSCRIBE operation failed"
+                                    );
+                                })?;
 
                             tracing::debug!(
                                 request_id = %request_id,

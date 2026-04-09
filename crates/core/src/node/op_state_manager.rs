@@ -873,15 +873,6 @@ impl OpManager {
         Ok(op)
     }
 
-    /// Returns `true` if `id` has already been marked completed via
-    /// [`Self::completed`]. Used by Phase 2b's task-per-tx subscribe path
-    /// (#1454) to detect that `complete_local_subscription` already
-    /// published a terminal result, so the driver task can avoid a
-    /// duplicate `result_router_tx` send.
-    pub fn is_completed(&self, id: &Transaction) -> bool {
-        self.ops.completed.contains(id)
-    }
-
     /// Emit a `NodeEvent::TransactionCompleted(tx)` to the event loop,
     /// triggering cleanup of any `pending_op_results` entry keyed by `tx`.
     ///
@@ -900,6 +891,19 @@ impl OpManager {
     /// `send_client_result` (that would publish N duplicate results to
     /// the client).
     ///
+    /// # Blocking vs non-blocking send
+    ///
+    /// Uses `send().await` wrapped in [`Self::NOTIFICATION_SEND_TIMEOUT`]
+    /// rather than `try_send` because the cleanup is load-bearing: a
+    /// dropped `TransactionCompleted` on a transiently-full notification
+    /// channel would leave the `pending_op_results` slot in place until
+    /// the 60 s periodic sweep runs, which
+    /// `test_pending_op_results_bounded` is designed to catch. Since this
+    /// method is only called from spawned task bodies (never from an
+    /// event loop), `send().await` is within the `.claude/rules/channel-safety.md`
+    /// rules. The 30 s timeout guards against a genuinely wedged event
+    /// loop — the same timeout [`Self::notify_op_change`] uses.
+    ///
     /// # Side effects on other `TransactionCompleted` consumers
     ///
     /// The `p2p_protoc::handle_notification_message` branch for
@@ -910,17 +914,34 @@ impl OpManager {
     /// / `waiting_for_transaction_result`, never on per-attempt txs. If a
     /// future change starts keying `tx_to_client` by attempt tx, this
     /// eager cleanup will silently drop mappings and must be revisited.
-    pub(crate) fn release_pending_op_slot(&self, tx: Transaction) {
-        if let Err(err) = self
-            .to_event_listener
-            .notifications_sender
-            .try_send(Either::Right(NodeEvent::TransactionCompleted(tx)))
+    pub(crate) async fn release_pending_op_slot(&self, tx: Transaction) {
+        match tokio::time::timeout(
+            Self::NOTIFICATION_SEND_TIMEOUT,
+            self.to_event_listener
+                .notifications_sender()
+                .send(Either::Right(NodeEvent::TransactionCompleted(tx))),
+        )
+        .await
         {
-            tracing::debug!(
-                %tx,
-                error = %err,
-                "failed to emit TransactionCompleted for pending_op_results cleanup"
-            );
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    %tx,
+                    "release_pending_op_slot: notification channel closed; \
+                     pending_op_results entry will be reclaimed by 60s sweep"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    %tx,
+                    timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
+                    channel_pending = self.to_event_listener.notification_channel_pending(),
+                    channel_remaining = self.to_event_listener.notifications_sender().capacity(),
+                    "release_pending_op_slot: notification channel full for too long; \
+                     event loop may be stuck; pending_op_results entry will be \
+                     reclaimed by 60s sweep"
+                );
+            }
         }
     }
 
