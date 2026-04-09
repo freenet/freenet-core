@@ -873,6 +873,46 @@ impl OpManager {
         Ok(op)
     }
 
+    /// Returns `true` if `id` has already been marked completed via
+    /// [`Self::completed`]. Used by Phase 2b's task-per-tx subscribe path
+    /// (#1454) to detect that `complete_local_subscription` already
+    /// published a terminal result, so the driver task can avoid a
+    /// duplicate `result_router_tx` send.
+    pub fn is_completed(&self, id: &Transaction) -> bool {
+        self.ops.completed.contains(id)
+    }
+
+    /// Emit a `NodeEvent::TransactionCompleted(tx)` to the event loop,
+    /// triggering cleanup of any `pending_op_results` entry keyed by `tx`.
+    ///
+    /// Used by Phase 2b's task-per-tx subscribe path (#1454) to release
+    /// the per-attempt callback slot in `p2p_protoc::pending_op_results`
+    /// after each `OpCtx::send_and_await` round-trip finishes. Without
+    /// this emission the attempt-tx entries accumulate until either the
+    /// periodic 60 s cleanup sweeps closed senders or the node shuts
+    /// down — see `test_pending_op_results_bounded` for the regression
+    /// guard.
+    ///
+    /// Distinct from [`Self::send_client_result`] which also emits this
+    /// event but additionally pushes a `HostResult` through
+    /// `result_router_tx`. The task-per-tx path has many attempt txs
+    /// per client tx, so per-attempt cleanup can't go through
+    /// `send_client_result` (that would publish N duplicate results to
+    /// the client).
+    pub(crate) fn release_pending_op_slot(&self, tx: Transaction) {
+        if let Err(err) = self
+            .to_event_listener
+            .notifications_sender
+            .try_send(Either::Right(NodeEvent::TransactionCompleted(tx)))
+        {
+            tracing::debug!(
+                %tx,
+                error = %err,
+                "failed to emit TransactionCompleted for pending_op_results cleanup"
+            );
+        }
+    }
+
     pub fn completed(&self, id: Transaction) {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.under_progress.remove(&id);

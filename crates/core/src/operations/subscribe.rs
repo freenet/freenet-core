@@ -307,24 +307,165 @@ pub(crate) async fn request_subscribe(
     let SubscribeState::PrepareRequest(ref data) = sub_op.state else {
         return Err(OpError::UnexpectedOpState);
     };
-    let id = &data.id;
-    let instance_id = &data.instance_id;
+    let id = data.id;
+    let instance_id = data.instance_id;
     let is_renewal = data.is_renewal;
 
     tracing::debug!(tx = %id, contract = %instance_id, is_renewal, "subscribe: request_subscribe invoked");
 
+    match prepare_initial_request(op_manager, id, instance_id, is_renewal).await? {
+        InitialRequest::LocallyComplete { key } => {
+            complete_local_subscription(op_manager, id, key, is_renewal).await
+        }
+        InitialRequest::NoHostingPeers => Err(RingError::NoHostingPeers(instance_id).into()),
+        InitialRequest::PeerNotJoined => Err(RingError::PeerNotJoined.into()),
+        InitialRequest::NetworkRequest {
+            target,
+            target_addr,
+            visited,
+            alternatives,
+            htl,
+        } => {
+            let msg = SubscribeMsg::Request {
+                id,
+                instance_id,
+                htl,
+                visited: visited.clone(),
+                is_renewal,
+            };
+
+            let mut tried_peers = HashSet::new();
+            tried_peers.insert(target_addr);
+
+            let op = SubscribeOp {
+                id,
+                state: SubscribeState::AwaitingResponse(AwaitingResponseData {
+                    next_hop: Some(target_addr),
+                    instance_id,
+                    retries: 0,
+                    current_hop: htl,
+                    tried_peers,
+                    alternatives, // remaining candidates after remove(0)
+                    attempts_at_hop: 1,
+                    visited,
+                }),
+                requester_addr: None, // We're the originator
+                requester_pub_key: None,
+                is_renewal,
+                stats: Some(SubscribeStats {
+                    target_peer: target,
+                    contract_location: Location::from(&instance_id),
+                    request_sent_at: Instant::now(),
+                }),
+                ack_received: false,
+                speculative_paths: 0,
+            };
+
+            // Renewals use non-blocking send to fail fast under congestion rather
+            // than blocking 30 s and compounding it. Client subscribes use the
+            // blocking path for a definitive success/failure response.
+            if is_renewal {
+                op_manager
+                    .notify_op_change_nonblocking(NetMessage::from(msg), OpEnum::Subscribe(op))
+                    .await?;
+            } else {
+                op_manager
+                    .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
+                    .await?;
+            }
+
+            Ok(())
+        }
+    }
+}
+
+/// Outcome of [`prepare_initial_request`]: the decision about how to originate
+/// a subscribe request based on the node's current ring state and contract
+/// availability.
+///
+/// This type exists so both the legacy state-machine path (`request_subscribe`)
+/// and the task-per-tx path (`op_ctx_task::run_client_subscribe`, #1454 Phase
+/// 2b) can share the "which peer, or local-complete, or give up?" decision
+/// logic without duplicating `k_closest_potentially_hosting` + fallback +
+/// local-completion handling.
+///
+/// The returned values describe what the caller should do; the helper does
+/// NOT mutate `op_manager` or push state. Any side-effects (emitting
+/// telemetry via `NetEventLog::subscribe_request`, calling
+/// `complete_local_subscription`, pushing state, sending the wire message)
+/// are the caller's responsibility.
+#[derive(Debug)]
+pub(super) enum InitialRequest {
+    /// Contract is available locally and no network round-trip is required.
+    /// Caller should call [`complete_local_subscription`] with the original
+    /// transaction id and propagate its result.
+    LocallyComplete { key: ContractKey },
+    /// No remote peers could be found and the contract is not available
+    /// locally. Caller should return `RingError::NoHostingPeers`.
+    NoHostingPeers,
+    /// Peer has not joined the ring yet (no own location) and the contract is
+    /// not available locally. Caller should return `RingError::PeerNotJoined`.
+    PeerNotJoined,
+    /// A target peer was selected and the caller should send a
+    /// `SubscribeMsg::Request` to it. `visited` and `alternatives` carry the
+    /// routing state the caller must thread into its retry logic.
+    NetworkRequest {
+        /// The chosen target peer (already removed from `alternatives`).
+        target: PeerKeyLocation,
+        /// Socket address of `target`; pre-resolved for convenience.
+        target_addr: std::net::SocketAddr,
+        /// Bloom filter of visited peers, already including `own_addr` and
+        /// `target_addr`. Callers should clone this into the outgoing
+        /// `SubscribeMsg::Request.visited`.
+        visited: super::VisitedPeers,
+        /// Remaining k_closest candidates not yet tried at this hop.
+        alternatives: Vec<PeerKeyLocation>,
+        /// Initial HTL for the request (= `op_manager.ring.max_hops_to_live`).
+        htl: usize,
+    },
+}
+
+/// Compute the initial "where do we send this subscribe, or do we complete
+/// locally?" decision for a subscribe request.
+///
+/// Factored out of [`request_subscribe`] so the task-per-tx client-initiated
+/// path (`op_ctx_task::run_client_subscribe`, #1454 Phase 2b) can reuse the
+/// exact same ring lookup / fallback / local-completion logic without
+/// duplicating it. The helper is pure modulo telemetry emission: it calls
+/// `NetEventLog::subscribe_request` on the `NetworkRequest` branch so both
+/// callers get identical event logs, but it does not mutate `op_manager`
+/// state and does not push any `SubscribeOp` into the per-op DashMap.
+///
+/// The decision branches exactly mirror the pre-extraction body of
+/// `request_subscribe`:
+///
+/// 1. If the peer has no ring location (hasn't joined), check local contract
+///    availability and either complete locally or return `PeerNotJoined`.
+/// 2. Query `k_closest_potentially_hosting` with `own_addr` already visited.
+///    If it returns candidates, take the first as the target.
+/// 3. If `k_closest` returned empty, fall back to any connected peer that
+///    hasn't been visited (sorted by location for determinism).
+/// 4. If no fallback is available either, check local contract availability
+///    one more time (standalone node / sole holder case) and either complete
+///    locally or return `NoHostingPeers`.
+pub(super) async fn prepare_initial_request(
+    op_manager: &OpManager,
+    id: Transaction,
+    instance_id: ContractInstanceId,
+    is_renewal: bool,
+) -> Result<InitialRequest, OpError> {
     let own_addr = match op_manager.ring.connection_manager.peer_addr() {
         Ok(addr) => addr,
         Err(_) => {
             // Peer hasn't joined the network yet - check if contract is available locally
-            if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
+            if let Some(key) = super::has_contract(op_manager, instance_id).await? {
                 tracing::info!(
                     tx = %id,
                     contract = %key,
                     phase = "local_complete",
                     "Peer not joined, but contract available locally - completing subscription locally"
                 );
-                return complete_local_subscription(op_manager, *id, key, is_renewal).await;
+                return Ok(InitialRequest::LocallyComplete { key });
             }
             tracing::warn!(
                 tx = %id,
@@ -332,7 +473,7 @@ pub(crate) async fn request_subscribe(
                 phase = "peer_not_joined",
                 "Cannot subscribe: peer has not joined network yet and contract not available locally"
             );
-            return Err(RingError::PeerNotJoined.into());
+            return Ok(InitialRequest::PeerNotJoined);
         }
     };
 
@@ -346,13 +487,13 @@ pub(crate) async fn request_subscribe(
     // This ensures proper subscription tree management for update propagation.
 
     // Find a peer to forward the request to (needed even if we have contract locally)
-    let mut visited = super::VisitedPeers::new(id);
+    let mut visited = super::VisitedPeers::new(&id);
     visited.mark_visited(own_addr);
 
     let mut candidates =
         op_manager
             .ring
-            .k_closest_potentially_hosting(instance_id, &visited, MAX_BREADTH);
+            .k_closest_potentially_hosting(&instance_id, &visited, MAX_BREADTH);
 
     // First try the best candidates from k_closest_potentially_hosting.
     // If that returns empty, fall back to any available connection.
@@ -396,17 +537,17 @@ pub(crate) async fn request_subscribe(
             None => {
                 // Truly no connections available - fall back to local completion only if isolated.
                 // This handles the case of a standalone node or when we're the only node with the contract.
-                if let Some(key) = super::has_contract(op_manager, *instance_id).await? {
+                if let Some(key) = super::has_contract(op_manager, instance_id).await? {
                     tracing::info!(
                         tx = %id,
                         contract = %key,
                         phase = "local_complete",
                         "Contract available locally and no network connections, completing subscription locally"
                     );
-                    return complete_local_subscription(op_manager, *id, key, is_renewal).await;
+                    return Ok(InitialRequest::LocallyComplete { key });
                 }
                 tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
-                return Err(RingError::NoHostingPeers(*instance_id).into());
+                return Ok(InitialRequest::NoHostingPeers);
             }
         }
     };
@@ -419,71 +560,31 @@ pub(crate) async fn request_subscribe(
     tracing::debug!(
         tx = %id,
         contract = %instance_id,
+        is_renewal,
         target_peer = %target_addr,
         "subscribe: forwarding Request to target peer"
     );
 
-    let msg = SubscribeMsg::Request {
-        id: *id,
-        instance_id: *instance_id,
-        htl: op_manager.ring.max_hops_to_live,
-        visited: visited.clone(),
-        is_renewal,
-    };
-
-    // Emit telemetry for subscribe request initiation
+    // Emit telemetry for subscribe request initiation. Placed inside the
+    // helper so both the legacy and task-per-tx paths produce identical
+    // `NetEventLog::subscribe_request` events.
     if let Some(event) = NetEventLog::subscribe_request(
-        id,
+        &id,
         &op_manager.ring,
-        *instance_id,
+        instance_id,
         target.clone(),
         op_manager.ring.max_hops_to_live,
     ) {
         op_manager.ring.register_events(Either::Left(event)).await;
     }
 
-    let htl = op_manager.ring.max_hops_to_live;
-    let mut tried_peers = HashSet::new();
-    tried_peers.insert(target_addr);
-
-    let op = SubscribeOp {
-        id: *id,
-        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
-            next_hop: Some(target_addr),
-            instance_id: *instance_id,
-            retries: 0,
-            current_hop: htl,
-            tried_peers,
-            alternatives: candidates, // remaining candidates after remove(0)
-            attempts_at_hop: 1,
-            visited,
-        }),
-        requester_addr: None, // We're the originator
-        requester_pub_key: None,
-        is_renewal,
-        stats: Some(SubscribeStats {
-            target_peer: target.clone(),
-            contract_location: Location::from(instance_id),
-            request_sent_at: Instant::now(),
-        }),
-        ack_received: false,
-        speculative_paths: 0,
-    };
-
-    // Renewals use non-blocking send to fail fast under congestion rather
-    // than blocking 30 s and compounding it. Client subscribes use the
-    // blocking path for a definitive success/failure response.
-    if is_renewal {
-        op_manager
-            .notify_op_change_nonblocking(NetMessage::from(msg), OpEnum::Subscribe(op))
-            .await?;
-    } else {
-        op_manager
-            .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
-            .await?;
-    }
-
-    Ok(())
+    Ok(InitialRequest::NetworkRequest {
+        target,
+        target_addr,
+        visited,
+        alternatives: candidates,
+        htl: op_manager.ring.max_hops_to_live,
+    })
 }
 
 /// Complete a **standalone** local subscription by notifying the client layer.
@@ -2104,6 +2205,12 @@ impl IsOperationCompleted for SubscribeOp {
 
 #[cfg(test)]
 mod tests;
+
+/// Task-per-transaction client-initiated SUBSCRIBE path (#1454 Phase 2b).
+/// First production consumer of `OpCtx::send_and_await`.
+mod op_ctx_task;
+
+pub(crate) use op_ctx_task::start_client_subscribe;
 
 mod messages {
     use std::fmt::Display;
