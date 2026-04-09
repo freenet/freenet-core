@@ -154,6 +154,13 @@ impl OpCtx {
 
         match response_receiver.recv().await {
             Some(reply) => {
+                // Debug-only defense-in-depth. In a release build a
+                // mismatched reply tx would silently return to the
+                // caller (the reply is for a *different* transaction).
+                // That would be a correctness bug in whatever mislabeled
+                // the message in `p2p_protoc::pending_op_results`, not a
+                // failure mode of `send_and_await` itself — the assert
+                // exists to catch such bugs at development time.
                 debug_assert_eq!(
                     reply.id(),
                     &self.tx,
@@ -189,6 +196,19 @@ mod tests {
         NetMessage::V1(NetMessageV1::Aborted(tx))
     }
 
+    /// Happy path: `send_and_await` fires an outbound message, the fake
+    /// executor reads it, replies with a terminal message keyed by the
+    /// same tx, and `send_and_await` returns `Ok(reply)`.
+    ///
+    /// "Happy path" here means "the round-trip mechanics work" — NOT
+    /// "the reply represents success". `send_and_await`'s `Ok(reply)`
+    /// contract is that the caller receives whatever terminal message
+    /// the op pipeline produced, including non-success terminals like
+    /// `SubscribeMsg::Response::NotFound`. The `NetMessageV1::Aborted`
+    /// variant used here is deliberately orthogonal to "success" — it
+    /// only carries a `Transaction`, so the assertion is purely on the
+    /// tx-routing mechanics. Callers of `send_and_await` must inspect
+    /// the returned `NetMessage` to decide what actually happened.
     #[tokio::test]
     async fn send_and_await_returns_reply_on_completion() {
         let (receiver, sender) = event_loop_notification_channel();
@@ -290,7 +310,7 @@ mod tests {
     /// message and then **keeps the second `reply_sender` alive without
     /// firing it**, which is exactly what Phase 1's real dedup
     /// (`completed` / `under_progress` sets in `OpManager`) does at the
-    /// pipeline level: the second `notify_op_execution` arrives, the
+    /// pipeline level: the second `send_and_await` call arrives, its
     /// callback is registered in `pending_op_results`, and
     /// `forward_pending_op_result_if_completed` never runs because the
     /// op is already `completed`. From `send_and_await`'s perspective
@@ -377,11 +397,18 @@ mod tests {
         assert_eq!(first.id(), &tx);
 
         // Second call: expected to hang until our timeout elapses because
-        // the fake executor holds `reply_sender_2` without firing. A
-        // short timeout keeps CI fast while still exercising the
-        // "will hang forever" behavior documented on `send_and_await`.
+        // the fake executor holds `reply_sender_2` without firing.
+        //
+        // 500 ms is ~5× the resolution time of the first call under
+        // uncontended local runs and ~2.5× what the other three tests
+        // give themselves (1 s default timeout, but those complete
+        // effectively instantly). That window is wide enough to survive
+        // CI overload — the Simulation job runs four fdev sims in
+        // parallel on the same runner — without meaningfully slowing
+        // the test suite. Keep it at 500 ms; if this becomes flaky,
+        // the root cause is scheduler starvation, not the constant.
         let second = timeout(
-            Duration::from_millis(200),
+            Duration::from_millis(500),
             ctx.send_and_await(dummy_reply_with_tx(tx)),
         )
         .await;

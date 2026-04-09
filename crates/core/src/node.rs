@@ -774,38 +774,45 @@ fn op_retry_backoff(attempt: usize) -> Duration {
 
 /// If `op_result` indicates the operation completed and a `pending_op_result`
 /// callback is wired, forward `reply` to the awaiting caller of
-/// `OpManager::notify_op_execution`.
+/// [`crate::operations::OpCtx::send_and_await`].
 ///
-/// This is the "round-trip primitive" used by the (currently dead) async
-/// sub-transaction scaffolding: `notify_op_execution` inserts a one-shot
-/// bounded sender into `p2p_protoc::pending_op_results`, and each branch of
-/// `handle_pure_network_message_v1` calls this helper after
-/// `handle_op_request` so the caller can `await` a single reply keyed by the
-/// same `Transaction`.
+/// This is the reply side of the async sub-transaction round-trip primitive
+/// introduced by #1454. The caller side — [`OpCtx::send_and_await`][ocx] —
+/// installs a one-shot bounded [`tokio::sync::mpsc::Sender`] into
+/// `p2p_protoc::pending_op_results` keyed by its `Transaction`, and each
+/// branch of `handle_pure_network_message_v1` calls this helper after
+/// `handle_op_request` so the caller can `await` a single reply keyed by
+/// the same `Transaction`.
 ///
 /// Wired for PUT and GET historically; extended to SUBSCRIBE, CONNECT, and
 /// UPDATE in Phase 1 of the async-transaction refactor (#1454) so every op
-/// kind can terminate a `notify_op_execution` round-trip without hanging.
+/// kind can terminate an `OpCtx::send_and_await` round-trip without hanging.
+/// (Phase 1 predates `OpCtx`; the caller side used to live directly on
+/// `OpManager::notify_op_execution`, now deleted. Phase 2a moved the caller
+/// side into `OpCtx` behind an `OpManager::op_ctx` factory.)
+///
+/// [ocx]: crate::operations::OpCtx::send_and_await
 ///
 /// # Channel safety
 ///
 /// Uses `try_send` rather than `.send().await` on the bounded capacity-1
-/// mpsc channel created inside `notify_op_execution`. This is sound
-/// because the callback is fired **at most once per transaction**: the
+/// mpsc channel created by `OpCtx::send_and_await`. This is sound because
+/// the callback is fired **at most once per transaction**: the
 /// `is_operation_completed` guard above combined with the `completed` /
 /// `under_progress` dedup sets in `OpManager` ensures that subsequent
 /// messages for the same tx short-circuit before reaching this code. So
 /// `try_send` on an empty capacity-1 channel cannot fail with `Full` —
-/// it can only fail with `Closed` when the caller of `notify_op_execution`
-/// has dropped its receiver. Using `try_send` eliminates any risk of
-/// blocking the pure-network-message handler if a future consumer ever
-/// ends up unable to drain the reply, satisfying the preference for
-/// non-blocking sends in `.claude/rules/channel-safety.md`.
+/// it can only fail with `Closed` when the `OpCtx` owner has dropped its
+/// receiver. Using `try_send` eliminates any risk of blocking the
+/// pure-network-message handler if a future consumer ever ends up unable
+/// to drain the reply, satisfying the preference for non-blocking sends
+/// in `.claude/rules/channel-safety.md`.
 ///
-/// In Phase 1 (#1454) this path is dormant: `pending_op_result` is always
-/// `None` because no production caller of `notify_op_execution` exists.
-/// Phase 2 will introduce the first real caller; the `try_send` choice
-/// here means Phase 2 does not need to touch this function.
+/// As of Phase 2a (#1454) this path is still dormant: `pending_op_result`
+/// is always `None` because no production caller of `OpCtx::send_and_await`
+/// exists yet. Phase 2b will introduce the first real caller (SUBSCRIBE
+/// client-initiated path); the `try_send` choice here means Phase 2b does
+/// not need to touch this function.
 fn forward_pending_op_result_if_completed(
     op_result: &Result<Option<OpEnum>, OpError>,
     pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
@@ -1055,14 +1062,15 @@ where
 
                 // Handle pending operation results (network concern).
                 //
-                // Phase 2 deferred: `subscribe::complete_local_subscription`
+                // Phase 2b deferred: `subscribe::complete_local_subscription`
                 // (operations/subscribe.rs) finishes a subscription without
-                // any network round-trip, so a `notify_op_execution` caller
-                // targeting a locally-completed SUBSCRIBE would still hang
-                // because no `NetMessage` ever reaches this branch. Handling
-                // the local-completion path requires either a synthetic
-                // "locally completed" reply or a change to the
-                // `notify_op_execution` contract. See #1454 §5 Phase 2.
+                // any network round-trip, so an `OpCtx::send_and_await`
+                // caller targeting a locally-completed SUBSCRIBE would still
+                // hang because no `NetMessage` ever reaches this branch.
+                // Handling the local-completion path requires either a
+                // synthetic "locally completed" reply at the task layer or
+                // a change to `OpCtx::send_and_await`'s contract. See
+                // #1454 §5 Phase 2b.
                 forward_pending_op_result_if_completed(
                     &op_result,
                     pending_op_result.as_ref(),
@@ -2539,10 +2547,12 @@ mod tests {
     // These exercise the callback-forwarding helper used by every branch of
     // `handle_pure_network_message_v1`. The helper is the only place that
     // drives the `pending_op_result` oneshot channel from a completed op
-    // result back to a caller of `OpManager::notify_op_execution`. Phase 1
-    // extended the hook from PUT/GET only to cover SUBSCRIBE/CONNECT/UPDATE
-    // as well, so these tests verify the helper forwards correctly for every
-    // op variant and short-circuits in the negative cases.
+    // result back to a caller of `OpCtx::send_and_await`. Phase 1 extended
+    // the hook from PUT/GET only to cover SUBSCRIBE/CONNECT/UPDATE as well,
+    // so these tests verify the helper forwards correctly for every op
+    // variant and short-circuits in the negative cases. (The caller side
+    // used to live on `OpManager::notify_op_execution`, which Phase 2a
+    // replaced with `OpCtx::send_and_await` — see #1454.)
     mod callback_forward_tests {
         use super::super::{OpError, OpNotAvailable, forward_pending_op_result_if_completed};
         use crate::message::{MessageStats, NetMessage, NetMessageV1, Transaction};
@@ -2617,8 +2627,8 @@ mod tests {
         async fn no_forward_when_op_in_progress() {
             // A non-completed op state (WaitingForResponses) must not trigger
             // the callback even though the op exists — this is the core guard
-            // that keeps mid-flight operations from prematurely terminating a
-            // `notify_op_execution` round-trip.
+            // that keeps mid-flight operations from prematurely terminating
+            // an `OpCtx::send_and_await` round-trip.
             use crate::operations::connect::JoinerState;
             use std::collections::HashSet;
             use tokio::time::Instant;
@@ -2648,7 +2658,7 @@ mod tests {
         #[tokio::test]
         async fn no_hang_when_receiver_dropped() {
             // Regression guard for the `try_send` channel-safety choice:
-            // if the caller of `notify_op_execution` drops its receiver
+            // if the `OpCtx::send_and_await` caller drops its receiver
             // (e.g. cancelled, timed out) before the op completes, the
             // reply side must not block the pure-network-message handler.
             // With `try_send` the send fails with `Closed` and we log;
@@ -2668,8 +2678,8 @@ mod tests {
         }
 
         // Note on per-variant coverage: Phase 1's point is that every op
-        // variant of `handle_pure_network_message_v1` can terminate a
-        // `notify_op_execution` round-trip. The helper tested above is
+        // variant of `handle_pure_network_message_v1` can terminate an
+        // `OpCtx::send_and_await` round-trip. The helper tested above is
         // variant-agnostic once the `is_operation_completed` guard passes,
         // and each op's own `is_completed` impl is covered by unit tests in
         // `crates/core/src/operations/{connect,put,get,subscribe,update}.rs`.
@@ -2679,7 +2689,7 @@ mod tests {
         // for the concrete op type and reconstructs the same variant before
         // handing it to `forward_pending_op_result_if_completed`. An
         // end-to-end integration test that spins up a node and exercises
-        // `notify_op_execution` for each op kind belongs in Phase 2, where
-        // the first real production caller is added.
+        // `OpCtx::send_and_await` for each op kind belongs in Phase 2b,
+        // where the first real production caller is added.
     }
 }

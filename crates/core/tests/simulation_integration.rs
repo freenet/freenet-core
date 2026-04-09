@@ -4758,10 +4758,14 @@ fn test_router_prediction_threshold_activation() {
 /// Verifies that the event loop properly cleans up completed/timed-out
 /// transaction callbacks, preventing unbounded HashMap growth.
 ///
-/// Note: The op_execution channel's sender (`notify_op_execution`) is currently
-/// dead code, so pending_op_results is not populated during simulation. This
-/// test serves as a regression guard — if the path is re-enabled (see #3159),
-/// it will catch unbounded growth.
+/// Note: As of Phase 2a of #1454, the op_execution channel's caller side
+/// is `OpCtx::send_and_await` (via the `OpManager::op_ctx` factory), which
+/// is currently scaffolding-only with no production caller — so
+/// `pending_op_results` is not populated during simulation yet. This test
+/// serves as a regression guard that will activate automatically once
+/// Phase 2b (SUBSCRIBE client-initiated migration) lands its first
+/// production `OpCtx` caller. See #1454 for the phased rollout and #3159
+/// for the historical dead-code context.
 #[test]
 #[cfg(feature = "simulation_tests")]
 fn test_pending_op_results_bounded() {
@@ -4775,9 +4779,10 @@ fn test_pending_op_results_bounded() {
     tracing::info!(inserts, removes, hwm, "pending_op_results resource metrics");
 
     if inserts == 0 {
-        // op_execution path is currently dead code; log for visibility
+        // `OpCtx::send_and_await` is Phase 2a scaffolding with no production
+        // caller yet; Phase 2b lands the first consumer (#1454).
         tracing::info!(
-            "pending_op_results path not exercised (notify_op_execution is dead code — see #3159)"
+            "pending_op_results path not exercised (no production OpCtx caller yet — see #1454 phase 2b)"
         );
     }
 
