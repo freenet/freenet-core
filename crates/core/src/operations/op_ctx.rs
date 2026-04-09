@@ -98,6 +98,33 @@ impl OpCtx {
     /// on `op_execution_sender` is bounded and can block; spawned tasks are
     /// OK, event loops are not. See `.claude/rules/channel-safety.md`.
     ///
+    /// # Push-before-send
+    ///
+    /// `send_and_await` is the task-per-tx model's network send primitive,
+    /// so the push-before-send invariant from `.claude/rules/operations.md`
+    /// applies here directly: **any state the op will need when the reply
+    /// arrives must be in place before calling this method**. The exact
+    /// meaning of "in place" depends on which execution path the caller
+    /// sits on:
+    ///
+    /// - **Legacy path** (ops still using `handle_op_result` and
+    ///   `notify_op_change`): the caller must have already called
+    ///   `op_manager.push(tx, updated_state).await?` for the same `tx`
+    ///   before `send_and_await`, otherwise a fast response can race the
+    ///   push and hit `OpNotAvailable` when the pipeline tries to look up
+    ///   the op.
+    /// - **Task-per-tx path** (Phase 2b and later): the op state lives in
+    ///   task locals owned by the task that created this `OpCtx`. The
+    ///   invariant becomes "initialize task-local state before calling
+    ///   `send_and_await`": all fields the task will need when processing
+    ///   the reply (retry counters, `visited` peer filters, pending
+    ///   sub-operations, etc.) must be set before the `await` so that the
+    ///   reply handler reads consistent state. There is no `op_manager`
+    ///   DashMap race in this path because the state never leaves the
+    ///   task, but the conceptual ordering rule is the same.
+    ///
+    /// In both cases, the rule is simple: **set up state, then send**.
+    ///
     /// # Terminal reply, not success reply
     ///
     /// The returned [`NetMessage`] is whatever the op pipeline produced when
@@ -253,5 +280,128 @@ mod tests {
             matches!(result, Err(OpError::NotificationError)),
             "expected NotificationError on closed executor channel, got {result:?}"
         );
+    }
+
+    /// Documents the "single-use per `Transaction`" constraint on
+    /// [`OpCtx::send_and_await`]. The doc comment asserts that a second
+    /// call on the same context "will hang forever" because Phase 1's
+    /// reply helper fires exactly once per tx — this test drives that
+    /// scenario with a fake executor that replies to the first outbound
+    /// message and then **keeps the second `reply_sender` alive without
+    /// firing it**, which is exactly what Phase 1's real dedup
+    /// (`completed` / `under_progress` sets in `OpManager`) does at the
+    /// pipeline level: the second `notify_op_execution` arrives, the
+    /// callback is registered in `pending_op_results`, and
+    /// `forward_pending_op_result_if_completed` never runs because the
+    /// op is already `completed`. From `send_and_await`'s perspective
+    /// the reply channel stays open forever with no message.
+    ///
+    /// The assertion wraps the second call in a short [`timeout`] and
+    /// asserts it elapses with `Err(Elapsed)` rather than resolving to
+    /// `Ok(_)` or `Err(NotificationError)`. A regression that made the
+    /// second call *fail fast* (e.g., by adding a runtime check or a
+    /// timeout inside `send_and_await`) would surface as `Ok(_)` from
+    /// the outer `timeout` and break this assertion — at which point
+    /// the doc comment on `send_and_await` must be updated to match.
+    ///
+    /// What this test does and does not guard against:
+    /// - **Does** guard against doc drift: if a future refactor adds a
+    ///   timeout or error path to the second call, the assertion shape
+    ///   breaks and the doc must be updated.
+    /// - **Does not** guard against the structural source of the hang
+    ///   (Phase 1's `completed` / `under_progress` dedup sets). Those
+    ///   live in `OpManager` and are not constructed here; this test
+    ///   simulates their effect directly by holding the reply sender
+    ///   alive without firing. A regression in the real dedup logic
+    ///   would not be caught here — it would be caught by integration
+    ///   tests that exercise the full pipeline.
+    #[tokio::test]
+    async fn send_and_await_second_call_hangs_as_documented() {
+        use tokio::sync::oneshot;
+
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut op_execution_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        // Shutdown signal the test sends once the second call has
+        // been observed hanging for the expected window. The executor
+        // releases its held `reply_sender_2` only after this fires,
+        // avoiding a permanent leak if something goes wrong.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let executor = tokio::spawn(async move {
+            // First outbound: fire the terminal reply and let the first
+            // `send_and_await` resolve normally.
+            let (reply_sender_1, _first) = op_execution_receiver
+                .recv()
+                .await
+                .expect("first outbound delivered");
+            reply_sender_1
+                .try_send(dummy_reply_with_tx(tx))
+                .expect("first reply accepted");
+
+            // Second outbound: hold `reply_sender_2` alive — do NOT drop
+            // it, do NOT fire it. This models what Phase 1's real dedup
+            // does at the `OpManager` level: the reply callback is
+            // installed, `forward_pending_op_result_if_completed`
+            // never runs again (because the op is already in the
+            // `completed` set), so the reply channel simply never
+            // produces a message or closes. From `send_and_await`'s
+            // viewpoint this is indistinguishable from a hang.
+            let (reply_sender_2, _second) = op_execution_receiver
+                .recv()
+                .await
+                .expect("second outbound delivered");
+
+            // Wait for the test to signal it has observed the hang, then
+            // drop the held sender cleanly so no resources leak. The
+            // `Result` is discarded via `drop` to satisfy the crate-level
+            // `clippy::let_underscore_must_use = "deny"` lint.
+            drop(shutdown_rx.await);
+            drop(reply_sender_2);
+        });
+
+        // First call: resolves normally.
+        let first = timeout(
+            Duration::from_secs(1),
+            ctx.send_and_await(dummy_reply_with_tx(tx)),
+        )
+        .await
+        .expect("first send_and_await should complete quickly")
+        .expect("first send_and_await should return Ok");
+        assert_eq!(first.id(), &tx);
+
+        // Second call: expected to hang until our timeout elapses because
+        // the fake executor holds `reply_sender_2` without firing. A
+        // short timeout keeps CI fast while still exercising the
+        // "will hang forever" behavior documented on `send_and_await`.
+        let second = timeout(
+            Duration::from_millis(200),
+            ctx.send_and_await(dummy_reply_with_tx(tx)),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "second send_and_await should have elapsed per the single-use-per-tx doc; got {second:?}"
+        );
+
+        // Release the executor so it can clean up. Send errors are
+        // ignored — if the executor already dropped its receiver (e.g.,
+        // because an earlier `expect` panicked), the shutdown signal is
+        // redundant. Explicit `match` is used instead of `let _ =` or
+        // `drop(...)` to satisfy both `clippy::let_underscore_must_use =
+        // "deny"` (the `Result` is `#[must_use]`) and
+        // `clippy::dropping_copy_types` (`Result<(), ()>` is `Copy`).
+        match shutdown_tx.send(()) {
+            Ok(()) | Err(()) => {}
+        }
+        executor
+            .await
+            .expect("executor task should complete without panicking");
     }
 }
