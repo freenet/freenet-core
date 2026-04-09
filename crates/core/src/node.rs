@@ -784,6 +784,22 @@ fn op_retry_backoff(attempt: usize) -> Duration {
 /// Wired for PUT and GET historically; extended to SUBSCRIBE, CONNECT, and
 /// UPDATE in Phase 1 of the async-transaction refactor (#1454) so every op
 /// kind can terminate a `notify_op_execution` round-trip without hanging.
+///
+/// # Phase 2 re-audit
+///
+/// The `.send().await` below targets a bounded capacity-1 channel (created
+/// by `notify_op_execution` itself). In Phase 1 this is dormant because no
+/// production caller of `notify_op_execution` exists yet, so
+/// `pending_op_result` is always `None` and the `.await` is unreachable.
+/// Before Phase 2 flips on the first real caller, re-audit against
+/// `.claude/rules/channel-safety.md`: the caller today is a short-lived
+/// task spawned by `p2p_protoc::process_message` (see `p2p_protoc.rs`
+/// around line 2510), which places it outside the ban on `.send().await`
+/// in event loops, but the *consumer* side (an op task awaiting
+/// `response_receiver.recv()` in `notify_op_execution`) is vulnerable if a
+/// Phase 2 op task ever ends up also being the only thing that would drain
+/// the reply. Phase 2 should either use `try_send` / `tokio::time::timeout`
+/// here or document why it is provably deadlock-free.
 async fn forward_pending_op_result_if_completed(
     op_result: &Result<Option<OpEnum>, OpError>,
     pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
@@ -1035,7 +1051,16 @@ where
                 )
                 .await;
 
-                // Handle pending operation results (network concern)
+                // Handle pending operation results (network concern).
+                //
+                // Phase 2 deferred: `subscribe::complete_local_subscription`
+                // (operations/subscribe.rs) finishes a subscription without
+                // any network round-trip, so a `notify_op_execution` caller
+                // targeting a locally-completed SUBSCRIBE would still hang
+                // because no `NetMessage` ever reaches this branch. Handling
+                // the local-completion path requires either a synthetic
+                // "locally completed" reply or a change to the
+                // `notify_op_execution` contract. See #1454 §5 Phase 2.
                 forward_pending_op_result_if_completed(
                     &op_result,
                     pending_op_result.as_ref(),
