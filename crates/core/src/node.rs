@@ -57,6 +57,8 @@ use tracing::Instrument;
 
 use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
+#[cfg(test)]
+pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
 // Re-export types for dev_tool and testing
 pub use network_bridge::{EventLoopExitReason, NetworkStats, reset_channel_id_counter};
 
