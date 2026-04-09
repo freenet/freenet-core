@@ -770,6 +770,57 @@ fn op_retry_backoff(attempt: usize) -> Duration {
     Duration::from_millis((5u64 << attempt.min(8)).min(1_000))
 }
 
+/// If `op_result` indicates the operation completed and a `pending_op_result`
+/// callback is wired, forward `reply` to the awaiting caller of
+/// `OpManager::notify_op_execution`.
+///
+/// This is the "round-trip primitive" used by the (currently dead) async
+/// sub-transaction scaffolding: `notify_op_execution` inserts a one-shot
+/// bounded sender into `p2p_protoc::pending_op_results`, and each branch of
+/// `handle_pure_network_message_v1` calls this helper after
+/// `handle_op_request` so the caller can `await` a single reply keyed by the
+/// same `Transaction`.
+///
+/// Wired for PUT and GET historically; extended to SUBSCRIBE, CONNECT, and
+/// UPDATE in Phase 1 of the async-transaction refactor (#1454) so every op
+/// kind can terminate a `notify_op_execution` round-trip without hanging.
+///
+/// # Channel safety
+///
+/// Uses `try_send` rather than `.send().await` on the bounded capacity-1
+/// mpsc channel created inside `notify_op_execution`. This is sound
+/// because the callback is fired **at most once per transaction**: the
+/// `is_operation_completed` guard above combined with the `completed` /
+/// `under_progress` dedup sets in `OpManager` ensures that subsequent
+/// messages for the same tx short-circuit before reaching this code. So
+/// `try_send` on an empty capacity-1 channel cannot fail with `Full` —
+/// it can only fail with `Closed` when the caller of `notify_op_execution`
+/// has dropped its receiver. Using `try_send` eliminates any risk of
+/// blocking the pure-network-message handler if a future consumer ever
+/// ends up unable to drain the reply, satisfying the preference for
+/// non-blocking sends in `.claude/rules/channel-safety.md`.
+///
+/// In Phase 1 (#1454) this path is dormant: `pending_op_result` is always
+/// `None` because no production caller of `notify_op_execution` exists.
+/// Phase 2 will introduce the first real caller; the `try_send` choice
+/// here means Phase 2 does not need to touch this function.
+fn forward_pending_op_result_if_completed(
+    op_result: &Result<Option<OpEnum>, OpError>,
+    pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+    reply: NetMessage,
+) {
+    if !is_operation_completed(op_result) {
+        return;
+    }
+    let Some(callback) = pending_op_result else {
+        return;
+    };
+    let tx_id = *reply.id();
+    if let Err(err) = callback.try_send(reply) {
+        tracing::error!(%err, %tx_id, "Failed to send message to executor");
+    }
+}
+
 /// Pure network message processing for V1 messages (no client concerns)
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message_v1<CB>(
@@ -814,6 +865,13 @@ where
                 )
                 .instrument(span)
                 .await;
+
+                // Handle pending operation results (network concern)
+                forward_pending_op_result_if_completed(
+                    &op_result,
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Connect((*op).clone())),
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -865,17 +923,11 @@ where
                 );
 
                 // Handle pending operation results (network concern)
-                if is_operation_completed(&op_result) {
-                    if let Some(ref op_execution_callback) = pending_op_result {
-                        let tx_id = *op.id();
-                        if let Err(err) = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Put((*op).clone())))
-                            .await
-                        {
-                            tracing::error!(%err, %tx_id, "Failed to send message to executor");
-                        }
-                    }
-                }
+                forward_pending_op_result_if_completed(
+                    &op_result,
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Put((*op).clone())),
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -914,17 +966,11 @@ where
                 .await;
 
                 // Handle pending operation results (network concern)
-                if is_operation_completed(&op_result) {
-                    if let Some(ref op_execution_callback) = pending_op_result {
-                        let tx_id = *op.id();
-                        if let Err(err) = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Get((*op).clone())))
-                            .await
-                        {
-                            tracing::error!(%err, %tx_id, "Failed to send message to executor");
-                        }
-                    }
-                }
+                forward_pending_op_result_if_completed(
+                    &op_result,
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Get((*op).clone())),
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -962,6 +1008,13 @@ where
                 )
                 .await;
 
+                // Handle pending operation results (network concern)
+                forward_pending_op_result_if_completed(
+                    &op_result,
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Update((*op).clone())),
+                );
+
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
@@ -997,6 +1050,22 @@ where
                     source_addr,
                 )
                 .await;
+
+                // Handle pending operation results (network concern).
+                //
+                // Phase 2 deferred: `subscribe::complete_local_subscription`
+                // (operations/subscribe.rs) finishes a subscription without
+                // any network round-trip, so a `notify_op_execution` caller
+                // targeting a locally-completed SUBSCRIBE would still hang
+                // because no `NetMessage` ever reaches this branch. Handling
+                // the local-completion path requires either a synthetic
+                // "locally completed" reply or a change to the
+                // `notify_op_execution` contract. See #1454 §5 Phase 2.
+                forward_pending_op_result_if_completed(
+                    &op_result,
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -2461,5 +2530,154 @@ mod tests {
             assert!(matches!(op_type, Some(OpType::Put)));
             assert!(!success);
         }
+    }
+
+    // Phase 1 (#1454) tests for forward_pending_op_result_if_completed.
+    //
+    // These exercise the callback-forwarding helper used by every branch of
+    // `handle_pure_network_message_v1`. The helper is the only place that
+    // drives the `pending_op_result` oneshot channel from a completed op
+    // result back to a caller of `OpManager::notify_op_execution`. Phase 1
+    // extended the hook from PUT/GET only to cover SUBSCRIBE/CONNECT/UPDATE
+    // as well, so these tests verify the helper forwards correctly for every
+    // op variant and short-circuits in the negative cases.
+    mod callback_forward_tests {
+        use super::super::{OpError, OpNotAvailable, forward_pending_op_result_if_completed};
+        use crate::message::{MessageStats, NetMessage, NetMessageV1, Transaction};
+        use crate::operations::OpEnum;
+        use crate::operations::connect::{ConnectMsg, ConnectOp, ConnectState};
+
+        fn completed_connect_op() -> ConnectOp {
+            ConnectOp::with_state(ConnectState::Completed)
+        }
+
+        fn dummy_reply() -> NetMessage {
+            // We don't care about the payload — the helper only looks at
+            // `NetMessage::id()` for logging. Use the tx-only `Aborted`
+            // variant to avoid building an entire ConnectMsg payload.
+            NetMessage::V1(NetMessageV1::Aborted(Transaction::new::<ConnectMsg>()))
+        }
+
+        #[tokio::test]
+        async fn forwards_reply_when_completed_and_sender_present() {
+            let op = completed_connect_op();
+            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let reply = dummy_reply();
+            let expected_id = *reply.id();
+
+            forward_pending_op_result_if_completed(&op_result, Some(&tx), reply);
+
+            let received = rx.try_recv().expect("helper should forward the reply");
+            assert_eq!(*received.id(), expected_id);
+        }
+
+        #[tokio::test]
+        async fn no_forward_when_sender_absent() {
+            // Helper must not panic / block when no pending_op_result sender is wired.
+            let op = completed_connect_op();
+            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
+
+            forward_pending_op_result_if_completed(&op_result, None, dummy_reply());
+            // Nothing to assert beyond "did not panic".
+        }
+
+        #[tokio::test]
+        async fn no_forward_when_op_not_completed() {
+            // `Ok(None)` and OpError variants should not trigger a send even if
+            // a sender is present. This is the guard that keeps in-progress
+            // ops (e.g. `SendAndContinue`) from prematurely firing the callback.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+
+            let ok_none: Result<Option<OpEnum>, OpError> = Ok(None);
+            forward_pending_op_result_if_completed(&ok_none, Some(&tx), dummy_reply());
+            assert!(rx.try_recv().is_err(), "Ok(None) must not forward");
+
+            let err_running: Result<Option<OpEnum>, OpError> =
+                Err(OpError::OpNotAvailable(OpNotAvailable::Running));
+            forward_pending_op_result_if_completed(&err_running, Some(&tx), dummy_reply());
+            assert!(
+                rx.try_recv().is_err(),
+                "OpNotAvailable::Running must not forward"
+            );
+
+            let err_completed: Result<Option<OpEnum>, OpError> =
+                Err(OpError::OpNotAvailable(OpNotAvailable::Completed));
+            forward_pending_op_result_if_completed(&err_completed, Some(&tx), dummy_reply());
+            assert!(
+                rx.try_recv().is_err(),
+                "OpNotAvailable::Completed must not forward (no OpEnum payload)"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_forward_when_op_in_progress() {
+            // A non-completed op state (WaitingForResponses) must not trigger
+            // the callback even though the op exists — this is the core guard
+            // that keeps mid-flight operations from prematurely terminating a
+            // `notify_op_execution` round-trip.
+            use crate::operations::connect::JoinerState;
+            use std::collections::HashSet;
+            use tokio::time::Instant;
+
+            let waiting = ConnectState::WaitingForResponses(JoinerState {
+                target_connections: 1,
+                observed_address: None,
+                accepted: HashSet::new(),
+                last_progress: Instant::now(),
+                started_without_address: true,
+            });
+            let op = ConnectOp::with_state(waiting);
+            assert!(
+                !op.is_completed(),
+                "precondition: WaitingForResponses must not be completed"
+            );
+            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            forward_pending_op_result_if_completed(&op_result, Some(&tx), dummy_reply());
+            assert!(
+                rx.try_recv().is_err(),
+                "in-progress op must not forward to pending_op_result"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_hang_when_receiver_dropped() {
+            // Regression guard for the `try_send` channel-safety choice:
+            // if the caller of `notify_op_execution` drops its receiver
+            // (e.g. cancelled, timed out) before the op completes, the
+            // reply side must not block the pure-network-message handler.
+            // With `try_send` the send fails with `Closed` and we log;
+            // with `.send().await` it would have succeeded but stranded
+            // the message. Either way the handler must make progress —
+            // the test asserts the helper returns promptly (the
+            // `#[tokio::test]` runtime would hang the whole test process
+            // on regression).
+            let op = completed_connect_op();
+            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            drop(rx);
+
+            forward_pending_op_result_if_completed(&op_result, Some(&tx), dummy_reply());
+            // Returning at all is the assertion.
+        }
+
+        // Note on per-variant coverage: Phase 1's point is that every op
+        // variant of `handle_pure_network_message_v1` can terminate a
+        // `notify_op_execution` round-trip. The helper tested above is
+        // variant-agnostic once the `is_operation_completed` guard passes,
+        // and each op's own `is_completed` impl is covered by unit tests in
+        // `crates/core/src/operations/{connect,put,get,subscribe,update}.rs`.
+        // The remaining "do the five branches of `handle_pure_network_message_v1`
+        // actually invoke the helper with the matching reply variant?"
+        // question is enforced by the compiler — each branch binds `ref op`
+        // for the concrete op type and reconstructs the same variant before
+        // handing it to `forward_pending_op_result_if_completed`. An
+        // end-to-end integration test that spins up a node and exercises
+        // `notify_op_execution` for each op kind belongs in Phase 2, where
+        // the first real production caller is added.
     }
 }

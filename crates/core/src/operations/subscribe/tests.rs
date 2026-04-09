@@ -948,7 +948,10 @@ fn test_subscribe_outcome_success_untimed_with_stats() {
             assert_eq!(*peer, target_peer);
             assert_eq!(loc, contract_location);
         }
-        other => {
+        other @ (OpOutcome::ContractOpSuccess { .. }
+        | OpOutcome::ContractOpFailure { .. }
+        | OpOutcome::Incomplete
+        | OpOutcome::Irrelevant) => {
             panic!("Expected ContractOpSuccessUntimed, got {other:?}")
         }
     }
@@ -1827,7 +1830,10 @@ fn completed_subscribe_reports_success() {
                 "subscribes have no transfer"
             );
         }
-        other => panic!("Expected ContractOpSuccess, got {other:?}"),
+        other @ (OpOutcome::ContractOpSuccessUntimed { .. }
+        | OpOutcome::ContractOpFailure { .. }
+        | OpOutcome::Incomplete
+        | OpOutcome::Irrelevant) => panic!("Expected ContractOpSuccess, got {other:?}"),
     }
 }
 

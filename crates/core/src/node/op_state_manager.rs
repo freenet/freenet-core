@@ -698,6 +698,34 @@ impl OpManager {
             .remove_peer_interest(contract, &peer_key);
     }
 
+    /// Send `msg` through the event loop and await a single reply keyed by the
+    /// same `Transaction`. This is the "round-trip primitive" for the async
+    /// sub-transaction refactor tracked in #1454.
+    ///
+    /// # Scaffolding reach
+    ///
+    /// As of Phase 1 (#1454), the reply callback inserted into
+    /// `p2p_protoc::pending_op_results` is fired for every network-terminating
+    /// op variant: PUT, GET, SUBSCRIBE, CONNECT, and UPDATE (see
+    /// `node::forward_pending_op_result_if_completed` and the branches of
+    /// `handle_pure_network_message_v1`). SUBSCRIBE's
+    /// `complete_local_subscription` path (`operations/subscribe.rs`) does
+    /// NOT pass through `handle_pure_network_message_v1`, so a caller
+    /// targeting a locally-completed subscribe would still hang on
+    /// `response_receiver.recv()` below. That gap is Phase 2 work.
+    ///
+    /// # Deadlock risk
+    ///
+    /// `response_receiver.recv()` has no timeout. If the caller of
+    /// `notify_op_execution` is also the only task that would drive the op
+    /// to completion, this will deadlock. The reply side
+    /// (`node::forward_pending_op_result_if_completed`) uses `try_send`
+    /// against this capacity-1 channel so it can never block the
+    /// pure-network-message handler; the remaining risk is strictly on
+    /// the caller side (the task awaiting below). Phase 2 must guarantee
+    /// that the awaiting task is not the sole driver of completion, or
+    /// add an explicit timeout around `response_receiver.recv()`
+    /// (see `.claude/rules/channel-safety.md`).
     #[allow(dead_code)] // FIXME: enable async sub-transactions
     pub async fn notify_op_execution(&self, msg: NetMessage) -> Result<NetMessage, OpError> {
         let (response_sender, mut response_receiver): (
