@@ -1137,10 +1137,19 @@ where
             }
             NetMessageV1::Subscribe(ref op) => {
                 // Phase 2b (#1454): task-per-tx bypass for client-initiated
-                // SUBSCRIBE. See `try_forward_task_per_tx_reply` for the full
-                // reasoning (reply-side structural gap between Phase 1's
-                // forwarding hook and task-per-tx callers who never push an
-                // op into the OpManager DashMap).
+                // SUBSCRIBE. See `try_forward_task_per_tx_reply` for the
+                // full reasoning (reply-side structural gap between Phase
+                // 1's forwarding hook and task-per-tx callers who never
+                // push an op into the OpManager DashMap).
+                //
+                // Once this returns `true` we exit the branch entirely, so
+                // the legacy `forward_pending_op_result_if_completed` call
+                // that follows the other op branches is DELIBERATELY
+                // ABSENT below: the bypass covers every case where
+                // `pending_op_result` is `Some` for a SUBSCRIBE tx, and
+                // by the time we reach `handle_op_request` we are
+                // guaranteed `pending_op_result.is_none()`. Adding the
+                // legacy forward call would be pure no-op noise.
                 if try_forward_task_per_tx_reply(
                     pending_op_result.as_ref(),
                     NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
@@ -1156,18 +1165,6 @@ where
                     source_addr,
                 )
                 .await;
-
-                // Legacy-path forwarding: no-op for SUBSCRIBE now that the
-                // task-per-tx bypass above handles every case where a
-                // callback is registered. Kept here for structural parity
-                // with the other op branches and to catch any future
-                // case where a legacy-path caller registers a callback
-                // without going through `OpCtx`.
-                forward_pending_op_result_if_completed(
-                    &op_result,
-                    pending_op_result.as_ref(),
-                    NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
-                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {

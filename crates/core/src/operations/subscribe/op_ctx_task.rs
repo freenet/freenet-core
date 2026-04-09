@@ -113,13 +113,38 @@ pub(crate) async fn start_client_subscribe(
     // `notify_op_change` and returns `Ok(())` immediately, letting the
     // event loop drive the rest).
     //
-    // Not registered with BackgroundTaskMonitor: like legacy subscribe
-    // work, this task is scoped to a single transaction and terminates
-    // on its own either on success, error, or the OPERATION_TTL-wrapped
-    // timeout path in the retry loop. A leaked task here would cost one
-    // tx slot in `pending_op_results` and one spawned future — bounded
-    // by the client-side rate-limiting on SUBSCRIBE requests, not
-    // unbounded amplification.
+    // Not registered with `BackgroundTaskMonitor`: per the decision tree
+    // in `.claude/rules/code-style.md` under "WHEN spawning tasks with
+    // `GlobalExecutor::spawn`", the monitor is for tasks that must run
+    // for the node's lifetime. This driver is per-transaction and
+    // terminates on its own via one of:
+    //
+    //   1. Happy path: `send_and_await` returns a terminal reply, loop exits.
+    //   2. Exhaustion path: `advance_to_next_peer` returns `None`, loop exits.
+    //   3. Per-attempt timeout: each `send_and_await` is wrapped in
+    //      `tokio::time::timeout(OPERATION_TTL, ...)`; a timed-out attempt
+    //      advances to the next peer or falls into the exhaustion path.
+    //   4. `OpCtx::send_and_await` infrastructure error (executor channel
+    //      closed / receiver dropped): surfaces as `DriverOutcome::InfrastructureError`
+    //      and exits via `deliver_outcome`.
+    //
+    // Amplification ceiling: the WS SUBSCRIBE request path enforces
+    // `MAX_SUBSCRIPTIONS_PER_CLIENT = 50` upstream via
+    // `notify_contract_handler(RegisterSubscriberListener)` →
+    // `runtime.rs:623` (Executor::register_subscription), which rejects
+    // the registration BEFORE `subscribe_with_id` is called. A client
+    // that tries to open more than 50 in-flight subscribes gets a
+    // `SubscriberLimit` error from the contract handler and never
+    // reaches this spawn site. In-flight task count is therefore
+    // bounded by `num_clients * 50`, not unbounded.
+    //
+    // Leak detection: if the driver somehow gets stuck without exiting
+    // any of the four paths above, `test_pending_op_results_bounded`
+    // (which watches `pending_op_inserts - pending_op_removes`) will
+    // flag the leak during simulation tests. Because every
+    // `send_and_await` attempt both inserts (via `handle_op_execution`)
+    // and removes (via `release_pending_op_slot`) a `pending_op_results`
+    // slot, a stuck task would show up as a widening insert/remove gap.
     GlobalExecutor::spawn(run_client_subscribe(op_manager, instance_id, client_tx));
 
     Ok(client_tx)
@@ -315,16 +340,24 @@ async fn drive_client_subscribe_inner(
         let reply = match round_trip {
             Ok(Ok(reply)) => reply,
             Ok(Err(err)) => {
+                // `send_and_await` infrastructure failure (executor
+                // channel closed, receiver dropped). Distinct from a
+                // wire-level `NotFound` for observability purposes:
+                // emit a structured `outcome=wire_error` field so log
+                // analytics can tell them apart. Retry behaviour is
+                // the same as NotFound — from "should we try another
+                // peer?" the answer is yes — so the downstream logic
+                // is shared (review finding T-4).
                 tracing::warn!(
                     tx = %client_tx,
                     attempt_tx = %attempt_tx,
+                    target = %current_target_addr,
+                    retries,
+                    attempts_at_hop,
+                    outcome = "wire_error",
                     error = %err,
-                    "subscribe (task-per-tx): send_and_await failed; treating as peer timeout"
+                    "subscribe (task-per-tx): send_and_await failed; advancing to next peer"
                 );
-                // Fall through to the "peer timeout / try next" branch.
-                // We don't distinguish infrastructure failure from a
-                // wire-level NotFound here — from "should we retry on a
-                // different peer?" the answer is the same.
                 match advance_to_next_peer(
                     op_manager,
                     &instance_id,
@@ -354,11 +387,20 @@ async fn drive_client_subscribe_inner(
                 }
             }
             Err(_) => {
+                // OPERATION_TTL elapsed without the peer producing a
+                // terminal reply. Distinct from `wire_error` (which is
+                // an infrastructure failure on the executor/send side)
+                // and from `not_found` (a legitimate wire-level
+                // response). `outcome=timeout` (review finding T-4).
                 tracing::warn!(
                     tx = %client_tx,
                     attempt_tx = %attempt_tx,
                     target = %current_target_addr,
-                    "subscribe (task-per-tx): attempt timed out after OPERATION_TTL; trying next peer"
+                    retries,
+                    attempts_at_hop,
+                    outcome = "timeout",
+                    timeout_secs = OPERATION_TTL.as_secs(),
+                    "subscribe (task-per-tx): attempt timed out; advancing to next peer"
                 );
                 match advance_to_next_peer(
                     op_manager,
@@ -397,6 +439,10 @@ async fn drive_client_subscribe_inner(
                     tx = %client_tx,
                     attempt_tx = %attempt_tx,
                     contract = %key,
+                    target = %current_target_addr,
+                    retries,
+                    attempts_at_hop,
+                    outcome = "subscribed",
                     "subscribe (task-per-tx): subscribed"
                 );
                 return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
@@ -407,10 +453,20 @@ async fn drive_client_subscribe_inner(
                 ))));
             }
             ReplyClass::NotFound => {
+                // Wire-level NotFound from a legitimate peer response.
+                // Distinct from `wire_error` (executor/send failure)
+                // and `timeout` (no terminal reply at all), so log
+                // analytics can count "contract not found at this
+                // peer" separately from infrastructure issues (review
+                // finding T-4).
                 tracing::debug!(
                     tx = %client_tx,
                     attempt_tx = %attempt_tx,
-                    "subscribe (task-per-tx): NotFound, trying next peer"
+                    target = %current_target_addr,
+                    retries,
+                    attempts_at_hop,
+                    outcome = "not_found",
+                    "subscribe (task-per-tx): NotFound from peer; advancing to next peer"
                 );
                 match advance_to_next_peer(
                     op_manager,
@@ -480,15 +536,11 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
 /// the legacy `subscribe::handle_op_response` NotFound + alternatives-exhausted
 /// logic (`subscribe.rs` ~1675–1842 before Phase 2b).
 ///
-/// Priority:
-/// 1. If `attempts_at_hop < MAX_BREADTH` and `alternatives` is non-empty,
-///    take the next alternative (breadth retry at the same hop).
-/// 2. Otherwise, if `retries < MAX_RETRIES`, run a fresh
-///    `k_closest_potentially_hosting` round with the accumulated `visited`
-///    filter, reset `attempts_at_hop` to 1, and increment `retries`.
-/// 3. Otherwise, return `None` (exhausted).
-///
-/// Mutates all state references on a successful advance.
+/// Thin wrapper around [`advance_to_next_peer_impl`] that binds the
+/// `fresh_candidates` hook to `op_manager.ring.k_closest_potentially_hosting`.
+/// Splitting the bind out keeps the retry decision logic unit-testable
+/// without needing a full `OpManager` + `Ring` setup (review finding
+/// Testing #2).
 async fn advance_to_next_peer(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,
@@ -498,6 +550,50 @@ async fn advance_to_next_peer(
     retries: &mut usize,
     attempts_at_hop: &mut usize,
 ) -> Option<(PeerKeyLocation, std::net::SocketAddr)> {
+    advance_to_next_peer_impl(
+        instance_id,
+        visited,
+        tried_peers,
+        alternatives,
+        retries,
+        attempts_at_hop,
+        |instance_id, visited| {
+            op_manager
+                .ring
+                .k_closest_potentially_hosting(instance_id, visited, MAX_BREADTH)
+        },
+    )
+}
+
+/// Core decision logic, parameterized on a `fresh_candidates` hook so
+/// tests can drive it without a real `Ring`.
+///
+/// Priority:
+/// 1. If `attempts_at_hop < MAX_BREADTH` and `alternatives` is non-empty,
+///    take the next alternative (breadth retry at the same hop, FIFO
+///    order to match legacy `handle_op_response`).
+/// 2. Otherwise, if `retries < MAX_RETRIES`, call `fresh_candidates` with
+///    the accumulated `visited` filter, reset `attempts_at_hop` to 1,
+///    and increment `retries`.
+/// 3. Otherwise, return `None` (exhausted).
+///
+/// Mutates all state references on a successful advance. The hook is a
+/// synchronous `Fn` rather than `async fn` because the real
+/// `k_closest_potentially_hosting` is also synchronous; this keeps the
+/// signature simple and `impl`-backed. No `.await` inside the body means
+/// the whole decision function can be a plain (non-async) fn.
+fn advance_to_next_peer_impl<F>(
+    instance_id: &ContractInstanceId,
+    visited: &mut VisitedPeers,
+    tried_peers: &mut HashSet<std::net::SocketAddr>,
+    alternatives: &mut Vec<PeerKeyLocation>,
+    retries: &mut usize,
+    attempts_at_hop: &mut usize,
+    mut fresh_candidates: F,
+) -> Option<(PeerKeyLocation, std::net::SocketAddr)>
+where
+    F: FnMut(&ContractInstanceId, &VisitedPeers) -> Vec<PeerKeyLocation>,
+{
     // 1. Breadth retry at the same hop. Use FIFO (`remove(0)`) to match the
     //    legacy `handle_op_response` ordering (`subscribe.rs:949, 1821`).
     //    `alternatives` is built in closest-first order by
@@ -529,11 +625,9 @@ async fn advance_to_next_peer(
     if *retries < MAX_RETRIES {
         *retries += 1;
         *attempts_at_hop = 1;
-        let mut fresh =
-            op_manager
-                .ring
-                .k_closest_potentially_hosting(instance_id, &*visited, MAX_BREADTH);
-        while let Some(candidate) = (!fresh.is_empty()).then(|| fresh.remove(0)) {
+        let mut fresh = fresh_candidates(instance_id, visited);
+        while !fresh.is_empty() {
+            let candidate = fresh.remove(0);
             if let Some(addr) = candidate.socket_addr() {
                 if tried_peers.contains(&addr) || visited.probably_visited(addr) {
                     continue;
@@ -687,21 +781,284 @@ mod tests {
         assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
     }
 
-    // Note on retry-logic coverage: `advance_to_next_peer` is the core
-    // decision helper. Pure unit-testing it requires constructing a
-    // minimal `OpManager` with a stubbed `Ring::k_closest_potentially_hosting`
-    // — heavier than the existing per-op unit-test harness supports out
-    // of the box. The legacy logic it mirrors is already covered by the
-    // integration tests in `subscribe/tests.rs`:
-    //
-    // - `test_subscription_routing_calls_k_closest_with_skip_list`
-    // - the alternatives/bloom-filter retry tests
-    //
-    // Those tests exercise the equivalent legacy code paths. The
-    // task-per-tx path is validated end-to-end by the
-    // `simulation_integration` subscribe scenarios, which run through
-    // `subscribe_with_id` → `start_client_subscribe` after Phase 2b
-    // lands. If `advance_to_next_peer` grows more logic in the future
-    // (e.g., when Phase 2.5 adds sub-op interactions), a `MockRing`-
-    // backed unit test should be added here.
+    // ──────────────────────────────────────────────────────────────
+    // Retry-logic coverage for `advance_to_next_peer_impl` (review
+    // finding Testing #2). The impl is parameterized on a
+    // `fresh_candidates` closure so these tests can drive it without
+    // building a full `OpManager` + `Ring`. Each test pins one
+    // distinct transition in the retry decision tree.
+    // ──────────────────────────────────────────────────────────────
+
+    /// Helper: construct a synthetic `PeerKeyLocation` with a
+    /// predictable socket address. Uses `PeerKeyLocation::random()` for
+    /// the `pub_key` (cached per-thread so it's cheap) and then
+    /// overrides the address with one we control so test assertions
+    /// can match on it. The actual location is derived from the
+    /// address by the ring code, which is irrelevant for these tests —
+    /// `advance_to_next_peer_impl` only looks at `socket_addr()`.
+    fn peer_at(addr: &str) -> PeerKeyLocation {
+        let mut p = PeerKeyLocation::random();
+        p.set_addr(addr.parse().expect("valid socket addr"));
+        p
+    }
+
+    fn contract_id() -> ContractInstanceId {
+        ContractInstanceId::new([9u8; 32])
+    }
+
+    #[test]
+    fn advance_breadth_retry_returns_next_alternative_fifo() {
+        // Setup: three alternatives, none tried yet, attempts_at_hop
+        // below MAX_BREADTH, retries at 0. The helper should pop the
+        // FIRST alternative (FIFO — closest-first) and return it.
+        let id = contract_id();
+        let tx = fresh_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let mut tried_peers: HashSet<std::net::SocketAddr> = HashSet::new();
+        let a = peer_at("10.0.0.1:1001");
+        let b = peer_at("10.0.0.2:1002");
+        let c = peer_at("10.0.0.3:1003");
+        let a_addr = a.socket_addr().unwrap();
+        let mut alternatives = vec![a.clone(), b.clone(), c.clone()];
+        let mut retries = 0usize;
+        let mut attempts_at_hop = 1usize;
+
+        let result = advance_to_next_peer_impl(
+            &id,
+            &mut visited,
+            &mut tried_peers,
+            &mut alternatives,
+            &mut retries,
+            &mut attempts_at_hop,
+            |_, _| panic!("breadth retry path must not call fresh_candidates"),
+        );
+
+        let (picked, picked_addr) = result.expect("breadth retry should return an alternative");
+        assert_eq!(picked_addr, a_addr, "must pick FIRST alternative (FIFO)");
+        assert_eq!(picked.socket_addr(), Some(a_addr));
+        assert_eq!(attempts_at_hop, 2, "attempts_at_hop must increment");
+        assert_eq!(retries, 0, "retries must not change on breadth retry");
+        assert_eq!(alternatives.len(), 2, "one alternative consumed");
+        assert!(tried_peers.contains(&a_addr));
+        assert!(visited.probably_visited(a_addr));
+    }
+
+    #[test]
+    fn advance_breadth_retry_skips_already_visited() {
+        // Setup: first alternative is already in visited bloom; helper
+        // must skip it and take the next one.
+        let id = contract_id();
+        let tx = fresh_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let a = peer_at("10.0.0.1:1001");
+        let b = peer_at("10.0.0.2:1002");
+        let a_addr = a.socket_addr().unwrap();
+        let b_addr = b.socket_addr().unwrap();
+        visited.mark_visited(a_addr); // A was already tried earlier
+        let mut tried_peers: HashSet<std::net::SocketAddr> = HashSet::new();
+        tried_peers.insert(a_addr);
+        let mut alternatives = vec![a, b];
+        let mut retries = 0usize;
+        let mut attempts_at_hop = 1usize;
+
+        let result = advance_to_next_peer_impl(
+            &id,
+            &mut visited,
+            &mut tried_peers,
+            &mut alternatives,
+            &mut retries,
+            &mut attempts_at_hop,
+            |_, _| panic!("should find B before falling through"),
+        );
+
+        let (_, picked_addr) = result.expect("should pick B after skipping A");
+        assert_eq!(picked_addr, b_addr);
+        assert!(alternatives.is_empty(), "both A and B consumed");
+    }
+
+    #[test]
+    fn advance_fresh_round_triggered_when_alternatives_exhausted() {
+        // Setup: alternatives empty, attempts_at_hop below MAX_BREADTH.
+        // The impl should bypass the breadth branch (nothing to pop)
+        // and call `fresh_candidates`, resetting attempts_at_hop to 1
+        // and incrementing retries.
+        let id = contract_id();
+        let tx = fresh_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let mut tried_peers: HashSet<std::net::SocketAddr> = HashSet::new();
+        let mut alternatives: Vec<PeerKeyLocation> = Vec::new();
+        let mut retries = 0usize;
+        let mut attempts_at_hop = 1usize;
+
+        let fresh_peer = peer_at("10.0.0.5:1005");
+        let fresh_addr = fresh_peer.socket_addr().unwrap();
+        let mut fresh_calls = 0;
+
+        let result = advance_to_next_peer_impl(
+            &id,
+            &mut visited,
+            &mut tried_peers,
+            &mut alternatives,
+            &mut retries,
+            &mut attempts_at_hop,
+            |got_id, _got_visited| {
+                fresh_calls += 1;
+                assert_eq!(got_id, &contract_id(), "passes through instance_id");
+                vec![fresh_peer.clone()]
+            },
+        );
+
+        assert_eq!(
+            fresh_calls, 1,
+            "fresh_candidates must be called exactly once"
+        );
+        let (_, picked_addr) = result.expect("fresh round should find a peer");
+        assert_eq!(picked_addr, fresh_addr);
+        assert_eq!(retries, 1, "retries incremented on fresh round");
+        assert_eq!(
+            attempts_at_hop, 1,
+            "attempts_at_hop reset to 1 on fresh round"
+        );
+    }
+
+    #[test]
+    fn advance_fresh_round_after_max_breadth_hit() {
+        // Setup: attempts_at_hop at MAX_BREADTH (the breadth guard
+        // rejects further breadth retries even with alternatives
+        // available). The impl must immediately fall through to the
+        // fresh_candidates branch.
+        let id = contract_id();
+        let tx = fresh_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let mut tried_peers: HashSet<std::net::SocketAddr> = HashSet::new();
+        // Alternatives are present, but breadth is already exhausted.
+        let unused_alt = peer_at("10.0.0.1:1001");
+        let mut alternatives = vec![unused_alt.clone()];
+        let mut retries = 0usize;
+        let mut attempts_at_hop = MAX_BREADTH;
+
+        let fresh_peer = peer_at("10.0.0.5:1005");
+        let fresh_addr = fresh_peer.socket_addr().unwrap();
+
+        let result = advance_to_next_peer_impl(
+            &id,
+            &mut visited,
+            &mut tried_peers,
+            &mut alternatives,
+            &mut retries,
+            &mut attempts_at_hop,
+            |_, _| vec![fresh_peer.clone()],
+        );
+
+        let (_, picked_addr) = result.expect("fresh round should run");
+        assert_eq!(picked_addr, fresh_addr);
+        // The unused alt must still be in `alternatives` OR have been
+        // replaced by the remainder of `fresh` — check that we did NOT
+        // consume it via the breadth branch.
+        assert_eq!(retries, 1, "went through fresh round, not breadth");
+        assert_eq!(attempts_at_hop, 1, "attempts_at_hop reset by fresh round");
+    }
+
+    #[test]
+    fn advance_exhausted_after_max_retries() {
+        // Setup: retries at MAX_RETRIES, no alternatives. Both guards
+        // reject; helper must return None.
+        let id = contract_id();
+        let tx = fresh_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let mut tried_peers: HashSet<std::net::SocketAddr> = HashSet::new();
+        let mut alternatives: Vec<PeerKeyLocation> = Vec::new();
+        let mut retries = MAX_RETRIES;
+        let mut attempts_at_hop = 1usize;
+
+        let result = advance_to_next_peer_impl(
+            &id,
+            &mut visited,
+            &mut tried_peers,
+            &mut alternatives,
+            &mut retries,
+            &mut attempts_at_hop,
+            |_, _| panic!("fresh_candidates must not be called when retries == MAX"),
+        );
+
+        assert!(result.is_none(), "exhausted case returns None");
+        assert_eq!(retries, MAX_RETRIES, "retries unchanged when exhausted");
+    }
+
+    #[test]
+    fn advance_exhausted_when_fresh_round_returns_empty() {
+        // Setup: below MAX_RETRIES, alternatives empty. fresh_candidates
+        // returns empty Vec (e.g., the ring has no candidates left after
+        // accounting for visited filter). Helper must return None AND
+        // have incremented retries.
+        let id = contract_id();
+        let tx = fresh_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let mut tried_peers: HashSet<std::net::SocketAddr> = HashSet::new();
+        let mut alternatives: Vec<PeerKeyLocation> = Vec::new();
+        let mut retries = 0usize;
+        let mut attempts_at_hop = 1usize;
+
+        let result = advance_to_next_peer_impl(
+            &id,
+            &mut visited,
+            &mut tried_peers,
+            &mut alternatives,
+            &mut retries,
+            &mut attempts_at_hop,
+            |_, _| Vec::new(),
+        );
+
+        assert!(result.is_none());
+        assert_eq!(
+            retries, 1,
+            "retries incremented even though fresh round was empty \
+             — the round was 'attempted', it just found nothing"
+        );
+    }
+
+    #[test]
+    fn advance_fresh_round_leftover_becomes_new_alternatives() {
+        // Setup: fresh_candidates returns 3 peers; helper picks the
+        // first, and the remaining 2 MUST be written back to
+        // `alternatives` so subsequent breadth retries can use them.
+        let id = contract_id();
+        let tx = fresh_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let mut tried_peers: HashSet<std::net::SocketAddr> = HashSet::new();
+        let mut alternatives: Vec<PeerKeyLocation> = Vec::new();
+        let mut retries = 0usize;
+        let mut attempts_at_hop = 1usize;
+
+        let p1 = peer_at("10.0.0.1:1001");
+        let p2 = peer_at("10.0.0.2:1002");
+        let p3 = peer_at("10.0.0.3:1003");
+        let p1_addr = p1.socket_addr().unwrap();
+        let p2_addr = p2.socket_addr().unwrap();
+        let p3_addr = p3.socket_addr().unwrap();
+
+        let result = advance_to_next_peer_impl(
+            &id,
+            &mut visited,
+            &mut tried_peers,
+            &mut alternatives,
+            &mut retries,
+            &mut attempts_at_hop,
+            |_, _| vec![p1.clone(), p2.clone(), p3.clone()],
+        );
+
+        let (_, picked) = result.expect("fresh round returns first candidate");
+        assert_eq!(picked, p1_addr);
+        assert_eq!(
+            alternatives.len(),
+            2,
+            "rest of fresh becomes new alternatives"
+        );
+        let alt_addrs: Vec<_> = alternatives
+            .iter()
+            .filter_map(|p| p.socket_addr())
+            .collect();
+        assert!(alt_addrs.contains(&p2_addr));
+        assert!(alt_addrs.contains(&p3_addr));
+    }
 }
