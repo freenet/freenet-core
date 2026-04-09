@@ -447,9 +447,15 @@ async fn advance_to_next_peer(
     retries: &mut usize,
     attempts_at_hop: &mut usize,
 ) -> Option<(PeerKeyLocation, std::net::SocketAddr)> {
-    // 1. Breadth retry at the same hop.
+    // 1. Breadth retry at the same hop. Use FIFO (`remove(0)`) to match the
+    //    legacy `handle_op_response` ordering (`subscribe.rs:949, 1821`).
+    //    `alternatives` is built in closest-first order by
+    //    `k_closest_potentially_hosting`, so FIFO means we try the best
+    //    candidate we have not yet tried. LIFO (`pop()`) would iterate in
+    //    reverse-distance order and diverge from legacy routing behaviour.
     if *attempts_at_hop < MAX_BREADTH {
-        while let Some(candidate) = alternatives.pop() {
+        while !alternatives.is_empty() {
+            let candidate = alternatives.remove(0);
             if let Some(addr) = candidate.socket_addr() {
                 if tried_peers.contains(&addr) || visited.probably_visited(addr) {
                     continue;

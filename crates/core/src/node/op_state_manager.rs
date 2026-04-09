@@ -899,6 +899,17 @@ impl OpManager {
     /// per client tx, so per-attempt cleanup can't go through
     /// `send_client_result` (that would publish N duplicate results to
     /// the client).
+    ///
+    /// # Side effects on other `TransactionCompleted` consumers
+    ///
+    /// The `p2p_protoc::handle_notification_message` branch for
+    /// `TransactionCompleted` (lines 2030–2036) also calls
+    /// `state.tx_to_client.remove(&tx)`. For task-per-tx attempt txs this
+    /// is a tolerated no-op: `tx_to_client` is only populated on
+    /// client-visible txs via `ch_outbound.waiting_for_subscription_result`
+    /// / `waiting_for_transaction_result`, never on per-attempt txs. If a
+    /// future change starts keying `tx_to_client` by attempt tx, this
+    /// eager cleanup will silently drop mappings and must be revisited.
     pub(crate) fn release_pending_op_slot(&self, tx: Transaction) {
         if let Err(err) = self
             .to_event_listener

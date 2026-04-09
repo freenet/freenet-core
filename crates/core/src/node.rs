@@ -773,8 +773,8 @@ fn op_retry_backoff(attempt: usize) -> Duration {
 }
 
 /// Route an inbound task-per-tx reply directly to an awaiting
-/// [`OpCtx::send_and_await`][ocx] caller, bypassing the legacy op state
-/// machine entirely.
+/// [`OpCtx::send_and_await`][ocxawait] caller, bypassing the legacy op
+/// state machine entirely.
 ///
 /// Returns `true` if a callback was registered and the message was forwarded
 /// (or dropped due to a closed receiver, which is also a successful
@@ -812,20 +812,30 @@ fn op_retry_backoff(attempt: usize) -> Duration {
 /// # Safety argument for the bypass
 ///
 /// `p2p_protoc::pending_op_results` is only populated via
-/// `p2p_protoc::handle_op_execution`, which is only driven by
-/// [`OpCtx::send_and_await`][ocx]. Legacy paths (SUBSCRIBE renewals, PUT
-/// sub-op subscribes, intermediate-peer forwarding) never call it, so the
-/// bypass never triggers for them and their behavior is unchanged.
+/// `p2p_protoc::handle_op_execution`, which is only driven by the
+/// `op_execution_sender` channel. The only way to obtain a clone of that
+/// sender is through [`crate::node::OpManager::op_ctx`] (production
+/// factory) or the in-module `OpCtx` unit tests — both of which construct
+/// an [`OpCtx`][ocx] whose only round-trip method is
+/// [`OpCtx::send_and_await`][ocxawait]. This is a **structural
+/// invariant**, not a convention: the sender field is `pub(crate)` and
+/// there is no other `pub` accessor on `EventLoopNotificationsSender`.
+///
+/// Consequence: legacy paths (SUBSCRIBE renewals, PUT sub-op subscribes,
+/// contract-executor-initiated subscribes, intermediate-peer forwarding)
+/// never appear in `pending_op_results` for their own txs, so the bypass
+/// never triggers for them and their behavior is unchanged.
+///
+/// [ocx]: crate::operations::OpCtx
+/// [ocxawait]: crate::operations::OpCtx::send_and_await
 ///
 /// # Channel safety
 ///
 /// Uses `try_send` on the bounded capacity-1 channel created by
-/// [`OpCtx::send_and_await`][ocx]. On a closed receiver (e.g., caller
+/// [`OpCtx::send_and_await`][ocxawait]. On a closed receiver (e.g., caller
 /// timed out or was cancelled) the send fails and is logged; the
 /// pure-network-message handler still makes progress. See
 /// `.claude/rules/channel-safety.md`.
-///
-/// [ocx]: crate::operations::OpCtx::send_and_await
 fn try_forward_task_per_tx_reply(
     pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
     reply: NetMessage,
