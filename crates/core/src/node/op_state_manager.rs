@@ -30,7 +30,7 @@ use crate::{
         TransactionType,
     },
     operations::{
-        OpEnum, OpError,
+        OpCtx, OpEnum, OpError,
         connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
         get::GetOp,
         orphan_streams::OrphanStreamRegistry,
@@ -698,50 +698,16 @@ impl OpManager {
             .remove_peer_interest(contract, &peer_key);
     }
 
-    /// Send `msg` through the event loop and await a single reply keyed by the
-    /// same `Transaction`. This is the "round-trip primitive" for the async
-    /// sub-transaction refactor tracked in #1454.
+    /// Build a per-transaction [`OpCtx`] bound to `tx`.
     ///
-    /// # Scaffolding reach
-    ///
-    /// As of Phase 1 (#1454), the reply callback inserted into
-    /// `p2p_protoc::pending_op_results` is fired for every network-terminating
-    /// op variant: PUT, GET, SUBSCRIBE, CONNECT, and UPDATE (see
-    /// `node::forward_pending_op_result_if_completed` and the branches of
-    /// `handle_pure_network_message_v1`). SUBSCRIBE's
-    /// `complete_local_subscription` path (`operations/subscribe.rs`) does
-    /// NOT pass through `handle_pure_network_message_v1`, so a caller
-    /// targeting a locally-completed subscribe would still hang on
-    /// `response_receiver.recv()` below. That gap is Phase 2 work.
-    ///
-    /// # Deadlock risk
-    ///
-    /// `response_receiver.recv()` has no timeout. If the caller of
-    /// `notify_op_execution` is also the only task that would drive the op
-    /// to completion, this will deadlock. The reply side
-    /// (`node::forward_pending_op_result_if_completed`) uses `try_send`
-    /// against this capacity-1 channel so it can never block the
-    /// pure-network-message handler; the remaining risk is strictly on
-    /// the caller side (the task awaiting below). Phase 2 must guarantee
-    /// that the awaiting task is not the sole driver of completion, or
-    /// add an explicit timeout around `response_receiver.recv()`
-    /// (see `.claude/rules/channel-safety.md`).
-    #[allow(dead_code)] // FIXME: enable async sub-transactions
-    pub async fn notify_op_execution(&self, msg: NetMessage) -> Result<NetMessage, OpError> {
-        let (response_sender, mut response_receiver): (
-            tokio::sync::mpsc::Sender<NetMessage>,
-            tokio::sync::mpsc::Receiver<NetMessage>,
-        ) = tokio::sync::mpsc::channel(1);
-
-        self.to_event_listener
-            .op_execution_sender
-            .send((response_sender, msg))
-            .await
-            .map_err(|_| OpError::NotificationError)?;
-        match response_receiver.recv().await {
-            Some(msg) => Ok(msg),
-            None => Err(OpError::NotificationError),
-        }
+    /// Phase 2a factory for the async sub-transaction refactor (#1454). The
+    /// returned context clones the event-loop `op_execution_sender` and is
+    /// the only supported way to obtain an `OpCtx` outside this crate's
+    /// unit tests. See [`OpCtx`] for scope, single-use semantics, and the
+    /// "where to call this" guidance.
+    #[allow(dead_code)] // Phase 2a scaffolding: first production caller lands in Phase 2b (#1454).
+    pub fn op_ctx(&self, tx: Transaction) -> OpCtx {
+        OpCtx::new(tx, self.to_event_listener.op_execution_sender.clone())
     }
 
     /// Send an event to the contract handler and await a response event from it if successful.

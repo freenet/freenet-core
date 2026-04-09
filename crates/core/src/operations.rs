@@ -19,6 +19,7 @@ use crate::{
 
 pub(crate) mod connect;
 pub(crate) mod get;
+pub(crate) mod op_ctx;
 pub(crate) mod orphan_streams;
 pub(crate) mod put;
 pub(crate) mod subscribe;
@@ -27,6 +28,7 @@ pub(crate) mod test_utils;
 pub(crate) mod update;
 pub(crate) mod visited_peers;
 
+pub(crate) use op_ctx::OpCtx;
 pub(crate) use visited_peers::VisitedPeers;
 
 pub(crate) trait Operation
