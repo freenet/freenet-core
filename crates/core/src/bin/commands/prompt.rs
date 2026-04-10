@@ -4,20 +4,20 @@
 //! a delegate emits `RequestUserInput`. It gets its own process and main thread,
 //! avoiding event loop conflicts with the node's tokio runtime.
 //!
-//! Strategy (tried in order):
-//! 1. **Linux**: zenity or kdialog (native GTK/Qt dialogs)
-//! 2. **macOS**: osascript (native Cocoa dialog via AppleScript)
-//! 3. **Windows**: PowerShell MessageBox
-//! 4. **Fallback**: stdin/stdout terminal prompt (if TTY available)
-//! 5. **Headless**: prints -1 (deny) if no dialog mechanism is available
+//! Strategy per platform:
+//! - **Linux**: Native GTK3 dialog (dynamically links to libgtk-3, near-universal on desktops)
+//! - **macOS**: osascript (native Cocoa dialog via AppleScript, always available)
+//! - **Windows**: PowerShell WinForms (always available)
+//! - **Fallback**: stdin/stdout terminal prompt (if TTY available)
+//! - **Headless**: prints -1 (deny) if no dialog mechanism is available
 //!
 //! Prints the selected button index (0-based) to stdout, or -1 on deny/timeout/dismiss.
 //!
 //! # Security
 //!
 //! The message and button labels originate from untrusted delegate WASM code.
-//! All platform dialog implementations sanitize inputs to prevent command injection:
-//! - **Linux**: Arguments passed via `Command::arg()` (no shell interpretation)
+//! All platform dialog implementations sanitize inputs to prevent injection:
+//! - **Linux**: GTK API takes strings directly (no shell/script interpretation)
 //! - **macOS**: Message piped via stdin to avoid AppleScript injection
 //! - **Windows**: Message and labels written to a temp file read by PowerShell
 
@@ -33,7 +33,7 @@ const MAX_MESSAGE_LEN: usize = 2048;
 const MAX_LABEL_LEN: usize = 64;
 
 /// Maximum number of response buttons. 10 keeps the dialog usable; more choices
-/// would overwhelm the user and may not fit in zenity/kdialog layouts.
+/// would overwhelm the user and may not fit in dialog layouts.
 const MAX_LABELS: usize = 10;
 
 /// Arguments for the `freenet prompt` subcommand.
@@ -97,9 +97,8 @@ fn sanitize_label(label: &str) -> String {
 
 /// Show a dialog and return the selected button index, or -1 on deny/dismiss/timeout.
 fn show_dialog(message: &str, labels: &[String], timeout_secs: u64) -> i32 {
-    // Try platform-specific dialogs first
     #[cfg(target_os = "linux")]
-    if let Some(idx) = try_linux_dialog(message, labels) {
+    if let Some(idx) = try_gtk_dialog(message, labels) {
         return idx;
     }
 
@@ -122,124 +121,51 @@ fn show_dialog(message: &str, labels: &[String], timeout_secs: u64) -> i32 {
     -1
 }
 
-/// Try to show a dialog using zenity or kdialog (Linux).
+/// Show a native GTK3 dialog with custom buttons (Linux).
+///
+/// GTK3 is dynamically linked -- `libgtk-3-0` must be installed at runtime.
+/// This is near-universal on Linux desktops (dependency of Firefox, Chrome,
+/// GIMP, and most GNOME/XFCE apps; KDE desktops also typically have it for
+/// cross-toolkit app support).
+///
+/// Returns `None` if GTK initialization fails (headless, no DISPLAY, etc.).
 #[cfg(target_os = "linux")]
-fn try_linux_dialog(message: &str, labels: &[String]) -> Option<i32> {
-    if let Some(idx) = try_zenity(message, labels) {
-        return Some(idx);
-    }
-    if let Some(idx) = try_kdialog(message, labels) {
-        return Some(idx);
-    }
-    None
-}
+fn try_gtk_dialog(message: &str, labels: &[String]) -> Option<i32> {
+    use gtk::prelude::*;
+    use gtk::{ButtonsType, DialogFlags, MessageDialog, MessageType, ResponseType, Window};
 
-/// Show a dialog via zenity. All arguments passed via `Command::arg()` which
-/// uses execvp -- no shell interpretation, so no injection risk.
-#[cfg(target_os = "linux")]
-fn try_zenity(message: &str, labels: &[String]) -> Option<i32> {
-    use std::process::Command;
-
-    if Command::new("zenity").arg("--version").output().is_err() {
+    if gtk::init().is_err() {
         return None;
     }
 
-    let mut cmd = Command::new("zenity");
-    cmd.arg("--question")
-        .arg("--title=Freenet Permission")
-        .arg(format!("--text={message}"))
-        .arg("--no-wrap");
+    let dialog = MessageDialog::new(
+        None::<&Window>,
+        DialogFlags::MODAL,
+        MessageType::Question,
+        ButtonsType::None,
+        message,
+    );
+    dialog.set_title("Freenet Permission");
 
-    match labels.len() {
-        1 => {
-            cmd.arg(format!("--ok-label={}", labels[0]));
-        }
-        2 => {
-            cmd.arg(format!("--ok-label={}", labels[0]));
-            cmd.arg(format!("--cancel-label={}", labels[1]));
-        }
-        _ => {
-            cmd.arg(format!("--ok-label={}", labels[0]));
-            cmd.arg(format!("--cancel-label={}", labels[labels.len() - 1]));
-            for label in &labels[1..labels.len() - 1] {
-                cmd.arg(format!("--extra-button={label}"));
-            }
-        }
+    // Add custom buttons with response IDs matching their index
+    for (i, label) in labels.iter().enumerate() {
+        dialog.add_button(label, ResponseType::Other(i as u16));
     }
 
-    let output = cmd.output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Set the first button as default
+    dialog.set_default_response(ResponseType::Other(0));
 
-    if output.status.success() {
-        return Some(0);
+    let response = dialog.run();
+    dialog.close();
+
+    // Process pending GTK events to ensure the dialog is fully destroyed
+    while gtk::events_pending() {
+        gtk::main_iteration();
     }
 
-    // Extra buttons: zenity exits with code 1 AND writes the button text to stdout.
-    // Check stdout for extra button text BEFORE falling back to Cancel interpretation,
-    // since both extra buttons and Cancel use exit code 1.
-    if !stdout.is_empty() {
-        for (i, label) in labels.iter().enumerate() {
-            if stdout == *label {
-                return Some(i as i32);
-            }
-        }
-    }
-
-    // Exit code 1 with no stdout = Cancel button (mapped to last label)
-    if output.status.code() == Some(1) && labels.len() >= 2 {
-        return Some(labels.len() as i32 - 1);
-    }
-
-    Some(-1)
-}
-
-#[cfg(target_os = "linux")]
-fn try_kdialog(message: &str, labels: &[String]) -> Option<i32> {
-    use std::process::Command;
-
-    if Command::new("kdialog").arg("--version").output().is_err() {
-        return None;
-    }
-
-    // kdialog supports --yesno (2 buttons) and --yesnocancel (3 buttons).
-    // For 4+ buttons, falls through to terminal prompt.
-    let mut cmd = Command::new("kdialog");
-    cmd.arg("--title").arg("Freenet Permission");
-
-    match labels.len() {
-        1 => {
-            cmd.arg("--msgbox").arg(message);
-            let status = cmd.status().ok()?;
-            Some(if status.success() { 0 } else { -1 })
-        }
-        2 => {
-            cmd.arg("--yesno")
-                .arg(message)
-                .arg("--yes-label")
-                .arg(&labels[0])
-                .arg("--no-label")
-                .arg(&labels[1]);
-            let status = cmd.status().ok()?;
-            Some(if status.success() { 0 } else { 1 })
-        }
-        3 => {
-            cmd.arg("--yesnocancel")
-                .arg(message)
-                .arg("--yes-label")
-                .arg(&labels[0])
-                .arg("--no-label")
-                .arg(&labels[1])
-                .arg("--cancel-label")
-                .arg(&labels[2]);
-            let status = cmd.status().ok()?;
-            match status.code() {
-                Some(0) => Some(0),
-                Some(1) => Some(1),
-                Some(2) => Some(2),
-                _ => Some(-1),
-            }
-        }
-        _ => None,
+    match response {
+        ResponseType::Other(idx) => Some(idx as i32),
+        _ => Some(-1), // Dialog closed without clicking a button
     }
 }
 
@@ -269,7 +195,6 @@ fn try_macos_dialog(message: &str, labels: &[String]) -> Option<i32> {
         .join(", ");
 
     // Read the message from stdin to avoid injection via string interpolation.
-    // The AppleScript reads stdin, so the message never appears in the script text.
     let script = format!(
         r#"set msg to do shell script "cat"
 display dialog msg buttons {{{button_list}}} default button 1 with title "Freenet Permission" with icon caution"#,
@@ -313,7 +238,6 @@ fn try_windows_dialog(message: &str, labels: &[String]) -> Option<i32> {
     use std::io::Write;
     use std::process::Command;
 
-    // Write message and labels to a temp file to avoid PowerShell injection
     let data = serde_json::json!({
         "message": message,
         "labels": labels,
@@ -325,7 +249,6 @@ fn try_windows_dialog(message: &str, labels: &[String]) -> Option<i32> {
     drop(f.write_all(data.to_string().as_bytes()));
     drop(f);
 
-    // PowerShell script reads from the JSON file -- no user-controlled string interpolation
     let script = format!(
         r#"
 Add-Type -AssemblyName System.Windows.Forms
@@ -369,7 +292,6 @@ Write-Output $form.Tag
         .output()
         .ok();
 
-    // Clean up temp file
     drop(std::fs::remove_file(&data_file));
 
     let output = output?;

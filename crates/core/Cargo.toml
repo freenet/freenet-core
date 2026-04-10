@@ -114,6 +114,9 @@ gag = { workspace = true }  # For suppressing libunwind stderr warnings during W
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "winuser"] }
 serde = { workspace = true }

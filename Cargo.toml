@@ -127,6 +127,7 @@ syn = { version = "2.0", features = ["full", "extra-traits", "parsing"] }
 trybuild = "1.0"
 
 # Platform-specific
+gtk = { version = "0.18", features = ["v3_24"] }
 libc = "0.2"
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
