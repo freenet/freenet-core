@@ -407,3 +407,53 @@ fn terminal_prompt(message: &str, labels: &[String], _timeout_secs: u64) -> i32 
 
     -1
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_message_preserves_normal_text() {
+        assert_eq!(sanitize_message("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn test_sanitize_message_preserves_newlines() {
+        assert_eq!(sanitize_message("Line 1\nLine 2"), "Line 1\nLine 2");
+    }
+
+    #[test]
+    fn test_sanitize_message_strips_control_chars() {
+        assert_eq!(sanitize_message("Hello\x00\x07\x1b world"), "Hello world");
+    }
+
+    #[test]
+    fn test_sanitize_message_truncates_at_limit() {
+        let long_msg = "A".repeat(MAX_MESSAGE_LEN + 500);
+        let result = sanitize_message(&long_msg);
+        assert_eq!(result.len(), MAX_MESSAGE_LEN);
+    }
+
+    #[test]
+    fn test_sanitize_label_strips_all_control_chars_including_newlines() {
+        assert_eq!(sanitize_label("Allow\nOnce"), "AllowOnce");
+        assert_eq!(sanitize_label("OK\x00\x07"), "OK");
+    }
+
+    #[test]
+    fn test_sanitize_label_truncates_at_limit() {
+        let long_label = "B".repeat(MAX_LABEL_LEN + 100);
+        let result = sanitize_label(&long_label);
+        assert_eq!(result.len(), MAX_LABEL_LEN);
+    }
+
+    #[test]
+    fn test_sanitize_label_empty() {
+        assert_eq!(sanitize_label(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_message_empty() {
+        assert_eq!(sanitize_message(""), "");
+    }
+}

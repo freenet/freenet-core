@@ -259,12 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_message_invalid_utf8_fallback() {
+    fn test_parse_message_json_with_quotes() {
         use freenet_stdlib::prelude::NotificationMessage;
 
-        // Construct via JSON then corrupt -- but we can't easily create invalid
-        // UTF-8 NotificationMessage without access to private fields.
-        // Instead, test that valid JSON-encoded strings are properly decoded.
+        // JSON-encoded strings with quotes/escapes should be properly decoded.
         let json_val = serde_json::Value::String("Test with \"quotes\"".to_string());
         let msg = NotificationMessage::try_from(&json_val).unwrap();
         let req = UserInputRequest {
