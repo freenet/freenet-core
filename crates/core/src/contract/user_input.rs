@@ -151,7 +151,9 @@ impl UserInputPrompter for AutoApprovePrompter {
     }
 }
 
-/// Always denies (returns None). For headless environments.
+/// Always denies (returns None). For headless environments where no display
+/// is available (e.g., gateway servers, CI). Will be wired in via configuration
+/// as an alternative to `SubprocessPrompter`.
 #[allow(dead_code)]
 pub struct AutoDenyPrompter;
 

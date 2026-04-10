@@ -23,9 +23,17 @@
 
 use clap::Args;
 
-/// Maximum length for message and button labels to prevent abuse.
+/// Maximum message length. 2KB is enough for a detailed permission description
+/// while preventing a malicious delegate from filling the screen or exhausting
+/// CLI argument space (~128KB on most OSes).
 const MAX_MESSAGE_LEN: usize = 2048;
+
+/// Maximum button label length. 64 chars fits comfortably in a dialog button
+/// on all platforms without truncation.
 const MAX_LABEL_LEN: usize = 64;
+
+/// Maximum number of response buttons. 10 keeps the dialog usable; more choices
+/// would overwhelm the user and may not fit in zenity/kdialog layouts.
 const MAX_LABELS: usize = 10;
 
 /// Arguments for the `freenet prompt` subcommand.
