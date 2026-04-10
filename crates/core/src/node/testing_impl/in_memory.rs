@@ -120,8 +120,11 @@ impl<ER> Builder<ER> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(
-            contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
+            contract::contract_handling(
+                contract_handler,
+                crate::contract::user_input::AutoApprovePrompter,
+            )
+            .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
 
         let conn_manager = P2pConnManager::build(
@@ -257,8 +260,11 @@ impl<ER> Builder<ER> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(
-            contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
+            contract::contract_handling(
+                contract_handler,
+                crate::contract::user_input::AutoApprovePrompter,
+            )
+            .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
 
         let conn_manager = P2pConnManager::build(
@@ -391,8 +397,11 @@ impl<ER> Builder<ER> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(
-            contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
+            contract::contract_handling(
+                contract_handler,
+                crate::contract::user_input::AutoApprovePrompter,
+            )
+            .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
 
         let conn_manager = P2pConnManager::build(

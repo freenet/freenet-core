@@ -11,6 +11,7 @@ mod executor;
 mod fair_queue;
 mod handler;
 pub mod storages;
+pub(crate) mod user_input;
 
 pub(crate) use executor::{
     Callback, ContractExecutor, ExecutorToEventLoopChannel, MAX_CREATED_DELEGATES_PER_NODE,
@@ -38,6 +39,7 @@ use freenet_stdlib::client_api::DelegateRequest;
 use tracing::Instrument;
 
 use self::executor::DelegateNotificationReceiver;
+use self::user_input::UserInputPrompter;
 
 /// Maximum iterations when handling contract requests to prevent infinite loops
 const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
@@ -59,14 +61,16 @@ const MAX_DELEGATE_DRAIN_BATCH: usize = 16;
 /// 5. Repeats until no more contract request messages
 ///
 /// Returns the final response with contract request messages filtered out.
-async fn handle_delegate_with_contract_requests<CH>(
+async fn handle_delegate_with_contract_requests<CH, P>(
     contract_handler: &mut CH,
     initial_req: DelegateRequest<'static>,
     origin_contract: Option<&ContractInstanceId>,
     delegate_key: &DelegateKey,
+    prompter: &P,
 ) -> Vec<OutboundDelegateMsg>
 where
     CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter,
 {
     // Extract initial params from the request (only ApplicationMessages has params we need)
     let initial_params = match &initial_req {
@@ -134,12 +138,14 @@ where
             }
         };
 
-        // Check for contract request messages (GET, PUT, UPDATE, SUBSCRIBE) and delegate messages
+        // Check for contract request messages (GET, PUT, UPDATE, SUBSCRIBE), delegate messages,
+        // and user input requests
         let mut get_requests: Vec<GetContractRequest> = Vec::new();
         let mut put_requests: Vec<PutContractRequest> = Vec::new();
         let mut update_requests: Vec<UpdateContractRequest> = Vec::new();
         let mut subscribe_requests: Vec<SubscribeContractRequest> = Vec::new();
         let mut delegate_messages: Vec<DelegateMessage> = Vec::new();
+        let mut user_input_requests: Vec<UserInputRequest<'static>> = Vec::new();
 
         for msg in values {
             match msg {
@@ -158,21 +164,24 @@ where
                 OutboundDelegateMsg::SendDelegateMessage(msg) => {
                     delegate_messages.push(msg);
                 }
+                OutboundDelegateMsg::RequestUserInput(req) => {
+                    user_input_requests.push(req);
+                }
                 other @ OutboundDelegateMsg::ApplicationMessage(_)
-                | other @ OutboundDelegateMsg::RequestUserInput(_)
                 | other @ OutboundDelegateMsg::ContextUpdated(_) => {
-                    // Accumulate non-contract-request messages
+                    // Accumulate non-request messages
                     accumulated_messages.push(other);
                 }
             }
         }
 
-        // If no contract requests and no delegate messages, we're done
+        // If no contract requests, delegate messages, or user input requests, we're done
         if get_requests.is_empty()
             && put_requests.is_empty()
             && update_requests.is_empty()
             && subscribe_requests.is_empty()
             && delegate_messages.is_empty()
+            && user_input_requests.is_empty()
         {
             return accumulated_messages;
         }
@@ -494,6 +503,37 @@ where
             }
         }
 
+        // Process UserInput requests: prompt the user and send responses back
+        if !user_input_requests.is_empty() {
+            tracing::debug!(
+                delegate_key = %delegate_key,
+                count = user_input_requests.len(),
+                "Processing UserInputRequest messages from delegate"
+            );
+
+            for req in user_input_requests {
+                let request_id = req.request_id;
+                match prompter.prompt(&req).await {
+                    Some((_, response)) => {
+                        inbound_responses.push(InboundDelegateMsg::UserResponse(
+                            UserInputResponse {
+                                request_id,
+                                response,
+                                context: DelegateContext::default(),
+                            },
+                        ));
+                    }
+                    None => {
+                        tracing::warn!(
+                            request_id,
+                            delegate = %delegate_key,
+                            "User input request timed out or was denied"
+                        );
+                    }
+                }
+            }
+        }
+
         // Create a new request to send the responses back to the delegate
         current_req = DelegateRequest::ApplicationMessages {
             key: delegate_key.clone(),
@@ -529,9 +569,13 @@ fn try_recv_delegate_notification(
     }
 }
 
-pub(crate) async fn contract_handling<CH>(mut contract_handler: CH) -> Result<(), ContractError>
+pub(crate) async fn contract_handling<CH, P>(
+    mut contract_handler: CH,
+    prompter: P,
+) -> Result<(), ContractError>
 where
     CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter,
 {
     let mut delegate_rx = contract_handler.executor().take_delegate_notification_rx();
     let mut fair_queue = fair_queue::FairEventQueue::new();
@@ -569,7 +613,8 @@ where
         for _ in 0..MAX_DELEGATE_DRAIN_BATCH {
             match try_recv_delegate_notification(&mut delegate_rx) {
                 Some(notification) => {
-                    handle_delegate_notification(&mut contract_handler, notification).await;
+                    handle_delegate_notification(&mut contract_handler, notification, &prompter)
+                        .await;
                 }
                 None => break,
             }
@@ -577,7 +622,7 @@ where
 
         // Process one event from the fair queue (round-robin across contracts)
         if let Some((id, event)) = fair_queue.pop() {
-            handle_contract_event(&mut contract_handler, id, event).await?;
+            handle_contract_event(&mut contract_handler, id, event, &prompter).await?;
             continue;
         }
 
@@ -590,7 +635,7 @@ where
                 }
             }
             notification = recv_delegate_notification(&mut delegate_rx) => {
-                handle_delegate_notification(&mut contract_handler, notification).await;
+                handle_delegate_notification(&mut contract_handler, notification, &prompter).await;
             }
         }
     }
@@ -663,11 +708,13 @@ async fn send_queue_full_response(
     }
 }
 
-async fn handle_delegate_notification<CH>(
+async fn handle_delegate_notification<CH, P>(
     contract_handler: &mut CH,
     notification: executor::DelegateNotification,
+    prompter: &P,
 ) where
     CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter,
 {
     let executor::DelegateNotification {
         delegate_key,
@@ -699,8 +746,14 @@ async fn handle_delegate_notification<CH>(
         inbound,
     };
 
-    let outbound =
-        handle_delegate_with_contract_requests(contract_handler, req, None, &delegate_key).await;
+    let outbound = handle_delegate_with_contract_requests(
+        contract_handler,
+        req,
+        None,
+        &delegate_key,
+        prompter,
+    )
+    .await;
 
     // TODO: Route outbound ApplicationMessages to subscribed apps #3275
     // handle_delegate_with_contract_requests already processes contract requests
@@ -736,13 +789,15 @@ async fn handle_delegate_notification<CH>(
     }
 }
 
-async fn handle_contract_event<CH>(
+async fn handle_contract_event<CH, P>(
     contract_handler: &mut CH,
     id: handler::EventId,
     event: ContractHandlerEvent,
+    prompter: &P,
 ) -> Result<(), ContractError>
 where
     CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter,
 {
     tracing::debug!(
         event = %event,
@@ -1069,6 +1124,7 @@ where
                 req,
                 origin_contract.as_ref(),
                 &delegate_key,
+                prompter,
             )
             .await;
 
