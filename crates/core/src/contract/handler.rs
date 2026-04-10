@@ -1272,6 +1272,8 @@ pub(super) mod in_memory {
     pub struct MockWasmHandlerBuilder {
         pub identifier: String,
         pub shared_storage: MockStateStorage,
+        /// Pre-seeded contract store. If `None`, a fresh empty store is created.
+        pub contract_store: Option<crate::wasm_runtime::InMemoryContractStore>,
     }
 
     impl ContractHandler for MockWasmContractHandler {
@@ -1290,6 +1292,7 @@ pub(super) mod in_memory {
             let runtime = Executor::new_mock_wasm(
                 &builder.identifier,
                 builder.shared_storage,
+                builder.contract_store,
                 Some(op_sender),
                 Some(op_manager),
             )

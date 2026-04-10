@@ -2209,6 +2209,142 @@ fn test_full_state_send_no_incorrect_caching() {
 }
 
 // =============================================================================
+// Task-per-tx Subscribe ForwardingAck Regression Test (PR #3806)
+// =============================================================================
+
+/// Exercises the task-per-tx client-initiated subscribe path
+/// (`subscribe_with_id` → `start_client_subscribe`) in a multi-node
+/// simulation with network-routed subscribes.
+///
+/// ## Background (PR #3806, #1454 Phase 2b)
+///
+/// Phase 2b migrated client-initiated SUBSCRIBE to a task-per-tx driver.
+/// This test verifies the driver works end-to-end with network round-trips,
+/// retries, and peer selection.
+///
+/// ## ForwardingAck coverage
+///
+/// The ForwardingAck relay bug (commit 5cb6f37c) is covered by unit tests
+/// in `node.rs::callback_forward_tests`. Triggering it in simulation
+/// requires `SeedContract` + `use_mock_wasm=true` so that relay peers
+/// lack the contract. The `SeedContract` framework is in place but the
+/// mock WASM runtime has compatibility issues with `OpCtx::send_and_await`
+/// (separate from the local-completion fix below).
+///
+/// The task-per-tx `send_and_await` path IS exercised here: subscribes
+/// complete with `outcome="subscribed"` via the local-completion synthesis
+/// in the SUBSCRIBE branch of `handle_pure_network_message_v1`.
+#[test_log::test]
+fn test_subscribe_forwarding_ack_relay() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x5CB6_F37C_0001;
+    const NETWORK_NAME: &str = "subscribe-fwd-ack";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1, // 1 gateway
+            4, // 4 regular nodes
+            7, // ring_max_htl
+            3, // rnd_if_htl_above
+            5, // max_connections
+            2, // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xAC);
+    let contract_id = *contract.key().id();
+    let initial_state = SimOperation::create_test_state(1);
+
+    // Gateway PUTs, then multiple nodes subscribe via the task-per-tx path.
+    //
+    // Note: SeedContract (no-propagation local store) is available for
+    // tests that need to control which nodes have the contract, but
+    // requires use_mock_wasm=true which has compatibility issues with
+    // OpCtx::send_and_await. For now, use regular PUT + Subscribe.
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state,
+                subscribe: true,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 4),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+
+    // PRIMARY: simulation must complete without errors.
+    // Before the fix, ForwardingAck on the task-per-tx channel
+    // would cause UnexpectedOpState, crashing the simulation.
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed (ForwardingAck regression?): {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Verify subscribes succeeded.
+    let (success_count, not_found_count) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mut successes = 0usize;
+        let mut not_found = 0usize;
+        for log in logs.iter() {
+            match log.kind.subscribe_outcome() {
+                Some(true) => successes += 1,
+                Some(false) => not_found += 1,
+                None => {}
+            }
+        }
+        (successes, not_found)
+    });
+
+    tracing::info!(
+        success_count,
+        not_found_count,
+        "Subscribe telemetry summary"
+    );
+
+    // 4 explicit subscribes + 1 from gateway's put-with-subscribe.
+    assert!(
+        success_count >= 4,
+        "Expected at least 4 successful subscribes, got {} (not_found={})",
+        success_count,
+        not_found_count,
+    );
+}
+
+// =============================================================================
 // CRDT Emulation Mode Test (PR #2763 Bug Reproduction)
 // =============================================================================
 

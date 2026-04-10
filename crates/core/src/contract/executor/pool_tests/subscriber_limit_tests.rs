@@ -19,7 +19,7 @@ use crate::wasm_runtime::MockStateStorage;
 /// Helper to create a MockWasmRuntime executor (uses production bridged_* paths).
 async fn create_executor() -> Executor<MockWasmRuntime, MockStateStorage> {
     let storage = MockStateStorage::new();
-    Executor::new_mock_wasm("subscriber_limit_test", storage, None, None)
+    Executor::new_mock_wasm("subscriber_limit_test", storage, None, None, None)
         .await
         .expect("create executor")
 }

@@ -1,8 +1,11 @@
 //! Per-transaction execution context for the task-per-tx model (#1454).
 //!
 //! This module ships the `OpCtx` struct and its `send_and_await` round-trip
-//! primitive as dormant scaffolding. See the struct-level docs for the Phase
-//! 2a scope boundary.
+//! primitive. Phase 2a (PR #3803) landed `OpCtx` as dormant scaffolding
+//! with only unit-test callers; Phase 2b wires in the first production
+//! caller (client-initiated SUBSCRIBE, via
+//! [`crate::operations::subscribe::start_client_subscribe`]) so the
+//! `#[allow(dead_code)]` attributes from Phase 2a have been lifted.
 
 use tokio::sync::mpsc;
 
@@ -16,21 +19,20 @@ use crate::operations::OpError;
 /// driven by a single task; the context is [`Send`] but intentionally not
 /// [`Clone`].
 ///
-/// # Phase 2a scope
+/// # Phase 2a / 2b scope
 ///
-/// Phase 2a (#1454) ships this type as scaffolding only. The wider API
-/// sketched in the design doc (`spawn_sub`, per-tx WS fanout via `notify`,
-/// per-tx inbox, `OpRegistry`, and so on) is deferred. The only caller in
-/// Phase 2a is the unit tests in this module — no op in `operations/` has
-/// been migrated yet. Phase 2b will add the first production caller by
-/// migrating SUBSCRIBE's client-initiated path.
-#[allow(dead_code)] // Phase 2a scaffolding: first production caller lands in Phase 2b (#1454).
+/// Phase 2a (#1454) shipped this type with only the round-trip primitive
+/// `send_and_await`. The wider API sketched in the design doc
+/// (`spawn_sub`, per-tx WS fanout via `notify`, per-tx inbox,
+/// `OpRegistry`, and so on) is still deferred to later phases. Phase 2b
+/// activated the primitive by migrating SUBSCRIBE's client-initiated path
+/// onto it (see
+/// [`crate::operations::subscribe::start_client_subscribe`]).
 pub(crate) struct OpCtx {
     tx: Transaction,
     op_execution_sender: mpsc::Sender<(mpsc::Sender<NetMessage>, NetMessage)>,
 }
 
-#[allow(dead_code)] // Phase 2a scaffolding: first production caller lands in Phase 2b (#1454).
 impl OpCtx {
     /// Construct a new context bound to `tx`.
     ///
@@ -47,6 +49,14 @@ impl OpCtx {
     }
 
     /// The transaction this context is bound to.
+    ///
+    /// Unused by the Phase 2b production caller (the task holds the
+    /// attempt tx in a local), but kept on the API because later phases
+    /// (per-tx inbox, `OpRegistry`) will need the identity accessor to
+    /// look up per-tx state owned by other components. Dropping and
+    /// re-adding the getter would churn the public surface of `OpCtx`
+    /// without benefit.
+    #[allow(dead_code)] // Kept as stable API surface for later task-per-tx phases (#1454).
     pub fn tx(&self) -> Transaction {
         self.tx
     }

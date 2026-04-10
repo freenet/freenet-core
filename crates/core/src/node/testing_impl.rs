@@ -161,6 +161,22 @@ pub enum SimOperation {
         /// New state data
         data: Vec<u8>,
     },
+    /// Seed a contract into a node's local store WITHOUT network propagation.
+    ///
+    /// Unlike `Put`, this does not trigger a network PUT operation — the
+    /// contract is only stored in the target node's `MockStateStorage`.
+    /// This is useful for setting up test scenarios where specific nodes
+    /// must have (or not have) a contract before subscribe/get operations.
+    ///
+    /// Example: seed only on gateway, then subscribe from other nodes.
+    /// The subscribe will go through the network because other nodes lack
+    /// the contract, and relay peers will forward (generating ForwardingAck).
+    SeedContract {
+        /// The contract container (code + parameters)
+        contract: ContractContainer,
+        /// Initial state bytes
+        state: Vec<u8>,
+    },
 }
 
 impl SimOperation {
@@ -267,6 +283,12 @@ impl SimOperation {
                     key,
                     data: UpdateData::State(State::from(data)),
                 })
+            }
+            SimOperation::SeedContract { .. } => {
+                panic!(
+                    "SeedContract is not a client request — it must be handled \
+                     by run_controlled_simulation before event dispatch"
+                )
             }
         }
     }
@@ -3372,12 +3394,31 @@ impl SimNetwork {
             .rng_seed(seed)
             .build();
 
+        // Separate SeedContract operations (pre-simulation storage seeding)
+        // from event operations (dispatched during simulation).
+        let mut seed_ops: Vec<(NodeLabel, ContractContainer, Vec<u8>)> = Vec::new();
+        let mut event_ops: Vec<ScheduledOperation> = Vec::new();
+        for scheduled_op in operations {
+            match scheduled_op.operation {
+                SimOperation::SeedContract {
+                    ref contract,
+                    ref state,
+                } => {
+                    seed_ops.push((scheduled_op.node, contract.clone(), state.clone()));
+                }
+                SimOperation::Put { .. }
+                | SimOperation::Get { .. }
+                | SimOperation::Subscribe { .. }
+                | SimOperation::Update { .. } => event_ops.push(scheduled_op),
+            }
+        }
+
         // Build a map of label -> list of (event_id, operation)
         let mut operations_by_node: HashMap<NodeLabel, Vec<(EventId, SimOperation)>> =
             HashMap::new();
         let mut operation_sequence: Vec<(EventId, NodeLabel)> = Vec::new();
 
-        for (event_id, scheduled_op) in operations.into_iter().enumerate() {
+        for (event_id, scheduled_op) in event_ops.into_iter().enumerate() {
             let event_id = event_id as EventId;
             operation_sequence.push((event_id, scheduled_op.node.clone()));
             operations_by_node
@@ -3390,6 +3431,12 @@ impl SimNetwork {
         // gives tests access to the same data written during the simulation.
         let mut node_storages: HashMap<NodeLabel, crate::wasm_runtime::MockStateStorage> =
             HashMap::new();
+        // Pre-seeded contract stores for nodes with SeedContract operations.
+        // Wrapped in Arc<Mutex> so closures can look up their store at
+        // startup (after seed_ops populates the map, before sim.run()).
+        let contract_stores: Arc<
+            Mutex<HashMap<NodeLabel, crate::wasm_runtime::InMemoryContractStore>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
 
         let use_mock_wasm = self.use_mock_wasm;
 
@@ -3429,12 +3476,16 @@ impl SimNetwork {
             let user_events = Arc::new(Mutex::new(Some(user_events)));
             let span = Arc::new(Mutex::new(Some(span)));
             let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+            let contract_stores = contract_stores.clone();
+            let label_for_closure = label.clone();
 
             sim.host(host_name, move || {
                 let node = node.clone();
                 let user_events = user_events.clone();
                 let span = span.clone();
                 let shared_storage = shared_storage.clone();
+                let contract_stores = contract_stores.clone();
+                let label = label_for_closure.clone();
 
                 async move {
                     let node = node
@@ -3457,9 +3508,10 @@ impl SimNetwork {
                         .unwrap()
                         .take()
                         .expect("Turmoil host should only be called once");
+                    let cs = contract_stores.lock().unwrap().remove(&label);
 
                     if use_mock_wasm {
-                        node.run_node_with_mock_wasm(user_events, span, shared_storage)
+                        node.run_node_with_mock_wasm(user_events, span, shared_storage, cs)
                             .await
                             .map_err(|e| {
                                 Box::new(std::io::Error::other(e.to_string()))
@@ -3512,12 +3564,16 @@ impl SimNetwork {
             let user_events = Arc::new(Mutex::new(Some(user_events)));
             let span = Arc::new(Mutex::new(Some(span)));
             let shared_storage = Arc::new(Mutex::new(Some(shared_storage)));
+            let contract_stores = contract_stores.clone();
+            let label_for_closure = label.clone();
 
             sim.host(host_name, move || {
                 let node = node.clone();
                 let user_events = user_events.clone();
                 let span = span.clone();
                 let shared_storage = shared_storage.clone();
+                let contract_stores = contract_stores.clone();
+                let label = label_for_closure.clone();
 
                 async move {
                     let node = node
@@ -3540,9 +3596,10 @@ impl SimNetwork {
                         .unwrap()
                         .take()
                         .expect("Turmoil host should only be called once");
+                    let cs = contract_stores.lock().unwrap().remove(&label);
 
                     if use_mock_wasm {
-                        node.run_node_with_mock_wasm(user_events, span, shared_storage)
+                        node.run_node_with_mock_wasm(user_events, span, shared_storage, cs)
                             .await
                             .map_err(|e| {
                                 Box::new(std::io::Error::other(e.to_string()))
@@ -3558,6 +3615,33 @@ impl SimNetwork {
                     }
                 }
             });
+        }
+
+        // Apply SeedContract operations: pre-populate specific nodes'
+        // contract stores and state storage. This bypasses network PUT
+        // so the contract exists only on the seeded nodes.
+        for (label, contract, state) in seed_ops {
+            let storage = node_storages
+                .get(&label)
+                .unwrap_or_else(|| panic!("SeedContract: node {label:?} not found in storages"));
+            let key = contract.key();
+            storage.seed_state(key, WrappedState::new(state));
+            storage.seed_params(key, contract.params().clone());
+            // Also seed into the contract store (WASM code + params).
+            // Without this, the WASM cache check in client_events.rs
+            // rejects subscribes with "contract WASM not cached locally".
+            let mut stores = contract_stores.lock().unwrap();
+            let contract_store = stores.entry(label.clone()).or_default();
+            contract_store
+                .store_contract(contract.clone())
+                .unwrap_or_else(|e| {
+                    panic!("SeedContract: failed to store contract for {label:?}: {e}")
+                });
+            tracing::debug!(
+                node = %label,
+                contract = %key,
+                "SeedContract: pre-populated contract in node storage"
+            );
         }
 
         // Take the event controller and labels for triggering events
@@ -3987,7 +4071,7 @@ impl SimNetwork {
 
                 let handle = if use_mock_wasm {
                     tokio::spawn(async move {
-                        node.run_node_with_mock_wasm(user_events, span, shared_storage)
+                        node.run_node_with_mock_wasm(user_events, span, shared_storage, None)
                             .await
                     })
                 } else {
@@ -4042,7 +4126,7 @@ impl SimNetwork {
                 let handle = if use_mock_wasm {
                     tokio::spawn(async move {
                         tokio::time::sleep(backoff).await;
-                        node.run_node_with_mock_wasm(user_events, span, shared_storage)
+                        node.run_node_with_mock_wasm(user_events, span, shared_storage, None)
                             .await
                     })
                 } else {

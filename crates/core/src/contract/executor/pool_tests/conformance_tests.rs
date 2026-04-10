@@ -52,7 +52,7 @@ async fn create_mock_runtime_executor() -> Executor<MockRuntime, MockStateStorag
 /// Helper to create a MockWasmRuntime executor.
 async fn create_mock_wasm_executor() -> Executor<MockWasmRuntime, MockStateStorage> {
     let storage = MockStateStorage::new();
-    Executor::new_mock_wasm("conformance_wasm", storage, None, None)
+    Executor::new_mock_wasm("conformance_wasm", storage, None, None, None)
         .await
         .expect("create MockWasmRuntime executor")
 }
