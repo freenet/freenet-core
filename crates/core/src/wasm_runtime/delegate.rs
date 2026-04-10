@@ -1,13 +1,12 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use freenet_stdlib::prelude::{
-    ApplicationMessage, ClientResponse, DelegateContainer, DelegateContext, DelegateError,
-    DelegateInterfaceResult, DelegateKey, DelegateMessage, GetContractRequest, InboundDelegateMsg,
-    MessageOrigin, OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId,
-    SubscribeContractRequest, UpdateContractRequest,
+    ApplicationMessage, DelegateContainer, DelegateContext, DelegateError, DelegateInterfaceResult,
+    DelegateKey, DelegateMessage, GetContractRequest, InboundDelegateMsg, MessageOrigin,
+    OutboundDelegateMsg, Parameters, PutContractRequest, SecretsId, SubscribeContractRequest,
+    UpdateContractRequest,
 };
-use serde::{Deserialize, Serialize};
 
 use super::engine::{InstanceHandle, WasmEngine};
 use super::native_api::{CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, InstanceId};
@@ -33,18 +32,6 @@ impl Drop for DelegateEnvGuard {
         CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
         DELEGATE_ENV.remove(&self.instance_id);
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Response {
-    Allowed,
-    NotAllowed,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct Context {
-    waiting_for_user_input: HashSet<u32>,
-    user_response: HashMap<u32, Response>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -346,17 +333,15 @@ impl Runtime {
                 }
 
                 OutboundDelegateMsg::RequestUserInput(req) => {
-                    let user_response =
-                        ClientResponse::new(serde_json::to_vec(&Response::Allowed).unwrap());
-                    let response: Response = serde_json::from_slice(&user_response)
-                        .map_err(|err| DelegateError::Deser(format!("{err}")))
-                        .unwrap();
-                    let req_id = req.request_id;
-                    let mut ctx: Context =
-                        bincode::deserialize(context.as_slice()).unwrap_or_default();
-                    ctx.waiting_for_user_input.remove(&req_id);
-                    ctx.user_response.insert(req_id, response);
-                    *context = bincode::serialize(&ctx).unwrap();
+                    tracing::debug!(
+                        request_id = req.request_id,
+                        "Passing RequestUserInput to executor for user prompting"
+                    );
+                    results.push(OutboundDelegateMsg::RequestUserInput(req));
+                    for remaining in outbound_msgs.drain(..) {
+                        results.push(remaining);
+                    }
+                    break;
                 }
 
                 OutboundDelegateMsg::ContextUpdated(new_context) => {
