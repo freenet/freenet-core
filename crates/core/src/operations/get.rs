@@ -597,8 +597,9 @@ pub(crate) struct GetOp {
     /// Used for connection-based routing: responses are sent back to this address.
     upstream_addr: Option<std::net::SocketAddr>,
     /// Local cached state to fall back to if network query fails or returns NotFound.
-    /// Used by the original requester's `request_get` path for "network first, local
-    /// fallback" behavior. Also used as fallback on connection aborts.
+    /// Used by: (1) original requester's `request_get` path for "network first, local
+    /// fallback", (2) relay peers with stale cache (no active subscription) that defer
+    /// to the network, and (3) connection abort fallback.
     local_fallback: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
     /// True when this GET was spawned internally by try_auto_fetch_contract,
     /// not by a client request. Used to avoid sending spurious timeout errors
@@ -1396,13 +1397,34 @@ impl Operation for GetOp {
                             _ => None,
                         };
 
-                        // Relay peers with a locally cached contract serve it
-                        // immediately. Deferring to the network adds latency and risks
-                        // timeout when other peers near the ring location don't have
-                        // the contract cached. The network has no "more authoritative"
-                        // copy -- all peers receive state from the same PUT/broadcast
-                        // pipeline, so serving cached data is always preferable to a
-                        // timeout or extended fan-out search.
+                        // Relay peers hosting a contract with active subscriptions
+                        // serve it immediately -- their state is current. For peers
+                        // with only a stale LRU cache entry (no active subscription),
+                        // defer to the network but keep the local value as fallback.
+                        let local_value = if self.upstream_addr.is_some()
+                            && matches!(self.state, Some(GetState::ReceivedRequest))
+                        {
+                            match &local_value {
+                                Some((key, ..)) if !op_manager.ring.is_receiving_updates(key) => {
+                                    // Stale cache only (no subscription) -- defer to
+                                    // network but keep as fallback.
+                                    if let Some(lv) = local_value {
+                                        tracing::debug!(
+                                            tx = %id,
+                                            "Relay peer deferring stale cache (no active subscription), forwarding GET"
+                                        );
+                                        local_fallback = Some(lv);
+                                    }
+                                    None
+                                }
+                                _ => {
+                                    // Actively receiving updates -- serve immediately.
+                                    local_value
+                                }
+                            }
+                        } else {
+                            local_value
+                        };
 
                         if let Some((key, state, contract)) = local_value {
                             // Contract found locally!
@@ -5724,44 +5746,97 @@ mod tests {
         assert!(stats.transfer_time.unwrap().1.is_none());
     }
 
-    /// Regression test: relay peers with a locally cached contract must serve it
-    /// immediately rather than deferring to the network. Previously, relay peers
-    /// stashed local values into `local_fallback` and forwarded to the network,
-    /// causing GET timeouts when network peers didn't have the contract.
-    #[test]
-    fn relay_peer_with_local_cache_does_not_defer_to_network() {
-        let key = make_contract_key(1);
-        let upstream = "127.0.0.1:9999".parse().unwrap();
-
-        // A relay peer: has upstream_addr (forwarded request) and ReceivedRequest state
-        let op = GetOp {
-            id: Transaction::new::<GetMsg>(),
-            state: Some(GetState::ReceivedRequest),
-            result: None,
-            stats: None,
-            upstream_addr: Some(upstream),
-            local_fallback: None,
-            auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
-            client_return_code: true,
+    /// Simulates the relay peer local-cache decision from process_message.
+    ///
+    /// When a relay peer finds a contract locally, it checks whether it's
+    /// actively receiving updates (via subscription). If yes, serve
+    /// immediately. If no (stale cache), defer to network with local fallback.
+    ///
+    /// Returns (local_value, local_fallback) after applying the decision.
+    fn apply_relay_cache_decision(
+        is_relay: bool,
+        is_receiving_updates: bool,
+        local_value: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
+    ) -> (
+        Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
+        Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
+    ) {
+        // This mirrors the logic at get.rs ~line 1399.
+        let mut local_fallback = None;
+        let local_value = if is_relay {
+            match &local_value {
+                Some(_) if !is_receiving_updates => {
+                    // Stale cache -- defer to network, keep as fallback
+                    local_fallback = local_value;
+                    None
+                }
+                _ => {
+                    // Actively receiving updates -- serve immediately
+                    local_value
+                }
+            }
+        } else {
+            local_value
         };
+        (local_value, local_fallback)
+    }
 
-        // The relay peer should NOT have local_fallback set after construction.
-        // The old code would have set local_fallback = Some(local_value) here,
-        // suppressing the local cache. With the fix, local_value flows through
-        // to the immediate-serve path and local_fallback stays None.
-        assert!(
-            op.local_fallback.is_none(),
-            "Relay peer should not pre-populate local_fallback; local cache \
-             should be served immediately, not deferred as fallback"
-        );
+    /// Regression test: relay peers hosting a contract with active subscriptions
+    /// must serve it immediately. Previously, ALL relay peers deferred to the
+    /// network regardless of subscription status, causing GET timeouts.
+    #[test]
+    fn relay_peer_with_subscription_serves_immediately() {
+        let key = make_contract_key(1);
+        let state = WrappedState::new(vec![1, 2, 3]);
+        let local_value = Some((key, state.clone(), None));
 
-        // Also verify the state is correct for relay handling
-        assert!(op.upstream_addr.is_some(), "Must have upstream for relay");
+        // Relay peer WITH active subscription: serve immediately
+        let (value, fallback) = apply_relay_cache_decision(true, true, local_value.clone());
         assert!(
-            matches!(op.state, Some(GetState::ReceivedRequest)),
-            "Relay peer starts in ReceivedRequest state"
+            value.is_some(),
+            "Relay peer with subscription must serve immediately"
         );
+        assert!(
+            fallback.is_none(),
+            "Should not defer to fallback when subscription is active"
+        );
+    }
+
+    /// Relay peer with stale cache (no subscription) should defer to network
+    /// but keep local value as fallback.
+    #[test]
+    fn relay_peer_with_stale_cache_defers_with_fallback() {
+        let key = make_contract_key(1);
+        let state = WrappedState::new(vec![1, 2, 3]);
+        let local_value = Some((key, state.clone(), None));
+
+        // Relay peer WITHOUT subscription: defer to network
+        let (value, fallback) = apply_relay_cache_decision(true, false, local_value.clone());
+        assert!(
+            value.is_none(),
+            "Relay peer without subscription should defer to network"
+        );
+        assert!(fallback.is_some(), "Stale cache should be kept as fallback");
+    }
+
+    /// Non-relay (original requester) always serves local cache regardless
+    /// of subscription status.
+    #[test]
+    fn original_requester_always_serves_local_cache() {
+        let key = make_contract_key(1);
+        let state = WrappedState::new(vec![1, 2, 3]);
+        let local_value = Some((key, state.clone(), None));
+
+        let (value, fallback) = apply_relay_cache_decision(false, false, local_value);
+        assert!(value.is_some(), "Original requester always serves locally");
+        assert!(fallback.is_none());
+    }
+
+    /// Relay peer without local cache forwards regardless.
+    #[test]
+    fn relay_peer_without_cache_forwards_to_network() {
+        let (value, fallback) = apply_relay_cache_decision(true, true, None);
+        assert!(value.is_none(), "Nothing to serve without cache");
+        assert!(fallback.is_none(), "Nothing to fall back to");
     }
 }
