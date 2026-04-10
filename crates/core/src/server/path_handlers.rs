@@ -1188,6 +1188,10 @@ mod tests {
             "bridge JS must forward pathname in init message"
         );
         assert!(
+            !SHELL_BRIDGE_JS.contains("slice(0, 1024)"),
+            "hash/search limit must be 8192, not 1024"
+        );
+        assert!(
             SHELL_BRIDGE_JS.contains("popstate"),
             "bridge JS must forward hash on browser back/forward"
         );
@@ -1220,37 +1224,6 @@ mod tests {
             !SHELL_BRIDGE_JS.contains("clipboard.readText")
                 && !SHELL_BRIDGE_JS.contains("clipboard.read("),
             "bridge JS must be clipboard write-only — no read access"
-        );
-    }
-
-    #[test]
-    fn bridge_js_sends_init_on_iframe_load() {
-        // Verify the init message is sent on iframe load with all URL context fields
-        assert!(
-            SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
-            "must register load handler on iframe"
-        );
-        assert!(
-            SHELL_BRIDGE_JS.contains("type: 'init'"),
-            "load handler must send init message type"
-        );
-        // All three URL components must be present in the init message
-        assert!(
-            SHELL_BRIDGE_JS.contains("hash: location.hash.slice(0, 8192)"),
-            "init must include hash (truncated to 8192)"
-        );
-        assert!(
-            SHELL_BRIDGE_JS.contains("search: location.search.slice(0, 8192)"),
-            "init must include search/query params (truncated to 8192)"
-        );
-        assert!(
-            SHELL_BRIDGE_JS.contains("pathname: location.pathname"),
-            "init must include pathname"
-        );
-        // Hash limit must be 8192, not 1024
-        assert!(
-            !SHELL_BRIDGE_JS.contains("slice(0, 1024)"),
-            "hash/search limit must be 8192, not 1024"
         );
     }
 
