@@ -199,7 +199,7 @@ jobs:
       # Post PR comment if regressions detected
       - name: Comment on PR
         if: github.event_name == 'pull_request' && steps.parse_results.outputs.regression_detected == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

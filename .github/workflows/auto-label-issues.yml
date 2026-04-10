@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Check user account age to prevent spam
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             // Anti-spam: Only process issues from users with accounts older than 7 days
@@ -52,7 +52,7 @@ jobs:
       - name: Analyze issue and suggest labels
         if: steps.spam_check.outputs.skip != 'true'
         id: analyze
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         with:
