@@ -1396,22 +1396,11 @@ impl Operation for GetOp {
                             _ => None,
                         };
 
-                        // Relay peers in ReceivedRequest: prefer fresh network state,
-                        // local cache is fallback only. Store local value and forward.
-                        let local_value = if self.upstream_addr.is_some()
-                            && matches!(self.state, Some(GetState::ReceivedRequest))
-                        {
-                            if let Some(lv) = local_value {
-                                tracing::debug!(
-                                    tx = %id,
-                                    "Relay peer deferring local cache, forwarding GET for fresh state"
-                                );
-                                local_fallback = Some(lv);
-                            }
-                            None
-                        } else {
-                            local_value
-                        };
+                        // Relay peers hosting the contract should serve it immediately.
+                        // A hosting peer receives subscription updates, so its local
+                        // state is current. Deferring to the network adds latency and
+                        // risks timeout when other peers near the ring location don't
+                        // have the contract cached.
 
                         if let Some((key, state, contract)) = local_value {
                             // Contract found locally!
