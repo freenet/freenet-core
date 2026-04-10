@@ -2920,6 +2920,18 @@ mod tests {
                  the bypass invocation or update this regression guard if the \
                  branch has been legitimately refactored."
             );
+
+            // The bypass MUST be gated on Response-only. Without this
+            // filter, non-terminal messages like ForwardingAck fill the
+            // capacity-1 reply channel and cause UnexpectedOpState
+            // (commit 5cb6f37c).
+            assert!(
+                window.contains("matches!(op, subscribe::SubscribeMsg::Response { .. })"),
+                "SUBSCRIBE branch bypass is not gated on Response-only. \
+                 Non-terminal messages (ForwardingAck, Unsubscribe) must NOT \
+                 be forwarded to the task-per-tx channel — they would fill \
+                 the capacity-1 reply slot and block the real Response."
+            );
         }
 
         #[tokio::test]
@@ -2962,5 +2974,137 @@ mod tests {
         // end-to-end integration test that spins up a node and exercises
         // `OpCtx::send_and_await` for each op kind belongs in Phase 2b,
         // where the first real production caller is added.
+
+        // ───────────────────────────────────────────────────────────
+        // Regression tests for the subscribe-branch message-type
+        // filter added in the ForwardingAck fix (5cb6f37c).
+        //
+        // The bug: `try_forward_task_per_tx_reply` was called for ALL
+        // subscribe message types (including ForwardingAck). A relay
+        // peer's ForwardingAck would fill the capacity-1 reply
+        // channel, causing the task to receive it instead of the
+        // real Response and fail with UnexpectedOpState.
+        //
+        // These tests verify the filtering logic that
+        // `handle_pure_network_message_v1` applies BEFORE calling the
+        // bypass helper: only `SubscribeMsg::Response` is forwarded.
+        // ───────────────────────────────────────────────────────────
+
+        use crate::operations::VisitedPeers;
+        use crate::operations::subscribe::{SubscribeMsg, SubscribeMsgResult};
+
+        /// Helper: simulate the filtering logic from the SUBSCRIBE
+        /// branch of `handle_pure_network_message_v1`. Returns
+        /// `true` if the message would be forwarded to the
+        /// task-per-tx channel (and the branch would return early).
+        fn subscribe_branch_would_forward(
+            op: &SubscribeMsg,
+            callback: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+        ) -> bool {
+            matches!(op, SubscribeMsg::Response { .. })
+                && try_forward_task_per_tx_reply(
+                    callback,
+                    NetMessage::V1(NetMessageV1::Subscribe(op.clone())),
+                    "subscribe",
+                )
+        }
+
+        #[tokio::test]
+        async fn subscribe_response_is_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32]);
+            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                instance_id,
+                freenet_stdlib::prelude::CodeHash::new([2u8; 32]),
+            );
+            let op = SubscribeMsg::Response {
+                id: sub_tx,
+                instance_id,
+                result: SubscribeMsgResult::Subscribed { key },
+            };
+
+            let taken = subscribe_branch_would_forward(&op, Some(&tx));
+            assert!(taken, "Response with callback → must be forwarded");
+
+            let received = rx.try_recv().expect("Response should be in channel");
+            assert_eq!(*received.id(), sub_tx);
+        }
+
+        #[tokio::test]
+        async fn forwarding_ack_is_not_forwarded_to_task() {
+            // ForwardingAck is non-terminal: relay peers send it to
+            // signal "I'm working on it". Forwarding it would fill
+            // the capacity-1 channel and block the real Response.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([3u8; 32]);
+            let op = SubscribeMsg::ForwardingAck {
+                id: sub_tx,
+                instance_id,
+            };
+
+            let taken = subscribe_branch_would_forward(&op, Some(&tx));
+            assert!(
+                !taken,
+                "ForwardingAck must NOT be forwarded to task channel"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "channel must remain empty after ForwardingAck"
+            );
+        }
+
+        #[tokio::test]
+        async fn unsubscribe_is_not_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([4u8; 32]);
+            let op = SubscribeMsg::Unsubscribe {
+                id: sub_tx,
+                instance_id,
+            };
+
+            let taken = subscribe_branch_would_forward(&op, Some(&tx));
+            assert!(!taken, "Unsubscribe must NOT be forwarded to task channel");
+            assert!(rx.try_recv().is_err(), "channel must remain empty");
+        }
+
+        #[tokio::test]
+        async fn request_is_not_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([5u8; 32]);
+            let op = SubscribeMsg::Request {
+                id: sub_tx,
+                instance_id,
+                htl: 5,
+                visited: VisitedPeers::new(&sub_tx),
+                is_renewal: false,
+            };
+
+            let taken = subscribe_branch_would_forward(&op, Some(&tx));
+            assert!(!taken, "Request must NOT be forwarded to task channel");
+            assert!(rx.try_recv().is_err(), "channel must remain empty");
+        }
+
+        #[tokio::test]
+        async fn response_without_callback_falls_through() {
+            // No callback registered (legacy path) — filter must
+            // return false so handle_op_request runs.
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([6u8; 32]);
+            let op = SubscribeMsg::Response {
+                id: sub_tx,
+                instance_id,
+                result: SubscribeMsgResult::NotFound,
+            };
+
+            let taken = subscribe_branch_would_forward(&op, None);
+            assert!(
+                !taken,
+                "Response without callback → must fall through to legacy path"
+            );
+        }
     }
 }
