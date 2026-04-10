@@ -98,7 +98,7 @@ fn sanitize_label(label: &str) -> String {
 /// Show a dialog and return the selected button index, or -1 on deny/dismiss/timeout.
 fn show_dialog(message: &str, labels: &[String], timeout_secs: u64) -> i32 {
     // Linux: try GTK3 native dialog first (if compiled in), then zenity/kdialog
-    #[cfg(feature = "gtk-dialog")]
+    #[cfg(all(feature = "gtk-dialog", target_os = "linux"))]
     if let Some(idx) = try_gtk_dialog(message, labels) {
         return idx;
     }
@@ -139,7 +139,7 @@ fn show_dialog(message: &str, labels: &[String], timeout_secs: u64) -> i32 {
 /// and most GNOME/XFCE/KDE apps).
 ///
 /// Returns `None` if GTK initialization fails (headless, no DISPLAY, etc.).
-#[cfg(feature = "gtk-dialog")]
+#[cfg(all(feature = "gtk-dialog", target_os = "linux"))]
 fn try_gtk_dialog(message: &str, labels: &[String]) -> Option<i32> {
     use gtk::prelude::*;
     use gtk::{ButtonsType, DialogFlags, MessageDialog, MessageType, ResponseType, Window};
