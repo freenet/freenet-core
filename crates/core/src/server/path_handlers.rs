@@ -450,7 +450,7 @@ function freenetBridge(authToken) {
   // one load -- with the hash already in the URL.
   var iframeSrc = iframe.getAttribute('data-src');
   if (location.hash) {
-    iframeSrc += location.hash.slice(0, 1024);
+    iframeSrc += location.hash.slice(0, 8192);
   }
   iframe.src = iframeSrc;
 
@@ -481,7 +481,7 @@ function freenetBridge(authToken) {
         // Note: replaceState (not pushState) is intentional — avoids polluting
         // browser history with every in-app route change. This also means
         // replaceState does NOT fire popstate or hashchange, preventing loops.
-        var h = msg.hash.slice(0, 1024);
+        var h = msg.hash.slice(0, 8192);
         if (h.length > 0 && h.charAt(0) === '#') {
           history.replaceState(null, '', h);
         }
@@ -573,11 +573,21 @@ function freenetBridge(authToken) {
     }
   });
 
+  // Send full URL context to the iframe once it finishes loading, so apps
+  // can read hash, query params, and pathname on first render (deep linking).
+  iframe.addEventListener('load', function() {
+    sendToIframe({
+      __freenet_shell__: true, type: 'init',
+      hash: location.hash.slice(0, 8192),
+      search: location.search.slice(0, 8192),
+      pathname: location.pathname
+    });
+  });
+
   // Forward runtime hash changes (browser back/forward, manual URL edits)
-  // via postMessage. By this point the WASM app's listener is active.
   function forwardHash() {
     if (location.hash) {
-      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 1024) });
+      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 8192) });
     }
   }
   window.addEventListener('popstate', forwardHash);
@@ -1140,8 +1150,8 @@ mod tests {
             "bridge JS must require # prefix on hash values"
         );
         assert!(
-            SHELL_BRIDGE_JS.contains("msg.hash.slice(0, 1024)"),
-            "bridge JS must truncate hash to 1024 chars"
+            SHELL_BRIDGE_JS.contains("location.hash.slice(0, 8192)"),
+            "bridge JS must truncate hash to 8192 chars"
         );
         assert!(
             SHELL_BRIDGE_JS.contains("history.replaceState"),
@@ -1161,8 +1171,21 @@ mod tests {
             "bridge JS must set iframe src from data-src (single load, no race)"
         );
         assert!(
-            !SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
-            "bridge JS must NOT use load event for hash forwarding (race with WASM init)"
+            SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
+            "bridge JS must send init message on iframe load for deep linking"
+        );
+        // Init message must include hash, search (query params), and pathname
+        assert!(
+            SHELL_BRIDGE_JS.contains("type: 'init'"),
+            "bridge JS must send init message type on iframe load"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("search: location.search.slice(0, 8192)"),
+            "bridge JS must forward query parameters in init message"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("pathname: location.pathname"),
+            "bridge JS must forward pathname in init message"
         );
         assert!(
             SHELL_BRIDGE_JS.contains("popstate"),
@@ -1197,6 +1220,37 @@ mod tests {
             !SHELL_BRIDGE_JS.contains("clipboard.readText")
                 && !SHELL_BRIDGE_JS.contains("clipboard.read("),
             "bridge JS must be clipboard write-only — no read access"
+        );
+    }
+
+    #[test]
+    fn bridge_js_sends_init_on_iframe_load() {
+        // Verify the init message is sent on iframe load with all URL context fields
+        assert!(
+            SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
+            "must register load handler on iframe"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("type: 'init'"),
+            "load handler must send init message type"
+        );
+        // All three URL components must be present in the init message
+        assert!(
+            SHELL_BRIDGE_JS.contains("hash: location.hash.slice(0, 8192)"),
+            "init must include hash (truncated to 8192)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("search: location.search.slice(0, 8192)"),
+            "init must include search/query params (truncated to 8192)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("pathname: location.pathname"),
+            "init must include pathname"
+        );
+        // Hash limit must be 8192, not 1024
+        assert!(
+            !SHELL_BRIDGE_JS.contains("slice(0, 1024)"),
+            "hash/search limit must be 8192, not 1024"
         );
     }
 
