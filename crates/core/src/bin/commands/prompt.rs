@@ -97,8 +97,19 @@ fn sanitize_label(label: &str) -> String {
 
 /// Show a dialog and return the selected button index, or -1 on deny/dismiss/timeout.
 fn show_dialog(message: &str, labels: &[String], timeout_secs: u64) -> i32 {
-    #[cfg(target_os = "linux")]
+    // Linux: try GTK3 native dialog first, then zenity/kdialog as fallback
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     if let Some(idx) = try_gtk_dialog(message, labels) {
+        return idx;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(idx) = try_zenity(message, labels) {
+        return idx;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(idx) = try_kdialog(message, labels) {
         return idx;
     }
 
@@ -121,15 +132,14 @@ fn show_dialog(message: &str, labels: &[String], timeout_secs: u64) -> i32 {
     -1
 }
 
-/// Show a native GTK3 dialog with custom buttons (Linux).
+/// Show a native GTK3 dialog with custom buttons (Linux, glibc only).
 ///
 /// GTK3 is dynamically linked -- `libgtk-3-0` must be installed at runtime.
-/// This is near-universal on Linux desktops (dependency of Firefox, Chrome,
-/// GIMP, and most GNOME/XFCE apps; KDE desktops also typically have it for
-/// cross-toolkit app support).
+/// Near-universal on Linux desktops (dependency of Firefox, Chrome, GIMP,
+/// and most GNOME/XFCE/KDE apps).
 ///
 /// Returns `None` if GTK initialization fails (headless, no DISPLAY, etc.).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn try_gtk_dialog(message: &str, labels: &[String]) -> Option<i32> {
     use gtk::prelude::*;
     use gtk::{ButtonsType, DialogFlags, MessageDialog, MessageType, ResponseType, Window};
@@ -147,12 +157,9 @@ fn try_gtk_dialog(message: &str, labels: &[String]) -> Option<i32> {
     );
     dialog.set_title("Freenet Permission");
 
-    // Add custom buttons with response IDs matching their index
     for (i, label) in labels.iter().enumerate() {
         dialog.add_button(label, ResponseType::Other(i as u16));
     }
-
-    // Set the first button as default
     dialog.set_default_response(ResponseType::Other(0));
 
     let response = dialog.run();
@@ -165,7 +172,125 @@ fn try_gtk_dialog(message: &str, labels: &[String]) -> Option<i32> {
 
     match response {
         ResponseType::Other(idx) => Some(idx as i32),
-        _ => Some(-1), // Dialog closed without clicking a button
+        ResponseType::None
+        | ResponseType::Reject
+        | ResponseType::Accept
+        | ResponseType::DeleteEvent
+        | ResponseType::Ok
+        | ResponseType::Cancel
+        | ResponseType::Close
+        | ResponseType::Yes
+        | ResponseType::No
+        | ResponseType::Apply
+        | ResponseType::Help
+        | ResponseType::__Unknown(_) => Some(-1),
+    }
+}
+
+/// Fallback: show a dialog via zenity (Linux). Used when GTK is not available
+/// (musl builds, GTK init failure). All arguments passed via `Command::arg()`
+/// (no shell interpretation).
+#[cfg(target_os = "linux")]
+fn try_zenity(message: &str, labels: &[String]) -> Option<i32> {
+    use std::process::Command;
+
+    if Command::new("zenity").arg("--version").output().is_err() {
+        return None;
+    }
+
+    let mut cmd = Command::new("zenity");
+    cmd.arg("--question")
+        .arg("--title=Freenet Permission")
+        .arg(format!("--text={message}"))
+        .arg("--no-wrap");
+
+    match labels.len() {
+        1 => {
+            cmd.arg(format!("--ok-label={}", labels[0]));
+        }
+        2 => {
+            cmd.arg(format!("--ok-label={}", labels[0]));
+            cmd.arg(format!("--cancel-label={}", labels[1]));
+        }
+        _ => {
+            cmd.arg(format!("--ok-label={}", labels[0]));
+            cmd.arg(format!("--cancel-label={}", labels[labels.len() - 1]));
+            for label in &labels[1..labels.len() - 1] {
+                cmd.arg(format!("--extra-button={label}"));
+            }
+        }
+    }
+
+    let output = cmd.output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if output.status.success() {
+        return Some(0);
+    }
+
+    // Extra buttons write their text to stdout with exit code 1.
+    // Check stdout BEFORE falling back to Cancel interpretation.
+    if !stdout.is_empty() {
+        for (i, label) in labels.iter().enumerate() {
+            if stdout == *label {
+                return Some(i as i32);
+            }
+        }
+    }
+
+    if output.status.code() == Some(1) && labels.len() >= 2 {
+        return Some(labels.len() as i32 - 1);
+    }
+
+    Some(-1)
+}
+
+/// Fallback: show a dialog via kdialog (Linux/KDE).
+#[cfg(target_os = "linux")]
+fn try_kdialog(message: &str, labels: &[String]) -> Option<i32> {
+    use std::process::Command;
+
+    if Command::new("kdialog").arg("--version").output().is_err() {
+        return None;
+    }
+
+    let mut cmd = Command::new("kdialog");
+    cmd.arg("--title").arg("Freenet Permission");
+
+    match labels.len() {
+        1 => {
+            cmd.arg("--msgbox").arg(message);
+            let status = cmd.status().ok()?;
+            Some(if status.success() { 0 } else { -1 })
+        }
+        2 => {
+            cmd.arg("--yesno")
+                .arg(message)
+                .arg("--yes-label")
+                .arg(&labels[0])
+                .arg("--no-label")
+                .arg(&labels[1]);
+            let status = cmd.status().ok()?;
+            Some(if status.success() { 0 } else { 1 })
+        }
+        3 => {
+            cmd.arg("--yesnocancel")
+                .arg(message)
+                .arg("--yes-label")
+                .arg(&labels[0])
+                .arg("--no-label")
+                .arg(&labels[1])
+                .arg("--cancel-label")
+                .arg(&labels[2]);
+            let status = cmd.status().ok()?;
+            match status.code() {
+                Some(0) => Some(0),
+                Some(1) => Some(1),
+                Some(2) => Some(2),
+                _ => Some(-1),
+            }
+        }
+        _ => None,
     }
 }
 

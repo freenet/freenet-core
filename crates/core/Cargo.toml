@@ -108,13 +108,13 @@ lru = { workspace = true }
 libc = { workspace = true }  # For sendmmsg syscall batching on Linux
 gag = { workspace = true }  # For suppressing libunwind stderr warnings during WASM execution
 
+# Linux-gnu only dependencies (not musl — musl has its own allocator and GTK3 can't link against it).
 # jemalloc replaces glibc malloc to prevent memory fragmentation in long-running processes.
-# Only for linux-gnu targets — musl has its own allocator and jemalloc doesn't build on musl.
+# GTK3 for native permission dialogs on desktops (install.sh installs libgtk-3-0;
+# on headless systems gtk::init() fails gracefully, falling through to terminal prompt).
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
 gtk = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
