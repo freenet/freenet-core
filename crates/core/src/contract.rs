@@ -513,24 +513,27 @@ where
 
             for req in user_input_requests {
                 let request_id = req.request_id;
-                match prompter.prompt(&req).await {
-                    Some((_, response)) => {
-                        inbound_responses.push(InboundDelegateMsg::UserResponse(
-                            UserInputResponse {
-                                request_id,
-                                response,
-                                context: DelegateContext::default(),
-                            },
-                        ));
-                    }
+                let response = match prompter.prompt(&req).await {
+                    Some((_, response)) => response,
                     None => {
                         tracing::warn!(
                             request_id,
                             delegate = %delegate_key,
                             "User input request timed out or was denied"
                         );
+                        // Send an empty response so the delegate knows the request
+                        // was denied/timed out, rather than leaving it waiting forever.
+                        ClientResponse::new(Vec::new())
                     }
-                }
+                };
+                inbound_responses.push(InboundDelegateMsg::UserResponse(UserInputResponse {
+                    request_id,
+                    response,
+                    // UserInputRequest has no context field, so we use default.
+                    // The delegate's actual context is maintained separately in
+                    // the process_outbound loop in delegate.rs.
+                    context: DelegateContext::default(),
+                }));
             }
         }
 
