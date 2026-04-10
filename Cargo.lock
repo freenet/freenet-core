@@ -2046,6 +2046,7 @@ dependencies = [
  "freenet-test-network",
  "futures 0.3.32",
  "gag",
+ "gtk",
  "headers",
  "hex",
  "hickory-resolver",

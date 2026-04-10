@@ -221,10 +221,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install mold linker
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y mold
+          sudo apt-get install -y mold libgtk-3-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -301,7 +301,7 @@ jobs:
         if: steps.release_check.outputs.is_release != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y mold
+          sudo apt-get install -y mold libgtk-3-dev
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.release_check.outputs.is_release != 'true'
@@ -413,7 +413,7 @@ jobs:
         if: steps.release_check.outputs.is_release != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y mold
+          sudo apt-get install -y mold libgtk-3-dev
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.release_check.outputs.is_release != 'true'
@@ -554,7 +554,7 @@ jobs:
         if: steps.release_check.outputs.is_release != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y mold liblzma-dev
+          sudo apt-get install -y mold libgtk-3-dev liblzma-dev
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.release_check.outputs.is_release != 'true'
