@@ -66,7 +66,7 @@ fn show_dialog(message: &str, labels: &[String], timeout_secs: u64) -> i32 {
     }
 
     // Fallback: terminal prompt if stdin is a TTY
-    if atty_is_terminal() {
+    if stdin_is_terminal() {
         return terminal_prompt(message, labels, timeout_secs);
     }
 
@@ -131,13 +131,9 @@ fn try_zenity(message: &str, labels: &[String]) -> Option<i32> {
         return Some(0);
     }
 
-    // Check exit code: 1 = Cancel (last label), 5 = timeout
-    match output.status.code() {
-        Some(1) if labels.len() >= 2 => {
-            // Cancel = last button
-            return Some(labels.len() as i32 - 1);
-        }
-        _ => {}
+    // Exit code 1 = Cancel button (mapped to last label)
+    if output.status.code() == Some(1) && labels.len() >= 2 {
+        return Some(labels.len() as i32 - 1);
     }
 
     // Check stdout for extra button text
@@ -160,7 +156,8 @@ fn try_kdialog(message: &str, labels: &[String]) -> Option<i32> {
         return None;
     }
 
-    // kdialog supports --yesno, --yesnocancel, or --menu for arbitrary choices
+    // kdialog supports --yesno (2 buttons) and --yesnocancel (3 buttons).
+    // For 4+ buttons, falls through to terminal prompt.
     if labels.len() <= 3 {
         let mut cmd = Command::new("kdialog");
         cmd.arg("--title").arg("Freenet Permission");
@@ -249,8 +246,6 @@ fn try_macos_dialog(message: &str, labels: &[String]) -> Option<i32> {
 fn try_windows_dialog(message: &str, labels: &[String]) -> Option<i32> {
     use std::process::Command;
 
-    // For simple 2-3 button dialogs, use Windows Forms MessageBox
-    // For more complex cases, use a PowerShell custom form
     let escaped_msg = message.replace("'", "''");
 
     // Build a PowerShell script that creates a simple form with custom buttons
@@ -309,12 +304,14 @@ fn try_windows_dialog(message: &str, labels: &[String]) -> Option<i32> {
     Some(-1)
 }
 
-/// Check if stdin is a terminal (without pulling in the `atty` crate).
-fn atty_is_terminal() -> bool {
+fn stdin_is_terminal() -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
 /// Simple terminal-based prompt (fallback when no GUI is available).
+///
+/// Note: `_timeout_secs` is not enforced here; the parent process
+/// (`SubprocessPrompter`) kills this subprocess after the timeout.
 fn terminal_prompt(message: &str, labels: &[String], _timeout_secs: u64) -> i32 {
     use std::io::{self, Write};
 
