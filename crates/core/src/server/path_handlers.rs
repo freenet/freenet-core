@@ -573,17 +573,6 @@ function freenetBridge(authToken) {
     }
   });
 
-  // Send full URL context to the iframe once it finishes loading, so apps
-  // can read hash, query params, and pathname on first render (deep linking).
-  iframe.addEventListener('load', function() {
-    sendToIframe({
-      __freenet_shell__: true, type: 'init',
-      hash: location.hash.slice(0, 8192),
-      search: location.search.slice(0, 8192),
-      pathname: location.pathname
-    });
-  });
-
   // Forward runtime hash changes (browser back/forward, manual URL edits)
   function forwardHash() {
     if (location.hash) {
@@ -1171,25 +1160,12 @@ mod tests {
             "bridge JS must set iframe src from data-src (single load, no race)"
         );
         assert!(
-            SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
-            "bridge JS must send init message on iframe load for deep linking"
-        );
-        // Init message must include hash, search (query params), and pathname
-        assert!(
-            SHELL_BRIDGE_JS.contains("type: 'init'"),
-            "bridge JS must send init message type on iframe load"
-        );
-        assert!(
-            SHELL_BRIDGE_JS.contains("search: location.search.slice(0, 8192)"),
-            "bridge JS must forward query parameters in init message"
-        );
-        assert!(
-            SHELL_BRIDGE_JS.contains("pathname: location.pathname"),
-            "bridge JS must forward pathname in init message"
+            !SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
+            "bridge JS must NOT use load event (race with WASM init; hash is in iframe URL via data-src)"
         );
         assert!(
             !SHELL_BRIDGE_JS.contains("slice(0, 1024)"),
-            "hash/search limit must be 8192, not 1024"
+            "hash limit must be 8192, not 1024"
         );
         assert!(
             SHELL_BRIDGE_JS.contains("popstate"),
