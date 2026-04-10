@@ -450,7 +450,7 @@ function freenetBridge(authToken) {
   // one load -- with the hash already in the URL.
   var iframeSrc = iframe.getAttribute('data-src');
   if (location.hash) {
-    iframeSrc += location.hash.slice(0, 1024);
+    iframeSrc += location.hash.slice(0, 8192);
   }
   iframe.src = iframeSrc;
 
@@ -481,7 +481,7 @@ function freenetBridge(authToken) {
         // Note: replaceState (not pushState) is intentional — avoids polluting
         // browser history with every in-app route change. This also means
         // replaceState does NOT fire popstate or hashchange, preventing loops.
-        var h = msg.hash.slice(0, 1024);
+        var h = msg.hash.slice(0, 8192);
         if (h.length > 0 && h.charAt(0) === '#') {
           history.replaceState(null, '', h);
         }
@@ -574,10 +574,9 @@ function freenetBridge(authToken) {
   });
 
   // Forward runtime hash changes (browser back/forward, manual URL edits)
-  // via postMessage. By this point the WASM app's listener is active.
   function forwardHash() {
     if (location.hash) {
-      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 1024) });
+      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 8192) });
     }
   }
   window.addEventListener('popstate', forwardHash);
@@ -1140,8 +1139,8 @@ mod tests {
             "bridge JS must require # prefix on hash values"
         );
         assert!(
-            SHELL_BRIDGE_JS.contains("msg.hash.slice(0, 1024)"),
-            "bridge JS must truncate hash to 1024 chars"
+            SHELL_BRIDGE_JS.contains("location.hash.slice(0, 8192)"),
+            "bridge JS must truncate hash to 8192 chars"
         );
         assert!(
             SHELL_BRIDGE_JS.contains("history.replaceState"),
@@ -1162,7 +1161,11 @@ mod tests {
         );
         assert!(
             !SHELL_BRIDGE_JS.contains("iframe.addEventListener('load'"),
-            "bridge JS must NOT use load event for hash forwarding (race with WASM init)"
+            "bridge JS must NOT use load event (race with WASM init; hash is in iframe URL via data-src)"
+        );
+        assert!(
+            !SHELL_BRIDGE_JS.contains("slice(0, 1024)"),
+            "hash limit must be 8192, not 1024"
         );
         assert!(
             SHELL_BRIDGE_JS.contains("popstate"),
