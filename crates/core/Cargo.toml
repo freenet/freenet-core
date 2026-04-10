@@ -115,7 +115,7 @@ gag = { workspace = true }  # For suppressing libunwind stderr warnings during W
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
-gtk = { workspace = true }
+gtk = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "winuser"] }
@@ -190,7 +190,8 @@ chrono = { workspace = true }
 winres = "0.1"
 
 [features]
-default = ["redb", "trace", "websocket", "wasmtime-backend"]
+default = ["redb", "trace", "websocket", "wasmtime-backend", "gtk-dialog"]
+gtk-dialog = ["dep:gtk"]
 sqlite = ["sqlx"]
 trace = ["tracing-subscriber", "tracing-appender"]
 trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]
