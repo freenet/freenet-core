@@ -13,9 +13,7 @@ use freenet::{
 use std::sync::Arc;
 
 mod commands;
-use commands::{
-    prompt::PromptArgs, service::ServiceCommand, uninstall::UninstallCommand, update::UpdateCommand,
-};
+use commands::{service::ServiceCommand, uninstall::UninstallCommand, update::UpdateCommand};
 
 /// Freenet - A distributed, decentralized, and censorship-resistant platform
 #[derive(Parser, Debug)]
@@ -48,8 +46,6 @@ enum Command {
     Update(UpdateCommand),
     /// Completely uninstall Freenet (service, binaries, and optionally data)
     Uninstall(UninstallCommand),
-    /// Show a native permission dialog (used internally by the delegate runtime)
-    Prompt(PromptArgs),
 }
 
 /// Build metadata embedded at compile time
@@ -623,7 +619,6 @@ fn freenet_main() -> anyhow::Result<()> {
         }
         Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
         Some(Command::Uninstall(cmd)) => cmd.run(),
-        Some(Command::Prompt(args)) => args.run(),
         Some(Command::Network { mut config }) => {
             config.mode = Some(OperationMode::Network);
             run_node(config)

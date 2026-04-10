@@ -385,7 +385,9 @@ impl NodeP2P {
                 tracing::info!("Contract executor task starting");
                 let result = contract::contract_handling(
                     contract_handler,
-                    crate::contract::user_input::SubprocessPrompter,
+                    crate::contract::user_input::DashboardPrompter::new(
+                        crate::contract::user_input::pending_prompts(),
+                    ),
                 )
                 .await;
                 match &result {

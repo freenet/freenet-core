@@ -22,6 +22,7 @@ use super::{
     ApiVersion, AuthToken, ClientConnection, errors::WebSocketApiError, home_page, path_handlers,
 };
 
+mod permission_prompts;
 mod v1;
 mod v2;
 
@@ -72,15 +73,20 @@ impl HttpClientApi {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
         let origin_contracts = Arc::new(DashMap::new());
-        Self::as_router_with_origin_contracts(socket, origin_contracts)
+        Self::as_router_with_origin_contracts(
+            socket,
+            origin_contracts,
+            crate::contract::user_input::pending_prompts(),
+        )
     }
 
     /// Returns the uninitialized axum router with a provided origin_contracts map.
     ///
     /// Merges V1 and V2 HTTP routes; both currently share the same handler logic.
-    pub fn as_router_with_origin_contracts(
+    pub(crate) fn as_router_with_origin_contracts(
         socket: &SocketAddr,
         origin_contracts: OriginContractMap,
+        pending_prompts: crate::contract::user_input::PendingPrompts,
     ) -> (Self, Router) {
         // Controls the cookie Secure flag: when true, cookies are sent over HTTP
         // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
@@ -111,7 +117,9 @@ impl HttpClientApi {
             )
             .merge(v1::routes(config.clone()))
             .merge(v2::routes(config))
+            .merge(permission_prompts::routes())
             .layer(Extension(origin_contracts.clone()))
+            .layer(Extension(pending_prompts))
             .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
 
         (

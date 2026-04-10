@@ -469,8 +469,11 @@ async fn serve_client_api_in_impl(
     );
 
     // Pass the shared map to both the HTTP client API and WebSocketProxy
-    let (gw, gw_router) =
-        HttpClientApi::as_router_with_origin_contracts(&ws_socket, origin_contracts.clone());
+    let (gw, gw_router) = HttpClientApi::as_router_with_origin_contracts(
+        &ws_socket,
+        origin_contracts.clone(),
+        crate::contract::user_input::pending_prompts(),
+    );
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts);
 

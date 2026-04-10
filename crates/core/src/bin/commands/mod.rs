@@ -1,5 +1,4 @@
 pub mod auto_update;
-pub mod prompt;
 pub mod report;
 pub mod service;
 pub mod setup_wizard;
