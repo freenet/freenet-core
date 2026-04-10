@@ -1142,6 +1142,14 @@ where
                 // 1's forwarding hook and task-per-tx callers who never
                 // push an op into the OpManager DashMap).
                 //
+                // Only forward **terminal** Response messages to the
+                // task-per-tx channel. Non-terminal messages like
+                // ForwardingAck (sent by relay peers to signal "I'm working
+                // on it") must NOT be forwarded: they would fill the
+                // capacity-1 reply channel before the real Response arrives,
+                // causing the task to classify the ForwardingAck as
+                // Unexpected and fail with UnexpectedOpState.
+                //
                 // Once this returns `true` we exit the branch entirely, so
                 // the legacy `forward_pending_op_result_if_completed` call
                 // that follows the other op branches is DELIBERATELY
@@ -1150,11 +1158,13 @@ where
                 // by the time we reach `handle_op_request` we are
                 // guaranteed `pending_op_result.is_none()`. Adding the
                 // legacy forward call would be pure no-op noise.
-                if try_forward_task_per_tx_reply(
-                    pending_op_result.as_ref(),
-                    NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
-                    "subscribe",
-                ) {
+                if matches!(op, subscribe::SubscribeMsg::Response { .. })
+                    && try_forward_task_per_tx_reply(
+                        pending_op_result.as_ref(),
+                        NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
+                        "subscribe",
+                    )
+                {
                     return Ok(None);
                 }
 
