@@ -1150,14 +1150,14 @@ where
                 // causing the task to classify the ForwardingAck as
                 // Unexpected and fail with UnexpectedOpState.
                 //
-                // Once this returns `true` we exit the branch entirely, so
-                // the legacy `forward_pending_op_result_if_completed` call
-                // that follows the other op branches is DELIBERATELY
-                // ABSENT below: the bypass covers every case where
-                // `pending_op_result` is `Some` for a SUBSCRIBE tx, and
-                // by the time we reach `handle_op_request` we are
-                // guaranteed `pending_op_result.is_none()`. Adding the
-                // legacy forward call would be pure no-op noise.
+                // When a Response IS present and a callback is registered,
+                // the bypass returns Ok(None) and skips handle_op_request.
+                // For non-Response messages (Request, ForwardingAck, etc.)
+                // with a pending callback, the bypass doesn't fire and we
+                // fall through to handle_op_request. If handle_op_request
+                // completes the operation (e.g., local subscribe completion),
+                // forward_pending_op_result_if_completed below delivers
+                // the result to the OpCtx::send_and_await callback.
                 if matches!(op, subscribe::SubscribeMsg::Response { .. })
                     && try_forward_task_per_tx_reply(
                         pending_op_result.as_ref(),
@@ -1175,6 +1175,50 @@ where
                     source_addr,
                 )
                 .await;
+
+                // Forward result to OpCtx::send_and_await callback when
+                // the operation completes. This path fires when the
+                // originator processes its own Request locally via
+                // handle_op_execution (pending_op_result is Some) and
+                // the subscribe completes without needing the network
+                // (e.g., contract available locally). Without this,
+                // the response_sender in pending_op_results is dropped
+                // without a reply, causing send_and_await to fail.
+                //
+                // We synthesize a Response (not forward the original
+                // Request) because classify_reply in op_ctx_task expects
+                // a SubscribeMsg::Response variant.
+                if let Some(ref callback) = pending_op_result {
+                    if is_operation_completed(&op_result) {
+                        let instance_id = match op {
+                            subscribe::SubscribeMsg::Request { instance_id, .. }
+                            | subscribe::SubscribeMsg::Response { instance_id, .. }
+                            | subscribe::SubscribeMsg::Unsubscribe { instance_id, .. }
+                            | subscribe::SubscribeMsg::ForwardingAck { instance_id, .. } => {
+                                *instance_id
+                            }
+                        };
+                        let result = match &op_result {
+                            Ok(Some(OpEnum::Subscribe(sub_op))) => match sub_op.completed_key() {
+                                Some(key) => subscribe::SubscribeMsgResult::Subscribed { key },
+                                None => subscribe::SubscribeMsgResult::NotFound,
+                            },
+                            _ => subscribe::SubscribeMsgResult::NotFound,
+                        };
+                        let reply = NetMessage::from(subscribe::SubscribeMsg::Response {
+                            id: *op.id(),
+                            instance_id,
+                            result,
+                        });
+                        if let Err(err) = callback.try_send(reply) {
+                            tracing::debug!(
+                                %err,
+                                "subscribe local-completion: callback send failed \
+                                 (task may have timed out)"
+                            );
+                        }
+                    }
+                }
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {

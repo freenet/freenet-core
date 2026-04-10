@@ -224,6 +224,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
     pub async fn new_mock_wasm(
         _identifier: &str,
         shared_storage: MockStateStorage,
+        contract_store: Option<InMemoryContractStore>,
         op_sender: Option<OpRequestSender>,
         op_manager: Option<std::sync::Arc<crate::node::OpManager>>,
     ) -> anyhow::Result<Self> {
@@ -231,7 +232,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             crate::wasm_runtime::StateStore::new(shared_storage.clone(), 10_000_000).unwrap();
 
         let runtime = MockWasmRuntime {
-            contract_store: InMemoryContractStore::new(),
+            contract_store: contract_store.unwrap_or_default(),
             validate_overrides: HashMap::new(),
         };
 

@@ -332,6 +332,7 @@ impl<ER> Builder<ER> {
         user_events: UsrEv,
         parent_span: tracing::Span,
         shared_storage: MockStateStorage,
+        contract_store: Option<crate::wasm_runtime::InMemoryContractStore>,
     ) -> anyhow::Result<()>
     where
         UsrEv: ClientEventsProxy + Send + 'static,
@@ -385,6 +386,7 @@ impl<ER> Builder<ER> {
             MockWasmHandlerBuilder {
                 identifier: self.contract_handler_name,
                 shared_storage,
+                contract_store,
             },
         )
         .await

@@ -682,6 +682,16 @@ impl SubscribeOp {
         }
     }
 
+    /// Extract the contract key from a completed subscribe operation.
+    pub(crate) fn completed_key(&self) -> Option<ContractKey> {
+        match &self.state {
+            SubscribeState::Completed(data) => Some(data.key),
+            SubscribeState::PrepareRequest(_)
+            | SubscribeState::AwaitingResponse(_)
+            | SubscribeState::Failed => None,
+        }
+    }
+
     /// Whether this is a subscription renewal (node-internal, no client waiting).
     pub(crate) fn is_renewal(&self) -> bool {
         self.is_renewal
