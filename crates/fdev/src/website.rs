@@ -18,6 +18,13 @@ use crate::commands::{RESPONSE_TIMEOUT, close_api_client, execute_command, start
 use crate::config::BaseConfig;
 
 /// Pre-compiled website container contract WASM, embedded at build time.
+///
+/// This binary is committed at `crates/fdev/resources/website_contract.wasm` and is NOT
+/// recompiled when building fdev. If the contract source (`crates/website-contract/src/lib.rs`)
+/// changes, the WASM must be manually rebuilt and the updated binary committed. See
+/// `crates/website-contract/README.md` for the rebuild procedure.
+///
+/// Changing this binary changes all contract keys produced by `fdev website init`.
 const WEBSITE_CONTRACT_WASM: &[u8] = include_bytes!("../resources/website_contract.wasm");
 
 /// Metadata for a website container state, serialized as CBOR.
