@@ -1057,11 +1057,12 @@ create_github_release() {
     echo "✓"
 
     echo -n "  Creating GitHub release... "
-    release_url=$(gh release create "v$VERSION" --title "v$VERSION" --notes "$release_notes")
-    echo "✓"
+    release_url=$(gh release create "v$VERSION" --title "v$VERSION" --notes "$release_notes" --draft)
+    echo "✓ (draft)"
     mark_completed "RELEASE_CREATED"
 
-    echo "  Release created: $release_url"
+    echo "  Draft release created: $release_url"
+    echo "  Release will be published after cross-compile binaries are attached."
 }
 
 # Note: Cross-compilation is now triggered automatically when a version tag is pushed
@@ -1130,6 +1131,39 @@ trigger_gateway_updates() {
     fi
 }
 
+publish_draft_release() {
+    # Publish the draft release (idempotent -- no-op if already published)
+    local is_draft
+    is_draft=$(gh release view "v$VERSION" --repo freenet/freenet-core --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
+    if [[ "$is_draft" == "true" ]]; then
+        echo -n "  Publishing draft release... "
+        gh release edit "v$VERSION" --repo freenet/freenet-core --draft=false
+        echo "✓"
+    fi
+}
+
+verify_required_binaries() {
+    local required=("$@")
+    local assets
+    assets=$(gh release view "v$VERSION" --repo freenet/freenet-core --json assets --jq '.assets[].name' 2>/dev/null)
+    if [[ -z "$assets" ]]; then
+        return 1
+    fi
+    local missing=()
+    for bin in "${required[@]}"; do
+        if ! echo "$assets" | grep -qF "$bin"; then
+            missing+=("$bin")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        for m in "${missing[@]}"; do
+            echo "  ✗ Missing: $m"
+        done
+        return 1
+    fi
+    return 0
+}
+
 wait_for_binaries() {
     echo "Waiting for cross-compile workflow to complete:"
 
@@ -1138,11 +1172,19 @@ wait_for_binaries() {
         return 0
     fi
 
-    # Check if binaries are already available
-    local asset_count
-    asset_count=$(gh release view "v$VERSION" --repo freenet/freenet-core --json assets --jq '.assets | length' 2>/dev/null || echo "0")
-    if [[ "$asset_count" -ge 8 ]]; then
-        echo "  ✓ Binaries already available ($asset_count assets)"
+    # Required platform binaries that must be present in the release
+    local REQUIRED_BINARIES=(
+        "freenet-x86_64-unknown-linux-musl.tar.gz"
+        "freenet-aarch64-unknown-linux-musl.tar.gz"
+        "freenet-aarch64-apple-darwin.tar.gz"
+        "freenet-x86_64-apple-darwin.tar.gz"
+        "freenet-x86_64-pc-windows-msvc.zip"
+    )
+
+    # Check if all required binaries are already available
+    if verify_required_binaries "${REQUIRED_BINARIES[@]}"; then
+        echo "  ✓ All required platform binaries already available"
+        publish_draft_release
         return 0
     fi
 
@@ -1187,11 +1229,17 @@ wait_for_binaries() {
             if [[ "$conclusion" == "success" ]]; then
                 echo "  ✓ Cross-compile workflow completed successfully"
 
-                # Verify assets are uploaded
+                # Verify all required platform binaries are uploaded
                 sleep 5  # Brief delay for asset upload
-                asset_count=$(gh release view "v$VERSION" --repo freenet/freenet-core --json assets --jq '.assets | length' 2>/dev/null || echo "0")
-                echo "  ✓ Release has $asset_count assets attached"
-                return 0
+                if verify_required_binaries "${REQUIRED_BINARIES[@]}"; then
+                    echo "  ✓ All required platform binaries attached"
+                    publish_draft_release
+                    return 0
+                else
+                    echo "  ✗ Cross-compile succeeded but some required binaries are missing"
+                    echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
+                    return 1
+                fi
             else
                 echo "  ✗ Cross-compile workflow failed (conclusion: $conclusion)"
                 echo "     Binaries will NOT be available for auto-update."
