@@ -364,12 +364,17 @@ fn shell_page(
 /// This is called when the iframe requests `?__sandbox=1`. It reads the cached
 /// contract HTML, rewrites asset paths, and injects the WebSocket shim that
 /// routes connections through the shell page's postMessage bridge.
+///
+/// The `sub_path` parameter allows serving pages other than `index.html` for
+/// multi-page websites. When `None`, defaults to `index.html`.
 #[instrument(level = "debug")]
 pub(super) async fn serve_sandbox_content(
     key: String,
     api_version: ApiVersion,
+    sub_path: Option<&str>,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
-    debug!("serve_sandbox_content: serving iframe content for key: {key}");
+    let page = sub_path.unwrap_or("index.html");
+    debug!("serve_sandbox_content: serving iframe content for key: {key}, page: {page}");
     let instance_id =
         ContractInstanceId::from_bytes(&key).map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
@@ -380,21 +385,63 @@ pub(super) async fn serve_sandbox_content(
             error_cause: format!("Contract not cached yet: {key}"),
         });
     }
-    sandbox_content_body(&path, &key, api_version).await
+    sandbox_content_body(&path, &key, api_version, page).await
 }
 
-/// Reads the contract's index.html, rewrites paths, and injects the WebSocket shim.
+/// Reads a contract HTML page, rewrites paths, and injects the WebSocket shim
+/// and navigation interceptor.
 async fn sandbox_content_body(
     path: &Path,
     contract_key: &str,
     api_version: ApiVersion,
+    page: &str,
 ) -> Result<impl IntoResponse + use<>, WebSocketApiError> {
-    let web_path = path.join("index.html");
-    let mut key_file = File::open(&web_path)
-        .await
+    // Sanitize the page path to prevent directory traversal and absolute paths.
+    // Path::join with an absolute path replaces the base entirely on Unix,
+    // so we must reject absolute paths, parent directory components, and root
+    // directory components before joining.
+    let normalized = Path::new(page);
+    for component in normalized.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        ) {
+            return Err(WebSocketApiError::InvalidParam {
+                error_cause: "Path traversal not allowed".to_string(),
+            });
+        }
+    }
+
+    let mut web_path = path.join(page);
+    // For directory-style paths, look for index.html inside the directory
+    if web_path.is_dir() {
+        web_path = web_path.join("index.html");
+    }
+    // Ensure the resolved path is still under the contract's cache directory
+    let canonical_base = path
+        .canonicalize()
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
+    let canonical_file = web_path
+        .canonicalize()
+        .map_err(|err| WebSocketApiError::NodeError {
+            error_cause: format!("Page not found: {page} ({err})"),
+        })?;
+    if !canonical_file.starts_with(&canonical_base) {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "Path traversal not allowed".to_string(),
+        });
+    }
+
+    // Open the canonical path (not the user-supplied path) to prevent TOCTOU
+    // attacks where a symlink could be swapped between canonicalize and open.
+    let mut key_file =
+        File::open(&canonical_file)
+            .await
+            .map_err(|err| WebSocketApiError::NodeError {
+                error_cause: format!("{err}"),
+            })?;
     let mut buf = vec![];
     key_file
         .read_to_end(&mut buf)
@@ -414,16 +461,18 @@ async fn sandbox_content_body(
     body = body.replace("\"/./", &format!("\"{prefix}"));
     body = body.replace("'/./", &format!("'{prefix}"));
 
-    // Inject the WebSocket shim before any other scripts. The shim overrides
-    // window.WebSocket so that wasm-bindgen (which calls `new WebSocket(url)` from
-    // global scope at call time) routes connections through the shell page's bridge.
-    let shim_script = format!("<script>{WEBSOCKET_SHIM_JS}</script>");
+    // Inject the WebSocket shim and navigation interceptor before any other scripts.
+    // The shim overrides window.WebSocket so that wasm-bindgen routes connections
+    // through the shell page's bridge. The interceptor catches <a> clicks and
+    // routes them through postMessage for multi-page navigation.
+    let injected_scripts =
+        format!("<script>{WEBSOCKET_SHIM_JS}</script><script>{NAVIGATION_INTERCEPTOR_JS}</script>");
     if let Some(pos) = body.find("</head>") {
-        body.insert_str(pos, &shim_script);
+        body.insert_str(pos, &injected_scripts);
     } else if let Some(pos) = body.find("<body") {
-        body.insert_str(pos, &shim_script);
+        body.insert_str(pos, &injected_scripts);
     } else {
-        body = format!("{shim_script}{body}");
+        body = format!("{injected_scripts}{body}");
     }
 
     Ok(Html(body))
@@ -498,6 +547,33 @@ function freenetBridge(authToken) {
           lastClipboard = now;
           try { navigator.clipboard.writeText(msg.text.slice(0, 2048)); } catch(e) {}
         }
+      } else if (msg.type === 'navigate' && typeof msg.href === 'string') {
+        // In-contract page navigation for multi-page websites. The sandboxed
+        // iframe cannot navigate itself (no allow-top-navigation), so it sends
+        // navigation requests to the shell which updates iframe.src.
+        // Security: only allows paths under the current contract's web prefix
+        // to prevent cross-contract navigation or path traversal.
+        try {
+          var resolved = new URL(msg.href, iframe.src);
+          // Only allow same-origin navigation (no cross-site)
+          if (resolved.origin !== location.origin) return;
+          var cleanPath = resolved.pathname;
+          // Extract the contract web prefix from the iframe's data-src
+          var dataSrc = iframe.getAttribute('data-src');
+          var baseParts = dataSrc.match(/^(\/v[12]\/contract\/web\/[^/]+\/)/);
+          if (!baseParts) return;
+          var contractPrefix = baseParts[1];
+          // Ensure navigation stays within the same contract
+          if (cleanPath.indexOf(contractPrefix) !== 0) return;
+          // Close any open WebSocket connections from the previous page to
+          // prevent resource leaks. The old iframe document will be destroyed
+          // when src changes, orphaning any connection callbacks.
+          connections.forEach(function(ws) { try { ws.close(); } catch(e) {} });
+          connections.clear();
+          // Build new sandbox URL preserving __sandbox=1
+          resolved.searchParams.set('__sandbox', '1');
+          iframe.src = resolved.pathname + resolved.search;
+        } catch(e) {}
       } else if (msg.type === 'open_url' && typeof msg.url === 'string') {
         // Open external URLs in a new tab. Popups from the sandboxed iframe
         // inherit the opaque origin, breaking CORS on target sites. The shell
@@ -727,6 +803,49 @@ const WEBSOCKET_SHIM_JS: &str = r#"
 })();
 "#;
 
+/// JavaScript navigation interceptor injected into sandboxed iframe HTML pages.
+///
+/// Intercepts clicks on `<a>` elements and sends a postMessage to the shell
+/// page, which updates the iframe's `src` to navigate within the contract.
+/// This enables multi-page website navigation without weakening the sandbox
+/// (no `allow-top-navigation` needed). Only intercepts same-origin relative
+/// links; external links are left to the existing `open_url` bridge.
+const NAVIGATION_INTERCEPTOR_JS: &str = r#"
+(function() {
+  'use strict';
+  document.addEventListener('click', function(e) {
+    var target = e.target;
+    // Walk up to find the nearest <a> element (handles clicks on child elements)
+    while (target && target.tagName !== 'A') target = target.parentElement;
+    if (!target || !target.href) return;
+    // Skip links with explicit targets (e.g. target="_blank")
+    if (target.target && target.target !== '_self') return;
+    // Skip javascript: and mailto: links
+    var protocol = target.protocol;
+    if (protocol && protocol !== 'http:' && protocol !== 'https:') return;
+    // Skip links with download attribute
+    if (target.hasAttribute('download')) return;
+    // Skip links explicitly marked to bypass interception
+    if (target.dataset && target.dataset.freenetNoIntercept) return;
+    // For cross-origin links, use the open_url bridge instead
+    try {
+      if (target.origin !== location.origin) {
+        e.preventDefault();
+        window.parent.postMessage({
+          __freenet_shell__: true, type: 'open_url', url: target.href
+        }, '*');
+        return;
+      }
+    } catch(err) {}
+    // Same-origin in-contract link: request navigation via shell
+    e.preventDefault();
+    window.parent.postMessage({
+      __freenet_shell__: true, type: 'navigate', href: target.href
+    }, '*');
+  }, true);
+})();
+"#;
+
 /// Extracts the relative file path from a contract web URI.
 ///
 /// Strips the version and contract key prefix (e.g. `/v1/contract/web/{key}/`)
@@ -813,7 +932,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let result = response_body(
-            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
                 .await
                 .unwrap(),
         )
@@ -852,7 +971,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let result = response_body(
-            sandbox_content_body(dir.path(), key, ApiVersion::V2)
+            sandbox_content_body(dir.path(), key, ApiVersion::V2, "index.html")
                 .await
                 .unwrap(),
         )
@@ -877,7 +996,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let result = response_body(
-            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
                 .await
                 .unwrap(),
         )
@@ -900,7 +1019,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let result = response_body(
-            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
                 .await
                 .unwrap(),
         )
@@ -1027,14 +1146,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_content_injects_ws_shim_not_auth_token() {
+    async fn sandbox_content_injects_shims_not_auth_token() {
         let dir = tempfile::tempdir().unwrap();
         let key = "testkey123";
         let html = r#"<!DOCTYPE html><html><head></head><body>Hello</body></html>"#;
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let result = response_body(
-            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
                 .await
                 .unwrap(),
         )
@@ -1048,6 +1167,11 @@ mod tests {
         assert!(
             result.contains("window.WebSocket = FreenetWebSocket"),
             "WebSocket override not set"
+        );
+        // Navigation interceptor must be injected alongside WebSocket shim
+        assert!(
+            result.contains("type: 'navigate'"),
+            "navigation interceptor not injected"
         );
         // Auth token must NOT appear in sandbox content
         assert!(
@@ -1065,7 +1189,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let result = response_body(
-            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
                 .await
                 .unwrap(),
         )
@@ -1093,7 +1217,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), html).unwrap();
 
         let result = response_body(
-            sandbox_content_body(dir.path(), key, ApiVersion::V1)
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
                 .await
                 .unwrap(),
         )
@@ -1313,5 +1437,189 @@ mod tests {
         let uri: axum::http::Uri = req_path.parse().unwrap();
         let result = get_file_path(uri);
         assert!(result.is_err(), "expected error for /v3/ prefix");
+    }
+
+    #[test]
+    fn bridge_js_contains_navigate_handler() {
+        // The shell bridge must handle 'navigate' messages for multi-page
+        // website navigation within the sandboxed iframe (issue #3833).
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.type === 'navigate'"),
+            "bridge JS must handle navigate shell messages"
+        );
+        // Navigate handler must validate the path stays within the contract prefix
+        assert!(
+            SHELL_BRIDGE_JS.contains("contractPrefix"),
+            "navigate handler must extract and check the contract prefix"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("cleanPath.indexOf(contractPrefix) !== 0"),
+            "navigate handler must reject paths outside the contract prefix"
+        );
+        // Navigate handler must add __sandbox=1 to the new URL
+        assert!(
+            SHELL_BRIDGE_JS.contains("resolved.searchParams.set('__sandbox', '1')"),
+            "navigate handler must add __sandbox=1 to navigated URL"
+        );
+        // Navigate handler must validate same-origin
+        assert!(
+            SHELL_BRIDGE_JS.contains("resolved.origin !== location.origin"),
+            "navigate handler must reject cross-origin navigation"
+        );
+    }
+
+    #[test]
+    fn navigation_interceptor_js_intercepts_clicks() {
+        // The navigation interceptor must catch <a> clicks and route them
+        // through postMessage for multi-page navigation (issue #3833).
+        assert!(
+            NAVIGATION_INTERCEPTOR_JS.contains("document.addEventListener('click'"),
+            "interceptor must listen for click events"
+        );
+        assert!(
+            NAVIGATION_INTERCEPTOR_JS.contains("type: 'navigate'"),
+            "interceptor must send navigate messages to shell"
+        );
+        assert!(
+            NAVIGATION_INTERCEPTOR_JS.contains("__freenet_shell__: true"),
+            "interceptor must use __freenet_shell__ namespace"
+        );
+        assert!(
+            NAVIGATION_INTERCEPTOR_JS.contains("e.preventDefault()"),
+            "interceptor must prevent default link behavior"
+        );
+        // Cross-origin links should use open_url instead of navigate
+        assert!(
+            NAVIGATION_INTERCEPTOR_JS.contains("type: 'open_url'"),
+            "interceptor must route cross-origin links through open_url"
+        );
+        // Skip links with target="_blank" etc.
+        assert!(
+            NAVIGATION_INTERCEPTOR_JS.contains("target.target"),
+            "interceptor must respect target attribute on links"
+        );
+        // Must walk up DOM to handle clicks on child elements of <a>
+        assert!(
+            NAVIGATION_INTERCEPTOR_JS.contains("target.parentElement"),
+            "interceptor must walk up DOM to find <a> ancestor"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_content_serves_sub_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        // Create a sub-page
+        let sub_html = r#"<!DOCTYPE html><html><head></head><body><h1>News</h1></body></html>"#;
+        std::fs::write(dir.path().join("news.html"), sub_html).unwrap();
+
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "news.html")
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        // Sub-page content must be served
+        assert!(
+            result.contains("<h1>News</h1>"),
+            "sub-page content not served"
+        );
+        // WebSocket shim must be injected
+        assert!(
+            result.contains("FreenetWebSocket"),
+            "WebSocket shim not injected in sub-page"
+        );
+        // Navigation interceptor must be injected
+        assert!(
+            result.contains("type: 'navigate'"),
+            "navigation interceptor not injected in sub-page"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_content_serves_directory_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        // Create a subdirectory with index.html
+        std::fs::create_dir(dir.path().join("news")).unwrap();
+        let sub_html =
+            r#"<!DOCTYPE html><html><head></head><body><h1>News Index</h1></body></html>"#;
+        std::fs::write(dir.path().join("news/index.html"), sub_html).unwrap();
+
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "news")
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(
+            result.contains("<h1>News Index</h1>"),
+            "directory index.html not served"
+        );
+        assert!(
+            result.contains("FreenetWebSocket"),
+            "WebSocket shim not injected in directory index"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_content_rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        std::fs::write(dir.path().join("index.html"), "<html></html>").unwrap();
+
+        // Attempting to traverse above the contract directory must fail
+        let result =
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "../../../etc/passwd").await;
+        assert!(result.is_err(), "path traversal should be rejected");
+    }
+
+    #[tokio::test]
+    async fn sandbox_content_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        std::fs::write(dir.path().join("index.html"), "<html></html>").unwrap();
+
+        // Absolute paths would make Path::join replace the base directory entirely,
+        // so they must be rejected by the component check.
+        let result = sandbox_content_body(dir.path(), key, ApiVersion::V1, "/etc/passwd").await;
+        assert!(result.is_err(), "absolute path should be rejected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_content_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.html"), "<html>secret</html>").unwrap();
+
+        // Create a symlink inside the contract directory pointing outside it.
+        // The canonicalize + starts_with check must catch this even though the
+        // component-level ParentDir check would not.
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.html"),
+            dir.path().join("escape.html"),
+        )
+        .unwrap();
+
+        let result = sandbox_content_body(dir.path(), key, ApiVersion::V1, "escape.html").await;
+        assert!(result.is_err(), "symlink escape should be rejected");
+    }
+
+    #[test]
+    fn bridge_js_cleans_up_websockets_on_navigate() {
+        // When navigating to a new page, existing WebSocket connections must be
+        // closed to prevent resource leaks from orphaned connections.
+        assert!(
+            SHELL_BRIDGE_JS.contains("connections.forEach"),
+            "navigate handler must close existing WebSocket connections"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("connections.clear()"),
+            "navigate handler must clear the connections map"
+        );
     }
 }
