@@ -1153,7 +1153,7 @@ verify_required_binaries() {
     fi
     local missing=()
     for bin in "${required[@]}"; do
-        if ! echo "$assets" | grep -qF "$bin"; then
+        if ! echo "$assets" | grep -xqF "$bin"; then
             missing+=("$bin")
         fi
     done
@@ -1174,13 +1174,19 @@ wait_for_binaries() {
         return 0
     fi
 
-    # Required platform binaries that must be present in the release
+    # Required platform binaries that must be present in the release.
+    # Both freenet and fdev must be present for all platforms.
     local REQUIRED_BINARIES=(
         "freenet-x86_64-unknown-linux-musl.tar.gz"
         "freenet-aarch64-unknown-linux-musl.tar.gz"
         "freenet-aarch64-apple-darwin.tar.gz"
         "freenet-x86_64-apple-darwin.tar.gz"
         "freenet-x86_64-pc-windows-msvc.zip"
+        "fdev-x86_64-unknown-linux-musl.tar.gz"
+        "fdev-aarch64-unknown-linux-musl.tar.gz"
+        "fdev-aarch64-apple-darwin.tar.gz"
+        "fdev-x86_64-apple-darwin.tar.gz"
+        "fdev-x86_64-pc-windows-msvc.zip"
     )
 
     # Check if all required binaries are already available
