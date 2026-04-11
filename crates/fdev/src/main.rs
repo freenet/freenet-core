@@ -15,6 +15,7 @@ mod testing;
 mod util;
 mod verify_state;
 mod wasm_runtime;
+mod website;
 
 use crate::{
     build::build_package,
@@ -100,6 +101,19 @@ fn main() -> anyhow::Result<()> {
             SubCommand::VerifyState(verify_config) => {
                 verify_state::verify_state(verify_config).await
             }
+            SubCommand::Website { command } => match command {
+                website::WebsiteCommand::Init { output } => website::init(output),
+                website::WebsiteCommand::Publish {
+                    directory,
+                    key_file,
+                    contract_wasm,
+                } => website::publish(directory, key_file, contract_wasm, config.additional).await,
+                website::WebsiteCommand::Update {
+                    directory,
+                    key_file,
+                    contract_wasm,
+                } => website::update(directory, key_file, contract_wasm, config.additional).await,
+            },
         };
         // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow
         r.map_err(|e| anyhow::format_err!(e))
