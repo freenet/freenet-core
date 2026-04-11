@@ -166,20 +166,6 @@ async fn web_home(
         .unwrap_or(false);
 
     if is_sandbox {
-        // Block top-level navigation to sandbox URLs. With allow-popups-to-escape-sandbox
-        // on the iframe, a malicious contract could window.open() its own URL to escape
-        // the sandbox and gain same-origin access to the API. Sec-Fetch-Dest: iframe
-        // is set by the browser automatically and cannot be spoofed by scripts.
-        let fetch_dest = req_headers
-            .get("sec-fetch-dest")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if fetch_dest == "document" {
-            // Top-level navigation to a sandbox URL — redirect to the shell page instead
-            let shell_url = format!("/{}/contract/web/{key}/", api_version.prefix());
-            return Ok(axum::response::Redirect::to(&shell_url).into_response());
-        }
-
         return serve_sandbox_response(key, api_version, None, &req_headers).await;
     }
 
@@ -277,12 +263,27 @@ fn is_html_page(path: &str) -> bool {
 ///
 /// Shared by `web_home` (for the root page) and `web_subpages` (for sub-pages).
 /// No auth token or cookie -- the shell page handles auth via postMessage.
+///
+/// Includes `Sec-Fetch-Dest` check: if a sandbox URL is loaded as a top-level
+/// document (e.g. pasted in the address bar), redirect to the shell page instead
+/// of serving raw sandbox content outside the iframe.
 async fn serve_sandbox_response(
     key: String,
     api_version: ApiVersion,
     sub_path: Option<&str>,
     req_headers: &axum::http::HeaderMap,
 ) -> Result<axum::response::Response, WebSocketApiError> {
+    // Block top-level navigation to sandbox URLs. Sec-Fetch-Dest: iframe is set
+    // by the browser automatically and cannot be spoofed by scripts.
+    let fetch_dest = req_headers
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if fetch_dest == "document" {
+        let shell_url = format!("/{}/contract/web/{key}/", api_version.prefix());
+        return Ok(axum::response::Redirect::to(&shell_url).into_response());
+    }
+
     let contract_response =
         path_handlers::serve_sandbox_content(key, api_version, sub_path).await?;
     let mut response = contract_response.into_response();

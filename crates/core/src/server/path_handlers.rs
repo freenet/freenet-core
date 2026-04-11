@@ -396,10 +396,16 @@ async fn sandbox_content_body(
     api_version: ApiVersion,
     page: &str,
 ) -> Result<impl IntoResponse + use<>, WebSocketApiError> {
-    // Sanitize the page path to prevent directory traversal
+    // Sanitize the page path to prevent directory traversal and absolute paths.
+    // Path::join with an absolute path replaces the base entirely on Unix,
+    // so we must reject absolute paths, parent directory components, and root
+    // directory components before joining.
     let normalized = Path::new(page);
     for component in normalized.components() {
-        if matches!(component, std::path::Component::ParentDir) {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        ) {
             return Err(WebSocketApiError::InvalidParam {
                 error_cause: "Path traversal not allowed".to_string(),
             });
@@ -428,11 +434,14 @@ async fn sandbox_content_body(
         });
     }
 
-    let mut key_file = File::open(&web_path)
-        .await
-        .map_err(|err| WebSocketApiError::NodeError {
-            error_cause: format!("{err}"),
-        })?;
+    // Open the canonical path (not the user-supplied path) to prevent TOCTOU
+    // attacks where a symlink could be swapped between canonicalize and open.
+    let mut key_file =
+        File::open(&canonical_file)
+            .await
+            .map_err(|err| WebSocketApiError::NodeError {
+                error_cause: format!("{err}"),
+            })?;
     let mut buf = vec![];
     key_file
         .read_to_end(&mut buf)
@@ -556,6 +565,11 @@ function freenetBridge(authToken) {
           var contractPrefix = baseParts[1];
           // Ensure navigation stays within the same contract
           if (cleanPath.indexOf(contractPrefix) !== 0) return;
+          // Close any open WebSocket connections from the previous page to
+          // prevent resource leaks. The old iframe document will be destroyed
+          // when src changes, orphaning any connection callbacks.
+          connections.forEach(function(ws) { try { ws.close(); } catch(e) {} });
+          connections.clear();
           // Build new sandbox URL preserving __sandbox=1
           resolved.searchParams.set('__sandbox', '1');
           iframe.src = resolved.pathname + resolved.search;
@@ -1560,5 +1574,52 @@ mod tests {
         let result =
             sandbox_content_body(dir.path(), key, ApiVersion::V1, "../../../etc/passwd").await;
         assert!(result.is_err(), "path traversal should be rejected");
+    }
+
+    #[tokio::test]
+    async fn sandbox_content_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        std::fs::write(dir.path().join("index.html"), "<html></html>").unwrap();
+
+        // Absolute paths would make Path::join replace the base directory entirely,
+        // so they must be rejected by the component check.
+        let result = sandbox_content_body(dir.path(), key, ApiVersion::V1, "/etc/passwd").await;
+        assert!(result.is_err(), "absolute path should be rejected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_content_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.html"), "<html>secret</html>").unwrap();
+
+        // Create a symlink inside the contract directory pointing outside it.
+        // The canonicalize + starts_with check must catch this even though the
+        // component-level ParentDir check would not.
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.html"),
+            dir.path().join("escape.html"),
+        )
+        .unwrap();
+
+        let result = sandbox_content_body(dir.path(), key, ApiVersion::V1, "escape.html").await;
+        assert!(result.is_err(), "symlink escape should be rejected");
+    }
+
+    #[test]
+    fn bridge_js_cleans_up_websockets_on_navigate() {
+        // When navigating to a new page, existing WebSocket connections must be
+        // closed to prevent resource leaks from orphaned connections.
+        assert!(
+            SHELL_BRIDGE_JS.contains("connections.forEach"),
+            "navigate handler must close existing WebSocket connections"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("connections.clear()"),
+            "navigate handler must clear the connections map"
+        );
     }
 }
