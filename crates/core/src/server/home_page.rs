@@ -1583,20 +1583,36 @@ fn peer_detail_html(address_str: &str) -> String {
     // Build prediction summary card
     let prediction_card = if let Some(ref pr) = peer_routing {
         if let Some(ref pred) = pr.prediction_at_own_location {
+            // Sentinel values (f64::MAX / 2.0) indicate insufficient data
+            let reasonable_limit = 1.0e9;
+            let fmt_time = |v: f64| -> String {
+                if v.is_finite() && v < reasonable_limit {
+                    format!("{v:.3}s")
+                } else {
+                    "N/A".to_string()
+                }
+            };
+            let fmt_speed = |v: f64| -> String {
+                if v.is_finite() && v > 0.0 {
+                    format!("{v:.0} B/s")
+                } else {
+                    "N/A".to_string()
+                }
+            };
             format!(
                 r#"<div class="card">
                     <h2>Prediction at Peer Location</h2>
                     <div class="info-grid">
                         <div class="info-label">Failure probability</div><div class="info-value">{fp:.4}</div>
-                        <div class="info-label">Response time</div><div class="info-value">{rt:.3}s</div>
-                        <div class="info-label">Expected total time</div><div class="info-value">{ett:.3}s</div>
-                        <div class="info-label">Transfer speed</div><div class="info-value">{ts:.0} B/s</div>
+                        <div class="info-label">Response time</div><div class="info-value">{rt}</div>
+                        <div class="info-label">Expected total time</div><div class="info-value">{ett}</div>
+                        <div class="info-label">Transfer speed</div><div class="info-value">{ts}</div>
                     </div>
                 </div>"#,
                 fp = pred.failure_probability,
-                rt = pred.time_to_response_start,
-                ett = pred.expected_total_time,
-                ts = pred.transfer_speed_bps,
+                rt = fmt_time(pred.time_to_response_start),
+                ett = fmt_time(pred.expected_total_time),
+                ts = fmt_speed(pred.transfer_speed_bps),
             )
         } else {
             r#"<div class="card"><h2>Prediction</h2><p class="empty">Insufficient data for prediction at this peer's location</p></div>"#.to_string()
@@ -1938,31 +1954,51 @@ fn build_estimator_chart(
 fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
     use std::fmt::Write;
 
+    let successes: Vec<f64> = pairs
+        .iter()
+        .filter(|(_, a)| *a < 0.5)
+        .map(|(p, _)| p.clamp(0.0, 1.0))
+        .collect();
+    let failures: Vec<f64> = pairs
+        .iter()
+        .filter(|(_, a)| *a >= 0.5)
+        .map(|(p, _)| p.clamp(0.0, 1.0))
+        .collect();
+
     let w = 400.0_f64;
-    let h = 160.0_f64;
+    let h = 200.0_f64;
     let pad_l = 50.0;
     let pad_r = 20.0;
     let pad_t = 30.0;
     let pad_b = 30.0;
     let plot_w = w - pad_l - pad_r;
     let plot_h = h - pad_t - pad_b;
+    let mid_y = pad_t + plot_h / 2.0; // dividing line between failure (top) and success (bottom)
+    let half_h = plot_h / 2.0;
 
-    let to_x = |predicted: f64| -> f64 { pad_l + predicted.clamp(0.0, 1.0) * plot_w };
-    let to_y = |actual: f64| -> f64 {
-        if actual > 0.5 {
-            pad_t + 10.0 // failure near top
-        } else {
-            pad_t + plot_h - 10.0 // success near bottom
-        }
+    // Use dots for very small datasets, bars for larger ones
+    let use_dots = pairs.len() < 15;
+
+    // Adaptive bin count: fewer bins when less data
+    let n_bins = if pairs.len() < 30 {
+        5
+    } else if pairs.len() < 100 {
+        8
+    } else {
+        10
     };
+    let bin_width = 1.0 / n_bins as f64;
+
+    let to_x = |v: f64| -> f64 { pad_l + v.clamp(0.0, 1.0) * plot_w };
 
     let mut svg = format!(
         r#"<div class="card">
         <h2>Renegade Prediction Accuracy</h2>
         <p style="font-size:0.8em;color:var(--text-muted);">
-            Each dot is a routing event. X = predicted failure probability.
-            Top row = actual failures, bottom = actual successes.
-            Well-calibrated: failures cluster right, successes cluster left.
+            Distribution of predicted failure probability, split by outcome.
+            <span style="color:var(--accent-danger, #f85149);">Failures</span> above,
+            <span style="color:var(--accent-success, #3fb950);">successes</span> below.
+            Well-calibrated: failures skew right, successes skew left.
         </p>
         <svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="chart-svg">"#,
         w = w as u32,
@@ -1980,17 +2016,17 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
     )
     .ok();
 
-    // Axes
+    // Center dividing line
     write!(
         svg,
-        r#"<line x1="{lx}" y1="{by}" x2="{rx}" y2="{by}" stroke="var(--text-muted)" stroke-width="1"/>"#,
+        r#"<line x1="{lx}" y1="{my}" x2="{rx}" y2="{my}" stroke="var(--text-muted)" stroke-width="1"/>"#,
         lx = pad_l,
-        by = pad_t + plot_h,
+        my = mid_y,
         rx = pad_l + plot_w,
     )
     .ok();
 
-    // X-axis labels
+    // X-axis labels and grid
     for &v in &[0.0, 0.25, 0.5, 0.75, 1.0] {
         let x = to_x(v);
         write!(
@@ -2001,7 +2037,6 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
             v = v,
         )
         .ok();
-        // Grid line
         write!(
             svg,
             r#"<line x1="{x}" y1="{ty}" x2="{x}" y2="{by}" stroke="var(--text-muted)" stroke-width="0.3" stroke-dasharray="3"/>"#,
@@ -2015,14 +2050,14 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
     // Y-axis labels
     write!(
         svg,
-        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--text-muted)">Failure</text>"#,
+        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--accent-danger, #f85149)">Fail</text>"#,
         x = pad_l - 4.0,
         y = pad_t + 14.0,
     )
     .ok();
     write!(
         svg,
-        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--text-muted)">Success</text>"#,
+        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--accent-success, #3fb950)">OK</text>"#,
         x = pad_l - 4.0,
         y = pad_t + plot_h - 6.0,
     )
@@ -2037,45 +2072,148 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
     )
     .ok();
 
-    // Plot points with jitter to avoid overlap
-    let mut jitter_seed = 0u32;
-    for &(predicted, actual) in pairs {
-        // Simple deterministic jitter
-        jitter_seed = jitter_seed.wrapping_mul(1103515245).wrapping_add(12345);
-        let jitter = ((jitter_seed >> 16) as f64 / 65535.0 - 0.5) * (plot_h * 0.3);
+    if use_dots {
+        // Dot strip mode: stack dots vertically from the center line outward
+        let dot_r = 3.5;
+        let dot_spacing = dot_r * 2.2;
 
-        let x = to_x(predicted);
-        let y = to_y(actual) + jitter;
-        let y = y.clamp(pad_t + 2.0, pad_t + plot_h - 2.0);
+        // Bin dots to stack them
+        let mut fail_bins: Vec<Vec<f64>> = vec![Vec::new(); n_bins];
+        let mut ok_bins: Vec<Vec<f64>> = vec![Vec::new(); n_bins];
 
-        let color = if actual > 0.5 {
-            "var(--accent-danger, #f85149)"
-        } else {
-            "var(--accent-success, #3fb950)"
-        };
+        for &p in &failures {
+            let bin = ((p / bin_width) as usize).min(n_bins - 1);
+            fail_bins[bin].push(p);
+        }
+        for &p in &successes {
+            let bin = ((p / bin_width) as usize).min(n_bins - 1);
+            ok_bins[bin].push(p);
+        }
 
-        write!(
-            svg,
-            r#"<circle cx="{x:.1}" cy="{y:.1}" r="2.5" fill="{color}" opacity="0.6"/>"#,
-            x = x,
-            y = y,
-            color = color,
-        )
-        .ok();
+        // Draw failure dots (grow upward from center)
+        for (bin_idx, dots) in fail_bins.iter().enumerate() {
+            let cx = pad_l + (bin_idx as f64 + 0.5) * bin_width * plot_w;
+            for (i, _) in dots.iter().enumerate() {
+                let cy = mid_y - dot_spacing * (i as f64 + 0.5);
+                if cy < pad_t + dot_r {
+                    break;
+                }
+                write!(
+                    svg,
+                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r}" fill="var(--accent-danger, #f85149)" opacity="0.7"/>"#,
+                    cx = cx,
+                    cy = cy,
+                    r = dot_r,
+                )
+                .ok();
+            }
+        }
+
+        // Draw success dots (grow downward from center)
+        for (bin_idx, dots) in ok_bins.iter().enumerate() {
+            let cx = pad_l + (bin_idx as f64 + 0.5) * bin_width * plot_w;
+            for (i, _) in dots.iter().enumerate() {
+                let cy = mid_y + dot_spacing * (i as f64 + 0.5);
+                if cy > pad_t + plot_h - dot_r {
+                    break;
+                }
+                write!(
+                    svg,
+                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r}" fill="var(--accent-success, #3fb950)" opacity="0.7"/>"#,
+                    cx = cx,
+                    cy = cy,
+                    r = dot_r,
+                )
+                .ok();
+            }
+        }
+    } else {
+        // Histogram bar mode
+        let mut fail_counts = vec![0usize; n_bins];
+        let mut ok_counts = vec![0usize; n_bins];
+
+        for &p in &failures {
+            let bin = ((p / bin_width) as usize).min(n_bins - 1);
+            fail_counts[bin] += 1;
+        }
+        for &p in &successes {
+            let bin = ((p / bin_width) as usize).min(n_bins - 1);
+            ok_counts[bin] += 1;
+        }
+
+        let max_count = fail_counts
+            .iter()
+            .chain(ok_counts.iter())
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1);
+
+        let bar_w = plot_w / n_bins as f64;
+        let bar_pad = bar_w * 0.1;
+
+        for i in 0..n_bins {
+            let x = pad_l + i as f64 * bar_w + bar_pad;
+            let bw = bar_w - 2.0 * bar_pad;
+
+            // Failure bars grow upward from center
+            if fail_counts[i] > 0 {
+                let bar_h = (fail_counts[i] as f64 / max_count as f64) * (half_h - 4.0);
+                let y = mid_y - bar_h;
+                write!(
+                    svg,
+                    r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="var(--accent-danger, #f85149)" opacity="0.7" rx="1"/>"#,
+                    x = x,
+                    y = y,
+                    w = bw,
+                    h = bar_h,
+                )
+                .ok();
+                // Count label on bar
+                write!(
+                    svg,
+                    r#"<text x="{tx:.1}" y="{ty:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{n}</text>"#,
+                    tx = x + bw / 2.0,
+                    ty = y - 2.0,
+                    n = fail_counts[i],
+                )
+                .ok();
+            }
+
+            // Success bars grow downward from center
+            if ok_counts[i] > 0 {
+                let bar_h = (ok_counts[i] as f64 / max_count as f64) * (half_h - 4.0);
+                write!(
+                    svg,
+                    r#"<rect x="{x:.1}" y="{my:.1}" width="{w:.1}" height="{h:.1}" fill="var(--accent-success, #3fb950)" opacity="0.7" rx="1"/>"#,
+                    x = x,
+                    my = mid_y,
+                    w = bw,
+                    h = bar_h,
+                )
+                .ok();
+                // Count label on bar
+                write!(
+                    svg,
+                    r#"<text x="{tx:.1}" y="{ty:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{n}</text>"#,
+                    tx = x + bw / 2.0,
+                    ty = mid_y + bar_h + 10.0,
+                    n = ok_counts[i],
+                )
+                .ok();
+            }
+        }
     }
 
-    // Count stats
-    let n_success = pairs.iter().filter(|(_, a)| *a < 0.5).count();
-    let n_failure = pairs.len() - n_success;
-
+    // Stats summary
     write!(
         svg,
-        r#"<text x="{x}" y="{y}" text-anchor="start" font-size="9" fill="var(--text-muted)">{n} pts ({s} ok, {f} fail)</text>"#,
+        r#"<text x="{x}" y="{y}" text-anchor="start" font-size="9" fill="var(--text-muted)">{n} events ({s} ok, {f} fail)</text>"#,
         x = pad_l + 2.0,
         y = pad_t - 5.0,
         n = pairs.len(),
-        s = n_success,
-        f = n_failure,
+        s = successes.len(),
+        f = failures.len(),
     )
     .ok();
 
