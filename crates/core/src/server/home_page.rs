@@ -1583,31 +1583,6 @@ fn peer_detail_html(address_str: &str) -> String {
     // Build prediction summary card
     let prediction_card = if let Some(ref pr) = peer_routing {
         if let Some(ref pred) = pr.prediction_at_own_location {
-            // Sentinel values (f64::MAX / 2.0 ~ 9e307) indicate insufficient
-            // transfer data. Cap at ~31 years -- anything above is clearly
-            // not a real prediction.
-            let reasonable_limit = 1.0e9;
-            let fmt_time = |v: f64| -> String {
-                if v.is_finite() && (0.0..reasonable_limit).contains(&v) {
-                    format!("{v:.3}s")
-                } else {
-                    "N/A".to_string()
-                }
-            };
-            let fmt_speed = |v: f64| -> String {
-                if v.is_finite() && v > 0.0 {
-                    format!("{v:.0} B/s")
-                } else {
-                    "N/A".to_string()
-                }
-            };
-            let fmt_prob = |v: f64| -> String {
-                if v.is_finite() && (0.0..=1.0).contains(&v) {
-                    format!("{v:.4}")
-                } else {
-                    "N/A".to_string()
-                }
-            };
             format!(
                 r#"<div class="card">
                     <h2>Prediction at Peer Location</h2>
@@ -1618,10 +1593,10 @@ fn peer_detail_html(address_str: &str) -> String {
                         <div class="info-label">Transfer speed</div><div class="info-value">{ts}</div>
                     </div>
                 </div>"#,
-                fp = fmt_prob(pred.failure_probability),
-                rt = fmt_time(pred.time_to_response_start),
-                ett = fmt_time(pred.expected_total_time),
-                ts = fmt_speed(pred.transfer_speed_bps),
+                fp = fmt_prediction_prob(pred.failure_probability),
+                rt = fmt_prediction_time(pred.time_to_response_start),
+                ett = fmt_prediction_time(pred.expected_total_time),
+                ts = fmt_prediction_speed(pred.transfer_speed_bps),
             )
         } else {
             r#"<div class="card"><h2>Prediction</h2><p class="empty">Insufficient data for prediction at this peer's location</p></div>"#.to_string()
@@ -1954,6 +1929,34 @@ fn build_estimator_chart(
 
     svg.push_str("</svg></div>");
     svg
+}
+
+/// Sentinel values (f64::MAX / 2.0 ~ 9e307) indicate insufficient transfer data.
+/// Cap at ~31 years in seconds -- anything above is clearly not a real prediction.
+const REASONABLE_TIME_LIMIT: f64 = 1.0e9;
+
+fn fmt_prediction_time(v: f64) -> String {
+    if v.is_finite() && (0.0..REASONABLE_TIME_LIMIT).contains(&v) {
+        format!("{v:.3}s")
+    } else {
+        "N/A".to_string()
+    }
+}
+
+fn fmt_prediction_speed(v: f64) -> String {
+    if v.is_finite() && v > 0.0 {
+        format!("{v:.0} B/s")
+    } else {
+        "N/A".to_string()
+    }
+}
+
+fn fmt_prediction_prob(v: f64) -> String {
+    if v.is_finite() && (0.0..=1.0).contains(&v) {
+        format!("{v:.4}")
+    } else {
+        "N/A".to_string()
+    }
 }
 
 /// Build an SVG strip chart showing predicted failure probability vs actual outcome.
@@ -2743,5 +2746,37 @@ mod tests {
         let pairs = vec![(1.0, 0.0), (0.0, 1.0)];
         let svg = build_renegade_accuracy_chart(&pairs);
         assert!(svg.contains("2 events"));
+    }
+
+    #[test]
+    fn fmt_prediction_time_sentinel_values() {
+        assert_eq!(fmt_prediction_time(f64::MAX / 2.0), "N/A");
+        assert_eq!(fmt_prediction_time(f64::INFINITY), "N/A");
+        assert_eq!(fmt_prediction_time(f64::NAN), "N/A");
+        assert_eq!(fmt_prediction_time(-1.0), "N/A");
+        assert_eq!(fmt_prediction_time(0.0), "0.000s");
+        assert_eq!(fmt_prediction_time(1.5), "1.500s");
+        assert_eq!(fmt_prediction_time(1.0e9), "N/A"); // at the limit
+        assert_eq!(fmt_prediction_time(999_999_999.0), "999999999.000s");
+    }
+
+    #[test]
+    fn fmt_prediction_speed_sentinel_values() {
+        assert_eq!(fmt_prediction_speed(0.0), "N/A");
+        assert_eq!(fmt_prediction_speed(-5.0), "N/A");
+        assert_eq!(fmt_prediction_speed(f64::NAN), "N/A");
+        assert_eq!(fmt_prediction_speed(f64::INFINITY), "N/A");
+        assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
+    }
+
+    #[test]
+    fn fmt_prediction_prob_sentinel_values() {
+        assert_eq!(fmt_prediction_prob(f64::NAN), "N/A");
+        assert_eq!(fmt_prediction_prob(f64::INFINITY), "N/A");
+        assert_eq!(fmt_prediction_prob(-0.1), "N/A");
+        assert_eq!(fmt_prediction_prob(1.1), "N/A");
+        assert_eq!(fmt_prediction_prob(0.0), "0.0000");
+        assert_eq!(fmt_prediction_prob(1.0), "1.0000");
+        assert_eq!(fmt_prediction_prob(0.5), "0.5000");
     }
 }
