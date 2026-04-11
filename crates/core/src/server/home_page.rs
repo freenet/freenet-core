@@ -709,7 +709,7 @@ fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Strin
             // operation count includes periodic lease renewals (every 2 min per contract)
             // which inflates the number and confuses users.
             let active = snap.contracts.len() as u32;
-            let total_ops = ops.subscribes.0 + ops.subscribes.1;
+            let total_ops = ops.subscribes.0.saturating_add(ops.subscribes.1);
             if total_ops > 0 {
                 format!(
                     r#"<div class="op-cell">
