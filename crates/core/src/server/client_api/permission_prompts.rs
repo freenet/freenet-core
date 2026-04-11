@@ -259,13 +259,23 @@ fn is_trusted_origin(origin: &str) -> bool {
     let Some(host_port) = origin.strip_prefix("http://") else {
         return false;
     };
-    // Extract hostname (before the port)
+    // Handle bracketed IPv6 addresses: [::1]:port or [::1]
+    if host_port.starts_with('[') {
+        let host = if let Some((h, _port)) = host_port.split_once(']') {
+            // h is "[::1" without closing bracket, add it back
+            format!("{h}]")
+        } else {
+            return false;
+        };
+        return host == "[::1]";
+    }
+    // For non-IPv6: extract hostname before the port
     let host = if let Some((h, _port)) = host_port.rsplit_once(':') {
         h
     } else {
         host_port
     };
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+    matches!(host, "127.0.0.1" | "localhost")
 }
 
 /// HTML for when a permission request has expired or already been answered.
@@ -306,4 +316,76 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trusted_origin_localhost_default_port() {
+        assert!(is_trusted_origin("http://localhost:7509"));
+    }
+
+    #[test]
+    fn test_trusted_origin_localhost_custom_port() {
+        assert!(is_trusted_origin("http://localhost:8080"));
+    }
+
+    #[test]
+    fn test_trusted_origin_ipv4_loopback() {
+        assert!(is_trusted_origin("http://127.0.0.1:7509"));
+    }
+
+    #[test]
+    fn test_trusted_origin_ipv6_loopback() {
+        assert!(is_trusted_origin("http://[::1]:7509"));
+    }
+
+    #[test]
+    fn test_trusted_origin_ipv6_no_port() {
+        assert!(is_trusted_origin("http://[::1]"));
+    }
+
+    #[test]
+    fn test_untrusted_origin_external() {
+        assert!(!is_trusted_origin("http://evil.com"));
+        assert!(!is_trusted_origin("http://evil.com:7509"));
+    }
+
+    #[test]
+    fn test_untrusted_origin_https() {
+        assert!(!is_trusted_origin("https://localhost:7509"));
+    }
+
+    #[test]
+    fn test_untrusted_origin_null() {
+        assert!(!is_trusted_origin("null"));
+    }
+
+    #[test]
+    fn test_untrusted_origin_empty() {
+        assert!(!is_trusted_origin(""));
+    }
+
+    #[test]
+    fn test_html_escape_script_tag() {
+        assert_eq!(
+            html_escape("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn test_html_escape_quotes() {
+        assert_eq!(
+            html_escape(r#"" onclick="evil()""#),
+            "&quot; onclick=&quot;evil()&quot;"
+        );
+    }
+
+    #[test]
+    fn test_html_escape_ampersand() {
+        assert_eq!(html_escape("a & b"), "a &amp; b");
+    }
 }
