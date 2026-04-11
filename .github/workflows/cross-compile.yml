@@ -136,10 +136,6 @@ jobs:
     name: Build for x86_64-apple-darwin
     runs-on: macos-latest  # Cross-compile from Apple Silicon to x86_64
     timeout-minutes: 60
-    # Apple deprecated x86_64 macOS; this build is best-effort and should not
-    # block the attach-to-release job when it fails.
-    continue-on-error: true
-
     steps:
       - uses: actions/checkout@v6
 
@@ -265,17 +261,15 @@ jobs:
           name: binaries-arm64-macos-fdev
           path: artifacts/arm64-macos-fdev
 
-      # macOS x86_64 (best-effort — may not exist if build failed)
+      # macOS x86_64
       - name: Download x86_64 macOS freenet binary
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: binaries-x86_64-macos-freenet
           path: artifacts/x86_64-macos-freenet
 
       - name: Download x86_64 macOS fdev binary
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: binaries-x86_64-macos-fdev
           path: artifacts/x86_64-macos-fdev
@@ -308,13 +302,9 @@ jobs:
           cd artifacts/arm64-macos-freenet && tar -czvf ../../freenet-aarch64-apple-darwin.tar.gz freenet && cd ../..
           cd artifacts/arm64-macos-fdev && tar -czvf ../../fdev-aarch64-apple-darwin.tar.gz fdev && cd ../..
 
-          # macOS x86_64 (best-effort — may not exist)
-          if [ -d artifacts/x86_64-macos-freenet ]; then
-            cd artifacts/x86_64-macos-freenet && tar -czvf ../../freenet-x86_64-apple-darwin.tar.gz freenet && cd ../..
-          fi
-          if [ -d artifacts/x86_64-macos-fdev ]; then
-            cd artifacts/x86_64-macos-fdev && tar -czvf ../../fdev-x86_64-apple-darwin.tar.gz fdev && cd ../..
-          fi
+          # macOS x86_64
+          cd artifacts/x86_64-macos-freenet && tar -czvf ../../freenet-x86_64-apple-darwin.tar.gz freenet && cd ../..
+          cd artifacts/x86_64-macos-fdev && tar -czvf ../../fdev-x86_64-apple-darwin.tar.gz fdev && cd ../..
 
           # Windows x86_64 (zip for backwards compat + bare exe for direct download)
           cd artifacts/x86_64-windows-freenet && zip ../../freenet-x86_64-pc-windows-msvc.zip freenet.exe && cd ../..
