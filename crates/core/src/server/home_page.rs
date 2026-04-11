@@ -2107,14 +2107,16 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
             ok_bins[bin].push(p);
         }
 
-        // Draw failure dots (grow upward from center)
+        // Draw failure dots (grow upward from center), with overflow indicator
         for (bin_idx, dots) in fail_bins.iter().enumerate() {
             let cx = pad_l + (bin_idx as f64 + 0.5) * bin_width * plot_w;
+            let mut drawn = 0;
             for (i, _) in dots.iter().enumerate() {
                 let cy = mid_y - dot_spacing * (i as f64 + 0.5);
                 if cy < pad_t + dot_r {
                     break;
                 }
+                drawn += 1;
                 write!(
                     svg,
                     r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r}" fill="var(--accent-danger, #f85149)" opacity="0.7"/>"#,
@@ -2124,22 +2126,44 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
                 )
                 .ok();
             }
+            if drawn < dots.len() {
+                write!(
+                    svg,
+                    r#"<text x="{cx:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--accent-danger, #f85149)">+{n}</text>"#,
+                    cx = cx,
+                    y = pad_t - 1.0,
+                    n = dots.len() - drawn,
+                )
+                .ok();
+            }
         }
 
-        // Draw success dots (grow downward from center)
+        // Draw success dots (grow downward from center), with overflow indicator
         for (bin_idx, dots) in ok_bins.iter().enumerate() {
             let cx = pad_l + (bin_idx as f64 + 0.5) * bin_width * plot_w;
+            let mut drawn = 0;
             for (i, _) in dots.iter().enumerate() {
                 let cy = mid_y + dot_spacing * (i as f64 + 0.5);
                 if cy > pad_t + plot_h - dot_r {
                     break;
                 }
+                drawn += 1;
                 write!(
                     svg,
                     r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r}" fill="var(--accent-success, #3fb950)" opacity="0.7"/>"#,
                     cx = cx,
                     cy = cy,
                     r = dot_r,
+                )
+                .ok();
+            }
+            if drawn < dots.len() {
+                write!(
+                    svg,
+                    r#"<text x="{cx:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--accent-success, #3fb950)">+{n}</text>"#,
+                    cx = cx,
+                    y = pad_t + plot_h + 10.0,
+                    n = dots.len() - drawn,
                 )
                 .ok();
             }
