@@ -220,26 +220,36 @@ async fn permission_respond(
         );
     }
 
-    if let Some((_, prompt)) = pending.remove(&nonce) {
-        if body.index < prompt.labels.len() {
-            if prompt.response_tx.send(body.index).is_err() {
-                tracing::debug!(nonce = %nonce, "Permission response channel already closed");
-            }
-            (
-                axum::http::StatusCode::OK,
-                Json(serde_json::json!({"ok": true})),
-            )
-        } else {
-            (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid index"})),
-            )
-        }
-    } else {
-        (
+    // Validate index BEFORE removing from DashMap. Removing first would
+    // consume the nonce on invalid input, leaving the user unable to retry.
+    let label_count = pending.get(&nonce).map(|e| e.labels.len());
+    match label_count {
+        None => (
             axum::http::StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "expired or already answered"})),
-        )
+        ),
+        Some(len) if body.index >= len => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid index"})),
+        ),
+        Some(_) => {
+            // Index is valid -- now atomically remove and send response
+            if let Some((_, prompt)) = pending.remove(&nonce) {
+                if prompt.response_tx.send(body.index).is_err() {
+                    tracing::debug!(nonce = %nonce, "Permission response channel already closed");
+                }
+                (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({"ok": true})),
+                )
+            } else {
+                // Race: another request consumed it between get and remove
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "expired or already answered"})),
+                )
+            }
+        }
     }
 }
 

@@ -96,14 +96,14 @@ impl UserInputPrompter for DashboardPrompter {
             PendingPrompt {
                 message,
                 labels,
-                delegate_key: String::new(), // TODO: pass from executor context
-                contract_id: String::new(),  // TODO: pass from executor context
+                delegate_key: "Unknown".to_string(), // TODO: pass from executor context
+                contract_id: "Unknown".to_string(),  // TODO: pass from executor context
                 response_tx: tx,
             },
         );
 
-        tracing::info!(
-            nonce = %nonce,
+        // Log at debug, not info -- nonce is the sole auth token for this prompt
+        tracing::debug!(
             request_id = request.request_id,
             "Permission prompt created, waiting for user response via dashboard"
         );
@@ -320,5 +320,83 @@ mod tests {
         };
         let parsed = parse_message(&req);
         assert_eq!(parsed, "Helloworld");
+    }
+
+    #[test]
+    fn test_parse_button_labels_invalid_utf8() {
+        use freenet_stdlib::prelude::NotificationMessage;
+        let req = UserInputRequest {
+            request_id: 1,
+            message: NotificationMessage::try_from(&serde_json::Value::String("msg".to_string()))
+                .unwrap(),
+            responses: vec![
+                ClientResponse::new(b"Valid".to_vec()),
+                ClientResponse::new(vec![0xFF, 0xFE]),
+            ],
+        };
+        let labels = parse_button_labels(&req);
+        assert_eq!(labels, vec!["Valid", "Option 2"]);
+    }
+
+    #[test]
+    fn test_parse_message_raw_utf8() {
+        use freenet_stdlib::prelude::NotificationMessage;
+        let raw_msg =
+            NotificationMessage::try_from(&serde_json::Value::String("Raw message".to_string()))
+                .unwrap();
+        let req = UserInputRequest {
+            request_id: 1,
+            message: raw_msg,
+            responses: vec![],
+        };
+        let msg = parse_message(&req);
+        assert_eq!(msg, "Raw message");
+    }
+
+    #[tokio::test]
+    async fn test_auto_approve_with_three_responses() {
+        let req = make_test_request("Allow?", vec!["Allow Once", "Always Allow", "Deny"]);
+        let result = AutoApprovePrompter.prompt(&req).await;
+        let (idx, response) = result.unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(&*response, b"Allow Once");
+    }
+
+    #[tokio::test]
+    async fn test_auto_deny_with_multiple_responses() {
+        let req = make_test_request("Allow?", vec!["Allow Once", "Always Allow", "Deny"]);
+        let result = AutoDenyPrompter.prompt(&req).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_prompter_happy_path() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = DashboardPrompter::new(pending.clone());
+
+        let req = make_test_request("Allow signing?", vec!["Allow", "Deny"]);
+
+        // Spawn the prompt in a task
+        let pending_clone = pending.clone();
+        let handle = tokio::spawn(async move { prompter.prompt(&req).await });
+
+        // Wait briefly for the prompt to be inserted
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Find the nonce and respond
+        let nonce = pending_clone
+            .iter()
+            .next()
+            .expect("should have a pending prompt")
+            .key()
+            .clone();
+
+        let (_, prompt) = pending_clone.remove(&nonce).unwrap();
+        prompt.response_tx.send(0).unwrap();
+
+        let result = handle.await.unwrap();
+        let (idx, response) = result.unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(&*response, b"Allow");
     }
 }
