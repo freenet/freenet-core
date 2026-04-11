@@ -594,6 +594,38 @@ function freenetBridge(authToken) {
   }
   window.addEventListener('popstate', forwardHash);
   window.addEventListener('hashchange', forwardHash);
+
+  // Permission prompt polling: check for pending delegate permission requests
+  // and show browser notifications. The user clicks the notification to open
+  // the permission page in a new tab.
+  var knownPrompts = {};
+  function checkPermissions() {
+    fetch('/permission/pending').then(function(r) { return r.json(); }).then(function(prompts) {
+      prompts.forEach(function(p) {
+        if (knownPrompts[p.nonce]) return;
+        knownPrompts[p.nonce] = true;
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          var n = new Notification('Freenet: Permission needed', {
+            body: p.preview || 'A delegate is requesting permission.',
+            tag: 'freenet-perm-' + p.nonce
+          });
+          n.onclick = function() { window.open('/permission/' + p.nonce, '_blank'); };
+        } else {
+          // Fallback: open directly if notifications not available
+          window.open('/permission/' + p.nonce, '_blank');
+        }
+      });
+      // Clean up nonces no longer pending
+      Object.keys(knownPrompts).forEach(function(k) {
+        if (!prompts.some(function(p) { return p.nonce === k; })) delete knownPrompts[k];
+      });
+    }).catch(function() {});
+  }
+  // Request notification permission on first load
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+  setInterval(checkPermissions, 3000);
 }
 "#;
 

@@ -65,8 +65,9 @@ async fn permission_page(
             let escaped = html_escape(label);
             // First button is primary (Allow), rest are secondary
             let class = if i == 0 { "btn primary" } else { "btn" };
+            let escaped_nonce = html_escape(&nonce);
             format!(
-                r#"<button class="{class}" onclick="respond('{nonce}', {i})">{escaped}</button>"#
+                r#"<button class="{class}" onclick="respond('{escaped_nonce}', {i})">{escaped}</button>"#
             )
         })
         .collect::<Vec<_>>()
@@ -242,14 +243,19 @@ async fn permission_respond(
     }
 }
 
-/// Check if an Origin header is from a trusted source (localhost).
+/// Check if an Origin header is from a trusted localhost source.
+/// Accepts any port on localhost/loopback to handle non-default configurations.
 fn is_trusted_origin(origin: &str) -> bool {
-    let trusted = [
-        "http://127.0.0.1:7509",
-        "http://localhost:7509",
-        "http://[::1]:7509",
-    ];
-    trusted.contains(&origin)
+    let Some(host_port) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    // Extract hostname (before the port)
+    let host = if let Some((h, _port)) = host_port.rsplit_once(':') {
+        h
+    } else {
+        host_port
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
 }
 
 /// HTML for when a permission request has expired or already been answered.
