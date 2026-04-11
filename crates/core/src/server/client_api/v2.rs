@@ -26,6 +26,8 @@ async fn web_home_v2(
 
 async fn web_subpages_v2(
     Path((key, last_path)): Path<(String, String)>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    web_subpages(key, last_path, ApiVersion::V2).await
+    web_subpages(key, last_path, ApiVersion::V2, query, headers).await
 }

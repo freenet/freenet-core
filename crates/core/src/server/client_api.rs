@@ -182,7 +182,8 @@ async fn web_home(
 
         // Serve sandbox content (contract HTML + WS shim) inside the iframe.
         // No auth token or cookie — the shell page handles auth via postMessage.
-        let contract_response = path_handlers::serve_sandbox_content(key, api_version).await?;
+        let contract_response =
+            path_handlers::serve_sandbox_content(key, api_version, None).await?;
         let mut response = contract_response.into_response();
         add_sandbox_cors_headers(&mut response);
         // CSP for sandbox content: the iframe has an opaque origin (null) because the
@@ -258,7 +259,47 @@ async fn web_subpages(
     key: String,
     last_path: String,
     api_version: ApiVersion,
+    query_string: Option<String>,
+    req_headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, WebSocketApiError> {
+    let is_sandbox = query_string
+        .as_ref()
+        .map(|qs| qs.split('&').any(|p| p == "__sandbox=1"))
+        .unwrap_or(false);
+
+    // For sandbox sub-page requests to HTML files, serve through the sandbox
+    // content pipeline (with WebSocket shim + navigation interceptor injected).
+    if is_sandbox && is_html_page(&last_path) {
+        // Block top-level navigation to sandbox URLs (same protection as web_home)
+        let fetch_dest = req_headers
+            .get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if fetch_dest == "document" {
+            let shell_url = format!("/{}/contract/web/{key}/", api_version.prefix());
+            return Ok(axum::response::Redirect::to(&shell_url).into_response());
+        }
+
+        let contract_response =
+            path_handlers::serve_sandbox_content(key, api_version, Some(&last_path)).await?;
+        let mut response = contract_response.into_response();
+        add_sandbox_cors_headers(&mut response);
+        let local_api_origin = req_headers
+            .get(axum::http::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .map(|host| format!("http://{host}"))
+            .unwrap_or_else(|| "'self'".to_string());
+        let csp = format!(
+            "default-src {local_api_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {local_api_origin} blob: data:"
+        );
+        if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_SECURITY_POLICY, csp_value);
+        }
+        return Ok(response);
+    }
+
     let version_prefix = api_version.prefix();
     let full_path: String = format!("/{version_prefix}/contract/web/{key}/{last_path}");
     path_handlers::variable_content(key, full_path, api_version)
@@ -269,6 +310,20 @@ async fn web_subpages(
             add_sandbox_cors_headers(&mut response);
             response
         })
+}
+
+/// Returns true if the path looks like an HTML page request.
+fn is_html_page(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // Explicit .html or .htm extension
+    if lower.ends_with(".html") || lower.ends_with(".htm") {
+        return true;
+    }
+    // Directory-style paths (e.g., "news/") where the server would serve index.html
+    if lower.ends_with('/') || !lower.contains('.') {
+        return true;
+    }
+    false
 }
 
 /// Adds CORS and security headers needed for sandbox iframe responses.
@@ -357,5 +412,39 @@ impl ClientEventsProxy for HttpClientApi {
             Ok(())
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_html_page_detects_html_extensions() {
+        assert!(is_html_page("page.html"));
+        assert!(is_html_page("page.HTML"));
+        assert!(is_html_page("page.htm"));
+        assert!(is_html_page("dir/page.html"));
+    }
+
+    #[test]
+    fn is_html_page_detects_directory_style_paths() {
+        assert!(is_html_page("news/"));
+        assert!(is_html_page("about/team/"));
+    }
+
+    #[test]
+    fn is_html_page_detects_extensionless_paths() {
+        // Extensionless paths are likely directory-style navigation
+        assert!(is_html_page("news"));
+        assert!(is_html_page("about/team"));
+    }
+
+    #[test]
+    fn is_html_page_rejects_non_html_files() {
+        assert!(!is_html_page("app.js"));
+        assert!(!is_html_page("style.css"));
+        assert!(!is_html_page("image.png"));
+        assert!(!is_html_page("assets/app.wasm"));
     }
 }
