@@ -34,6 +34,10 @@ pub struct BaseConfig {
     /// The default value is `127.0.0.1`.
     #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub(crate) address: IpAddr,
+    /// Full WebSocket URL to connect to (e.g. ws://host:port/secret/v1/contract/command?encodingProtocol=native).
+    /// When provided, --address, --port, and --mode are ignored.
+    #[arg(long, env = "FREENET_NODE_URL")]
+    pub(crate) node_url: Option<String>,
 }
 
 #[derive(clap::Subcommand, Clone)]

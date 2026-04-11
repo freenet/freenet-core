@@ -1,27 +1,28 @@
 use super::*;
 
 pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> {
-    let mode = cfg.mode;
-    let address = cfg.address;
-    let target = match mode {
-        OperationMode::Local => {
-            if !address.is_loopback() {
-                return Err(anyhow::anyhow!(
-                    "invalid ip: {address}, expecting a loopback ip address in local mode"
-                ));
+    let url = if let Some(node_url) = &cfg.node_url {
+        node_url.clone()
+    } else {
+        let mode = cfg.mode;
+        let address = cfg.address;
+        let target = match mode {
+            OperationMode::Local => {
+                if !address.is_loopback() {
+                    return Err(anyhow::anyhow!(
+                        "invalid ip: {address}, expecting a loopback ip address in local mode"
+                    ));
+                }
+                SocketAddr::new(address, cfg.port)
             }
-            SocketAddr::new(address, cfg.port)
-        }
-        OperationMode::Network => SocketAddr::new(address, cfg.port),
+            OperationMode::Network => SocketAddr::new(address, cfg.port),
+        };
+        format!("ws://{target}/v1/contract/command?encodingProtocol=native")
     };
 
-    let (stream, _) = tokio_tungstenite::connect_async(&format!(
-        "ws://{target}/v1/contract/command?encodingProtocol=native"
-    ))
-    .await
-    .map_err(|e| {
+    let (stream, _) = tokio_tungstenite::connect_async(&url).await.map_err(|e| {
         tracing::error!(err=%e);
-        anyhow::anyhow!(format!("fail to connect to the host({target}): {e}"))
+        anyhow::anyhow!("fail to connect to the host({url}): {e}")
     })?;
 
     Ok(WebApi::start(stream))
