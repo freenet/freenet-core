@@ -63,6 +63,14 @@ pub enum SubCommand {
     /// state transitions, and detects anomalies that indicate consistency
     /// failures (missing broadcasts, unapplied updates, state divergence).
     VerifyState(crate::verify_state::VerifyStateConfig),
+    /// Publish and manage static websites on Freenet.
+    ///
+    /// Use `init` to generate a signing keypair, `publish` to deploy a website,
+    /// and `update` to push new content to an existing website.
+    Website {
+        #[clap(subcommand)]
+        command: crate::website::WebsiteCommand,
+    },
 }
 
 impl SubCommand {
