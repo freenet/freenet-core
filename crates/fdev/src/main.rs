@@ -102,17 +102,18 @@ fn main() -> anyhow::Result<()> {
                 verify_state::verify_state(verify_config).await
             }
             SubCommand::Website { command } => match command {
-                website::WebsiteCommand::Init { output } => website::init(output),
+                website::WebsiteCommand::Init { name } => website::init(name),
                 website::WebsiteCommand::Publish {
                     directory,
-                    key_file,
+                    key,
                     contract_wasm,
-                } => website::publish(directory, key_file, contract_wasm, config.additional).await,
+                } => website::publish(directory, key, contract_wasm, config.additional).await,
                 website::WebsiteCommand::Update {
                     directory,
-                    key_file,
+                    key,
                     contract_wasm,
-                } => website::update(directory, key_file, contract_wasm, config.additional).await,
+                } => website::update(directory, key, contract_wasm, config.additional).await,
+                website::WebsiteCommand::List => website::list(),
             },
         };
         // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow

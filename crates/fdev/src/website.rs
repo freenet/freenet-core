@@ -37,19 +37,21 @@ struct WebContainerMetadata {
 
 #[derive(Subcommand, Clone)]
 pub enum WebsiteCommand {
-    /// Generate a new signing keypair for website publishing
+    /// Generate a new signing keypair for website publishing.
+    ///
+    /// Keys are stored in ~/.config/freenet/website-keys/<name>.toml.
+    /// Each name produces a unique contract key (website address).
     Init {
-        /// Output file for keys (default: ~/.config/freenet/website-keys.toml)
-        #[arg(long, short)]
-        output: Option<PathBuf>,
+        /// Name for this website (e.g., "my-blog", "docs")
+        name: String,
     },
     /// Publish a directory as a new website to Freenet
     Publish {
         /// Directory containing the website files (must contain index.html)
         directory: PathBuf,
-        /// Key file to use (default: ~/.config/freenet/website-keys.toml)
+        /// Name of the key to use (from `fdev website init <name>`)
         #[arg(long, short)]
-        key_file: Option<PathBuf>,
+        key: String,
         /// Path to a custom contract WASM file (uses built-in contract by default)
         #[arg(long)]
         contract_wasm: Option<PathBuf>,
@@ -58,31 +60,34 @@ pub enum WebsiteCommand {
     Update {
         /// Directory containing the updated website files
         directory: PathBuf,
-        /// Key file to use (default: ~/.config/freenet/website-keys.toml)
+        /// Name of the key to use (from `fdev website init <name>`)
         #[arg(long, short)]
-        key_file: Option<PathBuf>,
+        key: String,
         /// Path to a custom contract WASM file (uses built-in contract by default)
         #[arg(long)]
         contract_wasm: Option<PathBuf>,
     },
+    /// List all website signing keys
+    List,
 }
 
-fn default_key_path() -> anyhow::Result<PathBuf> {
+fn keys_dir() -> anyhow::Result<PathBuf> {
     let config_dir = dirs::config_dir().context("Could not determine config directory")?;
-    Ok(config_dir.join("freenet").join("website-keys.toml"))
+    Ok(config_dir.join("freenet").join("website-keys"))
 }
 
-fn key_path(override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
-    match override_path {
-        Some(p) => Ok(p.to_path_buf()),
-        None => default_key_path(),
-    }
+fn key_path_for_name(name: &str) -> anyhow::Result<PathBuf> {
+    Ok(keys_dir()?.join(format!("{name}.toml")))
 }
 
-fn read_signing_key(key_file: Option<&Path>) -> anyhow::Result<SigningKey> {
-    let path = key_path(key_file)?;
-    let config_str = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read key file: {}", path.display()))?;
+fn read_signing_key(name: &str) -> anyhow::Result<SigningKey> {
+    let path = key_path_for_name(name)?;
+    let config_str = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "No key named '{}'. Run `fdev website init {}` first.",
+            name, name
+        )
+    })?;
     let config: toml::Table = toml::from_str(&config_str)?;
     let key_hex = config
         .get("keys")
@@ -199,7 +204,7 @@ fn build_contract_key(wasm_bytes: &[u8], verifying_key: &VerifyingKey) -> Contra
     container.key()
 }
 
-pub fn init(output: Option<PathBuf>) -> anyhow::Result<()> {
+pub fn init(name: String) -> anyhow::Result<()> {
     let mut key_bytes = [0u8; 32];
     rand::fill(&mut key_bytes);
     let signing_key = SigningKey::from_bytes(&key_bytes);
@@ -210,10 +215,7 @@ pub fn init(output: Option<PathBuf>) -> anyhow::Result<()> {
     let config =
         format!("[keys]\nsigning_key = \"{signing_hex}\"\nverifying_key = \"{verifying_hex}\"\n");
 
-    let path = match output {
-        Some(p) => p,
-        None => default_key_path()?,
-    };
+    let path = key_path_for_name(&name)?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -221,9 +223,10 @@ pub fn init(output: Option<PathBuf>) -> anyhow::Result<()> {
 
     if path.exists() {
         anyhow::bail!(
-            "Key file already exists at {}. \
+            "Key '{}' already exists at {}. \
              Remove it first if you want to generate a new keypair. \
              WARNING: Losing your signing key means you can never update your website.",
+            name,
             path.display()
         );
     }
@@ -234,10 +237,17 @@ pub fn init(output: Option<PathBuf>) -> anyhow::Result<()> {
     let wasm_bytes = WEBSITE_CONTRACT_WASM;
     let key = build_contract_key(wasm_bytes, &verifying_key);
 
-    println!("Keypair generated and saved to: {}", path.display());
+    println!(
+        "Keypair '{}' generated and saved to: {}",
+        name,
+        path.display()
+    );
     println!();
     println!("Your website contract key: {key}");
     println!("Website URL: http://127.0.0.1:7509/v1/contract/web/{key}/");
+    println!();
+    println!("To publish:  fdev website publish ./my-site/ --key {name}");
+    println!("To update:   fdev website update ./my-site/ --key {name}");
     println!();
     println!(
         "IMPORTANT: Back up your key file! Losing it means you can never update your website."
@@ -245,13 +255,45 @@ pub fn init(output: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn list() -> anyhow::Result<()> {
+    let dir = keys_dir()?;
+    if !dir.exists() {
+        println!("No website keys found. Run `fdev website init <name>` to create one.");
+        return Ok(());
+    }
+    let mut found = false;
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            let name = path.file_stem().unwrap_or_default().to_string_lossy();
+            // Try to read the key and compute the contract key
+            match read_signing_key(&name) {
+                Ok(signing_key) => {
+                    let verifying_key = signing_key.verifying_key();
+                    let key = build_contract_key(WEBSITE_CONTRACT_WASM, &verifying_key);
+                    println!("{name}  {key}");
+                }
+                Err(_) => {
+                    println!("{name}  (invalid key file)");
+                }
+            }
+            found = true;
+        }
+    }
+    if !found {
+        println!("No website keys found. Run `fdev website init <name>` to create one.");
+    }
+    Ok(())
+}
+
 pub async fn publish(
     directory: PathBuf,
-    key_file: Option<PathBuf>,
+    key_name: String,
     contract_wasm: Option<PathBuf>,
     base_config: BaseConfig,
 ) -> anyhow::Result<()> {
-    let signing_key = read_signing_key(key_file.as_deref())?;
+    let signing_key = read_signing_key(&key_name)?;
     let verifying_key = signing_key.verifying_key();
     let wasm_bytes = load_contract_wasm(contract_wasm.as_deref())?;
 
@@ -323,19 +365,37 @@ pub async fn publish(
 
 pub async fn update(
     directory: PathBuf,
-    key_file: Option<PathBuf>,
+    key_name: String,
     contract_wasm: Option<PathBuf>,
     base_config: BaseConfig,
 ) -> anyhow::Result<()> {
     // Update is the same as publish -- the node handles PUT vs UPDATE based on
     // whether the contract already exists. The contract's update_state validates
     // that the version is strictly increasing.
-    publish(directory, key_file, contract_wasm, base_config).await
+    publish(directory, key_name, contract_wasm, base_config).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Override the keys directory for testing by writing directly to a temp path
+    /// and calling the internal parsing logic.
+    fn read_key_from_path(path: &Path) -> anyhow::Result<SigningKey> {
+        let config_str = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read key file: {}", path.display()))?;
+        let config: toml::Table = toml::from_str(&config_str)?;
+        let key_hex = config
+            .get("keys")
+            .and_then(|k| k.get("signing_key"))
+            .and_then(|v| v.as_str())
+            .context("Missing keys.signing_key in config")?;
+        let key_bytes = hex::decode(key_hex).context("Invalid hex in signing key")?;
+        let key_array: [u8; 32] = key_bytes.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("Signing key must be 32 bytes, got {}", v.len())
+        })?;
+        Ok(SigningKey::from_bytes(&key_array))
+    }
 
     #[test]
     fn test_read_signing_key_missing_section() {
@@ -344,7 +404,7 @@ mod tests {
 
         // Missing [keys] section entirely
         fs::write(&path, "[other]\nfoo = \"bar\"\n").unwrap();
-        let result = read_signing_key(Some(path.as_path()));
+        let result = read_key_from_path(&path);
         assert!(result.is_err());
         assert!(
             result
@@ -362,7 +422,7 @@ mod tests {
 
         // Has [keys] but no signing_key
         fs::write(&path, "[keys]\nverifying_key = \"abc\"\n").unwrap();
-        let result = read_signing_key(Some(path.as_path()));
+        let result = read_key_from_path(&path);
         assert!(result.is_err());
         assert!(
             result
@@ -386,7 +446,7 @@ mod tests {
         );
         fs::write(&path, config).unwrap();
 
-        let result = read_signing_key(Some(path.as_path()));
+        let result = read_key_from_path(&path);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().to_bytes(), signing_key.to_bytes());
     }
