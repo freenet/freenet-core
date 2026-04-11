@@ -49,8 +49,11 @@ pub(super) async fn start_api_client(cfg: BaseConfig) -> anyhow::Result<WebApi> 
 
     let (stream, _) = tokio_tungstenite::connect_async(&url).await.map_err(|e| {
         let safe_url = sanitize_url_for_log(&url);
-        tracing::error!(err=%e);
-        anyhow::anyhow!("failed to connect to the host({safe_url}): {e}")
+        // Log only the sanitized URL and error kind -- the raw tungstenite error
+        // may contain the full URL (including auth secrets) in its Display output.
+        let err_msg = sanitize_url_for_log(&e.to_string());
+        tracing::error!(url=%safe_url, err=%err_msg);
+        anyhow::anyhow!("failed to connect to the host({safe_url}): {err_msg}")
     })?;
 
     Ok(WebApi::start(stream))
@@ -142,5 +145,76 @@ mod tests {
     fn test_sanitize_url_no_secret() {
         let url = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
         assert_eq!(sanitize_url_for_log(url), url);
+    }
+
+    #[test]
+    fn test_sanitize_url_hides_multi_segment_secret() {
+        let url = "ws://host:7520/token/extra/nested/v1/contract/command";
+        assert_eq!(
+            sanitize_url_for_log(url),
+            "ws://host:7520/***/v1/contract/command"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_url_in_error_message() {
+        // Secrets embedded in error messages (e.g. from tungstenite) are also sanitized
+        let err = "Connection failed: ws://host:7520/my-secret/v1/contract/command";
+        assert_eq!(
+            sanitize_url_for_log(err),
+            "Connection failed: ws://host:7520/***/v1/contract/command"
+        );
+    }
+
+    #[test]
+    fn test_clap_node_url_with_defaults() {
+        use crate::config::Config;
+        use clap::Parser;
+        // --node-url alone should work; defaulted --address/--port don't trigger conflicts
+        assert!(
+            Config::try_parse_from([
+                "fdev",
+                "--node-url",
+                "ws://host/v1/contract/command?encodingProtocol=native",
+                "query",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_clap_node_url_conflicts_with_explicit_port() {
+        use crate::config::Config;
+        use clap::Parser;
+        // --node-url + explicit --port should fail
+        assert!(
+            Config::try_parse_from([
+                "fdev",
+                "--node-url",
+                "ws://host/v1/contract/command?encodingProtocol=native",
+                "--port",
+                "8080",
+                "query",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_clap_node_url_conflicts_with_explicit_address() {
+        use crate::config::Config;
+        use clap::Parser;
+        // --node-url + explicit --address should fail
+        assert!(
+            Config::try_parse_from([
+                "fdev",
+                "--node-url",
+                "ws://host/v1/contract/command?encodingProtocol=native",
+                "--address",
+                "10.0.0.1",
+                "query",
+            ])
+            .is_err()
+        );
     }
 }
