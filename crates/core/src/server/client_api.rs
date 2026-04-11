@@ -180,32 +180,7 @@ async fn web_home(
             return Ok(axum::response::Redirect::to(&shell_url).into_response());
         }
 
-        // Serve sandbox content (contract HTML + WS shim) inside the iframe.
-        // No auth token or cookie — the shell page handles auth via postMessage.
-        let contract_response =
-            path_handlers::serve_sandbox_content(key, api_version, None).await?;
-        let mut response = contract_response.into_response();
-        add_sandbox_cors_headers(&mut response);
-        // CSP for sandbox content: the iframe has an opaque origin (null) because the
-        // sandbox attribute omits allow-same-origin. This means CSP 'self' won't match
-        // the local API server's actual origin, so we must use the explicit local API
-        // origin derived from the Host header. This allows the iframe to load scripts,
-        // styles, images, and WASM from the local API server while blocking access
-        // to other origins.
-        let local_api_origin = req_headers
-            .get(axum::http::header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .map(|host| format!("http://{host}"))
-            .unwrap_or_else(|| "'self'".to_string());
-        let csp = format!(
-            "default-src {local_api_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {local_api_origin} blob: data:"
-        );
-        if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
-            response
-                .headers_mut()
-                .insert(axum::http::header::CONTENT_SECURITY_POLICY, csp_value);
-        }
-        return Ok(response);
+        return serve_sandbox_response(key, api_version, None, &req_headers).await;
     }
 
     // Shell page: generate auth token, serve iframe wrapper with CSP
@@ -270,34 +245,7 @@ async fn web_subpages(
     // For sandbox sub-page requests to HTML files, serve through the sandbox
     // content pipeline (with WebSocket shim + navigation interceptor injected).
     if is_sandbox && is_html_page(&last_path) {
-        // Block top-level navigation to sandbox URLs (same protection as web_home)
-        let fetch_dest = req_headers
-            .get("sec-fetch-dest")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if fetch_dest == "document" {
-            let shell_url = format!("/{}/contract/web/{key}/", api_version.prefix());
-            return Ok(axum::response::Redirect::to(&shell_url).into_response());
-        }
-
-        let contract_response =
-            path_handlers::serve_sandbox_content(key, api_version, Some(&last_path)).await?;
-        let mut response = contract_response.into_response();
-        add_sandbox_cors_headers(&mut response);
-        let local_api_origin = req_headers
-            .get(axum::http::header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .map(|host| format!("http://{host}"))
-            .unwrap_or_else(|| "'self'".to_string());
-        let csp = format!(
-            "default-src {local_api_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {local_api_origin} blob: data:"
-        );
-        if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
-            response
-                .headers_mut()
-                .insert(axum::http::header::CONTENT_SECURITY_POLICY, csp_value);
-        }
-        return Ok(response);
+        return serve_sandbox_response(key, api_version, Some(&last_path), &req_headers).await;
     }
 
     let version_prefix = api_version.prefix();
@@ -313,17 +261,50 @@ async fn web_subpages(
 }
 
 /// Returns true if the path looks like an HTML page request.
+///
+/// Matches `.html`/`.htm` extensions, directory-style paths (`news/`),
+/// and extensionless paths (`about/team`) that likely resolve to `index.html`.
 fn is_html_page(path: &str) -> bool {
     let lower = path.to_lowercase();
-    // Explicit .html or .htm extension
-    if lower.ends_with(".html") || lower.ends_with(".htm") {
-        return true;
+    lower.ends_with(".html")
+        || lower.ends_with(".htm")
+        || lower.ends_with('/')
+        || !lower.contains('.')
+}
+
+/// Serves sandbox content (contract HTML + WS shim) inside the iframe and adds
+/// the appropriate CORS and CSP headers.
+///
+/// Shared by `web_home` (for the root page) and `web_subpages` (for sub-pages).
+/// No auth token or cookie -- the shell page handles auth via postMessage.
+async fn serve_sandbox_response(
+    key: String,
+    api_version: ApiVersion,
+    sub_path: Option<&str>,
+    req_headers: &axum::http::HeaderMap,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    let contract_response =
+        path_handlers::serve_sandbox_content(key, api_version, sub_path).await?;
+    let mut response = contract_response.into_response();
+    add_sandbox_cors_headers(&mut response);
+    // CSP for sandbox content: the iframe has an opaque origin (null) because the
+    // sandbox attribute omits allow-same-origin. This means CSP 'self' won't match
+    // the local API server's actual origin, so we must use the explicit local API
+    // origin derived from the Host header.
+    let local_api_origin = req_headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|host| format!("http://{host}"))
+        .unwrap_or_else(|| "'self'".to_string());
+    let csp = format!(
+        "default-src {local_api_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {local_api_origin} blob: data:"
+    );
+    if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_SECURITY_POLICY, csp_value);
     }
-    // Directory-style paths (e.g., "news/") where the server would serve index.html
-    if lower.ends_with('/') || !lower.contains('.') {
-        return true;
-    }
-    false
+    Ok(response)
 }
 
 /// Adds CORS and security headers needed for sandbox iframe responses.

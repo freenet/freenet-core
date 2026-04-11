@@ -829,10 +829,6 @@ const NAVIGATION_INTERCEPTOR_JS: &str = r#"
       __freenet_shell__: true, type: 'navigate', href: target.href
     }, '*');
   }, true);
-
-  // Also intercept form-based navigation and programmatic location changes
-  // by overriding window.location assignment (history.pushState is already
-  // blocked by the sandbox without allow-same-origin).
 })();
 "#;
 
@@ -1136,7 +1132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_content_injects_ws_shim_not_auth_token() {
+    async fn sandbox_content_injects_shims_not_auth_token() {
         let dir = tempfile::tempdir().unwrap();
         let key = "testkey123";
         let html = r#"<!DOCTYPE html><html><head></head><body>Hello</body></html>"#;
@@ -1157,6 +1153,11 @@ mod tests {
         assert!(
             result.contains("window.WebSocket = FreenetWebSocket"),
             "WebSocket override not set"
+        );
+        // Navigation interceptor must be injected alongside WebSocket shim
+        assert!(
+            result.contains("type: 'navigate'"),
+            "navigation interceptor not injected"
         );
         // Auth token must NOT appear in sandbox content
         assert!(
@@ -1559,30 +1560,5 @@ mod tests {
         let result =
             sandbox_content_body(dir.path(), key, ApiVersion::V1, "../../../etc/passwd").await;
         assert!(result.is_err(), "path traversal should be rejected");
-    }
-
-    #[tokio::test]
-    async fn sandbox_content_injects_navigation_interceptor() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = "testkey123";
-        let html = r#"<!DOCTYPE html><html><head></head><body>Hello</body></html>"#;
-        std::fs::write(dir.path().join("index.html"), html).unwrap();
-
-        let result = response_body(
-            sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
-                .await
-                .unwrap(),
-        )
-        .await;
-
-        // Navigation interceptor must be injected alongside WebSocket shim
-        assert!(
-            result.contains("FreenetWebSocket"),
-            "WebSocket shim not injected"
-        );
-        assert!(
-            result.contains("type: 'navigate'"),
-            "navigation interceptor not injected"
-        );
     }
 }
