@@ -1583,10 +1583,12 @@ fn peer_detail_html(address_str: &str) -> String {
     // Build prediction summary card
     let prediction_card = if let Some(ref pr) = peer_routing {
         if let Some(ref pred) = pr.prediction_at_own_location {
-            // Sentinel values (f64::MAX / 2.0) indicate insufficient data
+            // Sentinel values (f64::MAX / 2.0 ~ 9e307) indicate insufficient
+            // transfer data. Cap at ~31 years -- anything above is clearly
+            // not a real prediction.
             let reasonable_limit = 1.0e9;
             let fmt_time = |v: f64| -> String {
-                if v.is_finite() && v < reasonable_limit {
+                if v.is_finite() && (0.0..reasonable_limit).contains(&v) {
                     format!("{v:.3}s")
                 } else {
                     "N/A".to_string()
@@ -1599,17 +1601,24 @@ fn peer_detail_html(address_str: &str) -> String {
                     "N/A".to_string()
                 }
             };
+            let fmt_prob = |v: f64| -> String {
+                if v.is_finite() && (0.0..=1.0).contains(&v) {
+                    format!("{v:.4}")
+                } else {
+                    "N/A".to_string()
+                }
+            };
             format!(
                 r#"<div class="card">
                     <h2>Prediction at Peer Location</h2>
                     <div class="info-grid">
-                        <div class="info-label">Failure probability</div><div class="info-value">{fp:.4}</div>
+                        <div class="info-label">Failure probability</div><div class="info-value">{fp}</div>
                         <div class="info-label">Response time</div><div class="info-value">{rt}</div>
                         <div class="info-label">Expected total time</div><div class="info-value">{ett}</div>
                         <div class="info-label">Transfer speed</div><div class="info-value">{ts}</div>
                     </div>
                 </div>"#,
-                fp = pred.failure_probability,
+                fp = fmt_prob(pred.failure_probability),
                 rt = fmt_time(pred.time_to_response_start),
                 ett = fmt_time(pred.expected_total_time),
                 ts = fmt_speed(pred.transfer_speed_bps),
@@ -1954,12 +1963,20 @@ fn build_estimator_chart(
 fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
     use std::fmt::Write;
 
-    let successes: Vec<f64> = pairs
+    // Filter out NaN/non-finite values before processing
+    let valid_pairs: Vec<(f64, f64)> = pairs
+        .iter()
+        .copied()
+        .filter(|(p, a)| p.is_finite() && a.is_finite())
+        .collect();
+    let total_count = valid_pairs.len();
+
+    let successes: Vec<f64> = valid_pairs
         .iter()
         .filter(|(_, a)| *a < 0.5)
         .map(|(p, _)| p.clamp(0.0, 1.0))
         .collect();
-    let failures: Vec<f64> = pairs
+    let failures: Vec<f64> = valid_pairs
         .iter()
         .filter(|(_, a)| *a >= 0.5)
         .map(|(p, _)| p.clamp(0.0, 1.0))
@@ -1977,12 +1994,12 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
     let half_h = plot_h / 2.0;
 
     // Use dots for very small datasets, bars for larger ones
-    let use_dots = pairs.len() < 15;
+    let use_dots = total_count < 15;
 
     // Adaptive bin count: fewer bins when less data
-    let n_bins = if pairs.len() < 30 {
+    let n_bins = if total_count < 30 {
         5
-    } else if pairs.len() < 100 {
+    } else if total_count < 100 {
         8
     } else {
         10
@@ -2162,11 +2179,11 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
                 let y = mid_y - bar_h;
                 write!(
                     svg,
-                    r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="var(--accent-danger, #f85149)" opacity="0.7" rx="1"/>"#,
+                    r#"<rect x="{x:.1}" y="{y:.1}" width="{bw:.1}" height="{bh:.1}" fill="var(--accent-danger, #f85149)" opacity="0.7" rx="1"/>"#,
                     x = x,
                     y = y,
-                    w = bw,
-                    h = bar_h,
+                    bw = bw,
+                    bh = bar_h,
                 )
                 .ok();
                 // Count label on bar
@@ -2185,11 +2202,11 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
                 let bar_h = (ok_counts[i] as f64 / max_count as f64) * (half_h - 4.0);
                 write!(
                     svg,
-                    r#"<rect x="{x:.1}" y="{my:.1}" width="{w:.1}" height="{h:.1}" fill="var(--accent-success, #3fb950)" opacity="0.7" rx="1"/>"#,
+                    r#"<rect x="{x:.1}" y="{my:.1}" width="{bw:.1}" height="{bh:.1}" fill="var(--accent-success, #3fb950)" opacity="0.7" rx="1"/>"#,
                     x = x,
                     my = mid_y,
-                    w = bw,
-                    h = bar_h,
+                    bw = bw,
+                    bh = bar_h,
                 )
                 .ok();
                 // Count label on bar
@@ -2211,7 +2228,7 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
         r#"<text x="{x}" y="{y}" text-anchor="start" font-size="9" fill="var(--text-muted)">{n} events ({s} ok, {f} fail)</text>"#,
         x = pad_l + 2.0,
         y = pad_t - 5.0,
-        n = pairs.len(),
+        n = total_count,
         s = successes.len(),
         f = failures.len(),
     )
@@ -2642,5 +2659,65 @@ mod tests {
             JS.contains("scheduleRefresh"),
             "JS constant must contain the auto-refresh scheduler"
         );
+    }
+
+    #[test]
+    fn renegade_chart_empty_input() {
+        let svg = build_renegade_accuracy_chart(&[]);
+        assert!(svg.contains("0 events (0 ok, 0 fail)"));
+        assert!(svg.contains("<svg"));
+    }
+
+    #[test]
+    fn renegade_chart_dot_mode_sparse_data() {
+        // < 15 points should use dot mode (circles, not rects for bars)
+        let pairs: Vec<(f64, f64)> = vec![
+            (0.1, 0.0), // success, low predicted
+            (0.9, 1.0), // failure, high predicted
+            (0.5, 0.0), // success, mid predicted
+        ];
+        let svg = build_renegade_accuracy_chart(&pairs);
+        assert!(svg.contains("<circle"), "dot mode should render circles");
+        assert!(svg.contains("3 events (2 ok, 1 fail)"));
+    }
+
+    #[test]
+    fn renegade_chart_bar_mode_dense_data() {
+        // >= 15 points should use histogram bars
+        let pairs: Vec<(f64, f64)> = (0..20)
+            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
+            .collect();
+        let svg = build_renegade_accuracy_chart(&pairs);
+        assert!(svg.contains("<rect"), "bar mode should render rects");
+        assert!(svg.contains("20 events"));
+    }
+
+    #[test]
+    fn renegade_chart_filters_nan_values() {
+        let pairs = vec![
+            (0.5, 0.0),           // valid success
+            (f64::NAN, 1.0),      // NaN predicted -- filtered
+            (0.3, f64::NAN),      // NaN actual -- filtered
+            (f64::INFINITY, 0.0), // infinite predicted -- filtered
+            (0.7, 1.0),           // valid failure
+        ];
+        let svg = build_renegade_accuracy_chart(&pairs);
+        // Only the 2 valid pairs should be counted
+        assert!(svg.contains("2 events (1 ok, 1 fail)"));
+    }
+
+    #[test]
+    fn renegade_chart_all_successes() {
+        let pairs: Vec<(f64, f64)> = vec![(0.1, 0.0), (0.2, 0.0), (0.3, 0.0)];
+        let svg = build_renegade_accuracy_chart(&pairs);
+        assert!(svg.contains("3 events (3 ok, 0 fail)"));
+    }
+
+    #[test]
+    fn renegade_chart_boundary_predicted_value() {
+        // p=1.0 should not panic (bin clamping)
+        let pairs = vec![(1.0, 0.0), (0.0, 1.0)];
+        let svg = build_renegade_accuracy_chart(&pairs);
+        assert!(svg.contains("2 events"));
     }
 }
