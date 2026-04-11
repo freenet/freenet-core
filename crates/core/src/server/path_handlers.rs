@@ -3,9 +3,10 @@
 //! Contract web apps are served inside sandboxed iframes to provide origin isolation.
 //! The local API server returns a "shell" page that holds the auth token and
 //! proxies WebSocket connections via postMessage, while the contract runs in an
-//! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox">`
+//! `<iframe sandbox="allow-scripts allow-forms allow-popups">`
 //! with an opaque origin that cannot access other contracts' data.
-//! `allow-popups-to-escape-sandbox` lets external links open normally; sandbox content
+//! Popups inherit the sandbox (no `allow-popups-to-escape-sandbox`); external links
+//! are opened via the `open_url` shell bridge message to avoid CORS issues. Sandbox content
 //! is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
 
 use std::path::{Path, PathBuf};
@@ -346,7 +347,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" data-src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -497,6 +498,18 @@ function freenetBridge(authToken) {
           lastClipboard = now;
           try { navigator.clipboard.writeText(msg.text.slice(0, 2048)); } catch(e) {}
         }
+      } else if (msg.type === 'open_url' && typeof msg.url === 'string') {
+        // Open external URLs in a new tab. Popups from the sandboxed iframe
+        // inherit the opaque origin, breaking CORS on target sites. The shell
+        // opens the URL instead, giving proper origin. See issue #1499.
+        // Security: only allow https: URLs that are NOT localhost/loopback.
+        try {
+          var u = new URL(msg.url);
+          if (u.protocol !== 'https:') return;
+          var h = u.hostname.toLowerCase();
+          if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '0.0.0.0') return;
+          window.open(u.href, '_blank', 'noopener,noreferrer');
+        } catch(e) {}
       }
       return;
     }
@@ -581,6 +594,38 @@ function freenetBridge(authToken) {
   }
   window.addEventListener('popstate', forwardHash);
   window.addEventListener('hashchange', forwardHash);
+
+  // Permission prompt polling: check for pending delegate permission requests
+  // and show browser notifications. The user clicks the notification to open
+  // the permission page in a new tab.
+  var knownPrompts = {};
+  function checkPermissions() {
+    fetch('/permission/pending').then(function(r) { return r.json(); }).then(function(prompts) {
+      prompts.forEach(function(p) {
+        if (knownPrompts[p.nonce]) return;
+        knownPrompts[p.nonce] = true;
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          var n = new Notification('Freenet: Permission needed', {
+            body: p.preview || 'A delegate is requesting permission.',
+            tag: 'freenet-perm-' + p.nonce
+          });
+          n.onclick = function() { window.open('/permission/' + p.nonce, '_blank'); };
+        } else {
+          // Fallback: open directly if notifications not available
+          window.open('/permission/' + p.nonce, '_blank');
+        }
+      });
+      // Clean up nonces no longer pending
+      Object.keys(knownPrompts).forEach(function(k) {
+        if (!prompts.some(function(p) { return p.nonce === k; })) delete knownPrompts[k];
+      });
+    }).catch(function() {});
+  }
+  // Request notification permission on first load
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+  setInterval(checkPermissions, 3000);
 }
 "#;
 
@@ -917,12 +962,18 @@ mod tests {
             html.contains("__freenet_shell__"),
             "bridge JS must handle shell-level messages (title/favicon)"
         );
-        // allow-popups-to-escape-sandbox must be present so that links opened
-        // from within the sandbox behave as normal browser tabs (without inheriting
-        // the sandbox's null origin, which breaks CORS on the target site). See #3613.
+        // allow-popups-to-escape-sandbox must NOT be present. It was removed because
+        // escaped popups gain localhost:7509 origin, allowing malicious web apps to
+        // access other apps' data and bypass permission prompts. External links are
+        // now opened via the open_url shell bridge message instead. See #1499.
         assert!(
-            html.contains("allow-popups-to-escape-sandbox"),
-            "allow-popups-to-escape-sandbox must be set so external links work (#3613)"
+            !html.contains("allow-popups-to-escape-sandbox"),
+            "allow-popups-to-escape-sandbox must not be set (security: #1499)"
+        );
+        // open_url handler must be present in shell bridge JS for external links
+        assert!(
+            html.contains("open_url"),
+            "shell bridge must handle open_url messages for external links"
         );
     }
 
@@ -940,7 +991,9 @@ mod tests {
         // The iframe must NOT have a src attribute (which would trigger an
         // immediate load before JS can append the hash fragment).
         assert!(
-            !html.contains(r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox" src="#),
+            !html.contains(
+                r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" src="#
+            ),
             "iframe must use data-src, not src, to avoid loading before JS appends the hash"
         );
         // The iframe must have data-src with the sandbox URL.
