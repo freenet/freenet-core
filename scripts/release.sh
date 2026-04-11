@@ -1132,12 +1132,14 @@ trigger_gateway_updates() {
 }
 
 publish_draft_release() {
-    # Publish the draft release (idempotent -- no-op if already published)
+    # Publish the draft release (idempotent -- no-op if already published).
+    # The cross-compile workflow also publishes via gh release edit --draft=false
+    # as a belt-and-suspenders measure (see cross-compile.yml).
     local is_draft
     is_draft=$(gh release view "v$VERSION" --repo freenet/freenet-core --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
     if [[ "$is_draft" == "true" ]]; then
         echo -n "  Publishing draft release... "
-        gh release edit "v$VERSION" --repo freenet/freenet-core --draft=false
+        gh release edit "v$VERSION" --repo freenet/freenet-core --draft=false > /dev/null
         echo "✓"
     fi
 }
