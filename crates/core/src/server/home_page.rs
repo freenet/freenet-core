@@ -704,7 +704,29 @@ fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Strin
         get = op_cell("GET", ops.gets.0, ops.gets.1),
         put = op_cell("PUT", ops.puts.0, ops.puts.1),
         update = update_cell,
-        subscribe = op_cell("SUBSCRIBE", ops.subscribes.0, ops.subscribes.1),
+        subscribe = {
+            // Show active subscription count as primary metric since the cumulative
+            // operation count includes periodic lease renewals (every 2 min per contract)
+            // which inflates the number and confuses users.
+            let active = snap.contracts.len() as u32;
+            let total_ops = ops.subscribes.0.saturating_add(ops.subscribes.1);
+            if total_ops > 0 {
+                format!(
+                    r#"<div class="op-cell">
+                        <div class="op-name">SUBSCRIBE</div>
+                        <div class="op-count">{active} active</div>
+                        <div class="op-received">{total_ops} ops</div>
+                    </div>"#,
+                )
+            } else {
+                format!(
+                    r#"<div class="op-cell">
+                        <div class="op-name">SUBSCRIBE</div>
+                        <div class="op-count">{active} active</div>
+                    </div>"#,
+                )
+            }
+        },
     )
 }
 
@@ -2487,6 +2509,55 @@ mod tests {
             !html.contains("http-equiv=\"refresh\""),
             "meta refresh must not be present — JS partial update is used instead"
         );
+    }
+
+    #[test]
+    fn subscribe_cell_shows_active_count() {
+        use crate::node::network_status::ContractSnapshot;
+
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.op_stats.subscribes = (250, 3);
+        snap.contracts = vec![
+            ContractSnapshot {
+                key_short: "ABC1...".to_string(),
+                key_full: "ABC123".to_string(),
+                subscribed_secs: 100,
+                last_updated_secs: Some(5),
+            },
+            ContractSnapshot {
+                key_short: "DEF4...".to_string(),
+                key_full: "DEF456".to_string(),
+                subscribed_secs: 50,
+                last_updated_secs: None,
+            },
+        ];
+        let html = build_ops_card(&Some(snap));
+        assert!(
+            html.contains("2 active"),
+            "should show active subscription count, got: {html}"
+        );
+        assert!(
+            html.contains("253 ops"),
+            "should show total ops as secondary info, got: {html}"
+        );
+        assert!(
+            !html.contains("\u{2713} 250"),
+            "should not show raw success/fail format for subscribes"
+        );
+    }
+
+    #[test]
+    fn subscribe_cell_zero_ops_shows_active_only() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.op_stats.gets = (1, 0); // need some ops so card renders
+        let html = build_ops_card(&Some(snap));
+        assert!(
+            html.contains("0 active"),
+            "should show 0 active when no subscriptions, got: {html}"
+        );
+        assert!(!html.contains("0 ops"), "should hide ops line when zero");
     }
 
     #[test]
