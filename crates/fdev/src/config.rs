@@ -35,8 +35,8 @@ pub struct BaseConfig {
     #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub(crate) address: IpAddr,
     /// Full WebSocket URL to connect to (e.g. ws://host:port/secret/v1/contract/command?encodingProtocol=native).
-    /// When provided, --address, --port, and --mode are ignored.
-    #[arg(long, env = "FREENET_NODE_URL")]
+    /// When provided, --address and --port must not be specified.
+    #[arg(long, env = "FREENET_NODE_URL", conflicts_with_all = ["address", "port"])]
     pub(crate) node_url: Option<String>,
 }
 
