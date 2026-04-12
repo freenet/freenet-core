@@ -2209,6 +2209,142 @@ fn test_full_state_send_no_incorrect_caching() {
 }
 
 // =============================================================================
+// Task-per-tx Subscribe ForwardingAck Regression Test (PR #3806)
+// =============================================================================
+
+/// Exercises the task-per-tx client-initiated subscribe path
+/// (`subscribe_with_id` → `start_client_subscribe`) in a multi-node
+/// simulation with network-routed subscribes.
+///
+/// ## Background (PR #3806, #1454 Phase 2b)
+///
+/// Phase 2b migrated client-initiated SUBSCRIBE to a task-per-tx driver.
+/// This test verifies the driver works end-to-end with network round-trips,
+/// retries, and peer selection.
+///
+/// ## ForwardingAck coverage
+///
+/// The ForwardingAck relay bug (commit 5cb6f37c) is covered by unit tests
+/// in `node.rs::callback_forward_tests`. Triggering it in simulation
+/// requires `SeedContract` + `use_mock_wasm=true` so that relay peers
+/// lack the contract. The `SeedContract` framework is in place but the
+/// mock WASM runtime has compatibility issues with `OpCtx::send_and_await`
+/// (separate from the local-completion fix below).
+///
+/// The task-per-tx `send_and_await` path IS exercised here: subscribes
+/// complete with `outcome="subscribed"` via the local-completion synthesis
+/// in the SUBSCRIBE branch of `handle_pure_network_message_v1`.
+#[test_log::test]
+fn test_subscribe_forwarding_ack_relay() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x5CB6_F37C_0001;
+    const NETWORK_NAME: &str = "subscribe-fwd-ack";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1, // 1 gateway
+            4, // 4 regular nodes
+            7, // ring_max_htl
+            3, // rnd_if_htl_above
+            5, // max_connections
+            2, // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xAC);
+    let contract_id = *contract.key().id();
+    let initial_state = SimOperation::create_test_state(1);
+
+    // Gateway PUTs, then multiple nodes subscribe via the task-per-tx path.
+    //
+    // Note: SeedContract (no-propagation local store) is available for
+    // tests that need to control which nodes have the contract, but
+    // requires use_mock_wasm=true which has compatibility issues with
+    // OpCtx::send_and_await. For now, use regular PUT + Subscribe.
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state,
+                subscribe: true,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 4),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+
+    // PRIMARY: simulation must complete without errors.
+    // Before the fix, ForwardingAck on the task-per-tx channel
+    // would cause UnexpectedOpState, crashing the simulation.
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed (ForwardingAck regression?): {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Verify subscribes succeeded.
+    let (success_count, not_found_count) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mut successes = 0usize;
+        let mut not_found = 0usize;
+        for log in logs.iter() {
+            match log.kind.subscribe_outcome() {
+                Some(true) => successes += 1,
+                Some(false) => not_found += 1,
+                None => {}
+            }
+        }
+        (successes, not_found)
+    });
+
+    tracing::info!(
+        success_count,
+        not_found_count,
+        "Subscribe telemetry summary"
+    );
+
+    // 4 explicit subscribes + 1 from gateway's put-with-subscribe.
+    assert!(
+        success_count >= 4,
+        "Expected at least 4 successful subscribes, got {} (not_found={})",
+        success_count,
+        not_found_count,
+    );
+}
+
+// =============================================================================
 // CRDT Emulation Mode Test (PR #2763 Bug Reproduction)
 // =============================================================================
 
@@ -4774,10 +4910,14 @@ fn test_router_prediction_threshold_activation() {
 /// Verifies that the event loop properly cleans up completed/timed-out
 /// transaction callbacks, preventing unbounded HashMap growth.
 ///
-/// Note: The op_execution channel's sender (`notify_op_execution`) is currently
-/// dead code, so pending_op_results is not populated during simulation. This
-/// test serves as a regression guard — if the path is re-enabled (see #3159),
-/// it will catch unbounded growth.
+/// Note: As of Phase 2a of #1454, the op_execution channel's caller side
+/// is `OpCtx::send_and_await` (via the `OpManager::op_ctx` factory), which
+/// is currently scaffolding-only with no production caller — so
+/// `pending_op_results` is not populated during simulation yet. This test
+/// serves as a regression guard that will activate automatically once
+/// Phase 2b (SUBSCRIBE client-initiated migration) lands its first
+/// production `OpCtx` caller. See #1454 for the phased rollout and #3159
+/// for the historical dead-code context.
 #[test]
 #[cfg(feature = "simulation_tests")]
 fn test_pending_op_results_bounded() {
@@ -4791,9 +4931,10 @@ fn test_pending_op_results_bounded() {
     tracing::info!(inserts, removes, hwm, "pending_op_results resource metrics");
 
     if inserts == 0 {
-        // op_execution path is currently dead code; log for visibility
+        // `OpCtx::send_and_await` is Phase 2a scaffolding with no production
+        // caller yet; Phase 2b lands the first consumer (#1454).
         tracing::info!(
-            "pending_op_results path not exercised (notify_op_execution is dead code — see #3159)"
+            "pending_op_results path not exercised (no production OpCtx caller yet — see #1454 phase 2b)"
         );
     }
 
@@ -8255,7 +8396,11 @@ async fn test_nightly_50_node_topology_formation() {
     tracing::info!("Running 1 virtual hour of topology formation...");
     let_network_run(&mut sim, VIRTUAL_DURATION).await;
 
-    // Collect per-node connection counts
+    // Collect per-node connection counts. `connection_count` returns `Option`
+    // and `filter_map` may drop nodes whose ConnectionManager is briefly
+    // unavailable; this matches the baseline `test_connection_growth_stall_regression`
+    // pattern. Percentages are computed against the sampled population, same
+    // as the baseline test.
     let mut node_counts: Vec<usize> = (0..NODES)
         .filter_map(|i| {
             let label = NodeLabel::node(NETWORK_NAME, i);
@@ -8428,14 +8573,17 @@ async fn test_nightly_connection_growth_checkpoints() {
         checkpoint_medians.push((target_secs, median));
     }
 
-    // Monotonic growth — each checkpoint median >= previous.
+    // Near-monotonic growth — each checkpoint median is within 1 connection of
+    // the previous. Topology-aware pruning legitimately trades a single
+    // connection for distribution quality, so a transient -1 dip is healthy
+    // behavior, not a stall.
     for window in checkpoint_medians.windows(2) {
         let (prev_t, prev_median) = window[0];
         let (curr_t, curr_median) = window[1];
         assert!(
-            curr_median >= prev_median,
-            "Connection growth stalled between @{}m (median={}) and @{}m (median={}). \
-             Growth must be monotonic. Seed: 0x{:X}",
+            curr_median + 1 >= prev_median,
+            "Connection growth regressed > 1 between @{}m (median={}) and @{}m (median={}). \
+             Growth must be near-monotonic. Seed: 0x{:X}",
             prev_t / 60,
             prev_median,
             curr_t / 60,
@@ -8519,6 +8667,11 @@ async fn test_nightly_fault_recovery_speed() {
         })
         .collect();
     pre_fault_counts.sort_unstable();
+    assert!(
+        !pre_fault_counts.is_empty(),
+        "Phase 1: no connection managers available. Seed: 0x{:X}",
+        SEED
+    );
     let pre_fault_median = pre_fault_counts[pre_fault_counts.len() / 2];
 
     tracing::info!(
@@ -8551,6 +8704,14 @@ async fn test_nightly_fault_recovery_speed() {
         })
         .collect();
     during_fault_counts.sort_unstable();
+    assert_eq!(
+        during_fault_counts.len(),
+        NODES,
+        "Phase 2: expected connection managers for all {} nodes, got {}. Seed: 0x{:X}",
+        NODES,
+        during_fault_counts.len(),
+        SEED
+    );
     let during_fault_median = during_fault_counts[during_fault_counts.len() / 2];
 
     tracing::info!(
@@ -8559,11 +8720,19 @@ async fn test_nightly_fault_recovery_speed() {
         during_fault_counts
     );
 
-    // No death spiral — network didn't collapse under faults.
+    // Resilience under load: 20% message loss must not push the median below
+    // half of MIN_CONN. The previous `> 0` bar was degenerate (a single peer
+    // surviving on the median node would pass), so it could not detect a
+    // partial death spiral. Half-of-min is the smallest threshold strict
+    // enough to fail on real cascade collapse but loose enough to tolerate
+    // brief pruning during a 5-minute fault window.
+    let during_fault_floor = MIN_CONN / 2;
     assert!(
-        during_fault_median > 0,
-        "Death spiral: median connections dropped to 0 during 20% message loss. \
+        during_fault_median >= during_fault_floor,
+        "Connection collapse under load: during_fault_median={} < MIN_CONN/2={}. \
          Counts: {:?}. Seed: 0x{:X}",
+        during_fault_median,
+        during_fault_floor,
         during_fault_counts,
         SEED
     );
@@ -8581,6 +8750,14 @@ async fn test_nightly_fault_recovery_speed() {
         })
         .collect();
     post_recovery_counts.sort_unstable();
+    assert_eq!(
+        post_recovery_counts.len(),
+        NODES,
+        "Phase 3: expected connection managers for all {} nodes, got {}. Seed: 0x{:X}",
+        NODES,
+        post_recovery_counts.len(),
+        SEED
+    );
 
     let post_recovery_median = post_recovery_counts[post_recovery_counts.len() / 2];
     let isolated_count = post_recovery_counts.iter().filter(|&&c| c == 0).count();
@@ -8595,14 +8772,18 @@ async fn test_nightly_fault_recovery_speed() {
         post_recovery_counts
     );
 
-    // Recovery to near pre-fault levels.
-    // Allow 1 connection of slack for topology churn during the fault period.
+    // Recovery to near pre-fault levels AND back above MIN_CONN. Without the
+    // MIN_CONN floor, `pre_fault_median.saturating_sub(1)` could allow the
+    // post-recovery median to fall below the documented success criterion
+    // (e.g. pre=10, post=9 would silently pass).
+    let recovery_floor = pre_fault_median.saturating_sub(1).max(MIN_CONN);
     assert!(
-        post_recovery_median >= pre_fault_median.saturating_sub(1),
-        "Incomplete recovery: post_recovery_median={} < pre_fault_median={} - 1. \
+        post_recovery_median >= recovery_floor,
+        "Incomplete recovery: post_recovery_median={} < floor={} \
+         (max(pre_fault_median - 1, MIN_CONN)). \
          Pre-fault: {:?}, Post-recovery: {:?}. Seed: 0x{:X}",
         post_recovery_median,
-        pre_fault_median,
+        recovery_floor,
         pre_fault_counts,
         post_recovery_counts,
         SEED

@@ -55,6 +55,27 @@ Usually you'll build `fdev` as part of the Freenet project:
 
 ---
 
+## Connection Options
+
+By default, `fdev` connects to a local Freenet node at `ws://127.0.0.1:7509`. You can customize this with:
+
+- **`--address`** and **`--port`**: Override the host/port for the WebSocket connection.
+- **`--node-url`**: Provide a full WebSocket URL, bypassing address/port construction. This is required when connecting through a gateway proxy that uses an auth secret in the URL path.
+
+```bash
+# Connect via gateway proxy (e.g. from CI/CD)
+fdev --node-url "ws://nova.locut.us:7520/SECRET/v1/contract/command?encodingProtocol=native" \
+    website publish ./public/ --key my-site
+
+# Or via environment variable
+export FREENET_NODE_URL="ws://nova.locut.us:7520/SECRET/v1/contract/command?encodingProtocol=native"
+fdev website publish ./public/ --key my-site
+```
+
+When `--node-url` is provided, `--address` and `--port` cannot be specified.
+
+---
+
 ## Local Node Example
 
 If you want to try out a contract in local mode, you typically run a separate “local node” process that listens for contract commands. There is a `local-node` executable (or an equivalent) in the Freenet repository. You can do something like:
@@ -271,7 +292,7 @@ fdev wasm-runtime \
     --deserialization-format binary \
     --terminal-output
 ```
-- The tool will connect to a local Freenet node by default (see `--mode`, `--address`, `--port` if needed).
+- The tool will connect to a local Freenet node by default (see `--mode`, `--address`, `--port` if needed). Use `--node-url` to connect to a remote gateway via proxy.
 - Commands you type—like `put`, `get`, `update`, or `exit`—are forwarded to the local node.
 - Additional command data is read from the file specified by `--input-file`.
 
@@ -676,7 +697,7 @@ fdev wasm-runtime \
     --deserialization-format json \
     --terminal-output
 ```
-- The tool will connect to a local Freenet node by default (see `--mode`, `--address`, `--port` if needed).
+- The tool will connect to a local Freenet node by default (see `--mode`, `--address`, `--port` if needed). Use `--node-url` to connect to a remote gateway via proxy.
 - Commands you type—like `put`, `get`, `update`, or `exit`—are forwarded to the local node.
 - Additional command data is read from the file specified by `--input-file`.
 

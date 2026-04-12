@@ -22,6 +22,7 @@ use super::{
     ApiVersion, AuthToken, ClientConnection, errors::WebSocketApiError, home_page, path_handlers,
 };
 
+mod permission_prompts;
 mod v1;
 mod v2;
 
@@ -72,15 +73,20 @@ impl HttpClientApi {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
         let origin_contracts = Arc::new(DashMap::new());
-        Self::as_router_with_origin_contracts(socket, origin_contracts)
+        Self::as_router_with_origin_contracts(
+            socket,
+            origin_contracts,
+            crate::contract::user_input::pending_prompts(),
+        )
     }
 
     /// Returns the uninitialized axum router with a provided origin_contracts map.
     ///
     /// Merges V1 and V2 HTTP routes; both currently share the same handler logic.
-    pub fn as_router_with_origin_contracts(
+    pub(crate) fn as_router_with_origin_contracts(
         socket: &SocketAddr,
         origin_contracts: OriginContractMap,
+        pending_prompts: crate::contract::user_input::PendingPrompts,
     ) -> (Self, Router) {
         // Controls the cookie Secure flag: when true, cookies are sent over HTTP
         // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
@@ -111,7 +117,9 @@ impl HttpClientApi {
             )
             .merge(v1::routes(config.clone()))
             .merge(v2::routes(config))
+            .merge(permission_prompts::routes())
             .layer(Extension(origin_contracts.clone()))
+            .layer(Extension(pending_prompts))
             .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
 
         (
@@ -158,45 +166,7 @@ async fn web_home(
         .unwrap_or(false);
 
     if is_sandbox {
-        // Block top-level navigation to sandbox URLs. With allow-popups-to-escape-sandbox
-        // on the iframe, a malicious contract could window.open() its own URL to escape
-        // the sandbox and gain same-origin access to the API. Sec-Fetch-Dest: iframe
-        // is set by the browser automatically and cannot be spoofed by scripts.
-        let fetch_dest = req_headers
-            .get("sec-fetch-dest")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if fetch_dest == "document" {
-            // Top-level navigation to a sandbox URL — redirect to the shell page instead
-            let shell_url = format!("/{}/contract/web/{key}/", api_version.prefix());
-            return Ok(axum::response::Redirect::to(&shell_url).into_response());
-        }
-
-        // Serve sandbox content (contract HTML + WS shim) inside the iframe.
-        // No auth token or cookie — the shell page handles auth via postMessage.
-        let contract_response = path_handlers::serve_sandbox_content(key, api_version).await?;
-        let mut response = contract_response.into_response();
-        add_sandbox_cors_headers(&mut response);
-        // CSP for sandbox content: the iframe has an opaque origin (null) because the
-        // sandbox attribute omits allow-same-origin. This means CSP 'self' won't match
-        // the local API server's actual origin, so we must use the explicit local API
-        // origin derived from the Host header. This allows the iframe to load scripts,
-        // styles, images, and WASM from the local API server while blocking access
-        // to other origins.
-        let local_api_origin = req_headers
-            .get(axum::http::header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .map(|host| format!("http://{host}"))
-            .unwrap_or_else(|| "'self'".to_string());
-        let csp = format!(
-            "default-src {local_api_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {local_api_origin} blob: data:"
-        );
-        if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
-            response
-                .headers_mut()
-                .insert(axum::http::header::CONTENT_SECURITY_POLICY, csp_value);
-        }
-        return Ok(response);
+        return serve_sandbox_response(key, api_version, None, &req_headers).await;
     }
 
     // Shell page: generate auth token, serve iframe wrapper with CSP
@@ -250,7 +220,20 @@ async fn web_subpages(
     key: String,
     last_path: String,
     api_version: ApiVersion,
+    query_string: Option<String>,
+    req_headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, WebSocketApiError> {
+    let is_sandbox = query_string
+        .as_ref()
+        .map(|qs| qs.split('&').any(|p| p == "__sandbox=1"))
+        .unwrap_or(false);
+
+    // For sandbox sub-page requests to HTML files, serve through the sandbox
+    // content pipeline (with WebSocket shim + navigation interceptor injected).
+    if is_sandbox && is_html_page(&last_path) {
+        return serve_sandbox_response(key, api_version, Some(&last_path), &req_headers).await;
+    }
+
     let version_prefix = api_version.prefix();
     let full_path: String = format!("/{version_prefix}/contract/web/{key}/{last_path}");
     path_handlers::variable_content(key, full_path, api_version)
@@ -261,6 +244,68 @@ async fn web_subpages(
             add_sandbox_cors_headers(&mut response);
             response
         })
+}
+
+/// Returns true if the path looks like an HTML page request.
+///
+/// Matches `.html`/`.htm` extensions, directory-style paths (`news/`),
+/// and extensionless paths (`about/team`) that likely resolve to `index.html`.
+fn is_html_page(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".html")
+        || lower.ends_with(".htm")
+        || lower.ends_with('/')
+        || !lower.contains('.')
+}
+
+/// Serves sandbox content (contract HTML + WS shim) inside the iframe and adds
+/// the appropriate CORS and CSP headers.
+///
+/// Shared by `web_home` (for the root page) and `web_subpages` (for sub-pages).
+/// No auth token or cookie -- the shell page handles auth via postMessage.
+///
+/// Includes `Sec-Fetch-Dest` check: if a sandbox URL is loaded as a top-level
+/// document (e.g. pasted in the address bar), redirect to the shell page instead
+/// of serving raw sandbox content outside the iframe.
+async fn serve_sandbox_response(
+    key: String,
+    api_version: ApiVersion,
+    sub_path: Option<&str>,
+    req_headers: &axum::http::HeaderMap,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    // Block top-level navigation to sandbox URLs. Sec-Fetch-Dest: iframe is set
+    // by the browser automatically and cannot be spoofed by scripts.
+    let fetch_dest = req_headers
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if fetch_dest == "document" {
+        let shell_url = format!("/{}/contract/web/{key}/", api_version.prefix());
+        return Ok(axum::response::Redirect::to(&shell_url).into_response());
+    }
+
+    let contract_response =
+        path_handlers::serve_sandbox_content(key, api_version, sub_path).await?;
+    let mut response = contract_response.into_response();
+    add_sandbox_cors_headers(&mut response);
+    // CSP for sandbox content: the iframe has an opaque origin (null) because the
+    // sandbox attribute omits allow-same-origin. This means CSP 'self' won't match
+    // the local API server's actual origin, so we must use the explicit local API
+    // origin derived from the Host header.
+    let local_api_origin = req_headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|host| format!("http://{host}"))
+        .unwrap_or_else(|| "'self'".to_string());
+    let csp = format!(
+        "default-src {local_api_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {local_api_origin} blob: data:"
+    );
+    if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_SECURITY_POLICY, csp_value);
+    }
+    Ok(response)
 }
 
 /// Adds CORS and security headers needed for sandbox iframe responses.
@@ -349,5 +394,39 @@ impl ClientEventsProxy for HttpClientApi {
             Ok(())
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_html_page_detects_html_extensions() {
+        assert!(is_html_page("page.html"));
+        assert!(is_html_page("page.HTML"));
+        assert!(is_html_page("page.htm"));
+        assert!(is_html_page("dir/page.html"));
+    }
+
+    #[test]
+    fn is_html_page_detects_directory_style_paths() {
+        assert!(is_html_page("news/"));
+        assert!(is_html_page("about/team/"));
+    }
+
+    #[test]
+    fn is_html_page_detects_extensionless_paths() {
+        // Extensionless paths are likely directory-style navigation
+        assert!(is_html_page("news"));
+        assert!(is_html_page("about/team"));
+    }
+
+    #[test]
+    fn is_html_page_rejects_non_html_files() {
+        assert!(!is_html_page("app.js"));
+        assert!(!is_html_page("style.css"));
+        assert!(!is_html_page("image.png"));
+        assert!(!is_html_page("assets/app.wasm"));
     }
 }

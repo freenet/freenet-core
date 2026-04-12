@@ -120,8 +120,11 @@ impl<ER> Builder<ER> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(
-            contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
+            contract::contract_handling(
+                contract_handler,
+                crate::contract::user_input::AutoApprovePrompter,
+            )
+            .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
 
         let conn_manager = P2pConnManager::build(
@@ -257,8 +260,11 @@ impl<ER> Builder<ER> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(
-            contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
+            contract::contract_handling(
+                contract_handler,
+                crate::contract::user_input::AutoApprovePrompter,
+            )
+            .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
 
         let conn_manager = P2pConnManager::build(
@@ -332,6 +338,7 @@ impl<ER> Builder<ER> {
         user_events: UsrEv,
         parent_span: tracing::Span,
         shared_storage: MockStateStorage,
+        contract_store: Option<crate::wasm_runtime::InMemoryContractStore>,
     ) -> anyhow::Result<()>
     where
         UsrEv: ClientEventsProxy + Send + 'static,
@@ -385,14 +392,18 @@ impl<ER> Builder<ER> {
             MockWasmHandlerBuilder {
                 identifier: self.contract_handler_name,
                 shared_storage,
+                contract_store,
             },
         )
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
         GlobalExecutor::spawn(
-            contract::contract_handling(contract_handler)
-                .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
+            contract::contract_handling(
+                contract_handler,
+                crate::contract::user_input::AutoApprovePrompter,
+            )
+            .instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling")),
         );
 
         let conn_manager = P2pConnManager::build(

@@ -57,6 +57,8 @@ use tracing::Instrument;
 
 use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
+#[cfg(test)]
+pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
 // Re-export types for dev_tool and testing
 pub use network_bridge::{EventLoopExitReason, NetworkStats, reset_channel_id_counter};
 
@@ -770,6 +772,148 @@ fn op_retry_backoff(attempt: usize) -> Duration {
     Duration::from_millis((5u64 << attempt.min(8)).min(1_000))
 }
 
+/// Route an inbound task-per-tx reply directly to an awaiting
+/// [`OpCtx::send_and_await`][ocxawait] caller, bypassing the legacy op
+/// state machine entirely.
+///
+/// Returns `true` if a callback was registered and the message was forwarded
+/// (or dropped due to a closed receiver, which is also a successful
+/// "bypass taken" from the pipeline's point of view — the legacy path must
+/// not run). Returns `false` if no callback is registered; the caller then
+/// falls through to the legacy `handle_op_request` path.
+///
+/// # Why this exists
+///
+/// Phase 1 (#3802) wired [`forward_pending_op_result_if_completed`] to fire
+/// the callback after the legacy state machine classified the reply as
+/// completed. That only works when a [`crate::operations::OpEnum`] was
+/// previously pushed into [`crate::node::OpManager`]'s per-op DashMap:
+/// `load_or_init` pops it, `process_message` produces
+/// [`crate::operations::OperationResult::SendAndComplete`], and
+/// `is_operation_completed` returns `true`.
+///
+/// Phase 2b's task-per-tx callers (starting with client-initiated SUBSCRIBE,
+/// #1454) never push an op into that DashMap: state lives in the task's
+/// locals. When a reply arrives, `load_or_init` sees an empty slot and
+/// returns [`crate::operations::OpError::OpNotPresent`] (this is the
+/// legacy guard against stale responses arriving after GC cleanup, e.g.
+/// `operations/subscribe.rs:1181-1192`). `handle_op_result` swallows
+/// `OpNotPresent` as benign and returns `Ok(None)`, so
+/// `forward_pending_op_result_if_completed` short-circuits and the
+/// awaiting task hangs forever.
+///
+/// This helper is the fix: any branch of
+/// [`handle_pure_network_message_v1`] that wants to support a task-per-tx
+/// caller checks this first, and on a hit returns without ever touching
+/// `handle_op_request`. Phase 2b adds this guard to the SUBSCRIBE branch
+/// only; Phases 2c/3/4 will add it to their own branches when they
+/// introduce their first task-per-tx callers.
+///
+/// # Safety argument for the bypass
+///
+/// `p2p_protoc::pending_op_results` is only populated via
+/// `p2p_protoc::handle_op_execution`, which is only driven by the
+/// `op_execution_sender` channel. The only way to obtain a clone of that
+/// sender is through [`crate::node::OpManager::op_ctx`] (production
+/// factory) or the in-module `OpCtx` unit tests — both of which construct
+/// an [`OpCtx`][ocx] whose only round-trip method is
+/// [`OpCtx::send_and_await`][ocxawait]. This is a **structural
+/// invariant**, not a convention: the sender field is `pub(crate)` and
+/// there is no other `pub` accessor on `EventLoopNotificationsSender`.
+///
+/// Consequence: legacy paths (SUBSCRIBE renewals, PUT sub-op subscribes,
+/// contract-executor-initiated subscribes, intermediate-peer forwarding)
+/// never appear in `pending_op_results` for their own txs, so the bypass
+/// never triggers for them and their behavior is unchanged.
+///
+/// [ocx]: crate::operations::OpCtx
+/// [ocxawait]: crate::operations::OpCtx::send_and_await
+///
+/// # Channel safety
+///
+/// Uses `try_send` on the bounded capacity-1 channel created by
+/// [`OpCtx::send_and_await`][ocxawait]. On a closed receiver (e.g., caller
+/// timed out or was cancelled) the send fails and is logged; the
+/// pure-network-message handler still makes progress. See
+/// `.claude/rules/channel-safety.md`.
+fn try_forward_task_per_tx_reply(
+    pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+    reply: NetMessage,
+    op_label: &'static str,
+) -> bool {
+    let Some(callback) = pending_op_result else {
+        return false;
+    };
+    let tx_id = *reply.id();
+    if let Err(err) = callback.try_send(reply) {
+        tracing::error!(
+            %err,
+            %tx_id,
+            op = op_label,
+            "Failed to forward task-per-tx reply to OpCtx task"
+        );
+    }
+    true
+}
+
+/// If `op_result` indicates the operation completed and a `pending_op_result`
+/// callback is wired, forward `reply` to the awaiting caller of
+/// [`crate::operations::OpCtx::send_and_await`].
+///
+/// This is the reply side of the async sub-transaction round-trip primitive
+/// introduced by #1454. The caller side — [`OpCtx::send_and_await`][ocx] —
+/// installs a one-shot bounded [`tokio::sync::mpsc::Sender`] into
+/// `p2p_protoc::pending_op_results` keyed by its `Transaction`, and each
+/// branch of `handle_pure_network_message_v1` calls this helper after
+/// `handle_op_request` so the caller can `await` a single reply keyed by
+/// the same `Transaction`.
+///
+/// Wired for PUT and GET historically; extended to SUBSCRIBE, CONNECT, and
+/// UPDATE in Phase 1 of the async-transaction refactor (#1454) so every op
+/// kind can terminate an `OpCtx::send_and_await` round-trip without hanging.
+/// (Phase 1 predates `OpCtx`; the caller side used to live directly on
+/// `OpManager::notify_op_execution`, now deleted. Phase 2a moved the caller
+/// side into `OpCtx` behind an `OpManager::op_ctx` factory.)
+///
+/// [ocx]: crate::operations::OpCtx::send_and_await
+///
+/// # Channel safety
+///
+/// Uses `try_send` rather than `.send().await` on the bounded capacity-1
+/// mpsc channel created by `OpCtx::send_and_await`. This is sound because
+/// the callback is fired **at most once per transaction**: the
+/// `is_operation_completed` guard above combined with the `completed` /
+/// `under_progress` dedup sets in `OpManager` ensures that subsequent
+/// messages for the same tx short-circuit before reaching this code. So
+/// `try_send` on an empty capacity-1 channel cannot fail with `Full` —
+/// it can only fail with `Closed` when the `OpCtx` owner has dropped its
+/// receiver. Using `try_send` eliminates any risk of blocking the
+/// pure-network-message handler if a future consumer ever ends up unable
+/// to drain the reply, satisfying the preference for non-blocking sends
+/// in `.claude/rules/channel-safety.md`.
+///
+/// As of Phase 2a (#1454) this path is still dormant: `pending_op_result`
+/// is always `None` because no production caller of `OpCtx::send_and_await`
+/// exists yet. Phase 2b will introduce the first real caller (SUBSCRIBE
+/// client-initiated path); the `try_send` choice here means Phase 2b does
+/// not need to touch this function.
+fn forward_pending_op_result_if_completed(
+    op_result: &Result<Option<OpEnum>, OpError>,
+    pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+    reply: NetMessage,
+) {
+    if !is_operation_completed(op_result) {
+        return;
+    }
+    let Some(callback) = pending_op_result else {
+        return;
+    };
+    let tx_id = *reply.id();
+    if let Err(err) = callback.try_send(reply) {
+        tracing::error!(%err, %tx_id, "Failed to send message to executor");
+    }
+}
+
 /// Pure network message processing for V1 messages (no client concerns)
 #[allow(clippy::too_many_arguments)]
 async fn handle_pure_network_message_v1<CB>(
@@ -814,6 +958,13 @@ where
                 )
                 .instrument(span)
                 .await;
+
+                // Handle pending operation results (network concern)
+                forward_pending_op_result_if_completed(
+                    &op_result,
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Connect((*op).clone())),
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -865,17 +1016,11 @@ where
                 );
 
                 // Handle pending operation results (network concern)
-                if is_operation_completed(&op_result) {
-                    if let Some(ref op_execution_callback) = pending_op_result {
-                        let tx_id = *op.id();
-                        if let Err(err) = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Put((*op).clone())))
-                            .await
-                        {
-                            tracing::error!(%err, %tx_id, "Failed to send message to executor");
-                        }
-                    }
-                }
+                forward_pending_op_result_if_completed(
+                    &op_result,
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Put((*op).clone())),
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -914,17 +1059,11 @@ where
                 .await;
 
                 // Handle pending operation results (network concern)
-                if is_operation_completed(&op_result) {
-                    if let Some(ref op_execution_callback) = pending_op_result {
-                        let tx_id = *op.id();
-                        if let Err(err) = op_execution_callback
-                            .send(NetMessage::V1(NetMessageV1::Get((*op).clone())))
-                            .await
-                        {
-                            tracing::error!(%err, %tx_id, "Failed to send message to executor");
-                        }
-                    }
-                }
+                forward_pending_op_result_if_completed(
+                    &op_result,
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Get((*op).clone())),
+                );
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -962,6 +1101,13 @@ where
                 )
                 .await;
 
+                // Handle pending operation results (network concern)
+                forward_pending_op_result_if_completed(
+                    &op_result,
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Update((*op).clone())),
+                );
+
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
                         OpNotAvailable::Running => {
@@ -990,6 +1136,38 @@ where
                 .await;
             }
             NetMessageV1::Subscribe(ref op) => {
+                // Phase 2b (#1454): task-per-tx bypass for client-initiated
+                // SUBSCRIBE. See `try_forward_task_per_tx_reply` for the
+                // full reasoning (reply-side structural gap between Phase
+                // 1's forwarding hook and task-per-tx callers who never
+                // push an op into the OpManager DashMap).
+                //
+                // Only forward **terminal** Response messages to the
+                // task-per-tx channel. Non-terminal messages like
+                // ForwardingAck (sent by relay peers to signal "I'm working
+                // on it") must NOT be forwarded: they would fill the
+                // capacity-1 reply channel before the real Response arrives,
+                // causing the task to classify the ForwardingAck as
+                // Unexpected and fail with UnexpectedOpState.
+                //
+                // When a Response IS present and a callback is registered,
+                // the bypass returns Ok(None) and skips handle_op_request.
+                // For non-Response messages (Request, ForwardingAck, etc.)
+                // with a pending callback, the bypass doesn't fire and we
+                // fall through to handle_op_request. If handle_op_request
+                // completes the operation (e.g., local subscribe completion),
+                // forward_pending_op_result_if_completed below delivers
+                // the result to the OpCtx::send_and_await callback.
+                if matches!(op, subscribe::SubscribeMsg::Response { .. })
+                    && try_forward_task_per_tx_reply(
+                        pending_op_result.as_ref(),
+                        NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
+                        "subscribe",
+                    )
+                {
+                    return Ok(None);
+                }
+
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                     &op_manager,
                     &mut conn_manager,
@@ -997,6 +1175,50 @@ where
                     source_addr,
                 )
                 .await;
+
+                // Forward result to OpCtx::send_and_await callback when
+                // the operation completes. This path fires when the
+                // originator processes its own Request locally via
+                // handle_op_execution (pending_op_result is Some) and
+                // the subscribe completes without needing the network
+                // (e.g., contract available locally). Without this,
+                // the response_sender in pending_op_results is dropped
+                // without a reply, causing send_and_await to fail.
+                //
+                // We synthesize a Response (not forward the original
+                // Request) because classify_reply in op_ctx_task expects
+                // a SubscribeMsg::Response variant.
+                if let Some(ref callback) = pending_op_result {
+                    if is_operation_completed(&op_result) {
+                        let instance_id = match op {
+                            subscribe::SubscribeMsg::Request { instance_id, .. }
+                            | subscribe::SubscribeMsg::Response { instance_id, .. }
+                            | subscribe::SubscribeMsg::Unsubscribe { instance_id, .. }
+                            | subscribe::SubscribeMsg::ForwardingAck { instance_id, .. } => {
+                                *instance_id
+                            }
+                        };
+                        let result = match &op_result {
+                            Ok(Some(OpEnum::Subscribe(sub_op))) => match sub_op.completed_key() {
+                                Some(key) => subscribe::SubscribeMsgResult::Subscribed { key },
+                                None => subscribe::SubscribeMsgResult::NotFound,
+                            },
+                            _ => subscribe::SubscribeMsgResult::NotFound,
+                        };
+                        let reply = NetMessage::from(subscribe::SubscribeMsg::Response {
+                            id: *op.id(),
+                            instance_id,
+                            result,
+                        });
+                        if let Err(err) = callback.try_send(reply) {
+                            tracing::debug!(
+                                %err,
+                                "subscribe local-completion: callback send failed \
+                                 (task may have timed out)"
+                            );
+                        }
+                    }
+                }
 
                 if let Err(OpError::OpNotAvailable(state)) = &op_result {
                     match state {
@@ -1774,53 +1996,78 @@ fn get_peer_key_from_addr(
         .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()))
 }
 
-/// Attempts to subscribe to a contract
+/// Attempts to subscribe to a contract. Thin wrapper around
+/// [`subscribe_with_id`] that allocates a fresh transaction.
 #[allow(dead_code)]
 pub async fn subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
 ) -> Result<Transaction, OpError> {
-    // Client-initiated subscriptions are never renewals
-    subscribe_with_id(op_manager, instance_id, client_id, None, false).await
+    subscribe_with_id(op_manager, instance_id, client_id, None).await
 }
 
-/// Attempts to subscribe to a contract with a specific transaction ID (for deduplication)
+/// Attempts to subscribe to a contract with a specific transaction ID (for deduplication).
 ///
-/// `is_renewal` indicates whether this is a renewal (requester already has the contract).
-/// If true, the responder will skip sending state to save bandwidth.
+/// Since #1454 Phase 2b, this function is the entry point for
+/// **client-initiated** SUBSCRIBE only — it spawns a task-per-tx driver via
+/// [`crate::operations::subscribe::start_client_subscribe`] rather than going
+/// through the legacy `request_subscribe` + `handle_op_result` re-entry loop.
+///
+/// The renewal-initiated path (`ring::connection_maintenance`), the PUT
+/// sub-op path (`operations::start_subscription_request_internal`), and the
+/// executor/WASM-initiated path (`contract::executor::SubscribeContract::resume_op`)
+/// all call `subscribe::request_subscribe` directly and bypass this function,
+/// so they continue on the legacy path unchanged.
+///
+/// The legacy `is_renewal` parameter has been removed in Phase 2b: no live
+/// caller passes `true`, and the task-per-tx path does not carry renewal
+/// jitter / spam-prevention semantics (those are owned by
+/// `ring::connection_maintenance` and are load-bearing there). Accepting
+/// `is_renewal=true` here would silently route a renewal through the wrong
+/// code path — removing the parameter makes the misuse a compile error
+/// instead of a runtime footgun (review finding L1).
+///
+/// # Parameters
+///
+/// - `client_id`: If set, registers a legacy subscription-result waiter via
+///   `ch_outbound.waiting_for_subscription_result`. Both WS call sites in
+///   `client_events.rs` leave this `None` because they pre-register a
+///   transaction-result waiter via `waiting_for_transaction_result`.
+/// - `transaction_id`: The client-visible transaction id. If `None`, a fresh
+///   one is allocated — currently only the dead-code wrapper `subscribe()`
+///   does this.
 pub async fn subscribe_with_id(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_id: Option<ClientId>,
     transaction_id: Option<Transaction>,
-    is_renewal: bool,
 ) -> Result<Transaction, OpError> {
-    let op = match transaction_id {
-        Some(id) => subscribe::start_op_with_id(instance_id, id, is_renewal),
-        None => subscribe::start_op(instance_id, is_renewal),
+    let client_tx = match transaction_id {
+        Some(id) => id,
+        None => Transaction::new::<subscribe::SubscribeMsg>(),
     };
-    let id = op.id;
+
     if let Some(client_id) = client_id {
         use crate::client_events::RequestId;
-        // Generate a default RequestId for internal subscription operations
+        // Generate a default RequestId for internal subscription operations.
+        // Legacy behaviour preserved: callers that pass a `client_id` expect
+        // the subscription-result waiter to be registered here. The WS path
+        // does not hit this branch (it pre-registers its own waiter).
         let request_id = RequestId::new();
         if let Err(e) = op_manager
             .ch_outbound
-            .waiting_for_subscription_result(id, instance_id, client_id, request_id)
+            .waiting_for_subscription_result(client_tx, instance_id, client_id, request_id)
             .await
         {
-            tracing::warn!(tx = %id, error = %e, "failed to register subscription result waiter");
+            tracing::warn!(tx = %client_tx, error = %e, "failed to register subscription result waiter");
         }
     }
-    // Initialize a subscribe op.
-    match subscribe::request_subscribe(&op_manager, op).await {
-        Err(err) => {
-            tracing::error!("{}", err);
-            Err(err)
-        }
-        Ok(()) => Ok(id),
-    }
+
+    // Task-per-tx: spawn the driver and return the client-visible tx
+    // immediately. The spawned task owns retries, peer selection, local
+    // completion, and result delivery via `result_router_tx`.
+    subscribe::start_client_subscribe(op_manager, instance_id, client_tx).await
 }
 
 async fn handle_aborted_op(
@@ -2460,6 +2707,448 @@ mod tests {
                 classify_op_outcome(TransactionType::Put, OpOutcome::Incomplete);
             assert!(matches!(op_type, Some(OpType::Put)));
             assert!(!success);
+        }
+    }
+
+    // Phase 1 (#1454) tests for forward_pending_op_result_if_completed.
+    //
+    // These exercise the callback-forwarding helper used by every branch of
+    // `handle_pure_network_message_v1`. The helper is the only place that
+    // drives the `pending_op_result` oneshot channel from a completed op
+    // result back to a caller of `OpCtx::send_and_await`. Phase 1 extended
+    // the hook from PUT/GET only to cover SUBSCRIBE/CONNECT/UPDATE as well,
+    // so these tests verify the helper forwards correctly for every op
+    // variant and short-circuits in the negative cases. (The caller side
+    // used to live on `OpManager::notify_op_execution`, which Phase 2a
+    // replaced with `OpCtx::send_and_await` — see #1454.)
+    mod callback_forward_tests {
+        use super::super::{
+            OpError, OpNotAvailable, forward_pending_op_result_if_completed,
+            try_forward_task_per_tx_reply,
+        };
+        use crate::message::{MessageStats, NetMessage, NetMessageV1, Transaction};
+        use crate::operations::OpEnum;
+        use crate::operations::connect::{ConnectMsg, ConnectOp, ConnectState};
+
+        fn completed_connect_op() -> ConnectOp {
+            ConnectOp::with_state(ConnectState::Completed)
+        }
+
+        fn dummy_reply() -> NetMessage {
+            // We don't care about the payload — the helper only looks at
+            // `NetMessage::id()` for logging. Use the tx-only `Aborted`
+            // variant to avoid building an entire ConnectMsg payload.
+            NetMessage::V1(NetMessageV1::Aborted(Transaction::new::<ConnectMsg>()))
+        }
+
+        #[tokio::test]
+        async fn forwards_reply_when_completed_and_sender_present() {
+            let op = completed_connect_op();
+            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let reply = dummy_reply();
+            let expected_id = *reply.id();
+
+            forward_pending_op_result_if_completed(&op_result, Some(&tx), reply);
+
+            let received = rx.try_recv().expect("helper should forward the reply");
+            assert_eq!(*received.id(), expected_id);
+        }
+
+        #[tokio::test]
+        async fn no_forward_when_sender_absent() {
+            // Helper must not panic / block when no pending_op_result sender is wired.
+            let op = completed_connect_op();
+            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
+
+            forward_pending_op_result_if_completed(&op_result, None, dummy_reply());
+            // Nothing to assert beyond "did not panic".
+        }
+
+        #[tokio::test]
+        async fn no_forward_when_op_not_completed() {
+            // `Ok(None)` and OpError variants should not trigger a send even if
+            // a sender is present. This is the guard that keeps in-progress
+            // ops (e.g. `SendAndContinue`) from prematurely firing the callback.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+
+            let ok_none: Result<Option<OpEnum>, OpError> = Ok(None);
+            forward_pending_op_result_if_completed(&ok_none, Some(&tx), dummy_reply());
+            assert!(rx.try_recv().is_err(), "Ok(None) must not forward");
+
+            let err_running: Result<Option<OpEnum>, OpError> =
+                Err(OpError::OpNotAvailable(OpNotAvailable::Running));
+            forward_pending_op_result_if_completed(&err_running, Some(&tx), dummy_reply());
+            assert!(
+                rx.try_recv().is_err(),
+                "OpNotAvailable::Running must not forward"
+            );
+
+            let err_completed: Result<Option<OpEnum>, OpError> =
+                Err(OpError::OpNotAvailable(OpNotAvailable::Completed));
+            forward_pending_op_result_if_completed(&err_completed, Some(&tx), dummy_reply());
+            assert!(
+                rx.try_recv().is_err(),
+                "OpNotAvailable::Completed must not forward (no OpEnum payload)"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_forward_when_op_in_progress() {
+            // A non-completed op state (WaitingForResponses) must not trigger
+            // the callback even though the op exists — this is the core guard
+            // that keeps mid-flight operations from prematurely terminating
+            // an `OpCtx::send_and_await` round-trip.
+            use crate::operations::connect::JoinerState;
+            use std::collections::HashSet;
+            use tokio::time::Instant;
+
+            let waiting = ConnectState::WaitingForResponses(JoinerState {
+                target_connections: 1,
+                observed_address: None,
+                accepted: HashSet::new(),
+                last_progress: Instant::now(),
+                started_without_address: true,
+            });
+            let op = ConnectOp::with_state(waiting);
+            assert!(
+                !op.is_completed(),
+                "precondition: WaitingForResponses must not be completed"
+            );
+            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            forward_pending_op_result_if_completed(&op_result, Some(&tx), dummy_reply());
+            assert!(
+                rx.try_recv().is_err(),
+                "in-progress op must not forward to pending_op_result"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_hang_when_receiver_dropped() {
+            // Regression guard for the `try_send` channel-safety choice:
+            // if the `OpCtx::send_and_await` caller drops its receiver
+            // (e.g. cancelled, timed out) before the op completes, the
+            // reply side must not block the pure-network-message handler.
+            // With `try_send` the send fails with `Closed` and we log;
+            // with `.send().await` it would have succeeded but stranded
+            // the message. Either way the handler must make progress —
+            // the test asserts the helper returns promptly (the
+            // `#[tokio::test]` runtime would hang the whole test process
+            // on regression).
+            let op = completed_connect_op();
+            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            drop(rx);
+
+            forward_pending_op_result_if_completed(&op_result, Some(&tx), dummy_reply());
+            // Returning at all is the assertion.
+        }
+
+        // ───────────────────────────────────────────────────────────
+        // Phase 2b (#1454) task-per-tx bypass tests for
+        // `try_forward_task_per_tx_reply`.
+        //
+        // The bypass routes a reply directly to an awaiting
+        // `OpCtx::send_and_await` caller, skipping the legacy
+        // `handle_op_request` path entirely. These tests cover the
+        // helper's contract; end-to-end "the SUBSCRIBE branch of
+        // `handle_pure_network_message_v1` actually invokes the helper"
+        // coverage comes from the `run_client_subscribe` tests added
+        // alongside the Phase 2b migration.
+        // ───────────────────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn bypass_forwards_when_callback_registered() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let reply = dummy_reply();
+            let expected_id = *reply.id();
+
+            let taken = try_forward_task_per_tx_reply(Some(&tx), reply, "subscribe");
+            assert!(taken, "callback present → bypass must be taken");
+
+            let received = rx
+                .try_recv()
+                .expect("helper should forward the reply to the callback");
+            assert_eq!(*received.id(), expected_id);
+        }
+
+        #[tokio::test]
+        async fn bypass_returns_false_when_no_callback() {
+            // No callback registered → caller must fall through to legacy
+            // `handle_op_request`. The helper must not panic and must
+            // return `false`.
+            let taken = try_forward_task_per_tx_reply(None, dummy_reply(), "subscribe");
+            assert!(!taken, "no callback → bypass must not be taken");
+        }
+
+        #[tokio::test]
+        async fn bypass_returns_true_even_when_receiver_dropped() {
+            // Structural rule: once a callback is registered, the bypass
+            // is taken — the legacy path must NOT run regardless of
+            // whether the task-side receiver is still alive. If the task
+            // was cancelled and dropped its receiver, `try_send` fails
+            // with `Closed` and we log, but we still return `true` so
+            // the caller returns `Ok(None)` from the pipeline.
+            //
+            // Running `handle_op_request` in this case would call
+            // `load_or_init` on an empty DashMap and return
+            // `OpNotPresent`, which is meaningless for a tx owned by a
+            // (now-dead) task and pointlessly wastes a pipeline
+            // iteration.
+            let (tx, rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            drop(rx);
+
+            let taken = try_forward_task_per_tx_reply(Some(&tx), dummy_reply(), "subscribe");
+            assert!(
+                taken,
+                "callback present but receiver dropped → bypass still taken"
+            );
+        }
+
+        /// Pin the bypass call site. Without this regression guard a
+        /// future refactor could delete the
+        /// `try_forward_task_per_tx_reply` invocation in the SUBSCRIBE
+        /// branch of `handle_pure_network_message_v1` and the unit tests
+        /// on the helper itself would still pass — because unit coverage
+        /// on the helper only proves the helper works, not that it's
+        /// wired in. Integration (simulation) failures would catch it
+        /// eventually but as end-to-end hangs, which is a noisy signal.
+        ///
+        /// This test reads the `node.rs` source at compile time via
+        /// `include_str!` and asserts that the SUBSCRIBE branch of
+        /// `handle_pure_network_message_v1` invokes
+        /// `try_forward_task_per_tx_reply` before running
+        /// `handle_op_request`. A refactor that deletes the bypass call
+        /// will fail this test at the unit-test level (review finding
+        /// Testing #1).
+        ///
+        /// If the match arm structure changes (e.g. SUBSCRIBE branch
+        /// moves or is renamed), the string patterns below need to be
+        /// updated to match. That's a load-bearing but intentional
+        /// coupling — the whole point is to fail loudly when the wiring
+        /// changes so the change is noticed.
+        #[test]
+        fn bypass_is_wired_into_subscribe_branch_regression_guard() {
+            // Full file text, read at compile time.
+            const SOURCE: &str = include_str!("node.rs");
+
+            // Locate the SUBSCRIBE branch of handle_pure_network_message_v1.
+            let subscribe_branch_anchor = "NetMessageV1::Subscribe(ref op) => {";
+            let branch_start = SOURCE.find(subscribe_branch_anchor).expect(
+                "SUBSCRIBE branch of handle_pure_network_message_v1 not found; \
+                         the match arm has been renamed or moved — update this regression guard",
+            );
+
+            // Slice a window large enough to contain the branch body up
+            // to (and including) the first `handle_op_request` call.
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<subscribe::SubscribeOp, _>")
+                .expect("SUBSCRIBE branch no longer calls handle_op_request — update guard")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+
+            // The bypass helper MUST be invoked BEFORE the legacy
+            // handle_op_request call. If this assertion fails, either:
+            //   (a) the bypass was removed (regression — re-add it), or
+            //   (b) the branch was restructured (update this guard).
+            assert!(
+                window.contains("try_forward_task_per_tx_reply("),
+                "SUBSCRIBE branch no longer calls try_forward_task_per_tx_reply \
+                 before handle_op_request. This is the bypass Phase 2b (#1454) \
+                 added to prevent task-per-tx callers from hanging on replies \
+                 that load_or_init would drop as OpNotPresent. Either restore \
+                 the bypass invocation or update this regression guard if the \
+                 branch has been legitimately refactored."
+            );
+
+            // The bypass MUST be gated on Response-only. Without this
+            // filter, non-terminal messages like ForwardingAck fill the
+            // capacity-1 reply channel and cause UnexpectedOpState
+            // (commit 5cb6f37c).
+            assert!(
+                window.contains("matches!(op, subscribe::SubscribeMsg::Response { .. })"),
+                "SUBSCRIBE branch bypass is not gated on Response-only. \
+                 Non-terminal messages (ForwardingAck, Unsubscribe) must NOT \
+                 be forwarded to the task-per-tx channel — they would fill \
+                 the capacity-1 reply slot and block the real Response."
+            );
+        }
+
+        #[tokio::test]
+        async fn bypass_does_not_block_when_channel_already_full() {
+            // Defensive regression: `try_send` on a full channel must
+            // fail without blocking the pure-network-message handler.
+            // Although Phase 1's dedup guarantees the callback fires at
+            // most once per tx (so a "full" capacity-1 channel
+            // shouldn't happen in practice), this test pins the
+            // non-blocking contract so future refactors can't
+            // accidentally switch to `.send().await` and reintroduce
+            // the class of bug documented in
+            // `.claude/rules/channel-safety.md`.
+            let (tx, _rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            // Pre-fill the capacity-1 channel.
+            tx.try_send(dummy_reply())
+                .expect("capacity-1 channel should accept first message");
+
+            let taken = try_forward_task_per_tx_reply(Some(&tx), dummy_reply(), "subscribe");
+            assert!(
+                taken,
+                "callback present but channel full → bypass still taken"
+            );
+            // The test would hang on regression: blocking `send().await`
+            // on a full channel whose receiver is still alive would
+            // stall the `#[tokio::test]` runtime indefinitely.
+        }
+
+        // Note on per-variant coverage: Phase 1's point is that every op
+        // variant of `handle_pure_network_message_v1` can terminate an
+        // `OpCtx::send_and_await` round-trip. The helper tested above is
+        // variant-agnostic once the `is_operation_completed` guard passes,
+        // and each op's own `is_completed` impl is covered by unit tests in
+        // `crates/core/src/operations/{connect,put,get,subscribe,update}.rs`.
+        // The remaining "do the five branches of `handle_pure_network_message_v1`
+        // actually invoke the helper with the matching reply variant?"
+        // question is enforced by the compiler — each branch binds `ref op`
+        // for the concrete op type and reconstructs the same variant before
+        // handing it to `forward_pending_op_result_if_completed`. An
+        // end-to-end integration test that spins up a node and exercises
+        // `OpCtx::send_and_await` for each op kind belongs in Phase 2b,
+        // where the first real production caller is added.
+
+        // ───────────────────────────────────────────────────────────
+        // Regression tests for the subscribe-branch message-type
+        // filter added in the ForwardingAck fix (5cb6f37c).
+        //
+        // The bug: `try_forward_task_per_tx_reply` was called for ALL
+        // subscribe message types (including ForwardingAck). A relay
+        // peer's ForwardingAck would fill the capacity-1 reply
+        // channel, causing the task to receive it instead of the
+        // real Response and fail with UnexpectedOpState.
+        //
+        // These tests verify the filtering logic that
+        // `handle_pure_network_message_v1` applies BEFORE calling the
+        // bypass helper: only `SubscribeMsg::Response` is forwarded.
+        // ───────────────────────────────────────────────────────────
+
+        use crate::operations::VisitedPeers;
+        use crate::operations::subscribe::{SubscribeMsg, SubscribeMsgResult};
+
+        /// Helper: simulate the filtering logic from the SUBSCRIBE
+        /// branch of `handle_pure_network_message_v1`. Returns
+        /// `true` if the message would be forwarded to the
+        /// task-per-tx channel (and the branch would return early).
+        fn subscribe_branch_would_forward(
+            op: &SubscribeMsg,
+            callback: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+        ) -> bool {
+            matches!(op, SubscribeMsg::Response { .. })
+                && try_forward_task_per_tx_reply(
+                    callback,
+                    NetMessage::V1(NetMessageV1::Subscribe(op.clone())),
+                    "subscribe",
+                )
+        }
+
+        #[tokio::test]
+        async fn subscribe_response_is_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32]);
+            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                instance_id,
+                freenet_stdlib::prelude::CodeHash::new([2u8; 32]),
+            );
+            let op = SubscribeMsg::Response {
+                id: sub_tx,
+                instance_id,
+                result: SubscribeMsgResult::Subscribed { key },
+            };
+
+            let taken = subscribe_branch_would_forward(&op, Some(&tx));
+            assert!(taken, "Response with callback → must be forwarded");
+
+            let received = rx.try_recv().expect("Response should be in channel");
+            assert_eq!(*received.id(), sub_tx);
+        }
+
+        #[tokio::test]
+        async fn forwarding_ack_is_not_forwarded_to_task() {
+            // ForwardingAck is non-terminal: relay peers send it to
+            // signal "I'm working on it". Forwarding it would fill
+            // the capacity-1 channel and block the real Response.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([3u8; 32]);
+            let op = SubscribeMsg::ForwardingAck {
+                id: sub_tx,
+                instance_id,
+            };
+
+            let taken = subscribe_branch_would_forward(&op, Some(&tx));
+            assert!(
+                !taken,
+                "ForwardingAck must NOT be forwarded to task channel"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "channel must remain empty after ForwardingAck"
+            );
+        }
+
+        #[tokio::test]
+        async fn unsubscribe_is_not_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([4u8; 32]);
+            let op = SubscribeMsg::Unsubscribe {
+                id: sub_tx,
+                instance_id,
+            };
+
+            let taken = subscribe_branch_would_forward(&op, Some(&tx));
+            assert!(!taken, "Unsubscribe must NOT be forwarded to task channel");
+            assert!(rx.try_recv().is_err(), "channel must remain empty");
+        }
+
+        #[tokio::test]
+        async fn request_is_not_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([5u8; 32]);
+            let op = SubscribeMsg::Request {
+                id: sub_tx,
+                instance_id,
+                htl: 5,
+                visited: VisitedPeers::new(&sub_tx),
+                is_renewal: false,
+            };
+
+            let taken = subscribe_branch_would_forward(&op, Some(&tx));
+            assert!(!taken, "Request must NOT be forwarded to task channel");
+            assert!(rx.try_recv().is_err(), "channel must remain empty");
+        }
+
+        #[tokio::test]
+        async fn response_without_callback_falls_through() {
+            // No callback registered (legacy path) — filter must
+            // return false so handle_op_request runs.
+            let sub_tx = Transaction::new::<SubscribeMsg>();
+            let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([6u8; 32]);
+            let op = SubscribeMsg::Response {
+                id: sub_tx,
+                instance_id,
+                result: SubscribeMsgResult::NotFound,
+            };
+
+            let taken = subscribe_branch_would_forward(&op, None);
+            assert!(
+                !taken,
+                "Response without callback → must fall through to legacy path"
+            );
         }
     }
 }

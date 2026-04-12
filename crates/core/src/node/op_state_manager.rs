@@ -30,7 +30,7 @@ use crate::{
         TransactionType,
     },
     operations::{
-        OpEnum, OpError,
+        OpCtx, OpEnum, OpError,
         connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
         get::GetOp,
         orphan_streams::OrphanStreamRegistry,
@@ -698,22 +698,16 @@ impl OpManager {
             .remove_peer_interest(contract, &peer_key);
     }
 
-    #[allow(dead_code)] // FIXME: enable async sub-transactions
-    pub async fn notify_op_execution(&self, msg: NetMessage) -> Result<NetMessage, OpError> {
-        let (response_sender, mut response_receiver): (
-            tokio::sync::mpsc::Sender<NetMessage>,
-            tokio::sync::mpsc::Receiver<NetMessage>,
-        ) = tokio::sync::mpsc::channel(1);
-
-        self.to_event_listener
-            .op_execution_sender
-            .send((response_sender, msg))
-            .await
-            .map_err(|_| OpError::NotificationError)?;
-        match response_receiver.recv().await {
-            Some(msg) => Ok(msg),
-            None => Err(OpError::NotificationError),
-        }
+    /// Build a per-transaction [`OpCtx`] bound to `tx`.
+    ///
+    /// Phase 2a factory for the async sub-transaction refactor (#1454). The
+    /// returned context clones the event-loop `op_execution_sender` and is
+    /// the only supported way to obtain an `OpCtx` outside this crate's
+    /// unit tests. See [`OpCtx`] for scope, single-use semantics, and the
+    /// "where to call this" guidance.
+    #[allow(dead_code)] // Phase 2a scaffolding: first production caller lands in Phase 2b (#1454).
+    pub fn op_ctx(&self, tx: Transaction) -> OpCtx {
+        OpCtx::new(tx, self.to_event_listener.op_execution_sender.clone())
     }
 
     /// Send an event to the contract handler and await a response event from it if successful.
@@ -877,6 +871,56 @@ impl OpManager {
         };
         self.ops.under_progress.insert(*id);
         Ok(op)
+    }
+
+    /// Emit a `NodeEvent::TransactionCompleted(tx)` to the event loop,
+    /// triggering cleanup of any `pending_op_results` entry keyed by `tx`.
+    ///
+    /// Used by Phase 2b's task-per-tx subscribe path (#1454) to release
+    /// the per-attempt callback slot in `p2p_protoc::pending_op_results`
+    /// after each `OpCtx::send_and_await` round-trip finishes. Without
+    /// this emission the attempt-tx entries accumulate until either the
+    /// periodic 60 s cleanup sweeps closed senders or the node shuts
+    /// down — see `test_pending_op_results_bounded` for the regression
+    /// guard.
+    ///
+    /// Distinct from [`Self::send_client_result`] which also emits this
+    /// event but additionally pushes a `HostResult` through
+    /// `result_router_tx`. The task-per-tx path has many attempt txs
+    /// per client tx, so per-attempt cleanup can't go through
+    /// `send_client_result` (that would publish N duplicate results to
+    /// the client).
+    ///
+    /// # Blocking vs non-blocking send
+    ///
+    /// Uses `send().await` wrapped in [`Self::NOTIFICATION_SEND_TIMEOUT`]
+    /// rather than `try_send` because the cleanup is load-bearing: a
+    /// dropped `TransactionCompleted` on a transiently-full notification
+    /// channel would leave the `pending_op_results` slot in place until
+    /// the 60 s periodic sweep runs, which
+    /// `test_pending_op_results_bounded` is designed to catch. Since this
+    /// method is only called from spawned task bodies (never from an
+    /// event loop), `send().await` is within the `.claude/rules/channel-safety.md`
+    /// rules. The 30 s timeout guards against a genuinely wedged event
+    /// loop — the same timeout [`Self::notify_op_change`] uses.
+    ///
+    /// # Side effects on other `TransactionCompleted` consumers
+    ///
+    /// The `p2p_protoc::handle_notification_message` branch for
+    /// `TransactionCompleted` (lines 2030–2036) also calls
+    /// `state.tx_to_client.remove(&tx)`. For task-per-tx attempt txs this
+    /// is a tolerated no-op: `tx_to_client` is only populated on
+    /// client-visible txs via `ch_outbound.waiting_for_subscription_result`
+    /// / `waiting_for_transaction_result`, never on per-attempt txs. If a
+    /// future change starts keying `tx_to_client` by attempt tx, this
+    /// eager cleanup will silently drop mappings and must be revisited.
+    pub(crate) async fn release_pending_op_slot(&self, tx: Transaction) {
+        release_pending_op_slot_on(
+            self.to_event_listener.notifications_sender(),
+            tx,
+            Self::NOTIFICATION_SEND_TIMEOUT,
+        )
+        .await
     }
 
     pub fn completed(&self, id: Transaction) {
@@ -1168,6 +1212,52 @@ impl OpManager {
         self.neighbor_hosting.on_peer_disconnected(pub_key);
         self.interest_manager
             .schedule_deferred_removal(&PeerKey::from(pub_key.clone()));
+    }
+}
+
+/// Emit `NodeEvent::TransactionCompleted(tx)` through a provided
+/// notification sender, timeout-wrapped so a wedged event loop does not
+/// hang the caller forever.
+///
+/// Extracted from [`OpManager::release_pending_op_slot`] so the channel
+/// interaction can be unit-tested in isolation without building a full
+/// `OpManager` (review finding T-3). The `OpManager` method is a thin
+/// wrapper around this free function.
+///
+/// Uses `send().await` (wrapped in `timeout`) rather than `try_send`
+/// because the caller is Phase 2b's task-per-tx subscribe driver
+/// spawned via `GlobalExecutor::spawn` — a short blocking wait is
+/// within the channel-safety rules for that context, and dropping the
+/// event on transient backpressure would re-introduce the
+/// `test_pending_op_results_bounded` leak.
+async fn release_pending_op_slot_on(
+    notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
+    tx: Transaction,
+    timeout: Duration,
+) {
+    match tokio::time::timeout(
+        timeout,
+        notifications_sender.send(Either::Right(NodeEvent::TransactionCompleted(tx))),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            tracing::warn!(
+                %tx,
+                "release_pending_op_slot: notification channel closed; \
+                 pending_op_results entry will be reclaimed by 60s sweep"
+            );
+        }
+        Err(_) => {
+            tracing::error!(
+                %tx,
+                timeout_secs = timeout.as_secs(),
+                "release_pending_op_slot: notification channel full for too long; \
+                 event loop may be stuck; pending_op_results entry will be \
+                 reclaimed by 60s sweep"
+            );
+        }
     }
 }
 
@@ -2175,6 +2265,161 @@ mod tests {
         assert!(
             !delivered,
             "notification delivery should fail once receiver is dropped"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // `release_pending_op_slot_on` tests (#1454 Phase 2b,
+    // review finding T-3). Tests the extracted helper directly
+    // so we don't need to build a full OpManager.
+    // ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn release_pending_op_slot_emits_transaction_completed() {
+        // Happy path: the helper must emit exactly one
+        // `TransactionCompleted(tx)` on the notification channel.
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::ttl_transaction();
+
+        super::release_pending_op_slot_on(
+            notifier.notifications_sender(),
+            tx,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let received = timeout(Duration::from_millis(100), notifications_receiver.recv())
+            .await
+            .expect("timed out waiting for TransactionCompleted emission")
+            .expect("notification channel closed");
+
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match received {
+            Either::Right(NodeEvent::TransactionCompleted(observed)) => {
+                assert_eq!(observed, tx, "emitted tx must match the argument");
+            }
+            other => panic!("expected TransactionCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn release_pending_op_slot_blocks_through_backpressure() {
+        // Regression guard for review finding M1: the earlier
+        // `try_send` implementation would silently drop the cleanup
+        // event when the notification channel was transiently full.
+        // The `send().await` implementation must block and deliver
+        // once the consumer drains one slot.
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        // Saturate the channel up to its capacity. The channel
+        // capacity is whatever `event_loop_notification_channel`
+        // configures — we don't hard-code it. Pre-fill until
+        // `try_send` fails, then use that count.
+        let filler_tx = Transaction::ttl_transaction();
+        let mut pre_filled = 0usize;
+        loop {
+            match notifier
+                .notifications_sender()
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(filler_tx)))
+            {
+                Ok(()) => pre_filled += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed while pre-filling")
+                }
+            }
+            // Safety valve: don't loop forever if the channel is
+            // unbounded or absurdly large. Real channel is bounded
+            // at a few hundred entries — if we hit this cap it's a
+            // test-config change and deserves an explicit fix.
+            if pre_filled > 4096 {
+                panic!("channel did not backpressure after 4096 entries");
+            }
+        }
+        assert!(
+            pre_filled > 0,
+            "expected a bounded channel; got what appears to be unbounded"
+        );
+
+        // Spawn the drain side a moment later: it will consume one
+        // entry, unblocking the `send().await` inside the helper.
+        let release_tx = Transaction::ttl_transaction();
+        let consumer = tokio::spawn(async move {
+            // Sleep briefly so the helper's `send().await` is already
+            // pending when we start draining.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Drain one entry to create room.
+            notifications_receiver
+                .recv()
+                .await
+                .expect("notification channel closed during drain");
+            // Keep draining until we see our release event. Additional
+            // pre-filled entries may sit ahead of it.
+            loop {
+                match notifications_receiver.recv().await {
+                    Some(Either::Right(NodeEvent::TransactionCompleted(observed)))
+                        if observed == release_tx =>
+                    {
+                        return;
+                    }
+                    Some(_) => continue,
+                    None => panic!("channel closed before release event observed"),
+                }
+            }
+        });
+
+        // The helper must not complete instantaneously (channel is
+        // saturated) but must complete once the consumer drains. Give
+        // it up to 2 s — plenty of slack for the 20 ms drain delay.
+        let release = timeout(
+            Duration::from_secs(2),
+            super::release_pending_op_slot_on(
+                notifier.notifications_sender(),
+                release_tx,
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+        release.expect("helper must complete once channel has room");
+
+        consumer
+            .await
+            .expect("consumer task should terminate cleanly");
+    }
+
+    #[tokio::test]
+    async fn release_pending_op_slot_returns_on_closed_channel() {
+        // If the notification channel is closed entirely (receiver
+        // dropped), the helper must return promptly (via the `Err`
+        // arm of the inner match) rather than hanging on
+        // `send().await`. The 60 s periodic sweep will still reclaim
+        // the slot eventually; this test pins "no hang."
+        let (receiver, notifier) = event_loop_notification_channel();
+        drop(receiver);
+
+        let tx = Transaction::ttl_transaction();
+
+        let result = timeout(
+            Duration::from_millis(200),
+            super::release_pending_op_slot_on(
+                notifier.notifications_sender(),
+                tx,
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "helper must return promptly on closed channel"
         );
     }
 

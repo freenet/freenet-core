@@ -34,6 +34,10 @@ pub struct BaseConfig {
     /// The default value is `127.0.0.1`.
     #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub(crate) address: IpAddr,
+    /// Full WebSocket URL to connect to (e.g. ws://host:port/secret/v1/contract/command?encodingProtocol=native).
+    /// When provided, --address and --port must not be specified.
+    #[arg(long, env = "FREENET_NODE_URL", conflicts_with_all = ["address", "port"])]
+    pub(crate) node_url: Option<String>,
 }
 
 #[derive(clap::Subcommand, Clone)]
@@ -63,6 +67,14 @@ pub enum SubCommand {
     /// state transitions, and detects anomalies that indicate consistency
     /// failures (missing broadcasts, unapplied updates, state divergence).
     VerifyState(crate::verify_state::VerifyStateConfig),
+    /// Publish and manage static websites on Freenet.
+    ///
+    /// Use `init` to generate a signing keypair, `publish` to deploy a website,
+    /// and `update` to push new content to an existing website.
+    Website {
+        #[clap(subcommand)]
+        command: crate::website::WebsiteCommand,
+    },
 }
 
 impl SubCommand {

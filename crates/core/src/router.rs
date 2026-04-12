@@ -2628,21 +2628,21 @@ mod tests {
         // Per-op failure: GET has 1 (success=0.0), PUT has 1 (failure=1.0)
         assert_eq!(router.per_op_failure.get(&OpType::Get).unwrap().len(), 1);
         assert_eq!(router.per_op_failure.get(&OpType::Put).unwrap().len(), 1);
-        assert!(router.per_op_failure.get(&OpType::Subscribe).is_none());
+        assert!(!router.per_op_failure.contains_key(&OpType::Subscribe));
 
         // Per-op response time: only GET (timed success)
         assert_eq!(
             router.per_op_response_time.get(&OpType::Get).unwrap().len(),
             1
         );
-        assert!(router.per_op_response_time.get(&OpType::Put).is_none());
+        assert!(!router.per_op_response_time.contains_key(&OpType::Put));
 
         // Per-op transfer rate: only GET (has payload data)
         assert_eq!(
             router.per_op_transfer_rate.get(&OpType::Get).unwrap().len(),
             1
         );
-        assert!(router.per_op_transfer_rate.get(&OpType::Put).is_none());
+        assert!(!router.per_op_transfer_rate.contains_key(&OpType::Put));
 
         // Snapshot should have per-op curves
         let snap = router.snapshot();
@@ -2703,18 +2703,8 @@ mod tests {
             router.per_op_failure.get(&OpType::Subscribe).unwrap().len(),
             1
         );
-        assert!(
-            router
-                .per_op_response_time
-                .get(&OpType::Subscribe)
-                .is_none()
-        );
-        assert!(
-            router
-                .per_op_transfer_rate
-                .get(&OpType::Subscribe)
-                .is_none()
-        );
+        assert!(!router.per_op_response_time.contains_key(&OpType::Subscribe));
+        assert!(!router.per_op_transfer_rate.contains_key(&OpType::Subscribe));
     }
 
     /// Regression test for crash: "user-provided comparison function does not
@@ -2790,15 +2780,13 @@ mod tests {
 
         let router = Router::new(&events);
 
-        match router.predict_routing_outcome(&peer, contract_location) {
-            Ok(pred) => {
-                assert!(
-                    pred.expected_total_time.is_finite(),
-                    "expected_total_time must be finite, got {}",
-                    pred.expected_total_time
-                );
-            }
-            Err(_) => {} // Not enough data is acceptable
+        // Not enough data (Err) is acceptable; only the Ok path is asserted.
+        if let Ok(pred) = router.predict_routing_outcome(&peer, contract_location) {
+            assert!(
+                pred.expected_total_time.is_finite(),
+                "expected_total_time must be finite, got {}",
+                pred.expected_total_time
+            );
         }
     }
 }

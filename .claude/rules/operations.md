@@ -6,9 +6,27 @@ paths:
 
 # Operations Module Rules
 
-## Critical Invariant: Push-Before-Send
+> **Path-scoped rule, legacy state-machine path.** As of #1454 Phase 2b
+> (PR #3806) the first operation (client-initiated SUBSCRIBE via
+> `subscribe_with_id`) has been migrated off the legacy re-entry loop
+> onto a task-per-transaction model in
+> `operations/subscribe/op_ctx_task.rs`. On that path, op state lives in
+> task locals and is never pushed into `OpManager.ops.*`, so rules below
+> that talk about "pushing state" / `load_or_init` / `handle_op_result`
+> apply only to the **legacy state-machine path** (still used by GET,
+> PUT, UPDATE, CONNECT, and by SUBSCRIBE's renewal / PUT-sub-op /
+> executor / intermediate-peer entry points).
+>
+> Task-per-tx drivers have their own invariants documented in the
+> `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.
+> The spirit of push-before-send is preserved (initialize task-local
+> state before calling `send_and_await`), but the mechanical
+> `op_manager.push(...)` call is absent. Phase 6 of #1454 will rewrite
+> this rules file in full once all ops have migrated.
 
-**This is the most important rule in this module.**
+## Critical Invariant: Push-Before-Send (legacy path)
+
+**This is the most important rule for code on the legacy state-machine path.**
 
 ```
 ALWAYS save state BEFORE sending network message:
@@ -23,6 +41,13 @@ WRONG:
 ```
 
 **Why:** If response arrives before state is saved, `load_or_init` will fail because the operation doesn't exist in storage.
+
+**Task-per-tx equivalent (#1454 Phase 2b+):** callers of
+`OpCtx::send_and_await` must have all fields the reply handler will read
+(retry counters, visited-peers filter, routing state) set in task locals
+BEFORE calling `send_and_await`. State is never published to the
+`OpManager` DashMap; the conceptual ordering rule is the same. See the
+`OpCtx::send_and_await` docstring for the full reasoning.
 
 ## State Machine Rules
 
@@ -171,6 +196,16 @@ This is usually benign (duplicate message, already completed)
 → Return Ok(None)
 → Do NOT treat as error
 ```
+
+**Note (#1454 Phase 2b):** For op kinds with a task-per-tx driver
+(currently SUBSCRIBE client-initiated), the pure-network-message
+handler checks `pending_op_results` FIRST and forwards the reply to
+the awaiting task via `node::try_forward_task_per_tx_reply` before
+reaching `load_or_init`. Do NOT "fix" `load_or_init`'s `OpNotPresent`
+handling by trying to look up a task-owned tx there — it will never
+find one, and it shouldn't. The bypass is the load-bearing piece;
+confirm by reading the SUBSCRIBE branch of
+`handle_pure_network_message_v1` in `node.rs`.
 
 ### WHEN encountering InvalidStateTransition
 

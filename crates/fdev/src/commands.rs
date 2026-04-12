@@ -20,7 +20,7 @@ mod v1;
 /// Contract operations (especially updates with large state) may take time to process
 /// and propagate through the network. Network publish operations may require forwarding
 /// through multiple hops, so we use a generous timeout.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {

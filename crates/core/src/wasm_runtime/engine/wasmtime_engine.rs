@@ -2007,12 +2007,47 @@ mod tests {
 
     /// Verify store refresh reduces virtual memory maps on Linux.
     ///
-    /// Uses /proc/self/maps which is process-global, so concurrent tests can
-    /// add noise. We assert the maps dropped by at least half the amount they
-    /// grew, which is robust against moderate concurrent allocation.
+    /// /proc/self/maps is process-global, so concurrent tests corrupt the
+    /// measurement. We run the actual check in a subprocess (same test binary,
+    /// gated by an env var) where it is the only test executing.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_store_refresh_reduces_vm_maps() {
+        use std::process::Command;
+
+        const SUBPROCESS_ENV: &str = "__FREENET_VM_MAPS_SUBPROCESS";
+
+        if std::env::var_os(SUBPROCESS_ENV).is_some() {
+            // Subprocess path: we are the only test running, /proc/self/maps
+            // reflects only our allocations.
+            vm_maps_check_impl();
+            return;
+        }
+
+        // Parent: re-invoke this exact test in a fresh process.
+        let exe = std::env::current_exe().expect("current_exe");
+        let output = Command::new(&exe)
+            .args([
+                "--exact",
+                "wasm_runtime::engine::wasmtime_engine::tests::test_store_refresh_reduces_vm_maps",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SUBPROCESS_ENV, "1")
+            .output()
+            .expect("Failed to spawn subprocess");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "VM maps subprocess failed:\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+
+    /// The actual /proc/self/maps measurement, only called from a subprocess.
+    #[cfg(target_os = "linux")]
+    fn vm_maps_check_impl() {
         fn count_maps() -> usize {
             std::fs::read_to_string("/proc/self/maps")
                 .expect("Failed to read /proc/self/maps")
@@ -2026,7 +2061,7 @@ mod tests {
 
         let baseline_maps = count_maps();
 
-        // Create and drop instances just below the threshold (no refresh yet)
+        // Create and drop instances just below the threshold (no refresh yet).
         for i in 0..STORE_REFRESH_THRESHOLD - 1 {
             let handle = engine
                 .create_instance(&module, i as i64, 1024)
@@ -2042,15 +2077,13 @@ mod tests {
              baseline={baseline_maps}, after={leaked_maps}, growth={growth}"
         );
 
-        // One more instance hits the threshold and triggers refresh
+        // One more instance hits the threshold and triggers refresh.
         let handle = engine
             .create_instance(&module, STORE_REFRESH_THRESHOLD as i64, 1024)
             .expect("final instance should succeed");
         engine.drop_instance(&handle);
 
         let after_refresh_maps = count_maps();
-        // Assert maps dropped by at least half the growth — tolerates noise from
-        // concurrent tests that may add a few mappings during this window.
         let reduction = leaked_maps.saturating_sub(after_refresh_maps);
         assert!(
             reduction > growth / 2,

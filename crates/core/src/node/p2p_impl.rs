@@ -383,7 +383,13 @@ impl NodeP2P {
         let contract_executor_task = GlobalExecutor::spawn({
             let task = async move {
                 tracing::info!("Contract executor task starting");
-                let result = contract::contract_handling(contract_handler).await;
+                let result = contract::contract_handling(
+                    contract_handler,
+                    crate::contract::user_input::DashboardPrompter::new(
+                        crate::contract::user_input::pending_prompts(),
+                    ),
+                )
+                .await;
                 match &result {
                     Ok(_) => tracing::warn!("Contract executor task exiting normally (unexpected)"),
                     Err(e) => tracing::error!("Contract executor task exiting with error: {e}"),
