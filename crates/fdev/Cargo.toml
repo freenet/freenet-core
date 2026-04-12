@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.3.203"
+version = "0.3.204"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -49,7 +49,7 @@ ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 hex = { workspace = true }
 
 # internal
-freenet = { path = "../core", version = "0.2.40", features = ["testing"] }
+freenet = { path = "../core", version = "0.2.41", features = ["testing"] }
 freenet-stdlib = { workspace = true }
 
 [dev-dependencies]
