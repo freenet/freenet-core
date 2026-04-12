@@ -2898,8 +2898,10 @@ impl SimNetwork {
                         UpdateEvent::BroadcastReceived { .. } => {
                             summary.update.broadcasts_received += 1
                         }
+                        UpdateEvent::BroadcastEmitted { .. } => {
+                            summary.update.broadcasts_emitted += 1
+                        }
                         UpdateEvent::UpdateFailure { .. }
-                        | UpdateEvent::BroadcastEmitted { .. }
                         | UpdateEvent::BroadcastComplete { .. }
                         | UpdateEvent::BroadcastApplied { .. }
                         | UpdateEvent::BroadcastDeliverySummary { .. } => {}
@@ -4709,6 +4711,8 @@ pub struct UpdateOperationStats {
     pub succeeded: usize,
     /// Number of Update operations that failed
     pub failed: usize,
+    /// Number of update broadcasts emitted
+    pub broadcasts_emitted: usize,
     /// Number of update broadcasts received by subscribers
     pub broadcasts_received: usize,
 }
