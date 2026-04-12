@@ -15,6 +15,13 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 filter = "test(test_interest_renewal)"
 slow-timeout = { period = "300s", terminate-after = 2 }
 
+# Ping integration tests have internal timeouts of 360-600s with sequential
+# phases (WS connect retries, ring connection waits, contract operations).
+# Default 240s nextest cap kills them before they can finish on slow runners.
+[[profile.ci.overrides]]
+filter = "package(freenet-ping-app)"
+slow-timeout = { period = "300s", terminate-after = 3 }
+
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0
