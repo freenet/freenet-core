@@ -258,6 +258,7 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.2.0"
+source = "git+https://github.com/freenet/freenet-stdlib?branch=feat-message-origin-delegate#7840137a1368731fd8420e522b586268cc8a75dd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -267,6 +268,7 @@ dependencies = [
 [[package]]
 name = "freenet-stdlib"
 version = "0.5.0"
+source = "git+https://github.com/freenet/freenet-stdlib?branch=feat-message-origin-delegate#7840137a1368731fd8420e522b586268cc8a75dd"
 dependencies = [
  "bincode",
  "blake3",

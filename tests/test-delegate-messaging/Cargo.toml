@@ -9,10 +9,12 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Point at the local freenet-stdlib worktree carrying the
-# MessageOrigin::Delegate variant (issue #3860). Must be replaced with
-# the published 0.5.0 from crates.io once stdlib is released.
-freenet-stdlib = { path = "../../../../freenet-stdlib-3860/rust", features = ["contract"] }
+# Temporary git pin: this fixture's parent workspace is separate from the
+# root freenet-core workspace, so the `[patch.crates-io]` override in the
+# root Cargo.toml does NOT apply here — we must point at the stdlib branch
+# directly. Must be replaced with the published 0.5.0 from crates.io once
+# stdlib is released. Tracked in freenet/freenet-core#3865.
+freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib", branch = "feat-message-origin-delegate", features = ["contract"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 
