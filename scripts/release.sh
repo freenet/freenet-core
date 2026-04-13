@@ -619,40 +619,28 @@ update_versions() {
         exit 1
     fi
 
-    # Verify that the project compiles with the new versions
-    echo -n "  Verifying compilation... "
-    if cargo build --release --quiet 2>/dev/null; then
+    # Quick sanity check that the version-bumped workspace still type-checks.
+    # This is intentionally `cargo check`, not `cargo build --release` or
+    # `cargo test --release`: the PR opened below runs the full build and test
+    # suite on GitHub CI, and that is the gate auto-merge waits on. The local
+    # step only needs to catch trivially broken states (bad Cargo.toml edit,
+    # version mismatch, `cargo update` pulling in an incompatible transitive)
+    # before we round-trip through CI — codegen and the test suite are pure
+    # duplication here and can cost 5–15+ minutes of local wall time per
+    # release depending on cache state.
+    echo -n "  Running cargo check on workspace... "
+    if cargo check --workspace --quiet 2>/dev/null; then
         echo "✓"
     else
         echo "✗"
         echo ""
-        echo "  ⚠️  ERROR: Project failed to compile with new versions!"
-        echo "     Running cargo build to see errors:"
+        echo "  ⚠️  ERROR: Workspace failed to type-check with new versions!"
+        echo "     Running cargo check to see errors:"
         echo ""
-        cargo build --release
+        cargo check --workspace
         echo ""
-        echo "  Please fix compilation errors before releasing."
+        echo "  Please fix errors before releasing."
         exit 1
-    fi
-
-    # Run tests to ensure nothing is broken
-    if [[ "$SKIP_TESTS" == "false" ]]; then
-        echo -n "  Running tests... "
-        if cargo test --release --quiet 2>/dev/null; then
-            echo "✓"
-        else
-            echo "✗"
-            echo ""
-            echo "  ⚠️  ERROR: Tests failed with new versions!"
-            echo "     Running cargo test to see failures:"
-            echo ""
-            cargo test --release
-            echo ""
-            echo "  Please fix test failures before releasing."
-            exit 1
-        fi
-    else
-        echo "  ⚠️  Skipping tests (--skip-tests specified)"
     fi
 }
 
