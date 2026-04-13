@@ -53,9 +53,9 @@ Each file is a state machine:
 
 Plus task-per-transaction drivers from #1454 Phase 2b onwards:
   subscribe/op_ctx_task.rs → client-initiated SUBSCRIBE driver
-    (first production consumer of `OpCtx::send_and_await`;
-     bypasses OpManager.ops.subscribe DashMap entirely and
-     owns retry state in task locals)
+  put/op_ctx_task.rs       → client-initiated PUT driver (Phase 3a)
+    Both use the shared `RetryDriver` trait from `op_ctx.rs` and
+    bypass the OpManager.ops DashMap, owning retry state in task locals.
 ```
 
 ## Module Map
