@@ -2461,7 +2461,7 @@ fn test_relay_does_not_pollute_active_subscriptions() {
     // contract. Only genuine originators of a subscription should appear here:
     //
     //   * The PUT-with-subscribe originator (gateway 0).
-    //   * Each of nodes 1..=4 that called Subscribe explicitly.
+    //   * Each of nodes 15..=18 that called Subscribe explicitly.
     //
     // That's at most 5 peers. Before the fix, the
     // `SubscribeMsgResult::Subscribed` handler would ALSO add every relay
