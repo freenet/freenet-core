@@ -630,7 +630,19 @@ function freenetBridge(authToken) {
           if (u.protocol !== 'https:') return;
           var h = u.hostname.toLowerCase();
           if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '0.0.0.0') return;
-          window.open(u.href, '_blank', 'noopener,noreferrer');
+          // Honour shift-click by requesting a popup-style window feature
+          // (freenet/freenet-core#3853). Firefox honours this as "open in
+          // a new window"; other browsers may still open a tab, which is
+          // an acceptable fallback. ctrl / meta / middle-click cannot be
+          // preserved from a postMessage handler because browsers only
+          // honour background-tab placement when window.open is called
+          // from a direct user gesture, so we route those through the
+          // same default-tab path as plain left-click.
+          if (msg.shiftKey === true) {
+            window.open(u.href, '_blank', 'noopener,noreferrer,popup');
+          } else {
+            window.open(u.href, '_blank', 'noopener,noreferrer');
+          }
         } catch(e) {}
       }
       return;
@@ -1095,20 +1107,38 @@ const WEBSOCKET_SHIM_JS: &str = r#"
 /// JavaScript navigation interceptor injected into sandboxed iframe HTML pages.
 ///
 /// Intercepts clicks on `<a>` elements and sends a postMessage to the shell
-/// page, which updates the iframe's `src` to navigate within the contract.
-/// This enables multi-page website navigation without weakening the sandbox
-/// (no `allow-top-navigation` needed). Only intercepts same-origin relative
-/// links; external links are left to the existing `open_url` bridge.
+/// page, which either opens the URL in a new window (cross-origin) or updates
+/// the iframe's `src` (same-origin). This enables multi-page website
+/// navigation without weakening the sandbox (no `allow-top-navigation` nor
+/// `allow-popups-to-escape-sandbox` needed).
+///
+/// Cross-origin links MUST be handled regardless of their `target` attribute,
+/// because without `allow-popups-to-escape-sandbox` a `target="_blank"` click
+/// would open a sandboxed popup with a null origin and the destination site
+/// would see CORS failures. This was freenet/river#208: River webapps added
+/// `target="_blank"` to every external link, the old interceptor skipped any
+/// anchor with an explicit target, and the resulting sandboxed popups broke
+/// logged-in pages like GitHub. The `open_url` bridge hands the URL to the
+/// shell page, which opens it with a proper origin via `window.open`.
+///
+/// Same-origin links with an explicit non-`_self` target are left to the
+/// browser so webapps that legitimately want multi-tab navigation within
+/// their own contract still work.
 const NAVIGATION_INTERCEPTOR_JS: &str = r#"
 (function() {
   'use strict';
-  document.addEventListener('click', function(e) {
+  // Shared handler for both `click` (primary button) and `auxclick`
+  // (non-primary, i.e. middle-click). Middle-click is dispatched via
+  // `auxclick` in modern browsers and does NOT fire `click` at all, so
+  // without a separate `auxclick` listener middle-clicks on cross-origin
+  // <a target="_blank"> links bypass the interceptor entirely and the
+  // browser opens a null-origin sandboxed popup (freenet/freenet-core#3853
+  // follow-up from #3852).
+  function handleAnchorClick(e) {
     var target = e.target;
     // Walk up to find the nearest <a> element (handles clicks on child elements)
     while (target && target.tagName !== 'A') target = target.parentElement;
     if (!target || !target.href) return;
-    // Skip links with explicit targets (e.g. target="_blank")
-    if (target.target && target.target !== '_self') return;
     // Skip javascript: and mailto: links
     var protocol = target.protocol;
     if (protocol && protocol !== 'http:' && protocol !== 'https:') return;
@@ -1116,22 +1146,48 @@ const NAVIGATION_INTERCEPTOR_JS: &str = r#"
     if (target.hasAttribute('download')) return;
     // Skip links explicitly marked to bypass interception
     if (target.dataset && target.dataset.freenetNoIntercept) return;
-    // For cross-origin links, use the open_url bridge instead
+    // Classify by origin. Cross-origin always goes through the open_url
+    // bridge, regardless of the `target` attribute, because a sandboxed
+    // popup would have a null origin and break CORS on the destination
+    // (freenet/river#208).
+    //
+    // Fail-safe default: if the origin comparison throws (pathological URLs
+    // that slipped past the protocol check above) we assume cross-origin,
+    // because the failure mode we are guarding against is a null-origin
+    // sandboxed popup, not an accidental in-contract navigation.
+    var isCrossOrigin = true;
     try {
-      if (target.origin !== location.origin) {
-        e.preventDefault();
-        window.parent.postMessage({
-          __freenet_shell__: true, type: 'open_url', url: target.href
-        }, '*');
-        return;
-      }
+      isCrossOrigin = target.origin !== location.origin;
     } catch(err) {}
+    if (isCrossOrigin) {
+      e.preventDefault();
+      // Forward shift-key state so the shell can honour shift-click
+      // as a new-window request (freenet/freenet-core#3853). ctrl /
+      // meta / middle-click intent can't be meaningfully preserved
+      // from a postMessage handler: browsers only allow background-
+      // tab placement when window.open is called directly from a
+      // user gesture, and all three collapse to a plain new tab
+      // regardless of what we forward. Keep the contract minimal.
+      window.parent.postMessage({
+        __freenet_shell__: true,
+        type: 'open_url',
+        url: target.href,
+        shiftKey: !!e.shiftKey
+      }, '*');
+      return;
+    }
+    // Same-origin link. Respect explicit non-_self targets so webapps
+    // that open multiple tabs within their own contract still work.
+    if (target.target && target.target !== '_self') return;
     // Same-origin in-contract link: request navigation via shell
     e.preventDefault();
     window.parent.postMessage({
       __freenet_shell__: true, type: 'navigate', href: target.href
     }, '*');
-  }, true);
+  }
+  document.addEventListener('click', handleAnchorClick, true);
+  // Catch middle-click and other non-primary button activations.
+  document.addEventListener('auxclick', handleAnchorClick, true);
 })();
 "#;
 
@@ -1854,15 +1910,171 @@ mod tests {
             NAVIGATION_INTERCEPTOR_JS.contains("type: 'open_url'"),
             "interceptor must route cross-origin links through open_url"
         );
-        // Skip links with target="_blank" etc.
+        // Same-origin links: must respect explicit non-_self target so
+        // webapps that open multiple tabs within their own contract still
+        // work.
         assert!(
             NAVIGATION_INTERCEPTOR_JS.contains("target.target"),
-            "interceptor must respect target attribute on links"
+            "interceptor must respect target attribute on same-origin links"
         );
         // Must walk up DOM to handle clicks on child elements of <a>
         assert!(
             NAVIGATION_INTERCEPTOR_JS.contains("target.parentElement"),
             "interceptor must walk up DOM to find <a> ancestor"
+        );
+    }
+
+    /// Regression test for freenet/river#208.
+    ///
+    /// River (and any other webapp) transforms links to include
+    /// `target="_blank"`. The original interceptor short-circuited on any
+    /// anchor with an explicit target, so cross-origin clicks fell through
+    /// to the browser. Without `allow-popups-to-escape-sandbox`, that
+    /// produced a sandboxed popup with a null origin, which broke CORS on
+    /// every external site (GitHub issues page reported by @lukors).
+    ///
+    /// Pin the contract: the cross-origin branch MUST be reached before
+    /// the target-attribute check, i.e. the origin classification dominates.
+    #[test]
+    fn navigation_interceptor_handles_cross_origin_target_blank() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+
+        // Anchor the cross-origin check and the target-attribute check and
+        // confirm the cross-origin check comes FIRST in the source order.
+        let cross_origin_idx = js
+            .find("target.origin !== location.origin")
+            .expect("cross-origin check present");
+        let target_attr_idx = js
+            .find("target.target && target.target !== '_self'")
+            .expect("target-attribute check present");
+        assert!(
+            cross_origin_idx < target_attr_idx,
+            "cross-origin classification must run before the target-attribute \
+             skip, otherwise target=\"_blank\" cross-origin links bypass the \
+             open_url bridge (freenet/river#208). cross_origin_idx={cross_origin_idx}, \
+             target_attr_idx={target_attr_idx}"
+        );
+
+        // The cross-origin branch must call preventDefault and send open_url,
+        // not navigate.
+        let cross_origin_block = &js[cross_origin_idx..target_attr_idx];
+        assert!(
+            cross_origin_block.contains("preventDefault"),
+            "cross-origin branch must preventDefault before opening popup"
+        );
+        assert!(
+            cross_origin_block.contains("type: 'open_url'"),
+            "cross-origin branch must send open_url, not navigate"
+        );
+    }
+
+    /// Regression test for freenet/freenet-core#3853.
+    ///
+    /// After #3852 fixed freenet/river#208, the cross-origin click handler
+    /// unconditionally `preventDefault`ed and sent `open_url`. Middle-click,
+    /// ctrl-click, shift-click and meta-click all collapsed to a single
+    /// foreground tab because the interceptor dropped modifier state and
+    /// the shell handler called `window.open` with no flags.
+    ///
+    /// A second latent bug: the listener was `click` only, but middle-click
+    /// fires `auxclick` (not `click`), so middle-clicks on cross-origin
+    /// links fell through to the browser's default handling and produced
+    /// the same null-origin sandboxed popup #3852 was meant to prevent.
+    ///
+    /// We can only meaningfully preserve shift-click (via a popup window
+    /// feature) because browsers refuse to honour background-tab placement
+    /// when `window.open` is called outside a direct user gesture. Pin the
+    /// minimal contract at both ends:
+    ///   1. The interceptor registers BOTH `click` and `auxclick` so
+    ///      middle-click is actually intercepted.
+    ///   2. The interceptor's cross-origin branch forwards `shiftKey` in
+    ///      the posted message, sourced from the MouseEvent.
+    ///   3. The shell bridge's `open_url` handler reads `msg.shiftKey` and
+    ///      uses the `popup` window feature when it's true.
+    #[test]
+    fn navigation_interceptor_forwards_shift_key_for_open_url() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+
+        let cross_origin_idx = js
+            .find("type: 'open_url'")
+            .expect("interceptor open_url branch present");
+        let target_attr_idx = js
+            .find("target.target && target.target !== '_self'")
+            .expect("same-origin target check present");
+        let block = &js[cross_origin_idx..target_attr_idx];
+
+        assert!(
+            block.contains("shiftKey"),
+            "cross-origin open_url postMessage must include shiftKey to honour \
+             shift-click as a new-window request (#3853); got block: {block}"
+        );
+        // Must be sourced from the actual event, not a hardcoded constant.
+        assert!(
+            block.contains("e.shiftKey"),
+            "interceptor must forward `e.shiftKey` from the MouseEvent, not a literal (#3853)"
+        );
+    }
+
+    /// Regression test for the middle-click half of #3853. Middle-click is
+    /// dispatched as `auxclick` in modern browsers, NOT `click`, so the
+    /// interceptor must listen on both events. Without the auxclick
+    /// listener, middle-clicks on cross-origin `<a target="_blank">` links
+    /// bypass the `open_url` routing and fall through to the browser's
+    /// default handling, producing a null-origin sandboxed popup (exactly
+    /// what #3852 was meant to prevent).
+    #[test]
+    fn navigation_interceptor_listens_on_click_and_auxclick() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+        assert!(
+            js.contains("addEventListener('click'"),
+            "interceptor must register a click listener"
+        );
+        assert!(
+            js.contains("addEventListener('auxclick'"),
+            "interceptor must register an auxclick listener so middle-click \
+             on cross-origin links is also routed through open_url (#3853)"
+        );
+    }
+
+    /// Regression test for freenet/freenet-core#3853 shell-side.
+    ///
+    /// The shell `open_url` handler must read `msg.shiftKey` and, when true,
+    /// call `window.open` with the `popup` window feature so Firefox honours
+    /// the shift-click-opens-new-window intent. Other browsers may fall back
+    /// to a tab, which is acceptable.
+    #[test]
+    fn shell_open_url_handler_honours_shift_key() {
+        let js = SHELL_BRIDGE_JS;
+
+        // Locate the open_url branch and bound the slice to the next
+        // `else if` branch so assertions can't match unrelated JS.
+        let open_url_idx = js
+            .find("msg.type === 'open_url'")
+            .expect("shell open_url branch present");
+        let rest = &js[open_url_idx..];
+        let next_branch = rest[1..]
+            .find("} else if")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let block = &rest[..next_branch];
+
+        assert!(
+            block.contains("msg.shiftKey"),
+            "open_url handler must read msg.shiftKey for new-window intent (#3853)"
+        );
+        // The popup window feature is the concrete mechanism; pin it so a
+        // future refactor that reads shiftKey but forgets the feature is
+        // caught.
+        assert!(
+            block.contains("'noopener,noreferrer,popup'"),
+            "open_url handler must pass the `popup` window feature on shift-click \
+             so Firefox honours the new-window intent (#3853); got block: {block}"
+        );
+        // The non-shift path must still use the plain new-tab features so
+        // left-click behaviour is unchanged.
+        assert!(
+            block.contains("'noopener,noreferrer'"),
+            "open_url handler must keep the plain new-tab path for non-shift clicks"
         );
     }
 
