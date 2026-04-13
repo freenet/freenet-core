@@ -256,7 +256,16 @@ async fn drive_client_put_inner(
                 related_contracts: self.related.clone(),
                 value: self.merged_value.clone(),
                 htl: self.htl,
-                skip_list: self.tried.iter().copied().collect::<HashSet<_>>(),
+                // Only include own_addr in skip_list (matching legacy request_put).
+                // `tried` contains driver-side routing state (peers the driver
+                // selected); process_message makes its own forwarding decisions.
+                skip_list: self
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .get_own_addr()
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
             })
         }
 
