@@ -671,37 +671,257 @@ function freenetBridge(authToken) {
   window.addEventListener('popstate', forwardHash);
   window.addEventListener('hashchange', forwardHash);
 
-  // Permission prompt polling: check for pending delegate permission requests
-  // and show browser notifications. The user clicks the notification to open
-  // the permission page in a new tab.
-  var knownPrompts = {};
-  function checkPermissions() {
-    fetch('/permission/pending').then(function(r) { return r.json(); }).then(function(prompts) {
-      prompts.forEach(function(p) {
-        if (knownPrompts[p.nonce]) return;
-        knownPrompts[p.nonce] = true;
-        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-          var n = new Notification('Freenet: Permission needed', {
-            body: p.preview || 'A delegate is requesting permission.',
-            tag: 'freenet-perm-' + p.nonce
-          });
-          n.onclick = function() { window.open('/permission/' + p.nonce, '_blank'); };
-        } else {
-          // Fallback: open directly if notifications not available
-          window.open('/permission/' + p.nonce, '_blank');
-        }
+  // Permission prompt overlay: render a modal in the shell page's DOM
+  // (outside the sandboxed iframe) whenever a delegate permission prompt
+  // is pending. The shell is trusted and same-origin with the gateway, so
+  // the sandboxed contract cannot reach into this DOM. See issue #3836.
+  //
+  // Every open Freenet tab renders the overlay for every pending prompt.
+  // When the user responds in one tab, the gateway removes the nonce from
+  // the pending registry; other tabs see it disappear on their next poll
+  // and hide their overlays automatically.
+  var overlayRoot = null;
+  var overlayCards = {}; // nonce -> card element
+  var OVERLAY_CSS =
+    '#__freenet_perm_overlay{position:fixed;inset:0;z-index:2147483647;' +
+    'background:rgba(8,10,14,0.62);backdrop-filter:blur(4px);' +
+    '-webkit-backdrop-filter:blur(4px);display:none;align-items:center;' +
+    'justify-content:center;padding:20px;overflow:auto;' +
+    'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}' +
+    '#__freenet_perm_overlay .fn-card{--bg:#0f1419;--fg:#e6e8eb;--card:#1a2028;' +
+    '--accent:#3b82f6;--border:#2d3748;--warn:#f59e0b;--muted:#9ca3af;' +
+    'background:var(--card);color:var(--fg);border:1px solid var(--border);' +
+    'border-radius:14px;padding:28px;max-width:520px;width:100%;margin:12px 0;' +
+    'box-shadow:0 12px 40px rgba(0,0,0,0.5);box-sizing:border-box;}' +
+    '@media (prefers-color-scheme: light){#__freenet_perm_overlay .fn-card{' +
+    '--bg:#f5f5f5;--fg:#1a1a1a;--card:#ffffff;--accent:#2563eb;' +
+    '--border:#d1d5db;--warn:#d97706;--muted:#6b7280;' +
+    'box-shadow:0 12px 40px rgba(0,0,0,0.18);}}' +
+    '#__freenet_perm_overlay .fn-header{display:flex;align-items:center;gap:12px;' +
+    'margin-bottom:18px;}' +
+    '#__freenet_perm_overlay .fn-icon{font-size:28px;line-height:1;}' +
+    '#__freenet_perm_overlay .fn-title{font-size:18px;font-weight:600;margin:0;' +
+    'color:var(--fg);}' +
+    '#__freenet_perm_overlay .fn-ctx{background:var(--bg);border:1px solid var(--border);' +
+    'border-radius:8px;padding:12px 14px;margin-bottom:16px;font-size:12px;' +
+    'color:var(--muted);}' +
+    '#__freenet_perm_overlay .fn-ctx dt{font-weight:600;color:var(--fg);' +
+    'font-family:inherit;margin-top:6px;}' +
+    '#__freenet_perm_overlay .fn-ctx dt:first-child{margin-top:0;}' +
+    '#__freenet_perm_overlay .fn-ctx dd{margin:2px 0 0 0;font-family:ui-monospace,' +
+    'SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;word-break:break-all;}' +
+    '#__freenet_perm_overlay .fn-msg-label{font-size:11px;color:var(--muted);' +
+    'text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;}' +
+    '#__freenet_perm_overlay .fn-msg{font-size:15px;line-height:1.5;margin:0 0 22px 0;' +
+    'padding:14px 16px;background:var(--bg);border-left:3px solid var(--warn);' +
+    'border-radius:4px;white-space:pre-wrap;word-wrap:break-word;color:var(--fg);}' +
+    '#__freenet_perm_overlay .fn-btns{display:flex;gap:10px;flex-wrap:wrap;}' +
+    '#__freenet_perm_overlay .fn-btn{padding:10px 20px;border-radius:8px;' +
+    'font-size:14px;cursor:pointer;flex:1;min-width:100px;font-weight:500;' +
+    'border:1px solid var(--border);background:var(--card);color:var(--fg);' +
+    'transition:transform 0.12s, opacity 0.12s, filter 0.12s;font-family:inherit;}' +
+    '#__freenet_perm_overlay .fn-btn.primary{background:var(--accent);' +
+    'color:#fff;border-color:var(--accent);}' +
+    '#__freenet_perm_overlay .fn-btn:hover:not(:disabled){transform:translateY(-1px);' +
+    'filter:brightness(1.08);}' +
+    '#__freenet_perm_overlay .fn-btn:disabled{opacity:0.55;cursor:not-allowed;}' +
+    '#__freenet_perm_overlay .fn-timer{margin-top:14px;font-size:12px;' +
+    'color:var(--muted);text-align:center;}';
+  // Auto-deny duration in seconds, mirroring the standalone /permission/{nonce}
+  // fallback page. Tracked client-side only; the server enforces the real
+  // timeout and will clear the nonce regardless.
+  var OVERLAY_AUTO_DENY_SECONDS = 60;
+  function ensureOverlayRoot() {
+    if (overlayRoot) return overlayRoot;
+    var style = document.createElement('style');
+    style.textContent = OVERLAY_CSS;
+    document.head.appendChild(style);
+    overlayRoot = document.createElement('div');
+    overlayRoot.id = '__freenet_perm_overlay';
+    overlayRoot.setAttribute('role', 'dialog');
+    overlayRoot.setAttribute('aria-modal', 'true');
+    overlayRoot.setAttribute('aria-label', 'Delegate permission request');
+    document.body.appendChild(overlayRoot);
+    // Escape-to-dismiss: routes to the last button in the most-recently-added
+    // card, which (by the standard delegate convention Allow Once / Always
+    // Allow / Deny) is the Deny button. If the delegate supplied a single
+    // label this is a no-op — Escape just does nothing.
+    document.addEventListener('keydown', function(e) {
+      if (e.key !== 'Escape') return;
+      if (!overlayRoot || overlayRoot.style.display === 'none') return;
+      var nonces = Object.keys(overlayCards);
+      if (nonces.length === 0) return;
+      var nonce = nonces[nonces.length - 1];
+      var card = overlayCards[nonce];
+      var btns = card.querySelectorAll('button');
+      if (btns.length < 2) return; // no non-primary option, ignore
+      btns[btns.length - 1].click();
+      e.preventDefault();
+    });
+    return overlayRoot;
+  }
+  function setText(el, text) {
+    // textContent avoids any HTML interpretation of delegate-controlled
+    // strings. Delegate-provided fields are never parsed as markup.
+    el.textContent = text == null ? '' : String(text);
+  }
+  function createCard(p) {
+    var card = document.createElement('div');
+    card.className = 'fn-card';
+    card.setAttribute('data-nonce', p.nonce);
+
+    var header = document.createElement('div');
+    header.className = 'fn-header';
+    var icon = document.createElement('span');
+    icon.className = 'fn-icon';
+    icon.textContent = '\u{1F512}';
+    var title = document.createElement('h1');
+    title.className = 'fn-title';
+    title.textContent = 'Permission Request';
+    header.appendChild(icon);
+    header.appendChild(title);
+    card.appendChild(header);
+
+    var ctx = document.createElement('dl');
+    ctx.className = 'fn-ctx';
+    var dkLabel = document.createElement('dt');
+    dkLabel.textContent = 'Delegate';
+    var dkVal = document.createElement('dd');
+    setText(dkVal, p.delegate_key || 'Unknown');
+    var ciLabel = document.createElement('dt');
+    ciLabel.textContent = 'Requesting contract';
+    var ciVal = document.createElement('dd');
+    setText(ciVal, p.contract_id || 'Unknown');
+    ctx.appendChild(dkLabel);
+    ctx.appendChild(dkVal);
+    ctx.appendChild(ciLabel);
+    ctx.appendChild(ciVal);
+    card.appendChild(ctx);
+
+    var msgLabel = document.createElement('div');
+    msgLabel.className = 'fn-msg-label';
+    msgLabel.textContent = 'Delegate says';
+    card.appendChild(msgLabel);
+    var msg = document.createElement('p');
+    msg.className = 'fn-msg';
+    setText(msg, p.message || 'A delegate is requesting permission.');
+    card.appendChild(msg);
+
+    var buttons = document.createElement('div');
+    buttons.className = 'fn-btns';
+    var labels = Array.isArray(p.labels) && p.labels.length > 0 ? p.labels : ['OK'];
+    labels.forEach(function(label, idx) {
+      var b = document.createElement('button');
+      b.className = 'fn-btn' + (idx === 0 ? ' primary' : '');
+      setText(b, label);
+      b.addEventListener('click', function() {
+        respondToPrompt(p.nonce, idx, card);
       });
-      // Clean up nonces no longer pending
-      Object.keys(knownPrompts).forEach(function(k) {
-        if (!prompts.some(function(p) { return p.nonce === k; })) delete knownPrompts[k];
+      buttons.appendChild(b);
+    });
+    card.appendChild(buttons);
+
+    // Countdown mirroring the standalone permission page. The real timeout
+    // lives server-side; this is a hint for the user that the prompt won't
+    // wait forever. On expiry the next poll drops the card via the
+    // reconciliation path, so we don't need a local hide here.
+    var timer = document.createElement('div');
+    timer.className = 'fn-timer';
+    var remaining = OVERLAY_AUTO_DENY_SECONDS;
+    timer.textContent = 'Auto-deny in ' + remaining + 's';
+    card._fnTimerId = setInterval(function() {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(card._fnTimerId);
+        timer.textContent = 'Auto-denied';
+        return;
+      }
+      timer.textContent = 'Auto-deny in ' + remaining + 's';
+    }, 1000);
+    card.appendChild(timer);
+    return card;
+  }
+  function showCard(nonce, card) {
+    var root = ensureOverlayRoot();
+    root.appendChild(card);
+    root.style.display = 'flex';
+    overlayCards[nonce] = card;
+    // Move keyboard focus to the primary button so Enter/Space answer the
+    // prompt without requiring a mouse click.
+    var primary = card.querySelector('.fn-btn.primary');
+    if (primary && typeof primary.focus === 'function') {
+      try { primary.focus(); } catch (e) {}
+    }
+  }
+  function hideCard(nonce) {
+    var card = overlayCards[nonce];
+    if (!card) return;
+    if (card._fnTimerId) {
+      clearInterval(card._fnTimerId);
+      card._fnTimerId = null;
+    }
+    if (card.parentNode) card.parentNode.removeChild(card);
+    delete overlayCards[nonce];
+    if (overlayRoot && Object.keys(overlayCards).length === 0) {
+      overlayRoot.style.display = 'none';
+    }
+  }
+  function respondToPrompt(nonce, index, card) {
+    var btns = card.querySelectorAll('button');
+    btns.forEach(function(b) { b.disabled = true; b.style.opacity = '0.5'; });
+    fetch('/permission/' + encodeURIComponent(nonce) + '/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ index: index })
+    }).then(function(r) {
+      // 404 means another tab already answered (or it auto-denied) — hide
+      // the overlay here as well so the user isn't staring at a dead button.
+      if (r.ok || r.status === 404) {
+        hideCard(nonce);
+      } else {
+        btns.forEach(function(b) { b.disabled = false; b.style.opacity = '1'; });
+      }
+    }).catch(function() {
+      btns.forEach(function(b) { b.disabled = false; b.style.opacity = '1'; });
+    });
+  }
+  function checkPermissions() {
+    // Skip polling when the tab is hidden: saves bandwidth and gateway
+    // load when the user has many Freenet tabs open in the background.
+    // The tab picks up the prompt again on its next visibility event.
+    if (typeof document !== 'undefined' &&
+        document.visibilityState === 'hidden' &&
+        Object.keys(overlayCards).length === 0) {
+      return;
+    }
+    fetch('/permission/pending').then(function(r) { return r.json(); }).then(function(prompts) {
+      if (!Array.isArray(prompts)) return;
+      var seen = {};
+      prompts.forEach(function(p) {
+        if (!p || typeof p.nonce !== 'string') return;
+        seen[p.nonce] = true;
+        if (overlayCards[p.nonce]) return;
+        var card = createCard(p);
+        showCard(p.nonce, card);
+      });
+      // Any card whose nonce is no longer pending was answered elsewhere
+      // (another tab, the 60s auto-deny, or delegate cancelled). Remove it
+      // so the user isn't clicking a dead button.
+      Object.keys(overlayCards).forEach(function(nonce) {
+        if (!seen[nonce]) hideCard(nonce);
       });
     }).catch(function() {});
   }
-  // Request notification permission on first load
-  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-    Notification.requestPermission();
-  }
   setInterval(checkPermissions, 3000);
+  checkPermissions();
+  // Re-check as soon as the tab becomes visible again so a user returning
+  // to a background tab sees any prompt that accumulated while they were
+  // away without waiting for the next poll tick.
+  if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('visibilitychange', function() {
+      if (document.visibilityState === 'visible') checkPermissions();
+    });
+  }
 }
 "#;
 
@@ -1093,6 +1313,82 @@ mod tests {
         assert!(
             html.contains("open_url"),
             "shell bridge must handle open_url messages for external links"
+        );
+    }
+
+    /// Regression test for issue #3836: permission prompts must render as an
+    /// in-page overlay in the shell DOM, NOT via browser Notifications (which
+    /// users block, miss, or dismiss accidentally).
+    #[tokio::test]
+    async fn shell_page_permission_overlay_present_and_safe() {
+        let token = AuthToken::generate();
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+
+        // Overlay root and accessibility attributes
+        assert!(
+            html.contains("__freenet_perm_overlay"),
+            "permission overlay root element missing from shell JS"
+        );
+        assert!(
+            html.contains("'role', 'dialog'") || html.contains("\"role\", \"dialog\""),
+            "overlay must declare role=dialog for a11y"
+        );
+        assert!(html.contains("aria-modal"), "overlay must set aria-modal");
+        // Polls the new pending endpoint and POSTs back with the response.
+        assert!(
+            html.contains("/permission/pending"),
+            "shell JS must poll /permission/pending"
+        );
+        assert!(
+            html.contains("/respond"),
+            "shell JS must POST to /permission/{{nonce}}/respond"
+        );
+        // The 404 branch is the cross-tab dismissal contract: "another tab
+        // answered, hide my card".
+        assert!(
+            html.contains("r.status === 404"),
+            "shell JS must treat 404 on respond as 'already answered' and hide the card"
+        );
+        // All delegate-controlled strings must go through textContent, never
+        // innerHTML — guards against a future refactor re-opening XSS into
+        // the trusted shell origin.
+        assert!(
+            html.contains("function setText(el, text)"),
+            "setText helper (textContent-only) missing"
+        );
+        // innerHTML must not appear anywhere in the overlay code path. It
+        // can appear elsewhere in the shell JS if needed, but this test
+        // enforces that the overlay diff doesn't introduce it.
+        let overlay_start = html.find("__freenet_perm_overlay").unwrap();
+        let overlay_end = html[overlay_start..]
+            .find("setInterval(checkPermissions")
+            .unwrap();
+        let overlay_slice = &html[overlay_start..overlay_start + overlay_end];
+        assert!(
+            !overlay_slice.contains("innerHTML"),
+            "overlay code path must not use innerHTML (XSS surface)"
+        );
+
+        // The old Notification flow must be gone: no requestPermission(),
+        // no new Notification(...), no window.open('/permission/').
+        assert!(
+            !html.contains("Notification.requestPermission"),
+            "browser Notification permission request must be removed (#3836)"
+        );
+        assert!(
+            !html.contains("new Notification("),
+            "browser Notification construction must be removed (#3836)"
+        );
+        assert!(
+            !html.contains("window.open('/permission/")
+                && !html.contains("window.open(\"/permission/"),
+            "shell must no longer open /permission/{{nonce}} as a popup (#3836)"
+        );
+        // Visibility gating keeps background tabs from polling forever.
+        assert!(
+            html.contains("visibilityState"),
+            "overlay polling should be gated on document.visibilityState"
         );
     }
 
