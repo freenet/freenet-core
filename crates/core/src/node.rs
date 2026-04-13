@@ -3225,6 +3225,11 @@ mod tests {
         // ───────────────────────────────────────────────────────────
 
         use crate::operations::put::PutMsg;
+        use freenet_stdlib::prelude::*;
+
+        fn dummy_put_key(a: u8, b: u8) -> ContractKey {
+            ContractKey::from_id_and_code(ContractInstanceId::new([a; 32]), CodeHash::new([b; 32]))
+        }
 
         fn put_branch_would_forward(
             op: &PutMsg,
@@ -3244,10 +3249,7 @@ mod tests {
         async fn put_response_is_forwarded_to_task() {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
             let put_tx = Transaction::new::<PutMsg>();
-            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
-                freenet_stdlib::prelude::ContractInstanceId::new([10u8; 32]),
-                freenet_stdlib::prelude::CodeHash::new([11u8; 32]),
-            );
+            let key = dummy_put_key(10, 11);
             let op = PutMsg::Response { id: put_tx, key };
 
             let taken = put_branch_would_forward(&op, Some(&tx));
@@ -3261,10 +3263,7 @@ mod tests {
         async fn put_response_streaming_is_forwarded_to_task() {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
             let put_tx = Transaction::new::<PutMsg>();
-            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
-                freenet_stdlib::prelude::ContractInstanceId::new([12u8; 32]),
-                freenet_stdlib::prelude::CodeHash::new([13u8; 32]),
-            );
+            let key = dummy_put_key(12, 13);
             let op = PutMsg::ResponseStreaming {
                 id: put_tx,
                 key,
@@ -3284,10 +3283,7 @@ mod tests {
         async fn put_forwarding_ack_is_not_forwarded_to_task() {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
             let put_tx = Transaction::new::<PutMsg>();
-            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
-                freenet_stdlib::prelude::ContractInstanceId::new([14u8; 32]),
-                freenet_stdlib::prelude::CodeHash::new([15u8; 32]),
-            );
+            let key = dummy_put_key(14, 15);
             let op = PutMsg::ForwardingAck {
                 id: put_tx,
                 contract_key: key,
@@ -3310,18 +3306,14 @@ mod tests {
             let put_tx = Transaction::new::<PutMsg>();
             let op = PutMsg::Request {
                 id: put_tx,
-                contract: freenet_stdlib::prelude::ContractContainer::Wasm(
-                    freenet_stdlib::prelude::ContractWasmAPIVersion::V1(
-                        freenet_stdlib::prelude::WrappedContract::new(
-                            std::sync::Arc::new(freenet_stdlib::prelude::ContractCode::from(vec![
-                                0u8,
-                            ])),
-                            freenet_stdlib::prelude::Parameters::from(vec![]),
-                        ),
+                contract: ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                    WrappedContract::new(
+                        std::sync::Arc::new(ContractCode::from(vec![0u8])),
+                        Parameters::from(vec![]),
                     ),
-                ),
-                related_contracts: freenet_stdlib::prelude::RelatedContracts::default(),
-                value: freenet_stdlib::prelude::WrappedState::new(vec![1u8]),
+                )),
+                related_contracts: RelatedContracts::default(),
+                value: WrappedState::new(vec![1u8]),
                 htl: 5,
                 skip_list: std::collections::HashSet::new(),
             };
@@ -3334,10 +3326,7 @@ mod tests {
         #[tokio::test]
         async fn put_response_without_callback_falls_through() {
             let put_tx = Transaction::new::<PutMsg>();
-            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
-                freenet_stdlib::prelude::ContractInstanceId::new([16u8; 32]),
-                freenet_stdlib::prelude::CodeHash::new([17u8; 32]),
-            );
+            let key = dummy_put_key(16, 17);
             let op = PutMsg::Response { id: put_tx, key };
 
             let taken = put_branch_would_forward(&op, None);

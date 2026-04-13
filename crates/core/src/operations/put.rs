@@ -565,10 +565,8 @@ impl Operation for PutOp {
                     // Network peer notification is now automatic via BroadcastStateChange
                     // event emitted by the executor when state changes. No manual triggering needed.
 
-                    // Phase 3a (#1454): The early try_send originator response was
-                    // removed. Client-initiated PUTs now use the task-per-tx driver
-                    // which delivers exactly one response via send_client_result.
-                    // The legacy duplicate-send pattern is no longer needed.
+                    // Phase 3a (#1454): originator early-response removed;
+                    // task-per-tx driver delivers via send_client_result.
 
                     // Step 2: Determine if we should forward or respond
                     // Build skip list: include sender (upstream) and already-tried peers
