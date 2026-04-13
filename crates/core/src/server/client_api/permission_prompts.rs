@@ -10,6 +10,65 @@
 //!
 //! The standalone `/permission/{nonce}` HTML page is retained as a fallback
 //! (e.g. if JS is disabled in the shell, or for debugging / manual testing).
+//!
+//! # Trust model and UI rationale (#3857)
+//!
+//! The user installed the delegate. It is their agent; its per-key storage is
+//! cryptographically isolated, so an impostor delegate with a different
+//! `DelegateKey` cannot read or sign with the real delegate's secrets. That
+//! limits one class of spoofing — but it does not make the prompt safe to
+//! ship without identity attestation. A malicious-but-installed delegate can
+//! still:
+//!
+//! - sign actions with its own (fake) key and trick the user into thinking
+//!   they signed as their real identity (downstream verifiers that don't
+//!   know the real public key would accept it);
+//! - condition the user toward "Always allow" on a hostile request;
+//! - exfiltrate user input via the response channel;
+//! - write text in the message that looks like Freenet UI chrome (e.g.
+//!   `"Freenet verified this request"`).
+//!
+//! The prompt UI defends against these the same way a hardware key does:
+//! by surfacing a stable, runtime-attested fingerprint the user can
+//! recognise across sessions. The runtime-attested `DelegateKey` is the one
+//! signal that a returning user can passively use to spot an impostor; the
+//! attested caller (today only `MessageOrigin::WebApp(..)`, see #3860) tells
+//! the user *which* application is asking right now.
+//!
+//! Concrete UI choices that follow from this:
+//!
+//! 1. **The delegate's message ("Delegate says:") stays.** It is the most
+//!    informative thing on the screen for the *honest* delegate case (which
+//!    is the common case). Removing the authorship label was tempting but
+//!    is wrong: it is the only thing on the page distinguishing
+//!    delegate-authored text from Freenet UI chrome, and HTML-escaping does
+//!    not protect against text deception.
+//! 2. **The truncated delegate hash is shown inline, always visible**,
+//!    under the buttons in muted monospace. A user who recognises their
+//!    delegate's fingerprint can spot an impostor without expanding any
+//!    disclosure.
+//! 3. **A `<details>` "Technical details" disclosure** holds the full
+//!    delegate hash and the Caller row (`Freenet app <truncated>` or
+//!    `No app caller` for the `None` case). Closed by default — the user's
+//!    real decision is timing/intent ("did I just trigger this?"), not
+//!    hash matching.
+//! 4. **No human-readable names.** Any name would have to come from
+//!    app-controlled metadata and would be spoofable by a malicious
+//!    contract publishing a manifest named after a popular app. Showing a
+//!    name beside an unverified hash would pretend they are equally
+//!    verified. Names are deferred until there is a real provenance story
+//!    (signed manifests, or trust-on-first-use state).
+//! 5. **`No app caller` rather than `Unknown` or `(not recorded)`** for
+//!    the `CallerIdentity::None` case. `Unknown` reads like a failure;
+//!    `No app caller` is accurate and neutral.
+//! 6. **No `"Freenet confirmed these identities"` badge.** Such a badge
+//!    would oversell the defensive value of the Delegate field (see above)
+//!    and underlabel the Caller field. The information is presented
+//!    factually and the user evaluates it against their own context.
+//!
+//! The shell-page overlay JS in `crates/core/src/server/path_handlers.rs`
+//! mirrors this same layout. Both code paths must stay in sync — the
+//! standalone page and the in-page overlay are both regression-tested.
 
 use axum::extract::Path;
 use axum::http::HeaderMap;
@@ -215,7 +274,13 @@ async fn permission_page(
     let delegate_trunc_html = html_escape(&delegate_trunc);
 
     let (caller_display_text, caller_full) = caller_display(&entry.caller);
-    let caller_full_attr = caller_full.as_deref().map(html_escape).unwrap_or_default();
+    // When the caller is None there's no full hash to surface, so omit the
+    // title attribute entirely rather than rendering `title=""`. Empty
+    // tooltips are noise and one fewer thing for users to wonder about.
+    let caller_title_html = caller_full
+        .as_deref()
+        .map(|h| format!(" title=\"{}\"", html_escape(h)))
+        .unwrap_or_default();
     let caller_display_html = html_escape(&caller_display_text);
 
     (
@@ -287,7 +352,7 @@ async fn permission_page(
       <dt>Delegate</dt>
       <dd title="{delegate_full_attr}">{delegate_full_attr}</dd>
       <dt>Caller</dt>
-      <dd title="{caller_full_attr}">{caller_display_html}</dd>
+      <dd{caller_title_html}>{caller_display_html}</dd>
     </dl>
   </details>
   <div class="timer">Auto-deny in <span id="countdown">60</span>s</div>
@@ -553,10 +618,21 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_hash_boundary() {
+    fn test_truncate_hash_boundary_at_threshold() {
         // Exactly prefix+suffix+1 chars: returning unchanged saves no space, return as-is.
         let h = "1234567890ABCD"; // 14 chars: 8 + 5 + 1
         assert_eq!(truncate_hash(h), h);
+    }
+
+    #[test]
+    fn test_truncate_hash_first_truncated_length() {
+        // The first input length that *should* actually get truncated. A
+        // one-off bug shifting the boundary by one would only be caught
+        // here, not by the at-threshold test above.
+        let h = "1234567890ABCDE"; // 15 chars: prefix(8) + suffix(5) + 2
+        let t = truncate_hash(h);
+        assert_eq!(t, "12345678…ABCDE");
+        assert_ne!(t, h, "15-char input must actually be truncated");
     }
 
     #[test]
@@ -948,6 +1024,14 @@ mod tests {
             html.contains("Delegate says:"),
             "authorship label must be present even with no app caller"
         );
+        // A regression that rendered `Freenet app ` (empty hash) for the
+        // None variant would still pass the positive assertion above
+        // because "No app caller" might also be present elsewhere. Pin it
+        // negatively too.
+        assert!(
+            !html.contains("Freenet app"),
+            "None caller must NOT render the 'Freenet app' prefix"
+        );
     }
 
     // Hostile delegate text must be HTML-escaped so it cannot inject markup
@@ -968,5 +1052,45 @@ mod tests {
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("&lt;b&gt;Allow&lt;/b&gt;"));
+    }
+
+    // Hostile content in the runtime-attested hash strings (delegate_key
+    // and caller hash) must also be HTML-escaped — those values flow into
+    // the page body AND into `title="..."` attributes, so a missed escape
+    // could break out of the attribute value. Realistic threat model: a
+    // future code path that writes attacker-influenced data into these
+    // fields. Sanitization strips control/bidi chars; html_escape handles
+    // quote/angle injection.
+    #[tokio::test]
+    async fn test_permission_page_escapes_hostile_hash_fields() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(
+            &pending,
+            "n",
+            "ok",
+            vec!["Allow"],
+            r#"<script>alert(1)</script>"#,
+            webapp_caller(r#""onload="evil()"#),
+        );
+        let html = call_permission_page("n", pending).await;
+        // Raw markup must not appear anywhere in the rendered page.
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "raw <script> from delegate_key must not appear in HTML"
+        );
+        assert!(
+            !html.contains(r#""onload="evil()"#),
+            "raw quote-bearing payload from caller hash must not appear unescaped"
+        );
+        // Escaped forms must be present, demonstrating that the values
+        // flowed through html_escape on every render path.
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "escaped delegate_key markup must appear"
+        );
+        assert!(
+            html.contains("&quot;onload=&quot;evil()"),
+            "escaped caller hash quotes must appear"
+        );
     }
 }

@@ -518,10 +518,10 @@ where
             // renders. Today the only attested non-None caller is a web app
             // (via `MessageOrigin::WebApp`); delegate-to-delegate attestation
             // is tracked by #3860 and will appear here as a new variant.
-            let caller = match origin_contract {
-                Some(id) => CallerIdentity::WebApp(id.to_string()),
-                None => CallerIdentity::None,
-            };
+            //
+            // The actual mapping lives in `caller_identity_from_origin` so it
+            // can be unit-tested independently of the executor plumbing.
+            let caller = caller_identity_from_origin(origin_contract);
             let delegate_key_str = delegate_key.to_string();
 
             for req in user_input_requests {
@@ -585,6 +585,28 @@ fn try_recv_delegate_notification(
     match rx {
         Some(rx) => rx.try_recv().ok(),
         None => None,
+    }
+}
+
+/// Build a `CallerIdentity` for the permission prompt UI from the executor's
+/// runtime origin context (see #3857).
+///
+/// The mapping is intentionally narrow: today the only attested non-`None`
+/// caller is a web app via `MessageOrigin::WebApp(..)`. Every other path
+/// (delegate-to-delegate, local client, missing attestation) collapses to
+/// `CallerIdentity::None` and renders as `"No app caller"` in the UI.
+/// Issue #3860 tracks adding a `MessageOrigin::Delegate(DelegateKey)` variant
+/// and the corresponding `CallerIdentity::Delegate` row; until that lands,
+/// inter-delegate calls are not distinguishable here from "no caller at all".
+///
+/// Extracted as a free function (rather than inlined at the call site) so
+/// the mapping can be unit-tested in isolation. Without this, swapping the
+/// `Some` and `None` arms — or accidentally wiring a delegate-controlled
+/// value into the prompter — would not fail any test.
+fn caller_identity_from_origin(origin: Option<&ContractInstanceId>) -> CallerIdentity {
+    match origin {
+        Some(id) => CallerIdentity::WebApp(id.to_string()),
+        None => CallerIdentity::None,
     }
 }
 
@@ -1327,6 +1349,32 @@ mod tests {
         let code = ContractCode::from(vec![42u8; 32]);
         let params = Parameters::from(vec![7u8; 8]);
         ContractKey::from_params_and_code(&params, &code)
+    }
+
+    // Regression test for issue #3857: the executor's origin context must be
+    // mapped onto the prompter's CallerIdentity correctly. Without this test,
+    // accidentally swapping the Some/None arms — or wiring the wrong
+    // variable into the prompter call — would not fail any other test in
+    // the suite (the prompter unit tests pass `CallerIdentity` in directly).
+    #[test]
+    fn test_caller_identity_from_origin() {
+        // None origin (delegate-to-delegate, local client, missing
+        // attestation) collapses to CallerIdentity::None.
+        assert_eq!(caller_identity_from_origin(None), CallerIdentity::None);
+
+        // Some(ContractInstanceId) becomes CallerIdentity::WebApp(<id>),
+        // with the id stringified via its Display impl.
+        let key = make_contract_key();
+        let id = *key.id();
+        let mapped = caller_identity_from_origin(Some(&id));
+        assert_eq!(mapped, CallerIdentity::WebApp(id.to_string()));
+
+        // Sanity check: the produced string must not be empty (would
+        // render as "Freenet app " with a dangling space in the UI).
+        match mapped {
+            CallerIdentity::WebApp(s) => assert!(!s.is_empty()),
+            other => panic!("expected WebApp, got {other:?}"),
+        }
     }
 
     /// Helper: send an event through the sender halve and receive it on the handler side,

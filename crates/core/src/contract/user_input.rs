@@ -14,6 +14,16 @@ const MAX_MESSAGE_LEN: usize = 2048;
 const MAX_LABEL_LEN: usize = 64;
 /// Maximum number of response buttons. Keeps the UI usable.
 const MAX_LABELS: usize = 10;
+/// Maximum stored length of a runtime-attested identity hash.
+///
+/// Defense-in-depth: today both `delegate_key` and `CallerIdentity::WebApp`
+/// hashes come from runtime context that is bounded at the source (BLAKE3
+/// hex / base58 contract id, both well under this limit). Capping at the
+/// insertion point keeps the prompt store from holding arbitrarily large
+/// strings if a future caller passes something larger, and matches the
+/// downstream cap applied in `permission_prompts.rs` at the JSON / HTML
+/// boundary so the two layers can never disagree about the maximum.
+const MAX_IDENTITY_HASH_CHARS: usize = 256;
 
 /// Runtime-attested identity of the entity that triggered a permission prompt.
 ///
@@ -126,13 +136,23 @@ impl UserInputPrompter for DashboardPrompter {
 
         let (tx, rx) = oneshot::channel();
 
+        // Cap stored identity hashes at MAX_IDENTITY_HASH_CHARS at the
+        // insertion boundary (not just at the JSON/HTML layer). Defense-in-
+        // depth: real-world delegate keys are BLAKE3 hex (~64 chars) and
+        // contract ids are base58 (~44 chars), both well under the cap.
+        let stored_delegate_key = cap_identity_chars(delegate_key);
+        let stored_caller = match caller {
+            CallerIdentity::None => CallerIdentity::None,
+            CallerIdentity::WebApp(hash) => CallerIdentity::WebApp(cap_identity_chars(&hash)),
+        };
+
         self.pending.insert(
             nonce.clone(),
             PendingPrompt {
                 message,
                 labels,
-                delegate_key: delegate_key.to_string(),
-                caller,
+                delegate_key: stored_delegate_key,
+                caller: stored_caller,
                 response_tx: tx,
             },
         );
@@ -168,6 +188,12 @@ impl UserInputPrompter for DashboardPrompter {
             }
         }
     }
+}
+
+/// Truncate a runtime-attested identity hash to `MAX_IDENTITY_HASH_CHARS`
+/// codepoints. Char-based so multi-byte content doesn't get split mid-grapheme.
+fn cap_identity_chars(s: &str) -> String {
+    s.chars().take(MAX_IDENTITY_HASH_CHARS).collect()
 }
 
 /// Generate a 128-bit cryptographic hex nonce.

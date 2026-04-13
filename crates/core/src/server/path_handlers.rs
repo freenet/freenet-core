@@ -771,14 +771,6 @@ function freenetBridge(authToken) {
     '#__freenet_perm_overlay .fn-icon{font-size:28px;line-height:1;}' +
     '#__freenet_perm_overlay .fn-title{font-size:18px;font-weight:600;margin:0;' +
     'color:var(--fg);}' +
-    '#__freenet_perm_overlay .fn-ctx{background:var(--bg);border:1px solid var(--border);' +
-    'border-radius:8px;padding:12px 14px;margin-bottom:16px;font-size:12px;' +
-    'color:var(--muted);}' +
-    '#__freenet_perm_overlay .fn-ctx dt{font-weight:600;color:var(--fg);' +
-    'font-family:inherit;margin-top:6px;}' +
-    '#__freenet_perm_overlay .fn-ctx dt:first-child{margin-top:0;}' +
-    '#__freenet_perm_overlay .fn-ctx dd{margin:2px 0 0 0;font-family:ui-monospace,' +
-    'SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;word-break:break-all;}' +
     '#__freenet_perm_overlay .fn-msg-label{font-size:11px;color:var(--muted);' +
     'text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;}' +
     '#__freenet_perm_overlay .fn-msg{font-size:15px;line-height:1.5;margin:0 0 22px 0;' +
@@ -794,6 +786,15 @@ function freenetBridge(authToken) {
     '#__freenet_perm_overlay .fn-btn:hover:not(:disabled){transform:translateY(-1px);' +
     'filter:brightness(1.08);}' +
     '#__freenet_perm_overlay .fn-btn:disabled{opacity:0.55;cursor:not-allowed;}' +
+    '#__freenet_perm_overlay .fn-delegate-line{font-size:12px;color:var(--muted);' +
+    'margin-top:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}' +
+    '#__freenet_perm_overlay .fn-delegate-line .hash{user-select:all;}' +
+    '#__freenet_perm_overlay .fn-tech{margin-top:10px;font-size:12px;color:var(--muted);}' +
+    '#__freenet_perm_overlay .fn-tech summary{cursor:pointer;user-select:none;}' +
+    '#__freenet_perm_overlay .fn-tech dl{margin:8px 0 0 16px;}' +
+    '#__freenet_perm_overlay .fn-tech dt{font-weight:600;color:var(--fg);margin-top:6px;}' +
+    '#__freenet_perm_overlay .fn-tech dd{margin:2px 0 0 0;font-family:ui-monospace,' +
+    'SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;user-select:all;}' +
     '#__freenet_perm_overlay .fn-timer{margin-top:14px;font-size:12px;' +
     'color:var(--muted);text-align:center;}';
   // Auto-deny duration in seconds, mirroring the standalone /permission/{nonce}
@@ -834,6 +835,36 @@ function freenetBridge(authToken) {
     // strings. Delegate-provided fields are never parsed as markup.
     el.textContent = text == null ? '' : String(text);
   }
+  // Truncate a hash for display: first8…last5. Mirrors truncate_hash() in
+  // crates/core/src/server/client_api/permission_prompts.rs so the overlay
+  // and the standalone /permission/{nonce} fallback page render identically.
+  // Handles multi-byte unicode by iterating Array.from(...) which gives
+  // codepoints, not UTF-16 code units.
+  function truncateHash(s) {
+    if (typeof s !== 'string' || s.length === 0) return '';
+    var chars = Array.from(s);
+    if (chars.length <= 14) return s;
+    return chars.slice(0, 8).join('') + '\u2026' + chars.slice(chars.length - 5).join('');
+  }
+  // Render the Caller row from the tagged caller object. Forward-compatible:
+  // an unknown `kind` (e.g. a future "delegate" variant from issue #3860)
+  // falls through to a neutral "Unknown caller" so the overlay does NOT
+  // pretend to render an identity it doesn't understand.
+  function formatCaller(caller) {
+    if (!caller || typeof caller !== 'object') {
+      return { display: 'No app caller', full: '' };
+    }
+    if (caller.kind === 'webapp' && typeof caller.hash === 'string') {
+      return {
+        display: 'Freenet app ' + truncateHash(caller.hash),
+        full: caller.hash,
+      };
+    }
+    if (caller.kind === 'none') {
+      return { display: 'No app caller', full: '' };
+    }
+    return { display: 'Unknown caller', full: '' };
+  }
   function createCard(p) {
     var card = document.createElement('div');
     card.className = 'fn-card';
@@ -851,25 +882,14 @@ function freenetBridge(authToken) {
     header.appendChild(title);
     card.appendChild(header);
 
-    var ctx = document.createElement('dl');
-    ctx.className = 'fn-ctx';
-    var dkLabel = document.createElement('dt');
-    dkLabel.textContent = 'Delegate';
-    var dkVal = document.createElement('dd');
-    setText(dkVal, p.delegate_key || 'Unknown');
-    var ciLabel = document.createElement('dt');
-    ciLabel.textContent = 'Requesting contract';
-    var ciVal = document.createElement('dd');
-    setText(ciVal, p.contract_id || 'Unknown');
-    ctx.appendChild(dkLabel);
-    ctx.appendChild(dkVal);
-    ctx.appendChild(ciLabel);
-    ctx.appendChild(ciVal);
-    card.appendChild(ctx);
-
+    // "Delegate says:" authorship label is non-negotiable: a malicious
+    // delegate would otherwise be able to write text like "Freenet verified
+    // this request" with no way for the user to tell who authored it. The
+    // text below the label is delegate-controlled; the label tells the user
+    // that. See the trust-model rationale in permission_prompts.rs.
     var msgLabel = document.createElement('div');
     msgLabel.className = 'fn-msg-label';
-    msgLabel.textContent = 'Delegate says';
+    msgLabel.textContent = 'Delegate says:';
     card.appendChild(msgLabel);
     var msg = document.createElement('p');
     msg.className = 'fn-msg';
@@ -889,6 +909,58 @@ function freenetBridge(authToken) {
       buttons.appendChild(b);
     });
     card.appendChild(buttons);
+
+    // Inline truncated delegate hash, always visible. Gives the user a
+    // passive anomaly signal: a returning user who recognises their
+    // delegate's fingerprint can spot an impostor without expanding the
+    // Technical details disclosure. Full hash is in the Technical details
+    // pane below and copyable via user-select: all on .hash.
+    var delegateLine = document.createElement('div');
+    delegateLine.className = 'fn-delegate-line';
+    var delegateLabel = document.createElement('span');
+    delegateLabel.textContent = 'Delegate: ';
+    delegateLine.appendChild(delegateLabel);
+    var delegateHashSpan = document.createElement('span');
+    delegateHashSpan.className = 'hash';
+    var delegateFull = typeof p.delegate_key === 'string' ? p.delegate_key : '';
+    setText(delegateHashSpan, truncateHash(delegateFull) || '(none)');
+    if (delegateFull) {
+      delegateHashSpan.setAttribute('title', delegateFull);
+    }
+    delegateLine.appendChild(delegateHashSpan);
+    card.appendChild(delegateLine);
+
+    // Technical details disclosure. Holds the full delegate hash and the
+    // Caller row. Closed by default — the user's decision is timing/intent
+    // ("did I just trigger this?"), not hash matching. Power users hover or
+    // copy via user-select: all to audit the unabbreviated value.
+    var details = document.createElement('details');
+    details.className = 'fn-tech';
+    var summary = document.createElement('summary');
+    summary.textContent = 'Technical details';
+    details.appendChild(summary);
+    var dl = document.createElement('dl');
+    var dtDelegate = document.createElement('dt');
+    dtDelegate.textContent = 'Delegate';
+    var ddDelegate = document.createElement('dd');
+    setText(ddDelegate, delegateFull || '(none)');
+    if (delegateFull) {
+      ddDelegate.setAttribute('title', delegateFull);
+    }
+    var dtCaller = document.createElement('dt');
+    dtCaller.textContent = 'Caller';
+    var ddCaller = document.createElement('dd');
+    var callerRendered = formatCaller(p.caller);
+    setText(ddCaller, callerRendered.display);
+    if (callerRendered.full) {
+      ddCaller.setAttribute('title', callerRendered.full);
+    }
+    dl.appendChild(dtDelegate);
+    dl.appendChild(ddDelegate);
+    dl.appendChild(dtCaller);
+    dl.appendChild(ddCaller);
+    details.appendChild(dl);
+    card.appendChild(details);
 
     // Countdown mirroring the standalone permission page. The real timeout
     // lives server-side; this is a hint for the user that the prompt won't
@@ -1458,6 +1530,73 @@ mod tests {
         assert!(
             html.contains("visibilityState"),
             "overlay polling should be gated on document.visibilityState"
+        );
+
+        // Regression test for issue #3857: the overlay must read the new
+        // tagged `caller` JSON shape and render the same Delegate /
+        // Technical details treatment as the standalone /permission/{nonce}
+        // page. A previous version of this code read `p.contract_id` and
+        // fell through to "Unknown" — which silently re-shipped the bug
+        // for the in-page overlay path even after the standalone page was
+        // fixed. Tests below pin every replacement contract:
+        //   1. The "Delegate says:" authorship label must survive (codex
+        //      review point 2: removing it is a UX/security regression).
+        //   2. The truncated-hash helper and tagged-caller formatter must
+        //      both be present in the JS.
+        //   3. The old `p.contract_id` field name must be gone.
+        //   4. The old `<dl class="fn-ctx">` container must be gone.
+        //   5. The new `formatCaller` helper must handle "webapp", "none",
+        //      and unknown-kind variants so a future MessageOrigin variant
+        //      (issue #3860) doesn't render as a bogus identity.
+        assert!(
+            html.contains("'Delegate says:'") || html.contains("\"Delegate says:\""),
+            "shell overlay must render the 'Delegate says:' authorship label (#3857)"
+        );
+        assert!(
+            html.contains("function truncateHash("),
+            "shell overlay must define a truncateHash helper for the new disclosure (#3857)"
+        );
+        assert!(
+            html.contains("function formatCaller("),
+            "shell overlay must define a formatCaller helper for the tagged caller object (#3857)"
+        );
+        assert!(
+            html.contains("p.caller"),
+            "shell overlay must read p.caller from /permission/pending (#3857)"
+        );
+        assert!(
+            !html.contains("p.contract_id"),
+            "shell overlay must not read the removed p.contract_id field (#3857)"
+        );
+        assert!(
+            !html.contains("'fn-ctx'") && !html.contains("\"fn-ctx\""),
+            "shell overlay must not build the removed <dl class=\"fn-ctx\"> container (#3857)"
+        );
+        assert!(
+            html.contains("'Freenet app '") || html.contains("\"Freenet app \""),
+            "formatCaller must render webapp callers as 'Freenet app <hash>' (#3857)"
+        );
+        assert!(
+            html.contains("'No app caller'") || html.contains("\"No app caller\""),
+            "formatCaller must render the None / no-app case as 'No app caller' (#3857)"
+        );
+        assert!(
+            html.contains("'Unknown caller'") || html.contains("\"Unknown caller\""),
+            "formatCaller must have a forward-compatible fallback for unknown caller kinds (#3857)"
+        );
+        // The Technical details disclosure is the one the standalone page
+        // also exposes; the overlay must mirror it so both code paths show
+        // the user the same information.
+        assert!(
+            html.contains("'Technical details'") || html.contains("\"Technical details\""),
+            "shell overlay must include a 'Technical details' disclosure (#3857)"
+        );
+        // The inline truncated delegate line is the always-visible passive
+        // anomaly signal (codex review point 3). It must appear above the
+        // Technical details disclosure, not only inside it.
+        assert!(
+            html.contains("'fn-delegate-line'") || html.contains("\"fn-delegate-line\""),
+            "shell overlay must render the inline truncated delegate hash line (#3857)"
         );
     }
 
