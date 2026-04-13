@@ -527,3 +527,75 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_key() -> ContractKey {
+        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32]);
+        ContractKey::from_id_and_code(
+            instance_id,
+            freenet_stdlib::prelude::CodeHash::new([2u8; 32]),
+        )
+    }
+
+    fn dummy_tx() -> Transaction {
+        Transaction::new::<PutMsg>()
+    }
+
+    #[test]
+    fn classify_reply_response_is_stored() {
+        let tx = dummy_tx();
+        let key = dummy_key();
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Response { id: tx, key }));
+        assert!(matches!(classify_reply(&msg), ReplyClass::Stored { .. }));
+    }
+
+    #[test]
+    fn classify_reply_response_streaming_is_stored() {
+        let tx = dummy_tx();
+        let key = dummy_key();
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
+            id: tx,
+            key,
+            continue_forwarding: false,
+        }));
+        assert!(matches!(classify_reply(&msg), ReplyClass::Stored { .. }));
+    }
+
+    #[test]
+    fn classify_reply_forwarding_ack_is_unexpected() {
+        let tx = dummy_tx();
+        let key = dummy_key();
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::ForwardingAck {
+            id: tx,
+            contract_key: key,
+        }));
+        assert!(
+            matches!(classify_reply(&msg), ReplyClass::Unexpected),
+            "ForwardingAck must NOT be classified as terminal (Phase 2b bug 2)"
+        );
+    }
+
+    #[test]
+    fn classify_reply_request_is_unexpected() {
+        let tx = dummy_tx();
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Request {
+            id: tx,
+            contract: freenet_stdlib::prelude::ContractContainer::Wasm(
+                freenet_stdlib::prelude::ContractWasmAPIVersion::V1(
+                    freenet_stdlib::prelude::WrappedContract::new(
+                        std::sync::Arc::new(freenet_stdlib::prelude::ContractCode::from(vec![0u8])),
+                        freenet_stdlib::prelude::Parameters::from(vec![]),
+                    ),
+                ),
+            ),
+            related_contracts: freenet_stdlib::prelude::RelatedContracts::default(),
+            value: freenet_stdlib::prelude::WrappedState::new(vec![1u8]),
+            htl: 5,
+            skip_list: HashSet::new(),
+        }));
+        assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
+    }
+}
