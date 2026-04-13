@@ -724,7 +724,13 @@ function freenetBridge(authToken) {
     'color:#fff;border-color:var(--accent);}' +
     '#__freenet_perm_overlay .fn-btn:hover:not(:disabled){transform:translateY(-1px);' +
     'filter:brightness(1.08);}' +
-    '#__freenet_perm_overlay .fn-btn:disabled{opacity:0.55;cursor:not-allowed;}';
+    '#__freenet_perm_overlay .fn-btn:disabled{opacity:0.55;cursor:not-allowed;}' +
+    '#__freenet_perm_overlay .fn-timer{margin-top:14px;font-size:12px;' +
+    'color:var(--muted);text-align:center;}';
+  // Auto-deny duration in seconds, mirroring the standalone /permission/{nonce}
+  // fallback page. Tracked client-side only; the server enforces the real
+  // timeout and will clear the nonce regardless.
+  var OVERLAY_AUTO_DENY_SECONDS = 60;
   function ensureOverlayRoot() {
     if (overlayRoot) return overlayRoot;
     var style = document.createElement('style');
@@ -732,7 +738,26 @@ function freenetBridge(authToken) {
     document.head.appendChild(style);
     overlayRoot = document.createElement('div');
     overlayRoot.id = '__freenet_perm_overlay';
+    overlayRoot.setAttribute('role', 'dialog');
+    overlayRoot.setAttribute('aria-modal', 'true');
+    overlayRoot.setAttribute('aria-label', 'Delegate permission request');
     document.body.appendChild(overlayRoot);
+    // Escape-to-dismiss: routes to the last button in the most-recently-added
+    // card, which (by the standard delegate convention Allow Once / Always
+    // Allow / Deny) is the Deny button. If the delegate supplied a single
+    // label this is a no-op — Escape just does nothing.
+    document.addEventListener('keydown', function(e) {
+      if (e.key !== 'Escape') return;
+      if (!overlayRoot || overlayRoot.style.display === 'none') return;
+      var nonces = Object.keys(overlayCards);
+      if (nonces.length === 0) return;
+      var nonce = nonces[nonces.length - 1];
+      var card = overlayCards[nonce];
+      var btns = card.querySelectorAll('button');
+      if (btns.length < 2) return; // no non-primary option, ignore
+      btns[btns.length - 1].click();
+      e.preventDefault();
+    });
     return overlayRoot;
   }
   function setText(el, text) {
@@ -795,6 +820,25 @@ function freenetBridge(authToken) {
       buttons.appendChild(b);
     });
     card.appendChild(buttons);
+
+    // Countdown mirroring the standalone permission page. The real timeout
+    // lives server-side; this is a hint for the user that the prompt won't
+    // wait forever. On expiry the next poll drops the card via the
+    // reconciliation path, so we don't need a local hide here.
+    var timer = document.createElement('div');
+    timer.className = 'fn-timer';
+    var remaining = OVERLAY_AUTO_DENY_SECONDS;
+    timer.textContent = 'Auto-deny in ' + remaining + 's';
+    card._fnTimerId = setInterval(function() {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(card._fnTimerId);
+        timer.textContent = 'Auto-denied';
+        return;
+      }
+      timer.textContent = 'Auto-deny in ' + remaining + 's';
+    }, 1000);
+    card.appendChild(timer);
     return card;
   }
   function showCard(nonce, card) {
@@ -802,10 +846,20 @@ function freenetBridge(authToken) {
     root.appendChild(card);
     root.style.display = 'flex';
     overlayCards[nonce] = card;
+    // Move keyboard focus to the primary button so Enter/Space answer the
+    // prompt without requiring a mouse click.
+    var primary = card.querySelector('.fn-btn.primary');
+    if (primary && typeof primary.focus === 'function') {
+      try { primary.focus(); } catch (e) {}
+    }
   }
   function hideCard(nonce) {
     var card = overlayCards[nonce];
     if (!card) return;
+    if (card._fnTimerId) {
+      clearInterval(card._fnTimerId);
+      card._fnTimerId = null;
+    }
     if (card.parentNode) card.parentNode.removeChild(card);
     delete overlayCards[nonce];
     if (overlayRoot && Object.keys(overlayCards).length === 0) {
@@ -832,6 +886,14 @@ function freenetBridge(authToken) {
     });
   }
   function checkPermissions() {
+    // Skip polling when the tab is hidden: saves bandwidth and gateway
+    // load when the user has many Freenet tabs open in the background.
+    // The tab picks up the prompt again on its next visibility event.
+    if (typeof document !== 'undefined' &&
+        document.visibilityState === 'hidden' &&
+        Object.keys(overlayCards).length === 0) {
+      return;
+    }
     fetch('/permission/pending').then(function(r) { return r.json(); }).then(function(prompts) {
       if (!Array.isArray(prompts)) return;
       var seen = {};
@@ -852,6 +914,14 @@ function freenetBridge(authToken) {
   }
   setInterval(checkPermissions, 3000);
   checkPermissions();
+  // Re-check as soon as the tab becomes visible again so a user returning
+  // to a background tab sees any prompt that accumulated while they were
+  // away without waiting for the next poll tick.
+  if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('visibilitychange', function() {
+      if (document.visibilityState === 'visible') checkPermissions();
+    });
+  }
 }
 "#;
 
@@ -1243,6 +1313,82 @@ mod tests {
         assert!(
             html.contains("open_url"),
             "shell bridge must handle open_url messages for external links"
+        );
+    }
+
+    /// Regression test for issue #3836: permission prompts must render as an
+    /// in-page overlay in the shell DOM, NOT via browser Notifications (which
+    /// users block, miss, or dismiss accidentally).
+    #[tokio::test]
+    async fn shell_page_permission_overlay_present_and_safe() {
+        let token = AuthToken::generate();
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+
+        // Overlay root and accessibility attributes
+        assert!(
+            html.contains("__freenet_perm_overlay"),
+            "permission overlay root element missing from shell JS"
+        );
+        assert!(
+            html.contains("'role', 'dialog'") || html.contains("\"role\", \"dialog\""),
+            "overlay must declare role=dialog for a11y"
+        );
+        assert!(html.contains("aria-modal"), "overlay must set aria-modal");
+        // Polls the new pending endpoint and POSTs back with the response.
+        assert!(
+            html.contains("/permission/pending"),
+            "shell JS must poll /permission/pending"
+        );
+        assert!(
+            html.contains("/respond"),
+            "shell JS must POST to /permission/{{nonce}}/respond"
+        );
+        // The 404 branch is the cross-tab dismissal contract: "another tab
+        // answered, hide my card".
+        assert!(
+            html.contains("r.status === 404"),
+            "shell JS must treat 404 on respond as 'already answered' and hide the card"
+        );
+        // All delegate-controlled strings must go through textContent, never
+        // innerHTML — guards against a future refactor re-opening XSS into
+        // the trusted shell origin.
+        assert!(
+            html.contains("function setText(el, text)"),
+            "setText helper (textContent-only) missing"
+        );
+        // innerHTML must not appear anywhere in the overlay code path. It
+        // can appear elsewhere in the shell JS if needed, but this test
+        // enforces that the overlay diff doesn't introduce it.
+        let overlay_start = html.find("__freenet_perm_overlay").unwrap();
+        let overlay_end = html[overlay_start..]
+            .find("setInterval(checkPermissions")
+            .unwrap();
+        let overlay_slice = &html[overlay_start..overlay_start + overlay_end];
+        assert!(
+            !overlay_slice.contains("innerHTML"),
+            "overlay code path must not use innerHTML (XSS surface)"
+        );
+
+        // The old Notification flow must be gone: no requestPermission(),
+        // no new Notification(...), no window.open('/permission/').
+        assert!(
+            !html.contains("Notification.requestPermission"),
+            "browser Notification permission request must be removed (#3836)"
+        );
+        assert!(
+            !html.contains("new Notification("),
+            "browser Notification construction must be removed (#3836)"
+        );
+        assert!(
+            !html.contains("window.open('/permission/")
+                && !html.contains("window.open(\"/permission/"),
+            "shell must no longer open /permission/{{nonce}} as a popup (#3836)"
+        );
+        // Visibility gating keeps background tabs from polling forever.
+        assert!(
+            html.contains("visibilityState"),
+            "overlay polling should be gated on document.visibilityState"
         );
     }
 

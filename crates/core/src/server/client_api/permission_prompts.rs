@@ -32,28 +32,90 @@ pub(super) fn routes() -> Router {
 /// amount of delegate-controlled text the shell renders per poll so a
 /// malicious delegate cannot balloon the polling response.
 const OVERLAY_MESSAGE_MAX: usize = 2048;
+/// Maximum number of button labels rendered on the overlay. A delegate
+/// cannot force the shell to create an unbounded button grid.
+const OVERLAY_LABELS_MAX: usize = 8;
+/// Maximum length of each individual button label.
+const OVERLAY_LABEL_CHARS_MAX: usize = 64;
+/// Maximum length of `delegate_key` / `contract_id` rendered on the overlay.
+/// These are normally short keys; the cap bounds the amplification surface if
+/// the producer populates them from untrusted data in the future.
+const OVERLAY_KEY_CHARS_MAX: usize = 256;
+
+/// Strip characters that can visually spoof or hide delegate identity in the
+/// overlay: ASCII control characters (except `\t`, `\n`, `\r`) and Unicode
+/// bidirectional / formatting overrides. A right-to-left override in a
+/// delegate_key could otherwise visually reverse the key displayed in the
+/// context panel, undermining user trust.
+fn sanitize_display(s: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max_chars * 4));
+    for ch in s.chars().take(max_chars) {
+        let keep = match ch {
+            '\t' | '\n' | '\r' => true,
+            // C0 / C1 controls
+            c if (c as u32) < 0x20 || ((c as u32) >= 0x7f && (c as u32) <= 0x9f) => false,
+            // Bidi overrides and invisible formatters
+            '\u{202A}'..='\u{202E}' => false,
+            '\u{2066}'..='\u{2069}' => false,
+            '\u{200B}'..='\u{200F}' => false,
+            '\u{FEFF}' => false,
+            _ => true,
+        };
+        if keep {
+            out.push(ch);
+        }
+    }
+    out
+}
 
 /// Return the list of pending prompts for the shell page to render as
-/// in-page overlays (see issue #3836). Each entry includes the message,
-/// button labels, and delegate/contract context. The shell page is trusted
-/// and same-origin with the gateway, so it renders this data outside the
-/// sandboxed iframe where the contract can't reach it.
-async fn pending_prompts(Extension(pending): Extension<PendingPrompts>) -> impl IntoResponse {
+/// in-page overlays (see issue #3836). Each entry includes the sanitized
+/// message, button labels, and delegate/contract context.
+///
+/// The endpoint is protected by the same Origin check as
+/// `/permission/{nonce}/respond`: since this response now carries the full
+/// delegate-controlled message (rather than just a 100-char preview), a
+/// cross-origin page or rebinding attacker could otherwise scrape live
+/// prompts before the user sees them. Only trusted localhost origins pass.
+async fn pending_prompts(
+    headers: HeaderMap,
+    Extension(pending): Extension<PendingPrompts>,
+) -> impl IntoResponse {
+    if let Some(origin) = headers.get("origin") {
+        let origin = origin.to_str().unwrap_or("");
+        if !is_trusted_origin(origin) {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "forbidden"})),
+            );
+        }
+    }
+    // Requests with no Origin header (e.g. same-origin top-level fetch from
+    // some browsers) are allowed: the gateway only listens on loopback, the
+    // response is same-origin by policy, and the polled payload is not a
+    // capability — answering still requires POSTing to `/respond` with an
+    // Origin check that does reject the no-header case.
     let prompts: Vec<serde_json::Value> = pending
         .iter()
         .map(|entry| {
             let prompt = entry.value();
-            let message: String = prompt.message.chars().take(OVERLAY_MESSAGE_MAX).collect();
+            let message = sanitize_display(&prompt.message, OVERLAY_MESSAGE_MAX);
+            let labels: Vec<String> = prompt
+                .labels
+                .iter()
+                .take(OVERLAY_LABELS_MAX)
+                .map(|l| sanitize_display(l, OVERLAY_LABEL_CHARS_MAX))
+                .collect();
             serde_json::json!({
                 "nonce": entry.key(),
                 "message": message,
-                "labels": prompt.labels,
-                "delegate_key": prompt.delegate_key,
-                "contract_id": prompt.contract_id,
+                "labels": labels,
+                "delegate_key": sanitize_display(&prompt.delegate_key, OVERLAY_KEY_CHARS_MAX),
+                "contract_id": sanitize_display(&prompt.contract_id, OVERLAY_KEY_CHARS_MAX),
             })
         })
         .collect();
-    Json(prompts)
+    (axum::http::StatusCode::OK, Json(serde_json::json!(prompts)))
 }
 
 /// Serve the HTML permission prompt page.
@@ -408,41 +470,73 @@ mod tests {
         assert_eq!(html_escape("a & b"), "a &amp; b");
     }
 
-    // Regression test for issue #3836: the /permission/pending JSON must
-    // carry enough data for the shell-page overlay to render the prompt
-    // (message, labels, delegate key, contract id), not just a preview.
-    // Before the overlay existed the endpoint returned only `{nonce, preview}`
-    // because the shell fired a browser Notification and the user was expected
-    // to navigate to `/permission/{nonce}` for the full page.
-    #[tokio::test]
-    async fn test_pending_prompts_includes_overlay_fields() {
-        use crate::contract::user_input::PendingPrompt;
-        use axum::body::to_bytes;
-        use axum::response::IntoResponse;
+    fn empty_pending() -> PendingPrompts {
         use dashmap::DashMap;
         use std::sync::Arc;
+        Arc::new(DashMap::new())
+    }
 
-        let pending: PendingPrompts = Arc::new(DashMap::new());
-        let (tx, _rx) = tokio::sync::oneshot::channel::<usize>();
+    fn insert_prompt(
+        pending: &PendingPrompts,
+        nonce: &str,
+        message: &str,
+        labels: Vec<&str>,
+        delegate_key: &str,
+        contract_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<usize> {
+        use crate::contract::user_input::PendingPrompt;
+        let (tx, rx) = tokio::sync::oneshot::channel::<usize>();
         pending.insert(
-            "nonce123".to_string(),
+            nonce.to_string(),
             PendingPrompt {
-                message: "Approve this?".to_string(),
-                labels: vec![
-                    "Allow Once".to_string(),
-                    "Always Allow".to_string(),
-                    "Deny".to_string(),
-                ],
-                delegate_key: "dkey".to_string(),
-                contract_id: "cid".to_string(),
+                message: message.to_string(),
+                labels: labels.into_iter().map(String::from).collect(),
+                delegate_key: delegate_key.to_string(),
+                contract_id: contract_id.to_string(),
                 response_tx: tx,
             },
         );
+        rx
+    }
 
-        let resp = pending_prompts(Extension(pending)).await.into_response();
-        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    fn trusted_header() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("origin", "http://localhost:7509".parse().unwrap());
+        h
+    }
+
+    async fn call_pending(
+        headers: HeaderMap,
+        pending: PendingPrompts,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        let resp = pending_prompts(headers, Extension(pending))
+            .await
+            .into_response();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (status, value)
+    }
 
+    // Regression test for issue #3836: the /permission/pending JSON must
+    // carry enough data for the shell-page overlay to render the prompt
+    // (message, labels, delegate key, contract id), not just a preview.
+    #[tokio::test]
+    async fn test_pending_prompts_includes_overlay_fields() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(
+            &pending,
+            "nonce123",
+            "Approve this?",
+            vec!["Allow Once", "Always Allow", "Deny"],
+            "dkey",
+            "cid",
+        );
+
+        let (status, value) = call_pending(trusted_header(), pending).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
         let arr = value.as_array().expect("array");
         assert_eq!(arr.len(), 1);
         let entry = &arr[0];
@@ -460,30 +554,180 @@ mod tests {
     // can't balloon the polling response the shell fetches every few seconds.
     #[tokio::test]
     async fn test_pending_prompts_message_capped() {
-        use crate::contract::user_input::PendingPrompt;
-        use axum::body::to_bytes;
-        use axum::response::IntoResponse;
-        use dashmap::DashMap;
-        use std::sync::Arc;
-
-        let pending: PendingPrompts = Arc::new(DashMap::new());
-        let (tx, _rx) = tokio::sync::oneshot::channel::<usize>();
+        let pending = empty_pending();
         let huge = "a".repeat(OVERLAY_MESSAGE_MAX * 4);
-        pending.insert(
-            "n".to_string(),
-            PendingPrompt {
-                message: huge,
-                labels: vec!["OK".to_string()],
-                delegate_key: "d".to_string(),
-                contract_id: "c".to_string(),
-                response_tx: tx,
-            },
-        );
+        let _rx = insert_prompt(&pending, "n", &huge, vec!["OK"], "d", "c");
 
-        let resp = pending_prompts(Extension(pending)).await.into_response();
-        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let msg = value[0]["message"].as_str().unwrap();
-        assert_eq!(msg.chars().count(), OVERLAY_MESSAGE_MAX);
+        let (_, value) = call_pending(trusted_header(), pending).await;
+        assert_eq!(
+            value[0]["message"].as_str().unwrap().chars().count(),
+            OVERLAY_MESSAGE_MAX
+        );
+    }
+
+    // Multi-byte characters (emoji, CJK) must be counted by `char`, not
+    // byte, so truncation never splits a grapheme and panics.
+    #[tokio::test]
+    async fn test_pending_prompts_message_cap_is_char_based() {
+        let pending = empty_pending();
+        // Each fire emoji is 4 UTF-8 bytes; OVERLAY_MESSAGE_MAX * 4 bytes
+        // would be the naive byte budget. Char-based truncation keeps them
+        // all intact.
+        let emoji = "\u{1F525}".repeat(OVERLAY_MESSAGE_MAX);
+        let _rx = insert_prompt(&pending, "n", &emoji, vec!["OK"], "d", "c");
+        let (_, value) = call_pending(trusted_header(), pending).await;
+        let got = value[0]["message"].as_str().unwrap();
+        assert_eq!(got.chars().count(), OVERLAY_MESSAGE_MAX);
+        assert!(got.chars().all(|c| c == '\u{1F525}'));
+    }
+
+    // A delegate supplying thousands of labels must not be able to make the
+    // shell draw a button grid of arbitrary size. The response must cap
+    // both the count and the per-label length.
+    #[tokio::test]
+    async fn test_pending_prompts_labels_capped_and_truncated() {
+        let pending = empty_pending();
+        let long_label: String = "L".repeat(OVERLAY_LABEL_CHARS_MAX * 4);
+        let labels: Vec<String> = (0..OVERLAY_LABELS_MAX * 4)
+            .map(|_| long_label.clone())
+            .collect();
+        {
+            use crate::contract::user_input::PendingPrompt;
+            let (tx, _rx) = tokio::sync::oneshot::channel::<usize>();
+            pending.insert(
+                "n".to_string(),
+                PendingPrompt {
+                    message: "m".to_string(),
+                    labels,
+                    delegate_key: "d".to_string(),
+                    contract_id: "c".to_string(),
+                    response_tx: tx,
+                },
+            );
+        }
+        let (_, value) = call_pending(trusted_header(), pending).await;
+        let out_labels = value[0]["labels"].as_array().unwrap();
+        assert_eq!(out_labels.len(), OVERLAY_LABELS_MAX);
+        for l in out_labels {
+            assert_eq!(l.as_str().unwrap().chars().count(), OVERLAY_LABEL_CHARS_MAX);
+        }
+    }
+
+    // Empty-labels case: the JSON must still round-trip as `[]`, and the
+    // shell JS has a local `['OK']` fallback that kicks in client-side.
+    #[tokio::test]
+    async fn test_pending_prompts_empty_labels_round_trip() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec![], "d", "c");
+        let (_, value) = call_pending(trusted_header(), pending).await;
+        assert_eq!(value[0]["labels"], serde_json::json!([]));
+    }
+
+    // Unicode right-to-left override in delegate_key / contract_id must
+    // be stripped so a hostile delegate can't visually reverse the key
+    // displayed in the overlay's context panel and spoof identity.
+    #[tokio::test]
+    async fn test_pending_prompts_strips_bidi_and_controls() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(
+            &pending,
+            "n",
+            // LRO + text + RLO in the middle of the message
+            "Hello\u{202E}evil\u{202A}!",
+            vec!["\u{202E}Allow\u{202C}"],
+            "\u{FEFF}key\u{200B}123",
+            "c\u{0007}id",
+        );
+        let (_, value) = call_pending(trusted_header(), pending).await;
+        assert_eq!(value[0]["message"], "Helloevil!");
+        assert_eq!(value[0]["labels"], serde_json::json!(["Allow"]));
+        assert_eq!(value[0]["delegate_key"], "key123");
+        assert_eq!(value[0]["contract_id"], "cid");
+    }
+
+    // /permission/pending now returns full delegate-controlled text, so
+    // the endpoint must reject cross-origin requests (same Origin check
+    // as /respond). This guards against DNS rebinding / browser-extension
+    // scraping of live prompts.
+    #[tokio::test]
+    async fn test_pending_prompts_rejects_untrusted_origin() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", "c");
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://evil.com".parse().unwrap());
+        let (status, _) = call_pending(headers, pending).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    // Missing Origin is allowed (some fetch flavors omit it); this matches
+    // the documented threat model: the poll payload is not a capability,
+    // and the /respond endpoint still rejects the no-Origin case.
+    #[tokio::test]
+    async fn test_pending_prompts_allows_missing_origin() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", "c");
+        let (status, _) = call_pending(HeaderMap::new(), pending).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+    }
+
+    // End-to-end flow: two prompts pending, user answers one, other remains,
+    // second response to the same nonce returns 404. This is the cross-tab
+    // dismissal contract the shell JS relies on ("another tab already
+    // answered" → hide the overlay).
+    #[tokio::test]
+    async fn test_respond_consumes_nonce_and_second_response_404s() {
+        let pending = empty_pending();
+        let rx_a = insert_prompt(&pending, "a", "mA", vec!["Yes", "No"], "d", "c");
+        let _rx_b = insert_prompt(&pending, "b", "mB", vec!["Yes", "No"], "d", "c");
+
+        let (_, value) = call_pending(trusted_header(), pending.clone()).await;
+        let nonces: Vec<&str> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["nonce"].as_str().unwrap())
+            .collect();
+        assert_eq!(nonces.len(), 2);
+        assert!(nonces.contains(&"a") && nonces.contains(&"b"));
+
+        // Answer A.
+        let (status, _) = {
+            let resp = permission_respond(
+                Path("a".to_string()),
+                trusted_header(),
+                Extension(pending.clone()),
+                Json(PermissionResponse { index: 0 }),
+            )
+            .await
+            .into_response();
+            let status = resp.status();
+            use axum::body::to_bytes;
+            let _ = to_bytes(resp.into_body(), 1024).await.unwrap();
+            (status, ())
+        };
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(rx_a.await.unwrap(), 0);
+
+        // Only B remains.
+        let (_, value) = call_pending(trusted_header(), pending.clone()).await;
+        let remaining: Vec<&str> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["nonce"].as_str().unwrap())
+            .collect();
+        assert_eq!(remaining, vec!["b"]);
+
+        // Responding to A again 404s — the shell JS treats this as "another
+        // tab already answered" and hides its overlay card.
+        let resp = permission_respond(
+            Path("a".to_string()),
+            trusted_header(),
+            Extension(pending),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }
