@@ -1,9 +1,15 @@
 //! HTTP endpoints for delegate permission prompts.
 //!
 //! When a delegate emits `RequestUserInput`, the `DashboardPrompter` stores the
-//! pending prompt and the gateway shell page's JS detects it via polling. The user
-//! clicks a browser notification to open the permission page, responds, and the
-//! result flows back to the delegate.
+//! pending prompt and the gateway shell page's JS detects it via polling the
+//! `/permission/pending` endpoint. The shell page renders the prompt as an
+//! in-page overlay (see issue #3836) on every open Freenet tab. When the user
+//! clicks a button in any tab the response is POSTed to
+//! `/permission/{nonce}/respond` and the result flows back to the delegate;
+//! other tabs see the nonce disappear on their next poll and hide the overlay.
+//!
+//! The standalone `/permission/{nonce}` HTML page is retained as a fallback
+//! (e.g. if JS is disabled in the shell, or for debugging / manual testing).
 
 use axum::extract::Path;
 use axum::http::HeaderMap;
@@ -22,15 +28,28 @@ pub(super) fn routes() -> Router {
         .route("/permission/{nonce}/respond", post(permission_respond))
 }
 
-/// Return a list of pending prompt nonces (for the shell page to show notifications).
-/// Only returns nonces and message previews, not full prompt data.
+/// Maximum message length returned to the shell-page overlay. Caps the
+/// amount of delegate-controlled text the shell renders per poll so a
+/// malicious delegate cannot balloon the polling response.
+const OVERLAY_MESSAGE_MAX: usize = 2048;
+
+/// Return the list of pending prompts for the shell page to render as
+/// in-page overlays (see issue #3836). Each entry includes the message,
+/// button labels, and delegate/contract context. The shell page is trusted
+/// and same-origin with the gateway, so it renders this data outside the
+/// sandboxed iframe where the contract can't reach it.
 async fn pending_prompts(Extension(pending): Extension<PendingPrompts>) -> impl IntoResponse {
     let prompts: Vec<serde_json::Value> = pending
         .iter()
         .map(|entry| {
+            let prompt = entry.value();
+            let message: String = prompt.message.chars().take(OVERLAY_MESSAGE_MAX).collect();
             serde_json::json!({
                 "nonce": entry.key(),
-                "preview": entry.value().message.chars().take(100).collect::<String>(),
+                "message": message,
+                "labels": prompt.labels,
+                "delegate_key": prompt.delegate_key,
+                "contract_id": prompt.contract_id,
             })
         })
         .collect();
@@ -387,5 +406,84 @@ mod tests {
     #[test]
     fn test_html_escape_ampersand() {
         assert_eq!(html_escape("a & b"), "a &amp; b");
+    }
+
+    // Regression test for issue #3836: the /permission/pending JSON must
+    // carry enough data for the shell-page overlay to render the prompt
+    // (message, labels, delegate key, contract id), not just a preview.
+    // Before the overlay existed the endpoint returned only `{nonce, preview}`
+    // because the shell fired a browser Notification and the user was expected
+    // to navigate to `/permission/{nonce}` for the full page.
+    #[tokio::test]
+    async fn test_pending_prompts_includes_overlay_fields() {
+        use crate::contract::user_input::PendingPrompt;
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let (tx, _rx) = tokio::sync::oneshot::channel::<usize>();
+        pending.insert(
+            "nonce123".to_string(),
+            PendingPrompt {
+                message: "Approve this?".to_string(),
+                labels: vec![
+                    "Allow Once".to_string(),
+                    "Always Allow".to_string(),
+                    "Deny".to_string(),
+                ],
+                delegate_key: "dkey".to_string(),
+                contract_id: "cid".to_string(),
+                response_tx: tx,
+            },
+        );
+
+        let resp = pending_prompts(Extension(pending)).await.into_response();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let entry = &arr[0];
+        assert_eq!(entry["nonce"], "nonce123");
+        assert_eq!(entry["message"], "Approve this?");
+        assert_eq!(
+            entry["labels"],
+            serde_json::json!(["Allow Once", "Always Allow", "Deny"])
+        );
+        assert_eq!(entry["delegate_key"], "dkey");
+        assert_eq!(entry["contract_id"], "cid");
+    }
+
+    // Oversized delegate messages must be clipped so a malicious delegate
+    // can't balloon the polling response the shell fetches every few seconds.
+    #[tokio::test]
+    async fn test_pending_prompts_message_capped() {
+        use crate::contract::user_input::PendingPrompt;
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let (tx, _rx) = tokio::sync::oneshot::channel::<usize>();
+        let huge = "a".repeat(OVERLAY_MESSAGE_MAX * 4);
+        pending.insert(
+            "n".to_string(),
+            PendingPrompt {
+                message: huge,
+                labels: vec!["OK".to_string()],
+                delegate_key: "d".to_string(),
+                contract_id: "c".to_string(),
+                response_tx: tx,
+            },
+        );
+
+        let resp = pending_prompts(Extension(pending)).await.into_response();
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let msg = value[0]["message"].as_str().unwrap();
+        assert_eq!(msg.chars().count(), OVERLAY_MESSAGE_MAX);
     }
 }
