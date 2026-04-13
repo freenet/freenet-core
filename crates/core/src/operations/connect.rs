@@ -1376,6 +1376,17 @@ impl ConnectOp {
         match self.state.as_mut() {
             Some(ConnectState::Relaying(state)) => {
                 state.upstream_addr = upstream_addr;
+                // Restore bloom filter hash keys from the transaction ID before
+                // installing the new request on the relay state. The incoming
+                // `request` has just been deserialized off the wire, so its
+                // `VisitedPeers::hash_keys` are zeroed (`#[serde(skip)]`). Only
+                // `ConnectOp::new_relay` re-keys on first receipt; this re-entry
+                // path previously assigned the zeroed bloom directly, which
+                // corrupted subsequent `mark_visited`/`probably_visited` calls
+                // and produced CONNECT forwarding loops at scale (observed in
+                // 50-node CI sims as non-monotonic visited set-bit oscillation).
+                let mut request = request;
+                request.visited = request.visited.with_transaction(&self.id);
                 state.request = request;
                 state.handle_request(
                     ctx,
@@ -3836,6 +3847,102 @@ mod tests {
             actions2.forward.is_none(),
             "second call should not forward again"
         );
+    }
+
+    /// Regression: when a relay op is re-entered for the same transaction with a
+    /// freshly deserialized `ConnectRequest`, `ConnectOp::handle_request` must restore
+    /// the `VisitedPeers` bloom filter's transaction-derived hash keys before using
+    /// the new request as relay state. `VisitedPeers::hash_keys` is `#[serde(skip)]`,
+    /// so an incoming request has zeroed hash keys. `ConnectOp::new_relay` re-keys
+    /// correctly, but the `handle_request` re-entry path at connect.rs used to assign
+    /// the incoming request directly to `state.request` without re-keying. Subsequent
+    /// `mark_visited`/`probably_visited` calls then ran against zero hash keys and
+    /// silently corrupted the bloom, producing a CONNECT forwarding loop at scale
+    /// (observed in 50-node CI simulations as non-monotonic visited set-bit
+    /// oscillation on a single transaction).
+    #[test]
+    fn regression_visited_hash_keys_preserved_across_reentry() {
+        let self_loc = make_peer(4800);
+        let upstream = make_peer(4801);
+        let joiner = make_peer(4802);
+        let marked_peer = make_peer(4803);
+
+        let tx = Transaction::new::<ConnectMsg>();
+
+        // Build an initial ConnectRequest as it would look when first arriving over
+        // the wire: bloom has been keyed (with_transaction) and a peer has been marked.
+        let mut visited = VisitedPeers::new(&tx);
+        let marked_addr = marked_peer
+            .socket_addr()
+            .expect("test peer must have address");
+        visited.mark_visited(marked_addr);
+        assert!(
+            visited.probably_visited(marked_addr),
+            "precondition: marked peer must be detectable before the wire round-trip"
+        );
+
+        let request = ConnectRequest {
+            desired_location: Location::random(),
+            joiner: joiner.clone(),
+            ttl: 3,
+            visited,
+            uphill_budget: DEFAULT_UPHILL_BUDGET,
+        };
+
+        // Create the relay op as `new_relay` would on first receipt.
+        let estimator_arc = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
+        let mut op = ConnectOp::new_relay(
+            tx,
+            upstream.socket_addr().expect("test peer must have address"),
+            request.clone(),
+            estimator_arc,
+        );
+
+        // Simulate the request making another hop and re-entering this relay: it
+        // crosses the wire, so serde round-trips through `bincode`, which zeros out
+        // `VisitedPeers::hash_keys` (marked `#[serde(skip)]`).
+        let wire_bytes = bincode::serialize(&request).expect("serialize ConnectRequest");
+        let reentered: ConnectRequest =
+            bincode::deserialize(&wire_bytes).expect("deserialize ConnectRequest");
+
+        // Sanity: the freshly deserialized bloom has zeroed hash keys, so the
+        // previously-marked peer is NOT detectable through it directly.
+        assert!(
+            !reentered.visited.probably_visited(marked_addr),
+            "sanity: deserialized bloom must fail to detect marked peer without re-keying (hash_keys are #[serde(skip)])"
+        );
+
+        // Re-enter `ConnectOp::handle_request` with the deserialized request. We do
+        // NOT want the relay to take any meaningful action (forward/accept); all we
+        // care about is that `state.request.visited` ends up with the correct hash
+        // keys restored so subsequent visited-set operations behave correctly.
+        let ctx = TestRelayContext::new(self_loc.clone())
+            .accept(false)
+            .next_hop(None);
+        let estimator = ConnectForwardEstimator::new();
+        let _actions = op.handle_request(
+            &ctx,
+            upstream.socket_addr().expect("test peer must have address"),
+            reentered,
+            &estimator,
+            Instant::now(),
+        );
+
+        // After the re-entry, the relay state's bloom must still correctly detect the
+        // originally-marked peer. Without the fix, hash_keys are (0, 0) and the bits
+        // set during the initial mark hash to entirely different indices, so this
+        // check fails — evidencing bloom corruption.
+        match op.state.as_ref() {
+            Some(ConnectState::Relaying(state)) => {
+                assert!(
+                    state.request.visited.probably_visited(marked_addr),
+                    "bloom corruption after re-entry: previously-marked peer no longer detected. \
+                     VisitedPeers::hash_keys were not restored via with_transaction() when \
+                     assigning the deserialized request to state.request."
+                );
+            }
+            other => panic!("expected Relaying state after handle_request, got {other:?}"),
+        }
     }
 
     /// Test that greedy routing excludes peers farther from target than ourselves.
