@@ -2344,6 +2344,170 @@ fn test_subscribe_forwarding_ack_relay() {
     );
 }
 
+/// Soundness check for the fix that moved `ring.subscribe()` /
+/// `record_subscription()` / `announce_contract_hosted()` out of the shared
+/// prefix of `SubscribeMsgResult::Subscribed` and into the originator-only
+/// branch.
+///
+/// The *direct* regression is covered by the unit test
+/// `ring::hosting::tests::test_relay_downstream_only_not_in_renewal`, which
+/// asserts at the HostingManager level that a pure-relay state (downstream
+/// subscriber registered, no self-lease) does not get recruited into
+/// `contracts_needing_renewal()`. That unit test is where the bug bite is
+/// pinned.
+///
+/// This simulation test verifies the broader property that subscribes still
+/// complete successfully under the refactored handler and that the bounded
+/// number of active-subscription-lease holders stays sane under a multi-peer
+/// subscribe scenario — any regression that re-introduced relay-side
+/// `ring.subscribe` calls on nodes running the LEGACY process_message path
+/// would cause `subscribed_peers` to grow beyond the expected count of
+/// genuine originators.
+///
+/// Note on turmoil vs production: in the turmoil simulation runner every
+/// peer shares one process, which means `pending_op_results` is effectively
+/// global. `node::try_forward_task_per_tx_reply` on an intermediate peer
+/// can therefore find the originator's task entry and short-circuit the
+/// Response before it reaches the legacy relay handler. In production each
+/// peer is an independent process with its own `pending_op_results`, so
+/// relays fall through to the legacy handler and hit the bug. This is why
+/// the *primary* regression test for the bug is the in-process hosting
+/// manager unit test rather than this simulation test.
+#[test_log::test]
+fn test_relay_does_not_pollute_active_subscriptions() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x5CB6_F37C_0002;
+    const NETWORK_NAME: &str = "subscribe-relay-pollution";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    // Sparse topology: more peers than max_connections so the ring can't
+    // be fully connected and subscribe requests MUST route through at least
+    // one relay to reach the peer that holds the contract.
+    let sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            2,  // 2 gateways
+            18, // 18 regular nodes (20 total peers)
+            10, // ring_max_htl
+            3,  // rnd_if_htl_above
+            3,  // max_connections — tight ring, non-full topology
+            2,  // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    let contract = SimOperation::create_test_contract(0xAD);
+    let contract_id = *contract.key().id();
+    let initial_state = SimOperation::create_test_state(1);
+
+    // Gateway PUTs (with subscribe). Multiple distant nodes then subscribe
+    // in parallel so at least some Subscribe requests must route through
+    // relay hops before reaching a peer that holds the contract.
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state,
+                subscribe: true,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 15),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 16),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 17),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 18),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // run_controlled_simulation snapshots every peer's HostingManager state
+    // at shutdown and returns them on the result. Use those directly rather
+    // than the global registry (which is cleared on SimNetwork drop).
+    let snapshots = &result.topology_snapshots;
+    assert!(
+        !snapshots.is_empty(),
+        "No topology snapshots captured — background snapshot task didn't run"
+    );
+
+    // Count peers whose `HostingManager::active_subscriptions` contains the
+    // contract. Only genuine originators of a subscription should appear here:
+    //
+    //   * The PUT-with-subscribe originator (gateway 0).
+    //   * Each of nodes 15..=18 that called Subscribe explicitly.
+    //
+    // That's at most 5 peers. Before the fix, the
+    // `SubscribeMsgResult::Subscribed` handler would ALSO add every relay
+    // that forwards a Subscribed response to the set — crucially, when four
+    // simultaneous subscribers route through each other, the bug's recruited
+    // relays overlap with legit subscribers, but additional strictly-relay
+    // peers still accumulate. After the fix the bound collapses to the 5
+    // genuine originators.
+    let mut subscribed_peers: Vec<SocketAddr> = snapshots
+        .iter()
+        .filter(|snap| snap.active_subscription_keys.contains(&contract_id))
+        .map(|snap| snap.peer_addr)
+        .collect();
+    subscribed_peers.sort();
+
+    tracing::info!(
+        subscribed_peer_count = subscribed_peers.len(),
+        ?subscribed_peers,
+        total_snapshots = snapshots.len(),
+        "Peers with contract in active_subscriptions"
+    );
+
+    // Five nodes legitimately install a lease in `active_subscriptions`:
+    // the PUT-with-subscribe gateway and the four explicit Subscribe
+    // originators (nodes 15..=18). Anything more means a peer that did
+    // not originate a subscribe — a pure relay — ended up with the
+    // contract in its active_subscriptions, which is the bug.
+    assert!(
+        subscribed_peers.len() <= 5,
+        "Relay pollution regression: {} peer(s) have the contract in \
+         `active_subscriptions`, expected at most 5 (gateway + 4 subscribing \
+         nodes). Polluted peers: {:?}. \
+         See subscribe.rs::SubscribeMsgResult::Subscribed — `ring.subscribe()` \
+         must only run on the originator branch, not on relays.",
+        subscribed_peers.len(),
+        subscribed_peers,
+    );
+
+    // Sanity: at least some peer must have actually subscribed.
+    assert!(
+        !subscribed_peers.is_empty(),
+        "No peers have the contract in active_subscriptions — \
+         subscribes didn't complete, test is degenerate"
+    );
+}
+
 // =============================================================================
 // CRDT Emulation Mode Test (PR #2763 Bug Reproduction)
 // =============================================================================

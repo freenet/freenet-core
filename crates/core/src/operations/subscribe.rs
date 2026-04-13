@@ -1648,8 +1648,75 @@ impl Operation for SubscribeOp {
                                 "subscribe: processing Subscribed response"
                             );
 
-                            // Register our subscription locally. Relay nodes also register
-                            // downstream subscribers (see relay path below) to propagate updates.
+                            if let Some(requester_addr) = self.requester_addr {
+                                // Relay path. We are forwarding a Subscribed response from
+                                // an upstream fulfilling peer back to a downstream requester.
+                                //
+                                // Critically, we do NOT call `ring.subscribe()`,
+                                // `record_subscription()`, `announce_contract_hosted()`, or
+                                // register ourselves as having an upstream. Relays are not
+                                // subscribers in their own right; they only mediate updates
+                                // between the upstream fulfilling node and the downstream
+                                // requester. Doing any of the above on a relay would:
+                                //   - Install a lease in `active_subscriptions`, which the
+                                //     renewal cycle (ring.rs::contracts_needing_renewal path 1)
+                                //     would then refresh every ~2 minutes indefinitely. Each
+                                //     renewal routes through fresh relays, which themselves
+                                //     then subscribe — a positive feedback loop that inflates
+                                //     subscription trees and UPDATE fan-out with peers that
+                                //     have no genuine interest in the contract. This mirrors
+                                //     the #3763 subscription-storm incident.
+                                //   - Broadcast a "I host this" announcement populating
+                                //     neighbors' proximity caches with the relay, further
+                                //     amplifying UPDATE broadcast targets.
+                                //   - Corrupt `subscription_backoff` by recording a bogus
+                                //     "successful subscription" for a request the relay
+                                //     never actually made.
+                                //
+                                // The GET-piggyback relay path already follows this model;
+                                // see `operations.rs::setup_subscription_forwarding_at_relay`
+                                // which documents the same constraint. The explicit
+                                // SUBSCRIBE path was asymmetric historically and is brought
+                                // into line here.
+                                //
+                                // UPDATE propagation back through the relay is driven by
+                                // `register_downstream_subscriber` below (which registers
+                                // the requester in both the hosting manager's downstream
+                                // subscriber list and the interest manager). The upstream
+                                // fulfilling node already registered *this relay* as its
+                                // downstream subscriber when it processed our forwarded
+                                // Request, so UPDATEs will reach us and we'll fan them out
+                                // to the registered downstream.
+                                register_downstream_subscriber(
+                                    op_manager,
+                                    key,
+                                    requester_addr,
+                                    self.requester_pub_key.as_ref(),
+                                    None,
+                                    msg_id,
+                                    " (relay registration on Response)",
+                                )
+                                .await;
+
+                                tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
+                                // Note: ResponseSent telemetry is emitted by from_outbound_msg()
+                                return Ok(OperationResult::SendAndComplete {
+                                    msg: NetMessage::from(SubscribeMsg::Response {
+                                        id: *msg_id,
+                                        instance_id: *instance_id,
+                                        result: SubscribeMsgResult::Subscribed { key: *key },
+                                    }),
+                                    next_hop: Some(requester_addr),
+                                    stream_data: None,
+                                });
+                            }
+
+                            // Originator path. We initiated this subscribe (client or
+                            // renewal cycle) and the upstream peer confirmed. Install the
+                            // local lease, fetch the contract if needed, and record the
+                            // upstream as our interest target for future Unsubscribes.
+
+                            // Register our subscription locally.
                             op_manager.ring.subscribe(*key);
                             op_manager.ring.complete_subscription_request(key, true);
 
@@ -1666,8 +1733,9 @@ impl Operation for SubscribeOp {
                             crate::node::network_status::record_subscription(format!("{key}"));
 
                             // Fetch contract if we don't have it.
-                            // This is non-fatal - if it fails, we still continue with forwarding/completing
-                            // the subscription. The contract will eventually arrive via UPDATE broadcasts.
+                            // This is non-fatal - if it fails, we still complete the
+                            // subscription. The contract will eventually arrive via
+                            // UPDATE broadcasts.
                             if let Err(e) = fetch_contract_if_missing(op_manager, *key.id()).await {
                                 tracing::debug!(
                                     tx = %msg_id,
@@ -1700,88 +1768,50 @@ impl Operation for SubscribeOp {
                                 }
                             }
 
-                            // Forward response to requester or complete
-                            if let Some(requester_addr) = self.requester_addr {
-                                // We're a relay node — register the upstream requester as a
-                                // downstream subscriber so update broadcasts propagate back
-                                // through us. The requester_addr is the direct connection we
-                                // received the original Request from, so the registration is
-                                // always deliverable. This creates the subscription relay tree:
-                                //   fulfilling_node → relay(us) → requester
-                                // Pass None for source_addr fallback because here source_addr
-                                // is the fulfilling node (Response sender), NOT the requester.
-                                // The primary lookup uses requester_pub_key (resolved at init).
-                                register_downstream_subscriber(
-                                    op_manager,
-                                    key,
-                                    requester_addr,
-                                    self.requester_pub_key.as_ref(),
-                                    None,
-                                    msg_id,
-                                    " (relay registration on Response)",
-                                )
-                                .await;
+                            tracing::info!(tx = %msg_id, contract = %key, phase = "complete", "Subscribe completed (originator)");
 
-                                tracing::debug!(tx = %msg_id, %key, requester = %requester_addr, "Forwarding Subscribed response to requester");
-                                // Note: ResponseSent telemetry is emitted by from_outbound_msg()
-                                Ok(OperationResult::SendAndComplete {
-                                    msg: NetMessage::from(SubscribeMsg::Response {
-                                        id: *msg_id,
-                                        instance_id: *instance_id,
-                                        result: SubscribeMsgResult::Subscribed { key: *key },
-                                    }),
-                                    next_hop: Some(requester_addr),
-                                    stream_data: None,
-                                })
-                            } else {
-                                // We're the originator - return completed state for handle_op_result
-                                tracing::info!(tx = %msg_id, contract = %key, phase = "complete", "Subscribe completed (originator)");
-
-                                // Register local interest so that ChangeInterests from peers
-                                // get properly processed. Without this, when other nodes broadcast
-                                // ChangeInterests for contracts they seed, the has_local_interest()
-                                // check in the ChangeInterests handler fails, preventing peer
-                                // interest registration and breaking update propagation.
-                                if !self.is_renewal {
-                                    let became_interested =
-                                        op_manager.interest_manager.add_local_client(key);
-                                    if became_interested {
-                                        super::broadcast_change_interests(
-                                            op_manager,
-                                            vec![*key],
-                                            vec![],
-                                        )
-                                        .await;
-                                    }
+                            // Register local interest so that ChangeInterests from peers
+                            // get properly processed. Without this, when other nodes broadcast
+                            // ChangeInterests for contracts they seed, the has_local_interest()
+                            // check in the ChangeInterests handler fails, preventing peer
+                            // interest registration and breaking update propagation.
+                            if !self.is_renewal {
+                                let became_interested =
+                                    op_manager.interest_manager.add_local_client(key);
+                                if became_interested {
+                                    super::broadcast_change_interests(
+                                        op_manager,
+                                        vec![*key],
+                                        vec![],
+                                    )
+                                    .await;
                                 }
-
-                                // Emit telemetry for successful subscription
-                                let own_loc = op_manager.ring.connection_manager.own_location();
-                                if let Some(event) = NetEventLog::subscribe_success(
-                                    msg_id,
-                                    &op_manager.ring,
-                                    *key,
-                                    own_loc,
-                                    None, // hop_count not tracked in subscribe
-                                ) {
-                                    op_manager.ring.register_events(Either::Left(event)).await;
-                                }
-
-                                Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
-                                    SubscribeOp {
-                                        id,
-                                        state: SubscribeState::Completed(CompletedData {
-                                            key: *key,
-                                        }),
-                                        requester_addr: None,
-                                        requester_pub_key: None,
-                                        is_renewal: self.is_renewal,
-                                        stats: self.stats,
-                                        ack_received: false,
-                                        speculative_paths: 0,
-                                    },
-                                )))
                             }
+
+                            // Emit telemetry for successful subscription
+                            let own_loc = op_manager.ring.connection_manager.own_location();
+                            if let Some(event) = NetEventLog::subscribe_success(
+                                msg_id,
+                                &op_manager.ring,
+                                *key,
+                                own_loc,
+                                None, // hop_count not tracked in subscribe
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+
+                            Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
+                                SubscribeOp {
+                                    id,
+                                    state: SubscribeState::Completed(CompletedData { key: *key }),
+                                    requester_addr: None,
+                                    requester_pub_key: None,
+                                    is_renewal: self.is_renewal,
+                                    stats: self.stats,
+                                    ack_received: false,
+                                    speculative_paths: 0,
+                                },
+                            )))
                         }
                         SubscribeMsgResult::NotFound => {
                             tracing::debug!(

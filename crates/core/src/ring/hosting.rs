@@ -924,6 +924,20 @@ impl HostingManager {
         let mut snapshot = TopologySnapshot::new(peer_addr, location);
         let now = self.time_source.now();
 
+        // Record the raw set of keys that are in `active_subscriptions` right
+        // now. This is used by regression tests to detect whether a peer
+        // installed a subscription lease — e.g. the relay-pollution bug fixed
+        // alongside this field where every forwarder on a SUBSCRIBE response
+        // path was unconditionally adding itself to active_subscriptions,
+        // causing feedback-loop renewal. Must be populated BEFORE the merged
+        // `contracts` map below, which hides active_subscriptions entries
+        // behind hosting cache presence when both exist.
+        for entry in self.active_subscriptions.iter() {
+            if *entry.value() > now {
+                snapshot.active_subscription_keys.insert(*entry.key().id());
+            }
+        }
+
         // Add all hosted contracts
         // Collect and sort for deterministic iteration order
         let hosting_cache = self.hosting_cache.read();
@@ -1564,6 +1578,67 @@ mod tests {
     // but caused subscription storms. Hosted-only contracts must NOT be renewed.
     // The exclusion test (test_contracts_needing_renewal_excludes_hosted_only)
     // covers the correct behavior.
+
+    /// Regression: a node that merely relays a SUBSCRIBE response for some
+    /// other peer must NOT end up with the contract in its own
+    /// `active_subscriptions`, and consequently must NOT appear in
+    /// `contracts_needing_renewal()`.
+    ///
+    /// Before the fix to `operations::subscribe::SubscribeMsgResult::Subscribed`,
+    /// every relay on a SUBSCRIBE response path called `ring.subscribe(*key)`
+    /// unconditionally. That installed a lease in `active_subscriptions`,
+    /// which `contracts_needing_renewal()` path #1 would then pick up every
+    /// ~2 minutes and spawn a fresh subscribe for — routing through new
+    /// relays that *also* installed leases, compounding with each cycle.
+    /// The feedback loop shows up as the 85+ phantom contracts observed on
+    /// the `technic` peer's local dashboard (see commit message).
+    ///
+    /// This test models the post-fix relay state as "contract has a
+    /// downstream subscriber registered, but no `subscribe()` lease", which
+    /// is what the SUBSCRIBE Response relay branch now does. The assertion
+    /// is that such a relay does not get recruited into the renewal cycle.
+    #[test]
+    fn test_relay_downstream_only_not_in_renewal() {
+        let manager = HostingManager::new();
+        let contract = make_contract_key(77);
+        let downstream = make_peer_key(42);
+
+        // Relay state: we've accepted a downstream subscriber for the
+        // contract, but we have not called `subscribe()` on our own behalf
+        // (we're just forwarding Updates for someone else) and we have no
+        // local client expressing interest.
+        assert!(manager.add_downstream_subscriber(&contract, downstream.clone()));
+
+        // Invariant 1: we did not install a self-subscription lease.
+        assert!(
+            !manager.is_subscribed(&contract),
+            "Relay must not have an active subscription lease just from \
+             registering a downstream subscriber"
+        );
+        assert!(
+            manager.get_subscribed_contracts().is_empty(),
+            "active_subscriptions must be empty on a pure-relay peer"
+        );
+
+        // Invariant 2: the contract is not in the renewal set. This is the
+        // load-bearing property: if the relay were in `active_subscriptions`,
+        // `contracts_needing_renewal()` path #1 (expiring active leases)
+        // would pick it up and spawn a new subscribe, recruiting more
+        // relays. Pure downstream registration must NOT trigger renewal.
+        let needs_renewal = manager.contracts_needing_renewal();
+        assert!(
+            !needs_renewal.contains(&contract),
+            "Pure-relay peer must not appear in contracts_needing_renewal \
+             (relay-subscription feedback loop regression, see \
+             subscribe.rs::SubscribeMsgResult::Subscribed)"
+        );
+
+        // Invariant 3: downstream registration still works as intended —
+        // the relay holds the downstream peer so UPDATE broadcasts can be
+        // forwarded. This is the *correct* mechanism for a relay to receive
+        // and propagate updates, without inflating subscription trees.
+        assert!(manager.has_downstream_subscribers(&contract));
+    }
 
     // Superseded: startup revalidation window removed in #3546 to prevent
     // subscription accumulation storms. Hosted-only contracts are no longer
