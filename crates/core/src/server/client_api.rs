@@ -3,6 +3,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::Instant;
 
+/// Content-Security-Policy served with the shell (outer) page of any Freenet
+/// webapp. The shell runs an inline postMessage bridge and embeds the real
+/// webapp in a sandboxed iframe.
+///
+/// `connect-src` must include BOTH of:
+///   - `'self'`: same-origin HTTP fetches (e.g. the `/permission/pending`
+///     poller injected by `path_handlers::serve_webapp_html`). Missing this
+///     was freenet/freenet-core#3842 — every webapp logged a repeating CSP
+///     violation every few seconds and permission prompts never surfaced.
+///   - `ws:` / `wss:`: the bridge opens the real WebSocket on behalf of the
+///     sandboxed iframe.
+const SHELL_PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src 'self' ws: wss:";
+
 use dashmap::DashMap;
 
 use axum::extract::Path;
@@ -196,12 +209,16 @@ async fn web_home(
     );
     // CSP: shell page runs the inline postMessage bridge script, embeds a sandboxed
     // iframe, and opens the real WebSocket on behalf of the iframe. connect-src must
-    // allow ws:/wss: so the bridge can establish the WebSocket connection.
+    // allow:
+    //   - 'self' so the shell can fetch same-origin endpoints (e.g. the
+    //     /permission/pending poller injected by path_handlers). Without it
+    //     every Freenet webapp logs a repeating CSP violation every few
+    //     seconds and the permission-prompt overlay never appears.
+    //   - ws: / wss: so the bridge can open the real WebSocket on behalf of
+    //     the sandboxed iframe.
     response.headers_mut().insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
-        axum::http::HeaderValue::from_static(
-            "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src ws: wss:",
-        ),
+        axum::http::HeaderValue::from_static(SHELL_PAGE_CSP),
     );
     // Shell page must not be framed itself
     response.headers_mut().insert(
@@ -428,5 +445,46 @@ mod tests {
         assert!(!is_html_page("style.css"));
         assert!(!is_html_page("image.png"));
         assert!(!is_html_page("assets/app.wasm"));
+    }
+
+    /// Regression test for freenet/freenet-core#3842.
+    ///
+    /// The shell page CSP must allow same-origin HTTP fetches (`'self'` in
+    /// `connect-src`) so the JavaScript that `path_handlers` injects can
+    /// poll `/permission/pending` without tripping a CSP violation. Before
+    /// the fix, `connect-src` was `ws: wss:` only, and every Freenet webapp
+    /// logged a repeating "Content-Security-Policy: blocked the loading of
+    /// a resource (connect-src) at http://.../permission/pending" error and
+    /// permission prompts never surfaced.
+    ///
+    /// Also verifies the WebSocket schemes stay allowed so the bridge can
+    /// still open ws/wss connections for the sandboxed iframe.
+    #[test]
+    fn shell_page_csp_allows_same_origin_and_websocket_connect() {
+        let csp = SHELL_PAGE_CSP;
+        let connect_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("connect-src"))
+            .expect("connect-src directive present");
+        // Present: 'self' for same-origin fetches (#3842 fix), plus ws:/wss:
+        // for the WebSocket bridge.
+        assert!(
+            connect_src.contains("'self'"),
+            "connect-src must include 'self' (regression #3842); got: {connect_src}"
+        );
+        assert!(
+            connect_src.contains("ws:"),
+            "connect-src must include ws:; got: {connect_src}"
+        );
+        assert!(
+            connect_src.contains("wss:"),
+            "connect-src must include wss:; got: {connect_src}"
+        );
+        // default-src should remain restrictive; only connect-src is relaxed.
+        assert!(
+            csp.contains("default-src 'none'"),
+            "default-src should stay 'none' for defence in depth; got: {csp}"
+        );
     }
 }
