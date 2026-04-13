@@ -162,6 +162,7 @@ impl Hash for RequestResource {
 /// for the actual operation. Subsequent clients share the same transaction and
 /// receive the result when the first client's operation completes.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Phase 3a: Put variant no longer constructed from client_events; Phase 6 cleanup
 pub enum DeduplicatedRequest {
     Get {
         /// Client requests use instance_id since they may not know the full key
