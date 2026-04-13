@@ -1128,10 +1128,15 @@ const NAVIGATION_INTERCEPTOR_JS: &str = r#"
     // Skip links explicitly marked to bypass interception
     if (target.dataset && target.dataset.freenetNoIntercept) return;
     // Classify by origin. Cross-origin always goes through the open_url
-    // bridge — regardless of the `target` attribute — because a sandboxed
+    // bridge, regardless of the `target` attribute, because a sandboxed
     // popup would have a null origin and break CORS on the destination
     // (freenet/river#208).
-    var isCrossOrigin = false;
+    //
+    // Fail-safe default: if the origin comparison throws (pathological URLs
+    // that slipped past the protocol check above) we assume cross-origin,
+    // because the failure mode we are guarding against is a null-origin
+    // sandboxed popup, not an accidental in-contract navigation.
+    var isCrossOrigin = true;
     try {
       isCrossOrigin = target.origin !== location.origin;
     } catch(err) {}
