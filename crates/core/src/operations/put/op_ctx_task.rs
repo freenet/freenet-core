@@ -344,7 +344,7 @@ async fn drive_client_put_inner(
                     client_tx,
                     reply_key,
                     PutFinalizationData {
-                        sender: current_target.clone(),
+                        sender: current_target,
                         hop_count: None,
                         state_hash: None,
                         state_size: None,
@@ -389,12 +389,9 @@ enum ReplyClass {
 
 fn classify_reply(msg: &NetMessage) -> ReplyClass {
     match msg {
-        NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key, .. })) => {
-            ReplyClass::Stored { key: *key }
-        }
-        NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming { key, .. })) => {
-            ReplyClass::Stored { key: *key }
-        }
+        NetMessage::V1(NetMessageV1::Put(
+            PutMsg::Response { key, .. } | PutMsg::ResponseStreaming { key, .. },
+        )) => ReplyClass::Stored { key: *key },
         _ => ReplyClass::Unexpected,
     }
 }
@@ -533,11 +530,7 @@ mod tests {
     use super::*;
 
     fn dummy_key() -> ContractKey {
-        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32]);
-        ContractKey::from_id_and_code(
-            instance_id,
-            freenet_stdlib::prelude::CodeHash::new([2u8; 32]),
-        )
+        ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
     }
 
     fn dummy_tx() -> Transaction {
@@ -583,16 +576,12 @@ mod tests {
         let tx = dummy_tx();
         let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Request {
             id: tx,
-            contract: freenet_stdlib::prelude::ContractContainer::Wasm(
-                freenet_stdlib::prelude::ContractWasmAPIVersion::V1(
-                    freenet_stdlib::prelude::WrappedContract::new(
-                        std::sync::Arc::new(freenet_stdlib::prelude::ContractCode::from(vec![0u8])),
-                        freenet_stdlib::prelude::Parameters::from(vec![]),
-                    ),
-                ),
-            ),
-            related_contracts: freenet_stdlib::prelude::RelatedContracts::default(),
-            value: freenet_stdlib::prelude::WrappedState::new(vec![1u8]),
+            contract: ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+                Arc::new(ContractCode::from(vec![0u8])),
+                Parameters::from(vec![]),
+            ))),
+            related_contracts: RelatedContracts::default(),
+            value: WrappedState::new(vec![1u8]),
             htl: 5,
             skip_list: HashSet::new(),
         }));
