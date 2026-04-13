@@ -661,265 +661,68 @@ async fn process_open_request(
 
                         let contract_key = contract.key();
 
-                        // Check if this will be a local-only PUT (no network peers available)
-                        // This prevents race condition where PUT completes instantly and TX is removed
-                        // before a second client can reuse it (issue #1886)
-                        let own_location = op_manager.ring.connection_manager.own_location();
-                        let skip_list: Vec<_> = own_location.socket_addr().into_iter().collect();
-                        let has_remote_peers = op_manager
-                            .ring
-                            .closest_potentially_hosting(&contract_key, skip_list.as_slice())
-                            .is_some();
+                        // Phase 3a (#1454): task-per-tx driver handles both
+                        // local-only and network PUTs. The driver calls
+                        // put_contract locally first, then finds peers and
+                        // sends the request. No request-router dedup needed
+                        // — each task owns its own operation lifecycle.
+                        let client_tx = crate::message::Transaction::new::<put::PutMsg>();
 
-                        if !has_remote_peers {
-                            // Local-only PUT - bypass router to avoid race condition
-                            tracing::debug!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                peer = %peer_id,
-                                contract = %contract_key,
-                                phase = "local_only",
-                                "PUT will complete locally (no remote peers)"
-                            );
-
-                            // Start a local PUT operation without going through the router
-                            // This avoids the race condition while still providing proper result delivery
-                            let op = put::start_op(
-                                contract.clone(),
-                                related_contracts.clone(),
-                                state.clone(),
-                                op_manager.ring.max_hops_to_live,
-                                subscribe,
-                                blocking_subscribe,
-                            );
-                            let op_id = op.id;
-
-                            op_manager
-                                .ch_outbound
-                                .waiting_for_transaction_result(op_id, client_id, request_id)
-                                .await
-                                .inspect_err(|err| {
-                                    tracing::error!(
-                                        client_id = %client_id,
-                                        request_id = %request_id,
-                                        tx = %op_id,
-                                        error = %err,
-                                        "Error waiting for transaction result"
-                                    )
-                                })?;
-
-                            if let Err(err) = put::request_put(&op_manager, op).await {
-                                report_op_init_error(
-                                    &op_manager,
-                                    op_id,
-                                    &contract_key,
-                                    "PUT",
-                                    &err,
-                                    client_id,
-                                    request_id,
+                        op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(client_tx, client_id, request_id)
+                            .await
+                            .inspect_err(|err| {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %client_tx,
+                                    error = %err,
+                                    "Error waiting for transaction result"
                                 )
-                                .await;
-                            } else if subscribe {
-                                if let Some(sl) = subscription_listener {
-                                    register_subscription_listener(
-                                        &op_manager,
-                                        *contract_key.id(),
-                                        client_id,
-                                        sl,
-                                        "PUT",
-                                    )
-                                    .await?;
-                                } else {
-                                    tracing::warn!(
-                                        client_id = %client_id,
-                                        contract = %contract_key,
-                                        "PUT with subscribe=true but no subscription_listener"
-                                    );
-                                }
-                            }
-                        } else if let Some(router) = &request_router {
-                            tracing::debug!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                peer = %peer_id,
-                                contract = %contract_key,
-                                phase = "routing",
-                                "Routing PUT request through deduplication layer"
-                            );
+                            })?;
 
-                            let request = crate::node::DeduplicatedRequest::Put {
-                                key: contract_key,
-                                contract: contract.clone(),
-                                related_contracts: related_contracts.clone(),
-                                state: state.clone(),
-                                subscribe,
-                                blocking_subscribe,
+                        if subscribe {
+                            if let Some(sl) = subscription_listener {
+                                register_subscription_listener(
+                                    &op_manager,
+                                    *contract_key.id(),
+                                    client_id,
+                                    sl,
+                                    "PUT",
+                                )
+                                .await?;
+                            } else {
+                                tracing::warn!(
+                                    client_id = %client_id,
+                                    contract = %contract_key,
+                                    "PUT with subscribe=true but no subscription_listener"
+                                );
+                            }
+                        }
+
+                        if let Err(err) = put::op_ctx_task::start_client_put(
+                            op_manager.clone(),
+                            client_tx,
+                            contract,
+                            related_contracts,
+                            state,
+                            op_manager.ring.max_hops_to_live,
+                            subscribe,
+                            blocking_subscribe,
+                        )
+                        .await
+                        {
+                            report_op_init_error(
+                                &op_manager,
+                                client_tx,
+                                &contract_key,
+                                "PUT",
+                                &err,
                                 client_id,
                                 request_id,
-                            };
-
-                            let (transaction_id, should_start_operation) =
-                                router.route_request(request).await.map_err(|e| {
-                                    Error::Node(format!("Request routing failed: {}", e))
-                                })?;
-
-                            op_manager
-                                .ch_outbound
-                                .waiting_for_transaction_result(
-                                    transaction_id,
-                                    client_id,
-                                    request_id,
-                                )
-                                .await
-                                .inspect_err(|err| {
-                                    tracing::error!(
-                                        "Error waiting for transaction result: {}",
-                                        err
-                                    );
-                                })?;
-
-                            if should_start_operation {
-                                tracing::debug!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %transaction_id,
-                                    peer = %peer_id,
-                                    contract = %contract_key,
-                                    phase = "new_operation",
-                                    "Starting new PUT network operation"
-                                );
-
-                                let op = put::start_op_with_id(
-                                    contract.clone(),
-                                    related_contracts.clone(),
-                                    state.clone(),
-                                    op_manager.ring.max_hops_to_live,
-                                    subscribe,
-                                    blocking_subscribe,
-                                    transaction_id,
-                                );
-
-                                if let Err(err) = put::request_put(&op_manager, op).await {
-                                    report_op_init_error(
-                                        &op_manager,
-                                        transaction_id,
-                                        &contract_key,
-                                        "PUT",
-                                        &err,
-                                        client_id,
-                                        request_id,
-                                    )
-                                    .await;
-                                } else if subscribe {
-                                    if let Some(sl) = subscription_listener {
-                                        register_subscription_listener(
-                                            &op_manager,
-                                            *contract_key.id(),
-                                            client_id,
-                                            sl,
-                                            "PUT",
-                                        )
-                                        .await?;
-                                    } else {
-                                        tracing::warn!(
-                                            client_id = %client_id,
-                                            contract = %contract_key,
-                                            "PUT with subscribe=true but no subscription_listener"
-                                        );
-                                    }
-                                }
-                            } else {
-                                tracing::debug!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %transaction_id,
-                                    peer = %peer_id,
-                                    contract = %contract_key,
-                                    phase = "reuse",
-                                    "Reusing existing PUT operation - client registered for result"
-                                );
-                                if subscribe {
-                                    if let Some(sl) = subscription_listener {
-                                        register_subscription_listener(
-                                            &op_manager,
-                                            *contract_key.id(),
-                                            client_id,
-                                            sl,
-                                            "PUT",
-                                        )
-                                        .await?;
-                                    } else {
-                                        tracing::warn!(
-                                            client_id = %client_id,
-                                            contract = %contract_key,
-                                            "PUT with subscribe=true but no subscription_listener"
-                                        );
-                                    }
-                                }
-                            }
-                        } else {
-                            tracing::debug!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                peer = %peer_id,
-                                contract = %contract_key,
-                                phase = "legacy",
-                                "Starting direct PUT operation (legacy mode)"
-                            );
-
-                            let op = put::start_op(
-                                contract.clone(),
-                                related_contracts.clone(),
-                                state.clone(),
-                                op_manager.ring.max_hops_to_live,
-                                subscribe,
-                                blocking_subscribe,
-                            );
-                            let op_id = op.id;
-
-                            op_manager
-                                .ch_outbound
-                                .waiting_for_transaction_result(op_id, client_id, request_id)
-                                .await
-                                .inspect_err(|err| {
-                                    tracing::error!(
-                                        client_id = %client_id,
-                                        request_id = %request_id,
-                                        tx = %op_id,
-                                        error = %err,
-                                        "Error waiting for transaction result"
-                                    )
-                                })?;
-
-                            if let Err(err) = put::request_put(&op_manager, op).await {
-                                report_op_init_error(
-                                    &op_manager,
-                                    op_id,
-                                    &contract_key,
-                                    "PUT",
-                                    &err,
-                                    client_id,
-                                    request_id,
-                                )
-                                .await;
-                            } else if subscribe {
-                                if let Some(sl) = subscription_listener {
-                                    register_subscription_listener(
-                                        &op_manager,
-                                        *contract_key.id(),
-                                        client_id,
-                                        sl,
-                                        "PUT",
-                                    )
-                                    .await?;
-                                } else {
-                                    tracing::warn!(
-                                        client_id = %client_id,
-                                        contract = %contract_key,
-                                        "PUT with subscribe=true but no subscription_listener"
-                                    );
-                                }
-                            }
+                            )
+                            .await;
                         }
                     }
                     ContractRequest::Update { key, data } => {

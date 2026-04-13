@@ -998,6 +998,25 @@ where
                 .await;
             }
             NetMessageV1::Put(ref op) => {
+                // Phase 3a (#1454): task-per-tx bypass for client-initiated
+                // PUT. Mirror of the SUBSCRIBE bypass at the Subscribe arm.
+                //
+                // Only forward **terminal** Response/ResponseStreaming messages.
+                // Non-terminal messages (Request, RequestStreaming, ForwardingAck,
+                // BroadcastTo, SuccessfulUpdate) must NOT be forwarded: they would
+                // fill the capacity-1 reply channel and cause classify_reply to
+                // fail with Unexpected (Phase 2b bug 2).
+                if matches!(
+                    op,
+                    put::PutMsg::Response { .. } | put::PutMsg::ResponseStreaming { .. }
+                ) && try_forward_task_per_tx_reply(
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Put((*op).clone())),
+                    "put",
+                ) {
+                    return Ok(None);
+                }
+
                 tracing::debug!(
                     tx = %op.id(),
                     "handle_pure_network_message_v1: Processing PUT message"
@@ -3148,6 +3167,52 @@ mod tests {
             assert!(
                 !taken,
                 "Response without callback → must fall through to legacy path"
+            );
+        }
+
+        // ───────────────────────────────────────────────────────────
+        // Regression guard: PUT branch of handle_pure_network_message_v1
+        // must call try_forward_task_per_tx_reply before handle_op_request,
+        // gated on Response|ResponseStreaming only. Mirror of the SUBSCRIBE
+        // guard above. Added in Phase 3a (#1454).
+        // ───────────────────────────────────────────────────────────
+
+        #[test]
+        fn bypass_is_wired_into_put_branch_regression_guard() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            let put_branch_anchor = "NetMessageV1::Put(ref op) => {";
+            let branch_start = SOURCE.find(put_branch_anchor).expect(
+                "PUT branch of handle_pure_network_message_v1 not found; \
+                 the match arm has been renamed or moved — update this regression guard",
+            );
+
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<put::PutOp, _>")
+                .expect("PUT branch no longer calls handle_op_request — update guard")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+
+            assert!(
+                window.contains("try_forward_task_per_tx_reply("),
+                "PUT branch no longer calls try_forward_task_per_tx_reply \
+                 before handle_op_request. This is the bypass Phase 3a (#1454) \
+                 added to prevent task-per-tx callers from hanging on replies \
+                 that load_or_init would drop as OpNotPresent. Either restore \
+                 the bypass invocation or update this regression guard if the \
+                 branch has been legitimately refactored."
+            );
+
+            assert!(
+                window.contains("put::PutMsg::Response { .. }"),
+                "PUT branch bypass is not gated on Response. \
+                 Non-terminal messages must NOT be forwarded to the task-per-tx channel."
+            );
+
+            assert!(
+                window.contains("put::PutMsg::ResponseStreaming { .. }"),
+                "PUT branch bypass is not gated on ResponseStreaming. \
+                 Both terminal variants must be forwarded."
             );
         }
     }

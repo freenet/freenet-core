@@ -5758,6 +5758,7 @@ mod tests {
     /// only), defer to the network with local fallback.
     ///
     /// Returns (local_value, local_fallback) after applying the decision.
+    #[allow(clippy::type_complexity)]
     fn apply_relay_cache_decision(
         is_relay: bool,
         has_local_interest: bool,

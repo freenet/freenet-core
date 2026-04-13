@@ -2220,7 +2220,7 @@ mod tests;
 /// First production consumer of `OpCtx::send_and_await`.
 mod op_ctx_task;
 
-pub(crate) use op_ctx_task::start_client_subscribe;
+pub(crate) use op_ctx_task::{run_client_subscribe, start_client_subscribe};
 
 mod messages {
     use std::fmt::Display;

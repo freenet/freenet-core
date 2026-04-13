@@ -155,7 +155,10 @@ pub(crate) async fn start_client_subscribe(
 ///
 /// Runs inside a spawned task. Never panics — any error is converted into
 /// a `HostResult::Err` and delivered through `result_router_tx`.
-async fn run_client_subscribe(
+///
+/// `pub(crate)` so PUT's task-per-tx driver (Phase 3a) can `.await` this
+/// inline for blocking-subscribe children without spawning a separate task.
+pub(crate) async fn run_client_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_tx: Transaction,
