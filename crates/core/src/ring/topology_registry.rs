@@ -76,6 +76,14 @@ pub struct TopologySnapshot {
     pub location: f64,
     /// Subscriptions per contract
     pub contracts: HashMap<ContractInstanceId, ContractSubscription>,
+    /// Keys present in this peer's `HostingManager::active_subscriptions` map.
+    ///
+    /// Unlike the `contracts` map (which is merged with the hosting cache and
+    /// may hide active-subscription presence behind `is_hosting=true`), this
+    /// field is a direct projection of `active_subscriptions` with no merge.
+    /// Tests that need to detect whether a peer installed a subscription
+    /// lease — as opposed to merely caching the contract — should read this.
+    pub active_subscription_keys: HashSet<ContractInstanceId>,
     /// Timestamp when this snapshot was taken (for staleness detection)
     pub timestamp_nanos: u64,
 }
@@ -87,6 +95,7 @@ impl TopologySnapshot {
             peer_addr,
             location,
             contracts: HashMap::new(),
+            active_subscription_keys: HashSet::new(),
             timestamp_nanos: 0,
         }
     }
