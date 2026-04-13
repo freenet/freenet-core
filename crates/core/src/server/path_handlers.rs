@@ -630,7 +630,24 @@ function freenetBridge(authToken) {
           if (u.protocol !== 'https:') return;
           var h = u.hostname.toLowerCase();
           if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '0.0.0.0') return;
-          window.open(u.href, '_blank', 'noopener,noreferrer');
+          // Honour modifier-key semantics from the interceptor
+          // (freenet/freenet-core#3853). Shift-click opens a popup-style
+          // new window; middle-click and ctrl/meta-click open a regular
+          // new tab (browsers generally decide foreground vs background
+          // based on their own heuristics since we are not in a direct
+          // user-gesture context). Plain left-click keeps the existing
+          // noopener/noreferrer tab behaviour.
+          var shiftKey = msg.shiftKey === true;
+          var newWindow = msg.ctrlKey === true || msg.metaKey === true || msg.button === 1;
+          if (shiftKey) {
+            window.open(u.href, '_blank', 'noopener,noreferrer,popup');
+          } else if (newWindow) {
+            // Background-tab intent; same window features as the default
+            // path, just named so the intent is explicit in the source.
+            window.open(u.href, '_blank', 'noopener,noreferrer');
+          } else {
+            window.open(u.href, '_blank', 'noopener,noreferrer');
+          }
         } catch(e) {}
       }
       return;
@@ -1142,8 +1159,19 @@ const NAVIGATION_INTERCEPTOR_JS: &str = r#"
     } catch(err) {}
     if (isCrossOrigin) {
       e.preventDefault();
+      // Forward modifier state so the shell can honour shift-click
+      // (new window) and middle / ctrl / meta clicks (best-effort new
+      // tab behaviour). `button` is the MouseEvent button code: 0 is
+      // left, 1 is middle. freenet/freenet-core#3853.
       window.parent.postMessage({
-        __freenet_shell__: true, type: 'open_url', url: target.href
+        __freenet_shell__: true,
+        type: 'open_url',
+        url: target.href,
+        button: typeof e.button === 'number' ? e.button : 0,
+        ctrlKey: !!e.ctrlKey,
+        metaKey: !!e.metaKey,
+        shiftKey: !!e.shiftKey,
+        altKey: !!e.altKey
       }, '*');
       return;
     }
@@ -1933,6 +1961,73 @@ mod tests {
         assert!(
             cross_origin_block.contains("type: 'open_url'"),
             "cross-origin branch must send open_url, not navigate"
+        );
+    }
+
+    /// Regression test for freenet/freenet-core#3853.
+    ///
+    /// After #3852 (river#208) the cross-origin click handler unconditionally
+    /// preventDefaults and sends `open_url`. This meant middle-click,
+    /// ctrl-click, shift-click, meta-click all behaved identically to a plain
+    /// left-click: a single foreground tab regardless of user intent.
+    ///
+    /// Fix the regression by forwarding modifier state in the postMessage
+    /// payload and honouring it in the shell `open_url` handler. This test
+    /// pins the contract at both ends:
+    ///   1. The interceptor's cross-origin branch includes `button`,
+    ///      `ctrlKey`, `metaKey`, `shiftKey` in the posted message.
+    ///   2. The shell bridge's `open_url` handler reads those fields and
+    ///      branches on `shiftKey` (new window) / button-1 / ctrl / meta.
+    #[test]
+    fn navigation_interceptor_forwards_modifier_state_for_open_url() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+
+        // Cross-origin branch must include the modifier fields.
+        let cross_origin_idx = js
+            .find("type: 'open_url'")
+            .expect("interceptor open_url branch present");
+        let target_attr_idx = js
+            .find("target.target && target.target !== '_self'")
+            .expect("same-origin target check present");
+        let block = &js[cross_origin_idx..target_attr_idx];
+
+        for field in ["button", "ctrlKey", "metaKey", "shiftKey"] {
+            assert!(
+                block.contains(field),
+                "cross-origin open_url postMessage must include {field} to honour \
+                 modifier-click semantics (freenet/freenet-core#3853); got block: {block}"
+            );
+        }
+    }
+
+    /// Regression test for freenet/freenet-core#3853 shell-side.
+    ///
+    /// The shell `open_url` handler must read the modifier fields from the
+    /// posted message and use them when calling `window.open` — otherwise
+    /// the forwarded state is silently ignored and the interceptor-side fix
+    /// is meaningless.
+    #[test]
+    fn shell_open_url_handler_honours_modifier_state() {
+        let js = SHELL_BRIDGE_JS;
+        // Locate the open_url branch specifically.
+        let open_url_idx = js
+            .find("msg.type === 'open_url'")
+            .expect("shell open_url branch present");
+        // Take a generous window around it for the assertions.
+        let window_end = (open_url_idx + 2048).min(js.len());
+        let block = &js[open_url_idx..window_end];
+
+        assert!(
+            block.contains("msg.shiftKey"),
+            "open_url handler must read shiftKey for new-window intent (#3853)"
+        );
+        assert!(
+            block.contains("msg.ctrlKey") || block.contains("msg.metaKey"),
+            "open_url handler must read ctrlKey/metaKey for new-tab intent (#3853)"
+        );
+        assert!(
+            block.contains("msg.button"),
+            "open_url handler must read button to detect middle-click (#3853)"
         );
     }
 
