@@ -2463,6 +2463,7 @@ async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> Tes
                                 "MessageOrigin contract ID does not match expected"
                             );
                         }
+                        other => bail!("Expected MessageOrigin::WebApp, got {other:?}"),
                     }
                     tracing::info!(
                         "SUCCESS: MessageOrigin correctly passed to delegate process function"

@@ -766,10 +766,23 @@ pub(crate) trait ContractExecutor: Send + 'static {
         summary: Option<StateSummary<'_>>,
     ) -> Result<(), Box<RequestError>>;
 
+    /// Execute a delegate request.
+    ///
+    /// `origin_contract` carries the WebApp attestation when a contract-backed
+    /// web app dispatches a request to a delegate.
+    ///
+    /// `caller_delegate` carries the runtime-attested identity of a calling
+    /// delegate when one delegate sends a message to another via
+    /// [`OutboundDelegateMsg::SendDelegateMessage`]. When `Some`, it takes
+    /// precedence over `origin_contract` (and over inherited origins) for
+    /// the receiver's `MessageOrigin`. At most one of these two arguments is
+    /// expected to be `Some` at a given call site, and only `caller_delegate`
+    /// is used for inter-delegate dispatch (issue #3860).
     fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
+        caller_delegate: Option<&DelegateKey>,
     ) -> impl Future<Output = Response> + Send;
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;

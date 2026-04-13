@@ -19,6 +19,10 @@ pub enum OutboundAppMessage {
     DelegateMessageReceived {
         sender_key_bytes: Vec<u8>,
         payload: Vec<u8>,
+        /// Runtime-attested caller key extracted from the `origin` parameter
+        /// passed to `process()`. `Some` when origin was
+        /// `MessageOrigin::Delegate(k)` (issue #3860); `None` otherwise.
+        origin_delegate_key_bytes: Option<Vec<u8>>,
     },
     PingResponse {
         data: Vec<u8>,
@@ -32,7 +36,7 @@ impl DelegateInterface for Delegate {
     fn process(
         _ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        _origin: Option<MessageOrigin>,
+        origin: Option<MessageOrigin>,
         messages: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match messages {
@@ -80,10 +84,20 @@ impl DelegateInterface for Delegate {
             }
             InboundDelegateMsg::DelegateMessage(msg) => {
                 let sender_key_bytes = msg.sender.bytes().to_vec();
+                // Echo the runtime-attested origin so the test can assert that
+                // `MessageOrigin::Delegate(caller_key)` reaches the receiver
+                // (issue #3860). Match exhaustively so a future MessageOrigin
+                // variant isn't silently dropped.
+                let origin_delegate_key_bytes = match &origin {
+                    Some(MessageOrigin::Delegate(k)) => Some(k.bytes().to_vec()),
+                    Some(MessageOrigin::WebApp(_)) | None => None,
+                    Some(_) => None,
+                };
                 let response_payload =
                     bincode::serialize(&OutboundAppMessage::DelegateMessageReceived {
                         sender_key_bytes,
                         payload: msg.payload,
+                        origin_delegate_key_bytes,
                     })
                     .map_err(|err| DelegateError::Other(format!("{err}")))?;
 

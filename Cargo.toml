@@ -150,7 +150,13 @@ muda = "0.17"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-freenet-stdlib = "0.4.0"
+freenet-stdlib = "0.5.0"
+
+# Local override for issue #3860 — points at the freenet-stdlib branch that
+# adds `MessageOrigin::Delegate(DelegateKey)`. MUST be removed before this PR
+# can merge — replace with the published 0.5.0 from crates.io.
+[patch.crates-io]
+freenet-stdlib = { path = "../../freenet-stdlib-3860/rust" }
 
 [profile.dev.package."*"]
 opt-level = 3

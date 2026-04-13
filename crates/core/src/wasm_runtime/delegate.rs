@@ -91,10 +91,18 @@ impl Runtime {
         // SAFETY: `self.secret_store` and `self.contract_store` are valid for the
         // duration of the WASM `process()` call below, and the `DelegateEnvGuard`
         // ensures the env is removed from `DELEGATE_ENV` before this function returns.
-        // Build the origin_contracts list from the MessageOrigin.
+        // Build the origin_contracts list from the MessageOrigin. Only WebApp
+        // attestations grant the receiving delegate access to a contract on
+        // behalf of the caller; an inter-delegate caller (Delegate variant)
+        // does not propagate contract access — its identity is conveyed only
+        // via the `origin` argument forwarded into the WASM `process()` call.
         let origin_contracts = match origin {
             Some(MessageOrigin::WebApp(contract_id)) => vec![*contract_id],
-            None => Vec::new(),
+            Some(MessageOrigin::Delegate(_)) | None => Vec::new(),
+            // MessageOrigin is `#[non_exhaustive]`; future variants must
+            // explicitly decide whether they grant contract access. Until
+            // then, default to "no access" — fail closed.
+            Some(_) => Vec::new(),
         };
 
         // SAFETY: The `DelegateCallEnv` does not outlive `self`. The raw pointers to
@@ -3665,6 +3673,10 @@ mod test {
             DelegateMessageReceived {
                 sender_key_bytes: Vec<u8>,
                 payload: Vec<u8>,
+                /// Mirror of the same field in the WASM-side
+                /// `OutboundAppMessage`; populated when the runtime delivered
+                /// this message with `MessageOrigin::Delegate(k)` (#3860).
+                origin_delegate_key_bytes: Option<Vec<u8>>,
             },
             PingResponse {
                 data: Vec<u8>,
@@ -3820,13 +3832,77 @@ mod test {
             OutboundAppMessage::DelegateMessageReceived {
                 sender_key_bytes,
                 payload,
+                origin_delegate_key_bytes,
             } => {
                 assert_eq!(sender_key_bytes, sender_key.bytes());
                 assert_eq!(payload, b"hello");
+                assert!(
+                    origin_delegate_key_bytes.is_none(),
+                    "origin was None, so receiver should see no Delegate origin"
+                );
             }
             OutboundAppMessage::MessageSent | OutboundAppMessage::PingResponse { .. } => {
                 panic!("Expected DelegateMessageReceived, got {:?}", response)
             }
+        }
+
+        Ok(())
+    }
+
+    /// Regression test for issue #3860: when the runtime delivers an inbound
+    /// `DelegateMessage` with `Some(MessageOrigin::Delegate(caller_key))`, the
+    /// receiving delegate's `process()` MUST see exactly that origin in its
+    /// `origin` parameter. Previously the inter-delegate dispatch path passed
+    /// `None`, leaving the receiver unable to authorize on caller identity.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_inbound_app_message_propagates_delegate_origin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use messaging_messages::*;
+
+        let (delegate_b, mut runtime, _temp_dir) =
+            setup_runtime_with_params(TEST_DELEGATE_MESSAGING, vec![2]).await?;
+        let key_b = delegate_b.key().clone();
+
+        // Synthetic caller delegate A — its key is what we expect the
+        // receiver to observe via MessageOrigin::Delegate.
+        let caller_a = DelegateKey::new([0xA1u8; 32], CodeHash::new([0xA2u8; 32]));
+
+        // Build an inbound DelegateMessage for B, with `sender` distinct from
+        // `caller_a` so the test cannot pass by accident if the receiver
+        // confuses `msg.sender` with the runtime-attested origin.
+        let inband_sender = DelegateKey::new([0xBBu8; 32], CodeHash::new([0xCCu8; 32]));
+        let delegate_msg =
+            DelegateMessage::new(key_b.clone(), inband_sender, b"attest-me".to_vec());
+
+        let origin = MessageOrigin::Delegate(caller_a.clone());
+        let outbound = runtime.inbound_app_message(
+            &key_b,
+            &vec![2u8].into(),
+            Some(&origin),
+            vec![InboundDelegateMsg::DelegateMessage(delegate_msg)],
+        )?;
+
+        assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
+
+        let app_msg = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => m,
+            other => panic!("Expected ApplicationMessage, got {other:?}"),
+        };
+        let response: OutboundAppMessage = bincode::deserialize(&app_msg.payload)?;
+        match response {
+            OutboundAppMessage::DelegateMessageReceived {
+                origin_delegate_key_bytes,
+                ..
+            } => {
+                let observed = origin_delegate_key_bytes
+                    .expect("Receiver should see Some(MessageOrigin::Delegate(..))");
+                assert_eq!(
+                    observed,
+                    caller_a.bytes(),
+                    "Receiver must see the runtime-attested caller key, not msg.sender"
+                );
+            }
+            other => panic!("Expected DelegateMessageReceived, got {other:?}"),
         }
 
         Ok(())
@@ -3910,6 +3986,7 @@ mod test {
             OutboundAppMessage::DelegateMessageReceived {
                 sender_key_bytes,
                 payload,
+                origin_delegate_key_bytes,
             } => {
                 assert_eq!(
                     sender_key_bytes,
@@ -3917,6 +3994,13 @@ mod test {
                     "B should see A as the sender"
                 );
                 assert_eq!(payload, b"inter-delegate");
+                // Origin not asserted here: this roundtrip test calls
+                // inbound_app_message with origin=None (it bypasses the
+                // executor that injects MessageOrigin::Delegate). End-to-end
+                // propagation of MessageOrigin::Delegate through the WASM
+                // boundary is covered by
+                // `test_inbound_app_message_propagates_delegate_origin`.
+                let _ = origin_delegate_key_bytes;
             }
             OutboundAppMessage::MessageSent | OutboundAppMessage::PingResponse { .. } => {
                 panic!("Expected DelegateMessageReceived, got {:?}", response)

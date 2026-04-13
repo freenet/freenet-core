@@ -666,9 +666,10 @@ impl ContractExecutor for RuntimePool {
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
+        caller_delegate: Option<&DelegateKey>,
     ) -> Response {
         let mut executor = self.pop_executor().await;
-        let result = executor.delegate_request(req, origin_contract);
+        let result = executor.delegate_request(req, origin_contract, caller_delegate);
         self.return_checked(executor, "execute_delegate_request")
             .await;
         result
@@ -2366,8 +2367,9 @@ impl ContractExecutor for Executor<Runtime> {
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
+        caller_delegate: Option<&DelegateKey>,
     ) -> Response {
-        self.delegate_request(req, origin_contract)
+        self.delegate_request(req, origin_contract, caller_delegate)
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
@@ -2513,7 +2515,7 @@ impl Executor<Runtime> {
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
-            ClientRequest::DelegateOp(op) => self.delegate_request(op, None),
+            ClientRequest::DelegateOp(op) => self.delegate_request(op, None, None),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
@@ -2661,9 +2663,11 @@ impl Executor<Runtime> {
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
+        caller_delegate: Option<&DelegateKey>,
     ) -> Response {
         tracing::debug!(
             origin_contract = ?origin_contract,
+            caller_delegate = ?caller_delegate.map(|k| k.to_string()),
             "received delegate request"
         );
         match req {
@@ -2741,9 +2745,19 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
-                // Resolve the message origin: use the direct origin_contract, falling back
-                // to inherited origin from parent delegates created via create_delegate host function.
-                let origin: Option<MessageOrigin> = if let Some(contract_id) = origin_contract {
+                // Resolve the message origin in priority order:
+                //   1. `caller_delegate` — set when another delegate dispatched
+                //      this message via `SendDelegateMessage` (issue #3860).
+                //      The runtime attests the caller's identity so the
+                //      receiver can authorize on it.
+                //   2. `origin_contract` — set when a contract-backed web app
+                //      dispatched this message via the WebSocket API.
+                //   3. `DELEGATE_INHERITED_ORIGINS` — set when a parent
+                //      delegate created this delegate via `create_delegate`,
+                //      inheriting its WebApp attestation.
+                let origin: Option<MessageOrigin> = if let Some(caller) = caller_delegate {
+                    Some(MessageOrigin::Delegate(caller.clone()))
+                } else if let Some(contract_id) = origin_contract {
                     Some(MessageOrigin::WebApp(*contract_id))
                 } else {
                     crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS

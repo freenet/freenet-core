@@ -9,7 +9,10 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-freenet-stdlib = { version = "0.3.5", features = ["contract"] }
+# Point at the local freenet-stdlib worktree carrying the
+# MessageOrigin::Delegate variant (issue #3860). Must be replaced with
+# the published 0.5.0 from crates.io once stdlib is released.
+freenet-stdlib = { path = "../../../../freenet-stdlib-3860/rust", features = ["contract"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 

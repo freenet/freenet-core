@@ -101,7 +101,7 @@ where
         // Execute the delegate request
         let values = match contract_handler
             .executor()
-            .execute_delegate_request(current_req, origin_contract)
+            .execute_delegate_request(current_req, origin_contract, None)
             .await
         {
             Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
@@ -454,8 +454,10 @@ where
         //   delegate registry — they are passed per-request at the API layer. If a target
         //   delegate's process() relies on params, the caller must use ApplicationMessages
         //   directly. This is a known v1 limitation.
-        // - origin_contract is None for inter-delegate delivery since the message
-        //   originates from another delegate, not from a contract attestation context.
+        // - The caller's delegate key is passed as `caller_delegate` so the receiver
+        //   sees `MessageOrigin::Delegate(caller_key)` and can authorize on it
+        //   (issue #3860). The runtime attests this identity — the calling delegate
+        //   cannot forge it.
         // - Inter-delegate messaging only works via ApplicationMessages path; messages
         //   from handle_delegate_notification (contract state change callbacks) do not
         //   trigger delegate-to-delegate delivery.
@@ -476,7 +478,7 @@ where
                 };
                 match contract_handler
                     .executor()
-                    .execute_delegate_request(target_req, None)
+                    .execute_delegate_request(target_req, None, Some(delegate_key))
                     .await
                 {
                     Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
