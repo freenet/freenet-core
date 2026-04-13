@@ -3,19 +3,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::Instant;
 
-/// Content-Security-Policy served with the shell (outer) page of any Freenet
-/// webapp. The shell runs an inline postMessage bridge and embeds the real
-/// webapp in a sandboxed iframe.
-///
-/// `connect-src` must include BOTH of:
-///   - `'self'`: same-origin HTTP fetches (e.g. the `/permission/pending`
-///     poller injected by `path_handlers::serve_webapp_html`). Missing this
-///     was freenet/freenet-core#3842 — every webapp logged a repeating CSP
-///     violation every few seconds and permission prompts never surfaced.
-///   - `ws:` / `wss:`: the bridge opens the real WebSocket on behalf of the
-///     sandboxed iframe.
-const SHELL_PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src 'self' ws: wss:";
-
 use dashmap::DashMap;
 
 use axum::extract::Path;
@@ -34,6 +21,30 @@ use crate::server::HostCallbackResult;
 use super::{
     ApiVersion, AuthToken, ClientConnection, errors::WebSocketApiError, home_page, path_handlers,
 };
+
+/// Content-Security-Policy served with the shell (outer) page of any Freenet
+/// webapp. The shell runs an inline postMessage bridge and embeds the real
+/// webapp in a sandboxed iframe.
+///
+/// `connect-src` must include BOTH of:
+///   - `'self'`: same-origin HTTP fetches (e.g. the `/permission/pending`
+///     poller injected by `path_handlers`). Missing this was
+///     freenet/freenet-core#3842 — every webapp logged a repeating CSP
+///     violation every few seconds and permission prompts never surfaced.
+///   - `ws:` / `wss:`: the bridge opens the real WebSocket on behalf of the
+///     sandboxed iframe.
+const SHELL_PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src 'self' ws: wss:";
+
+/// Content-Security-Policy served with the sandboxed iframe that actually
+/// runs a webapp. The iframe has an opaque (null) origin because the
+/// sandbox attribute omits `allow-same-origin`, so CSP `'self'` would not
+/// match the local API server's origin. We therefore interpolate the
+/// concrete origin derived from the request Host header.
+fn sandbox_csp_for_origin(origin: &str) -> String {
+    format!(
+        "default-src {origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {origin} blob: data:"
+    )
+}
 
 mod permission_prompts;
 mod v1;
@@ -305,18 +316,14 @@ async fn serve_sandbox_response(
         path_handlers::serve_sandbox_content(key, api_version, sub_path).await?;
     let mut response = contract_response.into_response();
     add_sandbox_cors_headers(&mut response);
-    // CSP for sandbox content: the iframe has an opaque origin (null) because the
-    // sandbox attribute omits allow-same-origin. This means CSP 'self' won't match
-    // the local API server's actual origin, so we must use the explicit local API
-    // origin derived from the Host header.
+    // See `sandbox_csp_for_origin` for why we interpolate a concrete origin
+    // rather than using `'self'`.
     let local_api_origin = req_headers
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
         .map(|host| format!("http://{host}"))
         .unwrap_or_else(|| "'self'".to_string());
-    let csp = format!(
-        "default-src {local_api_origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {local_api_origin} blob: data:"
-    );
+    let csp = sandbox_csp_for_origin(&local_api_origin);
     if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
         response
             .headers_mut()
@@ -481,10 +488,56 @@ mod tests {
             connect_src.contains("wss:"),
             "connect-src must include wss:; got: {connect_src}"
         );
-        // default-src should remain restrictive; only connect-src is relaxed.
+        // default-src 'none' doesn't affect connect-src (which is set
+        // explicitly), but it guards unset directives (font-src, media-src,
+        // object-src, ...) — defence in depth. Pinned so it's not silently
+        // relaxed in a future refactor.
         assert!(
             csp.contains("default-src 'none'"),
             "default-src should stay 'none' for defence in depth; got: {csp}"
         );
+    }
+
+    /// The sandbox iframe has an opaque (null) origin because the sandbox
+    /// attribute omits `allow-same-origin`, so CSP `'self'` wouldn't match
+    /// the local API server. `sandbox_csp_for_origin` must interpolate the
+    /// explicit origin into BOTH `default-src` and `connect-src`, otherwise
+    /// the webapp inside the sandbox can't load its own resources or talk
+    /// to the local API — the same class of bug as #3842, different page.
+    #[test]
+    fn sandbox_csp_includes_explicit_origin_in_connect_src() {
+        let csp = sandbox_csp_for_origin("http://127.0.0.1:7509");
+        let connect_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("connect-src"))
+            .expect("connect-src directive present");
+        assert!(
+            connect_src.contains("http://127.0.0.1:7509"),
+            "sandbox connect-src must include the explicit local API origin; got: {connect_src}"
+        );
+        let default_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("default-src"))
+            .expect("default-src directive present");
+        assert!(
+            default_src.contains("http://127.0.0.1:7509"),
+            "sandbox default-src must include the explicit local API origin; got: {default_src}"
+        );
+        // blob: and data: must remain allowed for client-side WASM/Blob
+        // workflows (e.g. spawning Web Workers from a Blob URL).
+        assert!(connect_src.contains("blob:"));
+        assert!(connect_src.contains("data:"));
+    }
+
+    #[test]
+    fn sandbox_csp_adapts_to_remote_host_origin() {
+        // When the gateway is accessed over the LAN, the Host header gives
+        // the LAN address; the CSP must still match rather than being
+        // pinned to localhost.
+        let csp = sandbox_csp_for_origin("http://192.168.1.42:7509");
+        assert!(csp.contains("http://192.168.1.42:7509"));
+        assert!(!csp.contains("127.0.0.1"));
     }
 }
