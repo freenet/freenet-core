@@ -1370,19 +1370,34 @@ if current_key != key_bytes:
     # `riverctl` binary. The installed binary embeds room_contract.wasm at install time,
     # which becomes stale when the contract WASM changes. The repo version uses a build
     # script that copies the current WASM from ui/public/contracts/ at build time.
+    #
+    # RIVER_SKIP_CONTRACT_CHECK=1 disables riverctl's build-time staleness check that
+    # compares `ui/public/contracts/room_contract.wasm` against
+    # `target/wasm32-unknown-unknown/release/room_contract.wasm`. That check catches
+    # out-of-date WASM before *publishing* riverctl to crates.io, but here we are only
+    # *running* riverctl locally to send a chat message. A developer with a freshly
+    # rebuilt room-contract in their workspace will otherwise hit a panic unrelated to
+    # sending the message.
+    #
+    # stderr is captured into a log instead of discarded so future failures are
+    # diagnosable from the release log.
     local RIVER_DIR="$HOME/code/freenet/river/main"
+    local RIVER_LOG="/tmp/release-$VERSION-river.log"
     if [[ -d "$RIVER_DIR" ]]; then
-        if (cd "$RIVER_DIR" && timeout 60 cargo run -p riverctl -- message send "$ROOM_OWNER_VK" "$announcement" 2>/dev/null); then
+        if (cd "$RIVER_DIR" && RIVER_SKIP_CONTRACT_CHECK=1 timeout 180 cargo run -p riverctl -- message send "$ROOM_OWNER_VK" "$announcement" >"$RIVER_LOG" 2>&1); then
             echo "✓"
             mark_completed "RIVER_ANNOUNCED"
         else
+            local rc=$?
             echo "✗"
-            echo "  ⚠️  Failed to send River announcement (non-critical)"
-            echo "     Manual: cd $RIVER_DIR && cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
+            echo "  ⚠️  Failed to send River announcement (non-critical, rc=$rc)"
+            echo "     Last log lines from $RIVER_LOG:"
+            tail -15 "$RIVER_LOG" 2>/dev/null | sed 's/^/       /'
+            echo "     Manual: cd $RIVER_DIR && RIVER_SKIP_CONTRACT_CHECK=1 cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
         fi
     else
         echo "⚠️  River repo not found at $RIVER_DIR"
-        echo "     Manual: cd <river-repo> && cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
+        echo "     Manual: cd <river-repo> && RIVER_SKIP_CONTRACT_CHECK=1 cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
     fi
 }
 
