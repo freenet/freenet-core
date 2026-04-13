@@ -198,14 +198,14 @@ This is usually benign (duplicate message, already completed)
 → Do NOT treat as error
 ```
 
-**Note (#1454 Phase 2b):** For op kinds with a task-per-tx driver
-(currently SUBSCRIBE client-initiated), the pure-network-message
+**Note (#1454 Phase 2b/3a):** For op kinds with a task-per-tx driver
+(SUBSCRIBE and PUT client-initiated), the pure-network-message
 handler checks `pending_op_results` FIRST and forwards the reply to
 the awaiting task via `node::try_forward_task_per_tx_reply` before
 reaching `load_or_init`. Do NOT "fix" `load_or_init`'s `OpNotPresent`
 handling by trying to look up a task-owned tx there — it will never
 find one, and it shouldn't. The bypass is the load-bearing piece;
-confirm by reading the SUBSCRIBE branch of
+confirm by reading the SUBSCRIBE and PUT branches of
 `handle_pure_network_message_v1` in `node.rs`.
 
 ### WHEN encountering InvalidStateTransition
