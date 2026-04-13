@@ -259,7 +259,12 @@ fi
 # State file for tracking progress (backup for manual inspection)
 STATE_FILE="/tmp/release-${VERSION}.state"
 
-# Get current fdev version and increment patch version
+# Provisional fdev version: bump the current Cargo.toml patch by one. On a
+# fresh run this is the target version. On a resume `load_state_file` will
+# overwrite FDEV_VERSION with the value persisted when the release PR was
+# created, so we never double-bump when the local Cargo.toml already reflects
+# the just-released version. See the v0.2.42 incident for the bug this guards
+# against: the summary printed 0.3.206, crates.io shipped 0.3.205.
 CURRENT_FDEV_VERSION=$(grep "^version" "$PROJECT_ROOT/crates/fdev/Cargo.toml" 2>/dev/null | cut -d'"' -f2)
 if [[ -n "$CURRENT_FDEV_VERSION" ]]; then
     FDEV_MAJOR=$(echo "$CURRENT_FDEV_VERSION" | cut -d. -f1)
@@ -302,6 +307,17 @@ load_state_file() {
             if [[ "$key" =~ ^COMPLETED_ ]]; then
                 local step="${key#COMPLETED_}"
                 COMPLETED_STEPS["$step"]=1
+            elif [[ "$key" == "FDEV_VERSION" && -n "$value" ]]; then
+                # Restore FDEV_VERSION from state so resumes after the release
+                # PR has already merged don't bump the already-published version
+                # a second time. Without this override, the top-level compute at
+                # script startup reads the just-released Cargo.toml value and
+                # adds 1, leaving the final summary printing a version that is
+                # one ahead of what actually shipped (v0.2.42 incident).
+                if [[ "$FDEV_VERSION" != "$value" ]]; then
+                    echo "  Restoring FDEV_VERSION from state: $value (was $FDEV_VERSION)"
+                    FDEV_VERSION="$value"
+                fi
             fi
         done < "$STATE_FILE"
     fi
@@ -1401,13 +1417,16 @@ if current_key != key_bytes:
 # Main execution
 echo "Freenet Release Script"
 echo "======================"
-echo "Target version: freenet $VERSION, fdev $FDEV_VERSION"
 echo "Project root: $PROJECT_ROOT"
 echo "State file: $STATE_FILE"
 echo
 
-# Auto-detect what's already completed
+# Auto-detect what's already completed. load_state_file runs inside
+# auto_detect_state and may restore FDEV_VERSION from a persisted value — so
+# the "Target version" line must be printed *after* that, not before.
 auto_detect_state
+echo
+echo "Target version: freenet $VERSION, fdev $FDEV_VERSION"
 echo
 
 check_prerequisites
