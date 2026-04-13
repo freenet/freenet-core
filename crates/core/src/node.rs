@@ -3215,5 +3215,136 @@ mod tests {
                  Both terminal variants must be forwarded."
             );
         }
+
+        // ───────────────────────────────────────────────────────────
+        // Per-variant filter tests for the PUT branch bypass.
+        // Mirror of the subscribe filter tests above. Verifies that
+        // only Response and ResponseStreaming are forwarded to the
+        // task-per-tx channel; all other variants must fall through
+        // to handle_op_request.
+        // ───────────────────────────────────────────────────────────
+
+        use crate::operations::put::PutMsg;
+
+        fn put_branch_would_forward(
+            op: &PutMsg,
+            callback: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+        ) -> bool {
+            matches!(
+                op,
+                PutMsg::Response { .. } | PutMsg::ResponseStreaming { .. }
+            ) && try_forward_task_per_tx_reply(
+                callback,
+                NetMessage::V1(NetMessageV1::Put(op.clone())),
+                "put",
+            )
+        }
+
+        #[tokio::test]
+        async fn put_response_is_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let put_tx = Transaction::new::<PutMsg>();
+            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                freenet_stdlib::prelude::ContractInstanceId::new([10u8; 32]),
+                freenet_stdlib::prelude::CodeHash::new([11u8; 32]),
+            );
+            let op = PutMsg::Response { id: put_tx, key };
+
+            let taken = put_branch_would_forward(&op, Some(&tx));
+            assert!(taken, "Response with callback → must be forwarded");
+
+            let received = rx.try_recv().expect("Response should be in channel");
+            assert_eq!(*received.id(), put_tx);
+        }
+
+        #[tokio::test]
+        async fn put_response_streaming_is_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let put_tx = Transaction::new::<PutMsg>();
+            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                freenet_stdlib::prelude::ContractInstanceId::new([12u8; 32]),
+                freenet_stdlib::prelude::CodeHash::new([13u8; 32]),
+            );
+            let op = PutMsg::ResponseStreaming {
+                id: put_tx,
+                key,
+                continue_forwarding: false,
+            };
+
+            let taken = put_branch_would_forward(&op, Some(&tx));
+            assert!(taken, "ResponseStreaming with callback → must be forwarded");
+
+            let received = rx
+                .try_recv()
+                .expect("ResponseStreaming should be in channel");
+            assert_eq!(*received.id(), put_tx);
+        }
+
+        #[tokio::test]
+        async fn put_forwarding_ack_is_not_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let put_tx = Transaction::new::<PutMsg>();
+            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                freenet_stdlib::prelude::ContractInstanceId::new([14u8; 32]),
+                freenet_stdlib::prelude::CodeHash::new([15u8; 32]),
+            );
+            let op = PutMsg::ForwardingAck {
+                id: put_tx,
+                contract_key: key,
+            };
+
+            let taken = put_branch_would_forward(&op, Some(&tx));
+            assert!(
+                !taken,
+                "ForwardingAck must NOT be forwarded to task channel"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "channel must remain empty after ForwardingAck"
+            );
+        }
+
+        #[tokio::test]
+        async fn put_request_is_not_forwarded_to_task() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let put_tx = Transaction::new::<PutMsg>();
+            let op = PutMsg::Request {
+                id: put_tx,
+                contract: freenet_stdlib::prelude::ContractContainer::Wasm(
+                    freenet_stdlib::prelude::ContractWasmAPIVersion::V1(
+                        freenet_stdlib::prelude::WrappedContract::new(
+                            std::sync::Arc::new(freenet_stdlib::prelude::ContractCode::from(vec![
+                                0u8,
+                            ])),
+                            freenet_stdlib::prelude::Parameters::from(vec![]),
+                        ),
+                    ),
+                ),
+                related_contracts: freenet_stdlib::prelude::RelatedContracts::default(),
+                value: freenet_stdlib::prelude::WrappedState::new(vec![1u8]),
+                htl: 5,
+                skip_list: std::collections::HashSet::new(),
+            };
+
+            let taken = put_branch_would_forward(&op, Some(&tx));
+            assert!(!taken, "Request must NOT be forwarded to task channel");
+            assert!(rx.try_recv().is_err(), "channel must remain empty");
+        }
+
+        #[tokio::test]
+        async fn put_response_without_callback_falls_through() {
+            let put_tx = Transaction::new::<PutMsg>();
+            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                freenet_stdlib::prelude::ContractInstanceId::new([16u8; 32]),
+                freenet_stdlib::prelude::CodeHash::new([17u8; 32]),
+            );
+            let op = PutMsg::Response { id: put_tx, key };
+
+            let taken = put_branch_would_forward(&op, None);
+            assert!(
+                !taken,
+                "Response without callback → must fall through to legacy path"
+            );
+        }
     }
 }
