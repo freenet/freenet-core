@@ -183,6 +183,185 @@ impl OpCtx {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Shared retry-loop driver (#3807).
+//
+// Encapsulates the tx-split + timeout + cleanup + classification
+// boilerplate that every task-per-tx op migration repeats. The
+// op-specific pieces are provided via the `RetryDriver` trait.
+// ─────────────────────────────────────────────────────────────────
+
+use crate::config::OPERATION_TTL;
+use crate::node::OpManager;
+
+/// What `classify` returns for each terminal reply.
+#[allow(dead_code)] // Retry used by SUBSCRIBE; all variants needed for future ops
+pub(crate) enum AttemptOutcome<T> {
+    /// The reply is a terminal success. Carries the caller's domain value.
+    Terminal(T),
+    /// The peer couldn't help but we should retry (e.g., NotFound).
+    Retry,
+    /// A reply variant that should never reach the driver (e.g.,
+    /// ForwardingAck slipping past the bypass filter).
+    Unexpected,
+}
+
+/// What `advance` returns.
+pub(crate) enum AdvanceOutcome {
+    /// Retry with the next peer.
+    Next,
+    /// All peers exhausted.
+    Exhausted,
+}
+
+/// Terminal outcome of the shared retry loop.
+#[allow(dead_code)] // InfraError used when send_and_await returns Err inside the loop
+pub(crate) enum RetryLoopOutcome<T> {
+    /// A terminal reply was classified successfully.
+    Done(T),
+    /// All peers exhausted after retries. Carries a human-readable cause.
+    Exhausted(String),
+    /// An unexpected reply variant was received.
+    Unexpected,
+    /// Infrastructure error (executor channel closed, etc.).
+    InfraError(OpError),
+}
+
+/// Op-specific behaviour for the shared retry loop.
+///
+/// Implementors hold their own routing state (tried peers, retry
+/// counters, etc.) as fields, avoiding the borrow-conflict that
+/// closure-based APIs would hit when `build_request` reads state
+/// that `advance` mutates.
+pub(crate) trait RetryDriver {
+    /// The domain value extracted from a successful terminal reply.
+    type Terminal;
+
+    /// Allocate a fresh `Transaction` for retry attempts.
+    fn new_attempt_tx(&mut self) -> Transaction;
+
+    /// Construct the wire message for this attempt.
+    fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage;
+
+    /// Classify a terminal reply from the network.
+    fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Self::Terminal>;
+
+    /// Pick the next peer or signal exhaustion.
+    fn advance(&mut self) -> AdvanceOutcome;
+}
+
+/// Drive a task-per-tx retry loop against the network.
+///
+/// The first attempt reuses `client_tx` so telemetry correlates with the
+/// client-visible transaction. Subsequent attempts use
+/// [`RetryDriver::new_attempt_tx`].
+///
+/// The loop handles:
+/// - `tokio::time::timeout(OPERATION_TTL, ...)` wrapping
+/// - `release_pending_op_slot` cleanup on every exit path
+/// - Structured `outcome=wire_error|timeout` logging
+pub(crate) async fn drive_retry_loop<D: RetryDriver>(
+    op_manager: &OpManager,
+    client_tx: Transaction,
+    op_label: &str,
+    driver: &mut D,
+) -> RetryLoopOutcome<D::Terminal> {
+    let mut is_first_attempt = true;
+    let mut attempt_count: usize = 0;
+
+    loop {
+        let attempt_tx = if is_first_attempt {
+            client_tx
+        } else {
+            driver.new_attempt_tx()
+        };
+        is_first_attempt = false;
+        attempt_count += 1;
+
+        let request = driver.build_request(attempt_tx);
+
+        let mut ctx = op_manager.op_ctx(attempt_tx);
+        let round_trip = tokio::time::timeout(OPERATION_TTL, ctx.send_and_await(request)).await;
+
+        // Release the per-attempt pending_op_results slot regardless
+        // of outcome. Without this, slots are only reclaimed by the
+        // 60s periodic sweep.
+        op_manager.release_pending_op_slot(attempt_tx).await;
+
+        let reply = match round_trip {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    tx = %client_tx,
+                    attempt_tx = %attempt_tx,
+                    attempt = attempt_count,
+                    outcome = "wire_error",
+                    error = %err,
+                    "{op_label} (task-per-tx): send_and_await failed; advancing"
+                );
+                match driver.advance() {
+                    AdvanceOutcome::Next => continue,
+                    AdvanceOutcome::Exhausted => {
+                        return RetryLoopOutcome::Exhausted(format!(
+                            "{op_label} failed after {attempt_count} attempts (last error: {err})"
+                        ));
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    tx = %client_tx,
+                    attempt_tx = %attempt_tx,
+                    attempt = attempt_count,
+                    outcome = "timeout",
+                    timeout_secs = OPERATION_TTL.as_secs(),
+                    "{op_label} (task-per-tx): attempt timed out; advancing"
+                );
+                match driver.advance() {
+                    AdvanceOutcome::Next => continue,
+                    AdvanceOutcome::Exhausted => {
+                        return RetryLoopOutcome::Exhausted(format!(
+                            "{op_label} timed out after {attempt_count} attempts"
+                        ));
+                    }
+                }
+            }
+        };
+
+        match driver.classify(reply) {
+            AttemptOutcome::Terminal(value) => {
+                return RetryLoopOutcome::Done(value);
+            }
+            AttemptOutcome::Retry => {
+                tracing::debug!(
+                    tx = %client_tx,
+                    attempt_tx = %attempt_tx,
+                    attempt = attempt_count,
+                    outcome = "retry",
+                    "{op_label} (task-per-tx): peer indicated retry; advancing"
+                );
+                match driver.advance() {
+                    AdvanceOutcome::Next => continue,
+                    AdvanceOutcome::Exhausted => {
+                        return RetryLoopOutcome::Exhausted(format!(
+                            "{op_label} exhausted all peers after {attempt_count} attempts"
+                        ));
+                    }
+                }
+            }
+            AttemptOutcome::Unexpected => {
+                tracing::warn!(
+                    tx = %client_tx,
+                    attempt_tx = %attempt_tx,
+                    attempt = attempt_count,
+                    "{op_label} (task-per-tx): unexpected terminal reply"
+                );
+                return RetryLoopOutcome::Unexpected;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 const _: fn() = || {
     fn assert_send<T: Send>() {}

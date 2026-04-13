@@ -46,7 +46,7 @@ use freenet_stdlib::client_api::{ContractResponse, ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 use crate::client_events::HostResult;
-use crate::config::{GlobalExecutor, OPERATION_TTL};
+use crate::config::GlobalExecutor;
 use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::OpManager;
 use crate::operations::OpError;
@@ -196,11 +196,11 @@ async fn drive_client_put_inner(
         .ring
         .closest_potentially_hosting(&key, tried.as_slice());
 
-    let (mut current_target, mut current_addr) = match initial_target {
+    let current_target = match initial_target {
         Some(peer) => match peer.socket_addr() {
             Some(addr) => {
                 tried.push(addr);
-                (peer, addr)
+                peer
             }
             None => {
                 return local_only_completion(
@@ -225,157 +225,117 @@ async fn drive_client_put_inner(
         }
     };
 
-    // 3. Retry loop. Fresh attempt_tx per retry (Phase 2b pattern, R4).
-    let mut retries: usize = 0;
-    let mut is_first_attempt = true;
+    // 3. Retry loop via shared driver (#3807).
+    use crate::operations::op_ctx::{
+        AdvanceOutcome, AttemptOutcome, RetryDriver, RetryLoopOutcome, drive_retry_loop,
+    };
 
-    loop {
-        // Fresh attempt tx: first attempt reuses client_tx (Phase 2b
-        // convention keeps first-attempt telemetry on the client-visible
-        // tx); retries allocate fresh txs because send_and_await is
-        // single-use-per-tx.
-        let attempt_tx = if is_first_attempt {
-            client_tx
-        } else {
+    struct PutRetryDriver<'a> {
+        op_manager: &'a OpManager,
+        key: ContractKey,
+        contract: ContractContainer,
+        related: RelatedContracts<'static>,
+        merged_value: WrappedState,
+        htl: usize,
+        tried: Vec<std::net::SocketAddr>,
+        retries: usize,
+        current_target: PeerKeyLocation,
+    }
+
+    impl RetryDriver for PutRetryDriver<'_> {
+        type Terminal = ContractKey;
+
+        fn new_attempt_tx(&mut self) -> Transaction {
             Transaction::new::<PutMsg>()
-        };
-        is_first_attempt = false;
+        }
 
-        tracing::debug!(
-            tx = %client_tx,
-            attempt_tx = %attempt_tx,
-            target = %current_addr,
-            retries,
-            "put (task-per-tx): sending attempt"
-        );
+        fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {
+            NetMessage::from(PutMsg::Request {
+                id: attempt_tx,
+                contract: self.contract.clone(),
+                related_contracts: self.related.clone(),
+                value: self.merged_value.clone(),
+                htl: self.htl,
+                skip_list: self.tried.iter().copied().collect::<HashSet<_>>(),
+            })
+        }
 
-        let request = PutMsg::Request {
-            id: attempt_tx,
-            contract: contract.clone(),
-            related_contracts: related.clone(),
-            value: merged_value.clone(),
-            htl,
-            skip_list: tried.iter().copied().collect::<HashSet<_>>(),
-        };
-
-        let mut ctx = op_manager.op_ctx(attempt_tx);
-        let round_trip =
-            tokio::time::timeout(OPERATION_TTL, ctx.send_and_await(NetMessage::from(request)))
-                .await;
-        op_manager.release_pending_op_slot(attempt_tx).await;
-
-        let reply = match round_trip {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    tx = %client_tx,
-                    attempt_tx = %attempt_tx,
-                    target = %current_addr,
-                    retries,
-                    outcome = "wire_error",
-                    error = %err,
-                    "put (task-per-tx): send_and_await failed; advancing to next peer"
-                );
-                match advance_to_next_peer(op_manager, &key, &mut tried, &mut retries) {
-                    Some((next_target, next_addr)) => {
-                        current_target = next_target;
-                        current_addr = next_addr;
-                        continue;
-                    }
-                    None => {
-                        return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                            cause: format!(
-                                "PUT to {key} failed after {} rounds (last peer error: {err})",
-                                retries + 1
-                            )
-                            .into(),
-                        }
-                        .into())));
-                    }
-                }
-            }
-            Err(_) => {
-                tracing::warn!(
-                    tx = %client_tx,
-                    attempt_tx = %attempt_tx,
-                    target = %current_addr,
-                    retries,
-                    outcome = "timeout",
-                    timeout_secs = OPERATION_TTL.as_secs(),
-                    "put (task-per-tx): attempt timed out; advancing to next peer"
-                );
-                match advance_to_next_peer(op_manager, &key, &mut tried, &mut retries) {
-                    Some((next_target, next_addr)) => {
-                        current_target = next_target;
-                        current_addr = next_addr;
-                        continue;
-                    }
-                    None => {
-                        return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                            cause: format!("PUT to {key} timed out after {} rounds", retries + 1)
-                                .into(),
-                        }
-                        .into())));
-                    }
-                }
-            }
-        };
-
-        match classify_reply(&reply) {
-            ReplyClass::Stored { key: reply_key } => {
-                tracing::info!(
-                    tx = %client_tx,
-                    attempt_tx = %attempt_tx,
-                    contract = %reply_key,
-                    target = %current_addr,
-                    retries,
-                    outcome = "stored",
-                    "put (task-per-tx): PUT accepted"
-                );
-
-                // Telemetry only — pass subscribe=false because the driver
-                // handles subscriptions via maybe_subscribe_child below.
-                // Passing subscribe=true here would double-subscribe: once
-                // via start_subscription_after_put (legacy path inside
-                // finalize_put_at_originator) and once via
-                // maybe_subscribe_child (task-per-tx path).
-                super::finalize_put_at_originator(
-                    op_manager,
-                    client_tx,
-                    reply_key,
-                    PutFinalizationData {
-                        sender: current_target,
-                        hop_count: None,
-                        state_hash: None,
-                        state_size: None,
-                    },
-                    false, // subscribe handled by maybe_subscribe_child
-                    false,
-                )
-                .await;
-
-                maybe_subscribe_child(
-                    op_manager,
-                    client_tx,
-                    reply_key,
-                    subscribe,
-                    blocking_subscribe,
-                )
-                .await;
-
-                return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
-                    ContractResponse::PutResponse { key: reply_key },
-                ))));
-            }
-            ReplyClass::Unexpected => {
-                tracing::warn!(
-                    tx = %client_tx,
-                    attempt_tx = %attempt_tx,
-                    "put (task-per-tx): unexpected terminal reply"
-                );
-                return Err(OpError::UnexpectedOpState);
+        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<ContractKey> {
+            match classify_reply(&reply) {
+                ReplyClass::Stored { key } => AttemptOutcome::Terminal(key),
+                ReplyClass::Unexpected => AttemptOutcome::Unexpected,
             }
         }
+
+        fn advance(&mut self) -> AdvanceOutcome {
+            match advance_to_next_peer(
+                self.op_manager,
+                &self.key,
+                &mut self.tried,
+                &mut self.retries,
+            ) {
+                Some((next_target, _next_addr)) => {
+                    self.current_target = next_target;
+                    AdvanceOutcome::Next
+                }
+                None => AdvanceOutcome::Exhausted,
+            }
+        }
+    }
+
+    let mut driver = PutRetryDriver {
+        op_manager,
+        key,
+        contract,
+        related,
+        merged_value,
+        htl,
+        tried,
+        retries: 0,
+        current_target,
+    };
+
+    let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
+
+    match loop_result {
+        RetryLoopOutcome::Done(reply_key) => {
+            // Telemetry only — subscribe=false to avoid double-subscribe.
+            super::finalize_put_at_originator(
+                op_manager,
+                client_tx,
+                reply_key,
+                PutFinalizationData {
+                    sender: driver.current_target,
+                    hop_count: None,
+                    state_hash: None,
+                    state_size: None,
+                },
+                false,
+                false,
+            )
+            .await;
+
+            maybe_subscribe_child(
+                op_manager,
+                client_tx,
+                reply_key,
+                subscribe,
+                blocking_subscribe,
+            )
+            .await;
+
+            Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+                ContractResponse::PutResponse { key: reply_key },
+            ))))
+        }
+        RetryLoopOutcome::Exhausted(cause) => {
+            Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                cause: cause.into(),
+            }
+            .into())))
+        }
+        RetryLoopOutcome::Unexpected => Err(OpError::UnexpectedOpState),
+        RetryLoopOutcome::InfraError(err) => Err(err),
     }
 }
 
