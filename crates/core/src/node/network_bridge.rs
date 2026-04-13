@@ -181,15 +181,31 @@ pub(crate) fn event_loop_notification_channel()
     )
 }
 
+/// Payload shared between [`EventLoopNotificationsSender::op_execution_sender`]
+/// and the event loop's `handle_op_execution` receiver.
+///
+/// `target_addr` carries the peer the driver wants the Request to reach on
+/// the wire. When `Some`, `handle_op_execution` emits
+/// [`ConnEvent::OutboundMessageWithTarget`] so the message is dispatched
+/// directly to that peer's connection. When `None`, the message loops back
+/// as a local [`ConnEvent::InboundMessage`] (the original Phase 2b behavior,
+/// used by non-routed call sites and tests).
+///
+/// The target-aware path was added for issue #3838: when a client-initiated
+/// SUBSCRIBE has the contract cached locally, the loop-back `InboundMessage`
+/// was short-circuiting in `process_message` instead of propagating upstream
+/// to register as a downstream subscriber on the home node.
+pub(crate) type OpExecutionPayload = (Sender<NetMessage>, NetMessage, Option<SocketAddr>);
+
 pub(crate) struct EventLoopNotificationsReceiver {
     pub(crate) notifications_receiver: Receiver<Either<NetMessage, NodeEvent>>,
-    pub(crate) op_execution_receiver: Receiver<(Sender<NetMessage>, NetMessage)>,
+    pub(crate) op_execution_receiver: Receiver<OpExecutionPayload>,
 }
 
 #[derive(Clone)]
 pub(crate) struct EventLoopNotificationsSender {
     pub(crate) notifications_sender: Sender<Either<NetMessage, NodeEvent>>,
-    pub(crate) op_execution_sender: Sender<(Sender<NetMessage>, NetMessage)>,
+    pub(crate) op_execution_sender: Sender<OpExecutionPayload>,
 }
 
 impl EventLoopNotificationsSender {

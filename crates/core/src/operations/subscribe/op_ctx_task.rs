@@ -314,10 +314,20 @@ async fn drive_client_subscribe_inner(
             is_renewal: false,
         };
 
+        // Dispatch via `send_to_and_await` so the Request reaches `current_target_addr`
+        // on the wire instead of looping back to `process_message` as a local
+        // `InboundMessage`. The local short-circuit would synthesize a success
+        // reply when the contract is cached locally (e.g., after a prior GET),
+        // but the home node would never see the request and never register us
+        // as a downstream subscriber — so subsequent UPDATE broadcasts would
+        // never reach this peer. See issue #3838 and the doc comment on
+        // `OpCtx::send_to_and_await`.
         let mut ctx = op_manager.op_ctx(attempt_tx);
-        let round_trip =
-            tokio::time::timeout(OPERATION_TTL, ctx.send_and_await(NetMessage::from(request)))
-                .await;
+        let round_trip = tokio::time::timeout(
+            OPERATION_TTL,
+            ctx.send_to_and_await(current_target_addr, NetMessage::from(request)),
+        )
+        .await;
 
         // Release the per-attempt `pending_op_results` slot before any
         // retry or return. Without this emission entries would only be
@@ -445,6 +455,21 @@ async fn drive_client_subscribe_inner(
                     outcome = "subscribed",
                     "subscribe (task-per-tx): subscribed"
                 );
+                // Mirror the legacy Response-handler side effects from
+                // `subscribe.rs`'s `SubscribeMsg::Response` arm. The
+                // task-per-tx reply forwarding bypass in `node.rs` skips
+                // `handle_op_request` for terminal Responses, so without
+                // these calls the local interest manager and ring would
+                // never learn about the subscription, breaking
+                // ChangeInterests-driven update propagation. Both calls are
+                // idempotent for repeat subscribes.
+                op_manager.ring.subscribe(key);
+                op_manager.ring.complete_subscription_request(&key, true);
+                let became_interested = op_manager.interest_manager.add_local_client(&key);
+                if became_interested {
+                    crate::operations::broadcast_change_interests(op_manager, vec![key], vec![])
+                        .await;
+                }
                 return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                     ContractResponse::SubscribeResponse {
                         key,
