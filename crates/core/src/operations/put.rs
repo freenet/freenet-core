@@ -565,35 +565,10 @@ impl Operation for PutOp {
                     // Network peer notification is now automatic via BroadcastStateChange
                     // event emitted by the executor when state changes. No manual triggering needed.
 
-                    // For originator PUTs, respond to client immediately after local
-                    // upsert. Network propagation continues asynchronously via forwarding.
-                    //
-                    // Uses raw try_send (not send_client_result) because the operation must
-                    // remain in the state map for routing. When the operation eventually
-                    // completes (via PutMsg::Response or no-next-hop), report_result will
-                    // send a second PutResponse through send_client_result. This duplicate
-                    // is safe: SessionActor.client_transactions is consumed on first
-                    // delivery, so the second send finds no recipients and is a no-op.
-                    if is_originator {
-                        let result_op = PutOp {
-                            id,
-                            state: Some(PutState::Finished(FinishedData { key })),
-                            upstream_addr: None,
-                            stats: None,
-                            ack_received: false,
-                            speculative_paths: 0,
-                        };
-                        if let Err(error) = op_manager
-                            .result_router_tx
-                            .try_send((id, result_op.to_host_result()))
-                        {
-                            tracing::error!(
-                                tx = %id,
-                                %error,
-                                "Failed to send early PutResponse to client"
-                            );
-                        }
-                    }
+                    // Phase 3a (#1454): The early try_send originator response was
+                    // removed. Client-initiated PUTs now use the task-per-tx driver
+                    // which delivers exactly one response via send_client_result.
+                    // The legacy duplicate-send pattern is no longer needed.
 
                     // Step 2: Determine if we should forward or respond
                     // Build skip list: include sender (upstream) and already-tried peers
@@ -1719,6 +1694,7 @@ pub(crate) fn start_op_with_id(
 
 /// Data for the PrepareRequest state: originator preparing initial PUT request.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Phase 6 cleanup: only constructed by now-dead start_op/start_op_with_id
 pub struct PrepareRequestData {
     pub contract: ContractContainer,
     pub related_contracts: RelatedContracts<'static>,
@@ -1830,86 +1806,6 @@ pub enum PutState {
     AwaitingResponse(AwaitingResponseData),
     /// Operation completed successfully.
     Finished(FinishedData),
-}
-
-/// Request to insert/update a value into a contract.
-/// Legacy entry point — no longer called after Phase 3a (#1454) migrated
-/// client-initiated PUTs to the task-per-tx driver. Kept for relay/legacy
-/// paths that may still reference it; will be removed in Phase 6 cleanup.
-#[allow(dead_code)]
-pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result<(), OpError> {
-    let (id, contract, value, related_contracts, htl, subscribe, blocking_subscribe) =
-        match &put_op.state {
-            Some(PutState::PrepareRequest(data)) => (
-                put_op.id,
-                data.contract.clone(),
-                data.value.clone(),
-                data.related_contracts.clone(),
-                data.htl,
-                data.subscribe,
-                data.blocking_subscribe,
-            ),
-            _ => {
-                tracing::error!(
-                    tx = %put_op.id,
-                    state = ?put_op.state,
-                    phase = "error",
-                    "request_put called with unexpected state"
-                );
-                return Err(OpError::UnexpectedOpState);
-            }
-        };
-
-    let key = contract.key();
-
-    tracing::info!(tx = %id, contract = %key, htl, subscribe, phase = "request", "Starting PUT operation");
-
-    // Build initial skip list with our own address
-    let mut skip_list = HashSet::new();
-    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
-        skip_list.insert(own_addr);
-    }
-
-    // Create the request message
-    let msg = PutMsg::Request {
-        id,
-        contract,
-        related_contracts,
-        value,
-        htl,
-        skip_list,
-    };
-
-    // Transition to AwaitingResponse and send the message
-    // Note: upstream_addr is None because we're the originator
-    // next_hop is None initially - we process locally first then determine routing
-    let new_op = PutOp {
-        id,
-        state: Some(PutState::AwaitingResponse(AwaitingResponseData {
-            subscribe,
-            blocking_subscribe,
-            next_hop: None,
-            current_htl: htl,
-            contract_key: key,
-
-            tried_peers: HashSet::new(),
-            alternatives: vec![],
-            attempts_at_hop: 1,
-            visited: VisitedPeers::default(),
-            retry_payload: None,
-        })),
-        upstream_addr: None,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-
-    // Send through the operation processing pipeline
-    op_manager
-        .notify_op_change(NetMessage::from(msg), OpEnum::Put(new_op))
-        .await?;
-
-    Ok(())
 }
 
 /// Stores the contract state and returns (new_state, state_changed).
