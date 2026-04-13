@@ -56,7 +56,9 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use crate::operations::handle_op_request;
-pub(crate) use network_bridge::{ConnectionError, EventLoopNotificationsSender, NetworkBridge};
+pub(crate) use network_bridge::{
+    ConnectionError, EventLoopNotificationsSender, NetworkBridge, OpExecutionPayload,
+};
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
 // Re-export types for dev_tool and testing

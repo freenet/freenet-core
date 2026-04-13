@@ -86,7 +86,7 @@ impl Stream for MockExecutorReceiverStream {
 #[test_log::test]
 async fn test_priority_select_future_wakeup() {
     let (notif_tx, notif_rx) = mpsc::channel(10);
-    let (_op_tx, op_rx) = mpsc::channel(10);
+    let (_op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(10);
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (_bridge_tx, bridge_rx) = mpsc::channel(10);
     let (_node_tx, node_rx) = mpsc::channel(10);
@@ -141,7 +141,7 @@ async fn test_priority_select_future_wakeup() {
 #[test_log::test]
 async fn test_priority_select_future_priority_ordering() {
     let (notif_tx, notif_rx) = mpsc::channel(10);
-    let (op_tx, op_rx) = mpsc::channel(10);
+    let (op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(10);
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (bridge_tx, bridge_rx) = mpsc::channel(10);
     let (_, node_rx) = mpsc::channel(10);
@@ -151,7 +151,10 @@ async fn test_priority_select_future_priority_ordering() {
     let dummy_msg = NetMessage::V1(crate::message::NetMessageV1::Aborted(
         crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
     ));
-    op_tx.send((callback_tx, dummy_msg.clone())).await.unwrap();
+    op_tx
+        .send((callback_tx, dummy_msg.clone(), None))
+        .await
+        .unwrap();
     bridge_tx
         .send(P2pBridgeEvent::NodeAction(NodeEvent::Disconnect {
             cause: None,
@@ -356,7 +359,7 @@ async fn test_priority_select_event_loop_simulation() {
 
     // Create channels once (like in wait_for_event)
     let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
-    let (op_tx, op_rx) = mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(10);
+    let (op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(10);
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(10);
     let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(10);
@@ -385,7 +388,10 @@ async fn test_priority_select_event_loop_simulation() {
             ));
             let (callback_tx, _) = mpsc::channel(1);
             tracing::info!("Sending op_execution {}", i);
-            op_tx_clone.send((callback_tx, test_msg)).await.unwrap();
+            op_tx_clone
+                .send((callback_tx, test_msg, None))
+                .await
+                .unwrap();
         }
 
         // Send 2 bridge events
@@ -605,7 +611,7 @@ async fn test_with_seed(seed: u64) {
 
     // Create channels once (like in wait_for_event)
     let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(100);
-    let (op_tx, op_rx) = mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(100);
+    let (op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(100);
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(100);
     let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(100);
     let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(100);
@@ -651,7 +657,7 @@ async fn test_with_seed(seed: u64) {
                 i,
                 delay_us
             );
-            op_tx.send((callback_tx, test_msg)).await.unwrap();
+            op_tx.send((callback_tx, test_msg, None)).await.unwrap();
         }
         tracing::info!("OpExecution task sent all {} messages", OP_COUNT);
         OP_COUNT
@@ -991,7 +997,7 @@ async fn test_priority_select_all_pending_waker_registration() {
 
     // Create all 8 channels
     let (notif_tx, notif_rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
-    let (op_tx, op_rx) = mpsc::channel::<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>(10);
+    let (op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(10);
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (bridge_tx, bridge_rx) = mpsc::channel::<P2pBridgeEvent>(10);
     let (node_tx, node_rx) = mpsc::channel::<NodeEvent>(10);
@@ -1040,7 +1046,10 @@ async fn test_priority_select_all_pending_waker_registration() {
             crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
         ));
         let (callback_tx, _) = mpsc::channel(1);
-        op_tx.send((callback_tx, test_msg.clone())).await.unwrap();
+        op_tx
+            .send((callback_tx, test_msg.clone(), None))
+            .await
+            .unwrap();
 
         tracing::info!("Sending to notification channel (highest priority)");
         notif_tx.send(Either::Left(test_msg)).await.unwrap();
@@ -1764,7 +1773,7 @@ async fn test_waker_registration_after_pending_poll() {
     let (tx, rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     // Keep senders alive to prevent channel closure
-    let (op_tx, op_rx) = mpsc::channel(10);
+    let (op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(10);
     let (bridge_tx, bridge_rx) = mpsc::channel(10);
     let (node_tx, node_rx) = mpsc::channel(10);
 
@@ -1832,7 +1841,7 @@ async fn test_waker_survives_multiple_pending_polls() {
     let (tx, rx) = mpsc::channel::<Either<NetMessage, NodeEvent>>(10);
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     // Keep senders alive to prevent channel closure
-    let (op_tx, op_rx) = mpsc::channel(10);
+    let (op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(10);
     let (bridge_tx, bridge_rx) = mpsc::channel(10);
     let (node_tx, node_rx) = mpsc::channel(10);
 
@@ -1898,7 +1907,7 @@ async fn test_waker_survives_multiple_pending_polls() {
 #[test_log::test]
 async fn test_closed_handshake_stream_no_spin() {
     let (notif_tx, notif_rx) = mpsc::channel(10);
-    let (_op_tx, op_rx) = mpsc::channel(10);
+    let (_op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(10);
     let (_conn_event_tx, conn_event_rx) = mpsc::channel(10);
     let (_bridge_tx, bridge_rx) = mpsc::channel(10);
     let (_node_tx, node_rx) = mpsc::channel(10);
@@ -2595,7 +2604,7 @@ async fn test_handshake_p2_before_op_execution_p3() {
     // Handshake (P2) and op_execution (P3) both have one event ready.
     // Handshake should be returned first.
     let (_, notif_rx) = mpsc::channel(1);
-    let (op_tx, op_rx) = mpsc::channel(1);
+    let (op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(1);
     let (_, conn_event_rx) = mpsc::channel(1);
     let (_, bridge_rx) = mpsc::channel(1);
     let (_, node_rx) = mpsc::channel(1);
@@ -2606,7 +2615,7 @@ async fn test_handshake_p2_before_op_execution_p3() {
         crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
     ));
     let (callback_tx, _) = mpsc::channel(1);
-    op_tx.send((callback_tx, dummy_msg)).await.unwrap();
+    op_tx.send((callback_tx, dummy_msg, None)).await.unwrap();
 
     drop(hs_tx);
     drop(op_tx);
@@ -2723,7 +2732,7 @@ async fn run_prefilled_stream(
     }
 
     let (notif_tx, notif_rx) = mpsc::channel(n_notif.max(1));
-    let (op_tx, op_rx) = mpsc::channel(n_op.max(1));
+    let (op_tx, op_rx) = mpsc::channel::<OpExecutionPayload>(n_op.max(1));
     let (_, conn_event_rx) = mpsc::channel(1);
     let (bridge_tx, bridge_rx) = mpsc::channel(n_bridge.max(1));
     let (node_tx, node_rx) = mpsc::channel(n_node.max(1));
@@ -2738,7 +2747,7 @@ async fn run_prefilled_stream(
             crate::message::Transaction::new::<crate::operations::put::PutMsg>(),
         ));
         let (cb, _) = mpsc::channel(1);
-        op_tx.send((cb, msg)).await.unwrap();
+        op_tx.send((cb, msg, None)).await.unwrap();
     }
     for _ in 0..n_bridge {
         bridge_tx

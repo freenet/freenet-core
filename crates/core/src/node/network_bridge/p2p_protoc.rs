@@ -3860,17 +3860,31 @@ impl P2pConnManager {
 
     fn handle_op_execution(
         &self,
-        msg: Option<(Sender<NetMessage>, NetMessage)>,
+        msg: Option<super::OpExecutionPayload>,
         state: &mut EventListenerState,
     ) -> EventResult {
         match msg {
-            Some((callback, msg)) => {
+            Some((callback, msg, target_addr)) => {
                 state.pending_op_results.insert(*msg.id(), callback);
                 crate::config::GlobalTestMetrics::record_pending_op_insert();
                 crate::config::GlobalTestMetrics::record_pending_op_size(
                     state.pending_op_results.len() as u64,
                 );
-                EventResult::Event(ConnEvent::InboundMessage(msg.into()).into())
+                // When the driver supplied an explicit target, dispatch the
+                // message to that peer over the network instead of looping it
+                // back as a local InboundMessage. The reply still flows back
+                // through the `pending_op_results` callback we just inserted.
+                //
+                // This is the load-bearing branch for issue #3838:
+                // client-initiated SUBSCRIBE with the contract cached locally
+                // would otherwise short-circuit in `process_message` and never
+                // register as a downstream subscriber on the home node.
+                match target_addr {
+                    Some(target_addr) => EventResult::Event(
+                        ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
+                    ),
+                    None => EventResult::Event(ConnEvent::InboundMessage(msg.into()).into()),
+                }
             }
             None => {
                 EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::OpExecution).into())

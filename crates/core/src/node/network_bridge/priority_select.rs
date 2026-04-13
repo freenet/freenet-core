@@ -10,6 +10,7 @@ use tokio::sync::mpsc::Receiver;
 use crate::client_events::ClientId;
 use crate::contract::WaitingTransaction;
 
+use super::OpExecutionPayload;
 use super::p2p_protoc::ConnEvent;
 use crate::contract::{
     ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
@@ -24,7 +25,7 @@ pub(crate) use super::p2p_protoc::P2pBridgeEvent;
 #[derive(Debug)]
 pub(super) enum SelectResult {
     Notification(Option<Either<NetMessage, NodeEvent>>),
-    OpExecution(Option<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>),
+    OpExecution(Option<OpExecutionPayload>),
     PeerConnection(Option<ConnEvent>),
     ConnBridge(Option<P2pBridgeEvent>),
     Handshake(Option<crate::node::network_bridge::handshake::Event>),
@@ -60,8 +61,7 @@ where
 {
     // Streams created from owned receivers
     notification: tokio_stream::wrappers::ReceiverStream<Either<NetMessage, NodeEvent>>,
-    op_execution:
-        tokio_stream::wrappers::ReceiverStream<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
+    op_execution: tokio_stream::wrappers::ReceiverStream<OpExecutionPayload>,
     conn_bridge: tokio_stream::wrappers::ReceiverStream<P2pBridgeEvent>,
     node_controller: tokio_stream::wrappers::ReceiverStream<NodeEvent>,
     conn_events: tokio_stream::wrappers::ReceiverStream<ConnEvent>,
@@ -101,7 +101,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         notification_rx: Receiver<Either<NetMessage, NodeEvent>>,
-        op_execution_rx: Receiver<(tokio::sync::mpsc::Sender<NetMessage>, NetMessage)>,
+        op_execution_rx: Receiver<OpExecutionPayload>,
         conn_bridge_rx: Receiver<P2pBridgeEvent>,
         handshake_handler: H,
         node_controller: Receiver<NodeEvent>,
