@@ -630,21 +630,16 @@ function freenetBridge(authToken) {
           if (u.protocol !== 'https:') return;
           var h = u.hostname.toLowerCase();
           if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '0.0.0.0') return;
-          // Honour modifier-key semantics from the interceptor
-          // (freenet/freenet-core#3853). Shift-click opens a popup-style
-          // new window; middle-click and ctrl/meta-click open a regular
-          // new tab (browsers generally decide foreground vs background
-          // based on their own heuristics since we are not in a direct
-          // user-gesture context). Plain left-click keeps the existing
-          // noopener/noreferrer tab behaviour.
-          var shiftKey = msg.shiftKey === true;
-          var newWindow = msg.ctrlKey === true || msg.metaKey === true || msg.button === 1;
-          if (shiftKey) {
+          // Honour shift-click by requesting a popup-style window feature
+          // (freenet/freenet-core#3853). Firefox honours this as "open in
+          // a new window"; other browsers may still open a tab, which is
+          // an acceptable fallback. ctrl / meta / middle-click cannot be
+          // preserved from a postMessage handler because browsers only
+          // honour background-tab placement when window.open is called
+          // from a direct user gesture, so we route those through the
+          // same default-tab path as plain left-click.
+          if (msg.shiftKey === true) {
             window.open(u.href, '_blank', 'noopener,noreferrer,popup');
-          } else if (newWindow) {
-            // Background-tab intent; same window features as the default
-            // path, just named so the intent is explicit in the source.
-            window.open(u.href, '_blank', 'noopener,noreferrer');
           } else {
             window.open(u.href, '_blank', 'noopener,noreferrer');
           }
@@ -1132,7 +1127,14 @@ const WEBSOCKET_SHIM_JS: &str = r#"
 const NAVIGATION_INTERCEPTOR_JS: &str = r#"
 (function() {
   'use strict';
-  document.addEventListener('click', function(e) {
+  // Shared handler for both `click` (primary button) and `auxclick`
+  // (non-primary, i.e. middle-click). Middle-click is dispatched via
+  // `auxclick` in modern browsers and does NOT fire `click` at all, so
+  // without a separate `auxclick` listener middle-clicks on cross-origin
+  // <a target="_blank"> links bypass the interceptor entirely and the
+  // browser opens a null-origin sandboxed popup (freenet/freenet-core#3853
+  // follow-up from #3852).
+  function handleAnchorClick(e) {
     var target = e.target;
     // Walk up to find the nearest <a> element (handles clicks on child elements)
     while (target && target.tagName !== 'A') target = target.parentElement;
@@ -1159,19 +1161,18 @@ const NAVIGATION_INTERCEPTOR_JS: &str = r#"
     } catch(err) {}
     if (isCrossOrigin) {
       e.preventDefault();
-      // Forward modifier state so the shell can honour shift-click
-      // (new window) and middle / ctrl / meta clicks (best-effort new
-      // tab behaviour). `button` is the MouseEvent button code: 0 is
-      // left, 1 is middle. freenet/freenet-core#3853.
+      // Forward shift-key state so the shell can honour shift-click
+      // as a new-window request (freenet/freenet-core#3853). ctrl /
+      // meta / middle-click intent can't be meaningfully preserved
+      // from a postMessage handler: browsers only allow background-
+      // tab placement when window.open is called directly from a
+      // user gesture, and all three collapse to a plain new tab
+      // regardless of what we forward. Keep the contract minimal.
       window.parent.postMessage({
         __freenet_shell__: true,
         type: 'open_url',
         url: target.href,
-        button: typeof e.button === 'number' ? e.button : 0,
-        ctrlKey: !!e.ctrlKey,
-        metaKey: !!e.metaKey,
-        shiftKey: !!e.shiftKey,
-        altKey: !!e.altKey
+        shiftKey: !!e.shiftKey
       }, '*');
       return;
     }
@@ -1183,7 +1184,10 @@ const NAVIGATION_INTERCEPTOR_JS: &str = r#"
     window.parent.postMessage({
       __freenet_shell__: true, type: 'navigate', href: target.href
     }, '*');
-  }, true);
+  }
+  document.addEventListener('click', handleAnchorClick, true);
+  // Catch middle-click and other non-primary button activations.
+  document.addEventListener('auxclick', handleAnchorClick, true);
 })();
 "#;
 
@@ -1966,23 +1970,31 @@ mod tests {
 
     /// Regression test for freenet/freenet-core#3853.
     ///
-    /// After #3852 (river#208) the cross-origin click handler unconditionally
-    /// preventDefaults and sends `open_url`. This meant middle-click,
-    /// ctrl-click, shift-click, meta-click all behaved identically to a plain
-    /// left-click: a single foreground tab regardless of user intent.
+    /// After #3852 fixed freenet/river#208, the cross-origin click handler
+    /// unconditionally `preventDefault`ed and sent `open_url`. Middle-click,
+    /// ctrl-click, shift-click and meta-click all collapsed to a single
+    /// foreground tab because the interceptor dropped modifier state and
+    /// the shell handler called `window.open` with no flags.
     ///
-    /// Fix the regression by forwarding modifier state in the postMessage
-    /// payload and honouring it in the shell `open_url` handler. This test
-    /// pins the contract at both ends:
-    ///   1. The interceptor's cross-origin branch includes `button`,
-    ///      `ctrlKey`, `metaKey`, `shiftKey` in the posted message.
-    ///   2. The shell bridge's `open_url` handler reads those fields and
-    ///      branches on `shiftKey` (new window) / button-1 / ctrl / meta.
+    /// A second latent bug: the listener was `click` only, but middle-click
+    /// fires `auxclick` (not `click`), so middle-clicks on cross-origin
+    /// links fell through to the browser's default handling and produced
+    /// the same null-origin sandboxed popup #3852 was meant to prevent.
+    ///
+    /// We can only meaningfully preserve shift-click (via a popup window
+    /// feature) because browsers refuse to honour background-tab placement
+    /// when `window.open` is called outside a direct user gesture. Pin the
+    /// minimal contract at both ends:
+    ///   1. The interceptor registers BOTH `click` and `auxclick` so
+    ///      middle-click is actually intercepted.
+    ///   2. The interceptor's cross-origin branch forwards `shiftKey` in
+    ///      the posted message, sourced from the MouseEvent.
+    ///   3. The shell bridge's `open_url` handler reads `msg.shiftKey` and
+    ///      uses the `popup` window feature when it's true.
     #[test]
-    fn navigation_interceptor_forwards_modifier_state_for_open_url() {
+    fn navigation_interceptor_forwards_shift_key_for_open_url() {
         let js = NAVIGATION_INTERCEPTOR_JS;
 
-        // Cross-origin branch must include the modifier fields.
         let cross_origin_idx = js
             .find("type: 'open_url'")
             .expect("interceptor open_url branch present");
@@ -1991,43 +2003,78 @@ mod tests {
             .expect("same-origin target check present");
         let block = &js[cross_origin_idx..target_attr_idx];
 
-        for field in ["button", "ctrlKey", "metaKey", "shiftKey"] {
-            assert!(
-                block.contains(field),
-                "cross-origin open_url postMessage must include {field} to honour \
-                 modifier-click semantics (freenet/freenet-core#3853); got block: {block}"
-            );
-        }
+        assert!(
+            block.contains("shiftKey"),
+            "cross-origin open_url postMessage must include shiftKey to honour \
+             shift-click as a new-window request (#3853); got block: {block}"
+        );
+        // Must be sourced from the actual event, not a hardcoded constant.
+        assert!(
+            block.contains("e.shiftKey"),
+            "interceptor must forward `e.shiftKey` from the MouseEvent, not a literal (#3853)"
+        );
+    }
+
+    /// Regression test for the middle-click half of #3853. Middle-click is
+    /// dispatched as `auxclick` in modern browsers, NOT `click`, so the
+    /// interceptor must listen on both events. Without the auxclick
+    /// listener, middle-clicks on cross-origin `<a target="_blank">` links
+    /// bypass the `open_url` routing and fall through to the browser's
+    /// default handling, producing a null-origin sandboxed popup (exactly
+    /// what #3852 was meant to prevent).
+    #[test]
+    fn navigation_interceptor_listens_on_click_and_auxclick() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+        assert!(
+            js.contains("addEventListener('click'"),
+            "interceptor must register a click listener"
+        );
+        assert!(
+            js.contains("addEventListener('auxclick'"),
+            "interceptor must register an auxclick listener so middle-click \
+             on cross-origin links is also routed through open_url (#3853)"
+        );
     }
 
     /// Regression test for freenet/freenet-core#3853 shell-side.
     ///
-    /// The shell `open_url` handler must read the modifier fields from the
-    /// posted message and use them when calling `window.open` — otherwise
-    /// the forwarded state is silently ignored and the interceptor-side fix
-    /// is meaningless.
+    /// The shell `open_url` handler must read `msg.shiftKey` and, when true,
+    /// call `window.open` with the `popup` window feature so Firefox honours
+    /// the shift-click-opens-new-window intent. Other browsers may fall back
+    /// to a tab, which is acceptable.
     #[test]
-    fn shell_open_url_handler_honours_modifier_state() {
+    fn shell_open_url_handler_honours_shift_key() {
         let js = SHELL_BRIDGE_JS;
-        // Locate the open_url branch specifically.
+
+        // Locate the open_url branch and bound the slice to the next
+        // `else if` branch so assertions can't match unrelated JS.
         let open_url_idx = js
             .find("msg.type === 'open_url'")
             .expect("shell open_url branch present");
-        // Take a generous window around it for the assertions.
-        let window_end = (open_url_idx + 2048).min(js.len());
-        let block = &js[open_url_idx..window_end];
+        let rest = &js[open_url_idx..];
+        let next_branch = rest[1..]
+            .find("} else if")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let block = &rest[..next_branch];
 
         assert!(
             block.contains("msg.shiftKey"),
-            "open_url handler must read shiftKey for new-window intent (#3853)"
+            "open_url handler must read msg.shiftKey for new-window intent (#3853)"
         );
+        // The popup window feature is the concrete mechanism; pin it so a
+        // future refactor that reads shiftKey but forgets the feature is
+        // caught.
         assert!(
-            block.contains("msg.ctrlKey") || block.contains("msg.metaKey"),
-            "open_url handler must read ctrlKey/metaKey for new-tab intent (#3853)"
+            block.contains("'noopener,noreferrer,popup'"),
+            "open_url handler must pass the `popup` window feature on shift-click \
+             so Firefox honours the new-window intent (#3853); got block: {block}"
         );
+        // The non-shift path must still use the plain new-tab features so
+        // left-click behaviour is unchanged.
         assert!(
-            block.contains("msg.button"),
-            "open_url handler must read button to detect middle-click (#3853)"
+            block.contains("'noopener,noreferrer'"),
+            "open_url handler must keep the plain new-tab path for non-shift clicks"
         );
     }
 
