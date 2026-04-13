@@ -259,7 +259,12 @@ fi
 # State file for tracking progress (backup for manual inspection)
 STATE_FILE="/tmp/release-${VERSION}.state"
 
-# Get current fdev version and increment patch version
+# Provisional fdev version: bump the current Cargo.toml patch by one. On a
+# fresh run this is the target version. On a resume `load_state_file` will
+# overwrite FDEV_VERSION with the value persisted when the release PR was
+# created, so we never double-bump when the local Cargo.toml already reflects
+# the just-released version. See the v0.2.42 incident for the bug this guards
+# against: the summary printed 0.3.206, crates.io shipped 0.3.205.
 CURRENT_FDEV_VERSION=$(grep "^version" "$PROJECT_ROOT/crates/fdev/Cargo.toml" 2>/dev/null | cut -d'"' -f2)
 if [[ -n "$CURRENT_FDEV_VERSION" ]]; then
     FDEV_MAJOR=$(echo "$CURRENT_FDEV_VERSION" | cut -d. -f1)
@@ -302,6 +307,17 @@ load_state_file() {
             if [[ "$key" =~ ^COMPLETED_ ]]; then
                 local step="${key#COMPLETED_}"
                 COMPLETED_STEPS["$step"]=1
+            elif [[ "$key" == "FDEV_VERSION" && -n "$value" ]]; then
+                # Restore FDEV_VERSION from state so resumes after the release
+                # PR has already merged don't bump the already-published version
+                # a second time. Without this override, the top-level compute at
+                # script startup reads the just-released Cargo.toml value and
+                # adds 1, leaving the final summary printing a version that is
+                # one ahead of what actually shipped (v0.2.42 incident).
+                if [[ "$FDEV_VERSION" != "$value" ]]; then
+                    echo "  Restoring FDEV_VERSION from state: $value (was $FDEV_VERSION)"
+                    FDEV_VERSION="$value"
+                fi
             fi
         done < "$STATE_FILE"
     fi
@@ -619,40 +635,28 @@ update_versions() {
         exit 1
     fi
 
-    # Verify that the project compiles with the new versions
-    echo -n "  Verifying compilation... "
-    if cargo build --release --quiet 2>/dev/null; then
+    # Quick sanity check that the version-bumped workspace still type-checks.
+    # This is intentionally `cargo check`, not `cargo build --release` or
+    # `cargo test --release`: the PR opened below runs the full build and test
+    # suite on GitHub CI, and that is the gate auto-merge waits on. The local
+    # step only needs to catch trivially broken states (bad Cargo.toml edit,
+    # version mismatch, `cargo update` pulling in an incompatible transitive)
+    # before we round-trip through CI — codegen and the test suite are pure
+    # duplication here and can cost 5–15+ minutes of local wall time per
+    # release depending on cache state.
+    echo -n "  Running cargo check on workspace... "
+    if cargo check --workspace --quiet 2>/dev/null; then
         echo "✓"
     else
         echo "✗"
         echo ""
-        echo "  ⚠️  ERROR: Project failed to compile with new versions!"
-        echo "     Running cargo build to see errors:"
+        echo "  ⚠️  ERROR: Workspace failed to type-check with new versions!"
+        echo "     Running cargo check to see errors:"
         echo ""
-        cargo build --release
+        cargo check --workspace
         echo ""
-        echo "  Please fix compilation errors before releasing."
+        echo "  Please fix errors before releasing."
         exit 1
-    fi
-
-    # Run tests to ensure nothing is broken
-    if [[ "$SKIP_TESTS" == "false" ]]; then
-        echo -n "  Running tests... "
-        if cargo test --release --quiet 2>/dev/null; then
-            echo "✓"
-        else
-            echo "✗"
-            echo ""
-            echo "  ⚠️  ERROR: Tests failed with new versions!"
-            echo "     Running cargo test to see failures:"
-            echo ""
-            cargo test --release
-            echo ""
-            echo "  Please fix test failures before releasing."
-            exit 1
-        fi
-    else
-        echo "  ⚠️  Skipping tests (--skip-tests specified)"
     fi
 }
 
@@ -1382,32 +1386,50 @@ if current_key != key_bytes:
     # `riverctl` binary. The installed binary embeds room_contract.wasm at install time,
     # which becomes stale when the contract WASM changes. The repo version uses a build
     # script that copies the current WASM from ui/public/contracts/ at build time.
+    #
+    # RIVER_SKIP_CONTRACT_CHECK=1 disables riverctl's build-time staleness check that
+    # compares `ui/public/contracts/room_contract.wasm` against
+    # `target/wasm32-unknown-unknown/release/room_contract.wasm`. That check catches
+    # out-of-date WASM before *publishing* riverctl to crates.io, but here we are only
+    # *running* riverctl locally to send a chat message. A developer with a freshly
+    # rebuilt room-contract in their workspace will otherwise hit a panic unrelated to
+    # sending the message.
+    #
+    # stderr is captured into a log instead of discarded so future failures are
+    # diagnosable from the release log.
     local RIVER_DIR="$HOME/code/freenet/river/main"
+    local RIVER_LOG="/tmp/release-$VERSION-river.log"
     if [[ -d "$RIVER_DIR" ]]; then
-        if (cd "$RIVER_DIR" && timeout 60 cargo run -p riverctl -- message send "$ROOM_OWNER_VK" "$announcement" 2>/dev/null); then
+        if (cd "$RIVER_DIR" && RIVER_SKIP_CONTRACT_CHECK=1 timeout 180 cargo run -p riverctl -- message send "$ROOM_OWNER_VK" "$announcement" >"$RIVER_LOG" 2>&1); then
             echo "✓"
             mark_completed "RIVER_ANNOUNCED"
         else
+            local rc=$?
             echo "✗"
-            echo "  ⚠️  Failed to send River announcement (non-critical)"
-            echo "     Manual: cd $RIVER_DIR && cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
+            echo "  ⚠️  Failed to send River announcement (non-critical, rc=$rc)"
+            echo "     Last log lines from $RIVER_LOG:"
+            tail -15 "$RIVER_LOG" 2>/dev/null | sed 's/^/       /'
+            echo "     Manual: cd $RIVER_DIR && RIVER_SKIP_CONTRACT_CHECK=1 cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
         fi
     else
         echo "⚠️  River repo not found at $RIVER_DIR"
-        echo "     Manual: cd <river-repo> && cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
+        echo "     Manual: cd <river-repo> && RIVER_SKIP_CONTRACT_CHECK=1 cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
     fi
 }
 
 # Main execution
 echo "Freenet Release Script"
 echo "======================"
-echo "Target version: freenet $VERSION, fdev $FDEV_VERSION"
 echo "Project root: $PROJECT_ROOT"
 echo "State file: $STATE_FILE"
 echo
 
-# Auto-detect what's already completed
+# Auto-detect what's already completed. load_state_file runs inside
+# auto_detect_state and may restore FDEV_VERSION from a persisted value — so
+# the "Target version" line must be printed *after* that, not before.
 auto_detect_state
+echo
+echo "Target version: freenet $VERSION, fdev $FDEV_VERSION"
 echo
 
 check_prerequisites

@@ -128,7 +128,7 @@ async fn run_network_node_with_signals(
     use commands::auto_update::{
         UpdateCheckResult, UpdateNeededError, check_if_update_available, clear_version_mismatch,
         get_open_connection_count, has_reached_max_backoff, has_version_mismatch, reset_backoff,
-        version_mismatch_generation,
+        startup_update_check, version_mismatch_generation,
     };
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
@@ -218,6 +218,47 @@ async fn run_network_node_with_signals(
             std::future::pending::<()>().await;
             return;
         }
+
+        // --- Startup update check (#3864) ---
+        //
+        // Ask GitHub directly, once at boot, whether a newer release exists.
+        // This closes the "offline-for-days transient peer" gap where a node
+        // that has fallen out of the compatible-version window has no way to
+        // discover the new release via peer handshake (handshakes with an
+        // incompatible peer may never complete), so the peer-signal-driven
+        // update loop below never fires.
+        //
+        // Cross-platform: on Linux (systemd ExecStopPost), macOS (wrapper
+        // script), and Windows (wrapper loop), a successful update is
+        // propagated through `update_tx` → graceful shutdown → exit 42 →
+        // the service manager runs `freenet update --quiet` and restarts
+        // the freshly installed binary.
+        //
+        // Small jitter (0-60s) avoids a thundering-herd GitHub API hit when
+        // many nodes restart together (e.g. post-outage). Jitter lives in
+        // the caller so the helper stays pure and unit-testable.
+        //
+        // Fail-open: any GitHub / parse error returns None and the node
+        // continues booting normally into the peer-signal loop below.
+        let startup_jitter_secs = freenet::config::GlobalRng::random_u64() % 60;
+        if startup_jitter_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(startup_jitter_secs)).await;
+        }
+        tracing::info!(
+            current = build_info::VERSION,
+            jitter_secs = startup_jitter_secs,
+            "Startup update check against GitHub"
+        );
+        if let Some(new_version) = startup_update_check(build_info::VERSION).await {
+            tracing::info!(
+                new_version = %new_version,
+                "Startup check: newer version on GitHub, triggering auto-update"
+            );
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = update_tx.send(new_version);
+            return;
+        }
+        tracing::debug!("Startup update check: no newer version found");
 
         /// Parse our version string into a (major, minor, patch) tuple for comparison.
         fn parse_our_version() -> Option<(u8, u8, u16)> {

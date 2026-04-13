@@ -7,9 +7,12 @@
 //! [`crate::operations::subscribe::start_client_subscribe`]) so the
 //! `#[allow(dead_code)]` attributes from Phase 2a have been lifted.
 
+use std::net::SocketAddr;
+
 use tokio::sync::mpsc;
 
 use crate::message::{MessageStats, NetMessage, Transaction};
+use crate::node::OpExecutionPayload;
 use crate::operations::OpError;
 
 /// Per-transaction execution context for the task-per-tx model (#1454).
@@ -30,7 +33,7 @@ use crate::operations::OpError;
 /// [`crate::operations::subscribe::start_client_subscribe`]).
 pub(crate) struct OpCtx {
     tx: Transaction,
-    op_execution_sender: mpsc::Sender<(mpsc::Sender<NetMessage>, NetMessage)>,
+    op_execution_sender: mpsc::Sender<OpExecutionPayload>,
 }
 
 impl OpCtx {
@@ -40,7 +43,7 @@ impl OpCtx {
     /// [`crate::node::OpManager::op_ctx`] and the in-module tests.
     pub(crate) fn new(
         tx: Transaction,
-        op_execution_sender: mpsc::Sender<(mpsc::Sender<NetMessage>, NetMessage)>,
+        op_execution_sender: mpsc::Sender<OpExecutionPayload>,
     ) -> Self {
         Self {
             tx,
@@ -148,7 +151,41 @@ impl OpCtx {
     /// Returns [`OpError::NotificationError`] if the executor channel is
     /// closed (send failure) or the reply receiver is dropped (receiver
     /// hang-up). Both indicate the round-trip could not complete.
+    #[allow(dead_code)] // Kept as stable API surface for later task-per-tx phases (#1454).
     pub async fn send_and_await(&mut self, msg: NetMessage) -> Result<NetMessage, OpError> {
+        self.send_and_await_inner(msg, None).await
+    }
+
+    /// Like [`Self::send_and_await`] but dispatches the message directly to
+    /// `target_addr` over the network instead of looping it back to the local
+    /// event loop as an `InboundMessage`.
+    ///
+    /// This is the load-bearing variant for ops that need their first hop to
+    /// reach a remote peer even when local processing of the same message
+    /// would short-circuit. The motivating case is client-initiated SUBSCRIBE
+    /// when the contract is already cached locally (#3838): looping the
+    /// `Subscribe::Request` back through `process_message` hits the
+    /// "originator has contract locally" branch and synthesizes a success
+    /// reply without the gateway ever seeing the request, so the home node
+    /// never learns we want updates. By emitting
+    /// [`crate::node::network_bridge::p2p_protoc::ConnEvent::OutboundMessageWithTarget`]
+    /// instead, the request reaches the home node and triggers
+    /// `register_downstream_subscriber` there. The reply still flows back via
+    /// the same `pending_op_results` callback registered by
+    /// `handle_op_execution`.
+    pub async fn send_to_and_await(
+        &mut self,
+        target_addr: SocketAddr,
+        msg: NetMessage,
+    ) -> Result<NetMessage, OpError> {
+        self.send_and_await_inner(msg, Some(target_addr)).await
+    }
+
+    async fn send_and_await_inner(
+        &mut self,
+        msg: NetMessage,
+        target_addr: Option<SocketAddr>,
+    ) -> Result<NetMessage, OpError> {
         debug_assert_eq!(
             msg.id(),
             &self.tx,
@@ -158,7 +195,7 @@ impl OpCtx {
         let (response_sender, mut response_receiver) = mpsc::channel::<NetMessage>(1);
 
         self.op_execution_sender
-            .send((response_sender, msg))
+            .send((response_sender, msg, target_addr))
             .await
             .map_err(|_| OpError::NotificationError)?;
 
@@ -233,11 +270,15 @@ mod tests {
         // Executor task: receive the outbound message and fire a synthetic
         // terminal reply keyed by the same tx.
         let executor = tokio::spawn(async move {
-            let (reply_sender, outbound) = op_execution_receiver
+            let (reply_sender, outbound, target_addr) = op_execution_receiver
                 .recv()
                 .await
                 .expect("outbound msg should be delivered");
             assert_eq!(outbound.id(), &tx, "outbound msg tx must match the ctx tx");
+            assert_eq!(
+                target_addr, None,
+                "send_and_await should not specify a target"
+            );
             reply_sender
                 .try_send(dummy_reply_with_tx(tx))
                 .expect("capacity-1 reply channel should accept the first send");
@@ -248,6 +289,70 @@ mod tests {
             .await
             .expect("send_and_await should complete quickly")
             .expect("send_and_await should return Ok");
+
+        assert_eq!(reply.id(), &tx, "reply tx must match ctx tx");
+
+        executor
+            .await
+            .expect("executor task should complete without panicking");
+    }
+
+    /// Regression for #3838. `send_to_and_await` MUST forward the
+    /// caller-provided target address through the op execution channel so
+    /// `handle_op_execution` can dispatch to that peer via
+    /// `OutboundMessageWithTarget` instead of looping the message back as a
+    /// local `InboundMessage`. The local-loop variant short-circuits in
+    /// `process_message` when the contract is cached locally, which is how
+    /// `test_ping_blocked_peers` was failing in the merge queue: the
+    /// gateway never saw the Subscribe Request, so it never registered the
+    /// node as a downstream subscriber, so UPDATE broadcasts never reached
+    /// it.
+    ///
+    /// This test asserts the channel-level invariant. The full integration
+    /// path (Request reaching the gateway, gateway responding, reply
+    /// classification) is covered by `test_ping_blocked_peers`, but that
+    /// test takes ~30 s to run; this one runs in milliseconds and pins the
+    /// contract so a regression that drops the target on the floor would
+    /// fail here first.
+    #[tokio::test]
+    async fn send_to_and_await_forwards_target_address() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut op_execution_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+        let expected_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 42)), 31337);
+
+        let executor = tokio::spawn(async move {
+            let (reply_sender, outbound, target_addr) = op_execution_receiver
+                .recv()
+                .await
+                .expect("outbound msg should be delivered");
+            assert_eq!(outbound.id(), &tx, "outbound msg tx must match the ctx tx");
+            assert_eq!(
+                target_addr,
+                Some(expected_target),
+                "send_to_and_await must propagate the caller's target address \
+                 through the op execution channel (regression for #3838)"
+            );
+            reply_sender
+                .try_send(dummy_reply_with_tx(tx))
+                .expect("capacity-1 reply channel should accept the first send");
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        let reply = timeout(
+            Duration::from_secs(1),
+            ctx.send_to_and_await(expected_target, outbound),
+        )
+        .await
+        .expect("send_to_and_await should complete quickly")
+        .expect("send_to_and_await should return Ok");
 
         assert_eq!(reply.id(), &tx, "reply tx must match ctx tx");
 
@@ -271,7 +376,7 @@ mod tests {
         // without firing anything. The caller must observe the hang-up as
         // `NotificationError`.
         let executor = tokio::spawn(async move {
-            let (reply_sender, _outbound) = op_execution_receiver
+            let (reply_sender, _outbound, _target_addr) = op_execution_receiver
                 .recv()
                 .await
                 .expect("outbound msg should be delivered");
@@ -367,7 +472,7 @@ mod tests {
         let executor = tokio::spawn(async move {
             // First outbound: fire the terminal reply and let the first
             // `send_and_await` resolve normally.
-            let (reply_sender_1, _first) = op_execution_receiver
+            let (reply_sender_1, _first, _target_addr_1) = op_execution_receiver
                 .recv()
                 .await
                 .expect("first outbound delivered");
@@ -383,7 +488,7 @@ mod tests {
             // `completed` set), so the reply channel simply never
             // produces a message or closes. From `send_and_await`'s
             // viewpoint this is indistinguishable from a hang.
-            let (reply_sender_2, _second) = op_execution_receiver
+            let (reply_sender_2, _second, _target_addr_2) = op_execution_receiver
                 .recv()
                 .await
                 .expect("second outbound delivered");

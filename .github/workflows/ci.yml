@@ -450,72 +450,124 @@ jobs:
         env:
           RUST_LOG: info,turmoil=warn
         run: |
+          # Each fdev sim runs under `timeout` so one hanging sim cannot eat the
+          # entire 30m budget silently. Each sim writes to its own log file so
+          # we can upload them as artifacts and tell which one wedged.
+          mkdir -p sim-logs
+
           # Nextest simulation tests (already built above with --no-run).
-          cargo nextest run -p freenet --locked \
-            --test simulation_integration \
-            --test simulation_smoke \
-            --test streaming_e2e \
-            --test state_verification \
-            --features simulation_tests,testing --profile ci &
+          {
+            echo "== $(date -u +%H:%M:%S) nextest starting"
+            cargo nextest run -p freenet --locked \
+              --test simulation_integration \
+              --test simulation_smoke \
+              --test streaming_e2e \
+              --test state_verification \
+              --features simulation_tests,testing --profile ci 2>&1
+            rc=$?
+            echo "== $(date -u +%H:%M:%S) nextest done rc=${rc}"
+            exit $rc
+          } > sim-logs/nextest.log 2>&1 &
           NEXTEST_PID=$!
 
-          # fdev simulation tests run in parallel with nextest above.
-          # Each fdev invocation uses unique network names and dynamic ports.
-          target/release/fdev test \
-            --name "ci-medium-50" \
-            --seed 0xDEADBEEF \
-            --gateways 4 --nodes 46 --events 2000 \
-            --ring-max-htl 12 --max-connections 20 --min-connections 6 \
-            --latency-min 10 --latency-max 50 \
-            --min-success-rate 1.0 \
-            --print-summary --print-network-stats \
-            single-process &
+          # 8 minute cap per sim, SIGKILL 30s later if it refuses to die.
+          # Background directly (no function) so $! refers to the actual child
+          # of this shell, which `wait` can then reap.
+          {
+            echo "== $(date -u +%H:%M:%S) ci-medium-50 starting"
+            timeout --kill-after=30s 8m target/release/fdev test \
+              --name "ci-medium-50" \
+              --seed 0xDEADBEEF \
+              --gateways 4 --nodes 46 --events 2000 \
+              --ring-max-htl 12 --max-connections 20 --min-connections 6 \
+              --latency-min 10 --latency-max 50 \
+              --min-success-rate 1.0 \
+              --print-summary --print-network-stats \
+              single-process 2>&1
+            rc=$?
+            echo "== $(date -u +%H:%M:%S) ci-medium-50 done rc=${rc}"
+            exit $rc
+          } > sim-logs/ci-medium-50.log 2>&1 &
           PID1=$!
 
-          target/release/fdev test \
-            --name "ci-fault-loss" \
-            --seed 0xFA017001 \
-            --gateways 3 --nodes 27 --events 1000 \
-            --message-loss 0.15 \
-            --latency-min 10 --latency-max 50 \
-            --min-success-rate 0.80 \
-            --print-summary --print-network-stats \
-            single-process &
+          {
+            echo "== $(date -u +%H:%M:%S) ci-fault-loss starting"
+            timeout --kill-after=30s 8m target/release/fdev test \
+              --name "ci-fault-loss" \
+              --seed 0xFA017001 \
+              --gateways 3 --nodes 27 --events 1000 \
+              --message-loss 0.15 \
+              --latency-min 10 --latency-max 50 \
+              --min-success-rate 0.80 \
+              --print-summary --print-network-stats \
+              single-process 2>&1
+            rc=$?
+            echo "== $(date -u +%H:%M:%S) ci-fault-loss done rc=${rc}"
+            exit $rc
+          } > sim-logs/ci-fault-loss.log 2>&1 &
           PID2=$!
 
-          target/release/fdev test \
-            --name "ci-high-latency" \
-            --seed 0x1A7E0C71 \
-            --gateways 2 --nodes 12 --events 500 \
-            --latency-min 50 --latency-max 200 \
-            --min-success-rate 0.95 \
-            --print-summary --print-network-stats \
-            single-process &
+          {
+            echo "== $(date -u +%H:%M:%S) ci-high-latency starting"
+            timeout --kill-after=30s 8m target/release/fdev test \
+              --name "ci-high-latency" \
+              --seed 0x1A7E0C71 \
+              --gateways 2 --nodes 12 --events 500 \
+              --latency-min 50 --latency-max 200 \
+              --min-success-rate 0.95 \
+              --print-summary --print-network-stats \
+              single-process 2>&1
+            rc=$?
+            echo "== $(date -u +%H:%M:%S) ci-high-latency done rc=${rc}"
+            exit $rc
+          } > sim-logs/ci-high-latency.log 2>&1 &
           PID3=$!
 
-          # Churn resilience: tests network behavior under node crashes/restarts.
-          # Only takes a few seconds, so cheap to run on every PR.
-          target/release/fdev test \
-            --name "ci-churn-20" \
-            --seed 0xC102FEED \
-            --gateways 2 --nodes 18 --events 500 \
-            --ring-max-htl 10 --max-connections 15 --min-connections 4 \
-            --latency-min 10 --latency-max 50 \
-            --churn-rate 0.1 --churn-recovery-delay-ms 3000 \
-            --churn-permanent-rate 0.05 --churn-tick-ms 5000 \
-            --min-success-rate 0.80 \
-            --print-summary --print-network-stats \
-            single-process &
+          {
+            echo "== $(date -u +%H:%M:%S) ci-churn-20 starting"
+            timeout --kill-after=30s 8m target/release/fdev test \
+              --name "ci-churn-20" \
+              --seed 0xC102FEED \
+              --gateways 2 --nodes 18 --events 500 \
+              --ring-max-htl 10 --max-connections 15 --min-connections 4 \
+              --latency-min 10 --latency-max 50 \
+              --churn-rate 0.1 --churn-recovery-delay-ms 3000 \
+              --churn-permanent-rate 0.05 --churn-tick-ms 5000 \
+              --min-success-rate 0.80 \
+              --print-summary --print-network-stats \
+              single-process 2>&1
+            rc=$?
+            echo "== $(date -u +%H:%M:%S) ci-churn-20 done rc=${rc}"
+            exit $rc
+          } > sim-logs/ci-churn-20.log 2>&1 &
           PID4=$!
+
+          echo "Started: nextest=$NEXTEST_PID medium=$PID1 fault=$PID2 latency=$PID3 churn=$PID4"
 
           # Wait for all and fail if any failed
           FAILED=0
-          wait $NEXTEST_PID || FAILED=1
-          wait $PID1 || FAILED=1
-          wait $PID2 || FAILED=1
-          wait $PID3 || FAILED=1
-          wait $PID4 || FAILED=1
+          wait $NEXTEST_PID || { echo "nextest FAILED"; FAILED=1; }
+          wait $PID1 || { echo "ci-medium-50 FAILED"; FAILED=1; }
+          wait $PID2 || { echo "ci-fault-loss FAILED"; FAILED=1; }
+          wait $PID3 || { echo "ci-high-latency FAILED"; FAILED=1; }
+          wait $PID4 || { echo "ci-churn-20 FAILED"; FAILED=1; }
+
+          echo "===== sim log tails ====="
+          for f in sim-logs/*.log; do
+            echo "----- $f (last 40 lines) -----"
+            tail -n 40 "$f" || true
+          done
+
           exit $FAILED
+
+      - name: Upload simulation logs
+        if: always() && steps.release_check.outputs.is_release != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulation-logs
+          path: sim-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   nat_validation:
     name: NAT Validation
