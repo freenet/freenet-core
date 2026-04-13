@@ -50,7 +50,11 @@ use crate::config::GlobalExecutor;
 use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::OpManager;
 use crate::operations::OpError;
-use crate::ring::PeerKeyLocation;
+use crate::operations::op_ctx::{
+    AdvanceOutcome, AttemptOutcome, RetryDriver, RetryLoopOutcome, drive_retry_loop,
+};
+use crate::ring::{Location, PeerKeyLocation};
+use crate::router::{RouteEvent, RouteOutcome};
 
 use super::{PutFinalizationData, PutMsg};
 
@@ -211,10 +215,6 @@ async fn drive_client_put_inner(
     };
 
     // Retry loop via shared driver (#3807).
-    use crate::operations::op_ctx::{
-        AdvanceOutcome, AttemptOutcome, RetryDriver, RetryLoopOutcome, drive_retry_loop,
-    };
-
     struct PutRetryDriver<'a> {
         op_manager: &'a OpManager,
         key: ContractKey,
@@ -299,6 +299,32 @@ async fn drive_client_put_inner(
             // Without this, the GC task finds a stale AwaitingResponse
             // entry and launches speculative retries on the completed op.
             op_manager.completed(client_tx);
+
+            // Emit routing event + telemetry — report_result (which normally
+            // does both) doesn't run because the bypass intercepted the
+            // Response. Without this, the router's prediction model never
+            // receives PUT success feedback and simulation tests that check
+            // route_outcome telemetry fail.
+            let contract_location = Location::from(&reply_key);
+            let route_event = RouteEvent {
+                peer: driver.current_target.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+                op_type: Some(crate::node::network_status::OpType::Put),
+            };
+            if let Some(log_event) =
+                crate::tracing::NetEventLog::route_event(&client_tx, &op_manager.ring, &route_event)
+            {
+                op_manager
+                    .ring
+                    .register_events(either::Either::Left(log_event))
+                    .await;
+            }
+            op_manager.ring.routing_finished(route_event);
+            crate::node::network_status::record_op_result(
+                crate::node::network_status::OpType::Put,
+                true,
+            );
 
             // Telemetry only — subscribe=false to avoid double-subscribe.
             super::finalize_put_at_originator(
