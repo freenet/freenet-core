@@ -181,12 +181,13 @@ async fn drive_client_put_inner(
 ) -> Result<DriverOutcome, OpError> {
     let key = contract.key();
 
-    // 1. Local upsert FIRST. put_contract is the authoritative
-    //    "my node has it" event.
-    let (merged_value, _state_changed) =
-        super::put_contract(op_manager, key, value, related.clone(), &contract).await?;
-
-    // 2. Route: local-only, or network fan-out?
+    // Route: local-only, or network fan-out?
+    // NOTE: Do NOT call put_contract here for the network path.
+    // The Request goes through send_and_await → handle_op_execution →
+    // process_message, which calls put_contract internally with the
+    // correct hosting/interest/broadcast side-effects. An early
+    // put_contract here would cause state_changed=false on the second
+    // call, breaking convergence in concurrent PUT scenarios.
     let mut tried: Vec<std::net::SocketAddr> = Vec::new();
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
         tried.push(own_addr);
@@ -207,6 +208,9 @@ async fn drive_client_put_inner(
                     op_manager,
                     client_tx,
                     key,
+                    &contract,
+                    related,
+                    value,
                     subscribe,
                     blocking_subscribe,
                 )
@@ -218,6 +222,9 @@ async fn drive_client_put_inner(
                 op_manager,
                 client_tx,
                 key,
+                &contract,
+                related,
+                value,
                 subscribe,
                 blocking_subscribe,
             )
@@ -235,7 +242,7 @@ async fn drive_client_put_inner(
         key: ContractKey,
         contract: ContractContainer,
         related: RelatedContracts<'static>,
-        merged_value: WrappedState,
+        value: WrappedState,
         htl: usize,
         tried: Vec<std::net::SocketAddr>,
         retries: usize,
@@ -254,7 +261,7 @@ async fn drive_client_put_inner(
                 id: attempt_tx,
                 contract: self.contract.clone(),
                 related_contracts: self.related.clone(),
-                value: self.merged_value.clone(),
+                value: self.value.clone(),
                 htl: self.htl,
                 // Only include own_addr in skip_list (matching legacy request_put).
                 // `tried` contains driver-side routing state (peers the driver
@@ -297,7 +304,7 @@ async fn drive_client_put_inner(
         key,
         contract,
         related,
-        merged_value,
+        value,
         htl,
         tried,
         retries: 0,
@@ -396,10 +403,14 @@ fn advance_to_next_peer(
 
 // --- Local-only completion ---
 
+#[allow(clippy::too_many_arguments)]
 async fn local_only_completion(
     op_manager: &Arc<OpManager>,
     client_tx: Transaction,
     key: ContractKey,
+    contract: &ContractContainer,
+    related: RelatedContracts<'static>,
+    value: WrappedState,
     subscribe: bool,
     blocking_subscribe: bool,
 ) -> Result<DriverOutcome, OpError> {
@@ -410,8 +421,9 @@ async fn local_only_completion(
         "put (task-per-tx): local-only completion (no remote peers)"
     );
 
-    // Telemetry only — pass subscribe=false to avoid double-subscribe.
-    // maybe_subscribe_child handles subscriptions via the task-per-tx path.
+    // Local-only path: no process_message runs, so we must store directly.
+    super::put_contract(op_manager, key, value, related, contract).await?;
+
     let own_location = op_manager.ring.connection_manager.own_location();
     super::finalize_put_at_originator(
         op_manager,
