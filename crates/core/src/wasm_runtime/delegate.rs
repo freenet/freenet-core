@@ -99,10 +99,21 @@ impl Runtime {
         let origin_contracts = match origin {
             Some(MessageOrigin::WebApp(contract_id)) => vec![*contract_id],
             Some(MessageOrigin::Delegate(_)) | None => Vec::new(),
-            // MessageOrigin is `#[non_exhaustive]`; future variants must
-            // explicitly decide whether they grant contract access. Until
-            // then, default to "no access" — fail closed.
-            Some(_) => Vec::new(),
+            // MessageOrigin is `#[non_exhaustive]`; future variants reach
+            // this arm because the compiler requires it. Default to "no
+            // contract access" (fail closed) AND log a warning so the gap
+            // is visible during the PR that adds the new variant — the
+            // catch-all should not silently default in production.
+            Some(other) => {
+                tracing::warn!(
+                    delegate_key = %delegate_key,
+                    origin = ?other,
+                    "Unknown MessageOrigin variant reached fail-closed default; \
+                     wasm_runtime::delegate::Runtime::inbound_app_message must \
+                     decide explicitly whether this variant grants contract access"
+                );
+                Vec::new()
+            }
         };
 
         // SAFETY: The `DelegateCallEnv` does not outlive `self`. The raw pointers to
