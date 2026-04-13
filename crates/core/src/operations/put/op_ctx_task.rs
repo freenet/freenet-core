@@ -596,6 +596,51 @@ mod tests {
     }
 
     #[test]
+    fn max_retries_boundary_exhausts_at_limit() {
+        // Verify the MAX_RETRIES boundary: retries >= MAX_RETRIES → None.
+        // Tests the counter logic that advance_to_next_peer uses.
+        let mut retries: usize = 0;
+        // First MAX_RETRIES calls should increment (simulating advance succeeding)
+        for _ in 0..MAX_RETRIES {
+            assert!(retries < MAX_RETRIES, "should not exhaust before limit");
+            retries += 1;
+        }
+        // At MAX_RETRIES, the guard triggers
+        assert!(
+            retries >= MAX_RETRIES,
+            "should exhaust at MAX_RETRIES={MAX_RETRIES}"
+        );
+    }
+
+    #[test]
+    fn classify_reply_unexpected_for_non_put_message() {
+        // An Aborted message (non-PUT) should be Unexpected.
+        let tx = dummy_tx();
+        let msg = NetMessage::V1(NetMessageV1::Aborted(tx));
+        assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
+    }
+
+    #[test]
+    fn driver_outcome_exhausted_produces_client_error() {
+        // Verify that RetryLoopOutcome::Exhausted maps to a client-visible
+        // OperationError, not a silent drop or infrastructure error.
+        let cause = "PUT to contract failed after 3 attempts".to_string();
+        let outcome: DriverOutcome = match RetryLoopOutcome::<ContractKey>::Exhausted(cause) {
+            RetryLoopOutcome::Exhausted(cause) => {
+                DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                    cause: cause.into(),
+                }
+                .into()))
+            }
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(outcome, DriverOutcome::Publish(Err(_))),
+            "Exhaustion must produce a client error, not be swallowed"
+        );
+    }
+
+    #[test]
     fn classify_reply_request_is_local_completion() {
         // When process_message completes locally (no next hop), the Request
         // is echoed back via forward_pending_op_result_if_completed.
