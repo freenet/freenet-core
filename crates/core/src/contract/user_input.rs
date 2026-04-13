@@ -15,11 +15,44 @@ const MAX_LABEL_LEN: usize = 64;
 /// Maximum number of response buttons. Keeps the UI usable.
 const MAX_LABELS: usize = 10;
 
+/// Runtime-attested identity of the entity that triggered a permission prompt.
+///
+/// This is a display-layer representation: it lives only between the executor
+/// (which knows the typed `ContractInstanceId` / future `DelegateKey`) and the
+/// permission-prompt UI. Stringification happens at the boundary so the UI
+/// doesn't depend on stdlib types and the stored prompt can be serialised to
+/// the dashboard JSON without any further conversion.
+///
+/// Variants reflect what `MessageOrigin` in freenet-stdlib can carry today.
+/// A `Delegate(String)` variant is reserved for #3860 (extending
+/// `MessageOrigin` to attest delegate-to-delegate callers); the prompt UI is
+/// already shaped to render it without further changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallerIdentity {
+    /// No structured caller was recorded for this request. Today this covers
+    /// both "no web app involved" and "delegate-to-delegate call" — those are
+    /// not currently distinguishable at the API level (see #3860).
+    None,
+    /// The request came from a web app whose contract id was attested by
+    /// `MessageOrigin::WebApp(..)`. The string is the `ContractInstanceId`
+    /// in its canonical display form.
+    WebApp(String),
+}
+
 /// Abstracts user prompting for delegate `RequestUserInput` messages.
+///
+/// Implementations receive the runtime-attested identity of the calling
+/// delegate and (when known) of the originating web app. These identities are
+/// rendered in the permission prompt UI so the user can see *who* is asking
+/// and *which* app triggered the request. The identities MUST come from the
+/// runtime context, never from the delegate's own message payload — a rogue
+/// delegate must not be able to spoof another delegate's or app's identity.
 pub trait UserInputPrompter: Send + Sync {
     fn prompt(
         &self,
         request: &UserInputRequest<'static>,
+        delegate_key: &str,
+        caller: CallerIdentity,
     ) -> impl std::future::Future<Output = Option<(usize, ClientResponse<'static>)>> + Send;
 }
 
@@ -28,7 +61,7 @@ pub(crate) struct PendingPrompt {
     pub message: String,
     pub labels: Vec<String>,
     pub delegate_key: String,
-    pub contract_id: String,
+    pub caller: CallerIdentity,
     pub response_tx: oneshot::Sender<usize>,
 }
 
@@ -69,6 +102,8 @@ impl UserInputPrompter for DashboardPrompter {
     async fn prompt(
         &self,
         request: &UserInputRequest<'static>,
+        delegate_key: &str,
+        caller: CallerIdentity,
     ) -> Option<(usize, ClientResponse<'static>)> {
         if request.responses.is_empty() {
             tracing::warn!("RequestUserInput has no response options");
@@ -96,8 +131,8 @@ impl UserInputPrompter for DashboardPrompter {
             PendingPrompt {
                 message,
                 labels,
-                delegate_key: "Unknown".to_string(), // TODO: pass from executor context
-                contract_id: "Unknown".to_string(),  // TODO: pass from executor context
+                delegate_key: delegate_key.to_string(),
+                caller,
                 response_tx: tx,
             },
         );
@@ -184,6 +219,8 @@ impl UserInputPrompter for AutoApprovePrompter {
     async fn prompt(
         &self,
         request: &UserInputRequest<'static>,
+        _delegate_key: &str,
+        _caller: CallerIdentity,
     ) -> Option<(usize, ClientResponse<'static>)> {
         request
             .responses
@@ -201,6 +238,8 @@ impl UserInputPrompter for AutoDenyPrompter {
     async fn prompt(
         &self,
         _request: &UserInputRequest<'static>,
+        _delegate_key: &str,
+        _caller: CallerIdentity,
     ) -> Option<(usize, ClientResponse<'static>)> {
         None
     }
@@ -226,10 +265,16 @@ pub(crate) fn make_test_request(message: &str, responses: Vec<&str>) -> UserInpu
 mod tests {
     use super::*;
 
+    fn webapp(s: &str) -> CallerIdentity {
+        CallerIdentity::WebApp(s.to_string())
+    }
+
     #[tokio::test]
     async fn test_auto_approve_returns_first_response() {
         let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
-        let result = AutoApprovePrompter.prompt(&req).await;
+        let result = AutoApprovePrompter
+            .prompt(&req, "dkey", webapp("cid"))
+            .await;
         let (idx, response) = result.unwrap();
         assert_eq!(idx, 0);
         assert_eq!(&*response, b"Allow");
@@ -238,14 +283,16 @@ mod tests {
     #[tokio::test]
     async fn test_auto_approve_empty_responses() {
         let req = make_test_request("Allow this?", vec![]);
-        let result = AutoApprovePrompter.prompt(&req).await;
+        let result = AutoApprovePrompter
+            .prompt(&req, "dkey", webapp("cid"))
+            .await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_auto_deny_always_returns_none() {
         let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
-        let result = AutoDenyPrompter.prompt(&req).await;
+        let result = AutoDenyPrompter.prompt(&req, "dkey", webapp("cid")).await;
         assert!(result.is_none());
     }
 
@@ -290,14 +337,14 @@ mod tests {
                     message: "test".to_string(),
                     labels: vec!["OK".to_string()],
                     delegate_key: String::new(),
-                    contract_id: String::new(),
+                    caller: CallerIdentity::None,
                     response_tx: tx,
                 },
             );
         }
 
         let req = make_test_request("Over limit", vec!["Allow"]);
-        let result = prompter.prompt(&req).await;
+        let result = prompter.prompt(&req, "dkey", webapp("cid")).await;
         assert!(result.is_none());
     }
 
@@ -356,7 +403,9 @@ mod tests {
     #[tokio::test]
     async fn test_auto_approve_with_three_responses() {
         let req = make_test_request("Allow?", vec!["Allow Once", "Always Allow", "Deny"]);
-        let result = AutoApprovePrompter.prompt(&req).await;
+        let result = AutoApprovePrompter
+            .prompt(&req, "dkey", webapp("cid"))
+            .await;
         let (idx, response) = result.unwrap();
         assert_eq!(idx, 0);
         assert_eq!(&*response, b"Allow Once");
@@ -365,8 +414,78 @@ mod tests {
     #[tokio::test]
     async fn test_auto_deny_with_multiple_responses() {
         let req = make_test_request("Allow?", vec!["Allow Once", "Always Allow", "Deny"]);
-        let result = AutoDenyPrompter.prompt(&req).await;
+        let result = AutoDenyPrompter.prompt(&req, "dkey", webapp("cid")).await;
         assert!(result.is_none());
+    }
+
+    // Regression test for issue #3857: the dashboard prompter MUST populate
+    // PendingPrompt's identity fields from the runtime-attested values passed
+    // into prompt(), not hardcode them to "Unknown". Without this, the
+    // permission overlay renders "Unknown" in the structured identity slots,
+    // forcing the user to trust the delegate's self-authored message for
+    // attribution, which a malicious delegate could spoof.
+    #[tokio::test]
+    async fn test_dashboard_prompter_populates_webapp_caller() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = DashboardPrompter::new(pending.clone());
+
+        let req = make_test_request("Approve?", vec!["Allow", "Deny"]);
+        let pending_clone = pending.clone();
+        let handle = tokio::spawn(async move {
+            prompter
+                .prompt(&req, "DLGKEY123", webapp("CONTRACT456"))
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let entry = pending_clone
+            .iter()
+            .next()
+            .expect("prompt should be registered");
+        assert_eq!(entry.value().delegate_key, "DLGKEY123");
+        assert_eq!(
+            entry.value().caller,
+            CallerIdentity::WebApp("CONTRACT456".to_string())
+        );
+
+        let nonce = entry.key().clone();
+        drop(entry);
+        let (_, prompt) = pending_clone.remove(&nonce).unwrap();
+        prompt.response_tx.send(1).unwrap();
+        let _ = handle.await.unwrap();
+    }
+
+    // When no web-app caller is attested (delegate-to-delegate, local client,
+    // or any other non-WebApp invocation path), the prompt should record
+    // CallerIdentity::None — distinct from WebApp(""), so the UI can render a
+    // dedicated "No app caller" line rather than a blank field.
+    #[tokio::test]
+    async fn test_dashboard_prompter_records_none_caller() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = DashboardPrompter::new(pending.clone());
+
+        let req = make_test_request("Approve?", vec!["Allow"]);
+        let pending_clone = pending.clone();
+        let handle =
+            tokio::spawn(
+                async move { prompter.prompt(&req, "DLGKEY", CallerIdentity::None).await },
+            );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let entry = pending_clone
+            .iter()
+            .next()
+            .expect("prompt should be registered");
+        assert_eq!(entry.value().delegate_key, "DLGKEY");
+        assert_eq!(entry.value().caller, CallerIdentity::None);
+
+        let nonce = entry.key().clone();
+        drop(entry);
+        let (_, prompt) = pending_clone.remove(&nonce).unwrap();
+        prompt.response_tx.send(0).unwrap();
+        let _ = handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -378,7 +497,8 @@ mod tests {
 
         // Spawn the prompt in a task
         let pending_clone = pending.clone();
-        let handle = tokio::spawn(async move { prompter.prompt(&req).await });
+        let handle =
+            tokio::spawn(async move { prompter.prompt(&req, "dkey", webapp("cid")).await });
 
         // Wait briefly for the prompt to be inserted
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

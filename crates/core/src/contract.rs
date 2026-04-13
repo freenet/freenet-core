@@ -39,7 +39,7 @@ use freenet_stdlib::client_api::DelegateRequest;
 use tracing::Instrument;
 
 use self::executor::DelegateNotificationReceiver;
-use self::user_input::UserInputPrompter;
+use self::user_input::{CallerIdentity, UserInputPrompter};
 
 /// Maximum iterations when handling contract requests to prevent infinite loops
 const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
@@ -511,9 +511,25 @@ where
                 "Processing UserInputRequest messages from delegate"
             );
 
+            // The caller identity passed to the prompter is built from the
+            // executor's runtime context, NOT from anything the delegate could
+            // influence — so a malicious delegate cannot spoof another app's
+            // or delegate's identity in the structured fields the prompt UI
+            // renders. Today the only attested non-None caller is a web app
+            // (via `MessageOrigin::WebApp`); delegate-to-delegate attestation
+            // is tracked by #3860 and will appear here as a new variant.
+            let caller = match origin_contract {
+                Some(id) => CallerIdentity::WebApp(id.to_string()),
+                None => CallerIdentity::None,
+            };
+            let delegate_key_str = delegate_key.to_string();
+
             for req in user_input_requests {
                 let request_id = req.request_id;
-                let response = match prompter.prompt(&req).await {
+                let response = match prompter
+                    .prompt(&req, &delegate_key_str, caller.clone())
+                    .await
+                {
                     Some((_, response)) => response,
                     None => {
                         tracing::warn!(
