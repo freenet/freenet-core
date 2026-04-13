@@ -498,11 +498,26 @@ function freenetBridge(authToken) {
   // linking. Using data-src (not src) in the HTML means the iframe
   // doesn't start loading until we set .src here, so there is exactly
   // one load -- with the hash already in the URL.
-  var iframeSrc = iframe.getAttribute('data-src');
+  var iframeDataSrc = iframe.getAttribute('data-src');
+  // Cache the contract web prefix once; used by nav/popstate path validation.
+  var contractPrefixMatch = iframeDataSrc.match(/^(\/v[12]\/contract\/web\/[^/]+\/)/);
+  var contractPrefix = contractPrefixMatch ? contractPrefixMatch[1] : null;
+  var iframeSrc = iframeDataSrc;
   if (location.hash) {
     iframeSrc += location.hash.slice(0, 8192);
   }
   iframe.src = iframeSrc;
+  // Seed history state so that back-navigating to the initial entry still
+  // has an identifiable __freenet_nav__ record. Using replaceState avoids
+  // adding a new entry — we just tag the existing one.
+  if (contractPrefix) {
+    try {
+      history.replaceState(
+        { __freenet_nav__: true, iframePath: iframeSrc },
+        ''
+      );
+    } catch(e) {}
+  }
 
   function sendToIframe(msg) {
     iframe.contentWindow.postMessage(msg, '*');
@@ -533,7 +548,23 @@ function freenetBridge(authToken) {
         // replaceState does NOT fire popstate or hashchange, preventing loops.
         var h = msg.hash.slice(0, 8192);
         if (h.length > 0 && h.charAt(0) === '#') {
-          history.replaceState(null, '', h);
+          // Preserve the existing state object (which may carry our
+          // __freenet_nav__ marker) so popstate can still restore the iframe.
+          // If the current entry is tagged, also update its iframePath to
+          // include the new fragment — otherwise back/forward would restore
+          // the iframe without the user's current fragment position.
+          var curState = history.state;
+          if (curState && curState.__freenet_nav__ === true &&
+              typeof curState.iframePath === 'string') {
+            var basePath = curState.iframePath.split('#')[0];
+            history.replaceState(
+              { __freenet_nav__: true, iframePath: basePath + h },
+              '',
+              h
+            );
+          } else {
+            history.replaceState(history.state, '', h);
+          }
         }
       } else if (msg.type === 'clipboard' && typeof msg.text === 'string') {
         // Sandboxed iframes can't use navigator.clipboard due to permissions
@@ -553,26 +584,41 @@ function freenetBridge(authToken) {
         // navigation requests to the shell which updates iframe.src.
         // Security: only allows paths under the current contract's web prefix
         // to prevent cross-contract navigation or path traversal.
+        // Cap href length to prevent a malicious contract from bloating
+        // history.state or the address bar with arbitrarily large URLs.
+        if (msg.href.length > 4096) return;
         try {
           var resolved = new URL(msg.href, iframe.src);
           // Only allow same-origin navigation (no cross-site)
           if (resolved.origin !== location.origin) return;
           var cleanPath = resolved.pathname;
-          // Extract the contract web prefix from the iframe's data-src
-          var dataSrc = iframe.getAttribute('data-src');
-          var baseParts = dataSrc.match(/^(\/v[12]\/contract\/web\/[^/]+\/)/);
-          if (!baseParts) return;
-          var contractPrefix = baseParts[1];
           // Ensure navigation stays within the same contract
-          if (cleanPath.indexOf(contractPrefix) !== 0) return;
+          if (!contractPrefix || cleanPath.indexOf(contractPrefix) !== 0) return;
           // Close any open WebSocket connections from the previous page to
           // prevent resource leaks. The old iframe document will be destroyed
           // when src changes, orphaning any connection callbacks.
           connections.forEach(function(ws) { try { ws.close(); } catch(e) {} });
           connections.clear();
+          // Cap the hash component to match the 8192-byte cap used by the
+          // hash-forwarding path; the iframe path is stored in history.state
+          // so unbounded hashes would bloat the per-tab history record.
+          var cappedHash = resolved.hash ? resolved.hash.slice(0, 8192) : '';
           // Build new sandbox URL preserving __sandbox=1
           resolved.searchParams.set('__sandbox', '1');
-          iframe.src = resolved.pathname + resolved.search;
+          var newIframePath = resolved.pathname + resolved.search + cappedHash;
+          iframe.src = newIframePath;
+          // Push a history entry so the browser back/forward buttons navigate
+          // between visited subpages, and update the address bar to the
+          // non-sandbox URL. The sandbox flag is intentionally omitted from the
+          // outer URL; the shell always re-adds it when loading the iframe.
+          // See issue #3839.
+          try {
+            history.pushState(
+              { __freenet_nav__: true, iframePath: newIframePath },
+              '',
+              cleanPath + cappedHash
+            );
+          } catch(e) {}
         } catch(e) {}
       } else if (msg.type === 'open_url' && typeof msg.url === 'string') {
         // Open external URLs in a new tab. Popups from the sandboxed iframe
@@ -668,7 +714,30 @@ function freenetBridge(authToken) {
       sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 8192) });
     }
   }
-  window.addEventListener('popstate', forwardHash);
+  // popstate fires when the user presses back/forward. If the popped entry
+  // carries our __freenet_nav__ marker, restore the iframe to the matching
+  // subpage. Otherwise, fall back to forwarding the hash. See issue #3839.
+  window.addEventListener('popstate', function(ev) {
+    var state = ev.state;
+    if (state && state.__freenet_nav__ === true && typeof state.iframePath === 'string') {
+      // Security: path must still live under this contract's web prefix.
+      // A stale state object from a different contract must not be able to
+      // redirect the iframe elsewhere.
+      if (contractPrefix && state.iframePath.indexOf(contractPrefix) === 0) {
+        // No-op if the iframe is already on the target path (e.g. popstate
+        // fired from a bfcache restore where iframe state was retained).
+        // This avoids a spurious reload that would tear down live WebSocket
+        // connections unnecessarily.
+        if (iframe.src.indexOf(state.iframePath) === -1) {
+          connections.forEach(function(ws) { try { ws.close(); } catch(e) {} });
+          connections.clear();
+          iframe.src = state.iframePath;
+        }
+        return;
+      }
+    }
+    forwardHash();
+  });
   window.addEventListener('hashchange', forwardHash);
 
   // Permission prompt overlay: render a modal in the shell page's DOM
@@ -1617,11 +1686,7 @@ mod tests {
         );
         assert!(
             SHELL_BRIDGE_JS.contains("history.replaceState"),
-            "bridge JS must use replaceState (not pushState) to avoid polluting browser history"
-        );
-        assert!(
-            !SHELL_BRIDGE_JS.contains("history.pushState"),
-            "bridge JS must not use pushState — hash changes should replace, not push"
+            "bridge JS must use replaceState for hash updates to avoid polluting browser history"
         );
         // Initial hash: built into iframe src from data-src for deep linking
         assert!(
@@ -1903,6 +1968,110 @@ mod tests {
 
         let result = sandbox_content_body(dir.path(), key, ApiVersion::V1, "escape.html").await;
         assert!(result.is_err(), "symlink escape should be rejected");
+    }
+
+    #[test]
+    fn bridge_js_navigate_pushes_history_state() {
+        // Regression test for #3839: in-contract navigation must push a browser
+        // history entry so back/forward works and the address bar updates.
+        assert!(
+            SHELL_BRIDGE_JS.contains("history.pushState"),
+            "navigate handler must push a history entry"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("__freenet_nav__: true"),
+            "history state must be tagged with __freenet_nav__ so popstate can recognise it"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("iframePath: newIframePath"),
+            "history state must carry the iframe sandbox URL for popstate restore"
+        );
+        // The pushState URL must be the clean path (without __sandbox=1) so the
+        // address bar shows the user-visible subpage URL, not the sandbox flag.
+        assert!(
+            SHELL_BRIDGE_JS.contains("cleanPath + cappedHash"),
+            "pushState URL must be the clean (non-sandbox) path"
+        );
+    }
+
+    #[test]
+    fn bridge_js_popstate_restores_iframe_from_state() {
+        // Regression test for #3839: browser back/forward must restore the
+        // iframe to the previously-visited subpage by reading history state.
+        assert!(
+            SHELL_BRIDGE_JS.contains("addEventListener('popstate'"),
+            "bridge JS must listen for popstate events"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("state.__freenet_nav__ === true"),
+            "popstate handler must check for the __freenet_nav__ marker"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("state.iframePath.indexOf(contractPrefix) === 0"),
+            "popstate handler must validate the restored iframe path stays under the contract prefix"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("iframe.src = state.iframePath"),
+            "popstate handler must restore iframe.src from state"
+        );
+    }
+
+    #[test]
+    fn bridge_js_seeds_initial_history_state() {
+        // Regression test for #3839: the initial history entry must carry the
+        // __freenet_nav__ marker so that navigating back to the first page
+        // still restores the iframe via popstate.
+        assert!(
+            SHELL_BRIDGE_JS.contains("history.replaceState"),
+            "bridge JS must seed history state on load"
+        );
+        // The replaceState call for hash forwarding must preserve existing
+        // state (history.state) rather than passing null, or it would wipe the
+        // __freenet_nav__ marker and break back-navigation.
+        assert!(
+            SHELL_BRIDGE_JS.contains("history.replaceState(history.state"),
+            "hash replaceState must preserve the existing state object"
+        );
+    }
+
+    #[test]
+    fn bridge_js_navigate_caps_href_length() {
+        // Prevent a malicious contract from bloating history.state / URL by
+        // spamming arbitrarily large navigate hrefs.
+        assert!(
+            SHELL_BRIDGE_JS.contains("msg.href.length > 4096"),
+            "navigate handler must cap msg.href length"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("resolved.hash.slice(0, 8192)"),
+            "navigate handler must cap the hash component stored in history.state"
+        );
+    }
+
+    #[test]
+    fn bridge_js_hash_update_syncs_nav_state() {
+        // When the iframe sends a hash update while sitting on a pushState
+        // entry, the stored iframePath must be refreshed to include the new
+        // fragment — otherwise back/forward loses the user's fragment.
+        assert!(
+            SHELL_BRIDGE_JS.contains("curState.__freenet_nav__ === true"),
+            "hash handler must detect tagged nav state"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("basePath + h"),
+            "hash handler must rewrite iframePath with the new fragment"
+        );
+    }
+
+    #[test]
+    fn bridge_js_popstate_skips_reload_when_iframe_on_target() {
+        // bfcache restore can fire popstate while the iframe is already on
+        // the target path. Re-assigning iframe.src would tear down live
+        // WebSockets for no reason.
+        assert!(
+            SHELL_BRIDGE_JS.contains("iframe.src.indexOf(state.iframePath) === -1"),
+            "popstate handler must skip reload when iframe is already on the target"
+        );
     }
 
     #[test]
