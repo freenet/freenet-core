@@ -5758,14 +5758,13 @@ mod tests {
     /// only), defer to the network with local fallback.
     ///
     /// Returns (local_value, local_fallback) after applying the decision.
+    type LocalValue = Option<(ContractKey, WrappedState, Option<ContractContainer>)>;
+
     fn apply_relay_cache_decision(
         is_relay: bool,
         has_local_interest: bool,
-        local_value: Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
-    ) -> (
-        Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
-        Option<(ContractKey, WrappedState, Option<ContractContainer>)>,
-    ) {
+        local_value: LocalValue,
+    ) -> (LocalValue, LocalValue) {
         // This mirrors the logic at get.rs ~line 1404.
         let mut local_fallback = None;
         let local_value = if is_relay {

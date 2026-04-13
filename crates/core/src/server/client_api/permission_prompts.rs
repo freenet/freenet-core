@@ -10,6 +10,65 @@
 //!
 //! The standalone `/permission/{nonce}` HTML page is retained as a fallback
 //! (e.g. if JS is disabled in the shell, or for debugging / manual testing).
+//!
+//! # Trust model and UI rationale (#3857)
+//!
+//! The user installed the delegate. It is their agent; its per-key storage is
+//! cryptographically isolated, so an impostor delegate with a different
+//! `DelegateKey` cannot read or sign with the real delegate's secrets. That
+//! limits one class of spoofing — but it does not make the prompt safe to
+//! ship without identity attestation. A malicious-but-installed delegate can
+//! still:
+//!
+//! - sign actions with its own (fake) key and trick the user into thinking
+//!   they signed as their real identity (downstream verifiers that don't
+//!   know the real public key would accept it);
+//! - condition the user toward "Always allow" on a hostile request;
+//! - exfiltrate user input via the response channel;
+//! - write text in the message that looks like Freenet UI chrome (e.g.
+//!   `"Freenet verified this request"`).
+//!
+//! The prompt UI defends against these the same way a hardware key does:
+//! by surfacing a stable, runtime-attested fingerprint the user can
+//! recognise across sessions. The runtime-attested `DelegateKey` is the one
+//! signal that a returning user can passively use to spot an impostor; the
+//! attested caller (today only `MessageOrigin::WebApp(..)`, see #3860) tells
+//! the user *which* application is asking right now.
+//!
+//! Concrete UI choices that follow from this:
+//!
+//! 1. **The delegate's message ("Delegate says:") stays.** It is the most
+//!    informative thing on the screen for the *honest* delegate case (which
+//!    is the common case). Removing the authorship label was tempting but
+//!    is wrong: it is the only thing on the page distinguishing
+//!    delegate-authored text from Freenet UI chrome, and HTML-escaping does
+//!    not protect against text deception.
+//! 2. **The truncated delegate hash is shown inline, always visible**,
+//!    under the buttons in muted monospace. A user who recognises their
+//!    delegate's fingerprint can spot an impostor without expanding any
+//!    disclosure.
+//! 3. **A `<details>` "Technical details" disclosure** holds the full
+//!    delegate hash and the Caller row (`Freenet app <truncated>` or
+//!    `No app caller` for the `None` case). Closed by default — the user's
+//!    real decision is timing/intent ("did I just trigger this?"), not
+//!    hash matching.
+//! 4. **No human-readable names.** Any name would have to come from
+//!    app-controlled metadata and would be spoofable by a malicious
+//!    contract publishing a manifest named after a popular app. Showing a
+//!    name beside an unverified hash would pretend they are equally
+//!    verified. Names are deferred until there is a real provenance story
+//!    (signed manifests, or trust-on-first-use state).
+//! 5. **`No app caller` rather than `Unknown` or `(not recorded)`** for
+//!    the `CallerIdentity::None` case. `Unknown` reads like a failure;
+//!    `No app caller` is accurate and neutral.
+//! 6. **No `"Freenet confirmed these identities"` badge.** Such a badge
+//!    would oversell the defensive value of the Delegate field (see above)
+//!    and underlabel the Caller field. The information is presented
+//!    factually and the user evaluates it against their own context.
+//!
+//! The shell-page overlay JS in `crates/core/src/server/path_handlers.rs`
+//! mirrors this same layout. Both code paths must stay in sync — the
+//! standalone page and the in-page overlay are both regression-tested.
 
 use axum::extract::Path;
 use axum::http::HeaderMap;
@@ -18,7 +77,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 
-use crate::contract::user_input::PendingPrompts;
+use crate::contract::user_input::{CallerIdentity, PendingPrompts};
 
 /// Register permission prompt routes.
 pub(super) fn routes() -> Router {
@@ -37,10 +96,33 @@ const OVERLAY_MESSAGE_MAX: usize = 2048;
 const OVERLAY_LABELS_MAX: usize = 8;
 /// Maximum length of each individual button label.
 const OVERLAY_LABEL_CHARS_MAX: usize = 64;
-/// Maximum length of `delegate_key` / `contract_id` rendered on the overlay.
+/// Maximum length of `delegate_key` / caller hash rendered on the overlay.
 /// These are normally short keys; the cap bounds the amplification surface if
 /// the producer populates them from untrusted data in the future.
 const OVERLAY_KEY_CHARS_MAX: usize = 256;
+
+/// Number of leading characters of a hash to show in the truncated form.
+const HASH_PREFIX_CHARS: usize = 8;
+/// Number of trailing characters of a hash to show in the truncated form.
+const HASH_SUFFIX_CHARS: usize = 5;
+
+/// Truncate a hash for display: `first8…last5`. Falls back to the full string
+/// if it's already short enough that truncating would lose nothing useful
+/// (i.e. when prefix + suffix + ellipsis ≥ original length).
+///
+/// The truncated form is what the user sees in the prompt UI; the full hash
+/// is preserved separately and surfaced via the `title` attribute on the
+/// rendered span so power users can hover to read the unabbreviated value.
+fn truncate_hash(s: &str) -> String {
+    let total: usize = s.chars().count();
+    if total <= HASH_PREFIX_CHARS + HASH_SUFFIX_CHARS + 1 {
+        return s.to_string();
+    }
+    let prefix: String = s.chars().take(HASH_PREFIX_CHARS).collect();
+    let suffix_rev: String = s.chars().rev().take(HASH_SUFFIX_CHARS).collect();
+    let suffix: String = suffix_rev.chars().rev().collect();
+    format!("{prefix}…{suffix}")
+}
 
 /// Strip characters that can visually spoof or hide delegate identity in the
 /// overlay: ASCII control characters (except `\t`, `\n`, `\r`) and Unicode
@@ -68,9 +150,23 @@ fn sanitize_display(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// Build the JSON representation of the caller identity for the overlay
+/// endpoint. Tagged shape so a future `delegate` variant (issue #3860) is
+/// purely additive — the shell-page JS can switch on `kind` and fall through
+/// safely on unknown values.
+fn caller_to_json(caller: &CallerIdentity) -> serde_json::Value {
+    match caller {
+        CallerIdentity::None => serde_json::json!({ "kind": "none", "hash": null }),
+        CallerIdentity::WebApp(hash) => serde_json::json!({
+            "kind": "webapp",
+            "hash": sanitize_display(hash, OVERLAY_KEY_CHARS_MAX),
+        }),
+    }
+}
+
 /// Return the list of pending prompts for the shell page to render as
 /// in-page overlays (see issue #3836). Each entry includes the sanitized
-/// message, button labels, and delegate/contract context.
+/// message, button labels, and delegate/caller context.
 ///
 /// The endpoint is protected by the same Origin check as
 /// `/permission/{nonce}/respond`: since this response now carries the full
@@ -111,11 +207,25 @@ async fn pending_prompts(
                 "message": message,
                 "labels": labels,
                 "delegate_key": sanitize_display(&prompt.delegate_key, OVERLAY_KEY_CHARS_MAX),
-                "contract_id": sanitize_display(&prompt.contract_id, OVERLAY_KEY_CHARS_MAX),
+                "caller": caller_to_json(&prompt.caller),
             })
         })
         .collect();
     (axum::http::StatusCode::OK, Json(serde_json::json!(prompts)))
+}
+
+/// Format the caller identity for the standalone HTML page's details
+/// disclosure. The variant tag determines the prefix word (`Freenet app`
+/// or `No app caller`) that appears next to the truncated hash.
+fn caller_display(caller: &CallerIdentity) -> (String, Option<String>) {
+    match caller {
+        CallerIdentity::None => ("No app caller".to_string(), None),
+        CallerIdentity::WebApp(hash) => {
+            let sanitized = sanitize_display(hash, OVERLAY_KEY_CHARS_MAX);
+            let truncated = truncate_hash(&sanitized);
+            (format!("Freenet app {truncated}"), Some(sanitized))
+        }
+    }
 }
 
 /// Serve the HTML permission prompt page.
@@ -154,8 +264,24 @@ async fn permission_page(
         .collect::<Vec<_>>()
         .join("\n            ");
 
-    let delegate_key_display = html_escape(&entry.delegate_key);
-    let contract_id_display = html_escape(&entry.contract_id);
+    // Delegate identity: always shown, both inline (truncated, under the
+    // buttons) and in the Technical details disclosure (full + truncated,
+    // copyable). The inline placement gives the user a passive anomaly
+    // signal without making them open the disclosure — codex review point 3.
+    let delegate_full = sanitize_display(&entry.delegate_key, OVERLAY_KEY_CHARS_MAX);
+    let delegate_trunc = truncate_hash(&delegate_full);
+    let delegate_full_attr = html_escape(&delegate_full);
+    let delegate_trunc_html = html_escape(&delegate_trunc);
+
+    let (caller_display_text, caller_full) = caller_display(&entry.caller);
+    // When the caller is None there's no full hash to surface, so omit the
+    // title attribute entirely rather than rendering `title=""`. Empty
+    // tooltips are noise and one fewer thing for users to wonder about.
+    let caller_title_html = caller_full
+        .as_deref()
+        .map(|h| format!(" title=\"{}\"", html_escape(h)))
+        .unwrap_or_default();
+    let caller_display_html = html_escape(&caller_display_text);
 
     (
         headers,
@@ -182,21 +308,25 @@ async fn permission_page(
   .header {{ display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }}
   .icon {{ font-size: 32px; }}
   h1 {{ font-size: 18px; font-weight: 600; }}
-  .context {{ background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-              padding: 12px; margin-bottom: 16px; font-size: 13px; color: var(--muted); }}
-  .context dt {{ font-weight: 600; color: var(--fg); }}
-  .context dd {{ margin-bottom: 8px; font-family: monospace; font-size: 12px; word-break: break-all; }}
-  .message {{ font-size: 15px; line-height: 1.5; margin-bottom: 24px; padding: 16px;
-              background: var(--bg); border-left: 3px solid var(--warn); border-radius: 4px; }}
   .message-label {{ font-size: 12px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase;
                     letter-spacing: 0.5px; }}
-  .buttons {{ display: flex; gap: 12px; flex-wrap: wrap; }}
+  .message {{ font-size: 15px; line-height: 1.5; margin-bottom: 24px; padding: 16px;
+              background: var(--bg); border-left: 3px solid var(--warn); border-radius: 4px; }}
+  .buttons {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }}
   .btn {{ padding: 10px 24px; border: 1px solid var(--border); border-radius: 8px;
           background: var(--card); color: var(--fg); font-size: 14px; cursor: pointer;
           transition: all 0.15s; flex: 1; min-width: 100px; font-weight: 500; }}
   .btn.primary {{ background: var(--accent); color: white; border-color: var(--accent); }}
   .btn:hover {{ opacity: 0.85; transform: translateY(-1px); }}
   .btn:disabled {{ opacity: 0.5; cursor: not-allowed; transform: none; }}
+  .delegate-line {{ font-size: 12px; color: var(--muted); margin-top: 8px;
+                    font-family: monospace; }}
+  .delegate-line .hash {{ user-select: all; }}
+  details.tech {{ margin-top: 12px; font-size: 12px; color: var(--muted); }}
+  details.tech summary {{ cursor: pointer; user-select: none; }}
+  details.tech dl {{ margin-top: 8px; padding-left: 16px; }}
+  details.tech dt {{ font-weight: 600; color: var(--fg); margin-top: 6px; }}
+  details.tech dd {{ font-family: monospace; word-break: break-all; user-select: all; }}
   .timer {{ margin-top: 16px; font-size: 13px; color: var(--muted); text-align: center; }}
   .result {{ text-align: center; padding: 24px 0; }}
   .result .icon {{ font-size: 48px; margin-bottom: 12px; }}
@@ -208,19 +338,23 @@ async fn permission_page(
     <span class="icon">&#x1f512;</span>
     <h1>Permission Request</h1>
   </div>
-  <div class="context">
-    <dl>
-      <dt>Delegate</dt>
-      <dd>{delegate_key_display}</dd>
-      <dt>Requesting contract</dt>
-      <dd>{contract_id_display}</dd>
-    </dl>
-  </div>
   <div class="message-label">Delegate says:</div>
   <p class="message">{message}</p>
   <div class="buttons">
     {buttons_html}
   </div>
+  <div class="delegate-line">
+    Delegate: <span class="hash" title="{delegate_full_attr}">{delegate_trunc_html}</span>
+  </div>
+  <details class="tech">
+    <summary>Technical details</summary>
+    <dl>
+      <dt>Delegate</dt>
+      <dd title="{delegate_full_attr}">{delegate_full_attr}</dd>
+      <dt>Caller</dt>
+      <dd{caller_title_html}>{caller_display_html}</dd>
+    </dl>
+  </details>
   <div class="timer">Auto-deny in <span id="countdown">60</span>s</div>
 </div>
 <div class="card result" id="done" style="display:none">
@@ -470,6 +604,47 @@ mod tests {
         assert_eq!(html_escape("a & b"), "a &amp; b");
     }
 
+    #[test]
+    fn test_truncate_hash_long_input() {
+        let h = "DLog47hEabcdefghijk8vK2";
+        let t = truncate_hash(h);
+        assert_eq!(t, "DLog47hE…k8vK2");
+    }
+
+    #[test]
+    fn test_truncate_hash_short_input_unchanged() {
+        let h = "abc";
+        assert_eq!(truncate_hash(h), "abc");
+    }
+
+    #[test]
+    fn test_truncate_hash_boundary_at_threshold() {
+        // Exactly prefix+suffix+1 chars: returning unchanged saves no space, return as-is.
+        let h = "1234567890ABCD"; // 14 chars: 8 + 5 + 1
+        assert_eq!(truncate_hash(h), h);
+    }
+
+    #[test]
+    fn test_truncate_hash_first_truncated_length() {
+        // The first input length that *should* actually get truncated. A
+        // one-off bug shifting the boundary by one would only be caught
+        // here, not by the at-threshold test above.
+        let h = "1234567890ABCDE"; // 15 chars: prefix(8) + suffix(5) + 2
+        let t = truncate_hash(h);
+        assert_eq!(t, "12345678…ABCDE");
+        assert_ne!(t, h, "15-char input must actually be truncated");
+    }
+
+    #[test]
+    fn test_truncate_hash_unicode() {
+        // Multi-byte chars must be counted by `char`, not byte.
+        let h = "🔥".repeat(16);
+        let t = truncate_hash(&h);
+        assert!(t.contains('…'));
+        assert!(t.starts_with(&"🔥".repeat(8)));
+        assert!(t.ends_with(&"🔥".repeat(5)));
+    }
+
     fn empty_pending() -> PendingPrompts {
         use dashmap::DashMap;
         use std::sync::Arc;
@@ -482,7 +657,7 @@ mod tests {
         message: &str,
         labels: Vec<&str>,
         delegate_key: &str,
-        contract_id: &str,
+        caller: CallerIdentity,
     ) -> tokio::sync::oneshot::Receiver<usize> {
         use crate::contract::user_input::PendingPrompt;
         let (tx, rx) = tokio::sync::oneshot::channel::<usize>();
@@ -492,11 +667,15 @@ mod tests {
                 message: message.to_string(),
                 labels: labels.into_iter().map(String::from).collect(),
                 delegate_key: delegate_key.to_string(),
-                contract_id: contract_id.to_string(),
+                caller,
                 response_tx: tx,
             },
         );
         rx
+    }
+
+    fn webapp_caller(s: &str) -> CallerIdentity {
+        CallerIdentity::WebApp(s.to_string())
     }
 
     fn trusted_header() -> HeaderMap {
@@ -520,9 +699,19 @@ mod tests {
         (status, value)
     }
 
+    async fn call_permission_page(nonce: &str, pending: PendingPrompts) -> String {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        let resp = permission_page(Path(nonce.to_string()), Extension(pending))
+            .await
+            .into_response();
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
     // Regression test for issue #3836: the /permission/pending JSON must
     // carry enough data for the shell-page overlay to render the prompt
-    // (message, labels, delegate key, contract id), not just a preview.
+    // (message, labels, delegate key, caller), not just a preview.
     #[tokio::test]
     async fn test_pending_prompts_includes_overlay_fields() {
         let pending = empty_pending();
@@ -532,7 +721,7 @@ mod tests {
             "Approve this?",
             vec!["Allow Once", "Always Allow", "Deny"],
             "dkey",
-            "cid",
+            webapp_caller("cid"),
         );
 
         let (status, value) = call_pending(trusted_header(), pending).await;
@@ -547,7 +736,22 @@ mod tests {
             serde_json::json!(["Allow Once", "Always Allow", "Deny"])
         );
         assert_eq!(entry["delegate_key"], "dkey");
-        assert_eq!(entry["contract_id"], "cid");
+        assert_eq!(entry["caller"]["kind"], "webapp");
+        assert_eq!(entry["caller"]["hash"], "cid");
+    }
+
+    // Regression test for issue #3857: when the prompt has no web-app
+    // caller (CallerIdentity::None), the overlay JSON must encode that
+    // explicitly as a tagged "none" variant rather than omitting the field
+    // or sending "Unknown" as a hash. The shell JS switches on `kind` to
+    // decide what to render, so the tag must be present and stable.
+    #[tokio::test]
+    async fn test_pending_prompts_none_caller_encoding() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "dkey", CallerIdentity::None);
+        let (_, value) = call_pending(trusted_header(), pending).await;
+        assert_eq!(value[0]["caller"]["kind"], "none");
+        assert!(value[0]["caller"]["hash"].is_null());
     }
 
     // Oversized delegate messages must be clipped so a malicious delegate
@@ -556,7 +760,7 @@ mod tests {
     async fn test_pending_prompts_message_capped() {
         let pending = empty_pending();
         let huge = "a".repeat(OVERLAY_MESSAGE_MAX * 4);
-        let _rx = insert_prompt(&pending, "n", &huge, vec!["OK"], "d", "c");
+        let _rx = insert_prompt(&pending, "n", &huge, vec!["OK"], "d", webapp_caller("c"));
 
         let (_, value) = call_pending(trusted_header(), pending).await;
         assert_eq!(
@@ -570,11 +774,8 @@ mod tests {
     #[tokio::test]
     async fn test_pending_prompts_message_cap_is_char_based() {
         let pending = empty_pending();
-        // Each fire emoji is 4 UTF-8 bytes; OVERLAY_MESSAGE_MAX * 4 bytes
-        // would be the naive byte budget. Char-based truncation keeps them
-        // all intact.
         let emoji = "\u{1F525}".repeat(OVERLAY_MESSAGE_MAX);
-        let _rx = insert_prompt(&pending, "n", &emoji, vec!["OK"], "d", "c");
+        let _rx = insert_prompt(&pending, "n", &emoji, vec!["OK"], "d", webapp_caller("c"));
         let (_, value) = call_pending(trusted_header(), pending).await;
         let got = value[0]["message"].as_str().unwrap();
         assert_eq!(got.chars().count(), OVERLAY_MESSAGE_MAX);
@@ -600,7 +801,7 @@ mod tests {
                     message: "m".to_string(),
                     labels,
                     delegate_key: "d".to_string(),
-                    contract_id: "c".to_string(),
+                    caller: webapp_caller("c"),
                     response_tx: tx,
                 },
             );
@@ -618,13 +819,13 @@ mod tests {
     #[tokio::test]
     async fn test_pending_prompts_empty_labels_round_trip() {
         let pending = empty_pending();
-        let _rx = insert_prompt(&pending, "n", "m", vec![], "d", "c");
+        let _rx = insert_prompt(&pending, "n", "m", vec![], "d", webapp_caller("c"));
         let (_, value) = call_pending(trusted_header(), pending).await;
         assert_eq!(value[0]["labels"], serde_json::json!([]));
     }
 
-    // Unicode right-to-left override in delegate_key / contract_id must
-    // be stripped so a hostile delegate can't visually reverse the key
+    // Unicode right-to-left override in delegate_key / caller hash must be
+    // stripped so a hostile delegate can't visually reverse the key
     // displayed in the overlay's context panel and spoof identity.
     #[tokio::test]
     async fn test_pending_prompts_strips_bidi_and_controls() {
@@ -636,13 +837,13 @@ mod tests {
             "Hello\u{202E}evil\u{202A}!",
             vec!["\u{202E}Allow\u{202C}"],
             "\u{FEFF}key\u{200B}123",
-            "c\u{0007}id",
+            webapp_caller("c\u{0007}id"),
         );
         let (_, value) = call_pending(trusted_header(), pending).await;
         assert_eq!(value[0]["message"], "Helloevil!");
         assert_eq!(value[0]["labels"], serde_json::json!(["Allow"]));
         assert_eq!(value[0]["delegate_key"], "key123");
-        assert_eq!(value[0]["contract_id"], "cid");
+        assert_eq!(value[0]["caller"]["hash"], "cid");
     }
 
     // /permission/pending now returns full delegate-controlled text, so
@@ -652,7 +853,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_prompts_rejects_untrusted_origin() {
         let pending = empty_pending();
-        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", "c");
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
         let mut headers = HeaderMap::new();
         headers.insert("origin", "http://evil.com".parse().unwrap());
         let (status, _) = call_pending(headers, pending).await;
@@ -665,7 +866,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_prompts_allows_missing_origin() {
         let pending = empty_pending();
-        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", "c");
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
         let (status, _) = call_pending(HeaderMap::new(), pending).await;
         assert_eq!(status, axum::http::StatusCode::OK);
     }
@@ -677,8 +878,22 @@ mod tests {
     #[tokio::test]
     async fn test_respond_consumes_nonce_and_second_response_404s() {
         let pending = empty_pending();
-        let rx_a = insert_prompt(&pending, "a", "mA", vec!["Yes", "No"], "d", "c");
-        let _rx_b = insert_prompt(&pending, "b", "mB", vec!["Yes", "No"], "d", "c");
+        let rx_a = insert_prompt(
+            &pending,
+            "a",
+            "mA",
+            vec!["Yes", "No"],
+            "d",
+            webapp_caller("c"),
+        );
+        let _rx_b = insert_prompt(
+            &pending,
+            "b",
+            "mB",
+            vec!["Yes", "No"],
+            "d",
+            webapp_caller("c"),
+        );
 
         let (_, value) = call_pending(trusted_header(), pending.clone()).await;
         let nonces: Vec<&str> = value
@@ -729,5 +944,153 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    // Regression tests for issue #3857 — behavioural assertions on the
+    // standalone HTML page (no structural assertions, per codex review
+    // point 7).
+    //
+    // What we check:
+    // 1. The "Delegate says:" authorship label is present next to the
+    //    message (codex point 2: removing it was a UX/security regression).
+    // 2. The truncated delegate hash is visible in the page body without
+    //    requiring the user to expand any disclosure (codex point 3:
+    //    preserves a passive anomaly signal for users who recognise their
+    //    delegate's fingerprint).
+    // 3. The full delegate hash is present in a `title=` attribute so power
+    //    users can hover or copy the unabbreviated value.
+    // 4. The caller's display string includes "Freenet app" so the user can
+    //    tell what kind of caller it is.
+    // 5. Delegate-supplied content is HTML-escaped (existing behaviour,
+    //    re-verified now that the template was rewritten).
+    #[tokio::test]
+    async fn test_permission_page_renders_webapp_caller() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(
+            &pending,
+            "abc",
+            "Approve signing this document.",
+            vec!["Allow", "Deny"],
+            "DLog47hEverylongdelegatekeyhashk8vK2",
+            webapp_caller("CONTRACTabcdefghijklmnopqZ"),
+        );
+        let html = call_permission_page("abc", pending).await;
+
+        assert!(
+            html.contains("Delegate says:"),
+            "authorship label must be present (codex point 2)"
+        );
+        assert!(
+            html.contains("Approve signing this document."),
+            "delegate message must be rendered"
+        );
+        assert!(
+            html.contains("DLog47hE…k8vK2"),
+            "truncated delegate hash must appear in body (codex point 3)"
+        );
+        assert!(
+            html.contains(r#"title="DLog47hEverylongdelegatekeyhashk8vK2""#),
+            "full delegate hash must be present in a title attribute"
+        );
+        assert!(
+            html.contains("Freenet app"),
+            "caller kind label must be present"
+        );
+        assert!(
+            html.contains("CONTRACT…nopqZ"),
+            "truncated caller hash must appear in body, got HTML: {html}"
+        );
+    }
+
+    // None caller renders as "No app caller" rather than a blank field or
+    // the misleading "(not recorded)" we considered earlier (codex point 4).
+    #[tokio::test]
+    async fn test_permission_page_renders_none_caller() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(
+            &pending,
+            "n",
+            "m",
+            vec!["OK"],
+            "DLGKEYabcdefghk8vK2",
+            CallerIdentity::None,
+        );
+        let html = call_permission_page("n", pending).await;
+        assert!(
+            html.contains("No app caller"),
+            "None caller must render as 'No app caller'"
+        );
+        assert!(
+            html.contains("Delegate says:"),
+            "authorship label must be present even with no app caller"
+        );
+        // A regression that rendered `Freenet app ` (empty hash) for the
+        // None variant would still pass the positive assertion above
+        // because "No app caller" might also be present elsewhere. Pin it
+        // negatively too.
+        assert!(
+            !html.contains("Freenet app"),
+            "None caller must NOT render the 'Freenet app' prefix"
+        );
+    }
+
+    // Hostile delegate text must be HTML-escaped so it cannot inject markup
+    // into the prompt page or break out of the message paragraph.
+    #[tokio::test]
+    async fn test_permission_page_escapes_hostile_message() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(
+            &pending,
+            "n",
+            r#"<script>alert('xss')</script><img src=x onerror=evil()>"#,
+            vec!["<b>Allow</b>"],
+            "dkey",
+            webapp_caller("cid"),
+        );
+        let html = call_permission_page("n", pending).await;
+        assert!(!html.contains("<script>alert"));
+        assert!(!html.contains("<img src=x"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&lt;b&gt;Allow&lt;/b&gt;"));
+    }
+
+    // Hostile content in the runtime-attested hash strings (delegate_key
+    // and caller hash) must also be HTML-escaped — those values flow into
+    // the page body AND into `title="..."` attributes, so a missed escape
+    // could break out of the attribute value. Realistic threat model: a
+    // future code path that writes attacker-influenced data into these
+    // fields. Sanitization strips control/bidi chars; html_escape handles
+    // quote/angle injection.
+    #[tokio::test]
+    async fn test_permission_page_escapes_hostile_hash_fields() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(
+            &pending,
+            "n",
+            "ok",
+            vec!["Allow"],
+            r#"<script>alert(1)</script>"#,
+            webapp_caller(r#""onload="evil()"#),
+        );
+        let html = call_permission_page("n", pending).await;
+        // Raw markup must not appear anywhere in the rendered page.
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "raw <script> from delegate_key must not appear in HTML"
+        );
+        assert!(
+            !html.contains(r#""onload="evil()"#),
+            "raw quote-bearing payload from caller hash must not appear unescaped"
+        );
+        // Escaped forms must be present, demonstrating that the values
+        // flowed through html_escape on every render path.
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "escaped delegate_key markup must appear"
+        );
+        assert!(
+            html.contains("&quot;onload=&quot;evil()"),
+            "escaped caller hash quotes must appear"
+        );
     }
 }
