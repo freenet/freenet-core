@@ -333,18 +333,24 @@ async fn drive_client_put_inner(
                     "put (task-per-tx): PUT accepted"
                 );
 
+                // Telemetry only — pass subscribe=false because the driver
+                // handles subscriptions via maybe_subscribe_child below.
+                // Passing subscribe=true here would double-subscribe: once
+                // via start_subscription_after_put (legacy path inside
+                // finalize_put_at_originator) and once via
+                // maybe_subscribe_child (task-per-tx path).
                 super::finalize_put_at_originator(
                     op_manager,
                     client_tx,
                     reply_key,
                     PutFinalizationData {
                         sender: current_target.clone(),
-                        hop_count: None, // Not available in response
+                        hop_count: None,
                         state_hash: None,
                         state_size: None,
                     },
-                    subscribe,
-                    blocking_subscribe,
+                    false, // subscribe handled by maybe_subscribe_child
+                    false,
                 )
                 .await;
 
@@ -435,6 +441,8 @@ async fn local_only_completion(
         "put (task-per-tx): local-only completion (no remote peers)"
     );
 
+    // Telemetry only — pass subscribe=false to avoid double-subscribe.
+    // maybe_subscribe_child handles subscriptions via the task-per-tx path.
     let own_location = op_manager.ring.connection_manager.own_location();
     super::finalize_put_at_originator(
         op_manager,
@@ -446,8 +454,8 @@ async fn local_only_completion(
             state_hash: None,
             state_size: None,
         },
-        subscribe,
-        blocking_subscribe,
+        false,
+        false,
     )
     .await;
 
