@@ -285,6 +285,88 @@ pub fn has_reached_max_backoff() -> bool {
     get_current_backoff() >= MAX_BACKOFF
 }
 
+/// One-shot GitHub check performed at node startup, independent of peer signals.
+///
+/// Addresses the "offline-for-days transient peer" gap: a node that has been
+/// offline long enough to fall out of the compatible-version window cannot rely
+/// on a peer handshake to tell it to update, because handshakes with an
+/// incompatible peer may never complete successfully. The normal peer-signal
+/// driven update loop therefore never triggers.
+///
+/// This function asks GitHub directly whether a newer release exists. It is
+/// intentionally decoupled from the backoff / failure-count state used by the
+/// peer-signal loop: startup is a distinct one-shot event and should not
+/// interact with running-state backoff.
+///
+/// Fail-open: any error (GitHub unreachable, parse failure, etc.) returns
+/// `None` so the caller falls through to the normal update loop.
+///
+/// Returns `Some(latest_version_string)` only when GitHub confirms a strictly
+/// newer release than `current_version`. Never returns a downgrade.
+pub async fn startup_update_check(current_version: &str) -> Option<String> {
+    startup_update_check_with_fetcher(current_version, get_latest_version).await
+}
+
+/// Testable core of [`startup_update_check`]. The `fetcher` argument returns
+/// the latest version string as reported by the release source; tests inject a
+/// fake fetcher to avoid hitting GitHub.
+pub(crate) async fn startup_update_check_with_fetcher<F, Fut>(
+    current_version: &str,
+    fetcher: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let latest = match fetcher().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "Startup update check: failed to fetch latest version: {}. \
+                 Continuing with current binary.",
+                e
+            );
+            return None;
+        }
+    };
+    compare_versions_for_startup(current_version, &latest)
+}
+
+/// Pure version comparison for the startup check.
+///
+/// Returns `Some(latest)` iff `latest` parses as semver strictly greater than
+/// `current`. Returns `None` on any parse failure (fail-open) or when the
+/// current binary is already at or ahead of the reported release.
+pub(crate) fn compare_versions_for_startup(current: &str, latest: &str) -> Option<String> {
+    let current_ver = match Version::parse(current) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "Startup update check: failed to parse current version '{}': {}",
+                current,
+                e
+            );
+            return None;
+        }
+    };
+    let latest_ver = match Version::parse(latest) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "Startup update check: failed to parse latest version '{}': {}",
+                latest,
+                e
+            );
+            return None;
+        }
+    };
+    if latest_ver > current_ver {
+        Some(latest.to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +424,90 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("0.1.74"));
         assert!(msg.contains("auto-update"));
+    }
+
+    #[test]
+    fn test_compare_versions_newer_available() {
+        assert_eq!(
+            compare_versions_for_startup("0.1.74", "0.1.75"),
+            Some("0.1.75".to_string())
+        );
+        assert_eq!(
+            compare_versions_for_startup("0.1.74", "0.2.0"),
+            Some("0.2.0".to_string())
+        );
+        assert_eq!(
+            compare_versions_for_startup("0.1.74", "1.0.0"),
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_already_current() {
+        assert_eq!(compare_versions_for_startup("0.1.75", "0.1.75"), None);
+    }
+
+    #[test]
+    fn test_compare_versions_never_downgrades() {
+        // GitHub reports an older version (e.g. tag rollback) — never downgrade.
+        assert_eq!(compare_versions_for_startup("0.2.0", "0.1.99"), None);
+        assert_eq!(compare_versions_for_startup("1.0.0", "0.9.99"), None);
+    }
+
+    #[test]
+    fn test_compare_versions_unparseable_fails_open() {
+        assert_eq!(
+            compare_versions_for_startup("not-a-version", "0.1.75"),
+            None
+        );
+        assert_eq!(compare_versions_for_startup("0.1.74", "also-garbage"), None);
+        assert_eq!(compare_versions_for_startup("", "0.1.75"), None);
+    }
+
+    #[test]
+    fn test_compare_versions_prerelease_semver_semantics() {
+        // semver: 0.1.75-alpha < 0.1.75, 0.1.75 > 0.1.75-alpha
+        assert_eq!(
+            compare_versions_for_startup("0.1.75-alpha", "0.1.75"),
+            Some("0.1.75".to_string())
+        );
+        assert_eq!(compare_versions_for_startup("0.1.75", "0.1.75-alpha"), None);
+    }
+
+    #[tokio::test]
+    async fn test_startup_check_fetcher_error_returns_none() {
+        // Fetcher failure must not propagate — startup check is fail-open so
+        // the node always boots even when GitHub is unreachable.
+        let result = startup_update_check_with_fetcher("0.1.74", || async {
+            anyhow::bail!("simulated network failure")
+        })
+        .await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_startup_check_finds_newer_version() {
+        let result =
+            startup_update_check_with_fetcher("0.1.74", || async { Ok("0.1.75".to_string()) })
+                .await;
+        assert_eq!(result, Some("0.1.75".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_startup_check_no_update_when_current() {
+        let result =
+            startup_update_check_with_fetcher("0.1.75", || async { Ok("0.1.75".to_string()) })
+                .await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_startup_check_refuses_downgrade() {
+        // A node running a newer (possibly pre-release) build must never be
+        // downgraded by the startup check, even if GitHub reports an older tag.
+        let result =
+            startup_update_check_with_fetcher("0.2.0", || async { Ok("0.1.99".to_string()) }).await;
+        assert_eq!(result, None);
     }
 
     #[test]
