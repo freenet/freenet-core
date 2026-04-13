@@ -358,7 +358,10 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
 
 // --- Peer advance ---
 
-/// Maximum routing rounds before giving up.
+/// Maximum routing rounds before giving up. Matches the legacy PUT retry
+/// budget (3 alternatives via `retry_with_next_alternative`) and the
+/// SUBSCRIBE driver's `MAX_RETRIES`. With typical ring fan-out of 3-5
+/// peers per k_closest call, 3 rounds covers 9-15 distinct peers.
 const MAX_RETRIES: usize = 3;
 
 /// Ask the ring for a new closest peer, excluding all previously tried
@@ -528,6 +531,65 @@ mod tests {
         assert!(
             matches!(classify_reply(&msg), ReplyClass::Unexpected),
             "ForwardingAck must NOT be classified as terminal (Phase 2b bug 2)"
+        );
+    }
+
+    /// Regression guard for the double-subscribe bug (commit 494a3c69).
+    ///
+    /// The driver calls `finalize_put_at_originator` for telemetry and then
+    /// `maybe_subscribe_child` for subscriptions. If `finalize_put_at_originator`
+    /// is called with `subscribe=true`, it starts a subscription via the legacy
+    /// `start_subscription_after_put` path, AND `maybe_subscribe_child` starts
+    /// another via the task-per-tx `run_client_subscribe` path — doubling
+    /// network traffic and subscription registrations.
+    ///
+    /// This test scrapes the source to verify all `finalize_put_at_originator`
+    /// calls inside the driver pass `false` for the subscribe arguments.
+    #[test]
+    fn finalize_put_at_originator_never_subscribes_from_driver() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+
+        // Find every call to finalize_put_at_originator in this file.
+        // Each call must pass `false` for the subscribe parameter (5th arg).
+        // The pattern we check: the two lines after `state_size: None,` and
+        // before `)` must both be `false,` or `false`.
+        let call_marker = "finalize_put_at_originator(";
+        let mut offset = 0;
+        let mut call_count = 0;
+
+        while let Some(pos) = SOURCE[offset..].find(call_marker) {
+            let abs_pos = offset + pos;
+            // Get the window from the call to the closing `.await`
+            let window_end = SOURCE[abs_pos..]
+                .find(".await")
+                .map(|p| abs_pos + p)
+                .unwrap_or(SOURCE.len().min(abs_pos + 500));
+            let window = &SOURCE[abs_pos..window_end];
+
+            // The subscribe arguments should be `false`. Check that
+            // `true` does NOT appear as a subscribe argument.
+            // The window contains the struct literal for PutFinalizationData
+            // plus the two boolean args. After `},` the next two values
+            // are subscribe and blocking_subscribe.
+            let after_struct = window.find("},").map(|p| &window[p..]);
+            if let Some(tail) = after_struct {
+                assert!(
+                    !tail.contains("subscribe"),
+                    "finalize_put_at_originator call in driver passes subscribe \
+                     arguments that reference the `subscribe` variable instead of \
+                     hardcoded `false`. This would cause double-subscription — \
+                     subscriptions must be handled exclusively by maybe_subscribe_child. \
+                     See commit 494a3c69 for the original fix."
+                );
+            }
+            call_count += 1;
+            offset = abs_pos + call_marker.len();
+        }
+
+        assert!(
+            call_count >= 2,
+            "Expected at least 2 finalize_put_at_originator calls in the driver \
+             (network path + local-only path), found {call_count}"
         );
     }
 
