@@ -583,26 +583,45 @@ function freenetBridge(authToken) {
           try { navigator.clipboard.writeText(msg.text.slice(0, 2048)); } catch(e) {}
         }
       } else if (msg.type === 'navigate' && typeof msg.href === 'string') {
-        // Same-origin navigation between contract pages. The sandboxed iframe
-        // cannot navigate the top window itself, so it sends navigation
-        // requests to the shell which updates iframe.src.
+        // Navigation from the sandboxed iframe. The iframe cannot navigate
+        // the top window itself, so it postMessages the shell, which does
+        // one of two things:
         //
-        // Accepts any path matching /v[12]/contract/(web/)?{key}/... including
-        // OTHER contracts, not just the currently loaded one. This is needed
-        // so a Delta site (or any other contract webapp) can link to another
-        // Freenet contract without forcing users to open it in a new tab.
-        // Before this fix, cross-contract links were silently dropped.
+        //   1. SAME-CONTRACT hop (subpage inside the current contract's
+        //      webapp): update iframe.src in place. This preserves the
+        //      running shell, auth token, and in-memory state — matching
+        //      what a multi-page webapp expects for client-side routing.
         //
-        // Security:
-        // - Same-origin only (rejects cross-site) — the sandbox still blocks
-        //   contract JS from reading gateway cookies or same-origin state.
-        // - Path must match the contract namespace shape, so this cannot
-        //   navigate into /v1/node/... or any other gateway internals.
-        // - No widening of the sandbox attributes themselves — the shell
-        //   remains the sole code with top-level navigation authority.
-        // - The user clicking a cross-contract link is the same trust
-        //   posture as middle-clicking it (which already works via the
-        //   target="_blank" + allow-popups path).
+        //   2. CROSS-CONTRACT hop (link to a different Freenet contract):
+        //      fall through to a top-level window.location.assign. The
+        //      gateway serves a fresh shell via `contract_home` for the
+        //      new contract, which generates a new auth token and origin
+        //      attribution. Reusing the current iframe for a different
+        //      contract would keep the old auth token bound to the
+        //      original contract, so the server would misattribute every
+        //      subsequent delegate/API request (see PR review: Codex P1).
+        //
+        // This is the fix for the "Delta cannot link to other Freenet
+        // contracts without forcing a new tab" report: cross-contract
+        // links now navigate in place via a full shell reload, instead of
+        // being silently dropped.
+        //
+        // Security posture:
+        // - Same-origin only (rejects cross-site). The sandbox still
+        //   blocks contract JS from reading gateway cookies or same-origin
+        //   state.
+        // - Target path must match the contract-webapp shape
+        //   /v[12]/contract/web/{key}/... . This rejects /v1/node/...,
+        //   /v1/delegate/..., or any other gateway endpoint as a
+        //   navigation target.
+        // - Sandbox iframe attributes are NOT widened. The shell remains
+        //   the sole code with top-level navigation authority.
+        // - Cross-contract navigation via window.location.assign is the
+        //   same privilege level as a user middle-clicking a link today
+        //   (target="_blank" + allow-popups already escapes the sandbox
+        //   and can reach any Freenet contract). The difference is that
+        //   the destination now loads in the same tab instead of a new
+        //   one.
         //
         // Cap href length to prevent a malicious contract from bloating
         // history.state or the address bar with arbitrarily large URLs.
@@ -612,42 +631,59 @@ function freenetBridge(authToken) {
           // Same-origin only.
           if (resolved.origin !== location.origin) return;
           var cleanPath = resolved.pathname;
-          // Path must live inside the contract namespace. This is the
-          // security boundary: rejects /v1/node/..., /v1/delegate/..., or
-          // anything else that isn't a contract webapp path.
+          // Contract-webapp shape check. This is the security boundary
+          // that prevents the handler from being used to navigate to
+          // gateway internals (/v1/node/..., /v1/delegate/...) or to
+          // non-contract paths in general. The contract-key segment is
+          // validated server-side in the freshly-loaded shell path via
+          // ContractInstanceId::from_bytes, so we only need a loose
+          // shape check here — a bogus key still produces a 4xx from the
+          // gateway, not a silent bypass.
           var newPrefixMatch = cleanPath.match(CONTRACT_PREFIX_RE);
           if (!newPrefixMatch) return;
           var newContractPrefix = newPrefixMatch[1];
-          // Close any open WebSocket connections from the previous page to
-          // prevent resource leaks. The old iframe document will be destroyed
-          // when src changes, orphaning any connection callbacks.
-          connections.forEach(function(ws) { try { ws.close(); } catch(e) {} });
-          connections.clear();
-          // Cap the hash component to match the 8192-byte cap used by the
-          // hash-forwarding path; the iframe path is stored in history.state
-          // so unbounded hashes would bloat the per-tab history record.
+          // Cap the hash component to match the 8192-byte cap used by
+          // the hash-forwarding path; the iframe path is stored in
+          // history.state so unbounded hashes would bloat the per-tab
+          // history record.
           var cappedHash = resolved.hash ? resolved.hash.slice(0, 8192) : '';
-          // Build new sandbox URL preserving __sandbox=1
-          resolved.searchParams.set('__sandbox', '1');
-          var newIframePath = resolved.pathname + resolved.search + cappedHash;
-          iframe.src = newIframePath;
-          // Update the cached prefix so subsequent in-contract navigations
-          // from the newly loaded page are validated against ITS prefix,
-          // not the original one. Without this, back-navigation or popstate
-          // handling would compare against the original contract.
-          contractPrefix = newContractPrefix;
-          // Push a history entry so the browser back/forward buttons navigate
-          // between visited subpages, and update the address bar to the
-          // non-sandbox URL. The sandbox flag is intentionally omitted from the
-          // outer URL; the shell always re-adds it when loading the iframe.
-          // See issue #3839.
-          try {
-            history.pushState(
-              { __freenet_nav__: true, iframePath: newIframePath },
-              '',
-              cleanPath + cappedHash
-            );
-          } catch(e) {}
+
+          if (newContractPrefix === contractPrefix) {
+            // SAME-CONTRACT: update iframe.src in place. This preserves
+            // the running shell, auth token, and client-side state.
+            //
+            // Close any open WebSocket connections from the previous
+            // page to prevent resource leaks. The old iframe document
+            // will be destroyed when src changes, orphaning any
+            // connection callbacks.
+            connections.forEach(function(ws) { try { ws.close(); } catch(e) {} });
+            connections.clear();
+            // Build new sandbox URL preserving __sandbox=1
+            resolved.searchParams.set('__sandbox', '1');
+            var newIframePath = resolved.pathname + resolved.search + cappedHash;
+            iframe.src = newIframePath;
+            // Push a history entry so back/forward navigate between
+            // visited subpages, and update the address bar to the
+            // non-sandbox URL. The sandbox flag is intentionally omitted
+            // from the outer URL; the shell always re-adds it when
+            // loading the iframe. See issue #3839.
+            try {
+              history.pushState(
+                { __freenet_nav__: true, iframePath: newIframePath },
+                '',
+                cleanPath + cappedHash
+              );
+            } catch(e) {}
+          } else {
+            // CROSS-CONTRACT: top-level navigation. The gateway's
+            // contract_home handler re-runs and generates a fresh auth
+            // token + origin attribution for the destination contract.
+            // The browser's normal back/forward history takes care of
+            // cross-contract restoration — no popstate handling needed.
+            try {
+              window.location.assign(cleanPath + cappedHash);
+            } catch(e) {}
+          }
         } catch(e) {}
       } else if (msg.type === 'open_url' && typeof msg.url === 'string') {
         // Open external URLs in a new tab. Popups from the sandboxed iframe
@@ -1838,10 +1874,9 @@ mod tests {
             "bridge JS must handle navigate shell messages"
         );
         // Navigate handler must validate that target paths live inside the
-        // contract namespace. The shape check replaces the old same-contract
-        // restriction to allow cross-contract navigation while still
-        // rejecting paths like /v1/node/... (issue: cross-contract links
-        // forced new tab).
+        // contract namespace. The shape check is the security boundary —
+        // it rejects /v1/node/..., /v1/delegate/..., and other gateway
+        // endpoints as navigation targets.
         assert!(
             SHELL_BRIDGE_JS.contains("CONTRACT_PREFIX_RE"),
             "navigate handler must reference the contract-shape regex"
@@ -1850,17 +1885,25 @@ mod tests {
             SHELL_BRIDGE_JS.contains("cleanPath.match(CONTRACT_PREFIX_RE)"),
             "navigate handler must enforce contract-shape check on target path"
         );
-        // Navigate handler must update the cached contractPrefix after a
-        // cross-contract hop so subsequent in-contract links are validated
-        // against the newly loaded contract.
+        // Same-contract branch: must update iframe.src in place, not do a
+        // top-level navigation (preserves auth token and client state).
         assert!(
-            SHELL_BRIDGE_JS.contains("contractPrefix = newContractPrefix"),
-            "navigate handler must update cached prefix after cross-contract hop"
+            SHELL_BRIDGE_JS.contains("newContractPrefix === contractPrefix"),
+            "same-contract branch must compare prefixes"
         );
-        // Navigate handler must add __sandbox=1 to the new URL
         assert!(
             SHELL_BRIDGE_JS.contains("resolved.searchParams.set('__sandbox', '1')"),
-            "navigate handler must add __sandbox=1 to navigated URL"
+            "same-contract branch must add __sandbox=1 to navigated URL"
+        );
+        // Cross-contract branch: must do a top-level window.location.assign
+        // so the gateway's contract_home regenerates a fresh shell + auth
+        // token. Reusing the iframe with a different contract would leak
+        // the old auth token and misattribute server-side requests
+        // (Codex review P1).
+        assert!(
+            SHELL_BRIDGE_JS.contains("window.location.assign"),
+            "cross-contract branch must use top-level navigation so the gateway \
+             regenerates a fresh shell + auth token for the new contract"
         );
         // Navigate handler must validate same-origin
         assert!(
@@ -1875,104 +1918,234 @@ mod tests {
         );
     }
 
-    /// Pure-function extraction of the shell's navigate-handler path
-    /// validation. Kept in sync with SHELL_BRIDGE_JS — any change to the
-    /// JS regex / checks below must update both. Returns the new contract
-    /// prefix if the path is accepted, None if it's rejected.
+    /// Decision returned by `navigate_shell_check` mirroring the JS handler.
+    #[derive(Debug, PartialEq, Eq)]
+    enum NavDecision {
+        /// Same-contract hop: update iframe.src in place (keeps the shell).
+        SameContract { new_prefix: String },
+        /// Cross-contract hop: top-level window.location.assign reloads the
+        /// shell with a fresh auth token via contract_home.
+        CrossContract { new_prefix: String },
+        /// Rejected — reason is only for test diagnostics.
+        Reject(&'static str),
+    }
+
+    /// Pure-Rust mirror of the JS `navigate` postMessage handler's decision
+    /// logic. Uses the `url` crate so WHATWG normalization (`..`, percent
+    /// encoding, relative hrefs, protocol-relative URLs) matches what a
+    /// browser would do inside `new URL(href, iframe.src)`.
     ///
-    /// Only accepts absolute http(s) URLs, which mirrors the test inputs
-    /// below. The real JS handler uses `new URL(href, iframe.src)` so it
-    /// also accepts relative hrefs, but the shape + origin checks are
-    /// identical.
-    fn navigate_shell_check(iframe_src: &str, href: &str) -> Option<String> {
+    /// Returns the decision: accept as same-contract / accept as
+    /// cross-contract / reject. Kept in sync with SHELL_BRIDGE_JS — any
+    /// change to the JS regex or origin check must update both.
+    fn navigate_shell_check(iframe_src: &str, current_prefix: &str, href: &str) -> NavDecision {
+        use url::Url;
+
         if href.len() > 4096 {
-            return None;
+            return NavDecision::Reject("href > 4096 bytes");
         }
-        fn split_origin_path(url: &str) -> Option<(&str, &str)> {
-            let after_scheme = url
-                .strip_prefix("http://")
-                .or_else(|| url.strip_prefix("https://"))?;
-            let scheme_end = url.len() - after_scheme.len();
-            let path_start_in_after = after_scheme.find('/').unwrap_or(after_scheme.len());
-            let origin_end = scheme_end + path_start_in_after;
-            let (origin, rest) = url.split_at(origin_end);
-            let path_end = rest
-                .find(|c: char| c == '?' || c == '#')
-                .unwrap_or(rest.len());
-            Some((origin, &rest[..path_end]))
+        let base = match Url::parse(iframe_src) {
+            Ok(u) => u,
+            Err(_) => return NavDecision::Reject("iframe_src unparseable"),
+        };
+        let resolved = match base.join(href) {
+            Ok(u) => u,
+            Err(_) => return NavDecision::Reject("href unparseable"),
+        };
+        if resolved.origin() != base.origin() {
+            return NavDecision::Reject("cross-origin");
         }
-        let (src_origin, _) = split_origin_path(iframe_src)?;
-        let (href_origin, href_path) = split_origin_path(href)?;
-        if src_origin != href_origin {
-            return None;
-        }
+        let clean_path = resolved.path();
         let re = regex::Regex::new(r"^(/v[12]/contract/web/[^/]+/)").unwrap();
-        let caps = re.captures(href_path)?;
-        Some(caps.get(1).unwrap().as_str().to_string())
+        let caps = match re.captures(clean_path) {
+            Some(c) => c,
+            None => return NavDecision::Reject("shape check failed"),
+        };
+        let new_prefix = caps.get(1).unwrap().as_str().to_string();
+        if new_prefix == current_prefix {
+            NavDecision::SameContract { new_prefix }
+        } else {
+            NavDecision::CrossContract { new_prefix }
+        }
+    }
+
+    const IFRAME_SRC: &str = "http://127.0.0.1:50509/v1/contract/web/AAAA/?__sandbox=1";
+    const CURRENT: &str = "/v1/contract/web/AAAA/";
+
+    #[test]
+    fn navigate_same_contract_subpage() {
+        // Subpage inside the currently-loaded contract → same-contract hop.
+        // The shell must NOT do a top-level navigation; it updates iframe.src
+        // in place.
+        let d = navigate_shell_check(
+            IFRAME_SRC,
+            CURRENT,
+            "http://127.0.0.1:50509/v1/contract/web/AAAA/page2",
+        );
+        assert_eq!(
+            d,
+            NavDecision::SameContract {
+                new_prefix: "/v1/contract/web/AAAA/".to_string()
+            }
+        );
     }
 
     #[test]
-    fn navigate_accepts_same_contract_path() {
-        let src = "http://127.0.0.1:50509/v1/contract/web/AAAA/?__sandbox=1";
-        let href = "http://127.0.0.1:50509/v1/contract/web/AAAA/page2";
-        let new_prefix = navigate_shell_check(src, href).expect("accepted");
-        assert_eq!(new_prefix, "/v1/contract/web/AAAA/");
+    fn navigate_cross_contract_hop() {
+        // PRIMARY REGRESSION TEST for the Delta cross-contract-link report.
+        // A link to a different contract must be ACCEPTED as a cross-contract
+        // hop, which the shell handles via window.location.assign so the
+        // gateway can regenerate a fresh auth token via contract_home.
+        let d = navigate_shell_check(
+            IFRAME_SRC,
+            CURRENT,
+            "http://127.0.0.1:50509/v1/contract/web/BBBB/welcome",
+        );
+        assert_eq!(
+            d,
+            NavDecision::CrossContract {
+                new_prefix: "/v1/contract/web/BBBB/".to_string()
+            }
+        );
     }
 
     #[test]
-    fn navigate_accepts_cross_contract_path() {
-        // This is the regression test for the Delta cross-contract-link
-        // report: a user clicking a link to another Freenet contract from
-        // within a contract webapp must not be silently dropped.
-        let src = "http://127.0.0.1:50509/v1/contract/web/AAAA/?__sandbox=1";
-        let href = "http://127.0.0.1:50509/v1/contract/web/BBBB/welcome";
-        let new_prefix = navigate_shell_check(src, href).expect("cross-contract accepted");
-        assert_eq!(new_prefix, "/v1/contract/web/BBBB/");
+    fn navigate_cross_contract_v2_api() {
+        assert!(matches!(
+            navigate_shell_check(
+                IFRAME_SRC,
+                CURRENT,
+                "http://127.0.0.1:50509/v2/contract/web/CCCC/app"
+            ),
+            NavDecision::CrossContract { .. }
+        ));
     }
 
     #[test]
-    fn navigate_accepts_v2_contract_path() {
-        let src = "http://127.0.0.1:50509/v1/contract/web/AAAA/?__sandbox=1";
-        let href = "http://127.0.0.1:50509/v2/contract/web/CCCC/app";
-        let new_prefix = navigate_shell_check(src, href).expect("v2 accepted");
-        assert_eq!(new_prefix, "/v2/contract/web/CCCC/");
+    fn navigate_relative_same_contract() {
+        // Relative href (most common real-world case for client-side
+        // routing): `page2` resolves against iframe src → same-contract.
+        assert!(matches!(
+            navigate_shell_check(IFRAME_SRC, CURRENT, "page2"),
+            NavDecision::SameContract { .. }
+        ));
     }
 
     #[test]
     fn navigate_rejects_gateway_internal_path() {
-        // The shape check is the security boundary — cross-contract nav
-        // must not become a ladder into /v1/node/..., /v1/delegate/..., or
-        // any other non-contract endpoint.
-        let src = "http://127.0.0.1:50509/v1/contract/web/AAAA/?__sandbox=1";
+        // The shape check is the security boundary. Navigation must not
+        // become a ladder into non-contract gateway endpoints, including
+        // via paths whose literal string matches contract shape but whose
+        // WHATWG-normalized form escapes the namespace.
         for evil in [
             "http://127.0.0.1:50509/v1/node/status",
             "http://127.0.0.1:50509/v1/delegate/foo",
             "http://127.0.0.1:50509/api/secret",
             "http://127.0.0.1:50509/",
             "http://127.0.0.1:50509/v1/contract/AAAA/",
+            "http://127.0.0.1:50509/v3/contract/web/AAAA/",
         ] {
             assert!(
-                navigate_shell_check(src, evil).is_none(),
+                matches!(
+                    navigate_shell_check(IFRAME_SRC, CURRENT, evil),
+                    NavDecision::Reject(_)
+                ),
                 "non-contract path must be rejected: {evil}"
             );
         }
     }
 
     #[test]
+    fn navigate_rejects_path_traversal() {
+        // Path-traversal via `..` would break out of the contract namespace
+        // post-normalization. `url::Url` resolves `..` the same way
+        // browsers do via `new URL()`.
+        for evil in [
+            "http://127.0.0.1:50509/v1/contract/web/AAAA/../../node/status",
+            "http://127.0.0.1:50509/v1/contract/web/AAAA/../../v1/node/status",
+            // Relative variant resolved against IFRAME_SRC.
+            "../../node/status",
+        ] {
+            let d = navigate_shell_check(IFRAME_SRC, CURRENT, evil);
+            assert!(
+                matches!(d, NavDecision::Reject(_)),
+                "traversal must be rejected post-normalization: {evil} -> {d:?}"
+            );
+        }
+    }
+
+    #[test]
     fn navigate_rejects_cross_origin() {
-        let src = "http://127.0.0.1:50509/v1/contract/web/AAAA/?__sandbox=1";
-        let evil = "http://evil.example.com/v1/contract/web/AAAA/";
-        assert!(navigate_shell_check(src, evil).is_none());
+        for evil in [
+            "http://evil.example.com/v1/contract/web/AAAA/",
+            "https://127.0.0.1:50509/v1/contract/web/AAAA/",
+            // Protocol-relative resolves against IFRAME_SRC's scheme but
+            // different host → cross-origin.
+            "//evil.example.com/v1/contract/web/AAAA/",
+        ] {
+            assert!(
+                matches!(
+                    navigate_shell_check(IFRAME_SRC, CURRENT, evil),
+                    NavDecision::Reject("cross-origin")
+                ),
+                "cross-origin must be rejected: {evil}"
+            );
+        }
+    }
+
+    #[test]
+    fn navigate_rejects_non_http_schemes() {
+        for evil in [
+            "javascript:alert(1)",
+            "data:text/html,<script>",
+            "file:///etc/passwd",
+        ] {
+            let d = navigate_shell_check(IFRAME_SRC, CURRENT, evil);
+            assert!(
+                matches!(d, NavDecision::Reject(_)),
+                "non-http scheme must be rejected: {evil} -> {d:?}"
+            );
+        }
     }
 
     #[test]
     fn navigate_rejects_oversized_href() {
-        let src = "http://127.0.0.1:50509/v1/contract/web/AAAA/?__sandbox=1";
         let huge = format!(
             "http://127.0.0.1:50509/v1/contract/web/AAAA/{}",
             "a".repeat(5000)
         );
-        assert!(navigate_shell_check(src, &huge).is_none());
+        assert!(matches!(
+            navigate_shell_check(IFRAME_SRC, CURRENT, &huge),
+            NavDecision::Reject("href > 4096 bytes")
+        ));
+    }
+
+    #[test]
+    fn navigate_rejects_empty_contract_key_segment() {
+        // `//foo` would leave the key segment empty; regex `[^/]+` rejects.
+        assert!(matches!(
+            navigate_shell_check(
+                IFRAME_SRC,
+                CURRENT,
+                "http://127.0.0.1:50509/v1/contract/web//foo"
+            ),
+            NavDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn navigate_rejects_missing_trailing_slash() {
+        // `/v1/contract/web/AAAA` without a trailing slash doesn't match the
+        // shape regex. Pin this so a future regex tweak can't silently
+        // loosen it.
+        assert!(matches!(
+            navigate_shell_check(
+                IFRAME_SRC,
+                CURRENT,
+                "http://127.0.0.1:50509/v1/contract/web/AAAA"
+            ),
+            NavDecision::Reject(_)
+        ));
     }
 
     #[test]
