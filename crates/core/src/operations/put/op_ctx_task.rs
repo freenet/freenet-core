@@ -181,58 +181,36 @@ async fn drive_client_put_inner(
 ) -> Result<DriverOutcome, OpError> {
     let key = contract.key();
 
-    // Route: local-only, or network fan-out?
-    // NOTE: Do NOT call put_contract here for the network path.
-    // The Request goes through send_and_await → handle_op_execution →
-    // process_message, which calls put_contract internally with the
-    // correct hosting/interest/broadcast side-effects. An early
-    // put_contract here would cause state_changed=false on the second
-    // call, breaking convergence in concurrent PUT scenarios.
+    // Always send through send_and_await so process_message handles
+    // local storage + hosting/interest/broadcast side effects.
+    // Do NOT call put_contract directly — process_message does it
+    // with the correct state_changed tracking for convergence.
+    //
+    // If no remote peers exist, process_message stores locally and
+    // returns ContinueOp(Finished). forward_pending_op_result_if_completed
+    // then sends the original Request back to the driver, which
+    // classify_reply handles as LocalCompletion.
     let mut tried: Vec<std::net::SocketAddr> = Vec::new();
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
         tried.push(own_addr);
     }
 
+    // Pre-select initial target for the driver's retry state. The actual
+    // routing decision is made by process_message, not the driver.
     let initial_target = op_manager
         .ring
         .closest_potentially_hosting(&key, tried.as_slice());
-
     let current_target = match initial_target {
-        Some(peer) => match peer.socket_addr() {
-            Some(addr) => {
+        Some(peer) => {
+            if let Some(addr) = peer.socket_addr() {
                 tried.push(addr);
-                peer
             }
-            None => {
-                return local_only_completion(
-                    op_manager,
-                    client_tx,
-                    key,
-                    &contract,
-                    related,
-                    value,
-                    subscribe,
-                    blocking_subscribe,
-                )
-                .await;
-            }
-        },
-        None => {
-            return local_only_completion(
-                op_manager,
-                client_tx,
-                key,
-                &contract,
-                related,
-                value,
-                subscribe,
-                blocking_subscribe,
-            )
-            .await;
+            peer
         }
+        None => op_manager.ring.connection_manager.own_location(),
     };
 
-    // 3. Retry loop via shared driver (#3807).
+    // Retry loop via shared driver (#3807).
     use crate::operations::op_ctx::{
         AdvanceOutcome, AttemptOutcome, RetryDriver, RetryLoopOutcome, drive_retry_loop,
     };
@@ -278,7 +256,9 @@ async fn drive_client_put_inner(
 
         fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<ContractKey> {
             match classify_reply(&reply) {
-                ReplyClass::Stored { key } => AttemptOutcome::Terminal(key),
+                ReplyClass::Stored { key } | ReplyClass::LocalCompletion { key } => {
+                    AttemptOutcome::Terminal(key)
+                }
                 ReplyClass::Unexpected => AttemptOutcome::Unexpected,
             }
         }
@@ -315,6 +295,11 @@ async fn drive_client_put_inner(
 
     match loop_result {
         RetryLoopOutcome::Done(reply_key) => {
+            // Clean up the DashMap entry that process_message created.
+            // Without this, the GC task finds a stale AwaitingResponse
+            // entry and launches speculative retries on the completed op.
+            op_manager.completed(client_tx);
+
             // Telemetry only — subscribe=false to avoid double-subscribe.
             super::finalize_put_at_originator(
                 op_manager,
@@ -359,7 +344,16 @@ async fn drive_client_put_inner(
 
 #[derive(Debug)]
 enum ReplyClass {
-    Stored { key: ContractKey },
+    /// Remote peer accepted the PUT.
+    Stored {
+        key: ContractKey,
+    },
+    /// Local completion: process_message stored locally but found no
+    /// next hop, so forward_pending_op_result_if_completed sent back
+    /// the original Request. The contract is stored at the originator.
+    LocalCompletion {
+        key: ContractKey,
+    },
     Unexpected,
 }
 
@@ -368,6 +362,13 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
         NetMessage::V1(NetMessageV1::Put(
             PutMsg::Response { key, .. } | PutMsg::ResponseStreaming { key, .. },
         )) => ReplyClass::Stored { key: *key },
+        // When process_message completes locally (no next hop), the
+        // Request is echoed back via forward_pending_op_result_if_completed.
+        NetMessage::V1(NetMessageV1::Put(PutMsg::Request {
+            id: _, contract, ..
+        })) => ReplyClass::LocalCompletion {
+            key: contract.key(),
+        },
         _ => ReplyClass::Unexpected,
     }
 }
@@ -399,52 +400,6 @@ fn advance_to_next_peer(
     let addr = peer.socket_addr()?;
     tried.push(addr);
     Some((peer, addr))
-}
-
-// --- Local-only completion ---
-
-#[allow(clippy::too_many_arguments)]
-async fn local_only_completion(
-    op_manager: &Arc<OpManager>,
-    client_tx: Transaction,
-    key: ContractKey,
-    contract: &ContractContainer,
-    related: RelatedContracts<'static>,
-    value: WrappedState,
-    subscribe: bool,
-    blocking_subscribe: bool,
-) -> Result<DriverOutcome, OpError> {
-    tracing::info!(
-        tx = %client_tx,
-        contract = %key,
-        phase = "complete",
-        "put (task-per-tx): local-only completion (no remote peers)"
-    );
-
-    // Local-only path: no process_message runs, so we must store directly.
-    super::put_contract(op_manager, key, value, related, contract).await?;
-
-    let own_location = op_manager.ring.connection_manager.own_location();
-    super::finalize_put_at_originator(
-        op_manager,
-        client_tx,
-        key,
-        PutFinalizationData {
-            sender: own_location,
-            hop_count: Some(0),
-            state_hash: None,
-            state_size: None,
-        },
-        false,
-        false,
-    )
-    .await;
-
-    maybe_subscribe_child(op_manager, client_tx, key, subscribe, blocking_subscribe).await;
-
-    Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
-        ContractResponse::PutResponse { key },
-    ))))
 }
 
 // --- Subscribe child ---
@@ -608,14 +563,16 @@ mod tests {
         }
 
         assert!(
-            call_count >= 2,
-            "Expected at least 2 finalize_put_at_originator calls in the driver \
-             (network path + local-only path), found {call_count}"
+            call_count >= 1,
+            "Expected at least 1 finalize_put_at_originator call in the driver, \
+             found {call_count}"
         );
     }
 
     #[test]
-    fn classify_reply_request_is_unexpected() {
+    fn classify_reply_request_is_local_completion() {
+        // When process_message completes locally (no next hop), the Request
+        // is echoed back via forward_pending_op_result_if_completed.
         let tx = dummy_tx();
         let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Request {
             id: tx,
@@ -628,6 +585,9 @@ mod tests {
             htl: 5,
             skip_list: HashSet::new(),
         }));
-        assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
+        assert!(matches!(
+            classify_reply(&msg),
+            ReplyClass::LocalCompletion { .. }
+        ));
     }
 }
