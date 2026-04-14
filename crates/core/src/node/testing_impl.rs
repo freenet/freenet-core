@@ -1735,12 +1735,18 @@ impl SimNetwork {
 
             peers.push(handle);
 
-            tokio::time::sleep(self.start_backoff).await;
-
-            let captured_cm = shared_cm.lock().take();
-            if let Some(cm) = captured_cm {
-                self.connection_managers.insert(label, cm);
-            }
+            let captured_cm = capture_shared_slot(&shared_cm, self.start_backoff, &label)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "SimNetwork: node {label} failed to publish ConnectionManager \
+                         within the capture budget. This means the spawned `run_node` \
+                         task panicked before reaching the `shared_cm` write at the top \
+                         of run_node_with_shared_storage, or the task was never scheduled \
+                         at all. Check preceding logs for the real failure."
+                    )
+                });
+            self.connection_managers.insert(label, captured_cm);
         }
 
         // Phase 2: Wait for all gateways to be registered in the peer registry
@@ -1848,12 +1854,18 @@ impl SimNetwork {
 
             peers.push(handle);
 
-            tokio::time::sleep(self.start_backoff).await;
-
-            let captured_cm = shared_cm.lock().take();
-            if let Some(cm) = captured_cm {
-                self.connection_managers.insert(label, cm);
-            }
+            let captured_cm = capture_shared_slot(&shared_cm, self.start_backoff, &label)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "SimNetwork: node {label} failed to publish ConnectionManager \
+                         within the capture budget. This means the spawned `run_node` \
+                         task panicked before reaching the `shared_cm` write at the top \
+                         of run_node_with_shared_storage, or the task was never scheduled \
+                         at all. Check preceding logs for the real failure."
+                    )
+                });
+            self.connection_managers.insert(label, captured_cm);
         }
 
         self.labels.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -4779,6 +4791,146 @@ impl Drop for SimNetwork {
         if self.clean_up_tmp_dirs {
             clean_up_tmp_dirs(self.labels.iter().map(|(l, _)| l));
         }
+    }
+}
+
+/// Wait for a spawned node task to publish its `ConnectionManager` (or any
+/// other value) to the shared slot, then take it.
+///
+/// Returns `None` only if the spawned task fails to publish within
+/// `MAX_PUBLISH_POLLS` yield passes, which in practice means it either
+/// panicked before reaching its publish point or is wedged in a loop before
+/// its first `.await`. The caller (`SimNetwork::start_*`) treats that as a
+/// hard failure and panics with the node label, because downstream sim
+/// helpers like `sim.connection_count(label)` would otherwise silently
+/// return `None` for that node and confuse every assertion that depends on
+/// the full node set.
+///
+/// ## Rationale
+///
+/// The previous implementation slept for `start_backoff` (50ms in the
+/// nightly fault-recovery test) and then called `take()` once. On a busy
+/// runner the spawned node task had not yet been polled far enough to reach
+/// the `shared_cm` write at the top of `run_node_with_shared_storage`, so
+/// `take()` returned `None` and the CM was silently dropped. That was the
+/// deterministic "46/50 connection managers" failure in
+/// `test_nightly_fault_recovery_speed`.
+///
+/// ## Mechanism
+///
+/// 1. Honor the configured `start_backoff` first so staggered-startup timing
+///    is preserved for tests that depend on it.
+/// 2. Try `take()` once — this covers the fast path where the node task was
+///    already polled during the backoff sleep.
+/// 3. If the slot is still empty, yield to the scheduler via
+///    `tokio::task::yield_now()` and re-check, bounded by an iteration
+///    budget. The publish happens synchronously before any `.await` in
+///    `run_node_with_shared_storage`, so once the spawned task is polled
+///    once past the entry point the slot is populated; we only need enough
+///    yields to give the scheduler a chance to choose it. The bound is an
+///    iteration count rather than a wall-clock deadline so the helper
+///    behaves identically under real and paused tokio runtimes (the direct
+///    simulation runner uses `tokio::time::start_paused(true)`, which makes
+///    any `tokio::time::Instant`-based deadline auto-advance virtual time
+///    while real scheduling has not progressed). It also keeps us out of
+///    the DST rule that bans `std::time::Instant::now()` in `crates/core/`.
+///
+/// Generic over the slot payload so unit tests can drive the helper without
+/// constructing a full `ConnectionManager`.
+async fn capture_shared_slot<T>(
+    slot: &Arc<parking_lot::Mutex<Option<T>>>,
+    start_backoff: Duration,
+    label: &NodeLabel,
+) -> Option<T> {
+    tokio::time::sleep(start_backoff).await;
+
+    if let Some(value) = slot.lock().take() {
+        return Some(value);
+    }
+
+    // Publication race: the spawned task hasn't been polled to its publish
+    // point yet. Yield-and-recheck with a generous but bounded budget.
+    //
+    // On a current_thread runtime each `yield_now().await` hands control to
+    // the scheduler, which then polls any other ready task (including our
+    // target spawned task) before polling us again. A single yield is
+    // usually enough, but a busy sim with hundreds of spawned tasks queued
+    // ahead of ours may need many more. 1024 is comfortably above every
+    // observed case and still returns in microseconds on the panic path.
+    const MAX_PUBLISH_POLLS: usize = 1024;
+    for _ in 0..MAX_PUBLISH_POLLS {
+        tokio::task::yield_now().await;
+        if let Some(value) = slot.lock().take() {
+            return Some(value);
+        }
+    }
+
+    tracing::warn!(
+        %label,
+        max_polls = MAX_PUBLISH_POLLS,
+        "SimNetwork: node did not publish its shared slot within the \
+         yield-poll budget — the spawned `run_node` task likely panicked \
+         before reaching its publish point, or is wedged before its first \
+         `.await`."
+    );
+    None
+}
+
+#[cfg(test)]
+mod capture_shared_slot_tests {
+    use super::{NodeLabel, capture_shared_slot};
+    use std::{sync::Arc, time::Duration};
+
+    fn label() -> NodeLabel {
+        NodeLabel::gateway("test", 0)
+    }
+
+    /// Fast path: the spawned task already published its value during the
+    /// initial `start_backoff` sleep (the old code's `take()` would have seen
+    /// it too). `capture_shared_slot` must return the published value
+    /// unchanged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fast_path_returns_published_value() {
+        let slot = Arc::new(parking_lot::Mutex::new(Some(42u32)));
+        let result = capture_shared_slot(&slot, Duration::from_millis(1), &label()).await;
+        assert_eq!(result, Some(42));
+        assert!(slot.lock().is_none(), "slot must be drained by take()");
+    }
+
+    /// The pre-fix race: the spawned task publishes *after* the initial
+    /// `start_backoff` sleep, during the yield-poll phase. The old code's
+    /// single `take()` would miss this and return `None`. The new helper's
+    /// yield loop must observe the publication and return `Some`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publication_race_resolves_via_yield_loop() {
+        let slot = Arc::new(parking_lot::Mutex::new(None::<u32>));
+        let publisher_slot = Arc::clone(&slot);
+
+        // Publish after several yield_now() passes — simulates a spawned
+        // node task that hadn't been polled to its publish point yet when
+        // `capture_shared_slot` entered the yield loop.
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            *publisher_slot.lock() = Some(7);
+        });
+
+        let result = capture_shared_slot(&slot, Duration::from_millis(1), &label()).await;
+        assert_eq!(result, Some(7));
+    }
+
+    /// Timeout path: nothing ever publishes. `capture_shared_slot` must
+    /// exhaust its yield-poll budget and return `None` so the caller can
+    /// panic loudly with the node label. With the iteration-bounded loop
+    /// this completes in microseconds (no wall-clock wait), so unlike the
+    /// earlier draft that used a 5-second `std::time::Instant` deadline
+    /// the test runs on every `cargo test` pass without `#[ignore]`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_returns_none_when_never_published() {
+        let slot: Arc<parking_lot::Mutex<Option<u32>>> = Arc::new(parking_lot::Mutex::new(None));
+        let result = capture_shared_slot(&slot, Duration::from_millis(1), &label()).await;
+        assert_eq!(result, None);
     }
 }
 

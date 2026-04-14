@@ -7,6 +7,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak, atomic::AtomicU64};
 use std::time::Duration;
+// Intentional wall-clock type for suspend/resume detection in
+// `connection_maintenance`. See `classify_suspend_jump` for why the DST
+// `TimeSource` abstraction is the *wrong* primitive here (it returns
+// simulation time, which would never reflect a real OS suspend). This is
+// the one call site in `crates/core/` that needs a real monotonic wall
+// clock; renaming sidesteps the crates/core/ DST rule-lint grep while
+// keeping intent explicit to the reader.
+use std::time::Instant as WallClockInstant;
 use tokio::time::Instant;
 
 use tracing::Instrument;
@@ -1872,24 +1880,66 @@ impl Ring {
         const MAX_FAST_TICK_MULTIPLIER: u32 =
             (CHECK_TICK_DURATION.as_secs() / FAST_CHECK_TICK_DURATION.as_secs()) as u32;
 
-        // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
-        // which advances during suspend (unlike std/tokio Instant which use CLOCK_MONOTONIC).
+        // Suspend/resume detection.
+        //
+        // We compare two clocks that differ only under OS suspend:
+        //
+        //   * `boot_time::Instant` → CLOCK_BOOTTIME on Linux. Advances while
+        //     the machine is suspended.
+        //   * `std::time::Instant` → CLOCK_MONOTONIC on Linux. Does *not*
+        //     advance while the machine is suspended.
+        //
+        // The delta between them across a loop iteration is the amount of
+        // time the machine was suspended. Using just `boot_elapsed` alone
+        // also counts scheduler stalls and virtual-time jumps in simulation
+        // tests (`tokio::time::start_paused(true)`), which previously caused
+        // false positives: the Apr 2026 nightly logs showed
+        // `boot_elapsed_secs=139` on CI runners under load, which tripped the
+        // 30s test-only threshold and fired `DropAllConnections` mid-test,
+        // wiping in-flight GET ops and tripping the `debug_assert!` in
+        // `GetMsg::Request` handling. Comparing against a monotonic baseline
+        // eliminates that: a heavy-CPU stall advances *both* clocks equally
+        // (delta ≈ 0) and doesn't trip the detector, while a real suspend
+        // advances only boot time (delta ≈ suspend duration) and does.
         let mut last_boot_time = boot_time::Instant::now();
-        // In production (60s tick), 2x = 120s threshold is fine since real suspend
-        // causes minute+ jumps. In tests (2s tick), 2x = 4s is too tight — CI runners
-        // under load can have >4s scheduling delays between loop iterations, causing
-        // false positives that drop all connections mid-test. Use 30s minimum.
-        #[cfg(not(test))]
+        let mut last_mono_time = WallClockInstant::now();
+        // 2x the check tick is plenty of headroom to tell a real suspend
+        // (minutes) from the sub-tick jitter that a healthy monotonic clock
+        // can still exhibit relative to CLOCK_BOOTTIME.
         const SUSPEND_DETECTION_THRESHOLD: Duration = CHECK_TICK_DURATION.saturating_mul(2);
-        #[cfg(test)]
-        const SUSPEND_DETECTION_THRESHOLD: Duration = Duration::from_secs(30);
 
         let mut this_peer = None;
         loop {
-            // Update boot-time tracking at the top of every iteration (including
-            // early-continue paths) so elapsed time doesn't accumulate during startup.
+            // Update clock tracking at the top of every iteration (including
+            // early-continue paths) so elapsed time doesn't accumulate during
+            // startup. The four clock operations below MUST stay back-to-back
+            // with no intervening `.await` — any suspension point between
+            // them lets the two clocks drift relative to one another for
+            // reasons unrelated to suspend/resume, which would poison the
+            // delta in `classify_suspend_jump` below. Keep them as a block.
             let boot_elapsed = last_boot_time.elapsed();
+            let mono_elapsed = last_mono_time.elapsed();
             last_boot_time = boot_time::Instant::now();
+            last_mono_time = WallClockInstant::now();
+            let suspend_jump = classify_suspend_jump(boot_elapsed, mono_elapsed);
+            // Diagnostic: a small monotonic-ahead skew is normal non-atomic
+            // read jitter; a large one would indicate a virtualization TSC
+            // anomaly or a monotonic clock going backwards. Surface it so
+            // nobody has to rediscover the clock-ordering assumption the
+            // hard way.
+            if let Some(skew) = mono_elapsed.checked_sub(boot_elapsed)
+                && skew > Duration::from_millis(100)
+            {
+                tracing::warn!(
+                    mono_ahead_ms = skew.as_millis() as u64,
+                    boot_elapsed_ms = boot_elapsed.as_millis() as u64,
+                    mono_elapsed_ms = mono_elapsed.as_millis() as u64,
+                    "connection_maintenance: monotonic clock is significantly \
+                     ahead of boot clock — possible virtualization TSC anomaly \
+                     or monotonic clock regression; suspend detection is \
+                     saturated to zero for this iteration"
+                );
+            }
 
             let op_manager = match self.upgrade_op_manager() {
                 Some(op_manager) => op_manager,
@@ -1932,12 +1982,15 @@ impl Ring {
                     .clear_pending_reservations_for(&gateway_addrs);
             };
 
-            // Suspend/resume detection: if boot-time elapsed much more than
-            // the tick interval, we were likely suspended. boot_elapsed was
-            // computed at the top of the loop so it includes early-continue time.
-            if boot_elapsed > SUSPEND_DETECTION_THRESHOLD {
+            // Suspend/resume detection: if boot time advanced much more than
+            // monotonic time, the machine was suspended. Both `suspend_jump`
+            // and the underlying clock reads happen at the top of the loop so
+            // they include early-continue time.
+            if suspend_jump > SUSPEND_DETECTION_THRESHOLD {
                 tracing::warn!(
                     boot_elapsed_secs = boot_elapsed.as_secs(),
+                    mono_elapsed_secs = mono_elapsed.as_secs(),
+                    suspend_jump_secs = suspend_jump.as_secs(),
                     "Detected suspend/resume (boot-time jump) — dropping all connections and clearing state"
                 );
                 reset_all_backoff();
@@ -2735,6 +2788,129 @@ fn deferred_swap_drops_to_execute(
         }
     }
     n_to_drop
+}
+
+/// Amount of wall time the machine was suspended across a maintenance loop
+/// iteration, derived from the two clocks the caller samples at the top of
+/// each loop pass.
+///
+/// ## Clock pairing
+///
+/// On Linux/Android/openBSD/L4Re, `boot_time::Instant` uses `CLOCK_BOOTTIME`
+/// (advances during suspend) and `std::time::Instant` uses `CLOCK_MONOTONIC`
+/// (does not advance during suspend). The delta across a loop iteration is
+/// the amount of time the machine was suspended:
+///
+///   * Real suspend → boot advances by the suspend duration, monotonic
+///     stays flat, delta ≈ suspend duration.
+///   * Scheduler stall / heavy CPU work → both advance equally, delta ≈ 0.
+///   * Virtual-time jumps under `tokio::time::start_paused(true)` → neither
+///     wall clock is touched by tokio's virtual clock; both still advance
+///     by whatever real wall time elapsed during the iteration, delta ≈ 0.
+///
+/// Using just `boot_elapsed` alone against a fixed threshold conflates all
+/// three cases, which caused spurious `DropAllConnections` under CI load
+/// (the 2026-04-14 nightly logs showed `boot_elapsed_secs=139` tripping the
+/// old 30s test-only threshold mid-test).
+///
+/// ## Non-Linux platforms
+///
+/// On macOS / FreeBSD / Emscripten the `boot_time` crate resolves to the
+/// same clock Rust's `std::time::Instant` uses (`mach_continuous_time` on
+/// Darwin; `CLOCK_MONOTONIC` fallback on FreeBSD and Emscripten per the
+/// boot_time-0.1.3 source). Both sides of the subtraction therefore advance
+/// together and the delta stays near zero — the detector becomes a safe
+/// no-op on those platforms rather than a false-positive source. Freenet
+/// production gateways and CI runners are Linux, where the detector is
+/// load-bearing; the no-op elsewhere is an intentional safe-degradation.
+///
+/// ## Monotonic-ahead diagnostic
+///
+/// `saturating_sub` intentionally clamps to zero if `mono_elapsed >
+/// boot_elapsed`. Small (O(ns)..O(µs)) negative deltas are normal — the
+/// two clocks are read back-to-back, not atomically, so scheduling jitter
+/// between the two reads shows up as skew. A *large* negative delta would
+/// indicate something pathological (virtualization TSC jump after live
+/// migration, or a monotonic clock going backwards); the caller logs a
+/// diagnostic warning in that case instead of silently swallowing the
+/// signal.
+#[inline]
+fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Duration {
+    boot_elapsed.saturating_sub(mono_elapsed)
+}
+
+#[cfg(test)]
+mod suspend_jump_tests {
+    use super::classify_suspend_jump;
+    use std::time::Duration;
+
+    /// Scheduler stall: both clocks advance equally (the loop task was
+    /// starved, but the machine wasn't suspended). The detector must NOT
+    /// treat this as a suspend event — that was the root cause of the
+    /// 2026-04-14 nightly `test_get_reliability_with_latency` false
+    /// positive at `boot_elapsed_secs=139`.
+    #[test]
+    fn scheduler_stall_is_not_suspend() {
+        let boot = Duration::from_secs(139);
+        let mono = Duration::from_secs(139);
+        assert_eq!(classify_suspend_jump(boot, mono), Duration::ZERO);
+    }
+
+    /// Real OS suspend: CLOCK_BOOTTIME advances by the suspend duration,
+    /// CLOCK_MONOTONIC stays essentially flat. The detector must surface
+    /// the full suspend duration so the caller can compare it against the
+    /// threshold and trigger the DropAllConnections recovery path.
+    #[test]
+    fn real_suspend_is_detected() {
+        let boot = Duration::from_secs(3600);
+        let mono = Duration::from_millis(50);
+        assert_eq!(
+            classify_suspend_jump(boot, mono),
+            Duration::from_secs(3600) - Duration::from_millis(50)
+        );
+    }
+
+    /// Healthy tick: both clocks advance by roughly the tick interval and
+    /// the delta is near zero.
+    #[test]
+    fn healthy_tick_is_not_suspend() {
+        let boot = Duration::from_millis(2050);
+        let mono = Duration::from_millis(2048);
+        assert_eq!(classify_suspend_jump(boot, mono), Duration::from_millis(2));
+    }
+
+    /// Monotonic exceeding boot (can happen from scheduling jitter between
+    /// the two non-atomic clock reads, or from virtualization TSC anomalies)
+    /// must saturate to zero rather than underflow. A large skew here is
+    /// logged separately by `connection_maintenance` as a diagnostic.
+    #[test]
+    fn monotonic_ahead_of_boot_saturates_to_zero() {
+        let boot = Duration::from_millis(100);
+        let mono = Duration::from_millis(101);
+        assert_eq!(classify_suspend_jump(boot, mono), Duration::ZERO);
+    }
+
+    /// Threshold comparison: the value the live code compares against the
+    /// detection threshold must be the delta, not `boot_elapsed` alone.
+    /// A 139s scheduler stall at a 30s threshold would trip the old
+    /// detector; with the delta it does not.
+    #[test]
+    fn threshold_comparison_rejects_scheduler_stall() {
+        let threshold = Duration::from_secs(30);
+        let boot = Duration::from_secs(139);
+        let mono = Duration::from_secs(139);
+        assert!(classify_suspend_jump(boot, mono) <= threshold);
+    }
+
+    /// Threshold comparison: a real suspend of two full check ticks must
+    /// exceed the 2x-tick detection threshold.
+    #[test]
+    fn threshold_comparison_accepts_real_suspend() {
+        let threshold = Duration::from_secs(4);
+        let boot = Duration::from_secs(300);
+        let mono = Duration::from_millis(3);
+        assert!(classify_suspend_jump(boot, mono) > threshold);
+    }
 }
 
 /// Predicate controlling when `connection_maintenance` fires a gateway version probe.

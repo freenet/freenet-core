@@ -148,48 +148,54 @@ jobs:
       #       echo "Skipping large_network test - riverctl not installed"
       #     fi
 
-  # Notify Matrix channel on failure
-  # Uses curl directly because the matrix-message action doesn't URL-encode room IDs
+  # Notify the Freenet dev room on failure.
+  #
+  # This used to post to Matrix via a direct curl against the matrix.org REST
+  # API using a MATRIX_ACCESS_TOKEN secret. That token expired at some point
+  # and every nightly failure since 2026-04-07 was also failing to deliver
+  # the notification (HTTP 401 M_UNKNOWN_TOKEN). Rather than rotate another
+  # standalone token, consolidate on the same transport
+  # `river_pr_merge_notify.yml` already uses: `riverctl` against the Freenet
+  # gateway, authenticated with the shared `RIVER_SIGNING_KEY` secret. One
+  # set of credentials to maintain, and the message ends up in the same
+  # Freenet room subscribers are already watching.
   notify-failure:
-    name: Notify Matrix on Failure
+    name: Notify River on Failure
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     needs: large-scale-simulation
     if: failure() && needs.large-scale-simulation.result == 'failure'
     continue-on-error: true
     steps:
-      - name: Send failure message to Matrix
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Install riverctl
+        run: cargo install riverctl
+
+      - name: Send failure message to River (with exponential backoff)
         env:
-          MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
-          MATRIX_ROOM_ID: ${{ secrets.MATRIX_DEV_ROOM_ID }}
+          RIVER_SIGNING_KEY: ${{ secrets.RIVER_SIGNING_KEY }}
         run: |
-          # Room ID is stored pre-encoded in the secret (with ! as %21 and : as %3A)
-          ENCODED_ROOM_ID="$MATRIX_ROOM_ID"
+          MESSAGE="🚨 Nightly Simulation Tests Failed - ${{ github.repository }} - branch: ${{ github.ref_name }} - commit: ${{ github.sha }} - seed: ${{ github.event.inputs.seed || '0xDEADBEEF' }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NODE_URL="${{ secrets.RIVER_GATEWAY_URL }}"
+          ROOM_ID="${{ secrets.RIVER_ROOM_ID }}"
 
-          # Plain text fallback
-          BODY="🚨 Nightly Simulation Tests Failed - ${{ github.repository }} - Branch: ${{ github.ref_name }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          # HTML formatted message
-          HTML="🚨 <strong>Nightly Simulation Tests Failed</strong><br><br>"
-          HTML+="<strong>Repository:</strong> <a href=\"${{ github.server_url }}/${{ github.repository }}\">${{ github.repository }}</a><br>"
-          HTML+="<strong>Run:</strong> <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View workflow run</a><br>"
-          HTML+="<strong>Branch:</strong> <code>${{ github.ref_name }}</code><br>"
-          HTML+="<strong>Commit:</strong> <code>${{ github.sha }}</code><br>"
-          HTML+="<strong>Seed:</strong> <code>${{ github.event.inputs.seed || '0xDEADBEEF' }}</code><br><br>"
-          HTML+="Please investigate the failure and check the logs for details."
-
-          # Send to Matrix (show response on error for debugging)
-          RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X PUT \
-            "https://matrix.org/_matrix/client/v3/rooms/${ENCODED_ROOM_ID}/send/m.room.message/$(date +%s%N)" \
-            -H "Authorization: Bearer ${MATRIX_ACCESS_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg body "$BODY" --arg html "$HTML" '{msgtype: "m.text", body: $body, format: "org.matrix.custom.html", formatted_body: $html}')")
-
-          HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE:" | cut -d: -f2)
-          BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE:")
-
-          if [ "$HTTP_CODE" -ge 400 ]; then
-            echo "Matrix API error (HTTP $HTTP_CODE): $BODY"
-            exit 1
-          fi
-          echo "Message sent successfully"
+          max_attempts=7
+          delay=10
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Attempt $attempt/$max_attempts (delay: ${delay}s)..."
+            if riverctl --node-url "$NODE_URL" message send "$ROOM_ID" "$MESSAGE" 2>&1; then
+              echo "Message sent successfully on attempt $attempt"
+              exit 0
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "Failed, retrying in ${delay}s..."
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+          done
+          echo "::warning::Failed to send River notification after $max_attempts attempts (gateway may be restarting)"
+          exit 0
