@@ -680,8 +680,17 @@ function freenetBridge(authToken) {
             // token + origin attribution for the destination contract.
             // The browser's normal back/forward history takes care of
             // cross-contract restoration — no popstate handling needed.
+            //
+            // Preserve `resolved.search` so any query parameters the link
+            // carries (e.g. app-level routing args) survive the hop. The
+            // destination shell strips `__sandbox=1` before forwarding to
+            // its own iframe, so passing through the full query is safe.
+            // The gateway handler redirects non-root HTML subpath loads
+            // to the shell route (see web_subpages Sec-Fetch-Dest
+            // handling) so paths like `/v1/contract/web/{key}/page2`
+            // still end up on the shell that issues the auth token.
             try {
-              window.location.assign(cleanPath + cappedHash);
+              window.location.assign(cleanPath + resolved.search + cappedHash);
             } catch(e) {}
           }
         } catch(e) {}
@@ -2099,6 +2108,15 @@ mod tests {
             SHELL_BRIDGE_JS.contains("window.location.assign"),
             "cross-contract branch must use top-level navigation so the gateway \
              regenerates a fresh shell + auth token for the new contract"
+        );
+        // Cross-contract branch must preserve the query string so any
+        // app-level routing arguments on the link survive the hop. Dropping
+        // `resolved.search` previously stripped query parameters that the
+        // destination webapp depended on.
+        assert!(
+            SHELL_BRIDGE_JS
+                .contains("window.location.assign(cleanPath + resolved.search + cappedHash)"),
+            "cross-contract branch must preserve the query string via resolved.search"
         );
         // Navigate handler must validate same-origin
         assert!(
