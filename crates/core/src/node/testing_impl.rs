@@ -1735,9 +1735,7 @@ impl SimNetwork {
 
             peers.push(handle);
 
-            tokio::time::sleep(self.start_backoff).await;
-
-            let captured_cm = shared_cm.lock().take();
+            let captured_cm = capture_shared_cm(&shared_cm, self.start_backoff, &label).await;
             if let Some(cm) = captured_cm {
                 self.connection_managers.insert(label, cm);
             }
@@ -1848,9 +1846,7 @@ impl SimNetwork {
 
             peers.push(handle);
 
-            tokio::time::sleep(self.start_backoff).await;
-
-            let captured_cm = shared_cm.lock().take();
+            let captured_cm = capture_shared_cm(&shared_cm, self.start_backoff, &label).await;
             if let Some(cm) = captured_cm {
                 self.connection_managers.insert(label, cm);
             }
@@ -4778,6 +4774,55 @@ impl Drop for SimNetwork {
 
         if self.clean_up_tmp_dirs {
             clean_up_tmp_dirs(self.labels.iter().map(|(l, _)| l));
+        }
+    }
+}
+
+/// Wait for the node's `run_node` to publish its `ConnectionManager` to the
+/// shared slot, then take it. Returns `None` only if the node fails to publish
+/// within a generous wall-clock budget (e.g. the task panicked before reaching
+/// the publish point).
+///
+/// Rationale: the previous implementation slept for `start_backoff` (often
+/// 50ms) and then called `take()` once. On a busy runner the spawned node task
+/// had not yet reached the point where it populates `shared_cm`, so `take()`
+/// returned `None` and the CM was silently lost. Downstream sim helpers like
+/// `sim.connection_count(label)` then returned `None` for that node, and any
+/// assertion that expected per-node ConnectionManagers for every label
+/// (e.g. `test_nightly_fault_recovery_speed`) would fail with
+/// `got N, expected NODES`.
+async fn capture_shared_cm(
+    shared_cm: &Arc<parking_lot::Mutex<Option<ConnectionManager>>>,
+    start_backoff: Duration,
+    label: &NodeLabel,
+) -> Option<ConnectionManager> {
+    // Always honor the configured start backoff first so nodes come online at
+    // roughly the requested cadence and tests that rely on staggered startup
+    // see the same timing as before.
+    tokio::time::sleep(start_backoff).await;
+
+    if let Some(cm) = shared_cm.lock().take() {
+        return Some(cm);
+    }
+
+    // Publication race: the node has spawned but has not yet reached the
+    // point where it stores its ConnectionManager in `shared_cm`. Poll with a
+    // short interval until it appears, capped at a generous overall budget.
+    const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+    const PUBLISH_POLL: Duration = Duration::from_millis(20);
+    let deadline = tokio::time::Instant::now() + PUBLISH_TIMEOUT;
+    loop {
+        tokio::time::sleep(PUBLISH_POLL).await;
+        if let Some(cm) = shared_cm.lock().take() {
+            return Some(cm);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                %label,
+                "SimNetwork: node did not publish ConnectionManager within {:?}",
+                PUBLISH_TIMEOUT
+            );
+            return None;
         }
     }
 }
