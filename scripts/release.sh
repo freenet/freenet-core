@@ -541,7 +541,14 @@ check_prerequisites() {
             # merge commit.
             local total_checks in_progress_count failed_count
             total_checks=$(echo "$check_runs_json" | jq '.total_count // 0')
-            in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and (.name | startswith("Build for") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure")] | length')
+            # `Dependabot` runs on a cron and attaches to the HEAD commit
+            # of main, which made a still-running Dependabot job block
+            # the release pre-flight wait indefinitely even though
+            # `failed_count` already excluded it below. Align the two
+            # filters so a Dependabot run in either state never gates a
+            # release (release blocked by unrelated Dependabot cron,
+            # 2026-04-14 v0.2.45 release).
+            in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure")] | length')
             failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure")] | length')
 
             if [[ "$total_checks" == "0" ]]; then
