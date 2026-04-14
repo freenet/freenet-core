@@ -688,7 +688,10 @@ async fn test_three_node_network_connectivity(ctx: &mut TestContext) -> TestResu
                     | other @ UpdateData::StateAndDelta { .. }
                     | other @ UpdateData::RelatedState { .. }
                     | other @ UpdateData::RelatedDelta { .. }
-                    | other @ UpdateData::RelatedStateAndDelta { .. } => {
+                    | other @ UpdateData::RelatedStateAndDelta { .. }
+                    // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0;
+                    // future variants are also unexpected here.
+                    | other => {
                         bail!("Unexpected update data type: {:?}", other)
                     }
                 }
