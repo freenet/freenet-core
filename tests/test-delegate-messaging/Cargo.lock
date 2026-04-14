@@ -258,7 +258,8 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.2.0"
-source = "git+https://github.com/freenet/freenet-stdlib?branch=feat-message-origin-delegate#7840137a1368731fd8420e522b586268cc8a75dd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26e5c6bee9ffa0e2683bc8b41a7bd9f1e57e7fd49ac4f6ae433e5a82e9006df"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -268,7 +269,8 @@ dependencies = [
 [[package]]
 name = "freenet-stdlib"
 version = "0.5.0"
-source = "git+https://github.com/freenet/freenet-stdlib?branch=feat-message-origin-delegate#7840137a1368731fd8420e522b586268cc8a75dd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2475e70183cf53033735bd4a794d7875d0b125f9369bd463dc30c83424dcbea6"
 dependencies = [
  "bincode",
  "blake3",

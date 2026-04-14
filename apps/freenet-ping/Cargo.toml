@@ -2,16 +2,6 @@
 resolver = "2"
 members = ["contracts/ping", "app", "types"]
 
-# Temporary git override for issue #3860 — the path-dep on freenet-core in
-# `app/` transitively requires freenet-stdlib 0.5.0, which is not yet on
-# crates.io. This `[patch.crates-io]` is a duplicate of the one in the root
-# freenet-core `Cargo.toml`; nested workspaces do not inherit `[patch]` from
-# their parent, so it must be repeated here for the ping contract build to
-# resolve dependencies in CI. MUST be removed before merge — replace with
-# the published 0.5.0 from crates.io. Tracked in freenet/freenet-core#3865.
-[patch.crates-io]
-freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib", branch = "feat-message-origin-delegate" }
-
 [workspace.dependencies]
 # freenet-stdlib = { path = "./../../stdlib/rust", features = ["contract"] }
 freenet-stdlib = { version = "0.3.5" }

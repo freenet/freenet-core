@@ -9,12 +9,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Temporary git pin: this fixture's parent workspace is separate from the
-# root freenet-core workspace, so the `[patch.crates-io]` override in the
-# root Cargo.toml does NOT apply here — we must point at the stdlib branch
-# directly. Must be replaced with the published 0.5.0 from crates.io once
-# stdlib is released. Tracked in freenet/freenet-core#3865.
-freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib", branch = "feat-message-origin-delegate", features = ["contract"] }
+freenet-stdlib = { version = "0.5.0", features = ["contract"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 

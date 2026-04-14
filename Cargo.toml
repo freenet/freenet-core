@@ -152,14 +152,6 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # Freenet
 freenet-stdlib = "0.5.0"
 
-# Temporary git override for issue #3860 — points at the freenet-stdlib
-# branch that adds `MessageOrigin::Delegate(DelegateKey)` so CI can build
-# this PR before stdlib publishes to crates.io. MUST be removed before this
-# PR can merge — replace with the published 0.5.0 from crates.io. Tracked
-# in the PR pre-merge checklist on freenet/freenet-core#3865.
-[patch.crates-io]
-freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib", branch = "feat-message-origin-delegate" }
-
 [profile.dev.package."*"]
 opt-level = 3
 
