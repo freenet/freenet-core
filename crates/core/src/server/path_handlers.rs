@@ -310,14 +310,30 @@ fn shell_page(
     let version_prefix = api_version.prefix();
     let base_path = format!("/{version_prefix}/contract/web/{contract_key}/");
 
-    // Build the iframe src URL: same path with __sandbox=1 plus any original query params
+    // Build the iframe src URL: same path with __sandbox=1 plus any
+    // original query params (e.g., ?invitation=...). `__sandbox` is the
+    // server-interpreted routing flag and must come only from the line
+    // we prepend here. `authToken` is the shell's credential — the
+    // freshly-generated one is passed to `freenetBridge(authToken)`
+    // below; a value forwarded from `query_string` would only arrive
+    // via an attacker-controlled URL (pasted deep link or cross-contract
+    // navigate-handler hop that preserved `resolved.search`), so strip
+    // it to keep the iframe's `location.search` free of injected
+    // credentials that a webapp reading `location.search` might pick up.
     let mut iframe_params = vec!["__sandbox=1".to_string()];
     if let Some(qs) = &query_string {
-        // Forward the original query params (e.g., ?invitation=...) to the iframe
         for param in qs.split('&') {
-            if !param.is_empty() && !param.starts_with("__sandbox") {
-                iframe_params.push(param.to_string());
+            if param.is_empty() {
+                continue;
             }
+            // Strip any `__sandbox*` param (server-interpreted routing
+            // flag) and the auth credential `authToken`. Both are
+            // prefix-checked since a future refactor might add
+            // variants like `__sandbox_debug` or `authToken2`.
+            if param.starts_with("__sandbox") || param.starts_with("authToken") {
+                continue;
+            }
+            iframe_params.push(param.to_string());
         }
     }
     let iframe_src_raw = format!("{}?{}", base_path, iframe_params.join("&"));
@@ -680,8 +696,20 @@ function freenetBridge(authToken) {
             // token + origin attribution for the destination contract.
             // The browser's normal back/forward history takes care of
             // cross-contract restoration — no popstate handling needed.
+            //
+            // Include `resolved.search` so any query parameters the link
+            // carries (e.g. app-level routing args) survive the hop. The
+            // destination shell page strips the sensitive routing params
+            // (`__sandbox`, `authToken`) before forwarding the rest into
+            // the iframe's `location.search`. The gateway's subpage
+            // handler redirects non-root HTML loads to the shell route
+            // (see `web_subpages` `Sec-Fetch-Dest` handling), which
+            // preserves the filtered query string all the way through,
+            // so `/v1/contract/web/{key}/page2?invite=…` still lands on
+            // a shell that issues an auth token and forwards `invite`
+            // into the iframe.
             try {
-              window.location.assign(cleanPath + cappedHash);
+              window.location.assign(cleanPath + resolved.search + cappedHash);
             } catch(e) {}
           }
         } catch(e) {}
@@ -1882,6 +1910,42 @@ mod tests {
         );
     }
 
+    /// Regression test for the cross-contract `authToken` injection
+    /// surface raised in review. A crafted cross-contract link with
+    /// `?authToken=attacker_value` reaches `shell_page` via the
+    /// `resolved.search` passthrough in the navigate bridge (or via a
+    /// pasted deep link that the subpage redirect forwards). The
+    /// iframe URL must never carry an attacker-supplied `authToken`
+    /// because any webapp that reads credentials from
+    /// `location.search` (Delta, River) would pick it up and use it
+    /// as its WebSocket credential.
+    #[tokio::test]
+    async fn shell_page_strips_auth_token_from_forwarded_query() {
+        let token = AuthToken::generate();
+        let qs = Some("authToken=attacker_value&invite=abc&authTokenExtra=x".to_string());
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+        assert!(
+            !html.contains("attacker_value"),
+            "attacker-supplied authToken value must not reach iframe src"
+        );
+        assert!(
+            !html.contains("authTokenExtra"),
+            "authToken-prefixed params must also be stripped"
+        );
+        assert!(
+            html.contains("invite=abc"),
+            "harmless params must still be forwarded"
+        );
+        // The only authToken in the resulting HTML is the
+        // freshly-generated one passed to `freenetBridge(authToken)`,
+        // not a query-string value in the iframe src.
+        assert!(
+            html.contains(&format!("freenetBridge(\"{}\"", token.as_str())),
+            "shell must still bind the freshly-generated auth token"
+        );
+    }
+
     #[tokio::test]
     async fn shell_page_escapes_html_in_query_params() {
         let token = AuthToken::generate();
@@ -2099,6 +2163,15 @@ mod tests {
             SHELL_BRIDGE_JS.contains("window.location.assign"),
             "cross-contract branch must use top-level navigation so the gateway \
              regenerates a fresh shell + auth token for the new contract"
+        );
+        // Cross-contract branch must preserve the query string so any
+        // app-level routing arguments on the link survive the hop. Dropping
+        // `resolved.search` previously stripped query parameters that the
+        // destination webapp depended on.
+        assert!(
+            SHELL_BRIDGE_JS
+                .contains("window.location.assign(cleanPath + resolved.search + cappedHash)"),
+            "cross-contract branch must preserve the query string via resolved.search"
         );
         // Navigate handler must validate same-origin
         assert!(
