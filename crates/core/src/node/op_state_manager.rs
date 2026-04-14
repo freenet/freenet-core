@@ -1945,10 +1945,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         // but does not remove the DashMap entry that
                         // `process_message` created (legacy `report_result`
                         // removal path is bypassed). Without this guard the
-                        // GC re-dispatches the completed PUT, which replays
-                        // `finalize_put_at_originator` side-effects — in
-                        // particular it resurrects upstream subscriptions on
-                        // other nodes, breaking
+                        // GC re-dispatches the completed PUT ~9-15s later,
+                        // which replays `finalize_put_at_originator` side
+                        // effects — in particular it resurrects upstream
+                        // subscriptions on other nodes, breaking
                         // `test_client_disconnect_triggers_upstream_unsubscribe`.
                         if ops.completed.contains(&tx) {
                             continue;
