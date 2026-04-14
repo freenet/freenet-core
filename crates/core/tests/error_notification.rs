@@ -427,6 +427,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
             token_ttl_seconds: None,
             token_cleanup_interval_seconds: None,
             allowed_host: None,
+            allowed_source_cidrs: None,
         },
         network_api: freenet::config::NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -485,6 +486,7 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
             token_ttl_seconds: None,
             token_cleanup_interval_seconds: None,
             allowed_host: None,
+            allowed_source_cidrs: None,
         },
         network_api: freenet::config::NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),

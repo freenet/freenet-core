@@ -378,6 +378,20 @@ pub(crate) async fn serve_client_api_in(
 /// Hostnames and IPs accepted in the HTTP `Host` header for WebSocket connections.
 pub(crate) type AllowedHosts = Arc<HashSet<String>>;
 
+/// User-supplied source CIDRs that extend the built-in private-IP allowlist.
+///
+/// The filter accepts a request if the source IP is private (loopback / RFC1918 /
+/// link-local / IPv6 ULA) **or** matches any of these ranges. Empty by default;
+/// populated via `--allowed-source-cidrs` or `allowed-source-cidrs` in config.toml.
+#[derive(Clone, Default)]
+pub(crate) struct AllowedSourceCidrs(pub Arc<Vec<ipnet::IpNet>>);
+
+impl AllowedSourceCidrs {
+    fn contains(&self, ip: &IpAddr) -> bool {
+        self.0.iter().any(|net| net.contains(ip))
+    }
+}
+
 /// Builds the allowlist of hostnames/IPs for WebSocket `Host` header validation.
 ///
 /// Each entry is stored with and without the port suffix so both
@@ -484,12 +498,24 @@ async fn serve_client_api_in_impl(
     ));
     tracing::info!(?allowed_hosts, "WebSocket Host header allowlist built");
 
+    let allowed_source_cidrs = AllowedSourceCidrs(Arc::new(config.allowed_source_cidrs.clone()));
+    if !allowed_source_cidrs.0.is_empty() {
+        tracing::warn!(
+            cidrs = ?allowed_source_cidrs.0,
+            "Extra source CIDR ranges enabled for local API. \
+             Ensure these ranges are fully under your control; \
+             anything reachable in them can access contract state and keys."
+        );
+    }
+
     // When bound to a non-loopback address, reject connections from non-private
-    // source IPs. This is sufficient security: only LAN clients can connect.
+    // source IPs. Users may extend the allowlist with --allowed-source-cidrs
+    // (e.g. for a Tailscale tailnet range).
     let needs_lan_filter = !config.address.is_loopback();
     let router = if needs_lan_filter {
         ws_router
             .layer(Extension(allowed_hosts))
+            .layer(Extension(allowed_source_cidrs))
             .layer(axum::middleware::from_fn(private_network_filter))
             .layer(TraceLayer::new_for_http())
     } else {
@@ -502,15 +528,28 @@ async fn serve_client_api_in_impl(
     Ok((gw, ws_proxy))
 }
 
-/// Middleware that rejects requests from non-private IP addresses.
+/// Middleware that rejects requests from non-private IP addresses unless the
+/// source IP matches an operator-supplied CIDR in [`AllowedSourceCidrs`].
 async fn private_network_filter(
     connect_info: axum::extract::ConnectInfo<SocketAddr>,
+    Extension(allowed_source_cidrs): Extension<AllowedSourceCidrs>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if !is_private_ip(&connect_info.0.ip()) {
+    let ip = connect_info.0.ip();
+    // Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to IPv4 so operator-supplied
+    // CIDRs expressed in IPv4 notation match traffic arriving on a dual-stack
+    // socket.
+    let match_ip = match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    if !is_private_ip(&match_ip) && !allowed_source_cidrs.contains(&match_ip) {
         tracing::warn!(
-            remote_ip = %connect_info.0.ip(),
+            remote_ip = %ip,
             "Rejected connection from non-private IP"
         );
         return (
@@ -707,6 +746,76 @@ mod tests {
         let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509, &[]);
         assert!(!hosts.contains("0.0.0.0"));
         assert!(!hosts.contains("0.0.0.0:7509"));
+    }
+
+    fn cidrs(list: &[&str]) -> AllowedSourceCidrs {
+        AllowedSourceCidrs(Arc::new(list.iter().map(|s| s.parse().unwrap()).collect()))
+    }
+
+    #[test]
+    fn allowed_source_cidrs_empty_rejects_public() {
+        let allow = AllowedSourceCidrs::default();
+        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        // Empty list means default-deny. Private IPs still pass via is_private_ip
+        // at the call site, so we only assert the CIDR layer here.
+        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn allowed_source_cidrs_tailscale_cgnat() {
+        let allow = cidrs(&["100.64.0.0/10"]);
+        // Tailscale tailnet IPs
+        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 100, 50, 1))));
+        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))));
+        // Outside CGNAT
+        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 63, 255, 255))));
+        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn allowed_source_cidrs_narrow_tailnet() {
+        // A user pinning to their assigned tailnet subnet only
+        let allow = cidrs(&["100.64.1.0/24"]);
+        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 64, 1, 5))));
+        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 64, 2, 5))));
+    }
+
+    #[test]
+    fn allowed_source_cidrs_ipv6() {
+        let allow = cidrs(&["fd7a:115c:a1e0::/48"]);
+        assert!(allow.contains(&IpAddr::V6(Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!allow.contains(&IpAddr::V6(Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e1, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn allowed_source_cidrs_multiple_ranges() {
+        let allow = cidrs(&["100.64.0.0/10", "10.100.0.0/16"]);
+        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 64, 1, 1))));
+        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(10, 100, 5, 5))));
+        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(10, 101, 0, 1))));
+    }
+
+    #[test]
+    fn allowed_source_cidrs_does_not_accept_public_by_default() {
+        // Regression guard: the default (no CIDRs configured) MUST NOT
+        // trust CGNAT or any public space. Users must opt in explicitly.
+        let allow = AllowedSourceCidrs::default();
+        for ip in [
+            Ipv4Addr::new(100, 64, 0, 1),   // CGNAT
+            Ipv4Addr::new(8, 8, 8, 8),      // Public
+            Ipv4Addr::new(203, 0, 113, 42), // Public (TEST-NET-3)
+        ] {
+            assert!(
+                !allow.contains(&IpAddr::V4(ip)),
+                "{ip} must not be trusted by default",
+            );
+        }
     }
 
     #[test]

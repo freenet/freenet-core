@@ -135,6 +135,7 @@ impl Default for ConfigArgs {
                 token_ttl_seconds: None,
                 token_cleanup_interval_seconds: None,
                 allowed_host: None,
+                allowed_source_cidrs: None,
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -637,6 +638,24 @@ impl ConfigArgs {
                     .token_cleanup_interval_seconds
                     .unwrap_or(default_token_cleanup_interval_seconds()),
                 allowed_hosts: self.ws_api.allowed_host.unwrap_or_default(),
+                allowed_source_cidrs: self
+                    .ws_api
+                    .allowed_source_cidrs
+                    .as_ref()
+                    .map(|cidrs| {
+                        cidrs
+                            .iter()
+                            .map(|s| {
+                                s.parse::<ipnet::IpNet>().map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "invalid CIDR `{s}` in allowed-source-cidrs: {e}"
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -1274,6 +1293,29 @@ pub struct WebsocketApiArgs {
     #[arg(long, env = "ALLOWED_HOST")]
     #[serde(rename = "allowed-host", skip_serializing_if = "Option::is_none")]
     pub allowed_host: Option<Vec<String>>,
+
+    /// Additional source IP ranges (CIDR notation) permitted to reach the
+    /// local HTTP/WebSocket API.
+    ///
+    /// By default, only loopback and RFC1918 / IPv6 ULA ranges are accepted.
+    /// Use this to grant access from VPN overlays you control (e.g. Tailscale:
+    /// `--allowed-source-cidrs 100.64.0.0/10`). Can be specified multiple times.
+    ///
+    /// SECURITY: Only add ranges you fully control. CGNAT space like
+    /// `100.64.0.0/10` is shared between subscribers of some ISPs (Starlink,
+    /// T-Mobile, many cable carriers) and is only safe on an overlay network
+    /// such as Tailscale or WireGuard. Anything that can reach the API port
+    /// can access your contract state, keys, and client API.
+    #[arg(
+        long = "allowed-source-cidrs",
+        env = "ALLOWED_SOURCE_CIDRS",
+        value_delimiter = ','
+    )]
+    #[serde(
+        rename = "allowed-source-cidrs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_source_cidrs: Option<Vec<String>>,
 }
 
 /// Default telemetry endpoint (nova.locut.us OTLP collector).
@@ -1393,6 +1435,12 @@ pub struct WebsocketApiConfig {
     /// Empty means only auto-detected hostnames (machine hostname + bound IP) are allowed.
     #[serde(default, rename = "allowed-host")]
     pub allowed_hosts: Vec<String>,
+
+    /// Additional source IP ranges (CIDR) permitted to reach the API.
+    /// Stored as parsed `IpNet` so config errors surface at startup.
+    /// Empty means only loopback + RFC1918 / IPv6 ULA are accepted.
+    #[serde(default, rename = "allowed-source-cidrs")]
+    pub allowed_source_cidrs: Vec<ipnet::IpNet>,
 }
 
 #[inline]
@@ -1413,6 +1461,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
+            allowed_source_cidrs: Vec::new(),
         }
     }
 }
@@ -1426,6 +1475,7 @@ impl Default for WebsocketApiConfig {
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
+            allowed_source_cidrs: Vec::new(),
         }
     }
 }
