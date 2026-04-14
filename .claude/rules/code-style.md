@@ -283,6 +283,34 @@ Need network socket in tests?
   → USE: Socket trait (crates/core/src/transport/)
 ```
 
+#### Exception: real wall-clock comparison against `boot_time::Instant`
+
+There is exactly **one** legitimate reason to reach for real wall-clock
+time in `crates/core/` rather than `TimeSource`: detecting OS
+suspend/resume by comparing `boot_time::Instant` (CLOCK_BOOTTIME, advances
+during suspend) against a monotonic wall clock that does not advance
+during suspend. `TimeSource` returns simulation time in test builds and
+would never reflect a real suspend, so it is the wrong abstraction for
+this specific use case.
+
+When you have this exact need:
+
+1. Alias the type at the `use` line so the rule-lint grep does not trip:
+   ```rust
+   use std::time::Instant as WallClockInstant;
+   ```
+2. Add a load-bearing comment on the `use` line explaining *why* the
+   exception is correct (cite the specific suspend-detection use case —
+   a generic "we need wall clock" justification is not sufficient).
+3. Use `WallClockInstant::now()` at the call sites.
+4. Keep the clock samples back-to-back with no intervening `.await`, so
+   the two clocks measure the same window.
+
+See `crates/core/src/ring.rs::connection_maintenance` for the canonical
+example (the `classify_suspend_jump` helper and its rustdoc). Do not
+add new call sites for any other purpose — every other "I need real
+time" urge in `crates/core/` should still go through `TimeSource`.
+
 ### WHEN writing documentation
 
 ```
