@@ -681,14 +681,13 @@ function freenetBridge(authToken) {
             // The browser's normal back/forward history takes care of
             // cross-contract restoration — no popstate handling needed.
             //
-            // Preserve `resolved.search` so any query parameters the link
-            // carries (e.g. app-level routing args) survive the hop. The
-            // destination shell strips `__sandbox=1` before forwarding to
-            // its own iframe, so passing through the full query is safe.
-            // The gateway handler redirects non-root HTML subpath loads
-            // to the shell route (see web_subpages Sec-Fetch-Dest
-            // handling) so paths like `/v1/contract/web/{key}/page2`
-            // still end up on the shell that issues the auth token.
+            // Include `resolved.search` so any query parameters the link
+            // carries (e.g. app-level routing args) survive the hop; the
+            // destination shell strips `__sandbox=1` before forwarding.
+            // The gateway redirects non-root HTML subpath loads to the
+            // shell route (see web_subpages `Sec-Fetch-Dest` handling)
+            // so `/v1/contract/web/{key}/page2` still lands on a shell
+            // that issues an auth token.
             try {
               window.location.assign(cleanPath + resolved.search + cappedHash);
             } catch(e) {}
