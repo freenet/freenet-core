@@ -2,6 +2,8 @@
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
 
+pub(crate) mod op_ctx_task;
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -563,35 +565,8 @@ impl Operation for PutOp {
                     // Network peer notification is now automatic via BroadcastStateChange
                     // event emitted by the executor when state changes. No manual triggering needed.
 
-                    // For originator PUTs, respond to client immediately after local
-                    // upsert. Network propagation continues asynchronously via forwarding.
-                    //
-                    // Uses raw try_send (not send_client_result) because the operation must
-                    // remain in the state map for routing. When the operation eventually
-                    // completes (via PutMsg::Response or no-next-hop), report_result will
-                    // send a second PutResponse through send_client_result. This duplicate
-                    // is safe: SessionActor.client_transactions is consumed on first
-                    // delivery, so the second send finds no recipients and is a no-op.
-                    if is_originator {
-                        let result_op = PutOp {
-                            id,
-                            state: Some(PutState::Finished(FinishedData { key })),
-                            upstream_addr: None,
-                            stats: None,
-                            ack_received: false,
-                            speculative_paths: 0,
-                        };
-                        if let Err(error) = op_manager
-                            .result_router_tx
-                            .try_send((id, result_op.to_host_result()))
-                        {
-                            tracing::error!(
-                                tx = %id,
-                                %error,
-                                "Failed to send early PutResponse to client"
-                            );
-                        }
-                    }
+                    // Phase 3a (#1454): originator early-response removed;
+                    // task-per-tx driver delivers via send_client_result.
 
                     // Step 2: Determine if we should forward or respond
                     // Build skip list: include sender (upstream) and already-tried peers
@@ -858,8 +833,6 @@ impl Operation for PutOp {
                             "PUT operation completed successfully"
                         );
 
-                        // Emit put_success telemetry
-                        // Calculate hop_count from current_htl in state
                         let current_htl = match &self.state {
                             Some(PutState::AwaitingResponse(data)) => Some(data.current_htl),
                             _ => None,
@@ -868,23 +841,20 @@ impl Operation for PutOp {
                             .map(|htl| op_manager.ring.max_hops_to_live.saturating_sub(htl));
 
                         if let Some(sender) = sender_from_addr.clone() {
-                            if let Some(event) = NetEventLog::put_success(
-                                &id,
-                                &op_manager.ring,
+                            finalize_put_at_originator(
+                                op_manager,
+                                id,
                                 *key,
-                                sender,
-                                hop_count,
-                                None, // State not available in response
-                                None, // Size not available in response
-                            ) {
-                                op_manager.ring.register_events(Either::Left(event)).await;
-                            }
-                        }
-
-                        // Start subscription if requested
-                        if subscribe {
-                            start_subscription_after_put(op_manager, id, *key, blocking_subscribe)
-                                .await;
+                                PutFinalizationData {
+                                    sender,
+                                    hop_count,
+                                    state_hash: None,
+                                    state_size: None,
+                                },
+                                subscribe,
+                                blocking_subscribe,
+                            )
+                            .await;
                         }
 
                         Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
@@ -1395,27 +1365,20 @@ impl Operation for PutOp {
                             let own_location = op_manager.ring.connection_manager.own_location();
                             let hash = Some(state_hash_full(&merged_value));
                             let size = Some(merged_value.len());
-                            if let Some(event) = NetEventLog::put_success(
-                                &id,
-                                &op_manager.ring,
+                            finalize_put_at_originator(
+                                op_manager,
+                                id,
                                 key,
-                                own_location,
-                                Some(0),
-                                hash,
-                                size,
-                            ) {
-                                op_manager.ring.register_events(Either::Left(event)).await;
-                            }
-
-                            if *msg_subscribe {
-                                start_subscription_after_put(
-                                    op_manager,
-                                    id,
-                                    key,
-                                    blocking_subscribe,
-                                )
-                                .await;
-                            }
+                                PutFinalizationData {
+                                    sender: own_location,
+                                    hop_count: Some(0),
+                                    state_hash: hash,
+                                    state_size: size,
+                                },
+                                *msg_subscribe,
+                                blocking_subscribe,
+                            )
+                            .await;
 
                             Ok(OperationResult::ContinueOp(OpEnum::Put(PutOp {
                                 id,
@@ -1485,23 +1448,20 @@ impl Operation for PutOp {
                         let hop_count = current_htl
                             .map(|htl| op_manager.ring.max_hops_to_live.saturating_sub(htl));
 
-                        if let Some(event) = NetEventLog::put_success(
-                            &id,
-                            &op_manager.ring,
+                        finalize_put_at_originator(
+                            op_manager,
+                            id,
                             *key,
-                            op_manager.ring.connection_manager.own_location(),
-                            hop_count,
-                            None, // No hash available in streaming response
-                            None, // No size available in streaming response
-                        ) {
-                            op_manager.ring.register_events(Either::Left(event)).await;
-                        }
-
-                        // Start subscription if requested
-                        if subscribe {
-                            start_subscription_after_put(op_manager, id, *key, blocking_subscribe)
-                                .await;
-                        }
+                            PutFinalizationData {
+                                sender: op_manager.ring.connection_manager.own_location(),
+                                hop_count,
+                                state_hash: None,
+                                state_size: None,
+                            },
+                            subscribe,
+                            blocking_subscribe,
+                        )
+                        .await;
 
                         tracing::info!(
                             tx = %id,
@@ -1566,8 +1526,48 @@ impl Operation for PutOp {
     }
 }
 
-/// Helper to start subscription after PUT completes (only for originator)
+/// Telemetry data for originator-side PUT finalization.
+pub(super) struct PutFinalizationData {
+    pub sender: PeerKeyLocation,
+    pub hop_count: Option<usize>,
+    pub state_hash: Option<String>,
+    pub state_size: Option<usize>,
+}
+
+/// Originator-side finalization after a PUT has been accepted by the network.
 ///
+/// Emits `put_success` telemetry and, if `subscribe` is true, starts a
+/// post-PUT subscription. Called by both the legacy `process_message`
+/// originator branches and the task-per-tx driver (Phase 3a).
+///
+/// The caller is responsible for constructing and delivering the client
+/// result (`OperationResult::ContinueOp` on the legacy path,
+/// `DriverOutcome::Publish` on the task-per-tx path).
+pub(super) async fn finalize_put_at_originator(
+    op_manager: &OpManager,
+    id: Transaction,
+    key: ContractKey,
+    telemetry: PutFinalizationData,
+    subscribe: bool,
+    blocking_subscribe: bool,
+) {
+    if let Some(event) = NetEventLog::put_success(
+        &id,
+        &op_manager.ring,
+        key,
+        telemetry.sender,
+        telemetry.hop_count,
+        telemetry.state_hash,
+        telemetry.state_size,
+    ) {
+        op_manager.ring.register_events(Either::Left(event)).await;
+    }
+
+    if subscribe {
+        start_subscription_after_put(op_manager, id, key, blocking_subscribe).await;
+    }
+}
+
 /// The `blocking_subscription` parameter controls subscription behavior:
 /// - When false (default): subscription completes asynchronously and PUT response
 ///   is sent immediately
@@ -1605,6 +1605,7 @@ async fn start_subscription_after_put(
     }
 }
 
+#[allow(dead_code)] // Used in tests; Phase 6 cleanup
 pub(crate) fn start_op(
     contract: ContractContainer,
     related_contracts: RelatedContracts<'static>,
@@ -1638,6 +1639,7 @@ pub(crate) fn start_op(
 }
 
 /// Create a PUT operation with a specific transaction ID (for operation deduplication)
+#[allow(dead_code)] // Used in tests; Phase 6 cleanup
 pub(crate) fn start_op_with_id(
     contract: ContractContainer,
     related_contracts: RelatedContracts<'static>,
@@ -1690,6 +1692,7 @@ pub(crate) fn start_op_with_id(
 
 /// Data for the PrepareRequest state: originator preparing initial PUT request.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Phase 6 cleanup: only constructed by now-dead start_op/start_op_with_id
 pub struct PrepareRequestData {
     pub contract: ContractContainer,
     pub related_contracts: RelatedContracts<'static>,
@@ -1794,6 +1797,8 @@ pub struct FinishedData {
 #[allow(clippy::large_enum_variant)]
 pub enum PutState {
     /// Local originator preparing to send initial request.
+    #[allow(dead_code)]
+    // Phase 6 cleanup: only constructed by now-dead start_op/start_op_with_id
     PrepareRequest(PrepareRequestData),
     /// Waiting for response from downstream node.
     AwaitingResponse(AwaitingResponseData),
@@ -1801,87 +1806,10 @@ pub enum PutState {
     Finished(FinishedData),
 }
 
-/// Request to insert/update a value into a contract.
-/// Called when a client initiates a PUT operation.
-pub(crate) async fn request_put(op_manager: &OpManager, put_op: PutOp) -> Result<(), OpError> {
-    let (id, contract, value, related_contracts, htl, subscribe, blocking_subscribe) =
-        match &put_op.state {
-            Some(PutState::PrepareRequest(data)) => (
-                put_op.id,
-                data.contract.clone(),
-                data.value.clone(),
-                data.related_contracts.clone(),
-                data.htl,
-                data.subscribe,
-                data.blocking_subscribe,
-            ),
-            _ => {
-                tracing::error!(
-                    tx = %put_op.id,
-                    state = ?put_op.state,
-                    phase = "error",
-                    "request_put called with unexpected state"
-                );
-                return Err(OpError::UnexpectedOpState);
-            }
-        };
-
-    let key = contract.key();
-
-    tracing::info!(tx = %id, contract = %key, htl, subscribe, phase = "request", "Starting PUT operation");
-
-    // Build initial skip list with our own address
-    let mut skip_list = HashSet::new();
-    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
-        skip_list.insert(own_addr);
-    }
-
-    // Create the request message
-    let msg = PutMsg::Request {
-        id,
-        contract,
-        related_contracts,
-        value,
-        htl,
-        skip_list,
-    };
-
-    // Transition to AwaitingResponse and send the message
-    // Note: upstream_addr is None because we're the originator
-    // next_hop is None initially - we process locally first then determine routing
-    let new_op = PutOp {
-        id,
-        state: Some(PutState::AwaitingResponse(AwaitingResponseData {
-            subscribe,
-            blocking_subscribe,
-            next_hop: None,
-            current_htl: htl,
-            contract_key: key,
-
-            tried_peers: HashSet::new(),
-            alternatives: vec![],
-            attempts_at_hop: 1,
-            visited: VisitedPeers::default(),
-            retry_payload: None,
-        })),
-        upstream_addr: None,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-
-    // Send through the operation processing pipeline
-    op_manager
-        .notify_op_change(NetMessage::from(msg), OpEnum::Put(new_op))
-        .await?;
-
-    Ok(())
-}
-
 /// Stores the contract state and returns (new_state, state_changed).
 /// `state_changed` is true if the stored state was actually modified
 /// (old state != new state), which is needed to trigger UPDATE propagation.
-async fn put_contract(
+pub(super) async fn put_contract(
     op_manager: &OpManager,
     key: ContractKey,
     state: WrappedState,

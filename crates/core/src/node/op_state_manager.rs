@@ -1940,6 +1940,20 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         let tx = *entry.key();
                         let put_op = entry.value();
 
+                        // Phase 3a (#1454): the task-per-tx PUT driver calls
+                        // `op_manager.completed(client_tx)` on terminal reply
+                        // but does not remove the DashMap entry that
+                        // `process_message` created (legacy `report_result`
+                        // removal path is bypassed). Without this guard the
+                        // GC re-dispatches the completed PUT ~9-15s later,
+                        // which replays `finalize_put_at_originator` side
+                        // effects — in particular it resurrects upstream
+                        // subscriptions on other nodes, breaking
+                        // `test_client_disconnect_triggers_upstream_unsubscribe`.
+                        if ops.completed.contains(&tx) {
+                            continue;
+                        }
+
                         if !put_op.is_client_initiated() {
                             continue;
                         }

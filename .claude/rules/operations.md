@@ -7,15 +7,16 @@ paths:
 # Operations Module Rules
 
 > **Path-scoped rule, legacy state-machine path.** As of #1454 Phase 2b
-> (PR #3806) the first operation (client-initiated SUBSCRIBE via
-> `subscribe_with_id`) has been migrated off the legacy re-entry loop
-> onto a task-per-transaction model in
-> `operations/subscribe/op_ctx_task.rs`. On that path, op state lives in
-> task locals and is never pushed into `OpManager.ops.*`, so rules below
-> that talk about "pushing state" / `load_or_init` / `handle_op_result`
-> apply only to the **legacy state-machine path** (still used by GET,
-> PUT, UPDATE, CONNECT, and by SUBSCRIBE's renewal / PUT-sub-op /
-> executor / intermediate-peer entry points).
+> (PR #3806) SUBSCRIBE's client-initiated path was migrated to a
+> task-per-transaction driver in `operations/subscribe/op_ctx_task.rs`.
+> Phase 3a (PR #3843) migrated client-initiated PUT to
+> `operations/put/op_ctx_task.rs` using the shared `RetryDriver` trait
+> from `op_ctx.rs`. On both paths, op state lives in task locals and
+> is never pushed into `OpManager.ops.*`, so rules below that talk
+> about "pushing state" / `load_or_init` / `handle_op_result` apply
+> only to the **legacy state-machine path** (still used by GET,
+> PUT relay/GC paths, UPDATE, CONNECT, and by SUBSCRIBE's renewal /
+> PUT-sub-op / executor / intermediate-peer entry points).
 >
 > Task-per-tx drivers have their own invariants documented in the
 > `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.
@@ -197,14 +198,14 @@ This is usually benign (duplicate message, already completed)
 → Do NOT treat as error
 ```
 
-**Note (#1454 Phase 2b):** For op kinds with a task-per-tx driver
-(currently SUBSCRIBE client-initiated), the pure-network-message
+**Note (#1454 Phase 2b/3a):** For op kinds with a task-per-tx driver
+(SUBSCRIBE and PUT client-initiated), the pure-network-message
 handler checks `pending_op_results` FIRST and forwards the reply to
 the awaiting task via `node::try_forward_task_per_tx_reply` before
 reaching `load_or_init`. Do NOT "fix" `load_or_init`'s `OpNotPresent`
 handling by trying to look up a task-owned tx there — it will never
 find one, and it shouldn't. The bypass is the load-bearing piece;
-confirm by reading the SUBSCRIBE branch of
+confirm by reading the SUBSCRIBE and PUT branches of
 `handle_pure_network_message_v1` in `node.rs`.
 
 ### WHEN encountering InvalidStateTransition
