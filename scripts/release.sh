@@ -526,10 +526,23 @@ check_prerequisites() {
             local check_runs_json
             check_runs_json=$(gh api repos/freenet/freenet-core/commits/main/check-runs 2>/dev/null || echo "{}")
 
+            # Exclude scheduled workflows and their cascade notifiers from the
+            # release pre-flight check. These run on a cron (not on commit
+            # merge) but attach their check runs to the HEAD commit of main,
+            # which makes them look like PR CI failures to the naive query.
+            # Neither blocks correctness of the commit under release:
+            #  - "Large Scale Simulation" / "Simulation Tests (Nightly)" are
+            #    scheduled soak tests with a long history of flakiness that
+            #    is tracked separately.
+            #  - "Notify Matrix on Failure" is a cascade notifier that fires
+            #    whenever any other workflow fails — it's not itself a test.
+            # If any of these are genuinely broken, fix them on their own
+            # schedule; they should never gate a release of a PR-CI-green
+            # merge commit.
             local total_checks in_progress_count failed_count
             total_checks=$(echo "$check_runs_json" | jq '.total_count // 0')
-            in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and (.name | startswith("Build for") | not) and .name != "claude")] | length')
-            failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude")] | length')
+            in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and (.name | startswith("Build for") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure")] | length')
+            failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure")] | length')
 
             if [[ "$total_checks" == "0" ]]; then
                 echo "⚠️  (no checks found)"
