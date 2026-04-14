@@ -268,16 +268,24 @@ async fn web_subpages(
     // response in the sandbox iframe. Otherwise `variable_content` serves
     // raw HTML with no `authToken` query parameter, breaking webapps that
     // read credentials from `location.search` (freenet/river#208 follow-up:
-    // Delta links hit "Connection failed" on the destination). Hash-routed
-    // webapps preserve their fragment across the redirect; path-based
-    // multi-page apps lose the sub-path but still get a working shell.
+    // Delta links hit "Connection failed" on the destination).
+    //
+    // The browser preserves any URL fragment across a 303 redirect, which
+    // is sufficient for hash-routed webapps (e.g. Delta). Path-based
+    // multi-page apps still lose the sub-path — this redirect restores
+    // the baseline guarantee that top-level contract loads get a working
+    // shell. A fuller fix for path-based deep linking (#3841) would
+    // thread the sub-path into shell generation.
+    //
+    // Clients without `Sec-Fetch-Dest` (curl, older browsers) intentionally
+    // fall through to `variable_content` — matches pre-PR behaviour and
+    // avoids redirect loops for non-browser clients.
     let fetch_dest = req_headers
         .get("sec-fetch-dest")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if should_redirect_subpage_to_shell(is_sandbox, &last_path, fetch_dest) {
-        let shell_url = format!("/{}/contract/web/{key}/", api_version.prefix());
-        return Ok(axum::response::Redirect::to(&shell_url).into_response());
+        return redirect_to_shell_root(&key, api_version, query_string.as_deref());
     }
 
     let version_prefix = api_version.prefix();
@@ -290,6 +298,69 @@ async fn web_subpages(
             add_sandbox_cors_headers(&mut response);
             response
         })
+}
+
+/// Builds a 303 redirect to the contract's shell root, preserving
+/// inbound query parameters (minus sensitive ones that must never be
+/// attacker-controlled across the redirect).
+///
+/// Validates `key` as a `ContractInstanceId` before interpolating into
+/// the `Location` header. A crafted path containing e.g. percent-encoded
+/// CRLF would otherwise reach `HeaderValue::try_from` inside
+/// `Redirect::to`, which panics on invalid header values. Returning a
+/// structured `InvalidParam` error instead keeps the handler panic-free
+/// and lets axum serialise a normal 4xx response.
+///
+/// `__sandbox=1` is stripped so a crafted deep link cannot land the
+/// victim inside `web_home`'s sandbox branch and bypass shell
+/// generation entirely. `authToken` is stripped so a malicious
+/// cross-contract link cannot inject a token into the destination
+/// shell's `location.search`; the shell generates its own token via
+/// `AuthToken::generate()` and any forwarded value would only mislead
+/// webapps that read credentials from the URL.
+fn redirect_to_shell_root(
+    key: &str,
+    api_version: ApiVersion,
+    query_string: Option<&str>,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    if key.is_empty() {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "empty contract key in redirect target".into(),
+        });
+    }
+    let _instance_id =
+        ContractInstanceId::from_bytes(key).map_err(|err| WebSocketApiError::InvalidParam {
+            error_cause: format!("invalid contract key in redirect target: {err}"),
+        })?;
+
+    let filtered_query = query_string
+        .map(|qs| {
+            qs.split('&')
+                .filter(|p| !p.is_empty())
+                .filter(|p| !is_sensitive_query_param(p))
+                .collect::<Vec<_>>()
+                .join("&")
+        })
+        .filter(|s| !s.is_empty());
+
+    let prefix = api_version.prefix();
+    let shell_url = match filtered_query {
+        Some(qs) => format!("/{prefix}/contract/web/{key}/?{qs}"),
+        None => format!("/{prefix}/contract/web/{key}/"),
+    };
+    Ok(axum::response::Redirect::to(&shell_url).into_response())
+}
+
+/// Query parameters that must be stripped before forwarding a user URL
+/// into the shell. `__sandbox` is a server-interpreted routing flag;
+/// `authToken` is the shell's auth credential and must only come from
+/// `AuthToken::generate()`, never from an attacker-controlled URL.
+fn is_sensitive_query_param(param: &str) -> bool {
+    // Prefix-match so variants like `__sandbox_debug` or `authTokenExtra`
+    // (from a future refactor or an adversarial URL) are also stripped.
+    // Matches the filter in `path_handlers::shell_page` that forwards
+    // query params into the iframe.
+    param.starts_with("__sandbox") || param.starts_with("authToken")
 }
 
 /// Returns true if a contract sub-path request is a top-level HTML
@@ -340,8 +411,7 @@ async fn serve_sandbox_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if fetch_dest == "document" {
-        let shell_url = format!("/{}/contract/web/{key}/", api_version.prefix());
-        return Ok(axum::response::Redirect::to(&shell_url).into_response());
+        return redirect_to_shell_root(&key, api_version, None);
     }
 
     let contract_response =
@@ -608,6 +678,241 @@ mod tests {
         // redirecting would break multi-page navigation inside the sandbox.
         assert!(!should_redirect_subpage_to_shell(true, "page2", "iframe"));
         assert!(!should_redirect_subpage_to_shell(true, "page2", "document"));
+    }
+
+    /// A valid contract key used across redirect tests. Constructed from
+    /// 32 zero bytes so `ContractInstanceId::from_bytes` accepts it.
+    fn valid_contract_key_b58() -> String {
+        use freenet_stdlib::prelude::ContractInstanceId;
+        let bytes = [0u8; 32];
+        ContractInstanceId::new(bytes).to_string()
+    }
+
+    #[test]
+    fn redirect_to_shell_root_drops_sensitive_params_and_preserves_others() {
+        let key = valid_contract_key_b58();
+        // Mixed query with sensitive + harmless params.
+        let query = Some("authToken=attacker&invite=abc&__sandbox=1&room=42");
+        let resp = redirect_to_shell_root(&key, ApiVersion::V1, query)
+            .expect("valid key should not fail validation");
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must set Location")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Pin the full shape: contract sub-path, preserved query (order
+        // preserved, sensitive params stripped).
+        assert_eq!(
+            loc,
+            format!("/v1/contract/web/{key}/?invite=abc&room=42"),
+            "sensitive params must be stripped, harmless ones preserved in order"
+        );
+
+        // Defensive: ensure attacker token never appears anywhere in the
+        // redirect URL. If a future refactor reintroduces it, this fails.
+        assert!(
+            !loc.contains("authToken"),
+            "authToken must never appear in redirect target"
+        );
+        assert!(
+            !loc.contains("__sandbox"),
+            "__sandbox must never appear in redirect target"
+        );
+    }
+
+    #[test]
+    fn redirect_to_shell_root_omits_query_when_empty() {
+        let key = valid_contract_key_b58();
+        let resp = redirect_to_shell_root(&key, ApiVersion::V1, None).unwrap();
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(loc, format!("/v1/contract/web/{key}/"));
+        assert!(!loc.contains('?'));
+
+        // A query that is entirely sensitive params must also produce no
+        // trailing `?` — keeps the URL canonical so browsers don't show
+        // a bare `?` in the address bar.
+        let resp =
+            redirect_to_shell_root(&key, ApiVersion::V1, Some("authToken=x&__sandbox=1")).unwrap();
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(loc, format!("/v1/contract/web/{key}/"));
+    }
+
+    #[test]
+    fn redirect_to_shell_root_uses_303_see_other_for_fragment_preservation() {
+        // A 303 See Other (axum's `Redirect::to` default) has RFC 7231
+        // SHOULD semantics for URL-fragment preservation across the
+        // redirect, and converts any method to GET. Pin so that a future
+        // refactor to `Redirect::temporary` (307) or `Redirect::permanent`
+        // (308) doesn't silently change fragment semantics for hash-routed
+        // webapps like Delta.
+        let key = valid_contract_key_b58();
+        let resp = redirect_to_shell_root(&key, ApiVersion::V1, None).unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::SEE_OTHER);
+    }
+
+    /// Regression test for the L3 panic surface raised during review:
+    /// without key validation, a crafted path containing percent-encoded
+    /// CRLF would reach `HeaderValue::try_from` inside `Redirect::to`,
+    /// which panics on invalid header values. Validating via
+    /// `ContractInstanceId::from_bytes` first converts this into a
+    /// structured 4xx response.
+    #[test]
+    fn redirect_to_shell_root_rejects_invalid_key_instead_of_panicking() {
+        // Obvious garbage.
+        assert!(matches!(
+            redirect_to_shell_root("not-a-real-contract-key", ApiVersion::V1, None),
+            Err(WebSocketApiError::InvalidParam { .. })
+        ));
+        // CRLF-bearing key: exactly the panic surface L3 flagged. Must
+        // return an error, not panic inside the handler.
+        assert!(matches!(
+            redirect_to_shell_root("AAAA\r\nInjected: x", ApiVersion::V1, None),
+            Err(WebSocketApiError::InvalidParam { .. })
+        ));
+        // Empty key.
+        assert!(matches!(
+            redirect_to_shell_root("", ApiVersion::V1, None),
+            Err(WebSocketApiError::InvalidParam { .. })
+        ));
+    }
+
+    /// End-to-end regression: call `web_subpages` with the exact input
+    /// shape the Delta cross-contract-link failure mode produces, and
+    /// assert the handler responds with the shell-root redirect, the
+    /// filtered query string, and the 303 status.
+    ///
+    /// Pins the wiring the predicate-only tests do not reach: the
+    /// `Sec-Fetch-Dest` header lookup, the interaction with the query
+    /// string from `RawQuery`, the redirect URL construction, and the
+    /// full status + `Location` response contract.
+    #[tokio::test]
+    async fn web_subpages_redirects_top_level_document_load_to_shell() {
+        let key = valid_contract_key_b58();
+
+        // Case 1: top-level HTML document load of an HTML sub-path
+        // (non-sandbox, matching a pasted cross-contract link). Must
+        // redirect to shell root, preserving `invite` and stripping
+        // the attacker-supplied `authToken`.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        let resp = web_subpages(
+            key.clone(),
+            "page2".to_string(),
+            ApiVersion::V1,
+            Some("authToken=attacker&invite=abc".to_string()),
+            headers,
+        )
+        .await
+        .expect("redirect response must be Ok");
+        assert_eq!(resp.status(), axum::http::StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("Location header must be set on the redirect")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(loc, format!("/v1/contract/web/{key}/?invite=abc"));
+        assert!(
+            !loc.contains("authToken"),
+            "authToken must be stripped on the redirect hop"
+        );
+
+        // Case 1b: a sandbox sub-page request with `Sec-Fetch-Dest:
+        // document` must still redirect to the shell root (via the
+        // sandbox branch's existing top-level-load guard) rather than
+        // serving raw sandbox content in the top frame. Exercises the
+        // sandbox short-circuit that runs *before* the new redirect
+        // block, which is the path a pasted sandbox URL hits.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        let resp = web_subpages(
+            key.clone(),
+            "page2".to_string(),
+            ApiVersion::V1,
+            Some("__sandbox=1".to_string()),
+            headers,
+        )
+        .await
+        .expect("sandbox document load must redirect, not error");
+        assert_eq!(resp.status(), axum::http::StatusCode::SEE_OTHER);
+
+        // Case 2: missing Sec-Fetch-Dest (curl, older browsers) falls
+        // through to variable_content — pre-PR behaviour preserved, no
+        // redirect loop for non-browser clients. Call returns an error
+        // (file does not exist in the test cache); we assert only that
+        // it is NOT a shell-root redirect.
+        let res = web_subpages(
+            key.clone(),
+            "page2".to_string(),
+            ApiVersion::V1,
+            None,
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        match res {
+            Ok(resp) => assert_ne!(resp.status(), axum::http::StatusCode::SEE_OTHER),
+            Err(_) => {
+                // variable_content returned an error for a missing
+                // cache file, which is fine — the point is that we did
+                // not take the redirect branch.
+            }
+        }
+    }
+
+    /// Regression test pinning the ordering inside `web_subpages`: a
+    /// sandbox iframe request for an HTML sub-path MUST hit the sandbox
+    /// branch (line ~261), not the new top-level-document redirect,
+    /// even if a future reorder moves the redirect block earlier.
+    ///
+    /// We cannot exercise the full sandbox pipeline in a unit test
+    /// (requires a real contract state in the cache), but we can
+    /// assert the predicate-level invariant — `should_redirect_subpage_to_shell`
+    /// returns false for any sandbox request — and check the source
+    /// ordering via byte-offset comparison so that a reorder is caught
+    /// mechanically.
+    #[test]
+    fn web_subpages_sandbox_branch_runs_before_redirect_branch() {
+        let src = include_str!("client_api.rs");
+        // The sandbox short-circuit must appear before the
+        // top-level-document redirect inside `web_subpages`. Both
+        // markers are unique to that function.
+        let sandbox_idx = src
+            .find("serve_sandbox_response(key, api_version, Some(&last_path)")
+            .expect("sandbox short-circuit marker present in web_subpages");
+        let redirect_idx = src
+            .find("should_redirect_subpage_to_shell(is_sandbox")
+            .expect("subpage redirect marker present in web_subpages");
+        assert!(
+            sandbox_idx < redirect_idx,
+            "sandbox branch must run before the top-level-document redirect: \
+             reordering would break sandbox iframe sub-page loads"
+        );
+
+        // Predicate-level invariant: sandbox requests are never
+        // redirected regardless of other inputs.
+        assert!(!should_redirect_subpage_to_shell(true, "page2", "document"));
+        assert!(!should_redirect_subpage_to_shell(true, "news/", "document"));
+        assert!(!should_redirect_subpage_to_shell(
+            true,
+            "index.html",
+            "iframe"
+        ));
     }
 
     #[test]
