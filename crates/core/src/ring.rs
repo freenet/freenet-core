@@ -1872,24 +1872,45 @@ impl Ring {
         const MAX_FAST_TICK_MULTIPLIER: u32 =
             (CHECK_TICK_DURATION.as_secs() / FAST_CHECK_TICK_DURATION.as_secs()) as u32;
 
-        // Suspend/resume detection: boot_time::Instant uses CLOCK_BOOTTIME on Linux,
-        // which advances during suspend (unlike std/tokio Instant which use CLOCK_MONOTONIC).
+        // Suspend/resume detection.
+        //
+        // We compare two clocks that differ only under OS suspend:
+        //
+        //   * `boot_time::Instant` → CLOCK_BOOTTIME on Linux. Advances while
+        //     the machine is suspended.
+        //   * `std::time::Instant` → CLOCK_MONOTONIC on Linux. Does *not*
+        //     advance while the machine is suspended.
+        //
+        // The delta between them across a loop iteration is the amount of
+        // time the machine was suspended. Using just `boot_elapsed` alone
+        // also counts scheduler stalls and virtual-time jumps in simulation
+        // tests (`tokio::time::start_paused(true)`), which previously caused
+        // false positives: the Apr 2026 nightly logs showed
+        // `boot_elapsed_secs=139` on CI runners under load, which tripped the
+        // 30s test-only threshold and fired `DropAllConnections` mid-test,
+        // wiping in-flight GET ops and tripping the `debug_assert!` in
+        // `GetMsg::Request` handling. Comparing against a monotonic baseline
+        // eliminates that: a heavy-CPU stall advances *both* clocks equally
+        // (delta ≈ 0) and doesn't trip the detector, while a real suspend
+        // advances only boot time (delta ≈ suspend duration) and does.
         let mut last_boot_time = boot_time::Instant::now();
-        // In production (60s tick), 2x = 120s threshold is fine since real suspend
-        // causes minute+ jumps. In tests (2s tick), 2x = 4s is too tight — CI runners
-        // under load can have >4s scheduling delays between loop iterations, causing
-        // false positives that drop all connections mid-test. Use 30s minimum.
-        #[cfg(not(test))]
+        let mut last_mono_time = std::time::Instant::now();
+        // 2x the check tick is plenty of headroom to tell a real suspend
+        // (minutes) from the sub-tick jitter that a healthy monotonic clock
+        // can still exhibit relative to CLOCK_BOOTTIME.
         const SUSPEND_DETECTION_THRESHOLD: Duration = CHECK_TICK_DURATION.saturating_mul(2);
-        #[cfg(test)]
-        const SUSPEND_DETECTION_THRESHOLD: Duration = Duration::from_secs(30);
 
         let mut this_peer = None;
         loop {
-            // Update boot-time tracking at the top of every iteration (including
+            // Update clock tracking at the top of every iteration (including
             // early-continue paths) so elapsed time doesn't accumulate during startup.
             let boot_elapsed = last_boot_time.elapsed();
+            let mono_elapsed = last_mono_time.elapsed();
             last_boot_time = boot_time::Instant::now();
+            last_mono_time = std::time::Instant::now();
+            // Real OS suspend advances boot time while monotonic stays flat;
+            // scheduler stalls and virtual-time jumps advance both equally.
+            let suspend_jump = boot_elapsed.saturating_sub(mono_elapsed);
 
             let op_manager = match self.upgrade_op_manager() {
                 Some(op_manager) => op_manager,
@@ -1932,12 +1953,15 @@ impl Ring {
                     .clear_pending_reservations_for(&gateway_addrs);
             };
 
-            // Suspend/resume detection: if boot-time elapsed much more than
-            // the tick interval, we were likely suspended. boot_elapsed was
-            // computed at the top of the loop so it includes early-continue time.
-            if boot_elapsed > SUSPEND_DETECTION_THRESHOLD {
+            // Suspend/resume detection: if boot time advanced much more than
+            // monotonic time, the machine was suspended. Both `suspend_jump`
+            // and the underlying clock reads happen at the top of the loop so
+            // they include early-continue time.
+            if suspend_jump > SUSPEND_DETECTION_THRESHOLD {
                 tracing::warn!(
                     boot_elapsed_secs = boot_elapsed.as_secs(),
+                    mono_elapsed_secs = mono_elapsed.as_secs(),
+                    suspend_jump_secs = suspend_jump.as_secs(),
                     "Detected suspend/resume (boot-time jump) — dropping all connections and clearing state"
                 );
                 reset_all_backoff();
