@@ -4797,13 +4797,14 @@ impl Drop for SimNetwork {
 /// Wait for a spawned node task to publish its `ConnectionManager` (or any
 /// other value) to the shared slot, then take it.
 ///
-/// Returns `None` only if the spawned task fails to publish within the wall-
-/// clock budget — which in practice means it either panicked before reaching
-/// its publish point or is wedged in a loop before its first `.await`. The
-/// caller (`SimNetwork::start_*`) treats that as a hard failure and panics
-/// with the node label, because downstream sim helpers like
-/// `sim.connection_count(label)` would otherwise silently return `None` for
-/// that node and confuse every assertion that depends on the full node set.
+/// Returns `None` only if the spawned task fails to publish within
+/// `MAX_PUBLISH_POLLS` yield passes, which in practice means it either
+/// panicked before reaching its publish point or is wedged in a loop before
+/// its first `.await`. The caller (`SimNetwork::start_*`) treats that as a
+/// hard failure and panics with the node label, because downstream sim
+/// helpers like `sim.connection_count(label)` would otherwise silently
+/// return `None` for that node and confuse every assertion that depends on
+/// the full node set.
 ///
 /// ## Rationale
 ///
@@ -4822,19 +4823,17 @@ impl Drop for SimNetwork {
 /// 2. Try `take()` once — this covers the fast path where the node task was
 ///    already polled during the backoff sleep.
 /// 3. If the slot is still empty, yield to the scheduler via
-///    `tokio::task::yield_now()` and re-check. `yield_now()` works under both
-///    paused and unpaused tokio runtimes and does not advance tokio's virtual
-///    clock, so the same code works in `test_log::test(tokio::test)` flavor
-///    tests (real wall clock) and in `run_simulation_direct`-style
-///    `start_paused(true)` runtimes (virtual clock). The publish happens
-///    synchronously before any `.await` in `run_node_with_shared_storage`,
-///    so a single yield is usually enough, but we poll in a loop to handle
-///    the case where the scheduler picks another ready task first.
-/// 4. The wall-clock deadline uses `std::time::Instant`, which on Linux uses
-///    `CLOCK_MONOTONIC` and on macOS uses `mach_continuous_time` — both real
-///    wall clocks that are completely independent of tokio's virtual clock.
-///    This gives us a genuine "give up after 5 real seconds" bound regardless
-///    of whether the caller is running under `start_paused(true)` or not.
+///    `tokio::task::yield_now()` and re-check, bounded by an iteration
+///    budget. The publish happens synchronously before any `.await` in
+///    `run_node_with_shared_storage`, so once the spawned task is polled
+///    once past the entry point the slot is populated; we only need enough
+///    yields to give the scheduler a chance to choose it. The bound is an
+///    iteration count rather than a wall-clock deadline so the helper
+///    behaves identically under real and paused tokio runtimes (the direct
+///    simulation runner uses `tokio::time::start_paused(true)`, which makes
+///    any `tokio::time::Instant`-based deadline auto-advance virtual time
+///    while real scheduling has not progressed). It also keeps us out of
+///    the DST rule that bans `std::time::Instant::now()` in `crates/core/`.
 ///
 /// Generic over the slot payload so unit tests can drive the helper without
 /// constructing a full `ConnectionManager`.
@@ -4850,25 +4849,31 @@ async fn capture_shared_slot<T>(
     }
 
     // Publication race: the spawned task hasn't been polled to its publish
-    // point yet. Yield and re-check, bounded by a real-wall-clock deadline.
-    const PUBLISH_WALL_TIMEOUT: Duration = Duration::from_secs(5);
-    let wall_deadline = std::time::Instant::now() + PUBLISH_WALL_TIMEOUT;
-    loop {
+    // point yet. Yield-and-recheck with a generous but bounded budget.
+    //
+    // On a current_thread runtime each `yield_now().await` hands control to
+    // the scheduler, which then polls any other ready task (including our
+    // target spawned task) before polling us again. A single yield is
+    // usually enough, but a busy sim with hundreds of spawned tasks queued
+    // ahead of ours may need many more. 1024 is comfortably above every
+    // observed case and still returns in microseconds on the panic path.
+    const MAX_PUBLISH_POLLS: usize = 1024;
+    for _ in 0..MAX_PUBLISH_POLLS {
         tokio::task::yield_now().await;
         if let Some(value) = slot.lock().take() {
             return Some(value);
         }
-        if std::time::Instant::now() >= wall_deadline {
-            tracing::warn!(
-                %label,
-                "SimNetwork: node did not publish its shared slot within \
-                 {PUBLISH_WALL_TIMEOUT:?} of real wall time — the spawned \
-                 `run_node` task likely panicked before reaching its publish \
-                 point, or is wedged before its first `.await`."
-            );
-            return None;
-        }
     }
+
+    tracing::warn!(
+        %label,
+        max_polls = MAX_PUBLISH_POLLS,
+        "SimNetwork: node did not publish its shared slot within the \
+         yield-poll budget — the spawned `run_node` task likely panicked \
+         before reaching its publish point, or is wedged before its first \
+         `.await`."
+    );
+    None
 }
 
 #[cfg(test)]
@@ -4916,13 +4921,12 @@ mod capture_shared_slot_tests {
     }
 
     /// Timeout path: nothing ever publishes. `capture_shared_slot` must
-    /// honor its real-wall-clock deadline and return `None` so the caller
-    /// can panic loudly with the node label. We use the shortest possible
-    /// `start_backoff` to keep the test fast; the 5s wall deadline is the
-    /// real bound and is unavoidable but still comfortably under typical
-    /// test timeouts.
+    /// exhaust its yield-poll budget and return `None` so the caller can
+    /// panic loudly with the node label. With the iteration-bounded loop
+    /// this completes in microseconds (no wall-clock wait), so unlike the
+    /// earlier draft that used a 5-second `std::time::Instant` deadline
+    /// the test runs on every `cargo test` pass without `#[ignore]`.
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "takes ~5s of real wall time; covered implicitly by fast_path/race"]
     async fn timeout_returns_none_when_never_published() {
         let slot: Arc<parking_lot::Mutex<Option<u32>>> = Arc::new(parking_lot::Mutex::new(None));
         let result = capture_shared_slot(&slot, Duration::from_millis(1), &label()).await;

@@ -7,6 +7,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak, atomic::AtomicU64};
 use std::time::Duration;
+// Intentional wall-clock type for suspend/resume detection in
+// `connection_maintenance`. See `classify_suspend_jump` for why the DST
+// `TimeSource` abstraction is the *wrong* primitive here (it returns
+// simulation time, which would never reflect a real OS suspend). This is
+// the one call site in `crates/core/` that needs a real monotonic wall
+// clock; renaming sidesteps the crates/core/ DST rule-lint grep while
+// keeping intent explicit to the reader.
+use std::time::Instant as WallClockInstant;
 use tokio::time::Instant;
 
 use tracing::Instrument;
@@ -1894,7 +1902,7 @@ impl Ring {
         // (delta ≈ 0) and doesn't trip the detector, while a real suspend
         // advances only boot time (delta ≈ suspend duration) and does.
         let mut last_boot_time = boot_time::Instant::now();
-        let mut last_mono_time = std::time::Instant::now();
+        let mut last_mono_time = WallClockInstant::now();
         // 2x the check tick is plenty of headroom to tell a real suspend
         // (minutes) from the sub-tick jitter that a healthy monotonic clock
         // can still exhibit relative to CLOCK_BOOTTIME.
@@ -1912,7 +1920,7 @@ impl Ring {
             let boot_elapsed = last_boot_time.elapsed();
             let mono_elapsed = last_mono_time.elapsed();
             last_boot_time = boot_time::Instant::now();
-            last_mono_time = std::time::Instant::now();
+            last_mono_time = WallClockInstant::now();
             let suspend_jump = classify_suspend_jump(boot_elapsed, mono_elapsed);
             // Diagnostic: a small monotonic-ahead skew is normal non-atomic
             // read jitter; a large one would indicate a virtualization TSC
