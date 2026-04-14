@@ -2124,6 +2124,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.27.0",
  "toml 1.1.2+spec-1.1.0",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-appender",

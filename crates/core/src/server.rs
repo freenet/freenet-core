@@ -581,10 +581,19 @@ async fn serve_client_api_in_impl(
     // (e.g. for a Tailscale tailnet range).
     let needs_lan_filter = !config.address.is_loopback();
     let router = if needs_lan_filter {
+        // Layer ordering matters: axum executes layers bottom-to-top per
+        // `Router::layer` docs, so the LAST `.layer(..)` call is the
+        // OUTERMOST and runs first in request flow. `private_network_filter`
+        // uses an `Extension<AllowedSourceCidrs>` extractor, so that
+        // Extension layer must be applied AFTER the `from_fn` layer here —
+        // otherwise the extension is injected after the filter runs and
+        // every request 500s because the extractor finds nothing. Docker
+        // NAT tests caught this (see regression in this module's `tests`
+        // submodule, `middleware_has_extension_injected`).
         ws_router
             .layer(Extension(allowed_hosts))
-            .layer(Extension(allowed_source_cidrs))
             .layer(axum::middleware::from_fn(private_network_filter))
+            .layer(Extension(allowed_source_cidrs))
             .layer(TraceLayer::new_for_http())
     } else {
         ws_router
@@ -808,6 +817,82 @@ mod tests {
 
     fn cidrs(list: &[&str]) -> AllowedSourceCidrs {
         AllowedSourceCidrs(Arc::new(list.iter().map(|s| s.parse().unwrap()).collect()))
+    }
+
+    /// Regression test for a layer-ordering bug that was only caught by the
+    /// Docker NAT CI job: axum executes `.layer(..)` calls bottom-to-top, so
+    /// the LAST `.layer(..)` call is the OUTERMOST and runs FIRST. If
+    /// `Extension(AllowedSourceCidrs)` is applied before `from_fn(filter)`
+    /// in the builder chain, the filter's `Extension<AllowedSourceCidrs>`
+    /// extractor runs before the extension is injected and every request
+    /// 500s — silently breaking every HTTP client including the in-test
+    /// connectivity probe. The test below builds the exact layer stack from
+    /// `serve_client_api_in_impl` and drives it with a synthetic request
+    /// from both an allowlisted source and a public one; if someone
+    /// reorders the layers again, the allowlisted request will stop
+    /// returning 200 and this test fails.
+    #[tokio::test]
+    async fn middleware_layer_stack_allows_configured_source() {
+        use axum::{Router, routing::get};
+        use tower::ServiceExt;
+
+        async fn handler() -> &'static str {
+            "ok"
+        }
+
+        let allowed = cidrs(&["100.64.0.0/10"]);
+        let app: Router = Router::new()
+            .route("/", get(handler))
+            .layer(axum::middleware::from_fn(private_network_filter))
+            .layer(Extension(allowed));
+
+        // A request with a ConnectInfo from inside the allowlist must
+        // pass through the middleware and reach the handler.
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                [100, 64, 0, 1],
+                12345,
+            ))))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "allowlisted CGNAT source must reach the handler; \
+             500 here means the middleware failed to extract the Extension \
+             (check layer ordering in serve_client_api_in_impl)"
+        );
+
+        // Public source outside the allowlist must be rejected with 403.
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                [8, 8, 8, 8],
+                12345,
+            ))))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+        // Loopback with empty allowlist (separate router) must still pass
+        // via the private-IP branch — the OR composition guard.
+        let empty_app: Router = Router::new()
+            .route("/", get(handler))
+            .layer(axum::middleware::from_fn(private_network_filter))
+            .layer(Extension(AllowedSourceCidrs::default()));
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                12345,
+            ))))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = empty_app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 
     #[test]

@@ -151,6 +151,7 @@ which = { workspace = true }
 regex = { workspace = true }
 serial_test = { workspace = true }
 url = "2"
+tower = { version = "0.5", features = ["util"] }
 
 # CI-optimized benchmark suite (~5 min, deterministic)
 [[bench]]
