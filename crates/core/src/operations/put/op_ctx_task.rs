@@ -632,7 +632,9 @@ mod tests {
                 }
                 .into()))
             }
-            _ => unreachable!(),
+            RetryLoopOutcome::Done(_)
+            | RetryLoopOutcome::Unexpected
+            | RetryLoopOutcome::InfraError(_) => unreachable!(),
         };
         assert!(
             matches!(outcome, DriverOutcome::Publish(Err(_))),
