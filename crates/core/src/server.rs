@@ -392,6 +392,70 @@ impl AllowedSourceCidrs {
     }
 }
 
+/// Minimum IPv4 CIDR prefix length the operator allowlist will accept.
+///
+/// `/8` is the broadest reasonable range: it still covers `10.0.0.0/8`
+/// (RFC1918) and `100.64.0.0/10` (CGNAT / Tailscale). Anything shorter
+/// (`/7` through `/0`) would span enormous public space — `0.0.0.0/0`
+/// would expose the fully-privileged client API to the entire internet
+/// — so we refuse to load such configs at all rather than trust the
+/// operator typed what they meant.
+const MIN_IPV4_PREFIX_LEN: u8 = 8;
+
+/// Minimum IPv6 CIDR prefix length accepted for the same reason.
+/// `/16` still accommodates a /48 tailnet, /56 Hurricane Electric subnet,
+/// or /64 home LAN while refusing `::/0`-sized footguns.
+const MIN_IPV6_PREFIX_LEN: u8 = 16;
+
+/// Validates a single operator-supplied CIDR for the local-API allowlist.
+///
+/// Returns an error if the prefix length is shorter than
+/// [`MIN_IPV4_PREFIX_LEN`] / [`MIN_IPV6_PREFIX_LEN`], which would widen the
+/// trust boundary past anything the operator could plausibly own. This is a
+/// safety net, not a substitute for good judgment: a user can still pass
+/// `8.8.0.0/16` and reach the public internet on purpose. We just refuse to
+/// silently accept whole-internet footguns like `0.0.0.0/0`.
+pub fn validate_source_cidr(net: &ipnet::IpNet) -> Result<(), String> {
+    let (prefix, min) = match net {
+        ipnet::IpNet::V4(v4) => (v4.prefix_len(), MIN_IPV4_PREFIX_LEN),
+        ipnet::IpNet::V6(v6) => (v6.prefix_len(), MIN_IPV6_PREFIX_LEN),
+    };
+    if prefix < min {
+        return Err(format!(
+            "CIDR `{net}` has prefix /{prefix}; minimum accepted is /{min}. \
+             Shorter prefixes would trust too large a range for a \
+             fully-privileged local API."
+        ));
+    }
+    Ok(())
+}
+
+/// Pure decision function for the source-IP filter.
+///
+/// Extracted from [`private_network_filter`] so the boolean composition can
+/// be unit-tested directly — catching inverted-operator regressions that
+/// would turn a security bypass into a silent test pass.
+///
+/// The filter accepts traffic when the source IP is private (loopback,
+/// RFC1918, IPv6 ULA / link-local) **or** when it matches an operator-
+/// supplied CIDR. IPv4-mapped IPv6 sources (`::ffff:a.b.c.d`) are normalized
+/// to IPv4 before the CIDR check so operators can write CIDRs in natural v4
+/// notation even on a dual-stack socket. (`is_private_ip` already handles
+/// mapped-v6 internally.)
+pub(crate) fn is_source_allowed(ip: IpAddr, allowed: &AllowedSourceCidrs) -> bool {
+    if is_private_ip(&ip) {
+        return true;
+    }
+    let match_ip = match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    allowed.contains(&match_ip)
+}
+
 /// Builds the allowlist of hostnames/IPs for WebSocket `Host` header validation.
 ///
 /// Each entry is stored with and without the port suffix so both
@@ -499,12 +563,16 @@ async fn serve_client_api_in_impl(
     tracing::info!(?allowed_hosts, "WebSocket Host header allowlist built");
 
     let allowed_source_cidrs = AllowedSourceCidrs(Arc::new(config.allowed_source_cidrs.clone()));
-    if !allowed_source_cidrs.0.is_empty() {
+    // Log each range on its own line so ops journald/grep output stays
+    // legible. `warn!` because granting non-private access to a fully-
+    // privileged API is a posture change the operator should see on every
+    // boot, not a silent tweak buried in info.
+    for cidr in allowed_source_cidrs.0.iter() {
         tracing::warn!(
-            cidrs = ?allowed_source_cidrs.0,
-            "Extra source CIDR ranges enabled for local API. \
-             Ensure these ranges are fully under your control; \
-             anything reachable in them can access contract state and keys."
+            %cidr,
+            "Local API source CIDR enabled: ensure this range is fully under \
+             your control. Anything reachable in it can access contract \
+             state and keys."
         );
     }
 
@@ -537,17 +605,7 @@ async fn private_network_filter(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let ip = connect_info.0.ip();
-    // Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to IPv4 so operator-supplied
-    // CIDRs expressed in IPv4 notation match traffic arriving on a dual-stack
-    // socket.
-    let match_ip = match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    };
-    if !is_private_ip(&match_ip) && !allowed_source_cidrs.contains(&match_ip) {
+    if !is_source_allowed(ip, &allowed_source_cidrs) {
         tracing::warn!(
             remote_ip = %ip,
             "Rejected connection from non-private IP"
@@ -791,6 +849,132 @@ mod tests {
         assert!(!allow.contains(&IpAddr::V6(Ipv6Addr::new(
             0xfd7a, 0x115c, 0xa1e1, 0, 0, 0, 0, 1
         ))));
+    }
+
+    // Middleware decision tests: exercise the full boolean composition of
+    // `is_source_allowed`, not just `AllowedSourceCidrs::contains`. An
+    // inverted operator in the middleware would still pass the bare
+    // `contains` tests above, so these are the regression guards that
+    // actually prevent a security bypass.
+
+    #[test]
+    fn is_source_allowed_accepts_private_with_empty_allowlist() {
+        let empty = AllowedSourceCidrs::default();
+        assert!(is_source_allowed(IpAddr::V4(Ipv4Addr::LOCALHOST), &empty));
+        assert!(is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            &empty
+        ));
+        assert!(is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            &empty
+        ));
+        assert!(is_source_allowed(IpAddr::V6(Ipv6Addr::LOCALHOST), &empty));
+    }
+
+    #[test]
+    fn is_source_allowed_rejects_public_with_empty_allowlist() {
+        let empty = AllowedSourceCidrs::default();
+        assert!(!is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            &empty
+        ));
+        assert!(!is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            &empty
+        ));
+        assert!(!is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)),
+            &empty
+        ));
+    }
+
+    #[test]
+    fn is_source_allowed_accepts_configured_tailscale_range() {
+        let tailnet = cidrs(&["100.64.0.0/10"]);
+        assert!(is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            &tailnet
+        ));
+        assert!(is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(100, 127, 0, 1)),
+            &tailnet
+        ));
+        // Outside the tailnet range, not private: must still reject.
+        assert!(!is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1)),
+            &tailnet
+        ));
+        assert!(!is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            &tailnet
+        ));
+        // Private IPs still pass alongside the CIDR.
+        assert!(is_source_allowed(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            &tailnet
+        ));
+    }
+
+    #[test]
+    fn is_source_allowed_normalizes_ipv4_mapped_ipv6_for_cidr_match() {
+        // An IPv4 client arriving on a dual-stack socket presents as
+        // ::ffff:a.b.c.d. Operators expect their v4 CIDRs to still match.
+        let tailnet = cidrs(&["100.64.0.0/10"]);
+        let mapped = IpAddr::V6(Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped());
+        assert!(is_source_allowed(mapped, &tailnet));
+
+        // And the same normalization must NOT accidentally promote a
+        // public mapped v4 into the private set: ::ffff:8.8.8.8 stays
+        // rejected with an empty allowlist, and public with an unrelated
+        // allowlist.
+        let public_mapped = IpAddr::V6(Ipv4Addr::new(8, 8, 8, 8).to_ipv6_mapped());
+        assert!(!is_source_allowed(
+            public_mapped,
+            &AllowedSourceCidrs::default()
+        ));
+        assert!(!is_source_allowed(public_mapped, &tailnet));
+    }
+
+    #[test]
+    fn is_source_allowed_accepts_configured_ipv6_range() {
+        let tailnet_v6 = cidrs(&["fd7a:115c:a1e0::/48"]);
+        // fd7a:115c:a1e0::/48 is inside fc00::/7 (ULA) so is_private_ip
+        // already accepts it — the allowlist is a no-op for this case but
+        // the test documents the intent and guards against a future change
+        // that narrows `is_private_ip` and breaks this invariant.
+        let inside = IpAddr::V6(Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0x0001, 0, 0, 0, 1));
+        assert!(is_source_allowed(inside, &tailnet_v6));
+    }
+
+    #[test]
+    fn validate_source_cidr_rejects_overly_broad_ipv4() {
+        // Whole-internet footguns must be rejected at parse time.
+        assert!(validate_source_cidr(&"0.0.0.0/0".parse().unwrap()).is_err());
+        assert!(validate_source_cidr(&"0.0.0.0/7".parse().unwrap()).is_err());
+        // /8 is the minimum accepted (covers 10.0.0.0/8 RFC1918).
+        assert!(validate_source_cidr(&"10.0.0.0/8".parse().unwrap()).is_ok());
+        // /10 allows Tailscale CGNAT.
+        assert!(validate_source_cidr(&"100.64.0.0/10".parse().unwrap()).is_ok());
+        // /32 (single host) is fine.
+        assert!(validate_source_cidr(&"203.0.113.5/32".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn validate_source_cidr_rejects_overly_broad_ipv6() {
+        assert!(validate_source_cidr(&"::/0".parse().unwrap()).is_err());
+        assert!(validate_source_cidr(&"::/15".parse().unwrap()).is_err());
+        assert!(validate_source_cidr(&"::/16".parse().unwrap()).is_ok());
+        assert!(validate_source_cidr(&"fd7a:115c:a1e0::/48".parse().unwrap()).is_ok());
+        assert!(validate_source_cidr(&"::1/128".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn validate_source_cidr_error_message_is_actionable() {
+        let err = validate_source_cidr(&"0.0.0.0/0".parse().unwrap()).unwrap_err();
+        assert!(err.contains("0.0.0.0/0"), "should quote the offending CIDR");
+        assert!(err.contains("/0"), "should state the offending prefix");
+        assert!(err.contains("/8"), "should state the minimum accepted");
     }
 
     #[test]

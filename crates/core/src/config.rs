@@ -646,11 +646,15 @@ impl ConfigArgs {
                         cidrs
                             .iter()
                             .map(|s| {
-                                s.parse::<ipnet::IpNet>().map_err(|e| {
+                                let net = s.parse::<ipnet::IpNet>().map_err(|e| {
                                     anyhow::anyhow!(
                                         "invalid CIDR `{s}` in allowed-source-cidrs: {e}"
                                     )
-                                })
+                                })?;
+                                crate::server::validate_source_cidr(&net).map_err(|msg| {
+                                    anyhow::anyhow!("allowed-source-cidrs: {msg}")
+                                })?;
+                                Ok::<_, anyhow::Error>(net)
                             })
                             .collect::<Result<Vec<_>, _>>()
                     })
@@ -2653,6 +2657,91 @@ mod tests {
         let cfg = args.build().await.unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    /// Build a minimal local-mode ConfigArgs with the given CIDR list and
+    /// return the result of `build().await`. The allowed_source_cidrs path
+    /// is the only interesting variation; everything else is defaulted.
+    async fn build_with_cidrs(cidrs: Option<Vec<String>>) -> anyhow::Result<Config> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ws_api: WebsocketApiArgs {
+                allowed_source_cidrs: cidrs,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        args.build().await
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_round_trip_through_build() {
+        let cfg = build_with_cidrs(Some(vec![
+            "100.64.0.0/10".to_string(),
+            "fd7a:115c:a1e0::/48".to_string(),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(cfg.ws_api.allowed_source_cidrs.len(), 2);
+        assert_eq!(
+            cfg.ws_api.allowed_source_cidrs[0],
+            "100.64.0.0/10".parse::<ipnet::IpNet>().unwrap()
+        );
+        assert_eq!(
+            cfg.ws_api.allowed_source_cidrs[1],
+            "fd7a:115c:a1e0::/48".parse::<ipnet::IpNet>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_default_is_empty() {
+        // Regression guard: if the user configures nothing, the built
+        // config must carry an empty vec so the server-side filter falls
+        // back to private-only behavior.
+        let cfg = build_with_cidrs(None).await.unwrap();
+        assert!(cfg.ws_api.allowed_source_cidrs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_rejects_malformed() {
+        let err = build_with_cidrs(Some(vec!["not-a-cidr".to_string()]))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("allowed-source-cidrs") && msg.contains("not-a-cidr"),
+            "error should name the field and the offending value: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_rejects_whole_internet_catchall() {
+        // 0.0.0.0/0 parses fine as IpNet but the validator must reject
+        // it — this is the footgun the middleware can't defend against
+        // once the vec is populated.
+        let err = build_with_cidrs(Some(vec!["0.0.0.0/0".to_string()]))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("0.0.0.0/0") && msg.contains("/8"),
+            "error should explain why and name the minimum: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_rejects_ipv6_catchall() {
+        let err = build_with_cidrs(Some(vec!["::/0".to_string()]))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("::/0") && msg.contains("/16"));
     }
 
     #[tokio::test]

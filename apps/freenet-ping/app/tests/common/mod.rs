@@ -154,6 +154,7 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             token_ttl_seconds: None,
             token_cleanup_interval_seconds: None,
             allowed_host: None,
+            allowed_source_cidrs: None,
         },
         network_api: NetworkArgs {
             // Use varied IP for network socket to get unique ring locations
