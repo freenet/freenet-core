@@ -317,7 +317,10 @@ where
                             }
                             // StateAndDelta, RelatedState, RelatedDelta, RelatedStateAndDelta
                             // are not supported because the delegate API doesn't provide the
-                            // related contract context needed to resolve them.
+                            // related contract context needed to resolve them. Future
+                            // `UpdateData` variants (the enum is `#[non_exhaustive]` since
+                            // stdlib 0.6.0) fall through the same "unsupported" branch and
+                            // are similarly rejected with a warn-level log.
                             other @ freenet_stdlib::prelude::UpdateData::StateAndDelta {
                                 ..
                             }
@@ -325,7 +328,8 @@ where
                             | other @ freenet_stdlib::prelude::UpdateData::RelatedDelta { .. }
                             | other @ freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta {
                                 ..
-                            } => {
+                            }
+                            | other => {
                                 tracing::warn!(
                                     contract = %contract_id,
                                     variant = ?std::mem::discriminant(&other),
@@ -1020,6 +1024,15 @@ where
                 | freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta { .. } => {
                     unreachable!()
                 }
+                // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0.
+                // Future variants must be explicitly handled before they
+                // flow through `UpdateQuery`; the producer at the edge
+                // should reject unknown variants rather than routing them
+                // here.
+                _ => unreachable!(
+                    "Unknown UpdateData variant reached ContractHandlerEvent::UpdateQuery; \
+                     add explicit handling before landing the new variant upstream"
+                ),
             };
             let update_result = contract_handler
                 .executor()

@@ -136,6 +136,17 @@ impl Hash for RequestResource {
                         state.hash(&mut hasher);
                         delta.hash(&mut hasher);
                     }
+                    // `UpdateData` is `#[non_exhaustive]` since stdlib
+                    // 0.6.0. Future variants reach this arm via the
+                    // compiler's exhaustiveness requirement. Hash them
+                    // under a sentinel discriminant (255) so dedup at
+                    // least never collides with a known variant; if a
+                    // new variant ships, this arm should be specialized
+                    // alongside the upstream change so dedup keys stay
+                    // distinct per content.
+                    _ => {
+                        255u8.hash(&mut hasher);
+                    }
                 }
                 hasher.finish().hash(state);
             }

@@ -1712,6 +1712,11 @@ async fn update_contract(
                         Some(WrappedState::from(state.clone().into_bytes()))
                     }
                     UpdateData::Delta(_) | UpdateData::RelatedDelta { .. } => None,
+                    // `UpdateData` is `#[non_exhaustive]` since stdlib
+                    // 0.6.0. We can't materialize state from an unknown
+                    // variant, so return None and let the caller treat
+                    // it as "no state to extract."
+                    _ => None,
                 }
             }
 

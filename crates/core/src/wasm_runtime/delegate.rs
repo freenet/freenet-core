@@ -196,6 +196,11 @@ impl Runtime {
             InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
             InboundDelegateMsg::ContractNotification(_) => "ContractNotification",
             InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+            // `InboundDelegateMsg` is `#[non_exhaustive]` (stdlib 0.6.0+).
+            // Future variants land here for tracing only — they still flow
+            // through the wasm boundary as raw bincode below; classifying
+            // them as "Unknown" affects logs only, not delivery.
+            _ => "Unknown",
         };
         tracing::debug!(
             inbound_msg_name,
@@ -506,6 +511,14 @@ impl DelegateRuntimeInterface for Runtime {
         // Cleanup happens after the loop regardless of success/failure.
         let process_result: RuntimeResult<()> = (|| {
             for msg in inbound {
+                // The wildcard arm at the bottom of this match exists
+                // solely because `InboundDelegateMsg` is `#[non_exhaustive]`
+                // (stdlib 0.6.0+); every currently-known variant is
+                // enumerated above. Re-listing them in a `pat | _` shape
+                // (as `wildcard_enum_match_arm` would prefer) is needless
+                // duplication that defeats the safety net the wildcard
+                // provides for future variants.
+                #[allow(clippy::wildcard_enum_match_arm)]
                 match msg {
                     InboundDelegateMsg::ApplicationMessage(ApplicationMessage {
                         payload,
@@ -602,6 +615,36 @@ impl DelegateRuntimeInterface for Runtime {
                             params,
                             origin,
                             &msg,
+                            context.clone(),
+                            &running.handle,
+                            instance_id,
+                            api_version,
+                        )?;
+                        context = updated_context;
+
+                        let mut outbound_queue = VecDeque::from(outbound);
+                        self.process_outbound(
+                            delegate_key,
+                            &running.handle,
+                            instance_id,
+                            params,
+                            origin,
+                            &mut outbound_queue,
+                            &mut context,
+                            &mut results,
+                        )?;
+                    }
+                    // `InboundDelegateMsg` is `#[non_exhaustive]` (stdlib
+                    // 0.6.0+). Future variants are forwarded to the WASM
+                    // through the same generic exec path so a delegate
+                    // built against a newer stdlib can handle them; the
+                    // host neither inspects nor classifies their payload.
+                    other => {
+                        let (outbound, updated_context) = self.exec_inbound_with_env(
+                            delegate_key,
+                            params,
+                            origin,
+                            &other,
                             context.clone(),
                             &running.handle,
                             instance_id,
