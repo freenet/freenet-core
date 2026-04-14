@@ -51,6 +51,9 @@ impl ContractInterface for Contract {
                 | UpdateData::RelatedStateAndDelta { .. } => {
                     // Ignore related data for the merge
                 }
+                // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0.
+                // Test fixture only — ignore unknown variants for the merge.
+                _ => {}
             }
         }
         match new_state {

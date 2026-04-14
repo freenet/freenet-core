@@ -2296,7 +2296,7 @@ pub async fn run_local_node(
                     ?origin_contract,
                     "Handling ClientRequest::DelegateOp"
                 );
-                executor.delegate_request(op, origin_contract.as_ref())
+                executor.delegate_request(op, origin_contract.as_ref(), None)
             }
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {

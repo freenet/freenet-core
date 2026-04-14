@@ -92,6 +92,9 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                 | UpdateData::RelatedStateAndDelta { .. } => {
                     // Ignore related data for the merge
                 }
+                // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0.
+                // Mock-only path: ignore future variants for the merge.
+                _ => {}
             }
         }
         match new_state {
@@ -189,6 +192,7 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         &mut self,
         _req: DelegateRequest<'_>,
         _origin_contract: Option<&ContractInstanceId>,
+        _caller_delegate: Option<&DelegateKey>,
     ) -> Response {
         Err(ExecutorError::other(anyhow::anyhow!(
             "delegates not supported in MockWasmRuntime"

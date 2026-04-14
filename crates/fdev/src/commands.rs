@@ -546,6 +546,11 @@ pub(crate) async fn close_api_client(client: &mut WebApi) {
 }
 
 /// Extract the primary state or delta bytes from an update notification.
+///
+/// `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0; the wildcard arm
+/// returns an empty slice for unknown variants. fdev consumers display this
+/// as "no payload" — they should be rebuilt against the stdlib version that
+/// emits the new variant if the bytes are needed.
 fn extract_update_bytes<'a>(update: &'a UpdateData<'_>) -> &'a [u8] {
     match update {
         UpdateData::State(state) => state.as_ref(),
@@ -554,9 +559,12 @@ fn extract_update_bytes<'a>(update: &'a UpdateData<'_>) -> &'a [u8] {
         UpdateData::RelatedState { state, .. } => state.as_ref(),
         UpdateData::RelatedDelta { delta, .. } => delta.as_ref(),
         UpdateData::RelatedStateAndDelta { state, .. } => state.as_ref(),
+        _ => &[],
     }
 }
 
+/// `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0; the wildcard arm
+/// returns "unknown" for future variants.
 fn describe_update_variant(update: &UpdateData<'_>) -> &'static str {
     match update {
         UpdateData::State(_) => "state",
@@ -565,6 +573,7 @@ fn describe_update_variant(update: &UpdateData<'_>) -> &'static str {
         UpdateData::RelatedState { .. } => "related-state",
         UpdateData::RelatedDelta { .. } => "related-delta",
         UpdateData::RelatedStateAndDelta { .. } => "related-state+delta",
+        _ => "unknown",
     }
 }
 

@@ -980,6 +980,30 @@ async fn process_open_request(
                                 state: State::from(state.into_bytes()),
                                 delta: StateDelta::from(delta.into_bytes()),
                             },
+                            // `UpdateData` is `#[non_exhaustive]` since
+                            // stdlib 0.6.0. Future variants reach this
+                            // arm because the compiler requires it; until
+                            // they are explicitly handled (each variant
+                            // has its own owned-bytes conversion), reject
+                            // them here rather than silently dropping the
+                            // payload further down the operation pipeline.
+                            other => {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    variant = ?std::mem::discriminant(&other),
+                                    "Rejecting UPDATE: unknown UpdateData variant — \
+                                     freenet-core was built against an older stdlib than \
+                                     the client expected; rebuild the host to handle this variant"
+                                );
+                                return Err(Error::Node(
+                                    "UPDATE rejected: unknown UpdateData variant from client; \
+                                     rebuild freenet-core against the stdlib version emitting \
+                                     this variant"
+                                        .to_string(),
+                                ));
+                            }
                         };
 
                         tracing::debug!(

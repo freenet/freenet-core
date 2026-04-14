@@ -101,7 +101,7 @@ where
         // Execute the delegate request
         let values = match contract_handler
             .executor()
-            .execute_delegate_request(current_req, origin_contract)
+            .execute_delegate_request(current_req, origin_contract, None)
             .await
         {
             Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
@@ -317,7 +317,10 @@ where
                             }
                             // StateAndDelta, RelatedState, RelatedDelta, RelatedStateAndDelta
                             // are not supported because the delegate API doesn't provide the
-                            // related contract context needed to resolve them.
+                            // related contract context needed to resolve them. Future
+                            // `UpdateData` variants (the enum is `#[non_exhaustive]` since
+                            // stdlib 0.6.0) fall through the same "unsupported" branch and
+                            // are similarly rejected with a warn-level log.
                             other @ freenet_stdlib::prelude::UpdateData::StateAndDelta {
                                 ..
                             }
@@ -325,7 +328,8 @@ where
                             | other @ freenet_stdlib::prelude::UpdateData::RelatedDelta { .. }
                             | other @ freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta {
                                 ..
-                            } => {
+                            }
+                            | other => {
                                 tracing::warn!(
                                     contract = %contract_id,
                                     variant = ?std::mem::discriminant(&other),
@@ -454,8 +458,10 @@ where
         //   delegate registry — they are passed per-request at the API layer. If a target
         //   delegate's process() relies on params, the caller must use ApplicationMessages
         //   directly. This is a known v1 limitation.
-        // - origin_contract is None for inter-delegate delivery since the message
-        //   originates from another delegate, not from a contract attestation context.
+        // - The caller's delegate key is passed as `caller_delegate` so the receiver
+        //   sees `MessageOrigin::Delegate(caller_key)` and can authorize on it
+        //   (issue #3860). The runtime attests this identity — the calling delegate
+        //   cannot forge it.
         // - Inter-delegate messaging only works via ApplicationMessages path; messages
         //   from handle_delegate_notification (contract state change callbacks) do not
         //   trigger delegate-to-delegate delivery.
@@ -476,7 +482,7 @@ where
                 };
                 match contract_handler
                     .executor()
-                    .execute_delegate_request(target_req, None)
+                    .execute_delegate_request(target_req, None, Some(delegate_key))
                     .await
                 {
                     Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
@@ -1056,6 +1062,15 @@ where
                 | freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta { .. } => {
                     unreachable!()
                 }
+                // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0.
+                // Future variants must be explicitly handled before they
+                // flow through `UpdateQuery`; the producer at the edge
+                // should reject unknown variants rather than routing them
+                // here.
+                _ => unreachable!(
+                    "Unknown UpdateData variant reached ContractHandlerEvent::UpdateQuery; \
+                     add explicit handling before landing the new variant upstream"
+                ),
             };
             let update_result = contract_handler
                 .executor()

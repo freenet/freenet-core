@@ -271,7 +271,7 @@ pub mod local_node {
                             .get(&token)
                             .map(|entry| entry.contract_id)
                     });
-                    executor.delegate_request(op, origin_contract.as_ref())
+                    executor.delegate_request(op, origin_contract.as_ref(), None)
                 }
                 ClientRequest::Disconnect { cause } => {
                     if let Some(cause) = cause {

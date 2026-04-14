@@ -1018,7 +1018,11 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                         | UpdateData::StateAndDelta { .. }
                         | UpdateData::RelatedState { .. }
                         | UpdateData::RelatedDelta { .. }
-                        | UpdateData::RelatedStateAndDelta { .. } => {
+                        | UpdateData::RelatedStateAndDelta { .. }
+                        // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0;
+                        // the wildcard handles future variants the same way as
+                        // any other unexpected variant in this assertion.
+                        | _ => {
                             tracing::warn!(
                                 "Client 1: Received unexpected update type: {:?}",
                                 update
@@ -1093,7 +1097,11 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                         | UpdateData::StateAndDelta { .. }
                         | UpdateData::RelatedState { .. }
                         | UpdateData::RelatedDelta { .. }
-                        | UpdateData::RelatedStateAndDelta { .. } => {
+                        | UpdateData::RelatedStateAndDelta { .. }
+                        // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0;
+                        // the wildcard handles future variants the same way as
+                        // any other unexpected variant in this assertion.
+                        | _ => {
                             tracing::warn!(
                                 "Client 2: Received unexpected update type: {:?}",
                                 update
@@ -1169,7 +1177,11 @@ async fn test_multiple_clients_subscription(ctx: &mut TestContext) -> TestResult
                         | UpdateData::StateAndDelta { .. }
                         | UpdateData::RelatedState { .. }
                         | UpdateData::RelatedDelta { .. }
-                        | UpdateData::RelatedStateAndDelta { .. } => {
+                        | UpdateData::RelatedStateAndDelta { .. }
+                        // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0;
+                        // the wildcard handles future variants the same way as
+                        // any other unexpected variant in this assertion.
+                        | _ => {
                             tracing::warn!(
                                 "Client 3: Received unexpected update type: {:?}",
                                 update
@@ -1450,7 +1462,10 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
                     | UpdateData::StateAndDelta { .. }
                     | UpdateData::RelatedState { .. }
                     | UpdateData::RelatedDelta { .. }
-                    | UpdateData::RelatedStateAndDelta { .. } => {
+                    | UpdateData::RelatedStateAndDelta { .. }
+                    // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0;
+                    // wildcard handles future variants as unexpected.
+                    | _ => {
                         tracing::warn!("Client 1: Received unexpected update type: {:?}", update);
                     }
                 }
@@ -1890,7 +1905,10 @@ async fn test_put_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
                     | UpdateData::StateAndDelta { .. }
                     | UpdateData::RelatedState { .. }
                     | UpdateData::RelatedDelta { .. }
-                    | UpdateData::RelatedStateAndDelta { .. } => {
+                    | UpdateData::RelatedStateAndDelta { .. }
+                    // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0;
+                    // wildcard handles future variants as unexpected.
+                    | _ => {
                         tracing::warn!(
                             contract = %contract_key,
                             client = 1,
@@ -2463,6 +2481,7 @@ async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> Tes
                                 "MessageOrigin contract ID does not match expected"
                             );
                         }
+                        other => bail!("Expected MessageOrigin::WebApp, got {other:?}"),
                     }
                     tracing::info!(
                         "SUCCESS: MessageOrigin correctly passed to delegate process function"

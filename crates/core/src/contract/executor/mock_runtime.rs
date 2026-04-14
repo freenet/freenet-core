@@ -702,6 +702,7 @@ where
         &mut self,
         _req: DelegateRequest<'_>,
         _origin_contract: Option<&ContractInstanceId>,
+        _caller_delegate: Option<&DelegateKey>,
     ) -> Response {
         Err(ExecutorError::other(anyhow::anyhow!(
             "not supported in mock runtime"
