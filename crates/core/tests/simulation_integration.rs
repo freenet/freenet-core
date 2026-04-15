@@ -8983,3 +8983,79 @@ async fn test_nightly_fault_recovery_speed() {
         fraction_isolated * 100.0
     );
 }
+
+/// Regression test for the 2026-04-15 nightly failure: pins the
+/// `SimNetwork::config_nodes` regular-node-label indexing convention so
+/// future tests can't silently re-introduce the off-by-GATEWAYS bug that
+/// broke `test_nightly_fault_recovery_speed`.
+///
+/// The convention (`crates/core/src/node/testing_impl.rs::config_nodes`,
+/// circa line 1580) iterates
+/// `number_of_gateways..num + number_of_gateways` when constructing
+/// regular-node labels. For a SimNetwork with G gateways and N nodes, the
+/// live regular-node labels are therefore
+/// `NodeLabel::node(name, G..G + N)` — NOT `0..N`. A test that iterates
+/// `0..N` and calls `NodeLabel::node(name, i)` will miss the top G entries
+/// entirely, deterministically getting `N - G` labels instead of `N`.
+///
+/// This test uses a small SimNetwork (2 gateways, 3 regular nodes, fast
+/// startup) and verifies:
+///   1. `node-0` and `node-1` (inside the gateway ID range) are NOT live
+///      regular-node labels.
+///   2. `node-2`, `node-3`, `node-4` (the `GATEWAYS..GATEWAYS + NODES`
+///      range) ARE live regular-node labels.
+///   3. `node-5` (one past the end) is NOT a live regular-node label.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn sim_network_regular_node_labels_start_at_gateway_count() {
+    const NETWORK_NAME: &str = "label-indexing-regression";
+    const GATEWAYS: usize = 2;
+    const NODES: usize = 3;
+    const SEED: u64 = 0xABCD_1234;
+
+    setup_deterministic_state(SEED);
+
+    let mut sim = SimNetwork::new(
+        NETWORK_NAME,
+        GATEWAYS,
+        NODES,
+        /* ring_max_htl */ 3,
+        /* rnd_if_htl_above */ 2,
+        /* max_connections */ 4,
+        /* min_connections */ 2,
+        SEED,
+    )
+    .await;
+
+    let _handles = sim
+        .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 0, 0)
+        .await;
+
+    // Labels inside the gateway ID range (0..GATEWAYS) must NOT exist as
+    // regular-node labels, even though `NodeLabel::node(name, i)` is a
+    // syntactically valid label for any `i`. The rule being pinned is that
+    // the *live* regular-node set starts at `GATEWAYS`, not 0.
+    for i in 0..GATEWAYS {
+        assert!(
+            sim.connection_count(&NodeLabel::node(NETWORK_NAME, i))
+                .is_none(),
+            "node-{i} must NOT be a live regular-node label (inside gateway range)"
+        );
+    }
+
+    // The live regular-node range is `GATEWAYS..GATEWAYS + NODES`.
+    for i in GATEWAYS..GATEWAYS + NODES {
+        assert!(
+            sim.connection_count(&NodeLabel::node(NETWORK_NAME, i))
+                .is_some(),
+            "node-{i} must be a live regular-node label"
+        );
+    }
+
+    // One past the end must not be live either.
+    assert!(
+        sim.connection_count(&NodeLabel::node(NETWORK_NAME, GATEWAYS + NODES))
+            .is_none(),
+        "node-{} must NOT be a live regular-node label (past end of range)",
+        GATEWAYS + NODES
+    );
+}
