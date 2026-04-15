@@ -2373,6 +2373,149 @@ fn test_subscribe_forwarding_ack_relay() {
 /// relays fall through to the legacy handler and hit the bug. This is why
 /// the *primary* regression test for the bug is the in-process hosting
 /// manager unit test rather than this simulation test.
+///
+/// Simulation-side regression coverage for the bug tracked in #3874: when a
+/// subscribed client disconnects, the node MUST emit an upstream Unsubscribe
+/// so the hoster can drop the downstream subscriber registration.
+///
+/// This test exercises the same code path the failing integration test
+/// `test_client_disconnect_triggers_upstream_unsubscribe` exercises — the
+/// `ClientRequest::Disconnect` arm in `client_events::process_open_request`,
+/// which calls `remove_client_from_all_subscriptions` /
+/// `should_unsubscribe_upstream` / `send_unsubscribe_upstream` — but through
+/// the simulation harness where the bug's preconditions (completed PUT
+/// replay from GC, subscription resurrection, etc.) can be controlled and
+/// reproduced deterministically.
+///
+/// Before this test existed, `SimOperation` had no client-disconnect variant
+/// and simulation had NO coverage of the disconnect → unsubscribe chain —
+/// see #3874 for the full gap analysis. The integration-test regression
+/// that came out of PR #3843 was therefore invisible to the simulation
+/// suite.
+///
+/// This test currently FAILS and reproduces a concrete regression that
+/// was invisible to the simulation suite before: the task-per-tx
+/// subscribe driver in `operations/subscribe/op_ctx_task.rs` does NOT
+/// call `interest_manager.register_peer_interest(..., is_upstream=true)`
+/// on subscribe completion, so `send_unsubscribe_upstream` logs
+/// `"No upstream peer found for unsubscribe"` and no Unsubscribe is
+/// ever emitted. The legacy `operations/subscribe.rs::SubscribeMsg::Response`
+/// arm DOES register the upstream peer (see subscribe.rs:1767), so the
+/// behaviour regressed when client-initiated SUBSCRIBE migrated to the
+/// task-per-tx driver in Phase 2b.
+///
+/// This is either the #3874 root cause or a closely-related bug on the
+/// same code path. Marked `#[ignore]` until the missing registration
+/// is restored; the test is kept in-tree as executable documentation
+/// of the gap and as a regression guard for the fix.
+// Ignored: reproduces #3874 — task-per-tx subscribe driver misses
+// register_peer_interest(.., is_upstream=true). Un-ignore once fixed. #3874
+#[ignore]
+#[test_log::test]
+fn test_client_disconnect_emits_upstream_unsubscribe() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x5CB6_F37C_0003;
+    const NETWORK_NAME: &str = "client-disconnect-unsub";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1, // 1 gateway
+            4, // 4 regular nodes (matching subscribe_forwarding_ack_relay)
+            7, // ring_max_htl
+            3, // rnd_if_htl_above
+            5, // max_connections
+            2, // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xDC);
+    let contract_id = *contract.key().id();
+    let initial_state = SimOperation::create_test_state(1);
+
+    // Gateway PUTs → node-1 subscribes → node-1 disconnects.
+    // Node-1 is a pure downstream subscriber with no further downstream
+    // of its own, so `should_unsubscribe_upstream` must return true
+    // on disconnect and an Unsubscribe must be emitted to its upstream.
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state,
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(NodeLabel::node(NETWORK_NAME, 1), SimOperation::Disconnect),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let (sent_count, received_count) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mut sent = 0usize;
+        let mut received = 0usize;
+        for log in logs.iter() {
+            if log
+                .kind
+                .unsubscribe_sent_instance_id()
+                .is_some_and(|id| *id == contract_id)
+            {
+                sent += 1;
+            }
+            if log
+                .kind
+                .unsubscribe_received_instance_id()
+                .is_some_and(|id| *id == contract_id)
+            {
+                received += 1;
+            }
+        }
+        (sent, received)
+    });
+
+    tracing::info!(
+        sent_count,
+        received_count,
+        "Unsubscribe telemetry after client disconnect"
+    );
+
+    assert!(
+        sent_count > 0,
+        "Disconnecting node MUST emit at least one UnsubscribeSent for the \
+         contract it was subscribed to (sent={sent_count}, received={received_count})"
+    );
+    assert!(
+        received_count > 0,
+        "Upstream node MUST log UnsubscribeReceived after client disconnect \
+         (sent={sent_count}, received={received_count})"
+    );
+}
+
 #[test_log::test]
 fn test_relay_does_not_pollute_active_subscriptions() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};

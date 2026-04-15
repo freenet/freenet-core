@@ -10,238 +10,262 @@
 //! via a semaphore, deduplicates entries per (contract, peer), and replaces
 //! older entries with newer state when a duplicate is enqueued.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use freenet_stdlib::prelude::{ContractKey, WrappedState};
-use tokio::sync::{Mutex, Notify, Semaphore};
 
 use crate::node::OpManager;
 use crate::ring::PeerKeyLocation;
 
 use super::p2p_protoc::P2pBridge;
 
-/// Maximum concurrent outbound broadcast streams for small payloads (< 64KB).
-/// Small payloads (deltas, chat messages) can fan out aggressively without
-/// saturating the uplink since they finish quickly.
-const DEFAULT_SMALL_PAYLOAD_CONCURRENCY: usize = 12;
-
-/// Maximum concurrent outbound broadcast streams for large payloads (>= 64KB).
-/// Large payloads (full state) are rate-limited to avoid uplink saturation.
-const DEFAULT_LARGE_PAYLOAD_CONCURRENCY: usize = 2;
-
-/// Payload size threshold for choosing the small vs large concurrency pool.
-/// Matches the streaming threshold used elsewhere in the broadcast path.
-const PAYLOAD_SIZE_THRESHOLD: usize = 64 * 1024;
-
-/// Maximum entries in the queue before oldest are dropped.
-const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
-
 /// Timeout for awaiting stream completion signal before releasing the permit
 /// anyway. Prevents permanent permit leak if a stream task panics or hangs.
+/// Used by `broadcast_to_single_peer` under both `simulation_tests` and
+/// production, hence kept at module scope rather than inside the cfg-gated
+/// `queue` submodule.
 const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Key for deduplicating broadcast entries: (contract, peer identity).
-type DedupeKey = (ContractKey, PeerKeyLocation);
+// The `BroadcastQueue` struct (constants, types, impl) is only used in the
+// production `p2p_protoc` path. Under `simulation_tests` the code routes
+// through `broadcast_to_single_peer` directly (see p2p_protoc.rs), so the
+// queue itself is dead code in that build. Gate it out to keep
+// `cargo clippy --features simulation_tests -- -D warnings` clean.
+#[cfg(not(feature = "simulation_tests"))]
+mod queue {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Arc;
 
-/// A pending broadcast entry in the queue.
-struct BroadcastEntry {
-    key: ContractKey,
-    target: PeerKeyLocation,
-    new_state: WrappedState,
-    /// Payload size in bytes, used to select concurrency pool.
-    payload_size: usize,
-}
+    use freenet_stdlib::prelude::{ContractKey, WrappedState};
+    use tokio::sync::{Mutex, Notify, Semaphore};
 
-/// Internal queue state: FIFO ordering via VecDeque + HashMap for dedup lookup.
-struct QueueState {
-    /// FIFO order of dedup keys. Entries may be stale if replaced by dedup.
-    order: VecDeque<DedupeKey>,
-    /// Actual entries, keyed by (contract, peer). Dedup replaces the state in-place.
-    entries: HashMap<DedupeKey, BroadcastEntry>,
-}
+    use crate::node::OpManager;
+    use crate::ring::PeerKeyLocation;
 
-impl QueueState {
-    fn new() -> Self {
-        Self {
-            order: VecDeque::new(),
-            entries: HashMap::new(),
-        }
-    }
+    use super::super::p2p_protoc::P2pBridge;
+    use super::broadcast_to_single_peer;
 
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
+    /// Maximum concurrent outbound broadcast streams for small payloads (< 64KB).
+    /// Small payloads (deltas, chat messages) can fan out aggressively without
+    /// saturating the uplink since they finish quickly.
+    const DEFAULT_SMALL_PAYLOAD_CONCURRENCY: usize = 12;
 
-    /// Pop the oldest entry. Skips stale keys (removed by eviction or dedup).
-    fn pop_front(&mut self) -> Option<BroadcastEntry> {
-        while let Some(key) = self.order.pop_front() {
-            if let Some(entry) = self.entries.remove(&key) {
-                return Some(entry);
-            }
-            // Stale key (was evicted or already popped), skip
-        }
-        None
-    }
-}
+    /// Maximum concurrent outbound broadcast streams for large payloads (>= 64KB).
+    /// Large payloads (full state) are rate-limited to avoid uplink saturation.
+    const DEFAULT_LARGE_PAYLOAD_CONCURRENCY: usize = 2;
 
-/// Global broadcast queue that serializes outbound broadcast streams
-/// with bounded concurrency and deduplication.
-///
-/// Uses dual concurrency pools: small payloads (< 64KB) get high concurrency
-/// (12 slots) for fast fan-out of deltas/chat messages, while large payloads
-/// (>= 64KB) get low concurrency (2 slots) to avoid saturating the uplink.
-#[derive(Clone)]
-pub(crate) struct BroadcastQueue {
-    queue: Arc<Mutex<QueueState>>,
-    notify: Arc<Notify>,
-    small_payload_concurrency: usize,
-    large_payload_concurrency: usize,
-    max_queue_depth: usize,
-}
+    /// Payload size threshold for choosing the small vs large concurrency pool.
+    /// Matches the streaming threshold used elsewhere in the broadcast path.
+    const PAYLOAD_SIZE_THRESHOLD: usize = 64 * 1024;
 
-impl BroadcastQueue {
-    pub(crate) fn new() -> Self {
-        Self {
-            queue: Arc::new(Mutex::new(QueueState::new())),
-            notify: Arc::new(Notify::new()),
-            small_payload_concurrency: DEFAULT_SMALL_PAYLOAD_CONCURRENCY,
-            large_payload_concurrency: DEFAULT_LARGE_PAYLOAD_CONCURRENCY,
-            max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
-        }
-    }
+    /// Maximum entries in the queue before oldest are dropped.
+    const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 
-    /// Enqueue a broadcast for a single (contract, peer) pair.
-    ///
-    /// If an entry for the same contract+peer already exists, it is replaced
-    /// with the newer state (the older state is stale and would be superseded
-    /// anyway). If the queue is at capacity, the oldest entry is evicted.
-    pub(crate) async fn enqueue(
-        &self,
+    /// Key for deduplicating broadcast entries: (contract, peer identity).
+    type DedupeKey = (ContractKey, PeerKeyLocation);
+
+    /// A pending broadcast entry in the queue.
+    struct BroadcastEntry {
         key: ContractKey,
         target: PeerKeyLocation,
         new_state: WrappedState,
-    ) {
-        let dedup_key = (key, target.clone());
-        let mut queue = self.queue.lock().await;
+        /// Payload size in bytes, used to select concurrency pool.
+        payload_size: usize,
+    }
 
-        // Replace-on-dedup: if same contract+peer exists, update state in-place
-        if let Some(existing) = queue.entries.get_mut(&dedup_key) {
-            existing.new_state = new_state;
-            tracing::trace!(
-                contract = %dedup_key.0,
-                peer = ?target.socket_addr(),
-                "Broadcast queue: replaced stale entry with newer state"
-            );
-        } else {
-            // Evict oldest if at capacity
-            while queue.len() >= self.max_queue_depth {
-                if let Some(entry) = queue.pop_front() {
-                    tracing::warn!(
-                        contract = %entry.key,
-                        peer = ?entry.target.socket_addr(),
-                        queue_depth = self.max_queue_depth,
-                        "Broadcast queue full, evicted oldest entry"
-                    );
-                } else {
-                    break;
-                }
+    /// Internal queue state: FIFO ordering via VecDeque + HashMap for dedup lookup.
+    struct QueueState {
+        /// FIFO order of dedup keys. Entries may be stale if replaced by dedup.
+        order: VecDeque<DedupeKey>,
+        /// Actual entries, keyed by (contract, peer). Dedup replaces the state in-place.
+        entries: HashMap<DedupeKey, BroadcastEntry>,
+    }
+
+    impl QueueState {
+        fn new() -> Self {
+            Self {
+                order: VecDeque::new(),
+                entries: HashMap::new(),
             }
-            let payload_size = new_state.size();
-            queue.entries.insert(
-                dedup_key.clone(),
-                BroadcastEntry {
-                    key,
-                    target,
-                    new_state,
-                    payload_size,
-                },
-            );
-            queue.order.push_back(dedup_key);
         }
 
-        drop(queue);
-        self.notify.notify_one();
-    }
+        fn len(&self) -> usize {
+            self.entries.len()
+        }
 
-    /// Start the background worker that drains the queue with bounded concurrency.
-    ///
-    /// The worker runs forever. It should be spawned as a background task.
-    pub(crate) fn start_worker(
-        &self,
-        bridge: P2pBridge,
-        op_manager: Arc<OpManager>,
-    ) -> tokio::task::JoinHandle<()> {
-        let queue = self.queue.clone();
-        let notify = self.notify.clone();
-        let small_semaphore = Arc::new(Semaphore::new(self.small_payload_concurrency));
-        let large_semaphore = Arc::new(Semaphore::new(self.large_payload_concurrency));
-
-        tokio::spawn(async move {
-            loop {
-                // Register the notified future BEFORE checking the queue to avoid
-                // a race where enqueue() calls notify_one() between our "queue empty"
-                // check and the notified().await call.
-                let notified = notify.notified();
-
-                // Drain all available entries
-                let mut drained_any = false;
-                loop {
-                    let entry = {
-                        let mut q = queue.lock().await;
-                        q.pop_front()
-                    };
-
-                    let Some(entry) = entry else {
-                        break; // Queue empty
-                    };
-                    drained_any = true;
-
-                    // Select concurrency pool based on payload size.
-                    // Small payloads (deltas, chat messages) get high concurrency for
-                    // fast fan-out. Large payloads get low concurrency to avoid saturation.
-                    let sem = if entry.payload_size < PAYLOAD_SIZE_THRESHOLD {
-                        small_semaphore.clone()
-                    } else {
-                        large_semaphore.clone()
-                    };
-
-                    // Acquire semaphore permit to limit concurrent streams.
-                    // This blocks until a slot is available.
-                    let permit = sem.acquire_owned().await;
-                    let Ok(permit) = permit else {
-                        tracing::error!("Broadcast queue semaphore closed unexpectedly");
-                        return;
-                    };
-
-                    let bridge = bridge.clone();
-                    let op_manager = op_manager.clone();
-
-                    tokio::spawn(async move {
-                        let _permit = permit; // Held until this task completes
-
-                        broadcast_to_single_peer(
-                            &bridge,
-                            &op_manager,
-                            entry.key,
-                            entry.new_state,
-                            entry.target,
-                        )
-                        .await;
-                    });
+        /// Pop the oldest entry. Skips stale keys (removed by eviction or dedup).
+        fn pop_front(&mut self) -> Option<BroadcastEntry> {
+            while let Some(key) = self.order.pop_front() {
+                if let Some(entry) = self.entries.remove(&key) {
+                    return Some(entry);
                 }
-
-                if !drained_any {
-                    // Queue was empty, wait for new entries
-                    notified.await;
-                }
-                // If we drained entries, loop immediately to check for more
-                // (the pre-registered notified future is dropped, which is fine)
+                // Stale key (was evicted or already popped), skip
             }
-        })
+            None
+        }
     }
-}
+
+    /// Global broadcast queue that serializes outbound broadcast streams
+    /// with bounded concurrency and deduplication.
+    ///
+    /// Uses dual concurrency pools: small payloads (< 64KB) get high concurrency
+    /// (12 slots) for fast fan-out of deltas/chat messages, while large payloads
+    /// (>= 64KB) get low concurrency (2 slots) to avoid saturating the uplink.
+    #[derive(Clone)]
+    pub(crate) struct BroadcastQueue {
+        queue: Arc<Mutex<QueueState>>,
+        notify: Arc<Notify>,
+        small_payload_concurrency: usize,
+        large_payload_concurrency: usize,
+        max_queue_depth: usize,
+    }
+
+    impl BroadcastQueue {
+        pub(crate) fn new() -> Self {
+            Self {
+                queue: Arc::new(Mutex::new(QueueState::new())),
+                notify: Arc::new(Notify::new()),
+                small_payload_concurrency: DEFAULT_SMALL_PAYLOAD_CONCURRENCY,
+                large_payload_concurrency: DEFAULT_LARGE_PAYLOAD_CONCURRENCY,
+                max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+            }
+        }
+
+        /// Enqueue a broadcast for a single (contract, peer) pair.
+        ///
+        /// If an entry for the same contract+peer already exists, it is replaced
+        /// with the newer state (the older state is stale and would be superseded
+        /// anyway). If the queue is at capacity, the oldest entry is evicted.
+        pub(crate) async fn enqueue(
+            &self,
+            key: ContractKey,
+            target: PeerKeyLocation,
+            new_state: WrappedState,
+        ) {
+            let dedup_key = (key, target.clone());
+            let mut queue = self.queue.lock().await;
+
+            // Replace-on-dedup: if same contract+peer exists, update state in-place
+            if let Some(existing) = queue.entries.get_mut(&dedup_key) {
+                existing.new_state = new_state;
+                tracing::trace!(
+                    contract = %dedup_key.0,
+                    peer = ?target.socket_addr(),
+                    "Broadcast queue: replaced stale entry with newer state"
+                );
+            } else {
+                // Evict oldest if at capacity
+                while queue.len() >= self.max_queue_depth {
+                    if let Some(entry) = queue.pop_front() {
+                        tracing::warn!(
+                            contract = %entry.key,
+                            peer = ?entry.target.socket_addr(),
+                            queue_depth = self.max_queue_depth,
+                            "Broadcast queue full, evicted oldest entry"
+                        );
+                    } else {
+                        break;
+                    }
+                }
+                let payload_size = new_state.size();
+                queue.entries.insert(
+                    dedup_key.clone(),
+                    BroadcastEntry {
+                        key,
+                        target,
+                        new_state,
+                        payload_size,
+                    },
+                );
+                queue.order.push_back(dedup_key);
+            }
+
+            drop(queue);
+            self.notify.notify_one();
+        }
+
+        /// Start the background worker that drains the queue with bounded concurrency.
+        ///
+        /// The worker runs forever. It should be spawned as a background task.
+        pub(crate) fn start_worker(
+            &self,
+            bridge: P2pBridge,
+            op_manager: Arc<OpManager>,
+        ) -> tokio::task::JoinHandle<()> {
+            let queue = self.queue.clone();
+            let notify = self.notify.clone();
+            let small_semaphore = Arc::new(Semaphore::new(self.small_payload_concurrency));
+            let large_semaphore = Arc::new(Semaphore::new(self.large_payload_concurrency));
+
+            tokio::spawn(async move {
+                loop {
+                    // Register the notified future BEFORE checking the queue to avoid
+                    // a race where enqueue() calls notify_one() between our "queue empty"
+                    // check and the notified().await call.
+                    let notified = notify.notified();
+
+                    // Drain all available entries
+                    let mut drained_any = false;
+                    loop {
+                        let entry = {
+                            let mut q = queue.lock().await;
+                            q.pop_front()
+                        };
+
+                        let Some(entry) = entry else {
+                            break; // Queue empty
+                        };
+                        drained_any = true;
+
+                        // Select concurrency pool based on payload size.
+                        // Small payloads (deltas, chat messages) get high concurrency for
+                        // fast fan-out. Large payloads get low concurrency to avoid saturation.
+                        let sem = if entry.payload_size < PAYLOAD_SIZE_THRESHOLD {
+                            small_semaphore.clone()
+                        } else {
+                            large_semaphore.clone()
+                        };
+
+                        // Acquire semaphore permit to limit concurrent streams.
+                        // This blocks until a slot is available.
+                        let permit = sem.acquire_owned().await;
+                        let Ok(permit) = permit else {
+                            tracing::error!("Broadcast queue semaphore closed unexpectedly");
+                            return;
+                        };
+
+                        let bridge = bridge.clone();
+                        let op_manager = op_manager.clone();
+
+                        tokio::spawn(async move {
+                            let _permit = permit; // Held until this task completes
+
+                            broadcast_to_single_peer(
+                                &bridge,
+                                &op_manager,
+                                entry.key,
+                                entry.new_state,
+                                entry.target,
+                            )
+                            .await;
+                        });
+                    }
+
+                    if !drained_any {
+                        // Queue was empty, wait for new entries
+                        notified.await;
+                    }
+                    // If we drained entries, loop immediately to check for more
+                    // (the pre-registered notified future is dropped, which is fine)
+                }
+            })
+        }
+    }
+} // end `mod queue` (cfg-gated)
+
+#[cfg(not(feature = "simulation_tests"))]
+pub(crate) use queue::BroadcastQueue;
 
 /// Send a state change broadcast to a single peer.
 ///

@@ -3938,11 +3938,17 @@ mod test {
 
         assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
 
+        // Wildcard satisfies #[non_exhaustive] on OutboundDelegateMsg so
+        // future stdlib variants don't break this test at compile time.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let app_msg = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => m,
             other => panic!("Expected ApplicationMessage, got {other:?}"),
         };
         let response: OutboundAppMessage = bincode::deserialize(&app_msg.payload)?;
+        // Wildcard satisfies #[non_exhaustive] on OutboundAppMessage so
+        // future stdlib variants don't break this test at compile time.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match response {
             OutboundAppMessage::DelegateMessageReceived {
                 origin_delegate_key_bytes,

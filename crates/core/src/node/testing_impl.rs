@@ -177,6 +177,20 @@ pub enum SimOperation {
         /// Initial state bytes
         state: Vec<u8>,
     },
+    /// Simulate a client disconnecting from this node.
+    ///
+    /// Emits `ClientRequest::Disconnect` through the same
+    /// `MemoryEventsGen` → `client_event_handling` path the real
+    /// WebSocket client takes, so the node runs
+    /// `remove_client_from_all_subscriptions`,
+    /// `should_unsubscribe_upstream`, and `send_unsubscribe_upstream`
+    /// — producing `UnsubscribeSent` / `UnsubscribeReceived` telemetry
+    /// that can be asserted on.
+    ///
+    /// This targets `ClientId::FIRST`, which is the client id used by
+    /// every other `SimOperation` in the same node, so subscriptions
+    /// issued earlier by this operation's node are the ones cleaned up.
+    Disconnect,
 }
 
 impl SimOperation {
@@ -290,6 +304,7 @@ impl SimOperation {
                      by run_controlled_simulation before event dispatch"
                 )
             }
+            SimOperation::Disconnect => ClientRequest::Disconnect { cause: None },
         }
     }
 }
@@ -3423,7 +3438,8 @@ impl SimNetwork {
                 SimOperation::Put { .. }
                 | SimOperation::Get { .. }
                 | SimOperation::Subscribe { .. }
-                | SimOperation::Update { .. } => event_ops.push(scheduled_op),
+                | SimOperation::Update { .. }
+                | SimOperation::Disconnect => event_ops.push(scheduled_op),
             }
         }
 
