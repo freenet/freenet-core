@@ -54,8 +54,10 @@ Each file is a state machine:
 Plus task-per-transaction drivers from #1454 Phase 2b onwards:
   subscribe/op_ctx_task.rs → client-initiated SUBSCRIBE driver
   put/op_ctx_task.rs       → client-initiated PUT driver (Phase 3a)
-    Both use the shared `RetryDriver` trait from `op_ctx.rs` and
+  get/op_ctx_task.rs       → client-initiated GET driver (Phase 3b)
+    All use the shared `RetryDriver` trait from `op_ctx.rs` and
     bypass the OpManager.ops DashMap, owning retry state in task locals.
+    Relay GETs stay on the legacy state machine (tracked in #3883).
 ```
 
 ## Module Map

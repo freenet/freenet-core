@@ -1071,6 +1071,25 @@ where
                 .await;
             }
             NetMessageV1::Get(ref op) => {
+                // Phase 3b (#1454): task-per-tx bypass for client-initiated
+                // GET. Mirror of the PUT bypass above.
+                //
+                // Only forward **terminal** Response/ResponseStreaming messages.
+                // Non-terminal messages (Request, ResponseStreamingAck,
+                // ForwardingAck) must NOT be forwarded: they would fill the
+                // capacity-1 reply channel and cause classify_reply to fail
+                // with Unexpected (Phase 2b bug 2).
+                if matches!(
+                    op,
+                    get::GetMsg::Response { .. } | get::GetMsg::ResponseStreaming { .. }
+                ) && try_forward_task_per_tx_reply(
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Get((*op).clone())),
+                    "get",
+                ) {
+                    return Ok(None);
+                }
+
                 let op_result = handle_op_request::<get::GetOp, _>(
                     &op_manager,
                     &mut conn_manager,

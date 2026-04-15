@@ -1,3 +1,5 @@
+pub(crate) mod op_ctx_task;
+
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 use std::collections::HashSet;
@@ -22,8 +24,7 @@ use super::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
 use super::{OpEnum, OpError, OpOutcome, OperationResult, should_use_streaming};
 use crate::transport::peer_connection::StreamId;
 
-use self::messages::GetStreamingPayload;
-pub(crate) use self::messages::{GetMsg, GetMsgResult};
+pub(crate) use self::messages::{GetMsg, GetMsgResult, GetStreamingPayload};
 
 /// Maximum number of retries to get values.
 const MAX_RETRIES: usize = 10;
@@ -78,6 +79,7 @@ pub(crate) fn start_op(
 }
 
 /// Create a GET operation with a specific transaction ID (for operation deduplication)
+#[allow(dead_code)] // Phase 6 cleanup: client-initiated GET now uses op_ctx_task::start_client_get
 pub(crate) fn start_op_with_id(
     instance_id: ContractInstanceId,
     fetch_contract: bool,

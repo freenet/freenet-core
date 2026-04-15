@@ -10,13 +10,16 @@ paths:
 > (PR #3806) SUBSCRIBE's client-initiated path was migrated to a
 > task-per-transaction driver in `operations/subscribe/op_ctx_task.rs`.
 > Phase 3a (PR #3843) migrated client-initiated PUT to
-> `operations/put/op_ctx_task.rs` using the shared `RetryDriver` trait
-> from `op_ctx.rs`. On both paths, op state lives in task locals and
-> is never pushed into `OpManager.ops.*`, so rules below that talk
-> about "pushing state" / `load_or_init` / `handle_op_result` apply
-> only to the **legacy state-machine path** (still used by GET,
-> PUT relay/GC paths, UPDATE, CONNECT, and by SUBSCRIBE's renewal /
-> PUT-sub-op / executor / intermediate-peer entry points).
+> `operations/put/op_ctx_task.rs`, and Phase 3b migrated
+> client-initiated GET to `operations/get/op_ctx_task.rs`, all using
+> the shared `RetryDriver` trait from `op_ctx.rs`. On these paths,
+> op state lives in task locals and is never pushed into
+> `OpManager.ops.*`, so rules below that talk about "pushing state" /
+> `load_or_init` / `handle_op_result` apply only to the **legacy
+> state-machine path** (still used by GET relay/GC/UPDATE-auto-fetch
+> paths — #3883 tracks relay-GET migration — PUT relay/GC paths,
+> UPDATE, CONNECT, and by SUBSCRIBE's renewal / PUT-sub-op /
+> executor / intermediate-peer entry points).
 >
 > Task-per-tx drivers have their own invariants documented in the
 > `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.
@@ -49,6 +52,23 @@ WRONG:
 BEFORE calling `send_and_await`. State is never published to the
 `OpManager` DashMap; the conceptual ordering rule is the same. See the
 `OpCtx::send_and_await` docstring for the full reasoning.
+
+**GET-specific note (Phase 3b):** for client-initiated GETs the
+bypass at `node.rs::handle_pure_network_message_v1` returns BEFORE
+`handle_op_request` runs, so `process_message` does NOT execute on
+the originator for `GetMsg::Response` / `ResponseStreaming` replies.
+This is by design — there is no `GetOp` in `OpManager.ops.get` for a
+task-per-tx transaction, so `load_or_init` would return
+`OpNotPresent`. The driver (`operations/get/op_ctx_task.rs`) therefore
+owns the originator-side side effects that the legacy Response{Found}
+branch at `get.rs:2329` does: `PutQuery` to cache the state,
+`record_get_access`, `mark_local_client_access`,
+`announce_contract_hosted`, `register_local_hosting`, and
+`broadcast_change_interests`. If you add a new side effect to the
+legacy Response{Found} branch, mirror it in
+`op_ctx_task.rs::cache_contract_locally`. Relay GETs still go through
+`process_message` — the bypass only fires when the originator's
+`pending_op_results` callback is installed, which relays never have.
 
 ## State Machine Rules
 
@@ -198,15 +218,20 @@ This is usually benign (duplicate message, already completed)
 → Do NOT treat as error
 ```
 
-**Note (#1454 Phase 2b/3a):** For op kinds with a task-per-tx driver
-(SUBSCRIBE and PUT client-initiated), the pure-network-message
+**Note (#1454 Phase 2b/3a/3b):** For op kinds with a task-per-tx driver
+(SUBSCRIBE, PUT, and GET client-initiated), the pure-network-message
 handler checks `pending_op_results` FIRST and forwards the reply to
 the awaiting task via `node::try_forward_task_per_tx_reply` before
 reaching `load_or_init`. Do NOT "fix" `load_or_init`'s `OpNotPresent`
 handling by trying to look up a task-owned tx there — it will never
 find one, and it shouldn't. The bypass is the load-bearing piece;
-confirm by reading the SUBSCRIBE and PUT branches of
-`handle_pure_network_message_v1` in `node.rs`.
+confirm by reading the SUBSCRIBE, PUT, and GET branches of
+`handle_pure_network_message_v1` in `node.rs`. For GET the bypass is
+gated on `GetMsg::Response | GetMsg::ResponseStreaming` only —
+non-terminal GetMsg variants (Request, ResponseStreamingAck,
+ForwardingAck) fall through to the legacy state machine, and relay
+nodes (which have no entry in `pending_op_results` for the tx)
+continue handling forwarded messages via `process_message`.
 
 ### WHEN encountering InvalidStateTransition
 
