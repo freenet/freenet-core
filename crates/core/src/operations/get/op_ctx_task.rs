@@ -333,11 +333,9 @@ async fn drive_client_get_inner(
                 outcome: RouteOutcome::SuccessUntimed,
                 op_type: Some(crate::node::network_status::OpType::Get),
             };
-            if let Some(log_event) = crate::tracing::NetEventLog::route_event(
-                &client_tx,
-                &op_manager.ring,
-                &route_event,
-            ) {
+            if let Some(log_event) =
+                crate::tracing::NetEventLog::route_event(&client_tx, &op_manager.ring, &route_event)
+            {
                 op_manager
                     .ring
                     .register_events(either::Either::Left(log_event))
@@ -364,12 +362,12 @@ async fn drive_client_get_inner(
 
             Ok(DriverOutcome::Publish(host_result))
         }
-        RetryLoopOutcome::Exhausted(cause) => Ok(DriverOutcome::Publish(Err(
-            ErrorKind::OperationError {
+        RetryLoopOutcome::Exhausted(cause) => {
+            Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
             }
-            .into(),
-        ))),
+            .into())))
+        }
         RetryLoopOutcome::Unexpected => Err(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => Err(err),
     }
@@ -706,12 +704,12 @@ mod tests {
     fn driver_outcome_exhausted_produces_client_error() {
         let cause = "GET to contract failed after 3 attempts".to_string();
         let outcome: DriverOutcome = match RetryLoopOutcome::<()>::Exhausted(cause) {
-            RetryLoopOutcome::Exhausted(cause) => DriverOutcome::Publish(Err(
-                ErrorKind::OperationError {
+            RetryLoopOutcome::Exhausted(cause) => {
+                DriverOutcome::Publish(Err(ErrorKind::OperationError {
                     cause: cause.into(),
                 }
-                .into(),
-            )),
+                .into()))
+            }
             RetryLoopOutcome::Done(_)
             | RetryLoopOutcome::Unexpected
             | RetryLoopOutcome::InfraError(_) => unreachable!(),
