@@ -70,8 +70,18 @@ use crate::operations::op_ctx::{
 };
 use crate::ring::{Location, PeerKeyLocation};
 use crate::router::{RouteEvent, RouteOutcome};
+use crate::transport::peer_connection::StreamId;
 
-use super::{GetMsg, GetMsgResult};
+use super::{GetMsg, GetMsgResult, GetStreamingPayload};
+use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
+
+/// Test-only counter that increments every time `start_client_get` is
+/// called. Used by integration tests to verify that a GET actually
+/// routed through the task-per-tx driver rather than being satisfied
+/// by the `client_events.rs` local-cache shortcut.
+#[cfg(any(test, feature = "testing"))]
+pub static DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Start a client-initiated GET, returning as soon as the task has been
 /// spawned (mirrors legacy `request_get` timing).
@@ -90,6 +100,13 @@ pub(crate) async fn start_client_get(
     subscribe: bool,
     blocking_subscribe: bool,
 ) -> Result<Transaction, OpError> {
+    // Test-only: count driver invocations so integration tests can
+    // assert the driver was actually called (as opposed to
+    // `client_events.rs`'s local-cache shortcut satisfying the GET).
+    // Removed under #[cfg(not(any(test, feature = "testing")))].
+    #[cfg(any(test, feature = "testing"))]
+    DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     tracing::debug!(
         tx = %client_tx,
         contract = %instance_id,
@@ -248,15 +265,41 @@ async fn drive_client_get_inner(
                     cache_contract_locally(op_manager, *key, state.clone(), contract.clone()).await;
                     *key
                 }
-                Terminal::Streaming { key } => {
-                    // Stream assembly and local caching for the
-                    // originator live on the legacy `process_message`
-                    // streaming branch (`get.rs:2895`). For Phase 3b
-                    // we keep streamed payloads on that path — the
-                    // store re-query below will find the bytes
-                    // whichever process_message invocation handled
-                    // assembly. See #3883 for full driver-owned
-                    // streaming.
+                Terminal::Streaming {
+                    key,
+                    stream_id,
+                    includes_contract,
+                } => {
+                    // Assemble the stream and cache locally. Mirrors
+                    // the legacy `process_message` streaming branch
+                    // at `get.rs:2721-3196`. Uses `current_target`
+                    // as the sender address — accurate for the
+                    // single-hop response case where the responder
+                    // equals the selected target.
+                    if let Some(peer_addr) = driver.current_target.socket_addr() {
+                        if let Err(e) = assemble_and_cache_stream(
+                            op_manager,
+                            peer_addr,
+                            *stream_id,
+                            *key,
+                            *includes_contract,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                %key,
+                                error = %e,
+                                "get (task-per-tx): stream assembly failed — \
+                                 state will not be cached locally"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            %key,
+                            "get (task-per-tx): current_target has no socket_addr; \
+                             cannot claim orphan stream"
+                        );
+                    }
                     *key
                 }
                 Terminal::LocalCompletion => {
@@ -397,11 +440,17 @@ enum Terminal {
         state: WrappedState,
         contract: Option<ContractContainer>,
     },
-    /// ResponseStreaming: stream assembly and local caching are not
-    /// yet wired through the driver. Tracked in #3883. For the happy
-    /// path the store re-query covers reads, so non-streaming tests
-    /// pass; streamed payloads need follow-up work.
-    Streaming { key: ContractKey },
+    /// ResponseStreaming: the envelope references a stream_id whose
+    /// bytes arrive separately via the orphan stream registry. The
+    /// driver claims the stream, awaits assembly, and caches the
+    /// assembled state + contract locally — mirroring what the
+    /// legacy `process_message` streaming branch does at
+    /// `get.rs:2721-3196`.
+    Streaming {
+        key: ContractKey,
+        stream_id: StreamId,
+        includes_contract: bool,
+    },
     /// Request-echo from `forward_pending_op_result_if_completed` —
     /// state was already in the local store (via the pre-send
     /// local-cache shortcut), so no new PutQuery is needed. The
@@ -443,9 +492,16 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
             result: GetMsgResult::NotFound,
             ..
         })) => AttemptOutcome::Retry,
-        NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreaming { key, .. })) => {
-            AttemptOutcome::Terminal(Terminal::Streaming { key })
-        }
+        NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreaming {
+            key,
+            stream_id,
+            includes_contract,
+            ..
+        })) => AttemptOutcome::Terminal(Terminal::Streaming {
+            key,
+            stream_id,
+            includes_contract,
+        }),
         NetMessage::V1(NetMessageV1::Get(GetMsg::Request { .. })) => {
             AttemptOutcome::Terminal(Terminal::LocalCompletion)
         }
@@ -701,6 +757,76 @@ async fn cache_contract_locally(
     } else if !removed_contracts.is_empty() {
         crate::operations::broadcast_change_interests(op_manager, vec![], removed_contracts).await;
     }
+}
+
+/// Claim an orphan stream, await assembly, deserialize the payload,
+/// and cache the contract state locally.
+///
+/// Mirrors the originator-side streaming branch of the legacy
+/// `process_message` at `get.rs:2721-3196`. The driver is the only
+/// place this can run for task-per-tx GETs because the bypass at
+/// `node.rs::handle_pure_network_message_v1` forwards the
+/// `ResponseStreaming` envelope to the driver before
+/// `handle_op_request` — `process_message` never executes on the
+/// originator for task-per-tx ops (`load_or_init` would return
+/// `OpNotPresent`).
+///
+/// `peer_addr` is the sender's transport address — currently we
+/// use `driver.current_target.socket_addr()`, which is accurate for
+/// single-hop responses. Multi-hop (where a relay answers on behalf
+/// of a further peer) is not yet supported by the task-per-tx driver;
+/// see #3883.
+async fn assemble_and_cache_stream(
+    op_manager: &OpManager,
+    peer_addr: std::net::SocketAddr,
+    stream_id: StreamId,
+    expected_key: ContractKey,
+    includes_contract: bool,
+) -> Result<(), String> {
+    let handle = match op_manager
+        .orphan_stream_registry()
+        .claim_or_wait(peer_addr, stream_id, STREAM_CLAIM_TIMEOUT)
+        .await
+    {
+        Ok(h) => h,
+        Err(OrphanStreamError::AlreadyClaimed) => {
+            tracing::debug!(
+                %peer_addr,
+                %stream_id,
+                "stream already claimed (dedup)"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(format!("claim_or_wait: {e}")),
+    };
+
+    let bytes = handle
+        .assemble()
+        .await
+        .map_err(|e| format!("stream assembly: {e}"))?;
+
+    let payload: GetStreamingPayload =
+        bincode::deserialize(&bytes).map_err(|e| format!("deserialize: {e}"))?;
+
+    if payload.key != expected_key {
+        return Err(format!(
+            "stream key mismatch: expected {expected_key}, got {}",
+            payload.key
+        ));
+    }
+
+    let Some(state) = payload.value.state else {
+        return Err("stream payload has no state".into());
+    };
+
+    let contract = if includes_contract {
+        payload.value.contract
+    } else {
+        None
+    };
+
+    cache_contract_locally(op_manager, payload.key, state, contract).await;
+    Ok(())
 }
 
 /// Re-query the local store for the contract key, used on the

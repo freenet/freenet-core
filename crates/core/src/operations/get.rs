@@ -24,8 +24,7 @@ use super::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
 use super::{OpEnum, OpError, OpOutcome, OperationResult, should_use_streaming};
 use crate::transport::peer_connection::StreamId;
 
-use self::messages::GetStreamingPayload;
-pub(crate) use self::messages::{GetMsg, GetMsgResult};
+pub(crate) use self::messages::{GetMsg, GetMsgResult, GetStreamingPayload};
 
 /// Maximum number of retries to get values.
 const MAX_RETRIES: usize = 10;

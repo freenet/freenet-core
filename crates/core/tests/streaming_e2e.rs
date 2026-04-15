@@ -872,6 +872,34 @@ fn test_streaming_get_triggers_auto_subscribe() {
 // client receives an `OperationError`. Node 3's storage check then fails.
 // =============================================================================
 
+/// Set up a SimNetwork with a LOW ring_max_htl so PUT fan-out can't
+/// reach the GETting node — the setup that forces a cold-cache GET
+/// through the task-per-tx driver.
+///
+/// `setup_streaming_network` uses `ring_max_htl=7` which is enough
+/// for PUT to propagate to every node in small topologies, making the
+/// GETter's `client_events.rs` local-cache shortcut always satisfy
+/// the request.
+async fn setup_htl1_network(name: &str, nodes: usize, seed: u64, threshold: usize) -> SimNetwork {
+    GlobalRng::set_seed(seed);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+
+    let mut sim = SimNetwork::new(
+        name, 1,     // 1 gateway
+        nodes, // N nodes
+        1,     // ring_max_htl = 1 — PUT forwards at most once past the originator
+        1,     // rnd_if_htl_above
+        10,    // max_connections
+        2,     // min_connections
+        seed,
+    )
+    .await;
+    sim.with_streaming_threshold(threshold);
+    sim
+}
+
 /// Cold-cache streaming GET via task-per-tx driver.
 ///
 /// Scope: bug #1 from the #3884 skeptical review — the driver's
@@ -880,63 +908,114 @@ fn test_streaming_get_triggers_auto_subscribe() {
 /// that has no relay-cached copy returns `OperationError` on the client
 /// channel and leaves local storage empty.
 ///
-/// ## Known coverage gap
+/// ## Driver isolation strategy
 ///
-/// This test currently passes for the wrong reason: the SimNetwork
-/// harness's PUT fan-out reaches the GETting node, so
-/// `client_events.rs`'s local-cache shortcut satisfies the GET before
-/// the task-per-tx driver is ever called. Verified empirically by
-/// instrumenting `start_client_get` with an atomic counter — the
-/// driver is never invoked during this test run.
+/// Uses `ring_max_htl = 1` so the gateway's PUT propagates at most one
+/// hop. In a 10-node topology, at least one node (the one furthest
+/// from the gateway) doesn't receive the state during PUT. That node's
+/// cold GET falls through the `client_events.rs:1108` shortcut
+/// (since `local_satisfies_request = false`) and invokes the
+/// task-per-tx driver. Verification via `GET_DRIVER_CALL_COUNT`.
 ///
-/// Isolating the driver's streaming path deterministically requires
-/// either (a) a SimNetwork helper that seeds state on the gateway
-/// AND announces hosting without full PUT propagation, or (b) a
-/// topology large enough that HTL doesn't reach the GETter. Both
-/// are non-trivial infrastructure work tracked in #3883 alongside
-/// relay-GET migration.
+/// ## Known infrastructure gap
 ///
-/// The driver's side-effect contract is pinned by unit tests in
-/// `operations/get/op_ctx_task.rs` (`cache_contract_locally_*`,
-/// `record_op_result_reflects_host_result_outcome`,
-/// `driver_calls_auto_subscribe_on_get_response`).
-#[ignore = "Does not isolate the driver path; see docstring and #3883"]
+/// Currently `#[ignore]`'d because even with the driver correctly
+/// reached, the HTL=1 topology used to force cold-cache leaves the
+/// driver unable to route (driver retries exhaust with "channel
+/// closed"). The driver fix itself is validated by unit tests in
+/// `operations/get/op_ctx_task.rs`; the remaining work is test
+/// infrastructure (either a SimNetwork helper that sets up a more
+/// routable cold-cache topology, or a `SimOperation::SeedContract`
+/// variant that also announces hosting). Tracked in #3883.
+#[ignore = "Infrastructure gap — HTL=1 topology isn't routable; see docstring and #3883"]
 #[test]
 fn test_driver_streaming_get_cold_cache() {
+    use freenet::dev_tool::GET_DRIVER_CALL_COUNT;
+    use std::sync::atomic::Ordering;
+
     const SEED: u64 = 0xDE1A_0B0B_C01D_CA7E;
-    const NETWORK_NAME: &str = "driver-streaming-cold-cache";
+    const NETWORK_NAME_PHASE1: &str = "driver-streaming-cold-cache-p1";
+    const NETWORK_NAME_PHASE2: &str = "driver-streaming-cold-cache-p2";
     const THRESHOLD: usize = 1024;
     const LARGE_STATE_SIZE: usize = 100 * 1024; // 100KB, above THRESHOLD
+    const NODES: usize = 10;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
 
-    let sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 4, SEED, THRESHOLD));
-
     let contract = SimOperation::create_test_contract(0xBC);
     let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0xBC);
     let contract_key = contract.key();
     let contract_id = *contract_key.id();
 
-    // Gateway PUTs the contract. `subscribe: false` keeps PUT
-    // fan-out limited so the GETting node doesn't receive a
-    // relay-cached copy during PUT.
-    let operations = vec![
+    // Phase 1: run the PUT in isolation to discover which nodes
+    // DIDN'T receive the state during PUT fan-out (with HTL=1 and
+    // 10 nodes, at least one should be cold).
+    let sim1 = rt.block_on(setup_htl1_network(
+        NETWORK_NAME_PHASE1,
+        NODES,
+        SEED,
+        THRESHOLD,
+    ));
+    let phase1_ops = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME_PHASE1, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: large_state.clone(),
+            subscribe: false,
+        },
+    )];
+    let phase1 = sim1.run_controlled_simulation(
+        SEED,
+        phase1_ops,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        phase1.turmoil_result.is_ok(),
+        "Phase 1 (PUT only) should complete: {:?}",
+        phase1.turmoil_result.err()
+    );
+    let cold_node_idx = (1..=NODES).find(|i| {
+        let label = NodeLabel::node(NETWORK_NAME_PHASE1, *i);
+        phase1
+            .node_storages
+            .get(&label)
+            .is_some_and(|s| s.get_stored_state(&contract_key).is_none())
+    });
+    let Some(cold_idx) = cold_node_idx else {
+        panic!(
+            "Test precondition: no cold-cache node exists after HTL=1 PUT \
+             in {NODES}-node topology. All nodes received the state during \
+             fan-out, which contradicts HTL=1. Try a larger topology."
+        );
+    };
+
+    // Phase 2: fresh network with the same topology (same seed →
+    // same ring), gateway PUTs then the cold node GETs. The cold
+    // node's local cache is empty → `local_satisfies_request=false`
+    // → `client_events.rs` falls through to the driver.
+    let baseline_calls = GET_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+    let sim2 = rt.block_on(setup_htl1_network(
+        NETWORK_NAME_PHASE2,
+        NODES,
+        SEED,
+        THRESHOLD,
+    ));
+    let cold_node_label = NodeLabel::node(NETWORK_NAME_PHASE2, cold_idx);
+    let phase2_ops = vec![
         ScheduledOperation::new(
-            NodeLabel::gateway(NETWORK_NAME, 0),
+            NodeLabel::gateway(NETWORK_NAME_PHASE2, 0),
             SimOperation::Put {
                 contract: contract.clone(),
                 state: large_state.clone(),
                 subscribe: false,
             },
         ),
-        // Node 3 (far end of the 4-node ring) GETs — its local
-        // cache should not satisfy the request, forcing the GET
-        // through the task-per-tx driver.
         ScheduledOperation::new(
-            NodeLabel::node(NETWORK_NAME, 3),
+            cold_node_label.clone(),
             SimOperation::Get {
                 contract_id,
                 return_contract_code: true,
@@ -944,39 +1023,48 @@ fn test_driver_streaming_get_cold_cache() {
             },
         ),
     ];
-
-    let result = sim.run_controlled_simulation(
+    let phase2 = sim2.run_controlled_simulation(
         SEED,
-        operations,
+        phase2_ops,
         Duration::from_secs(300),
         Duration::from_secs(120),
     );
-
     assert!(
-        result.turmoil_result.is_ok(),
-        "Cold-cache streaming GET should complete: {:?}",
-        result.turmoil_result.err()
+        phase2.turmoil_result.is_ok(),
+        "Phase 2 (PUT + cold GET) should complete: {:?}",
+        phase2.turmoil_result.err()
     );
 
-    // Assertion: node 3 stored the 100KB contract state locally.
-    // Fails with the current driver because `Terminal::Streaming`
-    // does not call `cache_contract_locally` and nothing else writes
-    // the store on the task-per-tx originator path.
-    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
-    let node3_storage = result
-        .node_storages
-        .get(&node3_label)
-        .expect("node 3 should have a storage handle");
-    let node3_state = node3_storage.get_stored_state(&contract_key);
+    // Driver-isolation probe: confirm the GET actually invoked the
+    // task-per-tx driver (and wasn't short-circuited by
+    // `client_events.rs`'s local-cache path).
+    let driver_calls = GET_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
     assert!(
-        node3_state.is_some(),
-        "Node 3 should have stored the contract state after cold-cache streaming GET \
-         (regression: driver's Terminal::Streaming path does not write local store)"
+        driver_calls > baseline_calls,
+        "Test infrastructure failure: GET_DRIVER_CALL_COUNT did not advance during \
+         phase 2. Either node {cold_idx} still had a relay-cached copy of the \
+         contract (phase-1 topology diverged from phase-2 topology), or the \
+         local-cache shortcut fired for some other reason. Without driver \
+         invocation this test does not exercise bug #1 from PR #3884."
+    );
+
+    // Bug #1 regression: after the driver-routed streaming GET, the
+    // cold-cache node must have stored the contract state locally.
+    let storage = phase2
+        .node_storages
+        .get(&cold_node_label)
+        .expect("cold-cache node should have a storage handle");
+    let stored = storage.get_stored_state(&contract_key);
+    assert!(
+        stored.is_some(),
+        "Bug #1 regression: cold-cache streaming GET through the driver did \
+         not write the contract state to local storage on {cold_node_label:?}. \
+         The driver's Terminal::Streaming path must ensure local caching."
     );
     assert_eq!(
-        node3_state.unwrap().as_ref().to_vec(),
+        stored.unwrap().as_ref().to_vec(),
         large_state,
-        "Stored state bytes must match the seeded state"
+        "Stored state on {cold_node_label:?} must match the PUT state"
     );
 }
 
@@ -987,52 +1075,100 @@ fn test_driver_streaming_get_cold_cache() {
 /// against a cold cache silently skips the AUTO_SUBSCRIBE_ON_GET fallback
 /// that the legacy `process_message` branch would have invoked.
 ///
-/// ## Known coverage gap
+/// ## Driver isolation strategy
 ///
-/// Same issue as `test_driver_streaming_get_cold_cache` above: the
-/// SimNetwork harness's PUT fan-out satisfies the GET via local-cache
-/// shortcut before reaching the driver. The auto-subscribe invariant
-/// is pinned by `driver_calls_auto_subscribe_on_get_response` (unit,
-/// source-scrape) in `operations/get/op_ctx_task.rs`; this test is
-/// preserved as a scaffolding for when driver-isolated simulation
-/// infrastructure lands (#3883).
-#[ignore = "Does not isolate the driver path; see docstring and #3883"]
+/// Same HTL=1 approach as `test_driver_streaming_get_cold_cache`.
+/// Phase 1 discovers a cold node; phase 2 GETs from it with a small
+/// (inline, not streamed) payload; asserts that the driver fired
+/// (via `GET_DRIVER_CALL_COUNT`) AND that the cold node ended up
+/// with an active subscription (AUTO_SUBSCRIBE_ON_GET fallback).
+///
+/// Same infrastructure gap as above — currently `#[ignore]`'d.
+#[ignore = "Infrastructure gap — HTL=1 topology isn't routable; see docstring and #3883"]
 #[test]
 fn test_driver_inline_get_triggers_auto_subscribe() {
+    use freenet::dev_tool::GET_DRIVER_CALL_COUNT;
+    use std::sync::atomic::Ordering;
+
     const SEED: u64 = 0xDE1A_0B0C_A570_5C2B;
-    const NETWORK_NAME: &str = "driver-inline-auto-subscribe";
+    const NETWORK_NAME_PHASE1: &str = "driver-inline-auto-sub-p1";
+    const NETWORK_NAME_PHASE2: &str = "driver-inline-auto-sub-p2";
     const THRESHOLD: usize = 1024;
-    // State well below THRESHOLD — forces inline Response path, not streaming.
+    // State well below THRESHOLD — forces inline Response, not streaming.
     const SMALL_STATE_SIZE: usize = 128;
+    const NODES: usize = 10;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
 
-    let sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 4, SEED, THRESHOLD));
-
     let contract = SimOperation::create_test_contract(0xBD);
     let small_state = SimOperation::create_large_state(SMALL_STATE_SIZE, 0xBD);
     let contract_key = contract.key();
     let contract_id = *contract_key.id();
 
-    let operations = vec![
-        // Gateway PUTs the contract (no subscribe → limited fan-out).
+    // Phase 1: discover which node doesn't receive the PUT.
+    let sim1 = rt.block_on(setup_htl1_network(
+        NETWORK_NAME_PHASE1,
+        NODES,
+        SEED,
+        THRESHOLD,
+    ));
+    let phase1_ops = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME_PHASE1, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: small_state.clone(),
+            subscribe: false,
+        },
+    )];
+    let phase1 = sim1.run_controlled_simulation(
+        SEED,
+        phase1_ops,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        phase1.turmoil_result.is_ok(),
+        "Phase 1 (PUT only) should complete: {:?}",
+        phase1.turmoil_result.err()
+    );
+    let cold_node_idx = (1..=NODES).find(|i| {
+        let label = NodeLabel::node(NETWORK_NAME_PHASE1, *i);
+        phase1
+            .node_storages
+            .get(&label)
+            .is_some_and(|s| s.get_stored_state(&contract_key).is_none())
+    });
+    let Some(cold_idx) = cold_node_idx else {
+        panic!(
+            "Test precondition: no cold-cache node exists after HTL=1 PUT \
+             in {NODES}-node topology."
+        );
+    };
+
+    // Phase 2: fresh network, gateway PUTs + cold node GETs
+    // (subscribe=false, inline payload).
+    let baseline_calls = GET_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+    let sim2 = rt.block_on(setup_htl1_network(
+        NETWORK_NAME_PHASE2,
+        NODES,
+        SEED,
+        THRESHOLD,
+    ));
+    let cold_node_label = NodeLabel::node(NETWORK_NAME_PHASE2, cold_idx);
+    let phase2_ops = vec![
         ScheduledOperation::new(
-            NodeLabel::gateway(NETWORK_NAME, 0),
+            NodeLabel::gateway(NETWORK_NAME_PHASE2, 0),
             SimOperation::Put {
                 contract: contract.clone(),
                 state: small_state.clone(),
                 subscribe: false,
             },
         ),
-        // Node 3 cold-GETs with subscribe=false. The originator-side
-        // legacy branch would call `auto_subscribe_on_get_response` here
-        // (AUTO_SUBSCRIBE_ON_GET = true in ring.rs:60); the driver must
-        // do the same.
         ScheduledOperation::new(
-            NodeLabel::node(NETWORK_NAME, 3),
+            cold_node_label.clone(),
             SimOperation::Get {
                 contract_id,
                 return_contract_code: true,
@@ -1040,45 +1176,53 @@ fn test_driver_inline_get_triggers_auto_subscribe() {
             },
         ),
     ];
-
-    let result = sim.run_controlled_simulation(
+    let phase2 = sim2.run_controlled_simulation(
         SEED,
-        operations,
-        Duration::from_secs(120),
-        Duration::from_secs(60),
+        phase2_ops,
+        Duration::from_secs(180),
+        Duration::from_secs(90),
     );
-
     assert!(
-        result.turmoil_result.is_ok(),
-        "Cold-cache inline GET should complete: {:?}",
-        result.turmoil_result.err()
+        phase2.turmoil_result.is_ok(),
+        "Phase 2 (PUT + cold GET) should complete: {:?}",
+        phase2.turmoil_result.err()
     );
 
-    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
-    let node3_storage = result
+    // Driver-isolation probe.
+    let driver_calls = GET_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+    assert!(
+        driver_calls > baseline_calls,
+        "Test infrastructure failure: GET_DRIVER_CALL_COUNT did not advance \
+         during phase 2. The cold node {cold_idx} must have routed through \
+         the task-per-tx driver."
+    );
+
+    // Precondition: the driver-routed GET stored state locally.
+    let storage = phase2
         .node_storages
-        .get(&node3_label)
-        .expect("node 3 should have a storage handle");
+        .get(&cold_node_label)
+        .expect("cold-cache node should have a storage handle");
     assert!(
-        node3_storage.get_stored_state(&contract_key).is_some(),
-        "Node 3 should have stored the contract state after GET"
+        storage.get_stored_state(&contract_key).is_some(),
+        "Cold-cache node should have stored the contract state after the GET"
     );
 
-    // Assertion: after a cold-cache GET with subscribe=false, the
-    // GETting node should end up subscribed (AUTO_SUBSCRIBE_ON_GET
-    // fallback). Without the fix, the driver never invokes
-    // `auto_subscribe_on_get_response` and no subscription is recorded.
-    let gateway_addr = std::net::IpAddr::from([1u8, 0, 0, 1]);
-    let auto_subscribed = result.topology_snapshots.iter().any(|s| {
-        s.peer_addr.ip() != gateway_addr && s.active_subscription_keys.contains(&contract_id)
-    });
+    // Bug #2 regression: after the driver-routed GET with
+    // subscribe=false, the cold node should have auto-subscribed.
+    // AUTO_SUBSCRIBE_ON_GET = true in ring.rs:60.
+    let auto_subscribed = phase2
+        .topology_snapshots
+        .iter()
+        .any(|s| s.active_subscription_keys.contains(&contract_id));
 
     assert!(
         auto_subscribed,
-        "Node 3 should be auto-subscribed to the contract after cold-cache GET \
-         (regression: driver's Done arm never calls auto_subscribe_on_get_response). \
-         Active subscriptions by peer: {:#?}",
-        result
+        "Bug #2 regression: cold-cache GET through the driver did not \
+         auto-subscribe the requesting node {cold_node_label:?}. The \
+         driver's Done arm must invoke `auto_subscribe_on_get_response` \
+         for successful GETs when the client did not explicitly set \
+         `subscribe=true`. Active subscriptions: {:#?}",
+        phase2
             .topology_snapshots
             .iter()
             .map(|s| (s.peer_addr, s.active_subscription_keys.clone()))

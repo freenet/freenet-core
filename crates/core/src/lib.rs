@@ -88,6 +88,12 @@ pub mod dev_tool {
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
 
+    // #1454 Phase 3b — test hook to verify client-initiated GETs
+    // actually route through the task-per-tx driver rather than being
+    // satisfied by the `client_events.rs` local-cache shortcut.
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::get::op_ctx_task::DRIVER_CALL_COUNT as GET_DRIVER_CALL_COUNT;
+
     // Re-export state verification for telemetry-based consistency analysis
     pub use crate::tracing::state_verifier::{StateAnomaly, StateVerifier, VerificationReport};
 
