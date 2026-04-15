@@ -35,6 +35,7 @@ async fn create_test_config(
             token_ttl_seconds: Some(token_ttl_seconds),
             token_cleanup_interval_seconds: Some(cleanup_interval_seconds),
             allowed_host: None,
+            allowed_source_cidrs: None,
         },
         network_api: NetworkArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -131,6 +132,7 @@ async fn test_default_token_configuration() -> TestResult {
                 token_ttl_seconds: None,
                 token_cleanup_interval_seconds: None,
                 allowed_host: None,
+                allowed_source_cidrs: None,
             },
             network_api: NetworkArgs {
                 address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -211,6 +213,7 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
             token_ttl_seconds: TOKEN_TTL_SECS,
             token_cleanup_interval_seconds: CLEANUP_INTERVAL_SECS,
             allowed_hosts: Vec::new(),
+            allowed_source_cidrs: Vec::new(),
         };
 
         // Start the client API server (which spawns the cleanup task)

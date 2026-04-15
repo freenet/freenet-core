@@ -135,6 +135,7 @@ impl Default for ConfigArgs {
                 token_ttl_seconds: None,
                 token_cleanup_interval_seconds: None,
                 allowed_host: None,
+                allowed_source_cidrs: None,
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -637,6 +638,28 @@ impl ConfigArgs {
                     .token_cleanup_interval_seconds
                     .unwrap_or(default_token_cleanup_interval_seconds()),
                 allowed_hosts: self.ws_api.allowed_host.unwrap_or_default(),
+                allowed_source_cidrs: self
+                    .ws_api
+                    .allowed_source_cidrs
+                    .as_ref()
+                    .map(|cidrs| {
+                        cidrs
+                            .iter()
+                            .map(|s| {
+                                let net = s.parse::<ipnet::IpNet>().map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "invalid CIDR `{s}` in allowed-source-cidrs: {e}"
+                                    )
+                                })?;
+                                crate::server::validate_source_cidr(&net).map_err(|msg| {
+                                    anyhow::anyhow!("allowed-source-cidrs: {msg}")
+                                })?;
+                                Ok::<_, anyhow::Error>(net)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -1274,6 +1297,29 @@ pub struct WebsocketApiArgs {
     #[arg(long, env = "ALLOWED_HOST")]
     #[serde(rename = "allowed-host", skip_serializing_if = "Option::is_none")]
     pub allowed_host: Option<Vec<String>>,
+
+    /// Additional source IP ranges (CIDR notation) permitted to reach the
+    /// local HTTP/WebSocket API.
+    ///
+    /// By default, only loopback and RFC1918 / IPv6 ULA ranges are accepted.
+    /// Use this to grant access from VPN overlays you control (e.g. Tailscale:
+    /// `--allowed-source-cidrs 100.64.0.0/10`). Can be specified multiple times.
+    ///
+    /// SECURITY: Only add ranges you fully control. CGNAT space like
+    /// `100.64.0.0/10` is shared between subscribers of some ISPs (Starlink,
+    /// T-Mobile, many cable carriers) and is only safe on an overlay network
+    /// such as Tailscale or WireGuard. Anything that can reach the API port
+    /// can access your contract state, keys, and client API.
+    #[arg(
+        long = "allowed-source-cidrs",
+        env = "ALLOWED_SOURCE_CIDRS",
+        value_delimiter = ','
+    )]
+    #[serde(
+        rename = "allowed-source-cidrs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_source_cidrs: Option<Vec<String>>,
 }
 
 /// Default telemetry endpoint (nova.locut.us OTLP collector).
@@ -1393,6 +1439,12 @@ pub struct WebsocketApiConfig {
     /// Empty means only auto-detected hostnames (machine hostname + bound IP) are allowed.
     #[serde(default, rename = "allowed-host")]
     pub allowed_hosts: Vec<String>,
+
+    /// Additional source IP ranges (CIDR) permitted to reach the API.
+    /// Stored as parsed `IpNet` so config errors surface at startup.
+    /// Empty means only loopback + RFC1918 / IPv6 ULA are accepted.
+    #[serde(default, rename = "allowed-source-cidrs")]
+    pub allowed_source_cidrs: Vec<ipnet::IpNet>,
 }
 
 #[inline]
@@ -1413,6 +1465,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
+            allowed_source_cidrs: Vec::new(),
         }
     }
 }
@@ -1426,6 +1479,7 @@ impl Default for WebsocketApiConfig {
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
+            allowed_source_cidrs: Vec::new(),
         }
     }
 }
@@ -2603,6 +2657,91 @@ mod tests {
         let cfg = args.build().await.unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    /// Build a minimal local-mode ConfigArgs with the given CIDR list and
+    /// return the result of `build().await`. The allowed_source_cidrs path
+    /// is the only interesting variation; everything else is defaulted.
+    async fn build_with_cidrs(cidrs: Option<Vec<String>>) -> anyhow::Result<Config> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ws_api: WebsocketApiArgs {
+                allowed_source_cidrs: cidrs,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        args.build().await
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_round_trip_through_build() {
+        let cfg = build_with_cidrs(Some(vec![
+            "100.64.0.0/10".to_string(),
+            "fd7a:115c:a1e0::/48".to_string(),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(cfg.ws_api.allowed_source_cidrs.len(), 2);
+        assert_eq!(
+            cfg.ws_api.allowed_source_cidrs[0],
+            "100.64.0.0/10".parse::<ipnet::IpNet>().unwrap()
+        );
+        assert_eq!(
+            cfg.ws_api.allowed_source_cidrs[1],
+            "fd7a:115c:a1e0::/48".parse::<ipnet::IpNet>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_default_is_empty() {
+        // Regression guard: if the user configures nothing, the built
+        // config must carry an empty vec so the server-side filter falls
+        // back to private-only behavior.
+        let cfg = build_with_cidrs(None).await.unwrap();
+        assert!(cfg.ws_api.allowed_source_cidrs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_rejects_malformed() {
+        let err = build_with_cidrs(Some(vec!["not-a-cidr".to_string()]))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("allowed-source-cidrs") && msg.contains("not-a-cidr"),
+            "error should name the field and the offending value: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_rejects_whole_internet_catchall() {
+        // 0.0.0.0/0 parses fine as IpNet but the validator must reject
+        // it — this is the footgun the middleware can't defend against
+        // once the vec is populated.
+        let err = build_with_cidrs(Some(vec!["0.0.0.0/0".to_string()]))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("0.0.0.0/0") && msg.contains("/8"),
+            "error should explain why and name the minimum: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_source_cidrs_rejects_ipv6_catchall() {
+        let err = build_with_cidrs(Some(vec!["::/0".to_string()]))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("::/0") && msg.contains("/16"));
     }
 
     #[tokio::test]
