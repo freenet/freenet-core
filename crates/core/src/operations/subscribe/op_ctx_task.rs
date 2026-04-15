@@ -466,6 +466,20 @@ async fn drive_client_subscribe_inner(
                 // never learn about the subscription, breaking
                 // ChangeInterests-driven update propagation. Both calls are
                 // idempotent for repeat subscribes.
+                //
+                // Register the responding peer as our upstream. Without
+                // this, `send_unsubscribe_upstream` cannot locate the peer
+                // on client disconnect and no Unsubscribe is emitted (#3874).
+                if let Some(pkl) = op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_addr(current_target_addr)
+                {
+                    let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                    op_manager
+                        .interest_manager
+                        .register_peer_interest(&key, peer_key, None, true);
+                }
                 op_manager.ring.subscribe(key);
                 op_manager.ring.complete_subscription_request(&key, true);
                 let became_interested = op_manager.interest_manager.add_local_client(&key);
