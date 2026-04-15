@@ -8824,7 +8824,18 @@ async fn test_nightly_fault_recovery_speed() {
     tracing::info!("Phase 1: Convergence — 30 virtual minutes, no faults");
     let_network_run(&mut sim, Duration::from_secs(1800)).await;
 
-    let mut pre_fault_counts: Vec<usize> = (0..NODES)
+    // Regular-node IDs start at `GATEWAYS`, not 0. `SimNetwork::config_nodes`
+    // iterates `number_of_gateways..number_of_gateways + num` when constructing
+    // labels, so for GATEWAYS=4 / NODES=50 the regular-node labels are
+    // `NodeLabel::node(NETWORK_NAME, 4..54)`. Querying `(0..NODES)` would miss
+    // the top `GATEWAYS` nodes and collect an off-by-GATEWAYS subset — that was
+    // the deterministic `got 46, expected 50` nightly failure on seed
+    // 0x3511FA170003 before this fix. Iterate over the actual live-label range
+    // so every assertion in this test (Phase 1, 2, 3) sees the full 50-node
+    // population.
+    let node_ids = || GATEWAYS..GATEWAYS + NODES;
+
+    let mut pre_fault_counts: Vec<usize> = node_ids()
         .filter_map(|i| {
             let label = NodeLabel::node(NETWORK_NAME, i);
             sim.connection_count(&label)
@@ -8861,7 +8872,7 @@ async fn test_nightly_fault_recovery_speed() {
 
     let_network_run(&mut sim, Duration::from_secs(300)).await;
 
-    let mut during_fault_counts: Vec<usize> = (0..NODES)
+    let mut during_fault_counts: Vec<usize> = node_ids()
         .filter_map(|i| {
             let label = NodeLabel::node(NETWORK_NAME, i);
             sim.connection_count(&label)
@@ -8907,7 +8918,7 @@ async fn test_nightly_fault_recovery_speed() {
 
     let_network_run(&mut sim, Duration::from_secs(1500)).await;
 
-    let mut post_recovery_counts: Vec<usize> = (0..NODES)
+    let mut post_recovery_counts: Vec<usize> = node_ids()
         .filter_map(|i| {
             let label = NodeLabel::node(NETWORK_NAME, i);
             sim.connection_count(&label)
