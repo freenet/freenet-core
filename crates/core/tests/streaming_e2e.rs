@@ -845,3 +845,202 @@ fn test_streaming_get_triggers_auto_subscribe() {
             .collect::<Vec<_>>()
     );
 }
+
+// =============================================================================
+// Regression test for #1454 Phase 3b — driver must handle streaming GETs.
+//
+// The existing streaming tests above all satisfy the GETting node's request
+// via the client-events local-cache shortcut (`client_events.rs:1108-1154`)
+// because the gateway's `SimOperation::Put` propagates the contract to
+// neighbors during PUT, leaving the GETting node with a relay-cached copy
+// BEFORE the GET fires. That shortcut returns without ever calling
+// `start_client_get`, so the driver's `Terminal::Streaming` path is
+// untested.
+//
+// This test uses `SimOperation::SeedContract`, which seeds only the gateway's
+// local store without any network propagation. Node 3 then cold-GETs — the
+// local-cache shortcut misses, the request flows through the task-per-tx
+// driver, and the terminal reply arrives as `ResponseStreaming` because the
+// payload is above the streaming threshold. The driver's `Done` arm must
+// produce a client-visible `HostResponse::GetResponse` with the correct
+// state AND write the state to node 3's local store for subsequent access.
+//
+// Without the fix, `Terminal::Streaming` in the driver does not write the
+// store (the bypass skips `process_message`, and
+// `stream_handle.assemble()` never runs on the originator under
+// task-per-tx), so `build_host_response`'s re-query returns `None` and the
+// client receives an `OperationError`. Node 3's storage check then fails.
+// =============================================================================
+
+/// Cold-cache streaming GET via task-per-tx driver.
+///
+/// Scope: bug #1 from the #3884 skeptical review — the driver's
+/// `Terminal::Streaming` path does not write the contract state to the
+/// local store, so any client GET of a >threshold contract from a node
+/// that has no relay-cached copy returns `OperationError` on the client
+/// channel and leaves local storage empty.
+#[test]
+fn test_driver_streaming_get_cold_cache() {
+    const SEED: u64 = 0xDE1A_0B0B_C01D_CA7E;
+    const NETWORK_NAME: &str = "driver-streaming-cold-cache";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 100 * 1024; // 100KB, above THRESHOLD
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 4, SEED, THRESHOLD));
+
+    let contract = SimOperation::create_test_contract(0xBC);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0xBC);
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+
+    // Seed the contract on the gateway ONLY — no PUT, no propagation, no
+    // relay-caching on other nodes. Node 3 will have to fetch via network.
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::SeedContract {
+                contract: contract.clone(),
+                state: large_state.clone(),
+            },
+        ),
+        // Node 3 GETs — must go through the task-per-tx driver because
+        // there is no local cache to short-circuit the request.
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(120),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Cold-cache streaming GET should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Assertion 1: node 3 stored the 100KB contract state locally.
+    // Fails with the current driver because `Terminal::Streaming`
+    // does not call `cache_contract_locally` and nothing else writes
+    // the store on the task-per-tx originator path.
+    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
+    let node3_storage = result
+        .node_storages
+        .get(&node3_label)
+        .expect("node 3 should have a storage handle");
+    let node3_state = node3_storage.get_stored_state(&contract_key);
+    assert!(
+        node3_state.is_some(),
+        "Node 3 should have stored the contract state after cold-cache streaming GET \
+         (regression: driver's Terminal::Streaming path does not write local store)"
+    );
+    assert_eq!(
+        node3_state.unwrap().as_ref().to_vec(),
+        large_state,
+        "Stored state bytes must match the seeded state"
+    );
+}
+
+/// Cold-cache non-streaming GET must auto-subscribe at originator.
+///
+/// Scope: bug #2 from the #3884 skeptical review — the driver never calls
+/// `auto_subscribe_on_get_response`, so a client GET with `subscribe=false`
+/// against a cold cache silently skips the AUTO_SUBSCRIBE_ON_GET fallback
+/// that the legacy `process_message` branch would have invoked.
+#[test]
+fn test_driver_inline_get_triggers_auto_subscribe() {
+    const SEED: u64 = 0xDE1A_0B0C_A570_5C2B;
+    const NETWORK_NAME: &str = "driver-inline-auto-subscribe";
+    const THRESHOLD: usize = 1024;
+    // State well below THRESHOLD — forces inline Response path, not streaming.
+    const SMALL_STATE_SIZE: usize = 128;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 4, SEED, THRESHOLD));
+
+    let contract = SimOperation::create_test_contract(0xBD);
+    let small_state = SimOperation::create_large_state(SMALL_STATE_SIZE, 0xBD);
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+
+    let operations = vec![
+        // Seed the gateway only; no PUT → no relay-caching.
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::SeedContract {
+                contract: contract.clone(),
+                state: small_state.clone(),
+            },
+        ),
+        // Node 3 cold-GETs with subscribe=false. The originator-side
+        // legacy branch would call `auto_subscribe_on_get_response` here
+        // (AUTO_SUBSCRIBE_ON_GET = true in ring.rs:60); the driver must
+        // do the same.
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 3),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(60),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Cold-cache inline GET should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Assertion: after a cold-cache GET with subscribe=false, the
+    // GETting node should end up subscribed (AUTO_SUBSCRIBE_ON_GET
+    // fallback). Without the fix, the driver never invokes
+    // `auto_subscribe_on_get_response` and no subscription is recorded.
+    //
+    // We look for ANY non-gateway snapshot that has the contract in
+    // `active_subscription_keys` (the projection of
+    // HostingManager::active_subscriptions that ignores merge-with-hosting).
+    // There's only one non-gateway GET issuer (node 3) in this test, so
+    // any non-gateway match is node 3.
+    let gateway_addr = std::net::IpAddr::from([1u8, 0, 0, 1]);
+    let auto_subscribed = result.topology_snapshots.iter().any(|s| {
+        s.peer_addr.ip() != gateway_addr && s.active_subscription_keys.contains(&contract_id)
+    });
+
+    assert!(
+        auto_subscribed,
+        "Node 3 should be auto-subscribed to the contract after cold-cache GET \
+         (regression: driver's Done arm never calls auto_subscribe_on_get_response). \
+         Active subscriptions by peer: {:#?}",
+        result
+            .topology_snapshots
+            .iter()
+            .map(|s| (s.peer_addr, s.active_subscription_keys.clone()))
+            .collect::<Vec<_>>()
+    );
+}

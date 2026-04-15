@@ -897,6 +897,200 @@ mod tests {
         );
     }
 
+    /// Extract the non-test source of `op_ctx_task.rs` by truncating
+    /// at the `#[cfg(test)]` marker. Used by the bug-reproduction
+    /// source-scrape tests below so that comments inside this test
+    /// module don't create false positives.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("op_ctx_task.rs");
+        let cutoff = FULL
+            .find("#[cfg(test)]")
+            .expect("file must have a #[cfg(test)] section");
+        // The str literal outlives `cutoff`; slicing gives a &'static str.
+        #[allow(clippy::manual_unwrap_or_default)]
+        {
+            &FULL[..cutoff]
+        }
+    }
+
+    /// Isolate the body of a named function inside production source.
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        // Find the opening `{` of the body.
+        let brace = source[start..].find('{').expect("fn sig must have body");
+        let body_start = start + brace + 1;
+        // Walk to the matching closing brace, tracking nesting.
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Bug #3 reproduction: the legacy Response{Found} branch at
+    /// `get.rs:2218-2241` reads the local store via
+    /// `ContractHandlerEvent::GetQuery` FIRST, compares the stored bytes
+    /// against the incoming `value`, and skips the `PutQuery` entirely
+    /// when they match. This prevents re-invoking `update_state()` on
+    /// contracts that implement idempotency checks (see #2018). The
+    /// task-per-tx driver's `cache_contract_locally` must replicate
+    /// this idempotency short-circuit.
+    #[test]
+    fn cache_contract_locally_has_state_matches_short_circuit() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn cache_contract_locally(");
+        // A proper idempotency short-circuit reads the local state
+        // first (GetQuery BEFORE PutQuery) and compares bytes.
+        let get_pos = body
+            .find("ContractHandlerEvent::GetQuery")
+            .unwrap_or(usize::MAX);
+        let put_pos = body
+            .find("ContractHandlerEvent::PutQuery")
+            .unwrap_or(usize::MAX);
+        let has_byte_compare = body.contains("as_ref() ==") || body.contains("state_matches");
+        let has_short_circuit = get_pos < put_pos && has_byte_compare;
+        assert!(
+            has_short_circuit,
+            "cache_contract_locally is missing the state_matches idempotency \
+             short-circuit from the legacy Response{{Found}} branch \
+             (get.rs:2218-2241). Without it the driver re-invokes PutQuery \
+             on identical state — regressing issue #2018 for contracts \
+             that enforce idempotency in update_state()."
+        );
+    }
+
+    /// Bug #4 reproduction: the legacy branch at `get.rs:2420-2435`
+    /// logs on PutQuery error but **continues** to run the hosting /
+    /// interest / access-tracking side effects. The driver's current
+    /// `cache_contract_locally` returns inside each non-Ok arm, so
+    /// `record_get_access` / `mark_local_client_access` / hosting
+    /// announce never fire when PutQuery fails — breaking re-GET
+    /// hosting TTL refresh on any node with a transient store error.
+    #[test]
+    fn cache_contract_locally_runs_side_effects_on_put_error() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn cache_contract_locally(");
+        // Locate the Ok and Err arms of the PutResponse match.
+        let ok_arm = body
+            .find("new_value: Ok(_)")
+            .expect("PutResponse Ok arm must exist");
+        let err_arm = body
+            .find("new_value: Err(")
+            .expect("PutResponse Err arm must exist");
+        // Pick any hosting side effect unique to the Ok arm today.
+        let side_effect_call = "record_get_access";
+        let side_effect_in_ok = body[ok_arm..err_arm].contains(side_effect_call);
+        let side_effect_in_err = body[err_arm..].contains(side_effect_call);
+        assert!(
+            side_effect_in_ok && side_effect_in_err,
+            "cache_contract_locally runs hosting side effects ({side_effect_call}) \
+             only in the PutQuery Ok arm. The legacy branch at get.rs:2420-2435 \
+             continues these side effects on PutQuery error — hosting LRU / TTL \
+             must refresh for ANY successful GET, not only when the local store \
+             write succeeds. Factor the side effects out of the Ok arm."
+        );
+    }
+
+    /// Bug #2 reproduction (source-level): the legacy branch calls
+    /// `auto_subscribe_on_get_response` for any client-initiated GET
+    /// when `AUTO_SUBSCRIBE_ON_GET` is true (see `get.rs:2313, 2408`).
+    /// The driver currently never calls it; `maybe_subscribe_child`
+    /// only handles the explicit `subscribe=true` flag. This test
+    /// pairs with `test_driver_inline_get_triggers_auto_subscribe`
+    /// (integration) to lock down both the absence and the symptom.
+    #[test]
+    fn driver_calls_auto_subscribe_on_get_response() {
+        let src = production_source();
+        assert!(
+            src.contains("auto_subscribe_on_get_response"),
+            "The driver must invoke `auto_subscribe_on_get_response` on \
+             successful GET terminal paths (AUTO_SUBSCRIBE_ON_GET = true in \
+             ring.rs:60). The legacy branch does this at get.rs:2313/2408/3136/3185; \
+             the driver must mirror it so client GETs with subscribe=false \
+             still register the fallback subscription."
+        );
+    }
+
+    /// Bug #5 reproduction (source-level): `record_op_result` in the
+    /// Done arm must NOT be emitted unconditionally as success — if
+    /// `build_host_response` returned `Err`, the telemetry should
+    /// reflect failure. Otherwise the router's prediction model and
+    /// the network_status dashboard say "GET succeeded" while the
+    /// client sees an OperationError.
+    #[test]
+    fn record_op_result_reflects_host_result_outcome() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        // Find the Done arm (the `RetryLoopOutcome::Done` branch).
+        let done_arm_start = SOURCE
+            .find("RetryLoopOutcome::Done(")
+            .expect("Done arm must exist");
+        let next_arm = SOURCE[done_arm_start..]
+            .find("RetryLoopOutcome::Exhausted")
+            .expect("Exhausted arm must follow");
+        let arm = &SOURCE[done_arm_start..done_arm_start + next_arm];
+        // Locate the record_op_result call inside the arm.
+        let call_pos = arm
+            .find("record_op_result")
+            .expect("record_op_result must be called in Done arm");
+        // Get the surrounding ~200 chars to inspect the success flag.
+        let tail = &arm[call_pos..];
+        let call_window = &tail[..tail.len().min(200)];
+        // Unconditional `true` is the bug. A proper implementation
+        // derives the success flag from `host_result.is_ok()` or a
+        // similarly named value.
+        let looks_unconditional = call_window.contains("true,") && !call_window.contains("is_ok()");
+        assert!(
+            !looks_unconditional,
+            "record_op_result in the Done arm is passed an unconditional \
+             `true`. The success flag must track `host_result.is_ok()` so \
+             telemetry does not diverge from the client-visible outcome. \
+             Call window: {call_window}"
+        );
+    }
+
+    /// Bug #6 reproduction (source-level): the driver hard-codes
+    /// `fetch_contract: true` in every `GetMsg::Request`. The client's
+    /// `return_contract_code` flag must propagate to the wire field so
+    /// relays don't unnecessarily stream contract code bytes when the
+    /// client didn't ask for them. Post-#3757 the node ALSO needs the
+    /// contract for local validation/hosting — so this is a bandwidth
+    /// optimization, not a correctness fix. Still worth asserting.
+    #[test]
+    fn driver_threads_return_contract_code_through_wire_request() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let build_request_start = SOURCE
+            .find("fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {")
+            .expect("build_request must exist");
+        let build_end_offset = SOURCE[build_request_start..]
+            .find("fn classify")
+            .expect("classify must follow build_request");
+        let build_body = &SOURCE[build_request_start..build_request_start + build_end_offset];
+        // If fetch_contract is still hard-coded true, the value the
+        // client asked for never reaches the wire request.
+        let hardcoded = build_body.contains("fetch_contract: true,");
+        assert!(
+            !hardcoded,
+            "GetMsg::Request.fetch_contract is hard-coded `true` in the \
+             driver's build_request. Thread the client's \
+             `return_contract_code` through so relays don't stream contract \
+             code when the client only asked for state."
+        );
+    }
+
     /// Guard against subscribe firing when the client did not request it.
     /// Source-scrape to verify `maybe_subscribe_child` short-circuits on
     /// `!subscribe`. Mirrors the spirit of PUT 3a's

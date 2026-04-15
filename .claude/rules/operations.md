@@ -53,16 +53,22 @@ BEFORE calling `send_and_await`. State is never published to the
 `OpManager` DashMap; the conceptual ordering rule is the same. See the
 `OpCtx::send_and_await` docstring for the full reasoning.
 
-**GET-specific note (Phase 3b):** the GET driver relies on the
-originator's `process_message` to assemble streamed responses and
-write bytes into the local contract store BEFORE the bypass at
-`node.rs::handle_pure_network_message_v1` forwards the terminal
-reply. This ordering is load-bearing — the Done arm re-queries the
-store via `notify_contract_handler(GetQuery)` to build the
-`ContractResponse::GetResponse` payload. Do not reorder the bypass
-check above the `handle_op_request` call in the GET branch, and do
-not change `process_message` to write the store asynchronously on
-that path.
+**GET-specific note (Phase 3b):** for client-initiated GETs the
+bypass at `node.rs::handle_pure_network_message_v1` returns BEFORE
+`handle_op_request` runs, so `process_message` does NOT execute on
+the originator for `GetMsg::Response` / `ResponseStreaming` replies.
+This is by design — there is no `GetOp` in `OpManager.ops.get` for a
+task-per-tx transaction, so `load_or_init` would return
+`OpNotPresent`. The driver (`operations/get/op_ctx_task.rs`) therefore
+owns the originator-side side effects that the legacy Response{Found}
+branch at `get.rs:2329` does: `PutQuery` to cache the state,
+`record_get_access`, `mark_local_client_access`,
+`announce_contract_hosted`, `register_local_hosting`, and
+`broadcast_change_interests`. If you add a new side effect to the
+legacy Response{Found} branch, mirror it in
+`op_ctx_task.rs::cache_contract_locally`. Relay GETs still go through
+`process_message` — the bypass only fires when the originator's
+`pending_op_results` callback is installed, which relays never have.
 
 ## State Machine Rules
 
