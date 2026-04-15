@@ -2474,6 +2474,9 @@ async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> Tes
                 OutboundAppMessage::Attested(Some(bytes)) => {
                     let origin: MessageOrigin = bincode::deserialize(&bytes)
                         .expect("Failed to deserialize MessageOrigin from delegate response");
+                    // Wildcard satisfies #[non_exhaustive] on MessageOrigin so
+                    // future stdlib variants don't break this test at compile time.
+                    #[allow(clippy::wildcard_enum_match_arm)]
                     match origin {
                         MessageOrigin::WebApp(contract_id) => {
                             assert_eq!(
