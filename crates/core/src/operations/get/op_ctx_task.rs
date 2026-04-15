@@ -505,6 +505,20 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
         NetMessage::V1(NetMessageV1::Get(GetMsg::Request { .. })) => {
             AttemptOutcome::Terminal(Terminal::LocalCompletion)
         }
+        // Explicit non-terminal `GetMsg` variants. These should never
+        // reach the driver — the bypass at
+        // `node.rs::handle_pure_network_message_v1` gates forwarding
+        // on terminal variants only — so their arrival here indicates
+        // a bug in the bypass gate (Phase 2b Bug 2 class).
+        NetMessage::V1(NetMessageV1::Get(
+            GetMsg::ForwardingAck { .. } | GetMsg::ResponseStreamingAck { .. },
+        )) => AttemptOutcome::Unexpected,
+        // Non-GET NetMessage variants (or any future `GetMsg` variant
+        // added without updating this match) fall through to
+        // Unexpected. If a new GetMsg variant is added, this arm must
+        // be audited — the Phase 3b GET driver has explicit handling
+        // for every variant above, and the bypass filter in node.rs
+        // must be extended in lockstep.
         _ => AttemptOutcome::Unexpected,
     }
 }
@@ -1297,6 +1311,108 @@ mod tests {
              the node needs WASM for local validation/hosting regardless of \
              the client's return_contract_code preference (issue #3757 / \
              get.rs:52-55)."
+        );
+    }
+
+    /// Bug #1 regression: `Terminal::Streaming` in the Done arm must
+    /// invoke `assemble_and_cache_stream` so that streamed GET
+    /// responses actually write the contract state into the local
+    /// executor. Without this call, a cold-cache client GET of a
+    /// >threshold contract succeeds on the wire but leaves the
+    /// originator's local store empty — the client gets
+    /// `OperationError` via `build_host_response`'s re-query miss.
+    ///
+    /// The simulation-level driver-isolation tests for this path are
+    /// `#[ignore]`'d pending infrastructure work (#3883); this
+    /// source-scrape pins the wiring so the call can't be silently
+    /// removed.
+    #[test]
+    fn streaming_terminal_calls_assemble_and_cache_stream() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        // Find the `Terminal::Streaming` arm of the Done match.
+        let arm = body
+            .find("Terminal::Streaming {")
+            .expect("Done arm must handle Terminal::Streaming");
+        // The matching arm must call `assemble_and_cache_stream`.
+        let tail = &body[arm..];
+        // Bound the search to this arm by clipping at the next
+        // `Terminal::` match arm.
+        let arm_end = tail[1..]
+            .find("Terminal::")
+            .map(|p| p + 1)
+            .unwrap_or(tail.len());
+        let arm_body = &tail[..arm_end];
+        assert!(
+            arm_body.contains("assemble_and_cache_stream"),
+            "Terminal::Streaming arm of drive_client_get_inner must call \
+             `assemble_and_cache_stream`. Without this, cold-cache streaming \
+             GETs return OperationError because nothing writes the local \
+             store. See bug #1 in PR #3884 review."
+        );
+    }
+
+    /// Pure-data regression test for the streaming payload shape the
+    /// driver deserializes. Locks down the invariant that
+    /// `GetStreamingPayload` round-trips via bincode, so a regression
+    /// that changes the wire format would break `assemble_and_cache_stream`
+    /// loudly at this level instead of silently producing an empty
+    /// store (bug #1 class).
+    #[test]
+    fn streaming_payload_round_trips_via_bincode() {
+        let key = dummy_key();
+        let state_bytes = vec![0x42u8; 512];
+        let payload = GetStreamingPayload {
+            key,
+            value: StoreResponse {
+                state: Some(WrappedState::new(state_bytes.clone())),
+                contract: None,
+            },
+        };
+        let encoded = bincode::serialize(&payload).expect("bincode encode");
+        let decoded: GetStreamingPayload = bincode::deserialize(&encoded).expect("bincode decode");
+        assert_eq!(decoded.key, key);
+        assert_eq!(
+            decoded.value.state.as_ref().map(|s| s.as_ref().to_vec()),
+            Some(state_bytes),
+            "state bytes must round-trip through the streaming payload"
+        );
+    }
+
+    /// Bug #1 follow-through: `assemble_and_cache_stream` must claim
+    /// the stream by `(peer_addr, stream_id)`, await assembly, and
+    /// check the key matches before caching. The source-scrape
+    /// verifies the function's structure hasn't been simplified in a
+    /// way that would skip any of those steps.
+    #[test]
+    fn assemble_and_cache_stream_performs_claim_assemble_key_check() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn assemble_and_cache_stream(");
+
+        assert!(
+            body.contains("orphan_stream_registry") && body.contains("claim_or_wait"),
+            "assemble_and_cache_stream must claim the stream via \
+             orphan_stream_registry().claim_or_wait()"
+        );
+        assert!(
+            body.contains(".assemble()") && body.contains(".await"),
+            "assemble_and_cache_stream must await stream assembly"
+        );
+        assert!(
+            body.contains("GetStreamingPayload") && body.contains("bincode::deserialize"),
+            "assemble_and_cache_stream must deserialize the payload \
+             as GetStreamingPayload"
+        );
+        assert!(
+            body.contains("payload.key != expected_key"),
+            "assemble_and_cache_stream must verify the stream payload's \
+             key matches the expected ContractKey — a mismatch would \
+             silently cache the wrong contract under the expected key"
+        );
+        assert!(
+            body.contains("cache_contract_locally"),
+            "assemble_and_cache_stream must delegate the actual write \
+             and hosting side effects to cache_contract_locally"
         );
     }
 
