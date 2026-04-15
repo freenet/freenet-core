@@ -879,6 +879,28 @@ fn test_streaming_get_triggers_auto_subscribe() {
 /// local store, so any client GET of a >threshold contract from a node
 /// that has no relay-cached copy returns `OperationError` on the client
 /// channel and leaves local storage empty.
+///
+/// ## Known coverage gap
+///
+/// This test currently passes for the wrong reason: the SimNetwork
+/// harness's PUT fan-out reaches the GETting node, so
+/// `client_events.rs`'s local-cache shortcut satisfies the GET before
+/// the task-per-tx driver is ever called. Verified empirically by
+/// instrumenting `start_client_get` with an atomic counter — the
+/// driver is never invoked during this test run.
+///
+/// Isolating the driver's streaming path deterministically requires
+/// either (a) a SimNetwork helper that seeds state on the gateway
+/// AND announces hosting without full PUT propagation, or (b) a
+/// topology large enough that HTL doesn't reach the GETter. Both
+/// are non-trivial infrastructure work tracked in #3883 alongside
+/// relay-GET migration.
+///
+/// The driver's side-effect contract is pinned by unit tests in
+/// `operations/get/op_ctx_task.rs` (`cache_contract_locally_*`,
+/// `record_op_result_reflects_host_result_outcome`,
+/// `driver_calls_auto_subscribe_on_get_response`).
+#[ignore = "Does not isolate the driver path; see docstring and #3883"]
 #[test]
 fn test_driver_streaming_get_cold_cache() {
     const SEED: u64 = 0xDE1A_0B0B_C01D_CA7E;
@@ -898,18 +920,21 @@ fn test_driver_streaming_get_cold_cache() {
     let contract_key = contract.key();
     let contract_id = *contract_key.id();
 
-    // Seed the contract on the gateway ONLY — no PUT, no propagation, no
-    // relay-caching on other nodes. Node 3 will have to fetch via network.
+    // Gateway PUTs the contract. `subscribe: false` keeps PUT
+    // fan-out limited so the GETting node doesn't receive a
+    // relay-cached copy during PUT.
     let operations = vec![
         ScheduledOperation::new(
             NodeLabel::gateway(NETWORK_NAME, 0),
-            SimOperation::SeedContract {
+            SimOperation::Put {
                 contract: contract.clone(),
                 state: large_state.clone(),
+                subscribe: false,
             },
         ),
-        // Node 3 GETs — must go through the task-per-tx driver because
-        // there is no local cache to short-circuit the request.
+        // Node 3 (far end of the 4-node ring) GETs — its local
+        // cache should not satisfy the request, forcing the GET
+        // through the task-per-tx driver.
         ScheduledOperation::new(
             NodeLabel::node(NETWORK_NAME, 3),
             SimOperation::Get {
@@ -933,7 +958,7 @@ fn test_driver_streaming_get_cold_cache() {
         result.turmoil_result.err()
     );
 
-    // Assertion 1: node 3 stored the 100KB contract state locally.
+    // Assertion: node 3 stored the 100KB contract state locally.
     // Fails with the current driver because `Terminal::Streaming`
     // does not call `cache_contract_locally` and nothing else writes
     // the store on the task-per-tx originator path.
@@ -961,6 +986,17 @@ fn test_driver_streaming_get_cold_cache() {
 /// `auto_subscribe_on_get_response`, so a client GET with `subscribe=false`
 /// against a cold cache silently skips the AUTO_SUBSCRIBE_ON_GET fallback
 /// that the legacy `process_message` branch would have invoked.
+///
+/// ## Known coverage gap
+///
+/// Same issue as `test_driver_streaming_get_cold_cache` above: the
+/// SimNetwork harness's PUT fan-out satisfies the GET via local-cache
+/// shortcut before reaching the driver. The auto-subscribe invariant
+/// is pinned by `driver_calls_auto_subscribe_on_get_response` (unit,
+/// source-scrape) in `operations/get/op_ctx_task.rs`; this test is
+/// preserved as a scaffolding for when driver-isolated simulation
+/// infrastructure lands (#3883).
+#[ignore = "Does not isolate the driver path; see docstring and #3883"]
 #[test]
 fn test_driver_inline_get_triggers_auto_subscribe() {
     const SEED: u64 = 0xDE1A_0B0C_A570_5C2B;
@@ -982,12 +1018,13 @@ fn test_driver_inline_get_triggers_auto_subscribe() {
     let contract_id = *contract_key.id();
 
     let operations = vec![
-        // Seed the gateway only; no PUT → no relay-caching.
+        // Gateway PUTs the contract (no subscribe → limited fan-out).
         ScheduledOperation::new(
             NodeLabel::gateway(NETWORK_NAME, 0),
-            SimOperation::SeedContract {
+            SimOperation::Put {
                 contract: contract.clone(),
                 state: small_state.clone(),
+                subscribe: false,
             },
         ),
         // Node 3 cold-GETs with subscribe=false. The originator-side
@@ -1017,16 +1054,20 @@ fn test_driver_inline_get_triggers_auto_subscribe() {
         result.turmoil_result.err()
     );
 
+    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
+    let node3_storage = result
+        .node_storages
+        .get(&node3_label)
+        .expect("node 3 should have a storage handle");
+    assert!(
+        node3_storage.get_stored_state(&contract_key).is_some(),
+        "Node 3 should have stored the contract state after GET"
+    );
+
     // Assertion: after a cold-cache GET with subscribe=false, the
     // GETting node should end up subscribed (AUTO_SUBSCRIBE_ON_GET
     // fallback). Without the fix, the driver never invokes
     // `auto_subscribe_on_get_response` and no subscription is recorded.
-    //
-    // We look for ANY non-gateway snapshot that has the contract in
-    // `active_subscription_keys` (the projection of
-    // HostingManager::active_subscriptions that ignores merge-with-hosting).
-    // There's only one non-gateway GET issuer (node 3) in this test, so
-    // any non-gateway match is node 3.
     let gateway_addr = std::net::IpAddr::from([1u8, 0, 0, 1]);
     let auto_subscribed = result.topology_snapshots.iter().any(|s| {
         s.peer_addr.ip() != gateway_addr && s.active_subscription_keys.contains(&contract_id)

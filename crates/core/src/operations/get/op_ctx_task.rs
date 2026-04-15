@@ -249,14 +249,14 @@ async fn drive_client_get_inner(
                     *key
                 }
                 Terminal::Streaming { key } => {
-                    // ResponseStreaming payload is assembled by a path
-                    // not yet wired through the driver. For Phase 3b,
-                    // the terminal reply suffices for client delivery
-                    // via a store re-query (process_message on a
-                    // different code path handled assembly before the
-                    // bypass could intercept, OR assembly happens
-                    // elsewhere in the pipeline). Tracked alongside
-                    // relay-GET migration in #3883.
+                    // Stream assembly and local caching for the
+                    // originator live on the legacy `process_message`
+                    // streaming branch (`get.rs:2895`). For Phase 3b
+                    // we keep streamed payloads on that path — the
+                    // store re-query below will find the bytes
+                    // whichever process_message invocation handled
+                    // assembly. See #3883 for full driver-owned
+                    // streaming.
                     *key
                 }
                 Terminal::LocalCompletion => {
@@ -275,15 +275,56 @@ async fn drive_client_get_inner(
             let host_result =
                 build_host_response(op_manager, &instance_id, return_contract_code).await;
 
-            // Emit routing event + telemetry — report_result (which
+            // Auto-subscribe on successful GET at the originator —
+            // mirrors the legacy branches at get.rs:2313/2408/3136/3185.
+            // AUTO_SUBSCRIBE_ON_GET (ring.rs:60) is a const; we still
+            // guard on `is_subscribed` to avoid duplicate registration
+            // if the request-router already wired up a subscribe.
+            //
+            // When the client explicitly set `subscribe=true`, the
+            // dedicated `maybe_subscribe_child` path below runs — skip
+            // auto-subscribe here so we never double-subscribe.
+            if host_result.is_ok()
+                && !subscribe
+                && crate::ring::AUTO_SUBSCRIBE_ON_GET
+                && !op_manager.ring.is_subscribed(&reply_key)
+            {
+                let path_label = match &terminal {
+                    Terminal::Streaming { .. } => "streaming (task-per-tx)",
+                    Terminal::InlineFound { .. } | Terminal::LocalCompletion => {
+                        "non-streaming (task-per-tx)"
+                    }
+                };
+                crate::operations::auto_subscribe_on_get_response(
+                    op_manager,
+                    &reply_key,
+                    &client_tx,
+                    &Some(driver.current_target.clone()),
+                    /* subscribe_requested */ false,
+                    /* blocking_sub */ blocking_subscribe,
+                    path_label,
+                )
+                .await;
+            }
+
+            // Emit routing event + telemetry — `report_result` (which
             // normally does both) doesn't run because the bypass
             // intercepted the Response. Without this, the router's
             // prediction model never receives GET success feedback.
+            //
+            // The success flag tracks the actual client-visible
+            // outcome (`host_result.is_ok()`), not the wire-level
+            // reply — if the store re-query returned nothing, the
+            // client sees OperationError and telemetry must agree.
             let contract_location = Location::from(&reply_key);
             let route_event = RouteEvent {
                 peer: driver.current_target.clone(),
                 contract_location,
-                outcome: RouteOutcome::SuccessUntimed,
+                outcome: if host_result.is_ok() {
+                    RouteOutcome::SuccessUntimed
+                } else {
+                    RouteOutcome::Failure
+                },
                 op_type: Some(crate::node::network_status::OpType::Get),
             };
             if let Some(log_event) =
@@ -297,13 +338,15 @@ async fn drive_client_get_inner(
             op_manager.ring.routing_finished(route_event);
             crate::node::network_status::record_op_result(
                 crate::node::network_status::OpType::Get,
-                true,
+                host_result.is_ok(),
             );
 
-            // Drive subscribe hand-off separately. Mirrors PUT 3a's
+            // Explicit-subscribe hand-off. Mirrors PUT 3a's
             // `maybe_subscribe_child` — subscribe is never handled in
             // the terminal-result construction to avoid double-subscribe
-            // (commit 494a3c69).
+            // (commit 494a3c69). This only runs when the client set
+            // `subscribe=true`; the auto-subscribe path above handles
+            // the AUTO_SUBSCRIBE_ON_GET fallback.
             maybe_subscribe_child(
                 op_manager,
                 client_tx,
@@ -517,102 +560,146 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
     ContractKey::from_id_and_code(*instance_id, CodeHash::new([0u8; 32]))
 }
 
-/// Store the fetched contract state in the local executor so that
-/// re-GETs, local-cache checks, and the hosting LRU see it. Mirrors
-/// the `PutQuery` call in the legacy `process_message` Response{Found}
-/// branch at `get.rs:2329`. Also triggers hosting / access-tracking
-/// side effects so a newly-hosted contract announces itself and
-/// register hosting interest — same as the legacy path.
+/// Store the fetched contract state in the local executor and run
+/// the originator-side hosting side effects. Mirrors the legacy
+/// `process_message` Response{Found} branch at `get.rs:2218-2450`:
+///
+/// 1. **Idempotency short-circuit (issue #2018)** — re-query the
+///    local store first. If the existing bytes match the incoming
+///    state, skip `PutQuery` entirely so contracts that enforce
+///    identical-state rejection in `update_state()` aren't invoked
+///    redundantly.
+/// 2. **Unconditional hosting refresh** — `record_get_access`,
+///    `mark_local_client_access`, and interest-manager eviction
+///    cleanup run for BOTH the state-matches short-circuit AND the
+///    PutQuery-failed error paths. Legacy behaviour at
+///    `get.rs:2420-2435` continues these side effects on error so
+///    re-GETs keep refreshing the hosting LRU/TTL even when the
+///    executor rejected the write.
+/// 3. **Newly-hosted announcement** — only runs when the local
+///    store actually transitioned from no-state to has-state
+///    (i.e., `access_result.is_new && put_persisted`).
 async fn cache_contract_locally(
     op_manager: &OpManager,
     key: ContractKey,
     state: WrappedState,
     contract: Option<ContractContainer>,
 ) {
-    let Some(contract_code) = contract else {
-        // No contract code means we can't cache (issue #2306). Skip
-        // silently — re-GET will retry with fetch_contract=true.
+    let state_size = state.size() as u64;
+
+    // (1) Idempotency short-circuit: re-query the local store FIRST.
+    // Comparing bytes against the incoming state avoids re-invoking
+    // `update_state()` in contracts that reject identical updates
+    // (regression guard for issue #2018 / PR #2018).
+    let local_state = op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            instance_id: *key.id(),
+            return_contract_code: false,
+        })
+        .await;
+    let state_matches = matches!(
+        &local_state,
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Ok(StoreResponse {
+                state: Some(local),
+                ..
+            }),
+            ..
+        }) if local.as_ref() == state.as_ref(),
+    );
+
+    // (2) Decide whether PutQuery must run. If local state already
+    // matches or we lack the contract code (issue #2306), skip the
+    // PutQuery but STILL run hosting side effects below so LRU/TTL
+    // refresh does not depend on the write path.
+    let put_persisted = if state_matches {
+        tracing::debug!(
+            %key,
+            "get (task-per-tx): local state matches, skipping redundant PutQuery"
+        );
+        false
+    } else if let Some(contract_code) = contract {
+        match op_manager
+            .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                key,
+                state,
+                related_contracts: RelatedContracts::default(),
+                contract: Some(contract_code),
+            })
+            .await
+        {
+            Ok(ContractHandlerEvent::PutResponse {
+                new_value: Ok(_), ..
+            }) => true,
+            Ok(ContractHandlerEvent::PutResponse {
+                new_value: Err(err),
+                ..
+            }) => {
+                tracing::warn!(
+                    %key,
+                    %err,
+                    "get (task-per-tx): PutQuery rejected by executor"
+                );
+                false
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    %key,
+                    ?other,
+                    "get (task-per-tx): PutQuery returned unexpected event"
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %key,
+                    %err,
+                    "get (task-per-tx): PutQuery failed"
+                );
+                false
+            }
+        }
+    } else {
+        // No contract code + state differs — we can't cache (issue #2306).
+        // Still refresh hosting side effects below so re-GET TTL bookkeeping
+        // isn't gated on the write path.
         tracing::debug!(
             %key,
             "get (task-per-tx): skipping local cache — contract code missing"
         );
-        return;
+        false
     };
 
-    let state_size = state.size() as u64;
+    // (3) Hosting side effects ALWAYS run (state_matches, put_persisted,
+    // or put failed). This mirrors the legacy invariant that a
+    // successful wire-level GET must refresh the hosting LRU/TTL
+    // regardless of what the local executor did with the state.
+    let access_result = op_manager.ring.record_get_access(key, state_size);
+    op_manager.ring.mark_local_client_access(&key);
 
-    let res = op_manager
-        .notify_contract_handler(ContractHandlerEvent::PutQuery {
-            key,
-            state,
-            related_contracts: RelatedContracts::default(),
-            contract: Some(contract_code),
-        })
-        .await;
+    let mut removed_contracts = Vec::new();
+    for evicted_key in &access_result.evicted {
+        if op_manager
+            .interest_manager
+            .unregister_local_hosting(evicted_key)
+        {
+            removed_contracts.push(*evicted_key);
+        }
+    }
 
-    match res {
-        Ok(ContractHandlerEvent::PutResponse {
-            new_value: Ok(_), ..
-        }) => {
-            let access_result = op_manager.ring.record_get_access(key, state_size);
-            op_manager.ring.mark_local_client_access(&key);
-
-            // Clean up interest tracking for evicted contracts.
-            let mut removed_contracts = Vec::new();
-            for evicted_key in &access_result.evicted {
-                if op_manager
-                    .interest_manager
-                    .unregister_local_hosting(evicted_key)
-                {
-                    removed_contracts.push(*evicted_key);
-                }
-            }
-
-            if access_result.is_new {
-                crate::operations::announce_contract_hosted(op_manager, &key).await;
-                let became_interested = op_manager.interest_manager.register_local_hosting(&key);
-                let added = if became_interested { vec![key] } else { vec![] };
-                if !added.is_empty() || !removed_contracts.is_empty() {
-                    crate::operations::broadcast_change_interests(
-                        op_manager,
-                        added,
-                        removed_contracts,
-                    )
-                    .await;
-                }
-            } else if !removed_contracts.is_empty() {
-                crate::operations::broadcast_change_interests(
-                    op_manager,
-                    vec![],
-                    removed_contracts,
-                )
+    // (4) Newly-hosted announcement gates on BOTH first-time access
+    // AND the fact that we actually persisted new state. Without
+    // persistence there's nothing to announce hosting for.
+    if access_result.is_new && put_persisted {
+        crate::operations::announce_contract_hosted(op_manager, &key).await;
+        let became_interested = op_manager.interest_manager.register_local_hosting(&key);
+        let added = if became_interested { vec![key] } else { vec![] };
+        if !added.is_empty() || !removed_contracts.is_empty() {
+            crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
                 .await;
-            }
         }
-        Ok(ContractHandlerEvent::PutResponse {
-            new_value: Err(err),
-            ..
-        }) => {
-            tracing::warn!(
-                %key,
-                %err,
-                "get (task-per-tx): PutQuery rejected by executor"
-            );
-        }
-        Ok(other) => {
-            tracing::warn!(
-                %key,
-                ?other,
-                "get (task-per-tx): PutQuery returned unexpected event"
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
-                %key,
-                %err,
-                "get (task-per-tx): PutQuery failed"
-            );
-        }
+    } else if !removed_contracts.is_empty() {
+        crate::operations::broadcast_change_interests(op_manager, vec![], removed_contracts).await;
     }
 }
 
@@ -975,33 +1062,36 @@ mod tests {
 
     /// Bug #4 reproduction: the legacy branch at `get.rs:2420-2435`
     /// logs on PutQuery error but **continues** to run the hosting /
-    /// interest / access-tracking side effects. The driver's current
-    /// `cache_contract_locally` returns inside each non-Ok arm, so
-    /// `record_get_access` / `mark_local_client_access` / hosting
-    /// announce never fire when PutQuery fails — breaking re-GET
-    /// hosting TTL refresh on any node with a transient store error.
+    /// interest / access-tracking side effects. Hosting LRU / TTL
+    /// must refresh for ANY successful wire-level GET, not only when
+    /// the local store write succeeded.
+    ///
+    /// After the fix the side effects live OUTSIDE the PutQuery match:
+    /// the match result feeds a `put_persisted: bool` and
+    /// `record_get_access` / `announce_contract_hosted` run after the
+    /// match closes — reachable from state-matches, PutQuery-Ok, and
+    /// PutQuery-Err paths alike. We pin that structure here by
+    /// requiring the `record_get_access` call to appear AFTER the
+    /// PutResponse match arms (identified by the `Err(err)` arm) in
+    /// the source order.
     #[test]
     fn cache_contract_locally_runs_side_effects_on_put_error() {
         let src = production_source();
         let body = extract_fn_body(src, "async fn cache_contract_locally(");
-        // Locate the Ok and Err arms of the PutResponse match.
-        let ok_arm = body
-            .find("new_value: Ok(_)")
-            .expect("PutResponse Ok arm must exist");
         let err_arm = body
             .find("new_value: Err(")
             .expect("PutResponse Err arm must exist");
-        // Pick any hosting side effect unique to the Ok arm today.
-        let side_effect_call = "record_get_access";
-        let side_effect_in_ok = body[ok_arm..err_arm].contains(side_effect_call);
-        let side_effect_in_err = body[err_arm..].contains(side_effect_call);
+        let side_effect = body
+            .find("record_get_access")
+            .expect("record_get_access must be called");
         assert!(
-            side_effect_in_ok && side_effect_in_err,
-            "cache_contract_locally runs hosting side effects ({side_effect_call}) \
-             only in the PutQuery Ok arm. The legacy branch at get.rs:2420-2435 \
-             continues these side effects on PutQuery error — hosting LRU / TTL \
-             must refresh for ANY successful GET, not only when the local store \
-             write succeeds. Factor the side effects out of the Ok arm."
+            side_effect > err_arm,
+            "record_get_access must run AFTER the PutResponse match \
+             (outside both Ok and Err arms) so hosting LRU/TTL refresh on \
+             any successful wire-level GET — including when the local \
+             executor rejects the PutQuery. The legacy branch at \
+             get.rs:2420-2435 continues these side effects on error; \
+             the driver must match."
         );
     }
 
@@ -1062,32 +1152,25 @@ mod tests {
         );
     }
 
-    /// Bug #6 reproduction (source-level): the driver hard-codes
-    /// `fetch_contract: true` in every `GetMsg::Request`. The client's
-    /// `return_contract_code` flag must propagate to the wire field so
-    /// relays don't unnecessarily stream contract code bytes when the
-    /// client didn't ask for them. Post-#3757 the node ALSO needs the
-    /// contract for local validation/hosting — so this is a bandwidth
-    /// optimization, not a correctness fix. Still worth asserting.
+    /// Non-bug: per #3757, the node ALWAYS requests contract code on
+    /// the wire regardless of what the client asked for, so it can
+    /// cache WASM for validation/hosting. The driver matches legacy
+    /// `start_op` behaviour (`get.rs:59` hard-codes the same value).
+    /// This test pins the intentional choice so a future refactor
+    /// doesn't silently reintroduce client-flag pass-through.
     #[test]
-    fn driver_threads_return_contract_code_through_wire_request() {
-        const SOURCE: &str = include_str!("op_ctx_task.rs");
-        let build_request_start = SOURCE
-            .find("fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {")
-            .expect("build_request must exist");
-        let build_end_offset = SOURCE[build_request_start..]
-            .find("fn classify")
-            .expect("classify must follow build_request");
-        let build_body = &SOURCE[build_request_start..build_request_start + build_end_offset];
-        // If fetch_contract is still hard-coded true, the value the
-        // client asked for never reaches the wire request.
-        let hardcoded = build_body.contains("fetch_contract: true,");
+    fn driver_hardcodes_fetch_contract_true_per_issue_3757() {
+        let src = production_source();
+        let build_body = extract_fn_body(
+            src,
+            "fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {",
+        );
         assert!(
-            !hardcoded,
-            "GetMsg::Request.fetch_contract is hard-coded `true` in the \
-             driver's build_request. Thread the client's \
-             `return_contract_code` through so relays don't stream contract \
-             code when the client only asked for state."
+            build_body.contains("fetch_contract: true,"),
+            "GetMsg::Request.fetch_contract must stay hard-coded `true` — \
+             the node needs WASM for local validation/hosting regardless of \
+             the client's return_contract_code preference (issue #3757 / \
+             get.rs:52-55)."
         );
     }
 
