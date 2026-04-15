@@ -168,29 +168,51 @@ fn caller_to_json(caller: &CallerIdentity) -> serde_json::Value {
 /// in-page overlays (see issue #3836). Each entry includes the sanitized
 /// message, button labels, and delegate/caller context.
 ///
-/// The endpoint is protected by the same Origin check as
-/// `/permission/{nonce}/respond`: since this response now carries the full
-/// delegate-controlled message (rather than just a 100-char preview), a
-/// cross-origin page or rebinding attacker could otherwise scrape live
-/// prompts before the user sees them. Only trusted localhost origins pass.
+/// Because the response carries full delegate-controlled text, it must
+/// not be readable by a cross-origin page or DNS-rebinding attacker.
+/// Earlier versions enforced that by replying `403 Forbidden` to any
+/// untrusted `Origin`, but the `403` carried no `Access-Control-Allow-*`
+/// headers, which caused the browser to surface a "CORS header missing"
+/// error in the devtools console for every non-same-origin caller
+/// (e.g. a sandboxed iframe whose origin is `null`) — user-visible
+/// noise that looked like a real bug.
+///
+/// Instead, always reply `200 OK` with `Access-Control-Allow-Origin: *`
+/// so the response body can be delivered, but withhold the real prompt
+/// list unless the `Origin` header is a trusted loopback origin.
+/// Untrusted / null / missing-but-rewritten origins get an empty `[]`,
+/// a valid-shape response the shell's polling loop silently ignores.
+///
+/// Security posture is unchanged: a cross-origin attacker still cannot
+/// read the contents of live prompts, and the state-changing
+/// `/permission/{nonce}/respond` endpoint retains its strict Origin
+/// check independently. `*` is safe on this endpoint because no
+/// credentials (cookies, auth tokens) are associated with the poll.
 async fn pending_prompts(
     headers: HeaderMap,
     Extension(pending): Extension<PendingPrompts>,
 ) -> impl IntoResponse {
-    if let Some(origin) = headers.get("origin") {
-        let origin = origin.to_str().unwrap_or("");
-        if !is_trusted_origin(origin) {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "forbidden"})),
-            );
-        }
+    // Missing Origin (e.g. same-origin top-level fetch from some
+    // browsers) is treated as trusted: the gateway only listens on
+    // loopback, and the poll payload is not a capability.
+    let trusted = match headers.get("origin") {
+        Some(value) => value.to_str().map(is_trusted_origin).unwrap_or(false),
+        None => true,
+    };
+
+    // Attach a permissive CORS header on every response so the browser
+    // delivers the body (real list or empty) instead of logging a
+    // "CORS header missing" error.
+    let cors_headers = [("access-control-allow-origin", "*")];
+
+    if !trusted {
+        return (
+            axum::http::StatusCode::OK,
+            cors_headers,
+            Json(serde_json::json!([])),
+        );
     }
-    // Requests with no Origin header (e.g. same-origin top-level fetch from
-    // some browsers) are allowed: the gateway only listens on loopback, the
-    // response is same-origin by policy, and the polled payload is not a
-    // capability — answering still requires POSTing to `/respond` with an
-    // Origin check that does reject the no-header case.
+
     let prompts: Vec<serde_json::Value> = pending
         .iter()
         .map(|entry| {
@@ -211,7 +233,11 @@ async fn pending_prompts(
             })
         })
         .collect();
-    (axum::http::StatusCode::OK, Json(serde_json::json!(prompts)))
+    (
+        axum::http::StatusCode::OK,
+        cors_headers,
+        Json(serde_json::json!(prompts)),
+    )
 }
 
 /// Format the caller identity for the standalone HTML page's details
@@ -688,15 +714,24 @@ mod tests {
         headers: HeaderMap,
         pending: PendingPrompts,
     ) -> (axum::http::StatusCode, serde_json::Value) {
+        let (status, _hdrs, value) = call_pending_full(headers, pending).await;
+        (status, value)
+    }
+
+    async fn call_pending_full(
+        headers: HeaderMap,
+        pending: PendingPrompts,
+    ) -> (axum::http::StatusCode, HeaderMap, serde_json::Value) {
         use axum::body::to_bytes;
         use axum::response::IntoResponse;
         let resp = pending_prompts(headers, Extension(pending))
             .await
             .into_response();
         let status = resp.status();
+        let resp_headers = resp.headers().clone();
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        (status, value)
+        (status, resp_headers, value)
     }
 
     async fn call_permission_page(nonce: &str, pending: PendingPrompts) -> String {
@@ -847,17 +882,74 @@ mod tests {
     }
 
     // /permission/pending now returns full delegate-controlled text, so
-    // the endpoint must reject cross-origin requests (same Origin check
-    // as /respond). This guards against DNS rebinding / browser-extension
-    // scraping of live prompts.
+    // the endpoint must not leak prompt contents to cross-origin callers.
+    // The previous implementation enforced that by replying `403` to any
+    // untrusted Origin, but the 403 carried no `Access-Control-Allow-*`
+    // header, so the browser surfaced a "CORS header missing" error in
+    // the devtools console for every non-same-origin caller — user-
+    // visible noise that looked like a real bug. The current contract:
+    // untrusted origins get `200 OK` with an empty `[]` body and a
+    // permissive CORS header. An attacker still learns nothing about
+    // live prompts, and no console error is generated.
     #[tokio::test]
-    async fn test_pending_prompts_rejects_untrusted_origin() {
+    async fn test_pending_prompts_untrusted_origin_returns_empty_with_cors() {
         let pending = empty_pending();
         let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
         let mut headers = HeaderMap::new();
         headers.insert("origin", "http://evil.com".parse().unwrap());
-        let (status, _) = call_pending(headers, pending).await;
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        let (status, resp_headers, value) = call_pending_full(headers, pending).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(value, serde_json::json!([]));
+        assert_eq!(
+            resp_headers
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().unwrap()),
+            Some("*"),
+            "CORS header must be present so the browser can deliver the \
+             empty-list response instead of logging a CORS error"
+        );
+    }
+
+    // Sandboxed iframes (e.g. the webapp content iframe on the gateway
+    // shell page) send `Origin: null` for fetches. The endpoint must
+    // treat that the same as any other untrusted origin: empty list +
+    // CORS header, not `403`. Regression for Lukas Orsvärn's
+    // `/permission/pending` console-error report.
+    #[tokio::test]
+    async fn test_pending_prompts_null_origin_returns_empty_with_cors() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "null".parse().unwrap());
+        let (status, resp_headers, value) = call_pending_full(headers, pending).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(value, serde_json::json!([]));
+        assert_eq!(
+            resp_headers
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().unwrap()),
+            Some("*"),
+        );
+    }
+
+    // Trusted (loopback) origins still see the full prompt list and
+    // still receive the CORS header (harmless on same-origin replies,
+    // required on any non-same-origin path the browser may take).
+    #[tokio::test]
+    async fn test_pending_prompts_trusted_origin_returns_list_with_cors() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "msg", vec!["OK"], "d", webapp_caller("c"));
+        let (status, resp_headers, value) = call_pending_full(trusted_header(), pending).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["message"], "msg");
+        assert_eq!(
+            resp_headers
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().unwrap()),
+            Some("*"),
+        );
     }
 
     // Missing Origin is allowed (some fetch flavors omit it); this matches
@@ -867,8 +959,10 @@ mod tests {
     async fn test_pending_prompts_allows_missing_origin() {
         let pending = empty_pending();
         let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
-        let (status, _) = call_pending(HeaderMap::new(), pending).await;
+        let (status, value) = call_pending(HeaderMap::new(), pending).await;
         assert_eq!(status, axum::http::StatusCode::OK);
+        // Missing Origin should still return the real list, not an empty one.
+        assert_eq!(value.as_array().unwrap().len(), 1);
     }
 
     // End-to-end flow: two prompts pending, user answers one, other remains,
