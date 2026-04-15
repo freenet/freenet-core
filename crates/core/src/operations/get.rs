@@ -1,3 +1,5 @@
+pub(crate) mod op_ctx_task;
+
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 use std::collections::HashSet;
