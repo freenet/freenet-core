@@ -4178,12 +4178,6 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
 /// the subscription works (update propagates), client B disconnects. The test
 /// asserts that node-b sent an UnsubscribeSent event and the upstream peer
 /// logged an UnsubscribeReceived event in the aggregated event logs.
-///
-/// Ignored: regression under #1454 Phase 3a PUT driver migration. Two bugs
-/// identified; Bug 1 (GC retry of completed PUTs) fixed; Bug 2 (fresh
-/// Subscribe::Request from node-b ~30-50s after Phase 2, origin not yet
-/// traced) still blocks the Unsubscribe emission. Tracked in #3874.
-#[ignore]
 #[freenet_test(
     nodes = ["gateway", "node-a", "node-b"],
     timeout_secs = 600,

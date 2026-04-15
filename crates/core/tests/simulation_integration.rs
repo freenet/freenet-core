@@ -2408,9 +2408,6 @@ fn test_subscribe_forwarding_ack_relay() {
 /// same code path. Marked `#[ignore]` until the missing registration
 /// is restored; the test is kept in-tree as executable documentation
 /// of the gap and as a regression guard for the fix.
-// Ignored: reproduces #3874 — task-per-tx subscribe driver misses
-// register_peer_interest(.., is_upstream=true). Un-ignore once fixed. #3874
-#[ignore]
 #[test_log::test]
 fn test_client_disconnect_emits_upstream_unsubscribe() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
@@ -2513,6 +2510,132 @@ fn test_client_disconnect_emits_upstream_unsubscribe() {
         received_count > 0,
         "Upstream node MUST log UnsubscribeReceived after client disconnect \
          (sent={sent_count}, received={received_count})"
+    );
+}
+
+/// Edge case: disconnect from a node that never subscribed. No Unsubscribe
+/// should be emitted and nothing should log "No upstream peer found".
+#[test_log::test]
+fn test_client_disconnect_without_subscriptions_is_noop() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x5CB6_F37C_0004;
+    const NETWORK_NAME: &str = "disconnect-no-subs";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(NETWORK_NAME, 1, 4, 7, 3, 5, 2, SEED).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let operations = vec![ScheduledOperation::new(
+        NodeLabel::node(NETWORK_NAME, 1),
+        SimOperation::Disconnect,
+    )];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let sent_count = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.iter()
+            .filter(|log| log.kind.unsubscribe_sent_instance_id().is_some())
+            .count()
+    });
+
+    assert_eq!(
+        sent_count, 0,
+        "Disconnecting a client with no subscriptions must not emit any \
+         UnsubscribeSent events (got {sent_count})"
+    );
+}
+
+/// Edge case: subscribe twice from the same client, then disconnect.
+/// The upstream registration is idempotent, so only one Unsubscribe should
+/// be emitted per contract.
+#[test_log::test]
+fn test_repeat_subscribe_then_disconnect_emits_single_unsubscribe() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x5CB6_F37C_0005;
+    const NETWORK_NAME: &str = "repeat-subscribe-disconnect";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(NETWORK_NAME, 1, 4, 7, 3, 5, 2, SEED).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0xDD);
+    let contract_id = *contract.key().id();
+    let initial_state = SimOperation::create_test_state(1);
+
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial_state,
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 1),
+            SimOperation::Subscribe { contract_id },
+        ),
+        ScheduledOperation::new(NodeLabel::node(NETWORK_NAME, 1), SimOperation::Disconnect),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let sent_count = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.iter()
+            .filter(|log| {
+                log.kind
+                    .unsubscribe_sent_instance_id()
+                    .is_some_and(|id| *id == contract_id)
+            })
+            .count()
+    });
+
+    assert_eq!(
+        sent_count, 1,
+        "Repeat-subscribe + disconnect must emit exactly one UnsubscribeSent \
+         (got {sent_count})"
     );
 }
 
