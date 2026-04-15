@@ -80,6 +80,7 @@ pub(crate) fn start_op(
 }
 
 /// Create a GET operation with a specific transaction ID (for operation deduplication)
+#[allow(dead_code)] // Phase 6 cleanup: client-initiated GET now uses op_ctx_task::start_client_get
 pub(crate) fn start_op_with_id(
     instance_id: ContractInstanceId,
     fetch_contract: bool,

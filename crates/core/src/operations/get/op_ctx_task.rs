@@ -1,10 +1,3 @@
-// This module is created standalone in Commit 2 of Phase 3b; wiring
-// into `client_events.rs` lands in Commit 3. Until then the entry
-// points are unused — silence warnings at module scope to keep
-// `cargo clippy -D warnings` green. This attribute is removed in
-// Commit 3 once `start_client_get` has its client-events caller.
-#![allow(dead_code)]
-
 //! Task-per-transaction client-initiated GET (#1454 Phase 3b).
 //!
 //! Mirrors [`crate::operations::put::op_ctx_task`] — the Phase 3a
@@ -90,14 +83,14 @@ use super::{GetMsg, GetMsgResult};
 pub(crate) async fn start_client_get(
     op_manager: Arc<OpManager>,
     client_tx: Transaction,
-    key: ContractKey,
+    instance_id: ContractInstanceId,
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
 ) -> Result<Transaction, OpError> {
     tracing::debug!(
         tx = %client_tx,
-        contract = %key,
+        contract = %instance_id,
         "get (task-per-tx): spawning client-initiated task"
     );
 
@@ -109,7 +102,7 @@ pub(crate) async fn start_client_get(
     GlobalExecutor::spawn(run_client_get(
         op_manager,
         client_tx,
-        key,
+        instance_id,
         return_contract_code,
         subscribe,
         blocking_subscribe,
@@ -121,7 +114,7 @@ pub(crate) async fn start_client_get(
 async fn run_client_get(
     op_manager: Arc<OpManager>,
     client_tx: Transaction,
-    key: ContractKey,
+    instance_id: ContractInstanceId,
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
@@ -129,7 +122,7 @@ async fn run_client_get(
     let outcome = drive_client_get(
         op_manager.clone(),
         client_tx,
-        key,
+        instance_id,
         return_contract_code,
         subscribe,
         blocking_subscribe,
@@ -151,7 +144,7 @@ enum DriverOutcome {
 async fn drive_client_get(
     op_manager: Arc<OpManager>,
     client_tx: Transaction,
-    key: ContractKey,
+    instance_id: ContractInstanceId,
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
@@ -159,7 +152,7 @@ async fn drive_client_get(
     match drive_client_get_inner(
         &op_manager,
         client_tx,
-        key,
+        instance_id,
         return_contract_code,
         subscribe,
         blocking_subscribe,
@@ -174,24 +167,30 @@ async fn drive_client_get(
 async fn drive_client_get_inner(
     op_manager: &Arc<OpManager>,
     client_tx: Transaction,
-    key: ContractKey,
+    instance_id: ContractInstanceId,
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
 ) -> Result<DriverOutcome, OpError> {
-    let instance_id = *key.id();
     let htl = op_manager.ring.max_hops_to_live;
 
     // Pre-select initial target for the driver's retry state. Actual
     // routing is done by `process_message` on the loop-back; this is
     // just so `advance_to_next_peer` has a starting "tried" set.
+    //
+    // At the client-API boundary we only have an instance_id — the
+    // full ContractKey (which includes the code hash) isn't known
+    // until a terminal reply with `GetMsgResult::Found` arrives.
+    // `k_closest_potentially_hosting` accepts either.
     let mut tried: Vec<std::net::SocketAddr> = Vec::new();
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
         tried.push(own_addr);
     }
     let initial_target = op_manager
         .ring
-        .closest_potentially_hosting(&key, tried.as_slice());
+        .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
+        .into_iter()
+        .next();
     let current_target = match initial_target {
         Some(peer) => {
             if let Some(addr) = peer.socket_addr() {
@@ -204,7 +203,6 @@ async fn drive_client_get_inner(
 
     struct GetRetryDriver<'a> {
         op_manager: &'a OpManager,
-        key: ContractKey,
         instance_id: ContractInstanceId,
         htl: usize,
         tried: Vec<std::net::SocketAddr>,
@@ -213,8 +211,19 @@ async fn drive_client_get_inner(
         attempt_visited: VisitedPeers,
     }
 
+    /// Terminal value for the GET driver. Carries the instance_id
+    /// (always known) and optionally the full ContractKey recovered
+    /// from a remote `GetMsgResult::Found` reply. LocalCompletion
+    /// and ResponseStreaming both provide the full key; Response with
+    /// `Found` also provides it. The instance_id suffices to re-query
+    /// the local store in all cases.
+    #[derive(Debug)]
+    struct Terminal {
+        key: Option<ContractKey>,
+    }
+
     impl RetryDriver for GetRetryDriver<'_> {
-        type Terminal = ContractKey;
+        type Terminal = Terminal;
 
         fn new_attempt_tx(&mut self) -> Transaction {
             // Refresh the per-attempt VisitedPeers bloom so
@@ -244,14 +253,12 @@ async fn drive_client_get_inner(
             })
         }
 
-        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<ContractKey> {
+        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Terminal> {
             match classify_reply(&reply) {
-                ReplyClass::Terminal { key } => AttemptOutcome::Terminal(key),
-                // LocalCompletion carries no key — the Request echo
-                // doesn't include a full ContractKey. Use the driver's
-                // own `self.key` which has been stable since the task
-                // was spawned.
-                ReplyClass::LocalCompletion => AttemptOutcome::Terminal(self.key),
+                ReplyClass::Terminal { key } => {
+                    AttemptOutcome::Terminal(Terminal { key: Some(key) })
+                }
+                ReplyClass::LocalCompletion => AttemptOutcome::Terminal(Terminal { key: None }),
                 ReplyClass::Retry => AttemptOutcome::Retry,
                 ReplyClass::Unexpected => AttemptOutcome::Unexpected,
             }
@@ -260,7 +267,7 @@ async fn drive_client_get_inner(
         fn advance(&mut self) -> AdvanceOutcome {
             match advance_to_next_peer(
                 self.op_manager,
-                &self.key,
+                &self.instance_id,
                 &mut self.tried,
                 &mut self.retries,
             ) {
@@ -275,7 +282,6 @@ async fn drive_client_get_inner(
 
     let mut driver = GetRetryDriver {
         op_manager,
-        key,
         instance_id,
         htl,
         tried,
@@ -287,11 +293,34 @@ async fn drive_client_get_inner(
     let loop_result = drive_retry_loop(op_manager, client_tx, "get", &mut driver).await;
 
     match loop_result {
-        RetryLoopOutcome::Done(reply_key) => {
+        RetryLoopOutcome::Done(terminal) => {
             // Clean up the DashMap entry that process_message created.
             // Without this, the GC task finds a stale entry and may
             // launch speculative retries on the completed op.
             op_manager.completed(client_tx);
+
+            // Re-query the local contract store. `process_message`
+            // has already written the assembled state into the store
+            // (either via stream assembly for ResponseStreaming, by
+            // `put_contract` for Response{Found}, or via the original
+            // local-completion path for Request-echo). This ordering
+            // is load-bearing: the bypass forwards the reply only
+            // after process_message runs on the originator, so the
+            // store write is guaranteed visible here.
+            //
+            // The query resolves the full ContractKey for us if the
+            // Request-echo path left us with only an instance_id.
+            let host_result =
+                build_host_response(op_manager, &instance_id, return_contract_code).await;
+
+            // Prefer the ContractKey the reply carried (authoritative
+            // on the happy path); fall back to the one resolved from
+            // the store re-query (LocalCompletion) or a synthetic one
+            // when even that fails.
+            let reply_key = terminal
+                .key
+                .or_else(|| extract_host_response_key(&host_result))
+                .unwrap_or_else(|| synthetic_key(&instance_id));
 
             // Emit routing event + telemetry — report_result (which
             // normally does both) doesn't run because the bypass
@@ -319,17 +348,6 @@ async fn drive_client_get_inner(
                 crate::node::network_status::OpType::Get,
                 true,
             );
-
-            // Re-query the local contract store. `process_message`
-            // has already written the assembled state into the store
-            // (either via stream assembly for ResponseStreaming, by
-            // `put_contract` for Response{Found}, or via the original
-            // local-completion path for Request-echo). This ordering
-            // is load-bearing: the bypass forwards the reply only
-            // after process_message runs on the originator, so the
-            // store write is guaranteed visible here.
-            let host_result =
-                build_host_response(op_manager, &reply_key, return_contract_code).await;
 
             // Drive subscribe hand-off separately. Mirrors PUT 3a's
             // `maybe_subscribe_child` — subscribe is never handled in
@@ -368,12 +386,12 @@ async fn drive_client_get_inner(
 /// `to_host_result` produces on NotFound.
 async fn build_host_response(
     op_manager: &OpManager,
-    key: &ContractKey,
+    instance_id: &ContractInstanceId,
     return_contract_code: bool,
 ) -> HostResult {
     let lookup = op_manager
         .notify_contract_handler(ContractHandlerEvent::GetQuery {
-            instance_id: *key.id(),
+            instance_id: *instance_id,
             return_contract_code,
         })
         .await;
@@ -401,17 +419,38 @@ async fn build_host_response(
         }
         _ => {
             tracing::warn!(
-                contract = %key,
+                contract = %instance_id,
                 "get (task-per-tx): terminal reply classified success but local \
                  store lookup returned no state; synthesizing client error"
             );
             Err(ErrorKind::OperationError {
-                cause: format!("GET succeeded on wire but local store lookup failed for {key}")
-                    .into(),
+                cause: format!(
+                    "GET succeeded on wire but local store lookup failed for {instance_id}"
+                )
+                .into(),
             }
             .into())
         }
     }
+}
+
+/// Extract the `ContractKey` from a successful `HostResponse::GetResponse`.
+/// Used to recover the full key when the driver's terminal reply only
+/// carried an instance_id (LocalCompletion path).
+fn extract_host_response_key(result: &HostResult) -> Option<ContractKey> {
+    if let Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. })) = result {
+        Some(*key)
+    } else {
+        None
+    }
+}
+
+/// Fallback `ContractKey` for telemetry when we have neither a
+/// remote-reply key nor a store-resolved key. Zero code-hash is the
+/// documented sentinel — routing telemetry only needs a `Location`
+/// derived from the instance_id, which is preserved here.
+fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
+    ContractKey::from_id_and_code(*instance_id, CodeHash::new([0u8; 32]))
 }
 
 // --- Reply classification ---
@@ -465,7 +504,7 @@ const MAX_RETRIES: usize = 3;
 
 fn advance_to_next_peer(
     op_manager: &OpManager,
-    key: &ContractKey,
+    instance_id: &ContractInstanceId,
     tried: &mut Vec<std::net::SocketAddr>,
     retries: &mut usize,
 ) -> Option<(PeerKeyLocation, std::net::SocketAddr)> {
@@ -476,7 +515,9 @@ fn advance_to_next_peer(
 
     let peer = op_manager
         .ring
-        .closest_potentially_hosting(key, tried.as_slice())?;
+        .k_closest_potentially_hosting(instance_id, tried.as_slice(), 1)
+        .into_iter()
+        .next()?;
     let addr = peer.socket_addr()?;
     tried.push(addr);
     Some((peer, addr))
@@ -664,11 +705,13 @@ mod tests {
     #[test]
     fn driver_outcome_exhausted_produces_client_error() {
         let cause = "GET to contract failed after 3 attempts".to_string();
-        let outcome: DriverOutcome = match RetryLoopOutcome::<ContractKey>::Exhausted(cause) {
-            RetryLoopOutcome::Exhausted(cause) => DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                cause: cause.into(),
-            }
-            .into())),
+        let outcome: DriverOutcome = match RetryLoopOutcome::<()>::Exhausted(cause) {
+            RetryLoopOutcome::Exhausted(cause) => DriverOutcome::Publish(Err(
+                ErrorKind::OperationError {
+                    cause: cause.into(),
+                }
+                .into(),
+            )),
             RetryLoopOutcome::Done(_)
             | RetryLoopOutcome::Unexpected
             | RetryLoopOutcome::InfraError(_) => unreachable!(),

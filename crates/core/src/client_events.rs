@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
-use crate::operations::{OpError, VisitedPeers, get, put, update};
+use crate::operations::{OpError, get, put, update};
 use crate::ring::KnownPeerKeyLocation;
 use crate::tracing::NetEventLog;
 use crate::{
@@ -1153,204 +1153,87 @@ async fn process_open_request(
                             })));
                         }
 
-                        // Route through network when:
-                        // 1. We don't have local cache, OR
-                        // 2. We have local cache but are NOT subscribed (cache may be stale)
-                        if let Some(router) = &request_router {
-                            tracing::debug!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                peer = %peer_id,
-                                contract = %key,
-                                has_local = has_local_state,
-                                is_subscribed,
-                                connection_count,
-                                phase = "network_routing",
-                                "Routing GET request through network (not subscribed or no local cache)"
-                            );
+                        // Phase 3b (#1454): task-per-tx driver handles network
+                        // GETs. The driver owns its routing state in task locals
+                        // and calls notify_contract_handler locally as needed.
+                        // No request-router dedup — each task owns its own
+                        // operation lifecycle (matching PUT 3a's decision).
+                        tracing::debug!(
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            peer = %peer_id,
+                            contract = %key,
+                            has_local = has_local_state,
+                            is_subscribed,
+                            connection_count,
+                            phase = "network_routing",
+                            "Routing GET request through network (task-per-tx driver)"
+                        );
 
-                            let request = crate::node::DeduplicatedRequest::Get {
+                        let client_tx = crate::message::Transaction::new::<get::GetMsg>();
+
+                        op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(client_tx, client_id, request_id)
+                            .await
+                            .inspect_err(|err| {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %client_tx,
+                                    error = %err,
+                                    "Error waiting for transaction result"
+                                )
+                            })?;
+
+                        if subscribe {
+                            if let Some(sl) = subscription_listener {
+                                register_subscription_listener(
+                                    &op_manager,
+                                    key,
+                                    client_id,
+                                    sl,
+                                    "GET",
+                                )
+                                .await?;
+                            } else {
+                                tracing::warn!(
+                                    client_id = %client_id,
+                                    contract = %key,
+                                    "GET with subscribe=true but no subscription_listener"
+                                );
+                            }
+                        }
+
+                        // `report_op_init_error` takes a &ContractKey, so we
+                        // synthesize one from the instance_id for the error
+                        // path (the full key isn't known until a Response).
+                        let key_for_err = full_key.unwrap_or_else(|| {
+                            ContractKey::from_id_and_code(
                                 key,
-                                return_contract_code,
-                                subscribe,
-                                blocking_subscribe,
+                                freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                            )
+                        });
+                        if let Err(err) = get::op_ctx_task::start_client_get(
+                            op_manager.clone(),
+                            client_tx,
+                            key,
+                            return_contract_code,
+                            subscribe,
+                            blocking_subscribe,
+                        )
+                        .await
+                        {
+                            report_op_init_error(
+                                &op_manager,
+                                client_tx,
+                                &key_for_err,
+                                "GET",
+                                &err,
                                 client_id,
                                 request_id,
-                            };
-
-                            let (transaction_id, should_start_operation) =
-                                router.route_request(request).await.map_err(|e| {
-                                    Error::Node(format!("Request routing failed: {}", e))
-                                })?;
-
-                            // Always register this client for the result
-                            op_manager
-                                .ch_outbound
-                                .waiting_for_transaction_result(
-                                    transaction_id,
-                                    client_id,
-                                    request_id,
-                                )
-                                .await
-                                .inspect_err(|err| {
-                                    tracing::error!(
-                                        "Error waiting for transaction result (get): {}",
-                                        err
-                                    );
-                                })?;
-
-                            // Only start new network operation if this is a new operation
-                            if should_start_operation {
-                                tracing::debug!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %transaction_id,
-                                    peer = %peer_id,
-                                    contract = %key,
-                                    phase = "new_operation",
-                                    "Starting new GET network operation"
-                                );
-
-                                let op = get::start_op_with_id(
-                                    key,
-                                    return_contract_code,
-                                    subscribe,
-                                    blocking_subscribe,
-                                    transaction_id,
-                                );
-
-                                if let Err(err) = get::request_get(
-                                    &op_manager,
-                                    op,
-                                    VisitedPeers::new(&transaction_id),
-                                )
-                                .await
-                                {
-                                    report_op_init_error(
-                                        &op_manager,
-                                        transaction_id,
-                                        &key,
-                                        "GET",
-                                        &err,
-                                        client_id,
-                                        request_id,
-                                    )
-                                    .await;
-                                } else if subscribe {
-                                    if let Some(sl) = subscription_listener {
-                                        register_subscription_listener(
-                                            &op_manager,
-                                            key,
-                                            client_id,
-                                            sl,
-                                            "GET",
-                                        )
-                                        .await?;
-                                    } else {
-                                        tracing::warn!(
-                                            client_id = %client_id,
-                                            contract = %key,
-                                            "GET with subscribe=true but no subscription_listener"
-                                        );
-                                    }
-                                }
-                            } else {
-                                tracing::debug!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %transaction_id,
-                                    peer = %peer_id,
-                                    contract = %key,
-                                    phase = "reuse",
-                                    "Reusing existing GET operation - client registered for result"
-                                );
-
-                                // Register subscription listener for reused operations too
-                                if subscribe {
-                                    if let Some(subscription_listener) = subscription_listener {
-                                        register_subscription_listener(
-                                            &op_manager,
-                                            key,
-                                            client_id,
-                                            subscription_listener,
-                                            "network GET",
-                                        )
-                                        .await?;
-                                    } else {
-                                        tracing::warn!(
-                                            client_id = %client_id,
-                                            contract = %key,
-                                            "GET with subscribe=true but no subscription_listener"
-                                        );
-                                    }
-                                }
-                            }
-                        } else {
-                            tracing::debug!(
-                                client_id = %client_id,
-                                request_id = %request_id,
-                                peer = %peer_id,
-                                contract = %key,
-                                phase = "legacy",
-                                "Contract not found locally, starting direct GET operation (legacy mode)"
-                            );
-
-                            // Legacy mode: direct operation without deduplication
-                            let op = get::start_op(
-                                key,
-                                return_contract_code,
-                                subscribe,
-                                blocking_subscribe,
-                            );
-                            let op_id = op.id;
-
-                            op_manager
-                                .ch_outbound
-                                .waiting_for_transaction_result(op_id, client_id, request_id)
-                                .await
-                                .inspect_err(|err| {
-                                    tracing::error!(
-                                        client_id = %client_id,
-                                        request_id = %request_id,
-                                        tx = %op_id,
-                                        error = %err,
-                                        "Error waiting for transaction result"
-                                    )
-                                })?;
-
-                            if let Err(err) =
-                                get::request_get(&op_manager, op, VisitedPeers::new(&op_id)).await
-                            {
-                                report_op_init_error(
-                                    &op_manager,
-                                    op_id,
-                                    &key,
-                                    "GET",
-                                    &err,
-                                    client_id,
-                                    request_id,
-                                )
-                                .await;
-                            }
-
-                            if subscribe {
-                                if let Some(subscription_listener) = subscription_listener {
-                                    register_subscription_listener(
-                                        &op_manager,
-                                        key,
-                                        client_id,
-                                        subscription_listener,
-                                        "GET",
-                                    )
-                                    .await?;
-                                } else {
-                                    tracing::warn!(
-                                        client_id = %client_id,
-                                        contract = %key,
-                                        "GET with subscribe=true but no subscription_listener"
-                                    );
-                                }
-                            }
+                            )
+                            .await;
                         }
                     }
                     ContractRequest::Subscribe { key, summary } => {
