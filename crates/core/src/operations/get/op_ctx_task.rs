@@ -19,31 +19,33 @@
 //!
 //! 1. Loops, calling [`OpCtx::send_and_await`] with a fresh
 //!    `Transaction` per attempt (single-use-per-tx constraint).
-//!    The loop-back through `process_message` handles initial peer
-//!    selection and forwarding; if the contract is already cached
-//!    locally, `process_message` synthesizes a terminal result and
-//!    echoes the `GetMsg::Request` back via
-//!    `forward_pending_op_result_if_completed` (same mechanism PUT 3a
-//!    relies on for `LocalCompletion`).
-//! 2. On terminal `Response{Found}` / `ResponseStreaming` /
-//!    Request-echo: re-queries the contract store via
-//!    `notify_contract_handler(GetQuery)` to extract the assembled
-//!    state + contract, publishes `HostResponse::ContractResponse::GetResponse`
-//!    to the client via `send_client_result`.
-//! 3. On `Response{NotFound}`: treats as a terminal failure from that
-//!    peer and advances to the next.
-//! 4. On timeout / wire-error: advances to next peer or exhausts.
-//!
-//! # Streaming assembly
-//!
-//! `process_message` already assembles `ResponseStreaming` via
-//! `stream_handle.assemble().await` inline at the originator and
-//! writes the bytes into the local contract store before completing.
-//! The driver never touches the stream handle — it re-queries the
-//! store after the terminal reply arrives. Because the originator's
-//! `process_message` runs synchronously before
-//! `try_forward_task_per_tx_reply` intercepts the reply, the store
-//! write is visible to the driver's `GetQuery` by the time it fires.
+//!    `process_message` handles routing/forwarding on remote hops and
+//!    the originator's own loop-back for the local-completion (cache
+//!    hit) case, which echoes the `GetMsg::Request` back as the
+//!    terminal "reply" via `forward_pending_op_result_if_completed`
+//!    (same mechanism PUT 3a relies on for `LocalCompletion`).
+//! 2. On terminal `Response{Found}`: the driver stores the returned
+//!    state into the local executor via `PutQuery`, runs hosting /
+//!    access-tracking / announce side effects, and publishes
+//!    `HostResponse::ContractResponse::GetResponse` to the client.
+//!    These side effects mirror what the legacy `process_message`
+//!    Response{Found} branch does at `get.rs:2329` — for task-per-tx
+//!    ops the bypass at `node.rs::handle_pure_network_message_v1`
+//!    intercepts the terminal reply before `process_message` runs on
+//!    the originator (because `load_or_init` would fail with
+//!    `OpNotPresent`), so the driver is the only place they can
+//!    happen.
+//! 3. On terminal `ResponseStreaming`: Phase 3b delivers the final
+//!    payload via a store re-query using the contract key from the
+//!    envelope. Stream assembly and local caching for streamed
+//!    payloads remain on the legacy path for now — full migration is
+//!    tracked in #3883.
+//! 4. On terminal Request-echo: the pre-send local-cache shortcut in
+//!    `client_events.rs` already returned the state directly, so the
+//!    driver just resolves the ContractKey from the store for
+//!    telemetry and client delivery.
+//! 5. On `Response{NotFound}`: advance to the next peer.
+//! 6. On timeout / wire-error: advance to next peer or exhaust.
 //!
 //! # Connection-drop latency (R6)
 //!
@@ -201,85 +203,6 @@ async fn drive_client_get_inner(
         None => op_manager.ring.connection_manager.own_location(),
     };
 
-    struct GetRetryDriver<'a> {
-        op_manager: &'a OpManager,
-        instance_id: ContractInstanceId,
-        htl: usize,
-        tried: Vec<std::net::SocketAddr>,
-        retries: usize,
-        current_target: PeerKeyLocation,
-        attempt_visited: VisitedPeers,
-    }
-
-    /// Terminal value for the GET driver. Carries the instance_id
-    /// (always known) and optionally the full ContractKey recovered
-    /// from a remote `GetMsgResult::Found` reply. LocalCompletion
-    /// and ResponseStreaming both provide the full key; Response with
-    /// `Found` also provides it. The instance_id suffices to re-query
-    /// the local store in all cases.
-    #[derive(Debug)]
-    struct Terminal {
-        key: Option<ContractKey>,
-    }
-
-    impl RetryDriver for GetRetryDriver<'_> {
-        type Terminal = Terminal;
-
-        fn new_attempt_tx(&mut self) -> Transaction {
-            // Refresh the per-attempt VisitedPeers bloom so
-            // process_message's forwarding loop-prevention uses a
-            // fresh-per-tx filter (matching legacy `request_get`
-            // which calls `VisitedPeers::new(&tx)` once per op).
-            let tx = Transaction::new::<GetMsg>();
-            self.attempt_visited = VisitedPeers::new(&tx);
-            tx
-        }
-
-        fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {
-            NetMessage::from(GetMsg::Request {
-                id: attempt_tx,
-                instance_id: self.instance_id,
-                // Wire always requests contract code post-#3757; the
-                // client's `return_contract_code` flag only gates the
-                // client-facing payload at delivery time.
-                fetch_contract: true,
-                htl: self.htl,
-                visited: self.attempt_visited.clone(),
-                // Subscription hand-off is driven by `maybe_subscribe_child`
-                // after the GET terminates, NOT by this flag. Leave
-                // false so the server-side GET path doesn't
-                // double-register a subscription.
-                subscribe: false,
-            })
-        }
-
-        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Terminal> {
-            match classify_reply(&reply) {
-                ReplyClass::Terminal { key } => {
-                    AttemptOutcome::Terminal(Terminal { key: Some(key) })
-                }
-                ReplyClass::LocalCompletion => AttemptOutcome::Terminal(Terminal { key: None }),
-                ReplyClass::Retry => AttemptOutcome::Retry,
-                ReplyClass::Unexpected => AttemptOutcome::Unexpected,
-            }
-        }
-
-        fn advance(&mut self) -> AdvanceOutcome {
-            match advance_to_next_peer(
-                self.op_manager,
-                &self.instance_id,
-                &mut self.tried,
-                &mut self.retries,
-            ) {
-                Some((next_target, _next_addr)) => {
-                    self.current_target = next_target;
-                    AdvanceOutcome::Next
-                }
-                None => AdvanceOutcome::Exhausted,
-            }
-        }
-    }
-
     let mut driver = GetRetryDriver {
         op_manager,
         instance_id,
@@ -294,33 +217,63 @@ async fn drive_client_get_inner(
 
     match loop_result {
         RetryLoopOutcome::Done(terminal) => {
-            // Clean up the DashMap entry that process_message created.
-            // Without this, the GC task finds a stale entry and may
-            // launch speculative retries on the completed op.
+            // Clean up any DashMap entry left behind. `op_manager.completed`
+            // is idempotent, so calling it even when the driver never
+            // pushed is harmless.
             op_manager.completed(client_tx);
 
-            // Re-query the local contract store. `process_message`
-            // has already written the assembled state into the store
-            // (either via stream assembly for ResponseStreaming, by
-            // `put_contract` for Response{Found}, or via the original
-            // local-completion path for Request-echo). This ordering
-            // is load-bearing: the bypass forwards the reply only
-            // after process_message runs on the originator, so the
-            // store write is guaranteed visible here.
+            // Mirror the originator-side side effects that the legacy
+            // `process_message` Response{Found} branch does
+            // (`get.rs:2218–2450`): PutQuery the fetched state into
+            // the local executor so re-GETs / local-cache checks / the
+            // hosting LRU see it, announce hosting, and record the
+            // access. Without this, a client-initiated GET succeeds
+            // on the wire but the requesting node never stores the
+            // contract — which broke `test_get_routing_coverage_low_htl`
+            // and `test_auto_fetch_from_update_sender` on CI when the
+            // bypass was first introduced.
             //
-            // The query resolves the full ContractKey for us if the
-            // Request-echo path left us with only an instance_id.
+            // The bypass at `node.rs::handle_pure_network_message_v1`
+            // intercepts the terminal reply BEFORE `process_message`
+            // runs on the originator (by design — process_message
+            // would fail with OpNotPresent for a task-per-tx op), so
+            // the driver is the only place these side effects can
+            // happen for Phase 3b.
+            let reply_key = match &terminal {
+                Terminal::InlineFound {
+                    key,
+                    state,
+                    contract,
+                } => {
+                    cache_contract_locally(op_manager, *key, state.clone(), contract.clone()).await;
+                    *key
+                }
+                Terminal::Streaming { key } => {
+                    // ResponseStreaming payload is assembled by a path
+                    // not yet wired through the driver. For Phase 3b,
+                    // the terminal reply suffices for client delivery
+                    // via a store re-query (process_message on a
+                    // different code path handled assembly before the
+                    // bypass could intercept, OR assembly happens
+                    // elsewhere in the pipeline). Tracked alongside
+                    // relay-GET migration in #3883.
+                    *key
+                }
+                Terminal::LocalCompletion => {
+                    // Request-echo: the pre-send local-cache shortcut
+                    // in `client_events.rs` already returned a cached
+                    // state directly, so reaching here means
+                    // `request_get`'s fallback cached it. The store
+                    // already has the bytes; just resolve the key.
+                    match lookup_stored_key(op_manager, &instance_id).await {
+                        Some(k) => k,
+                        None => synthetic_key(&instance_id),
+                    }
+                }
+            };
+
             let host_result =
                 build_host_response(op_manager, &instance_id, return_contract_code).await;
-
-            // Prefer the ContractKey the reply carried (authoritative
-            // on the happy path); fall back to the one resolved from
-            // the store re-query (LocalCompletion) or a synthetic one
-            // when even that fails.
-            let reply_key = terminal
-                .key
-                .or_else(|| extract_host_response_key(&host_result))
-                .unwrap_or_else(|| synthetic_key(&instance_id));
 
             // Emit routing event + telemetry — report_result (which
             // normally does both) doesn't run because the bypass
@@ -370,6 +323,130 @@ async fn drive_client_get_inner(
         }
         RetryLoopOutcome::Unexpected => Err(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => Err(err),
+    }
+}
+
+// --- Retry-driver state and classification ---
+
+struct GetRetryDriver<'a> {
+    op_manager: &'a OpManager,
+    instance_id: ContractInstanceId,
+    htl: usize,
+    tried: Vec<std::net::SocketAddr>,
+    retries: usize,
+    current_target: PeerKeyLocation,
+    attempt_visited: VisitedPeers,
+}
+
+/// Terminal value for the GET driver.
+///
+/// Carries the bytes needed to (a) store the contract in the local
+/// executor via `PutQuery` — matching the side effect that the legacy
+/// `process_message` Response{Found} branch performs at
+/// `get.rs:2329` — and (b) build the client-facing
+/// `HostResponse::GetResponse`.
+#[derive(Debug)]
+enum Terminal {
+    /// Inline Response{Found}: state and optional contract arrived in
+    /// the reply envelope; driver stores them locally via PutQuery.
+    InlineFound {
+        key: ContractKey,
+        state: WrappedState,
+        contract: Option<ContractContainer>,
+    },
+    /// ResponseStreaming: stream assembly and local caching are not
+    /// yet wired through the driver. Tracked in #3883. For the happy
+    /// path the store re-query covers reads, so non-streaming tests
+    /// pass; streamed payloads need follow-up work.
+    Streaming { key: ContractKey },
+    /// Request-echo from `forward_pending_op_result_if_completed` —
+    /// state was already in the local store (via the pre-send
+    /// local-cache shortcut), so no new PutQuery is needed. The
+    /// driver just resolves the key from the store.
+    LocalCompletion,
+}
+
+/// Classify a reply into a driver outcome. Extracted from the
+/// `RetryDriver::classify` impl so it's reachable from unit tests.
+fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
+    match reply {
+        NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+            result:
+                GetMsgResult::Found {
+                    key,
+                    value:
+                        StoreResponse {
+                            state: Some(state),
+                            contract,
+                        },
+                },
+            ..
+        })) => AttemptOutcome::Terminal(Terminal::InlineFound {
+            key,
+            state,
+            contract,
+        }),
+        NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+            result: GetMsgResult::Found { value, .. },
+            ..
+        })) => {
+            tracing::warn!(
+                ?value,
+                "get (task-per-tx): Response{{Found}} arrived without state"
+            );
+            AttemptOutcome::Unexpected
+        }
+        NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+            result: GetMsgResult::NotFound,
+            ..
+        })) => AttemptOutcome::Retry,
+        NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreaming { key, .. })) => {
+            AttemptOutcome::Terminal(Terminal::Streaming { key })
+        }
+        NetMessage::V1(NetMessageV1::Get(GetMsg::Request { .. })) => {
+            AttemptOutcome::Terminal(Terminal::LocalCompletion)
+        }
+        _ => AttemptOutcome::Unexpected,
+    }
+}
+
+impl RetryDriver for GetRetryDriver<'_> {
+    type Terminal = Terminal;
+
+    fn new_attempt_tx(&mut self) -> Transaction {
+        let tx = Transaction::new::<GetMsg>();
+        self.attempt_visited = VisitedPeers::new(&tx);
+        tx
+    }
+
+    fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {
+        NetMessage::from(GetMsg::Request {
+            id: attempt_tx,
+            instance_id: self.instance_id,
+            fetch_contract: true,
+            htl: self.htl,
+            visited: self.attempt_visited.clone(),
+            subscribe: false,
+        })
+    }
+
+    fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Terminal> {
+        classify(reply)
+    }
+
+    fn advance(&mut self) -> AdvanceOutcome {
+        match advance_to_next_peer(
+            self.op_manager,
+            &self.instance_id,
+            &mut self.tried,
+            &mut self.retries,
+        ) {
+            Some((next_target, _next_addr)) => {
+                self.current_target = next_target;
+                AdvanceOutcome::Next
+            }
+            None => AdvanceOutcome::Exhausted,
+        }
     }
 }
 
@@ -432,17 +509,6 @@ async fn build_host_response(
     }
 }
 
-/// Extract the `ContractKey` from a successful `HostResponse::GetResponse`.
-/// Used to recover the full key when the driver's terminal reply only
-/// carried an instance_id (LocalCompletion path).
-fn extract_host_response_key(result: &HostResult) -> Option<ContractKey> {
-    if let Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. })) = result {
-        Some(*key)
-    } else {
-        None
-    }
-}
-
 /// Fallback `ContractKey` for telemetry when we have neither a
 /// remote-reply key nor a store-resolved key. Zero code-hash is the
 /// documented sentinel — routing telemetry only needs a `Location`
@@ -451,44 +517,125 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
     ContractKey::from_id_and_code(*instance_id, CodeHash::new([0u8; 32]))
 }
 
-// --- Reply classification ---
+/// Store the fetched contract state in the local executor so that
+/// re-GETs, local-cache checks, and the hosting LRU see it. Mirrors
+/// the `PutQuery` call in the legacy `process_message` Response{Found}
+/// branch at `get.rs:2329`. Also triggers hosting / access-tracking
+/// side effects so a newly-hosted contract announces itself and
+/// register hosting interest — same as the legacy path.
+async fn cache_contract_locally(
+    op_manager: &OpManager,
+    key: ContractKey,
+    state: WrappedState,
+    contract: Option<ContractContainer>,
+) {
+    let Some(contract_code) = contract else {
+        // No contract code means we can't cache (issue #2306). Skip
+        // silently — re-GET will retry with fetch_contract=true.
+        tracing::debug!(
+            %key,
+            "get (task-per-tx): skipping local cache — contract code missing"
+        );
+        return;
+    };
 
-#[derive(Debug)]
-enum ReplyClass {
-    /// Remote peer returned a successful terminal (Found / streaming).
-    Terminal {
-        key: ContractKey,
-    },
-    /// Remote peer explicitly reported NotFound — advance to next peer.
-    Retry,
-    /// Local completion: process_message had the contract already and
-    /// echoed the Request back via `forward_pending_op_result_if_completed`.
-    /// The echo doesn't carry a full `ContractKey` (the Request uses
-    /// `instance_id`), so the driver's `classify` impl substitutes its
-    /// own `self.key` on this variant.
-    LocalCompletion,
-    Unexpected,
+    let state_size = state.size() as u64;
+
+    let res = op_manager
+        .notify_contract_handler(ContractHandlerEvent::PutQuery {
+            key,
+            state,
+            related_contracts: RelatedContracts::default(),
+            contract: Some(contract_code),
+        })
+        .await;
+
+    match res {
+        Ok(ContractHandlerEvent::PutResponse {
+            new_value: Ok(_), ..
+        }) => {
+            let access_result = op_manager.ring.record_get_access(key, state_size);
+            op_manager.ring.mark_local_client_access(&key);
+
+            // Clean up interest tracking for evicted contracts.
+            let mut removed_contracts = Vec::new();
+            for evicted_key in &access_result.evicted {
+                if op_manager
+                    .interest_manager
+                    .unregister_local_hosting(evicted_key)
+                {
+                    removed_contracts.push(*evicted_key);
+                }
+            }
+
+            if access_result.is_new {
+                crate::operations::announce_contract_hosted(op_manager, &key).await;
+                let became_interested = op_manager.interest_manager.register_local_hosting(&key);
+                let added = if became_interested { vec![key] } else { vec![] };
+                if !added.is_empty() || !removed_contracts.is_empty() {
+                    crate::operations::broadcast_change_interests(
+                        op_manager,
+                        added,
+                        removed_contracts,
+                    )
+                    .await;
+                }
+            } else if !removed_contracts.is_empty() {
+                crate::operations::broadcast_change_interests(
+                    op_manager,
+                    vec![],
+                    removed_contracts,
+                )
+                .await;
+            }
+        }
+        Ok(ContractHandlerEvent::PutResponse {
+            new_value: Err(err),
+            ..
+        }) => {
+            tracing::warn!(
+                %key,
+                %err,
+                "get (task-per-tx): PutQuery rejected by executor"
+            );
+        }
+        Ok(other) => {
+            tracing::warn!(
+                %key,
+                ?other,
+                "get (task-per-tx): PutQuery returned unexpected event"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                %key,
+                %err,
+                "get (task-per-tx): PutQuery failed"
+            );
+        }
+    }
 }
 
-fn classify_reply(msg: &NetMessage) -> ReplyClass {
-    match msg {
-        NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
-            result: GetMsgResult::Found { key, .. },
-            ..
-        })) => ReplyClass::Terminal { key: *key },
-        NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
-            result: GetMsgResult::NotFound,
-            ..
-        })) => ReplyClass::Retry,
-        NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreaming { key, .. })) => {
-            ReplyClass::Terminal { key: *key }
-        }
-        // Request-echo from forward_pending_op_result_if_completed —
-        // same mechanism PUT 3a uses. The echo carries only
-        // instance_id, not the full ContractKey; the driver's
-        // `classify` impl substitutes `self.key`.
-        NetMessage::V1(NetMessageV1::Get(GetMsg::Request { .. })) => ReplyClass::LocalCompletion,
-        _ => ReplyClass::Unexpected,
+/// Re-query the local store for the contract key, used on the
+/// LocalCompletion path where the Request echo carries only an
+/// instance_id.
+async fn lookup_stored_key(
+    op_manager: &OpManager,
+    instance_id: &ContractInstanceId,
+) -> Option<ContractKey> {
+    let lookup = op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            instance_id: *instance_id,
+            return_contract_code: false,
+        })
+        .await;
+
+    match lookup {
+        Ok(ContractHandlerEvent::GetResponse {
+            key: Some(key),
+            response: Ok(_),
+        }) => Some(key),
+        _ => None,
     }
 }
 
@@ -594,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_reply_response_found_is_terminal() {
+    fn classify_response_found_is_inline_terminal() {
         let tx = dummy_tx();
         let key = dummy_key();
         let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
@@ -608,11 +755,14 @@ mod tests {
                 },
             },
         }));
-        assert!(matches!(classify_reply(&msg), ReplyClass::Terminal { .. }));
+        assert!(matches!(
+            classify(msg),
+            AttemptOutcome::Terminal(Terminal::InlineFound { .. })
+        ));
     }
 
     #[test]
-    fn classify_reply_response_notfound_is_retry() {
+    fn classify_response_notfound_is_retry() {
         let tx = dummy_tx();
         let key = dummy_key();
         let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
@@ -620,11 +770,11 @@ mod tests {
             instance_id: *key.id(),
             result: GetMsgResult::NotFound,
         }));
-        assert!(matches!(classify_reply(&msg), ReplyClass::Retry));
+        assert!(matches!(classify(msg), AttemptOutcome::Retry));
     }
 
     #[test]
-    fn classify_reply_response_streaming_is_terminal() {
+    fn classify_response_streaming_is_streaming_terminal() {
         let tx = dummy_tx();
         let key = dummy_key();
         let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreaming {
@@ -635,11 +785,14 @@ mod tests {
             total_size: 1024,
             includes_contract: true,
         }));
-        assert!(matches!(classify_reply(&msg), ReplyClass::Terminal { .. }));
+        assert!(matches!(
+            classify(msg),
+            AttemptOutcome::Terminal(Terminal::Streaming { .. })
+        ));
     }
 
     #[test]
-    fn classify_reply_forwarding_ack_is_unexpected() {
+    fn classify_forwarding_ack_is_unexpected() {
         let tx = dummy_tx();
         let key = dummy_key();
         let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::ForwardingAck {
@@ -647,23 +800,23 @@ mod tests {
             instance_id: *key.id(),
         }));
         assert!(
-            matches!(classify_reply(&msg), ReplyClass::Unexpected),
+            matches!(classify(msg), AttemptOutcome::Unexpected),
             "ForwardingAck must NOT be classified as terminal (Phase 2b bug 2)"
         );
     }
 
     #[test]
-    fn classify_reply_response_streaming_ack_is_unexpected() {
+    fn classify_response_streaming_ack_is_unexpected() {
         let tx = dummy_tx();
         let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreamingAck {
             id: tx,
             stream_id: crate::transport::peer_connection::StreamId::next(),
         }));
-        assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
+        assert!(matches!(classify(msg), AttemptOutcome::Unexpected));
     }
 
     #[test]
-    fn classify_reply_request_echo_is_local_completion() {
+    fn classify_request_echo_is_local_completion() {
         // When process_message completes locally (no next hop, contract
         // already cached), the Request is echoed back via
         // forward_pending_op_result_if_completed.
@@ -677,14 +830,38 @@ mod tests {
             visited: VisitedPeers::new(&tx),
             subscribe: false,
         }));
-        assert!(matches!(classify_reply(&msg), ReplyClass::LocalCompletion));
+        assert!(matches!(
+            classify(msg),
+            AttemptOutcome::Terminal(Terminal::LocalCompletion)
+        ));
     }
 
     #[test]
-    fn classify_reply_unexpected_for_non_get_message() {
+    fn classify_response_found_without_state_is_unexpected() {
+        // Defensive: if a peer somehow returns Found but the inner
+        // StoreResponse has no state, the driver must NOT build an
+        // InlineFound Terminal with a missing state.
+        let tx = dummy_tx();
+        let key = dummy_key();
+        let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+            id: tx,
+            instance_id: *key.id(),
+            result: GetMsgResult::Found {
+                key,
+                value: StoreResponse {
+                    state: None,
+                    contract: None,
+                },
+            },
+        }));
+        assert!(matches!(classify(msg), AttemptOutcome::Unexpected));
+    }
+
+    #[test]
+    fn classify_unexpected_for_non_get_message() {
         let tx = dummy_tx();
         let msg = NetMessage::V1(NetMessageV1::Aborted(tx));
-        assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
+        assert!(matches!(classify(msg), AttemptOutcome::Unexpected));
     }
 
     #[test]
