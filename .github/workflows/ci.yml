@@ -562,7 +562,7 @@ jobs:
 
       - name: Upload simulation logs
         if: always() && steps.release_check.outputs.is_release != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: simulation-logs
           path: sim-logs/
