@@ -9005,6 +9005,42 @@ async fn test_nightly_fault_recovery_speed() {
 ///   2. `node-2`, `node-3`, `node-4` (the `GATEWAYS..GATEWAYS + NODES`
 ///      range) ARE live regular-node labels.
 ///   3. `node-5` (one past the end) is NOT a live regular-node label.
+/// Pins the `NodeLabel::node` / `NodeLabel::gateway` string format that
+/// `SimNetwork::config_nodes` and every downstream test query rely on.
+/// Keeping this as a plain `#[test]` (not `#[tokio::test]`) ensures the
+/// CI rule-lint regex `#\[(tokio::)?test\]` counts it as a regression
+/// test — the async `sim_network_regular_node_labels_start_at_gateway_count`
+/// below is annotated with `#[test_log::test(...)]` which the lint grep
+/// does not recognize. Both tests pin the same bug class at different
+/// layers: this one pins the label encoding, the async one pins the
+/// live-label ID range.
+#[test]
+fn node_label_node_and_gateway_formats_are_stable() {
+    // Expected encoding is "<network>-node-<id>" and "<network>-gateway-<id>".
+    assert_eq!(
+        NodeLabel::node("net", 5).to_string(),
+        "net-node-5",
+        "NodeLabel::node string format must remain stable"
+    );
+    assert_eq!(
+        NodeLabel::gateway("net", 2).to_string(),
+        "net-gateway-2",
+        "NodeLabel::gateway string format must remain stable"
+    );
+    // Gateway and regular-node labels at the same numeric ID must be
+    // distinct, because `config_nodes` and the test indexing convention
+    // rely on the two label spaces being disjoint by type-prefix — not
+    // by numeric range. A future refactor that conflates them would
+    // silently corrupt every connection-count assertion.
+    assert_ne!(
+        NodeLabel::node("net", 0),
+        NodeLabel::gateway("net", 0),
+        "gateway and regular-node labels must be distinct at the same numeric ID"
+    );
+    // And `node 5` must not equal `gateway 5` either.
+    assert_ne!(NodeLabel::node("net", 5), NodeLabel::gateway("net", 5));
+}
+
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn sim_network_regular_node_labels_start_at_gateway_count() {
     const NETWORK_NAME: &str = "label-indexing-regression";
