@@ -377,11 +377,32 @@ pub(crate) trait RelayContext {
     ) -> Option<PeerKeyLocation>;
 }
 
+/// Bundle of the two side-effects a relay must emit atomically when it
+/// decides to accept a CONNECT request: the `ConnectResponse` message to send
+/// upstream AND the `PeerKeyLocation` of the joiner whose transient transport
+/// connection must be promoted to a ring connection.
+///
+/// These MUST be handled together. Accepting without promoting leaves the
+/// joiner stuck in `transient_connections` on the acceptor, so downstream
+/// lookups like `get_peer_by_addr` (used by subscribe interest registration
+/// and broadcast fan-out) cannot find the peer. This was the root cause of
+/// issue #3838 — the `Rejected`/`ConnectFailed` retry paths in
+/// `process_message` had drifted apart and sent the response without
+/// promoting the joiner. Combining the two fields into one struct makes that
+/// class of bug unrepresentable.
+#[derive(Debug)]
+pub(crate) struct AcceptOutcome {
+    pub response: ConnectResponse,
+    pub joiner: PeerKeyLocation,
+}
+
 /// Result of processing a request at a relay.
 #[derive(Debug, Default)]
 pub(crate) struct RelayActions {
-    pub accept_response: Option<ConnectResponse>,
-    pub expect_connection_from: Option<PeerKeyLocation>,
+    /// Set when this relay decided to accept the joiner itself. The joiner
+    /// and the response travel together so callers cannot forget to promote
+    /// the transient connection to a ring connection. See [`AcceptOutcome`].
+    pub accept: Option<AcceptOutcome>,
     pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
     pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
     /// True when at terminus, cannot accept, and has no routing options.
@@ -612,11 +633,12 @@ impl RelayState {
                                     let acceptor = PeerKeyLocation::with_unknown_addr(
                                         self_loc.pub_key().clone(),
                                     );
-                                    actions.accept_response = Some(ConnectResponse {
-                                        acceptor: acceptor.clone(),
+                                    actions.accept = Some(AcceptOutcome {
+                                        response: ConnectResponse {
+                                            acceptor: acceptor.clone(),
+                                        },
+                                        joiner: self.request.joiner.clone(),
                                     });
-                                    actions.expect_connection_from =
-                                        Some(self.request.joiner.clone());
                                     tracing::info!(
                                         acceptor_loc = ?self_loc.location(),
                                         joiner_loc = ?self.request.joiner.location(),
@@ -667,10 +689,12 @@ impl RelayState {
             let self_loc = ctx.self_location();
             let acceptor = PeerKeyLocation::with_unknown_addr(self_loc.pub_key().clone());
             let dist = ring_distance(self_loc.location(), self.request.joiner.location());
-            actions.accept_response = Some(ConnectResponse {
-                acceptor: acceptor.clone(),
+            actions.accept = Some(AcceptOutcome {
+                response: ConnectResponse {
+                    acceptor: acceptor.clone(),
+                },
+                joiner: self.request.joiner.clone(),
             });
-            actions.expect_connection_from = Some(self.request.joiner.clone());
             // Response is routed hop-by-hop via upstream_addr, no target embedded in message
             tracing::info!(
                 acceptor_pub_key = %self_loc.pub_key(),
@@ -1573,7 +1597,7 @@ impl Operation for ConnectOp {
                         payload.joiner.clone(),
                         upstream_addr,
                         actions.forward.as_ref().map(|(peer, _)| peer.clone()),
-                        actions.accept_response.is_some(),
+                        actions.accept.is_some(),
                         payload.ttl,
                     ) {
                         op_manager.ring.register_events(Either::Left(event)).await;
@@ -1597,61 +1621,19 @@ impl Operation for ConnectOp {
                             .await?;
                     }
 
-                    if let Some(peer) = actions.expect_connection_from {
-                        if let Some(addr) = peer.socket_addr() {
-                            // Log to confirm this code path is executed
-                            tracing::info!(
-                                joiner_addr = %addr,
-                                tx = %self.id,
-                                "connect: acceptor accepted joiner, initiating hole punch"
-                            );
-
-                            // Register expectation for incoming connection from joiner
-                            op_manager
-                                .notify_node_event(NodeEvent::ExpectPeerConnection { addr })
-                                .await?;
-
-                            // UDP hole punching: The acceptor must ALSO initiate an outbound
-                            // connection to the joiner. This creates a NAT binding on the
-                            // acceptor's side, allowing the joiner's packets to pass through.
-                            // Without this, NAT peers cannot connect to each other because
-                            // only the joiner would be sending packets.
-                            let (callback, mut rx) = mpsc::channel(1);
-                            op_manager
-                                .notify_node_event(NodeEvent::ConnectPeer {
-                                    peer: peer.clone(),
-                                    tx: self.id,
-                                    callback,
-                                    is_gw: false,
-                                })
-                                .await?;
-
-                            // Don't block waiting for connection result - the joiner will
-                            // also be connecting to us simultaneously. Just spawn a task
-                            // to log the outcome.
-                            let tx_id = self.id;
-                            let peer_clone = peer.clone();
-                            GlobalExecutor::spawn(async move {
-                                if let Some(result) = rx.recv().await {
-                                    match result {
-                                        Ok((connected_peer, _)) => {
-                                            tracing::info!(
-                                                %connected_peer,
-                                                tx=%tx_id,
-                                                "connect: acceptor hole-punch connection succeeded"
-                                            );
-                                        }
-                                        Err(_) => {
-                                            tracing::debug!(
-                                                %peer_clone,
-                                                tx=%tx_id,
-                                                "connect: acceptor hole-punch connection failed (joiner may connect to us instead)"
-                                            );
-                                        }
-                                    }
-                                }
-                            });
-                        }
+                    // Promote the joiner BEFORE sending the `Response` upstream:
+                    // once the joiner receives our Response it may immediately
+                    // start subscribing through us, and `get_peer_by_addr` on
+                    // the acceptor side only finds ring connections. Dispatch
+                    // here (using a ref borrow) and let the `accept_response`
+                    // site below consume the owned value for the actual send.
+                    // (The `forward` branch below is uphill to the next relay,
+                    // not to the joiner, so its ordering relative to dispatch
+                    // doesn't matter — it's placed here mainly to match the
+                    // near-terminus "forward + accept" code path.)
+                    if let Some(ref accept) = actions.accept {
+                        dispatch_expect_connection_from(op_manager, self.id, accept.joiner.clone())
+                            .await?;
                     }
 
                     if let Some((next, request)) = actions.forward {
@@ -1702,12 +1684,12 @@ impl Operation for ConnectOp {
                         return Ok(store_operation_state(&mut self));
                     }
 
-                    if let Some(response) = actions.accept_response {
+                    if let Some(accept) = actions.accept {
                         // Emit telemetry for response sent
                         if let Some(event) = NetEventLog::connect_response_sent(
                             &self.id,
                             &op_manager.ring,
-                            response.acceptor.clone(),
+                            accept.response.acceptor.clone(),
                             payload.joiner.clone(),
                         ) {
                             op_manager.ring.register_events(Either::Left(event)).await;
@@ -1715,7 +1697,7 @@ impl Operation for ConnectOp {
 
                         let response_msg = ConnectMsg::Response {
                             id: self.id,
-                            payload: response,
+                            payload: accept.response,
                         };
                         // Route the response through upstream (where the request came from)
                         // using hop-by-hop routing. We don't embed target in the message.
@@ -2065,17 +2047,34 @@ impl Operation for ConnectOp {
                                     .send(addr, NetMessage::V1(NetMessageV1::Connect(forward_msg)))
                                     .await?;
                             }
-                        } else if let Some(response) = retry_actions.accept_response {
+                        } else if let Some(accept) = retry_actions.accept {
                             // Relay decided to accept on retry — send response upstream
+                            // AND promote the joiner's transient connection into a ring
+                            // connection. The `AcceptOutcome` bundles both halves so they
+                            // cannot drift apart again (#3838).
                             tracing::info!(
                                 tx = %self.id,
                                 failed_peer = ?failed_peer,
-                                acceptor = %response.acceptor.pub_key(),
+                                acceptor = %accept.response.acceptor.pub_key(),
                                 "connect: relay accepting locally after uphill rejection"
                             );
+                            // Emit `connect_response_sent` telemetry, matching the
+                            // happy-path accept branch (#3893 review: close the telemetry
+                            // gap between accept sites so analytics can count retry
+                            // acceptances alongside first-pass acceptances).
+                            if let Some(event) = NetEventLog::connect_response_sent(
+                                &self.id,
+                                &op_manager.ring,
+                                accept.response.acceptor.clone(),
+                                accept.joiner.clone(),
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+                            dispatch_expect_connection_from(op_manager, self.id, accept.joiner)
+                                .await?;
                             let response_msg = ConnectMsg::Response {
                                 id: self.id,
-                                payload: response,
+                                payload: accept.response,
                             };
                             network_bridge
                                 .send(
@@ -2218,16 +2217,32 @@ impl Operation for ConnectOp {
                                     .send(addr, NetMessage::V1(NetMessageV1::Connect(forward_msg)))
                                     .await?;
                             }
-                        } else if let Some(response) = retry_actions.accept_response {
+                        } else if let Some(accept) = retry_actions.accept {
+                            // Same rationale as the `Rejected` retry branch: the
+                            // `AcceptOutcome` bundles the response and the joiner so we
+                            // cannot forget to promote the transient connection when
+                            // accepting locally (#3838).
                             tracing::info!(
                                 tx = %self.id,
                                 failed_acceptor = %failed_acceptor_addr,
-                                acceptor = %response.acceptor.pub_key(),
+                                acceptor = %accept.response.acceptor.pub_key(),
                                 "connect: relay accepting locally after ConnectFailed"
                             );
+                            // Emit `connect_response_sent` telemetry, matching the
+                            // happy-path accept branch (#3893 review).
+                            if let Some(event) = NetEventLog::connect_response_sent(
+                                &self.id,
+                                &op_manager.ring,
+                                accept.response.acceptor.clone(),
+                                accept.joiner.clone(),
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
+                            dispatch_expect_connection_from(op_manager, self.id, accept.joiner)
+                                .await?;
                             let response_msg = ConnectMsg::Response {
                                 id: self.id,
-                                payload: response,
+                                payload: accept.response,
                             };
                             network_bridge
                                 .send(
@@ -2352,6 +2367,77 @@ fn ring_distance(a: Option<Location>, b: Option<Location>) -> Option<f64> {
         (Some(a), Some(b)) => Some(a.distance(b).as_f64()),
         _ => None,
     }
+}
+
+/// Fire the acceptor-side NodeEvents required to promote the joiner's
+/// transient transport connection into a ring connection. Must be invoked at
+/// every site where a relay decides to accept a CONNECT — the happy-path
+/// `handle_request` branch AND the retry branches that reach acceptance after
+/// receiving `Rejected` / `ConnectFailed` from an uphill peer. Skipping this
+/// call leaves the joiner stuck in `transient_connections` on the acceptor,
+/// so downstream lookups like `get_peer_by_addr` (used by subscribe interest
+/// registration, broadcast fan-out, etc.) never find the peer.
+async fn dispatch_expect_connection_from(
+    op_manager: &OpManager,
+    tx: Transaction,
+    peer: PeerKeyLocation,
+) -> Result<(), OpError> {
+    let Some(addr) = peer.socket_addr() else {
+        // Protocol invariant violation: `handle_request` only sets
+        // `AcceptOutcome` when the joiner's address has been filled in (the
+        // `KnownPeerKeyLocation::try_from` check upstream). Reaching this
+        // branch means something broke that invariant. Log loudly rather than
+        // silently no-op so we don't reintroduce #3838 in a new form.
+        tracing::error!(
+            tx = %tx,
+            joiner_pub_key = %peer.pub_key(),
+            "INTERNAL ERROR: acceptor reached dispatch_expect_connection_from with unknown joiner address — handle_request acceptance invariant violated"
+        );
+        return Ok(());
+    };
+
+    tracing::info!(
+        joiner_addr = %addr,
+        tx = %tx,
+        "connect: acceptor accepted joiner, initiating hole punch"
+    );
+
+    op_manager
+        .notify_node_event(NodeEvent::ExpectPeerConnection { addr })
+        .await?;
+
+    let (callback, mut rx) = mpsc::channel(1);
+    op_manager
+        .notify_node_event(NodeEvent::ConnectPeer {
+            peer: peer.clone(),
+            tx,
+            callback,
+            is_gw: false,
+        })
+        .await?;
+
+    GlobalExecutor::spawn(async move {
+        if let Some(result) = rx.recv().await {
+            match result {
+                Ok((connected_peer, _)) => {
+                    tracing::info!(
+                        %connected_peer,
+                        tx=%tx,
+                        "connect: acceptor hole-punch connection succeeded"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        %peer,
+                        tx=%tx,
+                        "connect: acceptor hole-punch connection failed (joiner may connect to us instead)"
+                    );
+                }
+            }
+        }
+    });
+
+    Ok(())
 }
 
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
@@ -3161,19 +3247,16 @@ mod tests {
             Instant::now(),
         );
 
-        let response = actions.accept_response.expect("expected acceptance");
+        let accept = actions.accept.expect("expected acceptance");
         // Verify acceptor has correct identity
-        assert_eq!(response.acceptor.pub_key(), self_loc.pub_key());
+        assert_eq!(accept.response.acceptor.pub_key(), self_loc.pub_key());
         // Acceptor address should be Unknown - relay fills it in from packet source
         // This is critical for NAT traversal: acceptor doesn't know its external address
         assert!(
-            response.acceptor.peer_addr.is_unknown(),
+            accept.response.acceptor.peer_addr.is_unknown(),
             "ConnectResponse acceptor should have Unknown address for NAT traversal"
         );
-        assert_eq!(
-            actions.expect_connection_from.unwrap().pub_key(),
-            joiner.pub_key()
-        );
+        assert_eq!(accept.joiner.pub_key(), joiner.pub_key());
         assert!(actions.forward.is_none());
     }
 
@@ -3213,17 +3296,17 @@ mod tests {
             Instant::now(),
         );
 
-        let response = actions.accept_response.expect("expected acceptance");
+        let accept = actions.accept.expect("expected acceptance");
 
         // Critical invariant: acceptor address must be Unknown initially
         // Relay will fill it in from the packet source address
         assert!(
-            response.acceptor.peer_addr.is_unknown(),
+            accept.response.acceptor.peer_addr.is_unknown(),
             "ConnectResponse.acceptor must have Unknown address for NAT traversal"
         );
         // pub_key should still match
         assert_eq!(
-            response.acceptor.pub_key(),
+            accept.response.acceptor.pub_key(),
             self_loc.pub_key(),
             "acceptor pub_key should come from self_location"
         );
@@ -3264,7 +3347,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert!(actions.accept_response.is_none());
+        assert!(actions.accept.is_none());
         let (forward_to, request) = actions.forward.expect("expected forward");
         assert_eq!(forward_to.pub_key(), next_hop.pub_key());
         assert_eq!(request.ttl, 1);
@@ -3320,7 +3403,7 @@ mod tests {
 
         // Should NOT accept (not at terminus)
         assert!(
-            actions.accept_response.is_none(),
+            actions.accept.is_none(),
             "relay should NOT accept when not at terminus, even if should_accept() is true"
         );
 
@@ -3591,15 +3674,12 @@ mod tests {
             Instant::now(),
         );
 
-        let response = accept_actions
-            .accept_response
+        let accept = accept_actions
+            .accept
             .expect("second relay should accept when policy allows");
         // Compare pub_key since acceptor's address is intentionally Unknown (NAT scenario)
-        assert_eq!(response.acceptor.pub_key(), relay_b.pub_key());
-        let expect_conn = accept_actions
-            .expect_connection_from
-            .expect("acceptance should request inbound connection from joiner");
-        assert_eq!(expect_conn.pub_key(), joiner.pub_key());
+        assert_eq!(accept.response.acceptor.pub_key(), relay_b.pub_key());
+        assert_eq!(accept.joiner.pub_key(), joiner.pub_key());
     }
 
     /// Regression test for issue #2141: expect_connection_from must have the joiner's
@@ -3648,19 +3728,14 @@ mod tests {
             Instant::now(),
         );
 
-        // Verify acceptance was issued
-        assert!(
-            actions.accept_response.is_some(),
-            "relay should accept joiner"
-        );
-
-        // Critical: expect_connection_from must have the observed public address
-        // so the acceptor can initiate hole-punching to the correct address
-        let expect_conn = actions
-            .expect_connection_from
+        // Verify acceptance was issued and joiner carries the observed public
+        // address (so the acceptor can hole-punch to the correct address).
+        let accept = actions
+            .accept
             .expect("expect_connection_from should be set when accepting");
         assert_eq!(
-            expect_conn
+            accept
+                .joiner
                 .socket_addr()
                 .expect("expect_connection_from must have address"),
             observed_public_addr,
@@ -3738,20 +3813,20 @@ mod tests {
         );
 
         // Verify acceptance was issued
-        let response = actions
-            .accept_response
+        let accept = actions
+            .accept
             .expect("acceptor should issue ConnectResponse");
 
         // CRITICAL: acceptor's address must be Unknown, not the acceptor's local address
         assert!(
-            response.acceptor.peer_addr.is_unknown(),
+            accept.response.acceptor.peer_addr.is_unknown(),
             "acceptor address should be Unknown for NAT traversal. Got: {:?}",
-            response.acceptor.peer_addr
+            accept.response.acceptor.peer_addr
         );
 
         // The pub_key should be set correctly
         assert_eq!(
-            response.acceptor.pub_key(),
+            accept.response.acceptor.pub_key(),
             acceptor_peer.pub_key(),
             "acceptor pub_key should match"
         );
@@ -3809,7 +3884,7 @@ mod tests {
 
         // Verify we forwarded, not accepted
         assert!(
-            actions1.accept_response.is_none(),
+            actions1.accept.is_none(),
             "first call should forward, not accept"
         );
         assert!(
@@ -3838,7 +3913,7 @@ mod tests {
 
         // CRITICAL: Should NOT accept (we already forwarded)
         assert!(
-            actions2.accept_response.is_none(),
+            actions2.accept.is_none(),
             "second call should NOT accept even though is_terminus=true (already forwarded)"
         );
 
@@ -3986,7 +4061,7 @@ mod tests {
 
         // Should accept because we're at terminus
         assert!(
-            actions.accept_response.is_some(),
+            actions.accept.is_some(),
             "should accept at terminus (no closer peers)"
         );
 
@@ -4043,7 +4118,7 @@ mod tests {
 
         // Should accept (at terminus due to TTL exhaustion)
         assert!(
-            actions.accept_response.is_some(),
+            actions.accept.is_some(),
             "should accept at terminus (TTL exhausted)"
         );
     }
@@ -4102,7 +4177,7 @@ mod tests {
 
         // Should NOT accept (should_accept returned false)
         assert!(
-            actions.accept_response.is_none(),
+            actions.accept.is_none(),
             "should not accept when should_accept() returns false"
         );
 
@@ -4170,7 +4245,7 @@ mod tests {
 
         // Should NOT accept
         assert!(
-            actions.accept_response.is_none(),
+            actions.accept.is_none(),
             "should not accept when should_accept() returns false"
         );
 
@@ -4224,7 +4299,7 @@ mod tests {
 
         // Should NOT accept
         assert!(
-            actions.accept_response.is_none(),
+            actions.accept.is_none(),
             "should not accept when should_accept() returns false"
         );
 
@@ -4275,7 +4350,7 @@ mod tests {
         );
 
         assert!(
-            actions.accept_response.is_none(),
+            actions.accept.is_none(),
             "should not accept when should_accept() returns false"
         );
         assert!(
@@ -4474,7 +4549,7 @@ mod tests {
         );
 
         assert!(actions.rejected, "should reject when no uphill peers");
-        assert!(actions.accept_response.is_none());
+        assert!(actions.accept.is_none());
         assert!(actions.forward.is_none());
     }
 
@@ -4512,7 +4587,7 @@ mod tests {
         );
 
         assert!(actions.rejected, "should reject when TTL exhausted");
-        assert!(actions.accept_response.is_none());
+        assert!(actions.accept.is_none());
         assert!(actions.forward.is_none());
     }
 
@@ -4554,7 +4629,7 @@ mod tests {
 
         assert!(!actions.rejected, "should not reject when uphill available");
         assert!(actions.forward.is_some(), "should forward uphill");
-        assert!(actions.accept_response.is_none());
+        assert!(actions.accept.is_none());
         assert!(
             state.forwarded_at.is_some(),
             "forwarded_at should be set after forwarding"
@@ -4686,7 +4761,100 @@ mod tests {
             "should reject when no uphill peers on retry"
         );
         assert!(retry_actions.forward.is_none());
-        assert!(retry_actions.accept_response.is_none());
+        assert!(retry_actions.accept.is_none());
+    }
+
+    /// Regression test for #3838: when the `Rejected` handler in
+    /// `process_message` invokes `handle_request` again after an uphill
+    /// rejection and the retry decides to accept locally, the returned
+    /// `AcceptOutcome` MUST carry the joiner alongside the response so that
+    /// the caller cannot forget to promote the transient connection into a
+    /// ring connection. Prior to this fix the two fields (`accept_response`,
+    /// `expect_connection_from`) were separate, and the retry path silently
+    /// dropped `expect_connection_from` — leaving the joiner stuck as a
+    /// transient on the acceptor's side. `get_peer_by_addr` (used by
+    /// subscribe interest registration and broadcast fan-out) only finds
+    /// ring connections, so downstream UPDATE broadcasts never reached the
+    /// joiner. The fields are now bundled in `AcceptOutcome`, making this
+    /// bug structurally unrepresentable.
+    #[test]
+    fn relay_retry_acceptance_bundles_joiner_with_response() {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let peer_a = make_peer(6000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+
+        // Step 1: Initial forward to peer_a (matches what process_message does
+        // on receipt of the original ConnectMsg::Request).
+        let ctx_a = TestRelayContext::new(self_loc.clone())
+            .accept(false)
+            .uphill_hop(Some(peer_a));
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+        let recency = HashMap::new();
+        let first = state.handle_request(
+            &ctx_a,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
+        assert!(
+            first.forward.is_some(),
+            "initial pass should forward uphill"
+        );
+        assert!(
+            first.accept.is_none(),
+            "initial pass should not accept (forwarding upstream)"
+        );
+
+        // Step 2: Simulate peer_a's Rejected message arriving. This mirrors
+        // the mutation `process_message::Rejected` applies before re-calling
+        // handle_request (see connect.rs Rejected handler).
+        state.forwarded_to = None;
+        state.forwarded_at = None;
+
+        // Step 3: Retry with no more uphill peers available AND the relay
+        // willing to accept — this is the exact path that produced the
+        // #3838 regression (accept_response set, expect_connection_from
+        // silently dropped by the caller).
+        let ctx_retry = TestRelayContext::new(self_loc).accept(true);
+        let retry = state.handle_request(
+            &ctx_retry,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
+
+        let accept = retry
+            .accept
+            .expect("retry must accept locally when no uphill peers remain");
+        assert_eq!(
+            accept.joiner.pub_key(),
+            joiner.pub_key(),
+            "AcceptOutcome must carry the joiner alongside the response so the caller \
+             cannot forget ring promotion (#3838)"
+        );
+        assert!(
+            accept.joiner.socket_addr().is_some(),
+            "joiner address must be known so the acceptor can emit ConnectPeer / \
+             ExpectPeerConnection against the observed address"
+        );
     }
 
     // ============ filter_low_score_peers tests ============
