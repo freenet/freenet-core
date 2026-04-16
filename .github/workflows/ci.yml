@@ -294,8 +294,11 @@ jobs:
     steps:
       - name: Detect release merge queue
         id: release_check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_COMMIT_MSG: ${{ github.event.merge_group.head_commit.message }}
         run: |
-          if [[ "${{ github.event_name }}" == "merge_group" && "${{ github.event.merge_group.head_commit.message }}" == build:\ release* ]]; then
+          if [[ "$EVENT_NAME" == "merge_group" && "$MERGE_COMMIT_MSG" == build:\ release* ]]; then
             echo "is_release=true" >> "$GITHUB_OUTPUT"
             echo "Skipping tests — release PRs only bump versions (main CI already validated)"
           else
@@ -406,8 +409,11 @@ jobs:
     steps:
       - name: Detect release merge queue
         id: release_check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_COMMIT_MSG: ${{ github.event.merge_group.head_commit.message }}
         run: |
-          if [[ "${{ github.event_name }}" == "merge_group" && "${{ github.event.merge_group.head_commit.message }}" == build:\ release* ]]; then
+          if [[ "$EVENT_NAME" == "merge_group" && "$MERGE_COMMIT_MSG" == build:\ release* ]]; then
             echo "is_release=true" >> "$GITHUB_OUTPUT"
             echo "Skipping tests — release PRs only bump versions (main CI already validated)"
           else
@@ -599,8 +605,11 @@ jobs:
     steps:
       - name: Detect release merge queue
         id: release_check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_COMMIT_MSG: ${{ github.event.merge_group.head_commit.message }}
         run: |
-          if [[ "${{ github.event_name }}" == "merge_group" && "${{ github.event.merge_group.head_commit.message }}" == build:\ release* ]]; then
+          if [[ "$EVENT_NAME" == "merge_group" && "$MERGE_COMMIT_MSG" == build:\ release* ]]; then
             echo "is_release=true" >> "$GITHUB_OUTPUT"
             echo "Skipping tests — release PRs only bump versions (main CI already validated)"
           else

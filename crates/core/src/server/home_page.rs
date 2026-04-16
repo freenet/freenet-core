@@ -71,7 +71,7 @@ fn homepage_html() -> String {
         {ops_card}
 
         <div class="card">
-            <h2>Freenet Apps</h2>
+            <h2>Freenet Links</h2>
             <ul class="app-list">
                 <li>
                     <a href="/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/">River Chat</a>
@@ -81,15 +81,14 @@ fn homepage_html() -> String {
                     <a href="/v1/contract/web/EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr/">Delta</a>
                     <p class="note">A website builder for Freenet.</p>
                 </li>
-            </ul>
-        </div>
-
-        <div class="card card-muted">
-            <h2>Links</h2>
-            <ul class="link-list">
-                <li><a href="https://freenet.org" target="_blank" rel="noopener noreferrer">freenet.org</a></li>
-                <li><a href="https://matrix.to/#/#freenet-locutus:matrix.org" target="_blank" rel="noopener noreferrer">Freenet Matrix channel</a></li>
-                <li><a href="https://github.com/freenet/freenet-core" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+                <li>
+                    <a href="/v1/contract/web/DLog47hEsrtuGT4N5XCeMBG45m4n1aWM89tBZXue2E1N/">Ghostkey Identity Vault</a>
+                    <p class="note">Manage Ghostkey identities on Freenet.</p>
+                </li>
+                <li>
+                    <a href="/v1/contract/web/E4m5WbaC4cdbpDjL82WfYUnrM9iMnfaaN8Tsn7UHPMjZ/">freenet.org</a>
+                    <p class="note">The freenet.org website, mirrored on Freenet.</p>
+                </li>
             </ul>
         </div>
     </main>
