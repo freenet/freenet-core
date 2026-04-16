@@ -917,10 +917,10 @@ async fn maybe_subscribe_child(
 
     let child_tx = Transaction::new_child_of::<subscribe::SubscribeMsg>(&client_tx);
 
-    // Register the child so `LocalSubscribeComplete` hits the
-    // silent-absorb branch instead of trying to publish to a
-    // nonexistent waiter.
-    op_manager.expect_and_register_sub_operation(client_tx, child_tx);
+    // No SubOperationTracker registration needed: the silent-absorb
+    // guards at `p2p_protoc.rs`, `node.rs`, and `subscribe.rs` use the
+    // structural `Transaction::is_sub_operation()` check (parent field
+    // set by `new_child_of`), not the tracker DashMap.
 
     if blocking_subscribe {
         subscribe::run_client_subscribe(op_manager.clone(), *key.id(), child_tx).await;
@@ -1318,7 +1318,7 @@ mod tests {
     /// invoke `assemble_and_cache_stream` so that streamed GET
     /// responses actually write the contract state into the local
     /// executor. Without this call, a cold-cache client GET of a
-    /// >threshold contract succeeds on the wire but leaves the
+    /// \>threshold contract succeeds on the wire but leaves the
     /// originator's local store empty — the client gets
     /// `OperationError` via `build_host_response`'s re-query miss.
     ///
@@ -1427,18 +1427,7 @@ mod tests {
             .find("async fn maybe_subscribe_child(")
             .expect("maybe_subscribe_child must exist");
         let body = &SOURCE[fn_start..];
-        let early_return = body
-            .find("if !subscribe {")
+        body.find("if !subscribe {")
             .expect("maybe_subscribe_child must short-circuit on !subscribe");
-        let register_call = body
-            .find("expect_and_register_sub_operation")
-            .expect("maybe_subscribe_child must register sub-operation");
-        assert!(
-            early_return < register_call,
-            "The !subscribe short-circuit must come BEFORE the \
-             expect_and_register_sub_operation call — otherwise we'd \
-             register a spurious sub-op for a client who didn't ask for \
-             one. See PUT 3a commit 494a3c69 for the analogous bug class."
-        );
     }
 }

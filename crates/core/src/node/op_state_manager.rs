@@ -192,6 +192,10 @@ impl SubOperationTracker {
 
     /// Check if a transaction is a sub-operation (has a parent transaction).
     /// Sub-operations should not send responses directly to clients.
+    ///
+    /// Production guards now use `Transaction::is_sub_operation()` (structural
+    /// check) instead. This method remains for legacy relay paths and unit tests.
+    #[cfg(test)]
     fn is_sub_operation(&self, tx: Transaction) -> bool {
         self.parent_of.contains_key(&tx)
     }
@@ -1046,12 +1050,6 @@ impl OpManager {
             );
         }
         Ok(())
-    }
-
-    /// Check if a transaction is a sub-operation (has a parent transaction).
-    /// Sub-operations should not send responses directly to clients.
-    pub fn is_sub_operation(&self, tx: Transaction) -> bool {
-        self.sub_op_tracker.is_sub_operation(tx)
     }
 
     /// Exposes root operations awaiting sub-operation completion.

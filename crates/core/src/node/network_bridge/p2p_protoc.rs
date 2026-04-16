@@ -2054,7 +2054,11 @@ impl P2pConnManager {
 
                                 // If this is a child operation (e.g., Subscribe spawned by PUT),
                                 // just mark it complete - parent operation handles client response.
-                                if op_manager.is_sub_operation(tx) {
+                                // Uses the structural Transaction::is_sub_operation() check
+                                // (parent field set at creation via new_child_of) rather than
+                                // the SubOperationTracker DashMap lookup — correct for both
+                                // legacy and task-per-tx children.
+                                if tx.is_sub_operation() {
                                     tracing::debug!(
                                         tx = %tx,
                                         contract = %key,
