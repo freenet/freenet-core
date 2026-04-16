@@ -549,7 +549,7 @@ async fn report_result(
             if let Some(transaction) = tx {
                 // Sub-operations (e.g., Subscribe spawned by PUT) don't notify clients directly;
                 // the parent operation handles the client response.
-                if op_manager.is_sub_operation(transaction) {
+                if transaction.is_sub_operation() {
                     tracing::debug!(
                         tx = %transaction,
                         "Skipping client notification for sub-operation"
@@ -643,7 +643,7 @@ async fn report_result(
                 // Sub-operations (e.g., Subscribe spawned by PUT) have no client
                 // registered — sending errors for them would pollute the
                 // SessionActor's pending_results cache.
-                if !op_manager.is_sub_operation(tx) {
+                if !tx.is_sub_operation() {
                     let client_error = freenet_stdlib::client_api::ClientError::from(
                         freenet_stdlib::client_api::ErrorKind::OperationError {
                             cause: err.to_string().into(),

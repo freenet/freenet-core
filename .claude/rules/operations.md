@@ -110,7 +110,7 @@ WRONG:
 
 ## Sub-Operation Rules
 
-### WHEN spawning a sub-operation
+### WHEN spawning a sub-operation (legacy state-machine path)
 
 ```
 1. FIRST: Register with expect_and_register_sub_operation()
@@ -126,6 +126,21 @@ WRONG:
   let child_op = SubscribeOp::new(...);
   op_manager.push(child_tx, child_op).await?;  // Child might complete here!
   op_manager.expect_and_register_sub_operation(parent_tx, child_tx);  // Too late
+```
+
+### WHEN spawning a sub-operation (task-per-tx path)
+
+```
+Task-per-tx drivers (PUT, GET) do NOT register children with
+SubOperationTracker. They create children via Transaction::new_child_of
+and either await them inline (blocking) or fire-and-forget (async).
+
+The is_sub_operation guards at p2p_protoc.rs, node.rs, and subscribe.rs
+use the structural Transaction::is_sub_operation() check (parent field
+set by new_child_of), not the tracker DashMap. No registration needed.
+
+SubOperationTracker is only used by legacy relay paths that go through
+the finalized-parent-parking branch in operations.rs:182–208.
 ```
 
 ### WHEN a sub-operation fails

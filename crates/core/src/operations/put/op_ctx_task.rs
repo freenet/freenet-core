@@ -450,10 +450,10 @@ async fn maybe_subscribe_child(
 
     let child_tx = Transaction::new_child_of::<subscribe::SubscribeMsg>(&client_tx);
 
-    // Register the child so `LocalSubscribeComplete` hits the
-    // silent-absorb branch at `p2p_protoc.rs:2057–2066` instead
-    // of trying to publish to a nonexistent waiter.
-    op_manager.expect_and_register_sub_operation(client_tx, child_tx);
+    // No SubOperationTracker registration needed: the silent-absorb
+    // guards at `p2p_protoc.rs`, `node.rs`, and `subscribe.rs` use the
+    // structural `Transaction::is_sub_operation()` check (parent field
+    // set by `new_child_of`), not the tracker DashMap.
 
     if blocking_subscribe {
         // Inline await — PUT response waits for subscribe completion.

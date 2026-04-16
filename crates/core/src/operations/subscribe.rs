@@ -929,7 +929,7 @@ impl SubscribeOp {
         let requester_pub_key = self.requester_pub_key;
         let is_renewal = self.is_renewal;
         let stats = self.stats;
-        let is_sub_op = op_manager.is_sub_operation(tx_id);
+        let is_sub_op = tx_id.is_sub_operation();
 
         tracing::debug!(
             tx = %tx_id,
