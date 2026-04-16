@@ -280,6 +280,20 @@ impl ConfigArgs {
             self.ws_api
                 .token_cleanup_interval_seconds
                 .get_or_insert(cfg.ws_api.token_cleanup_interval_seconds);
+            if !cfg.ws_api.allowed_hosts.is_empty() {
+                self.ws_api
+                    .allowed_host
+                    .get_or_insert(cfg.ws_api.allowed_hosts);
+            }
+            if !cfg.ws_api.allowed_source_cidrs.is_empty() {
+                self.ws_api.allowed_source_cidrs.get_or_insert(
+                    cfg.ws_api
+                        .allowed_source_cidrs
+                        .iter()
+                        .map(|net| net.to_string())
+                        .collect(),
+                );
+            }
             self.network_api
                 .address
                 .get_or_insert(cfg.network_api.address);
@@ -2742,6 +2756,119 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("::/0") && msg.contains("/16"));
+    }
+
+    /// Write a config.toml to `dir` by serializing a default local-mode
+    /// Config and patching ws-api fields into it.
+    async fn write_config_toml_with_ws_api(dir: &Path, ws_api_patch: &WebsocketApiConfig) {
+        // Build a valid base config we can serialize
+        let base_args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(dir.to_path_buf()),
+                data_dir: Some(dir.to_path_buf()),
+                log_dir: Some(dir.to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let mut base_cfg = base_args.build().await.unwrap();
+        base_cfg.ws_api = ws_api_patch.clone();
+        let toml_str = toml::to_string(&base_cfg).unwrap();
+        std::fs::write(dir.join("config.toml"), toml_str).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_config_cidrs_merged_into_build() {
+        // Regression test: allowed-source-cidrs and allowed-host set in
+        // config.toml were silently dropped because the merge block in
+        // build() didn't copy them from the file config into ConfigArgs.
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_config_toml_with_ws_api(
+            temp_dir.path(),
+            &WebsocketApiConfig {
+                allowed_source_cidrs: vec![
+                    "100.64.0.0/10".parse().unwrap(),
+                    "fd7a:115c:a1e0::/48".parse().unwrap(),
+                ],
+                allowed_hosts: vec!["my-tailscale-host".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Build again from the config file (no CLI overrides for these fields)
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+
+        assert_eq!(
+            cfg.ws_api.allowed_source_cidrs.len(),
+            2,
+            "CIDRs from config.toml must be present in built config"
+        );
+        assert_eq!(
+            cfg.ws_api.allowed_source_cidrs[0],
+            "100.64.0.0/10".parse::<ipnet::IpNet>().unwrap()
+        );
+        assert_eq!(
+            cfg.ws_api.allowed_source_cidrs[1],
+            "fd7a:115c:a1e0::/48".parse::<ipnet::IpNet>().unwrap()
+        );
+        assert_eq!(
+            cfg.ws_api.allowed_hosts,
+            vec!["my-tailscale-host".to_string()],
+            "allowed-host from config.toml must be present in built config"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_cidrs_override_file_config() {
+        // CLI args take precedence over config file values.
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_config_toml_with_ws_api(
+            temp_dir.path(),
+            &WebsocketApiConfig {
+                allowed_source_cidrs: vec!["10.0.0.0/8".parse().unwrap()],
+                allowed_hosts: vec!["file-host".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ws_api: WebsocketApiArgs {
+                allowed_source_cidrs: Some(vec!["172.16.0.0/12".to_string()]),
+                allowed_host: Some(vec!["cli-host".to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+
+        assert_eq!(cfg.ws_api.allowed_source_cidrs.len(), 1);
+        assert_eq!(
+            cfg.ws_api.allowed_source_cidrs[0],
+            "172.16.0.0/12".parse::<ipnet::IpNet>().unwrap(),
+            "CLI value must win over file config"
+        );
+        assert_eq!(
+            cfg.ws_api.allowed_hosts,
+            vec!["cli-host".to_string()],
+            "CLI value must win over file config"
+        );
     }
 
     #[tokio::test]
