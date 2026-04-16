@@ -1,3 +1,5 @@
+pub(crate) mod op_ctx_task;
+
 use either::Either;
 use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
@@ -259,10 +261,10 @@ struct UpdateStats {
     contract_location: Option<Location>,
 }
 
-struct UpdateExecution {
-    value: WrappedState,
-    summary: StateSummary<'static>,
-    changed: bool,
+pub(crate) struct UpdateExecution {
+    pub(crate) value: WrappedState,
+    pub(crate) summary: StateSummary<'static>,
+    pub(crate) changed: bool,
 }
 
 pub(crate) struct UpdateResult {}
@@ -1638,7 +1640,7 @@ fn build_op_result(
 /// The `update_data` parameter can be:
 /// - `UpdateData::Delta(delta)` - A delta from the client, merged with current state
 /// - `UpdateData::State(state)` - A full state from PUT or executor
-async fn update_contract(
+pub(crate) async fn update_contract(
     op_manager: &OpManager,
     key: ContractKey,
     update_data: UpdateData<'static>,
@@ -1825,6 +1827,7 @@ pub(crate) fn start_op(
 }
 
 /// This will be called from the node when processing an open request with a specific transaction ID
+#[allow(dead_code)] // Phase 4: client_events now uses op_ctx_task::start_client_update; kept for tests/future callers.
 pub(crate) fn start_op_with_id(
     key: ContractKey,
     update_data: UpdateData<'static>,
