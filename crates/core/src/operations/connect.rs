@@ -2380,7 +2380,6 @@ async fn dispatch_expect_connection_from(
         })
         .await?;
 
-    let peer_clone = peer;
     GlobalExecutor::spawn(async move {
         if let Some(result) = rx.recv().await {
             match result {
@@ -2393,7 +2392,7 @@ async fn dispatch_expect_connection_from(
                 }
                 Err(_) => {
                     tracing::debug!(
-                        %peer_clone,
+                        %peer,
                         tx=%tx,
                         "connect: acceptor hole-punch connection failed (joiner may connect to us instead)"
                     );
