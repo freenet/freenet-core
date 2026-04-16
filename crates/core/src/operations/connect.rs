@@ -1621,12 +1621,16 @@ impl Operation for ConnectOp {
                             .await?;
                     }
 
-                    // Promote the joiner BEFORE the forward/response sends: once the
-                    // joiner receives our Response it may immediately start subscribing
-                    // through us, and `get_peer_by_addr` on the acceptor side only
-                    // finds ring connections. Near-terminus acceptance sets both
-                    // `forward` AND `accept`, so we dispatch here and fall through to
-                    // the forward + response sites below.
+                    // Promote the joiner BEFORE sending the `Response` upstream:
+                    // once the joiner receives our Response it may immediately
+                    // start subscribing through us, and `get_peer_by_addr` on
+                    // the acceptor side only finds ring connections. Dispatch
+                    // here (using a ref borrow) and let the `accept_response`
+                    // site below consume the owned value for the actual send.
+                    // (The `forward` branch below is uphill to the next relay,
+                    // not to the joiner, so its ordering relative to dispatch
+                    // doesn't matter — it's placed here mainly to match the
+                    // near-terminus "forward + accept" code path.)
                     if let Some(ref accept) = actions.accept {
                         dispatch_expect_connection_from(op_manager, self.id, accept.joiner.clone())
                             .await?;
@@ -2054,6 +2058,18 @@ impl Operation for ConnectOp {
                                 acceptor = %accept.response.acceptor.pub_key(),
                                 "connect: relay accepting locally after uphill rejection"
                             );
+                            // Emit `connect_response_sent` telemetry, matching the
+                            // happy-path accept branch (#3893 review: close the telemetry
+                            // gap between accept sites so analytics can count retry
+                            // acceptances alongside first-pass acceptances).
+                            if let Some(event) = NetEventLog::connect_response_sent(
+                                &self.id,
+                                &op_manager.ring,
+                                accept.response.acceptor.clone(),
+                                accept.joiner.clone(),
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
                             dispatch_expect_connection_from(op_manager, self.id, accept.joiner)
                                 .await?;
                             let response_msg = ConnectMsg::Response {
@@ -2212,6 +2228,16 @@ impl Operation for ConnectOp {
                                 acceptor = %accept.response.acceptor.pub_key(),
                                 "connect: relay accepting locally after ConnectFailed"
                             );
+                            // Emit `connect_response_sent` telemetry, matching the
+                            // happy-path accept branch (#3893 review).
+                            if let Some(event) = NetEventLog::connect_response_sent(
+                                &self.id,
+                                &op_manager.ring,
+                                accept.response.acceptor.clone(),
+                                accept.joiner.clone(),
+                            ) {
+                                op_manager.ring.register_events(Either::Left(event)).await;
+                            }
                             dispatch_expect_connection_from(op_manager, self.id, accept.joiner)
                                 .await?;
                             let response_msg = ConnectMsg::Response {
@@ -2357,6 +2383,16 @@ async fn dispatch_expect_connection_from(
     peer: PeerKeyLocation,
 ) -> Result<(), OpError> {
     let Some(addr) = peer.socket_addr() else {
+        // Protocol invariant violation: `handle_request` only sets
+        // `AcceptOutcome` when the joiner's address has been filled in (the
+        // `KnownPeerKeyLocation::try_from` check upstream). Reaching this
+        // branch means something broke that invariant. Log loudly rather than
+        // silently no-op so we don't reintroduce #3838 in a new form.
+        tracing::error!(
+            tx = %tx,
+            joiner_pub_key = %peer.pub_key(),
+            "INTERNAL ERROR: acceptor reached dispatch_expect_connection_from with unknown joiner address — handle_request acceptance invariant violated"
+        );
         return Ok(());
     };
 
