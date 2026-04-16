@@ -10,16 +10,19 @@ paths:
 > (PR #3806) SUBSCRIBE's client-initiated path was migrated to a
 > task-per-transaction driver in `operations/subscribe/op_ctx_task.rs`.
 > Phase 3a (PR #3843) migrated client-initiated PUT to
-> `operations/put/op_ctx_task.rs`, and Phase 3b migrated
-> client-initiated GET to `operations/get/op_ctx_task.rs`, all using
-> the shared `RetryDriver` trait from `op_ctx.rs`. On these paths,
+> `operations/put/op_ctx_task.rs`, Phase 3b migrated client-initiated
+> GET to `operations/get/op_ctx_task.rs` (both using the shared
+> `RetryDriver` trait from `op_ctx.rs`), and Phase 4 migrated
+> client-initiated UPDATE to `operations/update/op_ctx_task.rs` (using
+> the fire-and-forget `OpCtx::send_fire_and_forget` — no retry loop
+> needed since UPDATE has no response to await). On these paths,
 > op state lives in task locals and is never pushed into
 > `OpManager.ops.*`, so rules below that talk about "pushing state" /
 > `load_or_init` / `handle_op_result` apply only to the **legacy
 > state-machine path** (still used by GET relay/GC/UPDATE-auto-fetch
 > paths — #3883 tracks relay-GET migration — PUT relay/GC paths,
-> UPDATE, CONNECT, and by SUBSCRIBE's renewal / PUT-sub-op /
-> executor / intermediate-peer entry points).
+> UPDATE relay/broadcast, CONNECT, and by SUBSCRIBE's renewal /
+> PUT-sub-op / executor / intermediate-peer entry points).
 >
 > Task-per-tx drivers have their own invariants documented in the
 > `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.

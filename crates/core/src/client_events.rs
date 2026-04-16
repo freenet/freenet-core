@@ -869,22 +869,23 @@ async fn process_open_request(
                                     "Starting new UPDATE network operation"
                                 );
 
-                                let op = update::start_op_with_id(
-                                    key,
-                                    update_data.clone(),
-                                    related_contracts,
-                                    transaction_id,
-                                );
-
                                 tracing::debug!(
                                     request_id = %request_id,
-                                    transaction_id = %op.id,
+                                    transaction_id = %transaction_id,
                                     operation = "update",
                                     "Request-Transaction correlation"
                                 );
 
-                                match update::request_update(&op_manager, op).await {
-                                    Ok(()) | Err(OpError::StatePushed) => {}
+                                match update::op_ctx_task::start_client_update(
+                                    op_manager.clone(),
+                                    transaction_id,
+                                    key,
+                                    update_data.clone(),
+                                    related_contracts,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {}
                                     Err(err) => {
                                         report_op_init_error(
                                             &op_manager,
@@ -920,8 +921,7 @@ async fn process_open_request(
                             );
 
                             // Legacy mode: direct operation without deduplication
-                            let op = update::start_op(key, update_data, related_contracts);
-                            let op_id = op.id;
+                            let op_id = crate::message::Transaction::new::<update::UpdateMsg>();
 
                             tracing::debug!(
                                 request_id = %request_id,
@@ -941,7 +941,15 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            if let Err(err) = update::request_update(&op_manager, op).await {
+                            if let Err(err) = update::op_ctx_task::start_client_update(
+                                op_manager.clone(),
+                                op_id,
+                                key,
+                                update_data,
+                                related_contracts,
+                            )
+                            .await
+                            {
                                 report_op_init_error(
                                     &op_manager,
                                     op_id,

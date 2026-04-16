@@ -55,6 +55,7 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
   subscribe/op_ctx_task.rs → client-initiated SUBSCRIBE driver
   put/op_ctx_task.rs       → client-initiated PUT driver (Phase 3a)
   get/op_ctx_task.rs       → client-initiated GET driver (Phase 3b)
+  update/op_ctx_task.rs    → client-initiated UPDATE driver (Phase 4, fire-and-forget)
     All use the shared `RetryDriver` trait from `op_ctx.rs` and
     bypass the OpManager.ops DashMap, owning retry state in task locals.
     Relay GETs stay on the legacy state machine (tracked in #3883).

@@ -181,6 +181,51 @@ impl OpCtx {
         self.send_and_await_inner(msg, Some(target_addr)).await
     }
 
+    /// Fire-and-forget send: dispatch `msg` to `target_addr` over the network
+    /// without awaiting a reply.
+    ///
+    /// The message flows through `handle_op_execution` as
+    /// [`ConnEvent::OutboundMessageWithTarget`], the same path used by
+    /// [`Self::send_to_and_await`]. The difference is that the response
+    /// receiver is dropped immediately — the `pending_op_results` callback
+    /// becomes reclaimable on the next periodic sweep (its receiver half is
+    /// closed, so `Sender::is_closed()` returns `true`).
+    ///
+    /// # Cleanup of the `pending_op_results` entry
+    ///
+    /// Do **not** call `release_pending_op_slot` immediately after this
+    /// method. `release_pending_op_slot` sends `TransactionCompleted` on
+    /// the notification channel (higher priority than op_execution), so it
+    /// can arrive at the event loop *before* `handle_op_execution` inserts
+    /// the callback — making the cleanup a no-op. Instead, let the caller's
+    /// subsequent `send_client_result` emit `TransactionCompleted`, which
+    /// runs after `handle_op_execution` has processed the outbound message.
+    ///
+    /// This is the load-bearing primitive for UPDATE's task-per-tx driver,
+    /// which applies the update locally and fires a `RequestUpdate` to a
+    /// remote peer without waiting for acknowledgement (#1454 Phase 4).
+    pub async fn send_fire_and_forget(
+        &mut self,
+        target_addr: SocketAddr,
+        msg: NetMessage,
+    ) -> Result<(), OpError> {
+        debug_assert_eq!(
+            msg.id(),
+            &self.tx,
+            "OpCtx::send_fire_and_forget: msg.id must match ctx.tx"
+        );
+
+        let (response_sender, _response_receiver) = mpsc::channel::<NetMessage>(1);
+        // _response_receiver is dropped here. The sender stored in
+        // pending_op_results becomes is_closed() == true, reclaimable by
+        // the 60s sweep or an explicit release_pending_op_slot call.
+
+        self.op_execution_sender
+            .send((response_sender, msg, Some(target_addr)))
+            .await
+            .map_err(|_| OpError::NotificationError)
+    }
+
     async fn send_and_await_inner(
         &mut self,
         msg: NetMessage,
@@ -589,6 +634,84 @@ mod tests {
 
         let outbound = dummy_reply_with_tx(tx);
         let result = ctx.send_and_await(outbound).await;
+
+        assert!(
+            matches!(result, Err(OpError::NotificationError)),
+            "expected NotificationError on closed executor channel, got {result:?}"
+        );
+    }
+
+    /// `send_fire_and_forget` delivers the message through the op execution
+    /// channel with the caller-supplied target address, then drops the
+    /// response receiver. The executor sees `Some(target_addr)` — the same
+    /// `OutboundMessageWithTarget` path that `send_to_and_await` uses.
+    #[tokio::test]
+    async fn send_fire_and_forget_delivers_message_with_target() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut op_execution_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+        let expected_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9000);
+
+        let executor = tokio::spawn(async move {
+            let (reply_sender, outbound, target_addr) = op_execution_receiver
+                .recv()
+                .await
+                .expect("outbound msg should be delivered");
+            assert_eq!(outbound.id(), &tx, "outbound msg tx must match the ctx tx");
+            assert_eq!(
+                target_addr,
+                Some(expected_target),
+                "send_fire_and_forget must propagate the target address"
+            );
+            // The response receiver was dropped by send_fire_and_forget,
+            // so the sender's is_closed() should be true.
+            assert!(
+                reply_sender.is_closed(),
+                "response receiver should be dropped (callback reclaimable)"
+            );
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        timeout(
+            Duration::from_secs(1),
+            ctx.send_fire_and_forget(expected_target, outbound),
+        )
+        .await
+        .expect("send_fire_and_forget should complete quickly")
+        .expect("send_fire_and_forget should return Ok");
+
+        executor
+            .await
+            .expect("executor task should complete without panicking");
+    }
+
+    /// `send_fire_and_forget` errors with `NotificationError` when the
+    /// executor channel is already closed (same contract as `send_and_await`).
+    #[tokio::test]
+    async fn send_fire_and_forget_errors_on_closed_sender() {
+        let (receiver, sender) = event_loop_notification_channel();
+        drop(receiver);
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        let outbound = dummy_reply_with_tx(tx);
+        let result = ctx
+            .send_fire_and_forget(
+                std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    1234,
+                ),
+                outbound,
+            )
+            .await;
 
         assert!(
             matches!(result, Err(OpError::NotificationError)),
