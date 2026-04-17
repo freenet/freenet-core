@@ -248,6 +248,10 @@ impl ReportCommand {
     /// diagnostics on success, or a human-readable error string on failure
     /// so the report can record *why* the field is missing rather than
     /// silently dropping it.
+    ///
+    /// Worst-case duration is `LOOPBACK_HOSTS.len() * (WS_RETRY_ATTEMPTS + 1) * WS_TIMEOUT_SECS`
+    /// seconds. Prints progress so the user isn't left staring at a blank
+    /// terminal during a degraded-node query.
     fn collect_network_status(&self, config_content: &Option<String>) -> Result<String, String> {
         let ws_port = config_content
             .as_ref()
@@ -257,7 +261,21 @@ impl ReportCommand {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
 
-        rt.block_on(query_with_fallback(ws_port, WS_RETRY_ATTEMPTS))
+        let worst_case_secs =
+            LOOPBACK_HOSTS.len() as u64 * (WS_RETRY_ATTEMPTS as u64 + 1) * WS_TIMEOUT_SECS;
+        print!("  Querying local node diagnostics (up to {worst_case_secs}s)... ");
+        io::stdout().flush().ok();
+
+        let result = rt.block_on(query_with_fallback(
+            ws_port,
+            WS_RETRY_ATTEMPTS,
+            StdDuration::from_secs(WS_TIMEOUT_SECS),
+        ));
+        match &result {
+            Ok(_) => println!("ok"),
+            Err(e) => println!("unreachable ({e})"),
+        }
+        result
     }
 
     fn get_user_message(&self) -> Result<Option<String>> {
@@ -663,17 +681,22 @@ fn parse_ws_port_from_config(config: &str) -> Option<u16> {
 ///
 /// Retries are timeout-only: connection-refused errors are reported
 /// immediately since they indicate the node is not running on that host.
-async fn query_with_fallback(port: u16, retry_attempts: u32) -> Result<String, String> {
+///
+/// The `per_attempt_timeout` parameter exists for tests; production callers
+/// pass `Duration::from_secs(WS_TIMEOUT_SECS)`. Worst-case duration is
+/// `LOOPBACK_HOSTS.len() * (retry_attempts + 1) * per_attempt_timeout`.
+async fn query_with_fallback(
+    port: u16,
+    retry_attempts: u32,
+    per_attempt_timeout: StdDuration,
+) -> Result<String, String> {
     let mut errors: Vec<String> = Vec::new();
     let total_attempts = retry_attempts.saturating_add(1);
 
     for host in LOOPBACK_HOSTS {
         for attempt in 0..total_attempts {
-            match tokio::time::timeout(
-                StdDuration::from_secs(WS_TIMEOUT_SECS),
-                query_node_diagnostics(host, port),
-            )
-            .await
+            match tokio::time::timeout(per_attempt_timeout, query_node_diagnostics(host, port))
+                .await
             {
                 Ok(Ok(diag)) => return Ok(diag),
                 Ok(Err(e)) => {
@@ -684,7 +707,8 @@ async fn query_with_fallback(port: u16, retry_attempts: u32) -> Result<String, S
                 }
                 Err(_) => {
                     errors.push(format!(
-                        "{host}:{port}: timed out after {WS_TIMEOUT_SECS}s (attempt {}/{})",
+                        "{host}:{port}: timed out after {:?} (attempt {}/{})",
+                        per_attempt_timeout,
                         attempt + 1,
                         total_attempts
                     ));
@@ -974,6 +998,11 @@ stack backtrace:
         assert_eq!(original_size, panic_content.len() as u64);
     }
 
+    /// Short per-attempt timeout for tests that exercise the timeout path.
+    /// 200ms is long enough to avoid CI flakes but short enough that a
+    /// retry test can run multiple attempts in under a second.
+    const TEST_TIMEOUT: StdDuration = StdDuration::from_millis(200);
+
     /// Regression for issue #3897: when no node is listening, the report must
     /// surface a concrete error instead of silently setting `network_status`
     /// to `None`. Uses a port that nothing is bound to so `connect_async`
@@ -985,7 +1014,7 @@ stack backtrace:
         // explanation and the test is still telling us something useful.
         let port = 59111;
 
-        let result = query_with_fallback(port, 0).await;
+        let result = query_with_fallback(port, 0, TEST_TIMEOUT).await;
 
         let err = result.expect_err("no listener → must return Err, not silent None");
         assert!(
@@ -1017,19 +1046,20 @@ stack backtrace:
         let port = listener.local_addr().unwrap().port();
 
         // Accept the connection but never write any handshake bytes, so
-        // `connect_async` blocks until WS_TIMEOUT_SECS fires. Holding
-        // `_handle` keeps the accept task alive for the duration of the test.
+        // `connect_async` blocks until the per-attempt timeout fires.
+        // Holding `_handle` keeps the accept task alive.
         let _handle = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(StdDuration::from_secs(60)).await;
+            loop {
+                let (_stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                // Keep the stream alive so the client's handshake hangs.
+                std::mem::forget(_stream);
+            }
         });
 
-        // Outer wrapper bounds total test time: WS_TIMEOUT_SECS (15s) must
-        // fire once on the 127.0.0.1 attempt, so 20s leaves margin without
-        // exceeding CI's default timeouts.
-        let result = tokio::time::timeout(StdDuration::from_secs(20), query_with_fallback(port, 0))
-            .await
-            .expect("test wrapper timed out before WS_TIMEOUT_SECS fired");
+        let result = query_with_fallback(port, 0, TEST_TIMEOUT).await;
 
         let err = result.expect_err("handshake never completes → must return Err");
         assert!(
@@ -1039,6 +1069,57 @@ stack backtrace:
         assert!(
             err.contains(&port.to_string()),
             "error should include the port number, got: {err}"
+        );
+    }
+
+    /// Regression for issue #3897: verify `retry_attempts > 0` actually
+    /// causes a second attempt when the first times out. The production
+    /// config passes `WS_RETRY_ATTEMPTS=1`, so this path must be exercised
+    /// by the test suite.
+    #[tokio::test]
+    async fn test_query_with_fallback_retries_on_timeout() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_clone = accepts.clone();
+
+        // Accept every connection and hang (never complete handshake).
+        let _handle = tokio::spawn(async move {
+            loop {
+                let (_stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                accepts_clone.fetch_add(1, Ordering::SeqCst);
+                std::mem::forget(_stream);
+            }
+        });
+
+        // retry_attempts=1 → 2 attempts per host × 1 host that accepts = 2 timeouts.
+        // ([::1] gets connection-refused immediately, not counted in accepts.)
+        let result = query_with_fallback(port, 1, TEST_TIMEOUT).await;
+        assert!(result.is_err());
+
+        // Give the accept task a moment to register both connections.
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        let total_accepts = accepts.load(Ordering::SeqCst);
+        assert_eq!(
+            total_accepts, 2,
+            "retry_attempts=1 must produce 2 v4 accepts (initial + 1 retry); got {total_accepts}"
+        );
+
+        // Error string must mention both attempts so operators can see the
+        // retry actually happened.
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("attempt 1/2") && err.contains("attempt 2/2"),
+            "error should identify both attempts, got: {err}"
         );
     }
 
