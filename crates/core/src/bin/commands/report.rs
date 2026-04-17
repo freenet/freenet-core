@@ -30,8 +30,17 @@ const MAX_TOTAL_LOG_SIZE: usize = 2 * 1024 * 1024;
 const MAX_LINE_LENGTH: usize = 10 * 1024;
 /// Default WebSocket API port
 const DEFAULT_WS_API_PORT: u16 = 7509;
-/// Timeout for WebSocket connection and queries
-const WS_TIMEOUT_SECS: u64 = 5;
+/// Timeout for a single WebSocket connect+query attempt. A struggling node
+/// is exactly the case we most need diagnostics for, so err on the side of
+/// waiting longer rather than dropping the field silently.
+const WS_TIMEOUT_SECS: u64 = 15;
+/// Number of additional retry attempts after the initial query times out.
+/// Connection refused is not retried — that signals the node isn't running.
+const WS_RETRY_ATTEMPTS: u32 = 1;
+/// Loopback hosts to try, in order. Both are attempted so that
+/// `ws-api-address = "::"` combined with `IPV6_V6ONLY=1` (or a v4-only
+/// bind) doesn't silently drop the diagnostics.
+const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "[::1]"];
 
 #[derive(Args, Debug, Clone)]
 pub struct ReportCommand {
@@ -64,8 +73,13 @@ pub struct DiagnosticReport {
     pub logs: LogContents,
     /// Config file contents (if available)
     pub config: Option<String>,
-    /// Network status (if node is running)
+    /// Network status (if node is running and responded successfully)
     pub network_status: Option<String>,
+    /// Reason `network_status` is missing (connection refused, timeout, etc.).
+    /// Populated whenever `network_status` is `None`, so the report never
+    /// silently drops the field without telling us why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_status_error: Option<String>,
     /// User's problem description
     pub user_message: Option<String>,
 }
@@ -165,7 +179,10 @@ impl ReportCommand {
 
         let logs = self.collect_logs(config_dirs.log_dir().map(Path::to_path_buf))?;
         let config = self.collect_config(&config_dirs.config_dir());
-        let network_status = self.collect_network_status(&config);
+        let (network_status, network_status_error) = match self.collect_network_status(&config) {
+            Ok(diag) => (Some(diag), None),
+            Err(e) => (None, Some(e)),
+        };
         let user_message = self.get_user_message()?;
 
         let client_timestamp = chrono::Utc::now().to_rfc3339();
@@ -177,6 +194,7 @@ impl ReportCommand {
             logs,
             config,
             network_status,
+            network_status_error,
             user_message,
         })
     }
@@ -226,33 +244,20 @@ impl ReportCommand {
         None
     }
 
-    fn collect_network_status(&self, config_content: &Option<String>) -> Option<String> {
-        // Try to query the local node's WebSocket API
-        // This is optional - if the node isn't running, we just skip this
-
-        // Parse the WebSocket port from config, or use default
+    /// Query the local node for live diagnostics. Returns the serialized
+    /// diagnostics on success, or a human-readable error string on failure
+    /// so the report can record *why* the field is missing rather than
+    /// silently dropping it.
+    fn collect_network_status(&self, config_content: &Option<String>) -> Result<String, String> {
         let ws_port = config_content
             .as_ref()
             .and_then(|c| parse_ws_port_from_config(c))
             .unwrap_or(DEFAULT_WS_API_PORT);
 
-        // Create a runtime for the async WebSocket query
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(_) => return None,
-        };
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
 
-        rt.block_on(async {
-            match tokio::time::timeout(
-                StdDuration::from_secs(WS_TIMEOUT_SECS),
-                query_node_diagnostics(ws_port),
-            )
-            .await
-            {
-                Ok(Ok(diagnostics)) => Some(diagnostics),
-                Ok(Err(_)) | Err(_) => None,
-            }
-        })
+        rt.block_on(query_with_fallback(ws_port, WS_RETRY_ATTEMPTS))
     }
 
     fn get_user_message(&self) -> Result<Option<String>> {
@@ -335,14 +340,11 @@ impl ReportCommand {
                 "not found"
             }
         );
-        println!(
-            "  - Node status: {}",
-            if report.network_status.is_some() {
-                "running"
-            } else {
-                "not running or unreachable"
-            }
-        );
+        match (&report.network_status, &report.network_status_error) {
+            (Some(_), _) => println!("  - Node status: running"),
+            (None, Some(err)) => println!("  - Node status: unreachable ({err})"),
+            (None, None) => println!("  - Node status: not running or unreachable"),
+        }
     }
 
     fn save_local(&self, report: &DiagnosticReport, path: &PathBuf) -> Result<()> {
@@ -654,9 +656,51 @@ fn parse_ws_port_from_config(config: &str) -> Option<u16> {
     None
 }
 
+/// Attempt the diagnostics query against each loopback host in order, with
+/// a bounded number of retries on timeout. Returns the serialized
+/// diagnostics on success, or a concatenated error string describing every
+/// attempt on failure.
+///
+/// Retries are timeout-only: connection-refused errors are reported
+/// immediately since they indicate the node is not running on that host.
+async fn query_with_fallback(port: u16, retry_attempts: u32) -> Result<String, String> {
+    let mut errors: Vec<String> = Vec::new();
+    let total_attempts = retry_attempts.saturating_add(1);
+
+    for host in LOOPBACK_HOSTS {
+        for attempt in 0..total_attempts {
+            match tokio::time::timeout(
+                StdDuration::from_secs(WS_TIMEOUT_SECS),
+                query_node_diagnostics(host, port),
+            )
+            .await
+            {
+                Ok(Ok(diag)) => return Ok(diag),
+                Ok(Err(e)) => {
+                    // Connection-level failure (refused, no route, etc.).
+                    // Don't retry the same host — the error won't change.
+                    let msg = format!("{host}:{port}: {e:#}");
+                    errors.push(msg);
+                    break;
+                }
+                Err(_) => {
+                    let msg = format!(
+                        "{host}:{port}: timed out after {WS_TIMEOUT_SECS}s (attempt {}/{})",
+                        attempt + 1,
+                        total_attempts
+                    );
+                    errors.push(msg);
+                }
+            }
+        }
+    }
+
+    Err(errors.join("; "))
+}
+
 /// Query the node for diagnostics via WebSocket API.
-async fn query_node_diagnostics(port: u16) -> Result<String> {
-    let url = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
+async fn query_node_diagnostics(host: &str, port: u16) -> Result<String> {
+    let url = format!("ws://{host}:{port}/v1/contract/command?encodingProtocol=native");
 
     let (stream, _) = connect_async(&url)
         .await
@@ -766,6 +810,7 @@ mod tests {
             },
             config: None,
             network_status: None,
+            network_status_error: None,
             user_message: Some("Test message".to_string()),
         };
 
@@ -929,6 +974,137 @@ stack backtrace:
             "Backtrace should be preserved"
         );
         assert_eq!(original_size, panic_content.len() as u64);
+    }
+
+    /// Regression for issue #3897: when no node is listening, the report must
+    /// surface a concrete error instead of silently setting `network_status`
+    /// to `None`. Uses a port that nothing is bound to so `connect_async`
+    /// fails with connection-refused.
+    #[tokio::test]
+    async fn test_query_with_fallback_connection_refused_reports_error() {
+        // Pick a port unlikely to have anything listening on loopback.
+        // If this ever flakes, a real listener on that port is the only
+        // explanation and the test is still telling us something useful.
+        let port = 59111;
+
+        let result = query_with_fallback(port, 0).await;
+
+        let err = result.expect_err("no listener → must return Err, not silent None");
+        assert!(
+            err.contains("127.0.0.1") && err.contains("[::1]"),
+            "error should mention BOTH loopback hosts, got: {err}"
+        );
+        assert!(
+            err.contains(&port.to_string()),
+            "error should include the port number, got: {err}"
+        );
+        // Must NOT be empty — the whole point is no silent failure.
+        assert!(!err.is_empty());
+    }
+
+    /// Regression for issue #3897: when the connect step hangs forever, the
+    /// query must time out and the error must identify timeout (not empty,
+    /// not connection-refused wording). Uses a TCP listener that accepts
+    /// the connection but never sends any WebSocket handshake bytes, so
+    /// tokio-tungstenite's `connect_async` blocks on the handshake until
+    /// our timeout fires.
+    #[tokio::test]
+    async fn test_query_with_fallback_timeout_reports_error() {
+        use tokio::net::TcpListener;
+
+        // Bind on IPv4 loopback only. IPv6 loopback ([::1]) will fail with
+        // connection-refused immediately, which is fine — we only need one
+        // of the two attempts to time out.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept-and-hold: drop the stream after accept so the peer blocks
+        // on handshake. We hold `_handle` for the duration of the test to
+        // keep the accept task alive.
+        let _handle = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // Hold the connection open without ever writing a handshake.
+            tokio::time::sleep(StdDuration::from_secs(60)).await;
+        });
+
+        // Override the timeout for the duration of this test by using a
+        // shorter wrapping timeout — we can't change WS_TIMEOUT_SECS at
+        // runtime, so instead bound the whole call to stay under CI limits.
+        // In practice WS_TIMEOUT_SECS is 15s; bounding to 20s lets the real
+        // timeout fire once, produces a timeout error string, and keeps the
+        // test well within CI's default timeouts.
+        let result = tokio::time::timeout(StdDuration::from_secs(20), query_with_fallback(port, 0))
+            .await
+            .expect("test wrapper timed out before WS_TIMEOUT_SECS fired");
+
+        let err = result.expect_err("handshake never completes → must return Err");
+        assert!(
+            err.contains("timed out") || err.contains("timeout"),
+            "error should identify timeout, got: {err}"
+        );
+        assert!(
+            err.contains(&port.to_string()),
+            "error should include the port number, got: {err}"
+        );
+    }
+
+    /// Serialization must round-trip the new `network_status_error` field
+    /// and omit it from JSON when `None` so existing report schemas stay
+    /// unchanged on the server side.
+    #[test]
+    fn test_network_status_error_serialization() {
+        let base_report = || DiagnosticReport {
+            client_timestamp: "2026-04-17T00:00:00Z".to_string(),
+            system_info: SystemInfo {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                hostname: "test".into(),
+            },
+            version_info: VersionInfo {
+                version: "0.2.46".into(),
+                git_commit: "abc".into(),
+                git_dirty: false,
+                build_timestamp: "".into(),
+            },
+            logs: LogContents {
+                main_log: None,
+                error_log: None,
+                main_log_size_bytes: 0,
+                error_log_size_bytes: 0,
+                main_log_original_size_bytes: 0,
+                error_log_original_size_bytes: 0,
+            },
+            config: None,
+            network_status: None,
+            network_status_error: None,
+            user_message: None,
+        };
+
+        // None case: field must be omitted from JSON so older server
+        // deserializers don't see an unexpected key.
+        let report = base_report();
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("network_status_error"),
+            "None should be skipped; got {json}"
+        );
+
+        // Some case: field must appear in JSON.
+        let mut report = base_report();
+        report.network_status_error = Some("timed out after 15s".to_string());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            json.contains("network_status_error"),
+            "Some should appear in JSON; got {json}"
+        );
+        assert!(json.contains("timed out after 15s"));
+
+        // Round-trip deserialization preserves the error string.
+        let restored: DiagnosticReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.network_status_error.as_deref(),
+            Some("timed out after 15s")
+        );
     }
 
     #[test]
