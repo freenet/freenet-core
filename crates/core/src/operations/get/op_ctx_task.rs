@@ -53,21 +53,23 @@
 //! relies on the `OPERATION_TTL` (60s) timeout. Accepted ceiling,
 //! matching Phase 2b/3a.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use freenet_stdlib::client_api::{ContractResponse, ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 use crate::client_events::HostResult;
-use crate::config::GlobalExecutor;
+use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::OpManager;
-use crate::operations::OpError;
-use crate::operations::VisitedPeers;
+#[rustfmt::skip]
 use crate::operations::op_ctx::{
     AdvanceOutcome, AttemptOutcome, RetryDriver, RetryLoopOutcome, drive_retry_loop,
 };
+use crate::operations::OpError;
+use crate::operations::VisitedPeers;
 use crate::ring::{Location, PeerKeyLocation};
 use crate::router::{RouteEvent, RouteOutcome};
 use crate::transport::peer_connection::StreamId;
@@ -955,6 +957,698 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
     }
 }
 
+// ── Relay GET task-per-tx driver (#3883) ────────────────────────────────────
+//
+// `start_relay_get` is the entry point for the relay (non-originator) GET
+// task-per-tx driver.  It is called from `node.rs` dispatch (commit 2) when
+// an incoming `GetMsg::Request` arrives with `source_addr.is_some()` — i.e.
+// from a real remote peer rather than the originator's own loop-back.
+//
+// The driver owns all routing / forwarding / retry state in task locals.
+// No `GetOp` is stored in `OpManager.ops.get` for any relay hop this driver
+// handles.  Responses are bubbled back upstream via `OpCtx::send_to_and_await`
+// targeting the downstream peer, and the reply (Found / NotFound) is forwarded
+// to `upstream_addr` via a fire-and-forget `conn_manager.send`.
+//
+// Out of scope for this commit (§7 of the port plan):
+//   - ResponseStreaming relay forwarding (chunk pipe-through).
+//   - GC-spawned retries.
+//   - start_targeted_op (UPDATE-triggered auto-fetch).
+//
+// This entire section is dead code in commit 1 — node.rs dispatch is not
+// changed until commit 2.
+
+/// Start a relay (non-originator) GET task-per-tx driver.
+///
+/// Called from `node.rs` dispatch when an incoming `GetMsg::Request`
+/// arrives from a remote peer (`source_addr.is_some()`).  The driver
+/// owns routing/forwarding/retry state in its task locals — no `GetOp`
+/// is stored in `OpManager.ops.get` for this transaction.
+///
+/// Originator loop-back (`source_addr.is_none()`) continues to use the
+/// legacy `handle_op_request` → `process_message` path.
+///
+/// # Scope (#3883)
+///
+/// Migrated:
+/// - `GetMsg::Request` relay arm: HTL check, local-cache lookup (with
+///   interest gate), forward-or-respond decision.
+/// - `GetMsg::Response{NotFound}` retry to next alternative peer.
+/// - `GetMsg::Response{Found}` bubble-up to upstream.
+/// - `ForwardingAck` send-before-forward.
+///
+/// NOT migrated (stays on legacy path; see port plan §7):
+/// - Streaming-chunk relay forwarding (`ResponseStreaming` pass-through).
+/// - GC-spawned retries.
+/// - `start_targeted_op` (UPDATE-triggered auto-fetch).
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Dead until commit 2 wires dispatch in node.rs.
+pub(crate) async fn start_relay_get(
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    instance_id: ContractInstanceId,
+    htl: usize,
+    upstream_addr: SocketAddr,
+    visited: VisitedPeers,
+    fetch_contract: bool,
+    subscribe: bool,
+) -> Result<(), OpError> {
+    tracing::debug!(
+        tx = %incoming_tx,
+        %instance_id,
+        htl,
+        %upstream_addr,
+        phase = "relay_start",
+        "GET relay (task-per-tx): spawning driver"
+    );
+
+    GlobalExecutor::spawn(run_relay_get(
+        op_manager,
+        incoming_tx,
+        instance_id,
+        htl,
+        upstream_addr,
+        visited,
+        fetch_contract,
+        subscribe,
+    ));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_get(
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    instance_id: ContractInstanceId,
+    htl: usize,
+    upstream_addr: SocketAddr,
+    visited: VisitedPeers,
+    fetch_contract: bool,
+    subscribe: bool,
+) {
+    if let Err(err) = drive_relay_get(
+        &op_manager,
+        incoming_tx,
+        instance_id,
+        htl,
+        upstream_addr,
+        visited,
+        fetch_contract,
+        subscribe,
+    )
+    .await
+    {
+        tracing::warn!(
+            tx = %incoming_tx,
+            %instance_id,
+            error = %err,
+            phase = "relay_infra_error",
+            "GET relay (task-per-tx): infrastructure error in driver"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_relay_get(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    instance_id: ContractInstanceId,
+    htl: usize,
+    upstream_addr: SocketAddr,
+    visited: VisitedPeers,
+    fetch_contract: bool,
+    subscribe: bool,
+) -> Result<(), OpError> {
+    match drive_relay_get_inner(
+        op_manager,
+        incoming_tx,
+        instance_id,
+        htl,
+        upstream_addr,
+        visited,
+        fetch_contract,
+        subscribe,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            tracing::warn!(
+                tx = %incoming_tx,
+                %instance_id,
+                error = %err,
+                phase = "relay_inner_error",
+                "GET relay (task-per-tx): inner driver returned error; sending NotFound upstream"
+            );
+            // On infrastructure error, send NotFound upstream so the upstream
+            // doesn't time out waiting for us.
+            relay_send_not_found(op_manager, incoming_tx, instance_id, upstream_addr).await;
+            Err(err)
+        }
+    }
+}
+
+/// Local fallback tuple: key, state, optional contract code.
+type LocalFallback = (ContractKey, WrappedState, Option<ContractContainer>);
+
+/// Relay-side local cache lookup with interest gate.
+///
+/// Mirrors `GetMsg::Request` match arm at `get.rs:1369-1433`.
+///
+/// Returns `(local_value, local_fallback)`:
+/// - `local_value`: Some if we should serve immediately (active interest or
+///   originator).  None if we should forward.
+/// - `local_fallback`: Some if we have stale local state with no active
+///   interest — used as a fallback if all downstream peers return NotFound.
+async fn check_local_with_interest_gate(
+    op_manager: &OpManager,
+    instance_id: &ContractInstanceId,
+    fetch_contract: bool,
+) -> (Option<LocalFallback>, Option<LocalFallback>) {
+    let get_result = op_manager
+        .notify_contract_handler(ContractHandlerEvent::GetQuery {
+            instance_id: *instance_id,
+            return_contract_code: fetch_contract,
+        })
+        .await;
+
+    let raw_local = match get_result {
+        Ok(ContractHandlerEvent::GetResponse {
+            key: Some(key),
+            response:
+                Ok(StoreResponse {
+                    state: Some(state),
+                    contract,
+                }),
+        }) => {
+            if fetch_contract && contract.is_none() {
+                // State available but contract code missing — cannot serve,
+                // must forward to get WASM from the network.
+                None
+            } else {
+                Some((key, state, contract))
+            }
+        }
+        _ => None,
+    };
+
+    match raw_local {
+        None => (None, None),
+        Some((key, state, contract)) => {
+            // Interest gate (mirrors get.rs:1408-1433):
+            // Relay peers actively hosting serve immediately.
+            // Peers with only stale LRU cache (no active interest) defer to
+            // the network but keep the local value as fallback.
+            if !op_manager.interest_manager.has_local_interest(&key) {
+                // Stale cache only — defer to network, keep as fallback.
+                tracing::debug!(
+                    %instance_id,
+                    "GET relay: stale cache (no local interest), will forward"
+                );
+                (None, Some((key, state, contract)))
+            } else {
+                // Actively hosting with interest — serve immediately.
+                (Some((key, state, contract)), None)
+            }
+        }
+    }
+}
+
+/// Select the next downstream peer for relay forwarding.
+///
+/// Uses `new_visited` (bloom filter) as the primary skip list for
+/// `k_closest_potentially_hosting` — this already encodes the upstream's
+/// skip list plus this peer and the upstream address.  `tried` is used
+/// for retry-count tracking and to ensure we don't revisit peers we've
+/// explicitly attempted in this driver invocation.
+///
+/// Returns None when exhausted (`retries >= MAX_RELAY_RETRIES`).
+fn relay_advance_to_next_peer(
+    op_manager: &OpManager,
+    instance_id: &ContractInstanceId,
+    tried: &mut Vec<SocketAddr>,
+    retries: &mut usize,
+    new_visited: &VisitedPeers,
+) -> Option<(PeerKeyLocation, SocketAddr)> {
+    const MAX_RELAY_RETRIES: usize = 3;
+    if *retries >= MAX_RELAY_RETRIES {
+        return None;
+    }
+    *retries += 1;
+
+    // Use new_visited as the skip list so upstream's visited set and our own
+    // marks are both respected.
+    let peer = op_manager
+        .ring
+        .k_closest_potentially_hosting(instance_id, new_visited.clone(), 1)
+        .into_iter()
+        .next()?;
+    let addr = peer.socket_addr()?;
+    // Double-check against tried (exact exclusion, no bloom false positives).
+    if tried.contains(&addr) {
+        return None;
+    }
+    tried.push(addr);
+    Some((peer, addr))
+}
+
+/// Send a fire-and-forget `ForwardingAck` to `upstream_addr`.
+///
+/// This tells the upstream "I'm forwarding this GET, don't retry me" so
+/// the upstream's GC task can distinguish dead peers from slow multi-hop
+/// chains.  Mirrors `get.rs:1628-1652`.
+async fn relay_send_forwarding_ack(
+    op_manager: &OpManager,
+    tx: Transaction,
+    instance_id: ContractInstanceId,
+    upstream_addr: SocketAddr,
+) {
+    let ack = NetMessage::from(GetMsg::ForwardingAck {
+        id: tx,
+        instance_id,
+    });
+    // Fire-and-forget via op_ctx fire-and-forget send.
+    // We use op_ctx_send_fire_and_forget_to so we go through the event
+    // loop's OutboundMessageWithTarget path, which is safe from spawned tasks.
+    let mut ctx = op_manager.op_ctx(tx);
+    if let Err(err) = ctx.send_fire_and_forget(upstream_addr, ack).await {
+        tracing::warn!(
+            tx = %tx,
+            %instance_id,
+            %upstream_addr,
+            error = %err,
+            "GET relay: failed to send ForwardingAck upstream"
+        );
+    } else {
+        // Emit telemetry for ForwardingAck sent (#3570 diagnostics)
+        let upstream_peer = op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_addr(upstream_addr)
+            .unwrap_or_else(|| op_manager.ring.connection_manager.own_location());
+        if let Some(event) = crate::tracing::NetEventLog::get_forwarding_ack_sent(
+            &tx,
+            &op_manager.ring,
+            instance_id,
+            upstream_peer,
+        ) {
+            op_manager
+                .ring
+                .register_events(either::Either::Left(event))
+                .await;
+        }
+    }
+}
+
+/// Build and send a `GetMsg::Response{NotFound}` to `upstream_addr`.
+async fn relay_send_not_found(
+    op_manager: &OpManager,
+    tx: Transaction,
+    instance_id: ContractInstanceId,
+    upstream_addr: SocketAddr,
+) {
+    let msg = NetMessage::from(GetMsg::Response {
+        id: tx,
+        instance_id,
+        result: GetMsgResult::NotFound,
+    });
+    let mut ctx = op_manager.op_ctx(tx);
+    // Fire-and-forget — relay doesn't await the upstream's ack.
+    if let Err(err) = ctx.send_fire_and_forget(upstream_addr, msg).await {
+        tracing::warn!(
+            tx = %tx,
+            %instance_id,
+            %upstream_addr,
+            error = %err,
+            "GET relay: failed to send NotFound upstream"
+        );
+    }
+}
+
+/// Build and send a `GetMsg::Response{Found}` (inline, non-streaming) to
+/// `upstream_addr`.  Returns an error on serialization failure.
+async fn relay_send_found(
+    op_manager: &OpManager,
+    tx: Transaction,
+    instance_id: ContractInstanceId,
+    upstream_addr: SocketAddr,
+    key: ContractKey,
+    state: WrappedState,
+    contract: Option<ContractContainer>,
+) -> Result<(), OpError> {
+    let msg = NetMessage::from(GetMsg::Response {
+        id: tx,
+        instance_id,
+        result: GetMsgResult::Found {
+            key,
+            value: StoreResponse {
+                state: Some(state),
+                contract,
+            },
+        },
+    });
+    let mut ctx = op_manager.op_ctx(tx);
+    // Fire-and-forget toward upstream — relay doesn't await upstream's ack.
+    ctx.send_fire_and_forget(upstream_addr, msg)
+        .await
+        .map_err(|_| OpError::NotificationError)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_relay_get_inner(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    instance_id: ContractInstanceId,
+    htl: usize,
+    upstream_addr: SocketAddr,
+    visited: VisitedPeers,
+    fetch_contract: bool,
+    subscribe: bool,
+) -> Result<(), OpError> {
+    let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
+    let htl = htl.min(ring_max_htl);
+
+    // ── Short-circuit 1: HTL = 0 ────────────────────────────────────────
+    if htl == 0 {
+        tracing::warn!(
+            tx = %incoming_tx,
+            %instance_id,
+            %upstream_addr,
+            htl = 0,
+            phase = "not_found",
+            "GET relay (task-per-tx): HTL exhausted — sending NotFound upstream"
+        );
+        if let Some(event) = crate::tracing::NetEventLog::get_not_found(
+            &incoming_tx,
+            &op_manager.ring,
+            instance_id,
+            Some(op_manager.ring.max_hops_to_live),
+        ) {
+            op_manager
+                .ring
+                .register_events(either::Either::Left(event))
+                .await;
+        }
+        relay_send_not_found(op_manager, incoming_tx, instance_id, upstream_addr).await;
+        return Ok(());
+    }
+
+    // ── Update visited set: mark this peer and the upstream ─────────────
+    let mut new_visited = visited.with_transaction(&incoming_tx);
+    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+        new_visited.mark_visited(own_addr);
+    }
+    new_visited.mark_visited(upstream_addr);
+
+    // ── Short-circuit 2: Local cache hit with interest ───────────────────
+    let (local_value, local_fallback) =
+        check_local_with_interest_gate(op_manager, &instance_id, fetch_contract).await;
+
+    if let Some((key, state, contract)) = local_value {
+        tracing::info!(
+            tx = %incoming_tx,
+            %instance_id,
+            contract = %key,
+            phase = "complete",
+            "GET relay (task-per-tx): contract found locally (active interest) — sending Found upstream"
+        );
+
+        // Register interest for the requester (mirrors get.rs:1447-1476).
+        if subscribe {
+            crate::operations::subscribe::register_downstream_subscriber(
+                op_manager,
+                &key,
+                upstream_addr,
+                None,
+                None,
+                &incoming_tx,
+                " (relay task-per-tx, piggybacked on GET)",
+            )
+            .await;
+        } else if let Some(pkl) = op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_addr(upstream_addr)
+        {
+            let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+            op_manager
+                .interest_manager
+                .register_peer_interest(&key, peer_key, None, false);
+        }
+
+        // Cache locally first (relay already hosting, idempotent).
+        cache_contract_locally(op_manager, key, state.clone(), contract.clone()).await;
+
+        relay_send_found(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            upstream_addr,
+            key,
+            state,
+            contract,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // ── Retry loop: forward to downstream peers ──────────────────────────
+    // `tried` tracks the exact addrs we've attempted for retry counting.
+    // The bloom filter `new_visited` acts as the skip list for
+    // `k_closest_potentially_hosting` (it already has own_addr and
+    // upstream_addr marked in).
+    let mut tried: Vec<SocketAddr> = Vec::new();
+    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+        tried.push(own_addr);
+    }
+    tried.push(upstream_addr);
+
+    let mut retries: usize = 0;
+    let mut sent_forwarding_ack = false;
+
+    loop {
+        // Pick next downstream peer.
+        let (peer, peer_addr) = match relay_advance_to_next_peer(
+            op_manager,
+            &instance_id,
+            &mut tried,
+            &mut retries,
+            &new_visited,
+        ) {
+            Some(p) => p,
+            None => {
+                // Exhausted: serve local fallback if available, else NotFound.
+                if let Some((key, state, contract)) = local_fallback {
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        %instance_id,
+                        contract = %key,
+                        "GET relay (task-per-tx): all peers exhausted — serving local fallback"
+                    );
+                    cache_contract_locally(op_manager, key, state.clone(), contract.clone()).await;
+                    relay_send_found(
+                        op_manager,
+                        incoming_tx,
+                        instance_id,
+                        upstream_addr,
+                        key,
+                        state,
+                        contract,
+                    )
+                    .await?;
+                } else {
+                    tracing::warn!(
+                        tx = %incoming_tx,
+                        %instance_id,
+                        %upstream_addr,
+                        phase = "not_found",
+                        "GET relay (task-per-tx): all peers exhausted — sending NotFound upstream"
+                    );
+                    if let Some(event) = crate::tracing::NetEventLog::get_not_found(
+                        &incoming_tx,
+                        &op_manager.ring,
+                        instance_id,
+                        None,
+                    ) {
+                        op_manager
+                            .ring
+                            .register_events(either::Either::Left(event))
+                            .await;
+                    }
+                    relay_send_not_found(op_manager, incoming_tx, instance_id, upstream_addr).await;
+                }
+                return Ok(());
+            }
+        };
+
+        // Send ForwardingAck BEFORE forwarding (mirrors get.rs:1628-1652).
+        // Only send once per relay invocation — subsequent retries don't
+        // resend it (the upstream already extended its timer on the first ack).
+        if !sent_forwarding_ack {
+            relay_send_forwarding_ack(op_manager, incoming_tx, instance_id, upstream_addr).await;
+            sent_forwarding_ack = true;
+        }
+
+        tracing::debug!(
+            tx = %incoming_tx,
+            %instance_id,
+            target = %peer,
+            target_addr = %peer_addr,
+            phase = "forward",
+            "GET relay (task-per-tx): forwarding request to downstream peer"
+        );
+
+        // Emit get_request telemetry for the relay forward.
+        let new_htl = htl.saturating_sub(1);
+        if let Some(event) = crate::tracing::NetEventLog::get_request(
+            &incoming_tx,
+            &op_manager.ring,
+            instance_id,
+            peer.clone(),
+            new_htl,
+        ) {
+            op_manager
+                .ring
+                .register_events(either::Either::Left(event))
+                .await;
+        }
+
+        // Build per-attempt tx (fresh per-attempt to satisfy single-use-per-tx).
+        let attempt_tx = Transaction::new::<GetMsg>();
+
+        let request = NetMessage::from(GetMsg::Request {
+            id: attempt_tx,
+            instance_id,
+            fetch_contract,
+            htl: new_htl,
+            visited: new_visited.clone(),
+            subscribe,
+        });
+
+        // Send to downstream peer and await reply.
+        let mut ctx = op_manager.op_ctx(attempt_tx);
+        let round_trip =
+            tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(peer_addr, request)).await;
+
+        // Always release the per-attempt slot.
+        op_manager.release_pending_op_slot(attempt_tx).await;
+
+        let reply = match round_trip {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    attempt_tx = %attempt_tx,
+                    target = %peer,
+                    error = %err,
+                    "GET relay (task-per-tx): send_to_and_await failed; advancing to next peer"
+                );
+                // Continue loop to try next peer.
+                new_visited.mark_visited(peer_addr);
+                continue;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    attempt_tx = %attempt_tx,
+                    target = %peer,
+                    timeout_secs = OPERATION_TTL.as_secs(),
+                    "GET relay (task-per-tx): attempt timed out; advancing to next peer"
+                );
+                new_visited.mark_visited(peer_addr);
+                continue;
+            }
+        };
+
+        // Classify the reply.
+        match classify(reply) {
+            AttemptOutcome::Terminal(Terminal::InlineFound {
+                key,
+                state,
+                contract,
+            }) => {
+                tracing::info!(
+                    tx = %incoming_tx,
+                    %instance_id,
+                    contract = %key,
+                    phase = "relay_found",
+                    "GET relay (task-per-tx): downstream returned Found — caching locally and bubbling upstream"
+                );
+
+                // Cache locally (relay opportunistically caches; side
+                // effects like `announce_contract_hosted` are skipped
+                // since relay is not the originator — `cache_contract_locally`
+                // handles the hosting LRU / interest manager for relay nodes).
+                cache_contract_locally(op_manager, key, state.clone(), contract.clone()).await;
+
+                // Bubble up to upstream.
+                relay_send_found(
+                    op_manager,
+                    incoming_tx,
+                    instance_id,
+                    upstream_addr,
+                    key,
+                    state,
+                    contract,
+                )
+                .await?;
+                return Ok(());
+            }
+            AttemptOutcome::Terminal(Terminal::Streaming { .. }) => {
+                // Streaming relay forwarding is out of scope for #3883 commit 1.
+                // Log and fall through to next peer (treat as NotFound for now).
+                // A follow-up PR will add proper chunk pipe-through.
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    %instance_id,
+                    target = %peer,
+                    "GET relay (task-per-tx): downstream returned ResponseStreaming — \
+                     streaming relay forwarding not yet implemented (port plan §7); \
+                     trying next peer"
+                );
+                new_visited.mark_visited(peer_addr);
+                continue;
+            }
+            AttemptOutcome::Terminal(Terminal::LocalCompletion) => {
+                // A relay driver should never receive a Request-echo because
+                // `send_to_and_await` targets a specific remote peer (not loopback).
+                // If this arrives, treat it as Unexpected.
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    %instance_id,
+                    "GET relay (task-per-tx): unexpected LocalCompletion (Request-echo) — trying next peer"
+                );
+                new_visited.mark_visited(peer_addr);
+                continue;
+            }
+            AttemptOutcome::Retry => {
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    attempt_tx = %attempt_tx,
+                    target = %peer,
+                    "GET relay (task-per-tx): downstream returned NotFound; advancing to next peer"
+                );
+                // Mark the failed peer so future iterations don't re-select it.
+                new_visited.mark_visited(peer_addr);
+                // Loop iterates to next peer.
+                continue;
+            }
+            AttemptOutcome::Unexpected => {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    attempt_tx = %attempt_tx,
+                    target = %peer,
+                    "GET relay (task-per-tx): unexpected reply variant; advancing to next peer"
+                );
+                new_visited.mark_visited(peer_addr);
+                continue;
+            }
+        }
+    }
+}
+
+// ── End of relay GET driver ──────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1429,5 +2123,178 @@ mod tests {
         let body = &SOURCE[fn_start..];
         body.find("if !subscribe {")
             .expect("maybe_subscribe_child must short-circuit on !subscribe");
+    }
+
+    // ── Relay driver source-scrape tests (#3883) ─────────────────────────────
+    //
+    // These tests validate the structural invariants of the relay GET driver
+    // without requiring a full simulation harness.  They mirror the pattern
+    // established by the client driver tests above.
+
+    /// T1: HTL=0 short-circuit must send NotFound upstream without entering
+    /// the retry loop.  The source must contain the htl==0 guard BEFORE the
+    /// first `relay_advance_to_next_peer` call.
+    #[test]
+    fn relay_driver_htl_zero_guard_precedes_retry_loop() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let htl_guard = body
+            .find("if htl == 0")
+            .expect("drive_relay_get_inner must have an `if htl == 0` guard");
+        let retry_loop = body
+            .find("relay_advance_to_next_peer")
+            .expect("drive_relay_get_inner must call relay_advance_to_next_peer");
+        assert!(
+            htl_guard < retry_loop,
+            "HTL=0 guard must appear BEFORE the retry loop; \
+             otherwise HTL exhaustion enters the retry loop and forwards unnecessarily"
+        );
+    }
+
+    /// T2: Local cache short-circuit must send Found upstream without entering
+    /// the retry loop.  The source must contain the local-cache check BEFORE
+    /// `relay_advance_to_next_peer` and AFTER the HTL guard.
+    #[test]
+    fn relay_driver_local_cache_check_precedes_retry_loop() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let local_check = body
+            .find("check_local_with_interest_gate")
+            .expect("drive_relay_get_inner must call check_local_with_interest_gate");
+        let retry_loop = body
+            .find("relay_advance_to_next_peer")
+            .expect("drive_relay_get_inner must call relay_advance_to_next_peer");
+        assert!(
+            local_check < retry_loop,
+            "Local-cache check must appear BEFORE the retry loop; \
+             otherwise a hosting relay forwards instead of answering immediately"
+        );
+    }
+
+    /// T3: Interest gate in `check_local_with_interest_gate` — stale cache
+    /// (no local interest) must NOT return a local_value (must go to fallback).
+    #[test]
+    fn check_local_with_interest_gate_has_interest_check() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn check_local_with_interest_gate(");
+        assert!(
+            body.contains("has_local_interest"),
+            "check_local_with_interest_gate must call `has_local_interest` to gate \
+             whether stale cache is served immediately or deferred to network"
+        );
+        // The stale-cache branch must put the value into the fallback slot,
+        // not into local_value.
+        assert!(
+            body.contains("None, Some("),
+            "check_local_with_interest_gate must return (None, Some(fallback)) \
+             when there is local state but no active interest"
+        );
+    }
+
+    /// T4: Downstream `Response{Found}` must call `cache_contract_locally`
+    /// before calling `relay_send_found`.  Ensures relay opportunistically
+    /// caches contract code.
+    #[test]
+    fn relay_driver_caches_locally_on_found_response() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        // Find the InlineFound arm inside the loop.
+        let found_arm = body
+            .find("Terminal::InlineFound {")
+            .expect("drive_relay_get_inner must handle Terminal::InlineFound");
+        let tail = &body[found_arm..];
+        // Find cache and send in order within the arm.
+        let cache_pos = tail.find("cache_contract_locally").unwrap_or(usize::MAX);
+        let send_pos = tail.find("relay_send_found").unwrap_or(usize::MAX);
+        assert!(
+            cache_pos < send_pos,
+            "cache_contract_locally must be called BEFORE relay_send_found \
+             in the InlineFound arm — the relay must cache the contract before \
+             bubbling the response upstream"
+        );
+    }
+
+    /// T5: Exhaustion path must send NotFound upstream.
+    #[test]
+    fn relay_driver_exhaustion_sends_not_found_upstream() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        // Find the exhaustion branch (None arm of relay_advance_to_next_peer).
+        assert!(
+            body.contains("relay_send_not_found"),
+            "drive_relay_get_inner must call `relay_send_not_found` on exhaustion"
+        );
+    }
+
+    /// T6: ForwardingAck must be sent BEFORE the downstream `send_to_and_await`
+    /// call.  The source must contain `relay_send_forwarding_ack` before
+    /// `send_to_and_await` in the loop body.
+    #[test]
+    fn relay_driver_forwarding_ack_sent_before_downstream_request() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let ack_pos = body
+            .find("relay_send_forwarding_ack")
+            .expect("drive_relay_get_inner must call relay_send_forwarding_ack");
+        let send_pos = body
+            .find("send_to_and_await")
+            .expect("drive_relay_get_inner must call send_to_and_await");
+        assert!(
+            ack_pos < send_pos,
+            "relay_send_forwarding_ack must be called BEFORE send_to_and_await \
+             (ForwardingAck timing: upstream must extend its timer before we \
+             fire the downstream request)"
+        );
+    }
+
+    /// T7: `relay_advance_to_next_peer` must respect incoming `VisitedPeers`
+    /// by using the bloom filter as the skip list for `k_closest_potentially_hosting`.
+    #[test]
+    fn relay_advance_uses_visited_bloom_filter_as_skip_list() {
+        let src = production_source();
+        let body = extract_fn_body(src, "fn relay_advance_to_next_peer(");
+        assert!(
+            body.contains("k_closest_potentially_hosting"),
+            "relay_advance_to_next_peer must use k_closest_potentially_hosting"
+        );
+        assert!(
+            body.contains("new_visited"),
+            "relay_advance_to_next_peer must pass new_visited as the skip list \
+             so the upstream's VisitedPeers is respected"
+        );
+    }
+
+    /// T8: Classify reuse — relay driver must call `classify` (the same
+    /// function the client driver uses) for reply classification.
+    #[test]
+    fn relay_driver_reuses_classify_function() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        assert!(
+            body.contains("classify(reply)"),
+            "drive_relay_get_inner must call `classify(reply)` to classify \
+             downstream replies — reusing the client driver's classify avoids \
+             duplicate terminal-variant handling"
+        );
+    }
+
+    /// T9: start_relay_get is pub(crate) and dead code until commit 2.
+    /// Source-scrape verifies the #[allow(dead_code)] attribute is present
+    /// so the compiler doesn't warn about the intentionally-dead driver.
+    #[test]
+    fn relay_entry_point_annotated_dead_code_for_commit1() {
+        let src = production_source();
+        // Find start_relay_get and check that dead_code allow is near it.
+        let fn_start = src
+            .find("pub(crate) async fn start_relay_get(")
+            .expect("start_relay_get must exist");
+        // Look in the 500 chars before the fn signature for the attribute.
+        let window_start = fn_start.saturating_sub(500);
+        let window = &src[window_start..fn_start];
+        assert!(
+            window.contains("dead_code"),
+            "start_relay_get must be annotated with #[allow(dead_code)] in commit 1 \
+             to suppress the compiler warning for the intentionally-dead driver"
+        );
     }
 }
