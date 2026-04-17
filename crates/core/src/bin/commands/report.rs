@@ -35,7 +35,7 @@ const DEFAULT_WS_API_PORT: u16 = 7509;
 /// waiting longer rather than dropping the field silently.
 const WS_TIMEOUT_SECS: u64 = 15;
 /// Number of additional retry attempts after the initial query times out.
-/// Connection refused is not retried — that signals the node isn't running.
+/// Connection refused is not retried: that signals the node isn't running.
 const WS_RETRY_ATTEMPTS: u32 = 1;
 /// Loopback hosts to try, in order. Both are attempted so that
 /// `ws-api-address = "::"` combined with `IPV6_V6ONLY=1` (or a v4-only
@@ -678,18 +678,16 @@ async fn query_with_fallback(port: u16, retry_attempts: u32) -> Result<String, S
                 Ok(Ok(diag)) => return Ok(diag),
                 Ok(Err(e)) => {
                     // Connection-level failure (refused, no route, etc.).
-                    // Don't retry the same host — the error won't change.
-                    let msg = format!("{host}:{port}: {e:#}");
-                    errors.push(msg);
+                    // Don't retry the same host: the error won't change.
+                    errors.push(format!("{host}:{port}: {e:#}"));
                     break;
                 }
                 Err(_) => {
-                    let msg = format!(
+                    errors.push(format!(
                         "{host}:{port}: timed out after {WS_TIMEOUT_SECS}s (attempt {}/{})",
                         attempt + 1,
                         total_attempts
-                    );
-                    errors.push(msg);
+                    ));
                 }
             }
         }
@@ -998,7 +996,7 @@ stack backtrace:
             err.contains(&port.to_string()),
             "error should include the port number, got: {err}"
         );
-        // Must NOT be empty — the whole point is no silent failure.
+        // Must NOT be empty: the whole point is no silent failure.
         assert!(!err.is_empty());
     }
 
@@ -1012,27 +1010,23 @@ stack backtrace:
     async fn test_query_with_fallback_timeout_reports_error() {
         use tokio::net::TcpListener;
 
-        // Bind on IPv4 loopback only. IPv6 loopback ([::1]) will fail with
-        // connection-refused immediately, which is fine — we only need one
-        // of the two attempts to time out.
+        // Bind on IPv4 loopback only. The [::1] attempt will fail with
+        // connection-refused immediately; we only need one of the two
+        // attempts to hit the timeout path.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // Accept-and-hold: drop the stream after accept so the peer blocks
-        // on handshake. We hold `_handle` for the duration of the test to
-        // keep the accept task alive.
+        // Accept the connection but never write any handshake bytes, so
+        // `connect_async` blocks until WS_TIMEOUT_SECS fires. Holding
+        // `_handle` keeps the accept task alive for the duration of the test.
         let _handle = tokio::spawn(async move {
             let (_stream, _) = listener.accept().await.unwrap();
-            // Hold the connection open without ever writing a handshake.
             tokio::time::sleep(StdDuration::from_secs(60)).await;
         });
 
-        // Override the timeout for the duration of this test by using a
-        // shorter wrapping timeout — we can't change WS_TIMEOUT_SECS at
-        // runtime, so instead bound the whole call to stay under CI limits.
-        // In practice WS_TIMEOUT_SECS is 15s; bounding to 20s lets the real
-        // timeout fire once, produces a timeout error string, and keeps the
-        // test well within CI's default timeouts.
+        // Outer wrapper bounds total test time: WS_TIMEOUT_SECS (15s) must
+        // fire once on the 127.0.0.1 attempt, so 20s leaves margin without
+        // exceeding CI's default timeouts.
         let result = tokio::time::timeout(StdDuration::from_secs(20), query_with_fallback(port, 0))
             .await
             .expect("test wrapper timed out before WS_TIMEOUT_SECS fired");
