@@ -7411,16 +7411,29 @@ fn test_get_succeeds_despite_readiness_gating() {
 ///
 #[test_log::test]
 fn test_get_routing_coverage_low_htl() {
-    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+    use std::sync::atomic::Ordering;
+
+    use freenet::dev_tool::{
+        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, ScheduledOperation, SimOperation,
+        register_crdt_contract,
+    };
 
     // Seed updated: per-peer acceptor reliability scoring replaces binary
     // exclusion (PR #3659), changing the CONNECT routing code path and
-    // Turmoil scheduling. Previous seed: 0xC0DE_B0CA_0031 (PR #3621).
+    // Turmoil scheduling. Previous seed: 0xC0DE_B0CA_0032 (PR #3621).
     const SEED: u64 = 0xC0DE_B0CA_0032;
     const NETWORK_NAME: &str = "get-routing-coverage";
 
     GlobalTestMetrics::reset();
     setup_deterministic_state(SEED);
+
+    // Baseline the relay driver counter so we can assert that the
+    // dispatch gate in handle_pure_network_message_v1 actually routed
+    // relay hops through the task-per-tx driver (not the legacy
+    // handle_op_request fallthrough). This is the behavioral companion
+    // to the source-scrape tests in op_ctx_task.rs that only pin the
+    // dispatch-block SHAPE. #1454 phase 5 / #3883.
+    let relay_baseline = GET_RELAY_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
 
     let rt = create_runtime();
 
@@ -7524,6 +7537,24 @@ fn test_get_routing_coverage_low_htl() {
         nodes_without_state
     );
 
+    // Behavioral companion to the dispatch-gate source-scrape tests in
+    // op_ctx_task.rs: prove the relay task-per-tx driver actually ran
+    // on at least one intermediate hop during the 15-node / HTL=3 /
+    // 15 parallel GETs workload. If this assertion ever starts failing,
+    // something has silently regressed the dispatch split in
+    // handle_pure_network_message_v1 — inbound relay Requests are going
+    // through the legacy handle_op_request path again. #1454 phase 5 / #3883.
+    let relay_after = GET_RELAY_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+    let relay_delta = relay_after.saturating_sub(relay_baseline);
+    assert!(
+        relay_delta > 0,
+        "RELAY_DRIVER_CALL_COUNT did not advance during the test — the \
+         relay task-per-tx driver never ran. With {num_nodes} nodes, HTL=3, \
+         and ~5 caching nodes, every non-caching requester should hit at \
+         least one relay hop. Dispatch gate in \
+         handle_pure_network_message_v1 has likely regressed. Baseline: {relay_baseline}, after: {relay_after}."
+    );
+
     // StateVerifier anomaly check
     let rt = create_runtime();
     let report = rt.block_on(async {
@@ -7532,9 +7563,10 @@ fn test_get_routing_coverage_low_htl() {
         verifier.verify()
     });
     tracing::info!(
-        "test_get_routing_coverage_low_htl PASSED: {} anomalies, {} events",
+        "test_get_routing_coverage_low_htl PASSED: {} anomalies, {} events, \
+         relay_driver_calls={relay_delta}",
         report.anomalies.len(),
-        report.total_events
+        report.total_events,
     );
 }
 

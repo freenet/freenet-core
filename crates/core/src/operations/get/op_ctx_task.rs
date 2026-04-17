@@ -274,7 +274,14 @@ async fn drive_client_get_inner(
                     state,
                     contract,
                 } => {
-                    cache_contract_locally(op_manager, *key, state.clone(), contract.clone()).await;
+                    cache_contract_locally(
+                        op_manager,
+                        *key,
+                        state.clone(),
+                        contract.clone(),
+                        true, // client driver: this node initiated the GET
+                    )
+                    .await;
                     *key
                 }
                 Terminal::Streaming {
@@ -651,21 +658,33 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 ///    state, skip `PutQuery` entirely so contracts that enforce
 ///    identical-state rejection in `update_state()` aren't invoked
 ///    redundantly.
-/// 2. **Unconditional hosting refresh** — `record_get_access`,
-///    `mark_local_client_access`, and interest-manager eviction
-///    cleanup run for BOTH the state-matches short-circuit AND the
-///    PutQuery-failed error paths. Legacy behaviour at
-///    `get.rs:2420-2435` continues these side effects on error so
-///    re-GETs keep refreshing the hosting LRU/TTL even when the
-///    executor rejected the write.
-/// 3. **Newly-hosted announcement** — only runs when the local
+/// 2. **Unconditional hosting refresh** — `record_get_access` and
+///    interest-manager eviction cleanup run for BOTH the
+///    state-matches short-circuit AND the PutQuery-failed error paths.
+///    Legacy behaviour at `get.rs:2420-2435` continues these side
+///    effects on error so re-GETs keep refreshing the hosting LRU/TTL
+///    even when the executor rejected the write.
+/// 3. **`mark_local_client_access` gated on `is_client_requester`** —
+///    the sticky flag that moves the contract into the
+///    `contracts_needing_renewal()` set (see `ring/hosting.rs:889`) must
+///    only fire when THIS node is the client-originating requester.
+///    Relay peers that merely cache a forwarded Found MUST NOT set it,
+///    or they permanently pay subscription-renewal cost for contracts
+///    no client on this node ever asked for. Legacy mirror:
+///    `get.rs:2260-2262, :2353-2355, :3056-3058`
+///    all gate the call on `is_original_requester =
+///    upstream_addr.is_none()`.
+/// 4. **Newly-hosted announcement** — only runs when the local
 ///    store actually transitioned from no-state to has-state
-///    (i.e., `access_result.is_new && put_persisted`).
+///    (i.e., `access_result.is_new && put_persisted`). NOT gated on
+///    `is_client_requester`; legacy announces on any first-time relay
+///    cache too (`get.rs:2278, 2370`).
 async fn cache_contract_locally(
     op_manager: &OpManager,
     key: ContractKey,
     state: WrappedState,
     contract: Option<ContractContainer>,
+    is_client_requester: bool,
 ) {
     let state_size = state.size() as u64;
 
@@ -757,7 +776,14 @@ async fn cache_contract_locally(
     // successful wire-level GET must refresh the hosting LRU/TTL
     // regardless of what the local executor did with the state.
     let access_result = op_manager.ring.record_get_access(key, state_size);
-    op_manager.ring.mark_local_client_access(&key);
+    // Sticky flag gating subscription renewal; only the client-originating
+    // node sets it. Relays that pass through a Found MUST NOT taint their
+    // own hosting cache with another node's client access. Legacy mirror:
+    // get.rs:2260-2262 / :2353-2355 / :3056-3058 all guard on
+    // `is_original_requester = upstream_addr.is_none()`.
+    if is_client_requester {
+        op_manager.ring.mark_local_client_access(&key);
+    }
 
     let mut removed_contracts = Vec::new();
     for evicted_key in &access_result.evicted {
@@ -851,7 +877,11 @@ async fn assemble_and_cache_stream(
         None
     };
 
-    cache_contract_locally(op_manager, payload.key, state, contract).await;
+    // Streaming assembly is reachable only from the client-driver side (the
+    // relay driver does not claim streams — port plan §7). The originator
+    // IS the client requester, so the sticky `local_client_access` flag
+    // applies.
+    cache_contract_locally(op_manager, payload.key, state, contract, true).await;
     Ok(())
 }
 
@@ -1414,7 +1444,11 @@ async fn drive_relay_get_inner(
         }
 
         // Cache locally first (relay already hosting, idempotent).
-        cache_contract_locally(op_manager, key, state.clone(), contract.clone()).await;
+        // `is_client_requester=false`: relay peers must not set the sticky
+        // `local_client_access` flag — that's exclusively for the client-
+        // originating node. Legacy mirror: `get.rs:2260-2262` gates on
+        // `is_original_requester`.
+        cache_contract_locally(op_manager, key, state.clone(), contract.clone(), false).await;
 
         relay_send_found(
             op_manager,
@@ -1462,7 +1496,10 @@ async fn drive_relay_get_inner(
                         contract = %key,
                         "GET relay (task-per-tx): all peers exhausted — serving local fallback"
                     );
-                    cache_contract_locally(op_manager, key, state.clone(), contract.clone()).await;
+                    // Relay path: is_client_requester=false (see top-of-loop
+                    // rationale).
+                    cache_contract_locally(op_manager, key, state.clone(), contract.clone(), false)
+                        .await;
                     relay_send_found(
                         op_manager,
                         incoming_tx,
@@ -1592,11 +1629,17 @@ async fn drive_relay_get_inner(
                     "GET relay (task-per-tx): downstream returned Found — caching locally and bubbling upstream"
                 );
 
-                // Cache locally (relay opportunistically caches; side
-                // effects like `announce_contract_hosted` are skipped
-                // since relay is not the originator — `cache_contract_locally`
-                // handles the hosting LRU / interest manager for relay nodes).
-                cache_contract_locally(op_manager, key, state.clone(), contract.clone()).await;
+                // Cache locally (relay opportunistically caches forwarded
+                // Found payloads). `is_client_requester=false` so this node
+                // does NOT set `mark_local_client_access` — the sticky flag
+                // belongs to the upstream client-originating node, not a
+                // forwarder. `announce_contract_hosted` DOES fire when
+                // `access_result.is_new && put_persisted` so first-time
+                // hosting at a relay is still broadcast (matches legacy
+                // `get.rs:2370` which announces on any first-time relay
+                // cache).
+                cache_contract_locally(op_manager, key, state.clone(), contract.clone(), false)
+                    .await;
 
                 // Bubble up to upstream.
                 relay_send_found(
@@ -1845,10 +1888,7 @@ mod tests {
             .find("#[cfg(test)]")
             .expect("file must have a #[cfg(test)] section");
         // The str literal outlives `cutoff`; slicing gives a &'static str.
-        #[allow(clippy::manual_unwrap_or_default)]
-        {
-            &FULL[..cutoff]
-        }
+        &FULL[..cutoff]
     }
 
     /// Isolate the body of a named function inside production source.
@@ -2913,6 +2953,196 @@ mod tests {
                 && !block.contains("has_get_op(contract_id)"),
             "Dispatch block must not gate on contract key (per-key dedup). \
              Found a suspicious has_get_op variant: {block}"
+        );
+    }
+
+    // ── C1: cache_contract_locally must gate mark_local_client_access ──────
+
+    /// Regression guard for the relay hosting-cache taint bug caught in
+    /// PR #3896 review. The legacy GET branch gates `mark_local_client_access`
+    /// on `is_original_requester = upstream_addr.is_none()` (see
+    /// `get.rs:2260-2262, :2353-2355, :3056-3058`). The task-per-tx driver
+    /// MUST respect that gate: relay peers that merely cache a forwarded
+    /// Found must NOT set the sticky `local_client_access` flag, or they
+    /// permanently pay subscription-renewal cost for contracts no client
+    /// on the relay node ever asked for.
+    ///
+    /// Source-scrape invariant: `cache_contract_locally` must accept an
+    /// `is_client_requester: bool` parameter and gate the
+    /// `mark_local_client_access` call on it.
+    #[test]
+    fn cache_contract_locally_gates_mark_local_client_access_on_requester() {
+        let src = production_source();
+        // Function signature must carry the new parameter.
+        let sig_start = src
+            .find("async fn cache_contract_locally(")
+            .expect("cache_contract_locally must exist");
+        let sig_window = &src[sig_start..(sig_start + 400).min(src.len())];
+        assert!(
+            sig_window.contains("is_client_requester: bool"),
+            "`cache_contract_locally` must accept `is_client_requester: bool` \
+             so relay callsites can opt out of the sticky local_client_access \
+             flag. Sig window: {sig_window}"
+        );
+        // Body must gate `mark_local_client_access` on the flag.
+        let body = extract_fn_body(src, "async fn cache_contract_locally(");
+        let gate_pos = body
+            .find("if is_client_requester {")
+            .expect("mark_local_client_access must be gated on is_client_requester");
+        let mark_pos = body
+            .find("mark_local_client_access")
+            .expect("mark_local_client_access must still be called under the gate");
+        assert!(
+            gate_pos < mark_pos,
+            "`if is_client_requester {{` must precede the \
+             `mark_local_client_access` call; otherwise the gate is \
+             structurally useless."
+        );
+        // Negative check: there must be NO unconditional (unguarded) call.
+        let guarded_snippet =
+            "if is_client_requester {\n        op_manager.ring.mark_local_client_access";
+        assert!(
+            body.contains(guarded_snippet),
+            "The `mark_local_client_access` call must be directly inside the \
+             `if is_client_requester {{ ... }}` block. Current body structure \
+             may have split the guard from the call.\n{body}"
+        );
+    }
+
+    /// All three relay-driver callsites must pass `false`.
+    /// Relay caches forwarded Found payloads but MUST NOT flag them as
+    /// client-accessed on the relay's own hosting cache. There are three
+    /// relay callsites in `drive_relay_get_inner`:
+    ///   1. Active-interest local Found (R4, immediate serve)
+    ///   2. Exhaustion fallback (R10, stale local state)
+    ///   3. Downstream Found bubble-up (R12a, forwarded payload)
+    #[test]
+    fn all_relay_callsites_pass_is_client_requester_false() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let callsites: Vec<usize> = body
+            .match_indices("cache_contract_locally(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            callsites.len(),
+            3,
+            "drive_relay_get_inner should have exactly three \
+             cache_contract_locally callsites (R4 immediate, R10 fallback, \
+             R12a bubble-up). Found {} — a refactor has changed the shape.",
+            callsites.len(),
+        );
+        // Each callsite must terminate with `, false)` (the
+        // `is_client_requester` argument). The body contains non-ASCII
+        // comment decorations, so walk by char rather than by byte to avoid
+        // slicing on a multi-byte boundary.
+        for (idx, &pos) in callsites.iter().enumerate() {
+            let tail = &body[pos..];
+            // End-of-args: first matching closing `)` at depth 0.
+            let mut depth: i32 = 0;
+            let mut end: Option<usize> = None;
+            for (i, c) in tail.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.unwrap_or_else(|| {
+                panic!("unterminated cache_contract_locally call at relay callsite #{idx}")
+            });
+            let call = &tail[..=end];
+            // The last argument must be `false`. Normalize whitespace.
+            let normalized: String = call.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                normalized.ends_with("false,).await") || normalized.ends_with("false)"),
+                "Relay callsite #{idx} of cache_contract_locally must pass \
+                 `false` for is_client_requester (relay is not the client). \
+                 Call text: {call}"
+            );
+        }
+    }
+
+    /// The `client_driver`-side callsite (drive_client_get_inner's
+    /// InlineFound arm) must pass `true`. Streaming assembly
+    /// (`assemble_and_cache_stream`) also must pass `true` — the stream
+    /// is only claimed by the client driver.
+    #[test]
+    fn client_driver_and_streaming_callsites_pass_is_client_requester_true() {
+        let src = production_source();
+        // Client driver InlineFound arm.
+        let drive_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        let drive_call_pos = drive_body
+            .find("cache_contract_locally(")
+            .expect("client driver must cache_contract_locally on InlineFound");
+        let drive_window =
+            &drive_body[drive_call_pos..(drive_call_pos + 400).min(drive_body.len())];
+        let drive_normalized: String = drive_window
+            .chars()
+            .take_while(|&c| c != ';')
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            drive_normalized.contains("true"),
+            "Client driver's cache_contract_locally call must pass `true` for \
+             is_client_requester (this node initiated the GET). Call window: \
+             {drive_window}"
+        );
+        // Streaming assembly.
+        let stream_body = extract_fn_body(src, "async fn assemble_and_cache_stream(");
+        let stream_call_pos = stream_body
+            .find("cache_contract_locally(")
+            .expect("assemble_and_cache_stream must cache_contract_locally");
+        let stream_window =
+            &stream_body[stream_call_pos..(stream_call_pos + 400).min(stream_body.len())];
+        let stream_normalized: String = stream_window
+            .chars()
+            .take_while(|&c| c != ';')
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            stream_normalized.contains("true"),
+            "assemble_and_cache_stream must pass `true` for is_client_requester \
+             (stream is only claimed by the client-originating driver). Call \
+             window: {stream_window}"
+        );
+    }
+
+    /// Docstring-level guard: the legacy-mirror references in
+    /// `cache_contract_locally`'s docstring (`get.rs:2260-2262, :2353-2355,
+    /// :3056-3058`) name the three legacy sites where the
+    /// `is_original_requester` gate lives. If those line numbers ever stop
+    /// referring to `mark_local_client_access` call sites, the docstring
+    /// has rotted and future maintenance may miss the invariant.
+    ///
+    /// This test anchors on the function-name reference rather than the
+    /// line numbers themselves (line numbers drift on unrelated edits) —
+    /// it just verifies the docstring still cites the function by name so
+    /// readers can grep for it.
+    #[test]
+    fn cache_contract_locally_docstring_cites_legacy_mirror() {
+        let src = production_source();
+        let fn_pos = src
+            .find("async fn cache_contract_locally(")
+            .expect("cache_contract_locally must exist");
+        // Look in the 1500 chars before the fn for the docstring.
+        let window_start = fn_pos.saturating_sub(1500);
+        let window = &src[window_start..fn_pos];
+        assert!(
+            window.contains("is_client_requester"),
+            "cache_contract_locally docstring must describe the \
+             is_client_requester parameter so callers know which value to pass."
+        );
+        assert!(
+            window.contains("mark_local_client_access"),
+            "cache_contract_locally docstring must name the legacy call \
+             (`mark_local_client_access`) it gates on is_client_requester."
         );
     }
 
