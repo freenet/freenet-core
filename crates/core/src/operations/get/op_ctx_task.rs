@@ -85,6 +85,16 @@ use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT}
 pub static DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only counter that increments every time `start_relay_get` is
+/// called. Used by integration tests to verify that relay dispatch
+/// actually routed a fresh inbound Request through the task-per-tx
+/// driver (and not through the legacy `handle_op_request` path that
+/// continues to serve originator loop-back, GC-spawned retries, and
+/// `start_targeted_op` UPDATE-triggered auto-fetches).
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Start a client-initiated GET, returning as soon as the task has been
 /// spawned (mirrors legacy `request_get` timing).
 ///
@@ -1012,6 +1022,14 @@ pub(crate) async fn start_relay_get(
     fetch_contract: bool,
     subscribe: bool,
 ) -> Result<(), OpError> {
+    // Test-only: count relay driver invocations so regression tests can
+    // assert the dispatch gate in node.rs actually routed a fresh inbound
+    // Request through the task-per-tx driver rather than the legacy
+    // `handle_op_request` fallthrough (phase-3b loopback, GC retries,
+    // `start_targeted_op`).
+    #[cfg(any(test, feature = "testing"))]
+    RELAY_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     tracing::debug!(
         tx = %incoming_tx,
         %instance_id,
@@ -2297,6 +2315,639 @@ mod tests {
             "start_relay_get must NOT be annotated with #[allow(dead_code)] in commit 2 \
              — the driver is now live (wired in node.rs dispatch). Remove the attribute \
              to keep dead-code warnings effective."
+        );
+    }
+
+    // ── Coverage-gap tests for PR #3896 (follow-up to T1-T9) ────────────────
+    //
+    // The T1-T9 suite above covers top-level structural ordering (guard-before-
+    // loop, cache-before-send, ack-before-request, etc). The tests below
+    // cover the behavioral contracts T1-T9 do NOT pin:
+    //
+    //   - G1/G2: dispatch gates in node.rs (source_addr=None loopback and
+    //     has_get_op=true both fall through to legacy)
+    //   - A   : HTL=0 emits NotFound upstream frame (not just logs-and-
+    //     returns)
+    //   - G/R10: downstream NotFound → exhaustion path; stale-cache
+    //     fallback answers Found instead of NotFound when local state
+    //     exists but interest is absent
+    //   - R7  : ForwardingAck emitted exactly once, not per retry
+    //   - R8  : wire-side Request propagation carries htl-1 and
+    //     updated visited bloom
+    //   - R12a→R13: send_found failure → compensating NotFound in outer
+    //     `drive_relay_get` error funnel
+    //   - R12b: streaming-downstream currently WARN+continue (regression
+    //     guard until follow-up PR migrates streaming relay)
+    //   - N   : concurrent same-key GET: gate condition at dispatch is
+    //     per-tx (has_get_op), NOT per-key (by design; documented)
+    //
+    // All tests below are source-scrape style to match the T1-T9 shape —
+    // they catch accidental code reorders or deletions without needing a
+    // full turmoil harness. Behavioral coverage for the happy path is
+    // already provided by `test_get_routing_coverage_low_htl` and
+    // `test_get_reliability_*` (nightly).
+
+    // ── G1/G2: Dispatch gates live in node.rs ────────────────────────────
+
+    /// G1: `source_addr.is_none()` (originator loopback from the phase-3b
+    /// client driver's `send_and_await(target=None)`) MUST NOT be routed
+    /// to the relay driver. The dispatch site in `node.rs` must check
+    /// `source_addr.is_some()` before calling `start_relay_get`; otherwise
+    /// the client driver's `Terminal::LocalCompletion` Request-echo contract
+    /// breaks and client-initiated GETs either hang or deadlock.
+    #[test]
+    fn dispatch_gate_loopback_source_addr_none_uses_legacy() {
+        const NODE_RS: &str = include_str!("../../node.rs");
+        let dispatch_start = NODE_RS
+            .find("// #1454 phase 5 / #3883: relay GET task-per-tx dispatch.")
+            .expect("relay dispatch comment anchor must exist in node.rs");
+        let dispatch_end = NODE_RS[dispatch_start..]
+            .find("let op_result = handle_op_request::<get::GetOp, _>")
+            .expect("legacy fallthrough anchor must follow relay dispatch");
+        let block = &NODE_RS[dispatch_start..dispatch_start + dispatch_end];
+        assert!(
+            block.contains("if let Some(upstream_addr) = source_addr"),
+            "Relay dispatch block must gate on `source_addr.is_some()` so that \
+             originator loopback (source_addr=None from phase-3b client driver) \
+             falls through to the legacy `handle_op_request` path. Without this \
+             gate, the Request-echo contract `drive_client_get_inner::classify` \
+             relies on for Terminal::LocalCompletion breaks. See port plan §2."
+        );
+    }
+
+    /// G2: `has_get_op(id) == true` (GC-spawned retries, `start_targeted_op`
+    /// UPDATE auto-fetch) MUST NOT be routed to the relay driver. Those
+    /// callers register a `GetOp` in `OpManager.ops.get` BEFORE the
+    /// Request hits the wire and rely on the legacy `process_message`
+    /// re-entry loop for their state machine. The dispatch site in
+    /// `node.rs` must check `!op_manager.has_get_op(id)` before calling
+    /// `start_relay_get`.
+    #[test]
+    fn dispatch_gate_existing_get_op_uses_legacy() {
+        const NODE_RS: &str = include_str!("../../node.rs");
+        let dispatch_start = NODE_RS
+            .find("// #1454 phase 5 / #3883: relay GET task-per-tx dispatch.")
+            .expect("relay dispatch comment anchor must exist in node.rs");
+        let dispatch_end = NODE_RS[dispatch_start..]
+            .find("let op_result = handle_op_request::<get::GetOp, _>")
+            .expect("legacy fallthrough anchor must follow relay dispatch");
+        let block = &NODE_RS[dispatch_start..dispatch_start + dispatch_end];
+        assert!(
+            block.contains("!op_manager.has_get_op(id)"),
+            "Relay dispatch block must gate on `!op_manager.has_get_op(id)` so that \
+             GC-spawned retries and `start_targeted_op` (UPDATE auto-fetch) continue \
+             through the legacy `handle_op_request` path. Without this gate, the \
+             relay driver would hijack transactions the legacy state machine owns."
+        );
+    }
+
+    /// G3 (companion): the dispatch block must sit AFTER the
+    /// `try_forward_task_per_tx_reply` bypass (phase-3b terminal forward)
+    /// and BEFORE the legacy `handle_op_request` call, so that:
+    ///   - terminal Response/ResponseStreaming from phase-3b client driver
+    ///     get forwarded to its pending callback, NOT handed to the relay
+    ///     driver (which would spawn a spurious task);
+    ///   - legacy handling still runs for the loopback / has_get_op gated
+    ///     fall-through cases.
+    #[test]
+    fn dispatch_gate_ordering_bypass_before_relay_before_legacy() {
+        const NODE_RS: &str = include_str!("../../node.rs");
+        let get_arm = NODE_RS
+            .find("NetMessageV1::Get(ref op) => {")
+            .expect("Get arm must exist in handle_pure_network_message_v1");
+        let tail = &NODE_RS[get_arm..];
+        let bypass_pos = tail
+            .find("try_forward_task_per_tx_reply")
+            .expect("phase-3b bypass must exist in Get arm");
+        let relay_pos = tail
+            .find("get::op_ctx_task::start_relay_get")
+            .expect("phase-5 relay dispatch must exist in Get arm");
+        let legacy_pos = tail
+            .find("handle_op_request::<get::GetOp, _>")
+            .expect("legacy fallthrough must exist in Get arm");
+        assert!(
+            bypass_pos < relay_pos && relay_pos < legacy_pos,
+            "Dispatch ordering in the Get arm must be: \
+             try_forward_task_per_tx_reply (phase-3b terminal bypass) \
+             THEN start_relay_get (phase-5 relay dispatch) \
+             THEN handle_op_request (legacy loopback + has_get_op fallthrough). \
+             Got bypass={bypass_pos}, relay={relay_pos}, legacy={legacy_pos}."
+        );
+    }
+
+    // ── A: HTL=0 actually sends a NotFound frame upstream ──────────────────
+
+    /// The HTL=0 short-circuit in `drive_relay_get_inner` must call
+    /// `relay_send_not_found(..., upstream_addr)` (not just log+return).
+    /// If this frame isn't emitted, the upstream peer waits for the full
+    /// `OPERATION_TTL` (60s) instead of seeing a fast NotFound — a
+    /// regression would show up as slow tail-latency under HTL-pressure,
+    /// not as a functional failure.
+    #[test]
+    fn htl_zero_guard_emits_not_found_upstream_frame() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        // Isolate the `if htl == 0 { ... }` block (before the retry loop).
+        let guard_start = body.find("if htl == 0").expect("htl==0 guard must exist");
+        let after_guard = &body[guard_start..];
+        // Closing brace of the guard block — walk until depth returns to 0.
+        let body_open = after_guard
+            .find('{')
+            .expect("htl==0 guard must have a body");
+        let bytes = after_guard.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_open + 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let guard_block = &after_guard[body_open..i];
+        assert!(
+            guard_block.contains("relay_send_not_found"),
+            "HTL=0 guard block must call `relay_send_not_found(...)` so the \
+             upstream gets a prompt NotFound frame instead of hanging until \
+             OPERATION_TTL. Guard body was: {guard_block}"
+        );
+        assert!(
+            guard_block.contains("upstream_addr"),
+            "HTL=0 NotFound must be sent to `upstream_addr`, not any other \
+             peer. Guard body was: {guard_block}"
+        );
+        assert!(
+            guard_block.contains("return Ok(())"),
+            "HTL=0 guard must return early after sending NotFound; otherwise \
+             execution would fall into the retry loop with htl=0."
+        );
+    }
+
+    // ── G/R10: Exhaustion path — NotFound vs stale-cache fallback ──────────
+
+    /// Exhaustion (None from `relay_advance_to_next_peer`) must branch on
+    /// `local_fallback`: with stale local state, serve Found from that
+    /// state (R10); without, send NotFound (G/R11). A regression where
+    /// both branches send NotFound silently loses availability for stale-
+    /// cache relays (they would forward then lose the fallback even though
+    /// they still hold the state locally).
+    #[test]
+    fn exhaustion_branches_on_local_fallback_presence() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        // The None arm of the `match relay_advance_to_next_peer(...)` is the
+        // exhaustion branch. It must contain both `local_fallback` disposition
+        // AND both Found and NotFound sends.
+        let none_arm = body
+            .find("None => {")
+            .expect("exhaustion arm (`None => {{`) must exist");
+        // Clip to the matching close; the next `Some(p) => {` arm may precede
+        // or follow, so take the whole match body from None onward up to the
+        // end of the outer function block.
+        let tail = &body[none_arm..];
+        // Bound at the `return Ok(());` that ends the exhaustion branch.
+        let clip = tail
+            .find("return Ok(());")
+            .expect("exhaustion branch must end with `return Ok(());`");
+        let arm = &tail[..clip + "return Ok(());".len()];
+        assert!(
+            arm.contains("if let Some((key, state, contract)) = local_fallback"),
+            "Exhaustion arm must branch on `local_fallback`; otherwise the \
+             stale-cache fallback semantic (R3d → R10) is lost."
+        );
+        assert!(
+            arm.contains("relay_send_found"),
+            "Exhaustion arm must call `relay_send_found` when `local_fallback` \
+             is Some — the stale-cache relay serves what it has after all \
+             downstream peers NotFound."
+        );
+        assert!(
+            arm.contains("relay_send_not_found"),
+            "Exhaustion arm must call `relay_send_not_found` when \
+             `local_fallback` is None — the non-caching relay bubbles \
+             NotFound upstream."
+        );
+        // Ordering: the `else` branch (NotFound) must follow the `if Some`
+        // branch (Found).
+        let found_pos = arm.find("relay_send_found").unwrap();
+        let not_found_pos = arm.find("relay_send_not_found").unwrap();
+        assert!(
+            found_pos < not_found_pos,
+            "Fallback-Found must precede NotFound in the exhaustion arm \
+             source order; a reversal would mean NotFound always runs first \
+             and the fallback path is dead code."
+        );
+    }
+
+    /// `check_local_with_interest_gate` must return the local state in
+    /// the fallback slot (not `local_value`) when the relay holds state
+    /// but `has_local_interest` is false. This locks down the interest
+    /// gate: hosting relays serve immediately, stale-cache relays defer
+    /// to the network and hold local state as a fallback.
+    #[test]
+    fn interest_gate_returns_fallback_when_not_actively_hosting() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn check_local_with_interest_gate(");
+        // The interest-gated branch structure must be:
+        //   if !has_local_interest(&key) {
+        //     (None, Some((key, state, contract)))
+        //   } else {
+        //     (Some((key, state, contract)), None)
+        //   }
+        let neg_gate = body
+            .find("if !op_manager.interest_manager.has_local_interest(&key)")
+            .expect("interest gate must check `!has_local_interest` branch explicitly");
+        let tail = &body[neg_gate..];
+        let stale_pos = tail.find("(None, Some(").expect("stale branch must exist");
+        let active_pos = tail.find("(Some(").expect("active branch must exist");
+        // active branch (Some(...), None) must come AFTER the stale branch in
+        // the `else` arm.
+        assert!(
+            stale_pos < active_pos,
+            "`if !has_local_interest` arm (stale → fallback slot) must appear \
+             before the `else` arm (active → local_value slot) in source order."
+        );
+    }
+
+    // ── R7: ForwardingAck emitted exactly once across retries ──────────────
+
+    /// The `sent_forwarding_ack` latch must be:
+    ///   - Initialized to `false` BEFORE the retry loop
+    ///   - Checked with `if !sent_forwarding_ack` inside the loop
+    ///   - Flipped to `true` after the first `relay_send_forwarding_ack` call
+    ///
+    /// If any of these are missing, the ForwardingAck either fires per-retry
+    /// (upstream sees N acks, unnecessary traffic) or never fires (upstream
+    /// times out the op after its own OPERATION_TTL).
+    #[test]
+    fn forwarding_ack_latched_and_sent_exactly_once() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let latch_init = body
+            .find("let mut sent_forwarding_ack = false;")
+            .expect("`let mut sent_forwarding_ack = false;` must precede the retry loop");
+        let loop_start = body.find("loop {").expect("retry loop must exist");
+        assert!(
+            latch_init < loop_start,
+            "`sent_forwarding_ack` latch must be initialized OUTSIDE the \
+             retry loop; initializing it inside would reset each iteration \
+             and cause the ack to fire on every retry."
+        );
+        // Inside the loop, the gate and the flip must both be present.
+        let loop_body = &body[loop_start..];
+        assert!(
+            loop_body.contains("if !sent_forwarding_ack {"),
+            "Retry loop must gate the ForwardingAck send on \
+             `if !sent_forwarding_ack` so it fires exactly once per relay \
+             invocation."
+        );
+        assert!(
+            loop_body.contains("sent_forwarding_ack = true;"),
+            "The ForwardingAck gate must flip `sent_forwarding_ack = true` \
+             after sending; otherwise the gate is never satisfied and the \
+             ack fires on every retry."
+        );
+        // Ordering: the gate check must appear before the flip in the loop
+        // body, and the flip must follow the `relay_send_forwarding_ack`
+        // call.
+        let gate_pos = loop_body.find("if !sent_forwarding_ack {").unwrap();
+        let ack_pos = loop_body
+            .find("relay_send_forwarding_ack")
+            .expect("relay_send_forwarding_ack must be called in loop");
+        let flip_pos = loop_body.find("sent_forwarding_ack = true;").unwrap();
+        assert!(
+            gate_pos < ack_pos && ack_pos < flip_pos,
+            "Loop body order must be: gate check → ack send → flip latch. \
+             Got gate={gate_pos}, ack={ack_pos}, flip={flip_pos}."
+        );
+    }
+
+    // ── R8: Wire-side Request propagation (htl-1 + updated visited) ────────
+
+    /// Each retry iteration must build a downstream `GetMsg::Request` with:
+    ///   - `htl: new_htl` where `new_htl = htl.saturating_sub(1)`
+    ///   - `visited: new_visited.clone()` (the bloom filter containing
+    ///     own_addr and upstream_addr plus the caller's skip set)
+    ///   - `id: attempt_tx` (fresh per-iteration tx, not `incoming_tx`)
+    ///
+    /// Without per-iteration `attempt_tx`, the single-use-per-tx invariant
+    /// for `send_and_await` is violated. Without `new_visited.clone()` the
+    /// downstream relay's skip list is missing upstream hops, leading to
+    /// loop formation.
+    #[test]
+    fn forwarded_request_decrements_htl_and_propagates_visited() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        // The forwarded Request must be built with the decremented HTL.
+        assert!(
+            body.contains("let new_htl = htl.saturating_sub(1);"),
+            "Retry loop must compute `new_htl = htl.saturating_sub(1)` so \
+             the forwarded Request carries one-less HTL — otherwise the \
+             downstream relay would forward with the same HTL and loops \
+             could form."
+        );
+        // The forwarded Request body must thread `new_htl` and `new_visited`.
+        let request_build = body
+            .find("NetMessage::from(GetMsg::Request")
+            .expect("retry loop must build the forwarded GetMsg::Request");
+        // Take the next ~400 chars after the `GetMsg::Request {` opening as
+        // the struct-literal window.
+        let window = &body[request_build..(request_build + 400).min(body.len())];
+        assert!(
+            window.contains("htl: new_htl"),
+            "Forwarded GetMsg::Request must set `htl: new_htl` (not `htl`) so \
+             the decremented value actually propagates on the wire. Window: {window}"
+        );
+        assert!(
+            window.contains("visited: new_visited.clone()"),
+            "Forwarded GetMsg::Request must set `visited: new_visited.clone()` \
+             so the downstream sees the updated skip set — without this, \
+             the downstream could forward back to peers the upstream already \
+             tried, forming routing loops. Window: {window}"
+        );
+        assert!(
+            window.contains("id: attempt_tx"),
+            "Forwarded GetMsg::Request must set `id: attempt_tx` (fresh \
+             per-iteration Transaction), not `incoming_tx`; send_and_await \
+             requires single-use-per-tx."
+        );
+    }
+
+    /// The `new_visited` bloom filter must be seeded with `own_addr` and
+    /// `upstream_addr` BEFORE the retry loop runs, so
+    /// `k_closest_potentially_hosting` can't select the upstream (loop) or
+    /// this peer (self-forward). Regression risk: if either mark is
+    /// missing, routing may loop back immediately.
+    #[test]
+    fn visited_bloom_seeded_with_own_and_upstream_before_loop() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let loop_start = body.find("loop {").expect("retry loop must exist");
+        let pre_loop = &body[..loop_start];
+        assert!(
+            pre_loop.contains("new_visited.mark_visited(upstream_addr);"),
+            "`new_visited.mark_visited(upstream_addr)` must run BEFORE the \
+             retry loop so downstream routing can't immediately hand back \
+             to upstream."
+        );
+        // own_addr is guarded by `if let Some(...)` so check for the mark call.
+        assert!(
+            pre_loop.contains("new_visited.mark_visited(own_addr);"),
+            "`new_visited.mark_visited(own_addr)` must run BEFORE the retry \
+             loop so we don't route back to ourselves."
+        );
+    }
+
+    // ── R12a→R13: send_found failure → compensating NotFound ───────────────
+
+    /// When `relay_send_found` fails (serialization or transport error
+    /// surfaced as `OpError::NotificationError`), the `?` propagation in
+    /// `drive_relay_get_inner` surfaces the error to `drive_relay_get`,
+    /// which must catch it and send a compensating NotFound upstream —
+    /// otherwise the upstream waits for the full OPERATION_TTL on an op
+    /// the relay has already abandoned.
+    #[test]
+    fn drive_relay_get_sends_compensating_not_found_on_inner_err() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get(");
+        // Expected shape:
+        //   match drive_relay_get_inner(...).await {
+        //     Ok(()) => Ok(()),
+        //     Err(err) => {
+        //       tracing::warn!(...);
+        //       relay_send_not_found(...).await;
+        //       Err(err)
+        //     }
+        //   }
+        let err_arm = body
+            .find("Err(err) =>")
+            .expect("drive_relay_get must have an Err arm");
+        let tail = &body[err_arm..];
+        assert!(
+            tail.contains("relay_send_not_found"),
+            "`drive_relay_get` Err arm must call `relay_send_not_found` so \
+             that an inner infrastructure error (including `relay_send_found` \
+             failures surfaced via `?`) produces a compensating NotFound \
+             upstream instead of a silent 60s upstream timeout."
+        );
+        assert!(
+            tail.contains("upstream_addr"),
+            "The compensating NotFound in `drive_relay_get` must target \
+             `upstream_addr`, not any other peer."
+        );
+        assert!(
+            tail.contains("Err(err)"),
+            "`drive_relay_get` Err arm must re-raise `Err(err)` after \
+             sending the compensating NotFound, so `run_relay_get`'s \
+             infra-error log still fires."
+        );
+    }
+
+    /// `relay_send_found` must map fire-and-forget send failures to
+    /// `OpError::NotificationError` so the `?` in `drive_relay_get_inner`
+    /// surfaces them to the outer error funnel. A `?` on an `Ok` unit
+    /// type would be a dead propagation; a non-OpError return would
+    /// break the error funnel.
+    #[test]
+    fn relay_send_found_maps_send_failure_to_op_error() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn relay_send_found(");
+        assert!(
+            body.contains("map_err(|_| OpError::NotificationError)"),
+            "`relay_send_found` must map fire-and-forget send errors to \
+             `OpError::NotificationError` so `?` surfaces them to the outer \
+             `drive_relay_get` error funnel and triggers the compensating \
+             NotFound."
+        );
+    }
+
+    // ── R12b: Streaming-downstream WARN+continue regression guard ──────────
+
+    /// Relay streaming-forward migration is deferred to a follow-up PR
+    /// (port plan §7). Until then, a downstream `ResponseStreaming` reply
+    /// must be handled by the `Terminal::Streaming { .. }` arm with
+    /// `continue;` semantics — NOT piped through to the upstream. A
+    /// regression that either claims the stream (breaking phase-5 scope)
+    /// or panics (breaking availability when any downstream peer happens
+    /// to own a large contract) is caught here.
+    #[test]
+    fn streaming_downstream_is_currently_warned_and_skipped() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let streaming_arm_start = body
+            .find("AttemptOutcome::Terminal(Terminal::Streaming { .. })")
+            .expect("Streaming arm must exist in relay driver");
+        let tail = &body[streaming_arm_start..];
+        // Bound at the next arm start.
+        let clip = tail[1..]
+            .find("AttemptOutcome::")
+            .map(|p| p + 1)
+            .unwrap_or(tail.len());
+        let arm = &tail[..clip];
+        assert!(
+            arm.contains("continue;"),
+            "Streaming arm must `continue;` to try the next peer — streaming \
+             relay forwarding is out of scope for #3883 (see port plan §7). \
+             A future PR will replace this with a proper chunk pipe-through."
+        );
+        assert!(
+            arm.contains("new_visited.mark_visited(peer_addr)"),
+            "Streaming arm must mark the streaming peer as visited so the \
+             retry loop doesn't re-select it next iteration."
+        );
+        assert!(
+            !arm.contains("relay_send_found"),
+            "Streaming arm must NOT call `relay_send_found` — doing so \
+             without the chunk payload would send a Found frame with \
+             `state: None` (Unexpected at the upstream classify). See R12b \
+             gap in port plan risk register."
+        );
+        assert!(
+            !arm.contains("orphan_stream_registry"),
+            "Streaming arm must NOT claim the stream via \
+             `orphan_stream_registry` — that's the migrated behavior for a \
+             follow-up PR. Doing it here without the upstream pipe would \
+             leak stream state."
+        );
+    }
+
+    // ── R9: send_and_await Err/timeout outcomes advance to next peer ───────
+
+    /// Both `Ok(Err(..))` (channel error / event loop gone) and
+    /// `Err(Elapsed)` (timeout) arms of the `tokio::time::timeout` wrapper
+    /// must:
+    ///   - mark the failed peer with `new_visited.mark_visited(peer_addr)`
+    ///   - `continue` to the next loop iteration
+    ///
+    /// A regression where either arm `break`s or `return Err(...)`s would
+    /// abandon remaining candidates and send a premature NotFound.
+    #[test]
+    fn send_and_await_failure_arms_continue_to_next_peer() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        // Match on the outer `round_trip` match arms.
+        let round_trip = body
+            .find("let reply = match round_trip {")
+            .expect("round_trip match must exist");
+        let tail = &body[round_trip..];
+        // Clip at the end of the match (next `match classify(reply)`).
+        let clip = tail
+            .find("match classify(reply)")
+            .expect("classify match must follow round_trip match");
+        let match_body = &tail[..clip];
+        // Channel-error arm: `Ok(Err(err)) => { ... continue; }`.
+        let err_arm = match_body
+            .find("Ok(Err(err)) =>")
+            .expect("channel-error arm must exist");
+        let err_tail = &match_body[err_arm..];
+        let err_arm_end = err_tail
+            .find("Err(_elapsed) =>")
+            .expect("timeout arm must follow channel-error arm");
+        let err_block = &err_tail[..err_arm_end];
+        assert!(
+            err_block.contains("continue;"),
+            "`Ok(Err(_))` arm must `continue;` so the loop tries the next \
+             peer. A regression that returns or breaks here would abandon \
+             remaining candidates."
+        );
+        assert!(
+            err_block.contains("mark_visited(peer_addr)"),
+            "`Ok(Err(_))` arm must mark the failing peer as visited so the \
+             next `relay_advance_to_next_peer` call doesn't re-select it."
+        );
+        // Timeout arm.
+        let timeout_arm = match_body
+            .find("Err(_elapsed) =>")
+            .expect("timeout arm must exist");
+        let timeout_tail = &match_body[timeout_arm..];
+        // Clip at the end of the match block.
+        let timeout_end = timeout_tail.rfind("};").unwrap_or(timeout_tail.len());
+        let timeout_block = &timeout_tail[..timeout_end];
+        assert!(
+            timeout_block.contains("continue;"),
+            "`Err(_elapsed)` (timeout) arm must `continue;` so the loop \
+             tries the next peer. A regression that returns here would \
+             mean any slow peer permanently blocks the relay."
+        );
+        assert!(
+            timeout_block.contains("mark_visited(peer_addr)"),
+            "`Err(_elapsed)` (timeout) arm must mark the timing-out peer \
+             as visited; otherwise the retry loop might re-select it and \
+             time out again."
+        );
+    }
+
+    // ── N: Concurrent same-key GET — dispatch gate is per-tx, not per-key ──
+
+    /// The dispatch gate in `node.rs` is `!op_manager.has_get_op(id)` —
+    /// keyed on the transaction id, NOT the contract key/instance. This
+    /// means two concurrent relay GETs for the *same* contract (from
+    /// different upstreams) each get their own driver task, each its
+    /// own `incoming_tx`. This is intentional: each upstream expects a
+    /// reply on its own tx, so per-tx independence preserves the
+    /// upstream-reply invariant. Per-key dedup would break it.
+    ///
+    /// This test pins the documented semantic so a well-meaning "add
+    /// per-key dedup" refactor can't silently land.
+    #[test]
+    fn dispatch_gate_is_per_transaction_not_per_contract() {
+        const NODE_RS: &str = include_str!("../../node.rs");
+        let dispatch_start = NODE_RS
+            .find("// #1454 phase 5 / #3883: relay GET task-per-tx dispatch.")
+            .expect("relay dispatch comment anchor must exist in node.rs");
+        let dispatch_end = NODE_RS[dispatch_start..]
+            .find("let op_result = handle_op_request::<get::GetOp, _>")
+            .expect("legacy fallthrough anchor must follow relay dispatch");
+        let block = &NODE_RS[dispatch_start..dispatch_start + dispatch_end];
+        assert!(
+            block.contains("has_get_op(id)"),
+            "Dispatch gate must be keyed on `has_get_op(id)` (per-transaction), \
+             not `instance_id` / contract key (per-key). Per-key dedup would \
+             break the upstream-reply invariant: two upstreams GETting the \
+             same contract need independent replies, each on its own tx."
+        );
+        // Negative: no contract-key dedup construct in the dispatch block.
+        assert!(
+            !block.contains("has_get_op(instance_id)")
+                && !block.contains("has_get_op(contract_id)"),
+            "Dispatch block must not gate on contract key (per-key dedup). \
+             Found a suspicious has_get_op variant: {block}"
+        );
+    }
+
+    // ── Counter: relay driver call count is wired ──────────────────────────
+
+    /// The `RELAY_DRIVER_CALL_COUNT` test counter must be incremented at
+    /// the top of `start_relay_get` under `#[cfg(any(test, feature =
+    /// "testing"))]`. Behavioral tests use this to assert the dispatch
+    /// gate routed a fresh inbound Request through the driver rather
+    /// than through the legacy fallthrough.
+    #[test]
+    fn relay_driver_call_count_incremented_on_entry() {
+        let src = production_source();
+        // Counter declaration must exist.
+        assert!(
+            src.contains("pub static RELAY_DRIVER_CALL_COUNT"),
+            "RELAY_DRIVER_CALL_COUNT static must be declared for behavioral \
+             tests to verify the dispatch gate routes through the relay driver."
+        );
+        // Increment must appear in the body of start_relay_get, under cfg.
+        let body = extract_fn_body(src, "pub(crate) async fn start_relay_get(");
+        assert!(
+            body.contains("RELAY_DRIVER_CALL_COUNT.fetch_add(1"),
+            "`start_relay_get` must increment `RELAY_DRIVER_CALL_COUNT` at \
+             entry so integration tests can assert dispatch-gate coverage."
+        );
+        // The increment must be cfg-gated to avoid shipping test code.
+        let counter_pos = body.find("RELAY_DRIVER_CALL_COUNT.fetch_add").unwrap();
+        // Walk back ~200 chars for the cfg attribute.
+        let pre = &body[counter_pos.saturating_sub(200)..counter_pos];
+        assert!(
+            pre.contains("#[cfg(any(test, feature = \"testing\"))]"),
+            "`RELAY_DRIVER_CALL_COUNT` increment must be gated behind \
+             `#[cfg(any(test, feature = \"testing\"))]` so it doesn't ship \
+             in release builds."
         );
     }
 }
