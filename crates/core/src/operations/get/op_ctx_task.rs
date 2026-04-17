@@ -1002,7 +1002,6 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 /// - GC-spawned retries.
 /// - `start_targeted_op` (UPDATE-triggered auto-fetch).
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // Dead until commit 2 wires dispatch in node.rs.
 pub(crate) async fn start_relay_get(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
@@ -2278,13 +2277,15 @@ mod tests {
         );
     }
 
-    /// T9: start_relay_get is pub(crate) and dead code until commit 2.
-    /// Source-scrape verifies the #[allow(dead_code)] attribute is present
-    /// so the compiler doesn't warn about the intentionally-dead driver.
+    /// T9 (commit 2 version): start_relay_get is now live — the #[allow(dead_code)]
+    /// attribute must have been removed when dispatch was wired in node.rs.
+    ///
+    /// This test replaces the commit-1 version that asserted the attribute WAS
+    /// present. Now it asserts the attribute is ABSENT so a future refactor can't
+    /// accidentally re-suppress the live driver with #[allow(dead_code)].
     #[test]
-    fn relay_entry_point_annotated_dead_code_for_commit1() {
+    fn relay_entry_point_no_longer_annotated_dead_code_after_commit2() {
         let src = production_source();
-        // Find start_relay_get and check that dead_code allow is near it.
         let fn_start = src
             .find("pub(crate) async fn start_relay_get(")
             .expect("start_relay_get must exist");
@@ -2292,9 +2293,10 @@ mod tests {
         let window_start = fn_start.saturating_sub(500);
         let window = &src[window_start..fn_start];
         assert!(
-            window.contains("dead_code"),
-            "start_relay_get must be annotated with #[allow(dead_code)] in commit 1 \
-             to suppress the compiler warning for the intentionally-dead driver"
+            !window.contains("#[allow(dead_code)]"),
+            "start_relay_get must NOT be annotated with #[allow(dead_code)] in commit 2 \
+             — the driver is now live (wired in node.rs dispatch). Remove the attribute \
+             to keep dead-code warnings effective."
         );
     }
 }

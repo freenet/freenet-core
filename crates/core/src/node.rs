@@ -1090,6 +1090,62 @@ where
                     return Ok(None);
                 }
 
+                // #1454 phase 5 / #3883: relay GET task-per-tx dispatch.
+                //
+                // For true relay hops (source_addr.is_some() AND incoming
+                // variant is GetMsg::Request AND no GetOp already exists in
+                // OpManager for this tx), spawn the relay driver and return.
+                // The driver owns routing, forwarding, retry, and upstream
+                // bubble-up in its task locals.
+                //
+                // source_addr.is_none() (originator loop-back from phase-3b
+                // client driver's send_and_await with target=None) falls
+                // through to the legacy path to preserve the Request-echo
+                // contract that drive_client_get_inner's `classify` relies on
+                // for Terminal::LocalCompletion.
+                //
+                // GC-spawned retries and start_targeted_op register a GetOp
+                // in OpManager before the Request hits the wire, so
+                // op_manager.has_get_op(id) returning true means this is not
+                // a fresh inbound relay call — fall through to legacy.
+                if let get::GetMsg::Request {
+                    id,
+                    instance_id,
+                    fetch_contract,
+                    htl,
+                    visited,
+                    subscribe,
+                } = op
+                {
+                    if let Some(upstream_addr) = source_addr {
+                        if !op_manager.has_get_op(id) {
+                            // True relay: no existing op, remote source, fresh
+                            // Request. Fire-and-forget spawn; driver publishes
+                            // its own upstream response.
+                            if let Err(err) = get::op_ctx_task::start_relay_get(
+                                op_manager.clone(),
+                                *id,
+                                *instance_id,
+                                *htl,
+                                upstream_addr,
+                                visited.clone(),
+                                *fetch_contract,
+                                *subscribe,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    %instance_id,
+                                    error = %err,
+                                    "GET relay dispatch: start_relay_get failed"
+                                );
+                            }
+                            return Ok(None);
+                        }
+                    }
+                }
+
                 let op_result = handle_op_request::<get::GetOp, _>(
                     &op_manager,
                     &mut conn_manager,
@@ -3354,6 +3410,117 @@ mod tests {
             assert!(
                 !taken,
                 "Response without callback → must fall through to legacy path"
+            );
+        }
+
+        // ───────────────────────────────────────────────────────────
+        // Regression guards for the GET branch of
+        // handle_pure_network_message_v1 added in #3883 (phase 5).
+        //
+        // The GET branch has two distinct dispatch layers:
+        //
+        //   1. Phase-3b bypass: terminal Response/ResponseStreaming for an
+        //      active client driver → try_forward_task_per_tx_reply (unchanged).
+        //
+        //   2. Relay dispatch (new in commit 2): GetMsg::Request with
+        //      source_addr.is_some() and no existing GetOp in OpManager →
+        //      start_relay_get (task-per-tx relay driver).
+        //
+        // Layer 1 is the same as PUT/SUBSCRIBE; the guards below cover
+        // layer 2 (source-literal, not runtime dispatch).
+        // ───────────────────────────────────────────────────────────
+
+        // Source-literal guard: verify the GET branch invokes
+        // try_forward_task_per_tx_reply before start_relay_get dispatch,
+        // gated on Response|ResponseStreaming only (phase-3b bypass).
+        #[test]
+        fn bypass_is_wired_into_get_branch_regression_guard() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            let get_branch_anchor = "NetMessageV1::Get(ref op) => {";
+            let branch_start = SOURCE.find(get_branch_anchor).expect(
+                "GET branch of handle_pure_network_message_v1 not found; \
+                 the match arm has been renamed or moved — update this regression guard",
+            );
+
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<get::GetOp, _>")
+                .expect("GET branch no longer calls handle_op_request — update guard")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+
+            // Phase-3b bypass must still be present (unchanged).
+            assert!(
+                window.contains("try_forward_task_per_tx_reply("),
+                "GET branch no longer calls try_forward_task_per_tx_reply \
+                 before handle_op_request. Phase-3b (#1454) bypass removed — restore it."
+            );
+
+            // Bypass must be gated on terminal variants only.
+            assert!(
+                window.contains("get::GetMsg::Response { .. }"),
+                "GET branch bypass is not gated on Response. \
+                 Non-terminal messages must NOT be forwarded to the task-per-tx channel."
+            );
+
+            assert!(
+                window.contains("get::GetMsg::ResponseStreaming { .. }"),
+                "GET branch bypass is not gated on ResponseStreaming. \
+                 Both terminal variants must be forwarded."
+            );
+
+            // Relay dispatch must call start_relay_get.
+            assert!(
+                window.contains("start_relay_get("),
+                "GET branch no longer calls start_relay_get for relay dispatch. \
+                 #3883 phase-5 relay dispatch was removed — restore it."
+            );
+
+            // Relay dispatch must be gated on source_addr (relay vs. loop-back).
+            assert!(
+                window.contains("source_addr"),
+                "GET branch relay dispatch is not gated on source_addr. \
+                 Originator loop-back (source_addr.is_none()) must fall through to legacy."
+            );
+
+            // Relay dispatch must guard on no existing GetOp (has_get_op).
+            assert!(
+                window.contains("has_get_op"),
+                "GET branch relay dispatch is not guarded by has_get_op. \
+                 GC-spawned retries must fall through to legacy handle_op_request."
+            );
+        }
+
+        // Source-literal guard: verify the GET branch wires
+        // try_forward_task_per_tx_reply before start_relay_get.
+        // (Ordering: phase-3b bypass comes first in source order.)
+        #[test]
+        fn get_branch_phase3b_bypass_precedes_relay_dispatch() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            let get_branch_anchor = "NetMessageV1::Get(ref op) => {";
+            let branch_start = SOURCE
+                .find(get_branch_anchor)
+                .expect("GET branch not found");
+
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<get::GetOp, _>")
+                .expect("GET branch no longer calls handle_op_request")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+
+            let bypass_pos = window
+                .find("try_forward_task_per_tx_reply(")
+                .expect("try_forward_task_per_tx_reply not found in GET branch");
+            let relay_pos = window
+                .find("start_relay_get(")
+                .expect("start_relay_get not found in GET branch");
+
+            assert!(
+                bypass_pos < relay_pos,
+                "Phase-3b bypass (try_forward_task_per_tx_reply) must appear \
+                 BEFORE relay dispatch (start_relay_get) in the GET branch. \
+                 Swapping order would break the client-driver terminal-reply fast path."
             );
         }
     }

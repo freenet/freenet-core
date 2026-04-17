@@ -976,6 +976,20 @@ impl OpManager {
         .await
     }
 
+    /// Returns `true` if there is an active `GetOp` stored in `OpManager.ops.get`
+    /// for the given transaction.
+    ///
+    /// Used by the relay GET dispatch in `node.rs` to distinguish a fresh inbound
+    /// relay request (no existing op → spawn the task-per-tx driver) from a
+    /// GC-spawned retry or `start_targeted_op` (existing op → fall through to the
+    /// legacy `handle_op_request` path).
+    ///
+    /// Does **not** check `completed` or `under_progress` — those are covered by
+    /// `pop` / `load_or_init`. This is a lightweight existence check only.
+    pub fn has_get_op(&self, id: &Transaction) -> bool {
+        self.ops.get.contains_key(id)
+    }
+
     pub fn completed(&self, id: Transaction) {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.under_progress.remove(&id);
@@ -3372,5 +3386,55 @@ mod tests {
         );
 
         GlobalSimulationTime::clear_time();
+    }
+
+    // ── has_get_op unit tests ─────────────────────────────────────────────
+    //
+    // `has_get_op` is a thin wrapper over `self.ops.get.contains_key`.
+    // Since `OpManager` requires complex infrastructure to construct in unit
+    // tests, we exercise the underlying `Ops::get` DashMap directly — the
+    // same pattern used by `remove_put_returns_false_for_missing_tx` above.
+    // The delegation in `has_get_op` is one line and trivially correct.
+
+    /// has_get_op returns false for an unknown transaction.
+    #[test]
+    fn has_get_op_returns_false_for_unknown_tx() {
+        let ops = Ops::default();
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        assert!(
+            !ops.get.contains_key(&tx),
+            "ops.get should not contain a never-inserted tx"
+        );
+    }
+
+    /// has_get_op returns true after a GetOp is inserted, and false once removed.
+    #[test]
+    fn has_get_op_returns_true_after_insert_false_after_remove() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let ops = Ops::default();
+        let instance_id = ContractInstanceId::new([0u8; 32]);
+        let get_op = crate::operations::get::start_op(instance_id, false, false, false);
+        let tx = get_op.id;
+
+        // Before insert: absent
+        assert!(
+            !ops.get.contains_key(&tx),
+            "ops.get should not contain tx before insertion"
+        );
+
+        // After insert: present
+        ops.get.insert(tx, get_op);
+        assert!(
+            ops.get.contains_key(&tx),
+            "ops.get should contain tx after insertion"
+        );
+
+        // After remove: absent again
+        ops.get.remove(&tx);
+        assert!(
+            !ops.get.contains_key(&tx),
+            "ops.get should not contain tx after removal"
+        );
     }
 }
