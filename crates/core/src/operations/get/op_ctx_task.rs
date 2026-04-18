@@ -1184,6 +1184,24 @@ async fn run_relay_get(
             "GET relay (task-per-tx): infrastructure error in driver"
         );
     }
+
+    // Release the per-tx `pending_op_results` slot at driver exit.
+    // `relay_send_found` / `relay_send_not_found` / the send_to_and_await
+    // in the retry loop all leave `pending_op_results[incoming_tx]`
+    // populated with an is_closed sender that would only be reclaimed
+    // by the 60s periodic sweep; sending `TransactionCompleted` now
+    // removes the entry immediately so `test_pending_op_results_bounded`
+    // stays under its leak ceiling.
+    //
+    // Yield first so any in-flight `send_fire_and_forget` has time to
+    // run through the event loop's `handle_op_execution` and actually
+    // INSERT into `pending_op_results`. `release_pending_op_slot` uses
+    // the higher-priority notification channel, so without the yield
+    // the TransactionCompleted arrives before the insert and the
+    // cleanup is a no-op (per the caveat in `OpCtx::send_fire_and_forget`
+    // docs).
+    tokio::task::yield_now().await;
+    op_manager.release_pending_op_slot(incoming_tx).await;
 }
 
 #[allow(clippy::too_many_arguments)]
