@@ -154,7 +154,15 @@ jobs:
           # child is the actual fdev process. Walk the pid tree rather
           # than relying on `pgrep -f` (which may match unrelated bash
           # subshells holding the same cmdline string in their env).
+          #
+          # Emit each sample to BOTH rss.csv AND stderr of this step.
+          # Stderr is captured by the GitHub Actions log — so even if
+          # the runner VM is OOM-killed before the Upload step can
+          # schedule (the pattern that keeps losing the sim-logs
+          # artifact), the partial RSS curve still lands in the CI log
+          # and we can grep it out post-hoc.
           echo "ts,rss_kb,vsz_kb,state" > sim-logs/rss.csv
+          echo "[rss-sampler] ts,rss_kb,vsz_kb,state" >&2
           while kill -0 "$SIM_PID" 2>/dev/null; do
             # First try: direct child of the timeout wrapper.
             FDEV_PID=$(pgrep -P "$SIM_PID" | head -1)
@@ -165,8 +173,9 @@ jobs:
             if [ -n "$FDEV_PID" ]; then
               read rss vsz st _ <<<"$(ps -o rss=,vsz=,stat= -p "$FDEV_PID" 2>/dev/null)"
               if [ -n "$rss" ]; then
-                printf '%s,%s,%s,%s\n' "$(date +%s)" "$rss" "$vsz" "$st" \
-                  >> sim-logs/rss.csv
+                line="$(date +%s),${rss},${vsz},${st}"
+                printf '%s\n' "$line" >> sim-logs/rss.csv
+                printf '[rss-sampler] %s\n' "$line" >&2
               fi
             fi
             sleep 1
