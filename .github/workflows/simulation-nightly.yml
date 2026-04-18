@@ -1,8 +1,11 @@
 name: Simulation Tests (Nightly)
 
 # Long-running and large-scale simulation tests too slow for PR CI.
-# Medium-scale fdev tests (50 nodes, fault tolerance, high latency, churn
-# resilience) now run in the main CI workflow. This workflow covers:
+# PR CI runs the smaller fault-loss / high-latency / churn sims in parallel;
+# this workflow covers:
+#   - Medium scale (46 nodes, 2000 events) — both the primary seed
+#     0xDEADBEEF and the alt seed 0xCAFEBABE, each in isolation so their
+#     ~5 GB RSS does not compete on the 16 GB runner
 #   - Nightly-gated nextest tests (1h virtual time, 250-contract scale)
 #   - Large scale (500 nodes, 10000 events)
 
@@ -78,8 +81,23 @@ jobs:
       - name: Build fdev
         run: cargo build -p fdev --release
 
+      # Medium scale, primary seed. Moved out of PR CI because running
+      # alongside the other fdev sims + nextest OOM-killed the
+      # ubicloud-standard-16 runner (~5 GB RSS × 4 concurrent sims >
+      # 16 GB). Runs in isolation here.
+      - name: Medium scale test (50 nodes, seed 0xDEADBEEF)
+        run: |
+          target/release/fdev test \
+            --name "nightly-medium-50" \
+            --seed 0xDEADBEEF \
+            --gateways 4 --nodes 46 --events 2000 \
+            --ring-max-htl 12 --max-connections 20 --min-connections 6 \
+            --latency-min 10 --latency-max 50 \
+            --min-success-rate 1.0 \
+            --print-summary --print-network-stats \
+            single-process
+
       # Medium scale with alternate seed (explores different code paths).
-      # The primary seed (0xDEADBEEF) runs in PR CI; this covers a second path.
       - name: Medium scale test (50 nodes, seed 0xCAFEBABE)
         run: |
           target/release/fdev test \

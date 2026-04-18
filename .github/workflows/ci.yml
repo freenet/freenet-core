@@ -487,23 +487,14 @@ jobs:
           # 8 minute cap per sim, SIGKILL 30s later if it refuses to die.
           # Background directly (no function) so $! refers to the actual child
           # of this shell, which `wait` can then reap.
-          {
-            echo "== $(date -u +%H:%M:%S) ci-medium-50 starting"
-            timeout --kill-after=30s 8m target/release/fdev test \
-              --name "ci-medium-50" \
-              --seed 0xDEADBEEF \
-              --gateways 4 --nodes 46 --events 2000 \
-              --ring-max-htl 12 --max-connections 20 --min-connections 6 \
-              --latency-min 10 --latency-max 50 \
-              --min-success-rate 1.0 \
-              --print-summary --print-network-stats \
-              single-process 2>&1
-            rc=$?
-            echo "== $(date -u +%H:%M:%S) ci-medium-50 done rc=${rc}"
-            exit $rc
-          } > sim-logs/ci-medium-50.log 2>&1 &
-          PID1=$!
-
+          #
+          # ci-medium-50 (46 nodes, 2000 events, seed 0xDEADBEEF) has been
+          # moved to simulation-nightly.yml: under concurrent load with the
+          # other three sims + nextest it pushed the ubicloud-standard-16
+          # runner past its 16 GB memory ceiling, producing silent OOM kills
+          # (exit 143) that masqueraded as test failures. Nightly covers the
+          # same scale via `nightly-medium-50-alt` (seed 0xCAFEBABE) and the
+          # 500-node large-scale run.
           {
             echo "== $(date -u +%H:%M:%S) ci-fault-loss starting"
             timeout --kill-after=30s 8m target/release/fdev test \
@@ -556,12 +547,11 @@ jobs:
           } > sim-logs/ci-churn-20.log 2>&1 &
           PID4=$!
 
-          echo "Started: nextest=$NEXTEST_PID medium=$PID1 fault=$PID2 latency=$PID3 churn=$PID4"
+          echo "Started: nextest=$NEXTEST_PID fault=$PID2 latency=$PID3 churn=$PID4"
 
           # Wait for all and fail if any failed
           FAILED=0
           wait $NEXTEST_PID || { echo "nextest FAILED"; FAILED=1; }
-          wait $PID1 || { echo "ci-medium-50 FAILED"; FAILED=1; }
           wait $PID2 || { echo "ci-fault-loss FAILED"; FAILED=1; }
           wait $PID3 || { echo "ci-high-latency FAILED"; FAILED=1; }
           wait $PID4 || { echo "ci-churn-20 FAILED"; FAILED=1; }
