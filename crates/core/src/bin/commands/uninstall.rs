@@ -37,7 +37,8 @@ impl UninstallCommand {
         // the binary in ~/.local/bin and they later ran `cargo install freenet`
         // which also dropped one in ~/.cargo/bin). Visiting only the directory
         // of the running executable leaves stale copies behind.
-        let install_dirs = get_install_dirs(None);
+        let env = RuntimeEnv::from_process();
+        let install_dirs = get_install_dirs(None, &env);
         let mut removed_any = false;
         for dir in &install_dirs {
             if !dir.exists() {
@@ -55,12 +56,8 @@ impl UninstallCommand {
         // drop binaries into shared dirs (~/.local/bin, ~/.cargo/bin) whose
         // parents belong to unrelated tools — don't touch those.
         #[cfg(target_os = "windows")]
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let bin_dir = PathBuf::from(local_app_data).join("Freenet").join("bin");
-            super::service::remove_dir_if_empty_pub(&bin_dir);
-            if let Some(parent) = bin_dir.parent() {
-                super::service::remove_dir_if_empty_pub(parent);
-            }
+        if let Some(ref local_app_data) = env.local_app_data {
+            collapse_windows_bin_tree(local_app_data);
         }
 
         // Summary
@@ -72,6 +69,32 @@ impl UninstallCommand {
         }
 
         Ok(())
+    }
+}
+
+/// Captures the process-environment values `get_install_dirs` needs. Pulling
+/// these out into a value-typed struct lets tests supply explicit inputs
+/// instead of mutating process-global env vars (which races with parallel
+/// `cargo test` threads — see #3905 testing review).
+#[derive(Debug, Clone, Default)]
+struct RuntimeEnv {
+    freenet_install_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+    current_exe_parent: Option<PathBuf>,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    local_app_data: Option<PathBuf>,
+}
+
+impl RuntimeEnv {
+    fn from_process() -> Self {
+        Self {
+            freenet_install_dir: std::env::var_os("FREENET_INSTALL_DIR").map(PathBuf::from),
+            home: dirs::home_dir(),
+            current_exe_parent: std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|p| p.to_path_buf())),
+            local_app_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        }
     }
 }
 
@@ -126,45 +149,60 @@ fn is_current_exe(path: &Path) -> bool {
 /// Get every directory that Freenet binaries may have been installed into,
 /// in no particular order (duplicates are removed).
 ///
-/// If `override_dir` or `FREENET_INSTALL_DIR` is set, only that location is
-/// returned — the caller has explicitly told us where to look. Otherwise we
-/// return the union of the install.sh default (`~/.local/bin`), the Cargo
-/// default (`~/.cargo/bin`), the Windows PowerShell installer default
-/// (`%LOCALAPPDATA%\Freenet\bin`), and the parent directory of the currently
-/// running executable.
-fn get_install_dirs(override_dir: Option<&Path>) -> Vec<PathBuf> {
+/// If `override_dir` or `env.freenet_install_dir` is non-empty, only that
+/// location is returned — the caller has explicitly told us where to look.
+/// Otherwise we return the union of the install.sh default (`~/.local/bin`),
+/// the Cargo default (`~/.cargo/bin`), the Windows PowerShell installer
+/// default (`%LOCALAPPDATA%\Freenet\bin`), and the parent directory of the
+/// currently running executable.
+fn get_install_dirs(override_dir: Option<&Path>, env: &RuntimeEnv) -> Vec<PathBuf> {
     if let Some(dir) = override_dir {
         return vec![dir.to_path_buf()];
     }
 
-    if let Ok(dir) = std::env::var("FREENET_INSTALL_DIR") {
-        return vec![PathBuf::from(dir)];
+    if let Some(dir) = env
+        .freenet_install_dir
+        .as_ref()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        return vec![dir.clone()];
     }
 
     let mut dirs: Vec<PathBuf> = Vec::new();
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            dirs.push(parent.to_path_buf());
-        }
+    if let Some(parent) = env.current_exe_parent.as_ref() {
+        dirs.push(parent.clone());
     }
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = env.home.as_ref() {
         dirs.push(home.join(".local/bin")); // install.sh default
         dirs.push(home.join(".cargo/bin")); // `cargo install freenet` default
     }
 
     #[cfg(target_os = "windows")]
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+    if let Some(local_app_data) = env.local_app_data.as_ref() {
         // install.ps1 default — not normally on PATH, so exe parent detection
         // misses it when the user ran a different `freenet.exe` (e.g. from a
         // crate install).
-        dirs.push(PathBuf::from(local_app_data).join("Freenet").join("bin"));
+        dirs.push(local_app_data.join("Freenet").join("bin"));
     }
 
     dirs.sort();
     dirs.dedup();
     dirs
+}
+
+/// On Windows, collapse `%LOCALAPPDATA%\Freenet\bin` and its enclosing
+/// `%LOCALAPPDATA%\Freenet\` folder if each is now empty. Extracted so the
+/// behavior is testable on any platform (unlike the caller, which is
+/// `#[cfg(target_os = "windows")]` and can't run in Linux CI).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn collapse_windows_bin_tree(local_app_data: &Path) {
+    let bin_dir = local_app_data.join("Freenet").join("bin");
+    super::service::remove_dir_if_empty_pub(&bin_dir);
+    if let Some(parent) = bin_dir.parent() {
+        super::service::remove_dir_if_empty_pub(parent);
+    }
 }
 
 /// Get the names of binaries to remove.
@@ -183,56 +221,99 @@ fn binary_names() -> &'static [&'static str] {
 mod tests {
     use super::*;
 
+    fn env_with(home: Option<&Path>, exe_parent: Option<&Path>) -> RuntimeEnv {
+        RuntimeEnv {
+            freenet_install_dir: None,
+            home: home.map(Path::to_path_buf),
+            current_exe_parent: exe_parent.map(Path::to_path_buf),
+            local_app_data: None,
+        }
+    }
+
     #[test]
     fn test_get_install_dirs_with_override() {
-        let dirs = get_install_dirs(Some(Path::new("/tmp/test-freenet")));
+        let env = env_with(Some(Path::new("/home/u")), Some(Path::new("/exe")));
+        let dirs = get_install_dirs(Some(Path::new("/tmp/test-freenet")), &env);
         assert_eq!(dirs, vec![PathBuf::from("/tmp/test-freenet")]);
     }
 
     #[test]
     fn test_get_install_dirs_without_override_includes_defaults() {
-        // Ensure the env var isn't leaking from another test.
-        // Safe: tests in this module run single-threaded via cargo test.
-        unsafe {
-            std::env::remove_var("FREENET_INSTALL_DIR");
-        }
+        let home = PathBuf::from("/home/u");
+        let exe_parent = PathBuf::from("/exe");
+        let env = env_with(Some(&home), Some(&exe_parent));
 
-        let dirs = get_install_dirs(None);
-        assert!(!dirs.is_empty(), "should always return at least exe parent");
-
-        // When $HOME is set, both user-local install dirs should appear.
-        if let Some(home) = dirs::home_dir() {
-            assert!(
-                dirs.contains(&home.join(".local/bin")),
-                "expected ~/.local/bin (install.sh default) in {dirs:?}",
-            );
-            assert!(
-                dirs.contains(&home.join(".cargo/bin")),
-                "expected ~/.cargo/bin (cargo install default) in {dirs:?}",
-            );
-        }
+        let dirs = get_install_dirs(None, &env);
+        assert!(dirs.contains(&home.join(".local/bin")), "{dirs:?}");
+        assert!(dirs.contains(&home.join(".cargo/bin")), "{dirs:?}");
+        assert!(dirs.contains(&exe_parent), "{dirs:?}");
     }
 
     #[test]
     fn test_get_install_dirs_env_var_takes_precedence() {
-        // Safe: tests in this module run single-threaded via cargo test.
-        unsafe {
-            std::env::set_var("FREENET_INSTALL_DIR", "/custom/path");
-        }
-        let dirs = get_install_dirs(None);
-        unsafe {
-            std::env::remove_var("FREENET_INSTALL_DIR");
-        }
+        let mut env = env_with(Some(Path::new("/home/u")), Some(Path::new("/exe")));
+        env.freenet_install_dir = Some(PathBuf::from("/custom/path"));
+
+        let dirs = get_install_dirs(None, &env);
+
         assert_eq!(dirs, vec![PathBuf::from("/custom/path")]);
     }
 
     #[test]
-    fn test_get_install_dirs_deduplicates() {
-        let dirs = get_install_dirs(None);
-        let mut sorted = dirs.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(dirs.len(), sorted.len(), "expected no duplicate entries");
+    fn test_get_install_dirs_empty_env_var_falls_through() {
+        // FREENET_INSTALL_DIR="" (explicitly empty) must not short-circuit
+        // to an empty PathBuf — that would collapse to the current dir and
+        // silently skip the defaults.
+        let mut env = env_with(Some(Path::new("/home/u")), None);
+        env.freenet_install_dir = Some(PathBuf::from(""));
+
+        let dirs = get_install_dirs(None, &env);
+
+        assert!(
+            dirs.contains(&PathBuf::from("/home/u/.local/bin")),
+            "empty env var should fall through to defaults, got {dirs:?}",
+        );
+        assert!(!dirs.contains(&PathBuf::from("")), "{dirs:?}");
+    }
+
+    #[test]
+    fn test_get_install_dirs_override_beats_env_var() {
+        // Explicit `override_dir` wins over `FREENET_INSTALL_DIR`.
+        let mut env = env_with(Some(Path::new("/home/u")), None);
+        env.freenet_install_dir = Some(PathBuf::from("/env/value"));
+
+        let dirs = get_install_dirs(Some(Path::new("/explicit/override")), &env);
+
+        assert_eq!(dirs, vec![PathBuf::from("/explicit/override")]);
+    }
+
+    #[test]
+    fn test_get_install_dirs_deduplicates_exe_parent_overlap() {
+        // If the running exe is already inside ~/.local/bin, both the
+        // exe-parent entry and the curl-installer-default entry resolve
+        // to the same path — make sure we only keep one copy.
+        let home = PathBuf::from("/home/u");
+        let exe_parent = home.join(".local/bin");
+        let env = env_with(Some(&home), Some(&exe_parent));
+
+        let dirs = get_install_dirs(None, &env);
+        let mut expected = dirs.clone();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(dirs.len(), expected.len(), "{dirs:?}");
+        let local_bin_count = dirs.iter().filter(|d| **d == exe_parent).count();
+        assert_eq!(local_bin_count, 1, "{dirs:?}");
+    }
+
+    #[test]
+    fn test_get_install_dirs_missing_home() {
+        // With no home directory available (e.g. chrooted environment), we
+        // still return something usable rather than an empty vec.
+        let env = env_with(None, Some(Path::new("/opt/freenet/bin")));
+
+        let dirs = get_install_dirs(None, &env);
+
+        assert_eq!(dirs, vec![PathBuf::from("/opt/freenet/bin")]);
     }
 
     #[test]
@@ -274,16 +355,73 @@ mod tests {
 
     #[test]
     fn test_remove_binaries_handles_partial_install() {
-        // A directory that contains freenet but not fdev (or vice versa)
-        // must not error — we're scanning multiple locations and may find
-        // only a subset of the binaries in any one of them.
+        // A directory that contains only `freenet` (not `fdev`) must not
+        // error. Importantly, we also assert that `fdev` is still absent
+        // afterward — we must NOT synthesize a file we didn't find.
         let tmp = tempfile::tempdir().unwrap();
         #[cfg(not(target_os = "windows"))]
-        std::fs::write(tmp.path().join("freenet"), b"fake").unwrap();
+        {
+            std::fs::write(tmp.path().join("freenet"), b"fake").unwrap();
+            let removed = remove_binaries(tmp.path()).unwrap();
+            assert_eq!(removed.len(), 1);
+            assert!(!tmp.path().join("freenet").exists());
+            assert!(!tmp.path().join("fdev").exists());
+        }
         #[cfg(target_os = "windows")]
-        std::fs::write(tmp.path().join("freenet.exe"), b"fake").unwrap();
+        {
+            std::fs::write(tmp.path().join("freenet.exe"), b"fake").unwrap();
+            let removed = remove_binaries(tmp.path()).unwrap();
+            assert_eq!(removed.len(), 1);
+            assert!(!tmp.path().join("freenet.exe").exists());
+            assert!(!tmp.path().join("fdev.exe").exists());
+        }
+    }
 
-        let removed = remove_binaries(tmp.path()).unwrap();
-        assert_eq!(removed.len(), 1);
+    #[test]
+    fn test_collapse_windows_bin_tree_removes_empty_tree() {
+        // Simulates the layout install.ps1 creates: `<LocalAppData>\Freenet\bin\`
+        // with both levels empty after our binary cleanup. Expected: both
+        // levels collapse, but the `<LocalAppData>` root is left alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let local_app_data = tmp.path();
+        let freenet = local_app_data.join("Freenet");
+        let bin = freenet.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        collapse_windows_bin_tree(local_app_data);
+
+        assert!(!bin.exists(), "bin should be gone");
+        assert!(!freenet.exists(), "Freenet parent should collapse");
+        assert!(local_app_data.exists(), "LocalAppData root must stay");
+    }
+
+    #[test]
+    fn test_collapse_windows_bin_tree_preserves_non_empty_sibling() {
+        // If another tool created `<LocalAppData>\Freenet\data\` (not us,
+        // but imagine a future subcommand), we must NOT remove `Freenet\`
+        // when only `bin\` is empty.
+        let tmp = tempfile::tempdir().unwrap();
+        let local_app_data = tmp.path();
+        let freenet = local_app_data.join("Freenet");
+        let bin = freenet.join("bin");
+        let foreign = freenet.join("other-tool");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("state.bin"), b"unrelated").unwrap();
+
+        collapse_windows_bin_tree(local_app_data);
+
+        assert!(!bin.exists(), "empty bin should still collapse");
+        assert!(freenet.exists(), "non-empty Freenet parent must stay");
+        assert!(foreign.join("state.bin").exists(), "foreign data preserved");
+    }
+
+    #[test]
+    fn test_collapse_windows_bin_tree_missing_tree_is_noop() {
+        // Most Linux installs don't have this tree at all. The helper must
+        // not panic or complain in that case.
+        let tmp = tempfile::tempdir().unwrap();
+        collapse_windows_bin_tree(tmp.path());
+        assert!(tmp.path().exists());
     }
 }
