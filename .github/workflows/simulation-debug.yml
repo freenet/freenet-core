@@ -150,10 +150,18 @@ jobs:
             single-process > "sim-logs/${SIM_NAME}.log" 2>&1 &
           SIM_PID=$!
 
-          # RSS sampler @ 1Hz — drops samples when the child is gone.
+          # RSS sampler @ 1Hz. $SIM_PID is the `timeout` wrapper; its
+          # child is the actual fdev process. Walk the pid tree rather
+          # than relying on `pgrep -f` (which may match unrelated bash
+          # subshells holding the same cmdline string in their env).
           echo "ts,rss_kb,vsz_kb,state" > sim-logs/rss.csv
           while kill -0 "$SIM_PID" 2>/dev/null; do
-            FDEV_PID=$(pgrep -f "target/release/fdev test.*${SIM_NAME}" | head -1)
+            # First try: direct child of the timeout wrapper.
+            FDEV_PID=$(pgrep -P "$SIM_PID" | head -1)
+            # Fallback: any fdev descendant (timeout may spawn a shim).
+            if [ -z "$FDEV_PID" ]; then
+              FDEV_PID=$(pgrep -x fdev | head -1)
+            fi
             if [ -n "$FDEV_PID" ]; then
               read rss vsz st _ <<<"$(ps -o rss=,vsz=,stat= -p "$FDEV_PID" 2>/dev/null)"
               if [ -n "$rss" ]; then
