@@ -409,12 +409,23 @@ impl Operation for PutOp {
                 })
             }
             Err(err) => {
-                tracing::error!(
-                    tx = %tx,
-                    error = %err,
-                    phase = "load_or_init",
-                    "Error popping operation"
-                );
+                // Already-completed is a benign race under task-per-tx retries
+                // (multiple NotFound retries against the same tx routinely hit
+                // it). Logging at ERROR here was producing 350k+ events/sec in
+                // ci-fault-loss, enough allocator churn to OOM the runner.
+                // Running is also expected (another task is mid-process).
+                // Keep ERROR for genuinely unexpected failures only.
+                match &err {
+                    crate::node::OpNotAvailable::Completed
+                    | crate::node::OpNotAvailable::Running => {
+                        tracing::debug!(
+                            tx = %tx,
+                            error = %err,
+                            phase = "load_or_init",
+                            "pop returned expected not-available state"
+                        );
+                    }
+                }
                 Err(err.into())
             }
         }
