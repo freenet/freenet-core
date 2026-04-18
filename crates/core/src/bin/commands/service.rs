@@ -9,7 +9,7 @@ use clap::Subcommand;
 use directories::ProjectDirs;
 use freenet::config::ConfigPaths;
 use freenet::tracing::tracer::get_log_dir;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::report::ReportCommand;
@@ -1163,6 +1163,43 @@ fn remove_if_exists(label: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Re-export for callers outside this module (e.g. `uninstall::run`) that also
+/// need to collapse empty parent folders after their own cleanup passes.
+/// Currently only used from the Windows-only branch in `uninstall::run` that
+/// cleans up `%LOCALAPPDATA%\Freenet\bin`; gate the export accordingly so
+/// non-Windows builds don't flag it as dead code.
+#[cfg(target_os = "windows")]
+pub(super) fn remove_dir_if_empty_pub(path: &Path) {
+    remove_dir_if_empty(path)
+}
+
+/// Remove a directory only if it is empty. Unlike `remove_if_exists`, this
+/// never recursively deletes — it is intended for cleaning up empty parent
+/// folders after their children have been removed (e.g. collapsing an empty
+/// `%APPDATA%\The Freenet Project Inc\Freenet\` once its `config` subfolder
+/// is gone). Any error other than "not empty" is swallowed; the parent is
+/// expendable and we should not fail the uninstall over it.
+fn remove_dir_if_empty(path: &Path) {
+    if !path.is_dir() {
+        return;
+    }
+    let Ok(mut entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    if entries.next().is_some() {
+        return;
+    }
+    match std::fs::remove_dir(path) {
+        Ok(()) => println!("Removing empty dir: {}", path.display()),
+        Err(err) => {
+            // Best-effort: the parent may have been re-populated by a
+            // concurrent process, or the user lacks permission. Either
+            // way, don't abort the uninstall.
+            eprintln!("Note: could not remove empty dir {}: {err}", path.display());
+        }
+    }
+}
+
 /// Public wrapper for use by the `uninstall` command.
 pub fn purge_data(system_mode: bool) -> Result<()> {
     purge_data_dirs(system_mode)
@@ -1197,17 +1234,29 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
         remove_if_exists("cache", &home.join(".cache/freenet"))?;
         remove_if_exists("logs", &home.join(".local/state/freenet"))?;
     } else {
+        // Track parent directories whose subfolders we removed, so that we
+        // can collapse them at the end if they are now empty. On Windows this
+        // is what keeps `%APPDATA%\The Freenet Project Inc\Freenet\` from
+        // being left behind once its `config` subfolder is gone (#3904).
+        let mut leftover_parents: Vec<PathBuf> = Vec::new();
+
         match ProjectDirs::from("", "The Freenet Project Inc", "Freenet") {
             Some(ref dirs) => {
                 // Use data_local_dir (Local AppData on Windows) to match where
                 // the node actually stores data since #3739.
                 let data_dir = dirs.data_local_dir();
                 remove_if_exists("data", data_dir)?;
+                if let Some(parent) = data_dir.parent() {
+                    leftover_parents.push(parent.to_path_buf());
+                }
 
                 // Also clean up old Roaming path from before #3739
                 let old_roaming = dirs.data_dir();
                 if old_roaming != data_dir {
                     remove_if_exists("data (legacy roaming)", old_roaming)?;
+                    if let Some(parent) = old_roaming.parent() {
+                        leftover_parents.push(parent.to_path_buf());
+                    }
                 }
 
                 // Skip config_dir if it overlaps with either data path
@@ -1215,9 +1264,16 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
                 let config_dir = dirs.config_dir();
                 if config_dir != data_dir && config_dir != old_roaming {
                     remove_if_exists("config", config_dir)?;
+                    if let Some(parent) = config_dir.parent() {
+                        leftover_parents.push(parent.to_path_buf());
+                    }
                 }
 
-                remove_if_exists("cache", dirs.cache_dir())?;
+                let cache_dir = dirs.cache_dir();
+                remove_if_exists("cache", cache_dir)?;
+                if let Some(parent) = cache_dir.parent() {
+                    leftover_parents.push(parent.to_path_buf());
+                }
             }
             None => {
                 eprintln!(
@@ -1232,11 +1288,32 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
             let cache_dir = dirs.cache_dir();
             if cache_dir.exists() {
                 remove_if_exists("cache", cache_dir)?;
+                if let Some(parent) = cache_dir.parent() {
+                    leftover_parents.push(parent.to_path_buf());
+                }
             }
         }
 
         if let Some(log_dir) = get_log_dir() {
             remove_if_exists("logs", &log_dir)?;
+            // On Windows the log dir is `%LOCALAPPDATA%\freenet\logs`; the
+            // enclosing `%LOCALAPPDATA%\freenet\` is Freenet-owned and safe
+            // to collapse. On Linux/macOS the log dir is itself the owned
+            // leaf, so `remove_dir_if_empty` on its parent is a no-op
+            // (the parent holds other apps' data).
+            if let Some(parent) = log_dir.parent() {
+                leftover_parents.push(parent.to_path_buf());
+            }
+        }
+
+        // Collapse any now-empty parent folders we uncovered. We dedup so
+        // that paths touched by multiple leaves (e.g. both `config` and
+        // `data` under the same `Freenet\` parent on Windows Roaming) are
+        // only attempted once.
+        leftover_parents.sort();
+        leftover_parents.dedup();
+        for parent in leftover_parents {
+            remove_dir_if_empty(&parent);
         }
     }
 
@@ -2585,6 +2662,85 @@ mod tests {
     fn test_should_purge_no_flags_non_tty() {
         // In CI/test environments stdin is not a TTY, so this should default to false
         assert!(!should_purge(false, false).unwrap());
+    }
+
+    // ── remove_dir_if_empty (Windows uninstall leftover cleanup, #3904) ──
+
+    #[test]
+    fn test_remove_dir_if_empty_removes_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+
+        remove_dir_if_empty(&empty);
+
+        assert!(!empty.exists(), "empty directory should have been removed");
+    }
+
+    #[test]
+    fn test_remove_dir_if_empty_preserves_non_empty_dir() {
+        // The whole point of this helper: if someone else dropped a file into
+        // the parent (an unrelated app under `The Freenet Project Inc\`, or a
+        // user-authored config file), we must NOT wipe it out. Any "looks
+        // close to empty" heuristic would be catastrophic here.
+        let tmp = tempfile::tempdir().unwrap();
+        let nonempty = tmp.path().join("nonempty");
+        std::fs::create_dir(&nonempty).unwrap();
+        std::fs::write(nonempty.join("other_app.txt"), b"do not delete").unwrap();
+
+        remove_dir_if_empty(&nonempty);
+
+        assert!(nonempty.exists(), "non-empty directory must be preserved");
+        assert!(
+            nonempty.join("other_app.txt").exists(),
+            "foreign files inside the parent must not be touched",
+        );
+    }
+
+    #[test]
+    fn test_remove_dir_if_empty_noop_on_missing_path() {
+        // The caller often passes a parent path that may or may not exist
+        // (because ProjectDirs invents canonical locations even on systems
+        // that have never installed Freenet). We must not error in that case.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("never-existed");
+
+        // Must not panic and must not create the directory.
+        remove_dir_if_empty(&missing);
+
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn test_remove_dir_if_empty_noop_on_file() {
+        // If someone's config lives at a path that happens to be a file and
+        // not a directory, silently do nothing rather than erroring.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notadir");
+        std::fs::write(&file, b"contents").unwrap();
+
+        remove_dir_if_empty(&file);
+
+        assert!(file.exists(), "regular file must be left alone");
+    }
+
+    #[test]
+    fn test_remove_dir_if_empty_collapses_after_children_removed() {
+        // Simulates the #3904 scenario: after `remove_if_exists` takes out
+        // each of `data`, `config`, `cache` under a `Freenet\` parent, the
+        // now-empty `Freenet\` parent must collapse.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("Freenet");
+        let config = parent.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), b"stuff").unwrap();
+
+        // Recursive child removal then empty-parent cleanup, mirroring
+        // purge_data_dirs' new structure.
+        std::fs::remove_dir_all(&config).unwrap();
+        remove_dir_if_empty(&parent);
+
+        assert!(!parent.exists(), "parent should collapse once empty");
     }
 
     // ── Wrapper backoff state machine tests ──
