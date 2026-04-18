@@ -1599,11 +1599,17 @@ async fn drive_relay_get_inner(
                 .await;
         }
 
-        // Build per-attempt tx (fresh per-attempt to satisfy single-use-per-tx).
-        let attempt_tx = Transaction::new::<GetMsg>();
-
+        // Forward downstream using the INCOMING tx (end-to-end preservation,
+        // matching legacy relay semantics). Minting a fresh `attempt_tx`
+        // per retry was the 3^HTL amplifier: downstream peers saw every
+        // retry as a brand-new Request, spawned a fresh relay subtree,
+        // and the aggregate spawn rate reached 7M/100s in ci-fault-loss
+        // (workflow run 24601908758). Reusing `incoming_tx` keeps the
+        // pending_op_results callback bound to a single key per hop;
+        // retries re-register the same callback after the previous
+        // attempt's receiver was consumed by timeout or reply.
         let request = NetMessage::from(GetMsg::Request {
-            id: attempt_tx,
+            id: incoming_tx,
             instance_id,
             fetch_contract,
             htl: new_htl,
@@ -1611,20 +1617,19 @@ async fn drive_relay_get_inner(
             subscribe,
         });
 
-        // Send to downstream peer and await reply.
-        let mut ctx = op_manager.op_ctx(attempt_tx);
+        // Send to downstream peer and await reply (keyed on incoming_tx).
+        let mut ctx = op_manager.op_ctx(incoming_tx);
         let round_trip =
             tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(peer_addr, request)).await;
 
-        // Always release the per-attempt slot.
-        op_manager.release_pending_op_slot(attempt_tx).await;
+        // Always release the slot so the next retry can re-register.
+        op_manager.release_pending_op_slot(incoming_tx).await;
 
         let reply = match round_trip {
             Ok(Ok(reply)) => reply,
             Ok(Err(err)) => {
                 tracing::warn!(
                     tx = %incoming_tx,
-                    attempt_tx = %attempt_tx,
                     target = %peer,
                     error = %err,
                     "GET relay (task-per-tx): send_to_and_await failed; advancing to next peer"
@@ -1636,7 +1641,6 @@ async fn drive_relay_get_inner(
             Err(_elapsed) => {
                 tracing::warn!(
                     tx = %incoming_tx,
-                    attempt_tx = %attempt_tx,
                     target = %peer,
                     timeout_secs = OPERATION_TTL.as_secs(),
                     "GET relay (task-per-tx): attempt timed out; advancing to next peer"
@@ -1716,7 +1720,6 @@ async fn drive_relay_get_inner(
             AttemptOutcome::Retry => {
                 tracing::debug!(
                     tx = %incoming_tx,
-                    attempt_tx = %attempt_tx,
                     target = %peer,
                     "GET relay (task-per-tx): downstream returned NotFound; advancing to next peer"
                 );
@@ -1728,7 +1731,6 @@ async fn drive_relay_get_inner(
             AttemptOutcome::Unexpected => {
                 tracing::warn!(
                     tx = %incoming_tx,
-                    attempt_tx = %attempt_tx,
                     target = %peer,
                     "GET relay (task-per-tx): unexpected reply variant; advancing to next peer"
                 );
