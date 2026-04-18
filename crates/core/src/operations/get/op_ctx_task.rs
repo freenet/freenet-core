@@ -95,6 +95,25 @@ pub static DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
 pub static RELAY_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Number of relay-GET driver tasks currently executing. Incremented
+/// on spawn, decremented on completion (both success and error paths).
+/// Surfaced via the periodic `memory_stats` dump so we can correlate
+/// RSS growth with spawn/complete rate and rule in/out a spawn storm
+/// vs. per-task memory bloat as the cause of phase-5 OOMs.
+pub static RELAY_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Lifetime count of relay-GET driver spawns. Paired with
+/// `RELAY_COMPLETED_TOTAL` so the `memory_stats` dump can show whether
+/// spawn rate exceeds completion rate (drivers stuck in retry loops)
+/// vs. balanced (per-task bloat is the culprit).
+pub static RELAY_SPAWNED_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Lifetime count of relay-GET driver completions. See
+/// `RELAY_SPAWNED_TOTAL`.
+pub static RELAY_COMPLETED_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Start a client-initiated GET, returning as soon as the task has been
 /// spawned (mirrors legacy `request_get` timing).
 ///
@@ -1082,6 +1101,19 @@ pub(crate) async fn start_relay_get(
     Ok(())
 }
 
+/// RAII guard that decrements `RELAY_INFLIGHT` and bumps
+/// `RELAY_COMPLETED_TOTAL` on drop. Using a guard (vs. matching every
+/// exit path) keeps the counter correct under panics and early
+/// returns so the memory_stats dump always reflects true steady-state.
+struct RelayInflightGuard;
+
+impl Drop for RelayInflightGuard {
+    fn drop(&mut self) {
+        RELAY_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        RELAY_COMPLETED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_relay_get(
     op_manager: Arc<OpManager>,
@@ -1093,6 +1125,10 @@ async fn run_relay_get(
     fetch_contract: bool,
     subscribe: bool,
 ) {
+    RELAY_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RELAY_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _guard = RelayInflightGuard;
+
     if let Err(err) = drive_relay_get(
         &op_manager,
         incoming_tx,

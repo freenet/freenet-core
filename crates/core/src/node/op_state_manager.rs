@@ -1664,10 +1664,20 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // runs where we want to correlate RSS growth with retained
                 // state in OpManager/SubOperationTracker.
                 if std::env::var("FREENET_MEMORY_STATS").is_ok() {
+                    use std::sync::atomic::Ordering;
                     let ops_sizes = ops.sizes();
                     let sub_sizes = sub_op_tracker.sizes();
                     let pending_fetches = pending_contract_fetches.len();
                     let waiters_len = contract_waiters.lock().len();
+                    let relay_inflight =
+                        crate::operations::get::op_ctx_task::RELAY_INFLIGHT
+                            .load(Ordering::Relaxed);
+                    let relay_spawned =
+                        crate::operations::get::op_ctx_task::RELAY_SPAWNED_TOTAL
+                            .load(Ordering::Relaxed);
+                    let relay_completed =
+                        crate::operations::get::op_ctx_task::RELAY_COMPLETED_TOTAL
+                            .load(Ordering::Relaxed);
                     tracing::info!(
                         target: "memory_stats",
                         tick = tick_count,
@@ -1685,6 +1695,9 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         failed_parents = sub_sizes.failed_parents,
                         pending_contract_fetches = pending_fetches,
                         contract_waiters = waiters_len,
+                        relay_inflight = relay_inflight,
+                        relay_spawned = relay_spawned,
+                        relay_completed = relay_completed,
                         "memory stats"
                     );
                 }
