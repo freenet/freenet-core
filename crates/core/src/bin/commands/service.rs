@@ -9,7 +9,7 @@ use clap::Subcommand;
 use directories::ProjectDirs;
 use freenet::config::ConfigPaths;
 use freenet::tracing::tracer::get_log_dir;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::report::ReportCommand;
@@ -1163,6 +1163,42 @@ fn remove_if_exists(label: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Re-export for callers outside this module (e.g. `uninstall::run`) that
+/// also need to collapse empty parent folders after their own cleanup
+/// passes. Runtime use is Windows-only (see `uninstall::collapse_windows_bin_tree`)
+/// but the function is exposed on every platform so that tests for the
+/// caller-side helper can run under Linux CI too.
+pub(super) fn remove_dir_if_empty_pub(path: &Path) {
+    remove_dir_if_empty(path)
+}
+
+/// Remove a directory only if it is empty. Unlike `remove_if_exists`, this
+/// never recursively deletes — it is intended for cleaning up empty parent
+/// folders after their children have been removed (e.g. collapsing an empty
+/// `%APPDATA%\The Freenet Project Inc\Freenet\` once its `config` subfolder
+/// is gone). Any error other than "not empty" is swallowed; the parent is
+/// expendable and we should not fail the uninstall over it.
+fn remove_dir_if_empty(path: &Path) {
+    if !path.is_dir() {
+        return;
+    }
+    let Ok(mut entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    if entries.next().is_some() {
+        return;
+    }
+    match std::fs::remove_dir(path) {
+        Ok(()) => println!("Removing empty dir: {}", path.display()),
+        Err(err) => {
+            // Best-effort: the parent may have been re-populated by a
+            // concurrent process, or the user lacks permission. Either
+            // way, don't abort the uninstall.
+            eprintln!("Note: could not remove empty dir {}: {err}", path.display());
+        }
+    }
+}
+
 /// Public wrapper for use by the `uninstall` command.
 pub fn purge_data(system_mode: bool) -> Result<()> {
     purge_data_dirs(system_mode)
@@ -1197,50 +1233,147 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
         remove_if_exists("cache", &home.join(".cache/freenet"))?;
         remove_if_exists("logs", &home.join(".local/state/freenet"))?;
     } else {
-        match ProjectDirs::from("", "The Freenet Project Inc", "Freenet") {
-            Some(ref dirs) => {
-                // Use data_local_dir (Local AppData on Windows) to match where
-                // the node actually stores data since #3739.
-                let data_dir = dirs.data_local_dir();
-                remove_if_exists("data", data_dir)?;
-
-                // Also clean up old Roaming path from before #3739
-                let old_roaming = dirs.data_dir();
-                if old_roaming != data_dir {
-                    remove_if_exists("data (legacy roaming)", old_roaming)?;
-                }
-
-                // Skip config_dir if it overlaps with either data path
-                // (e.g., on macOS config_dir == data_dir)
-                let config_dir = dirs.config_dir();
-                if config_dir != data_dir && config_dir != old_roaming {
-                    remove_if_exists("config", config_dir)?;
-                }
-
-                remove_if_exists("cache", dirs.cache_dir())?;
-            }
-            None => {
-                eprintln!(
-                    "Warning: Could not determine Freenet directories. Data and config may not have been removed."
-                );
-            }
-        }
-
-        // Also remove lowercase "freenet" cache dir used by webapp cache
-        // (may differ from uppercase "Freenet" on case-sensitive filesystems)
-        if let Some(ref dirs) = ProjectDirs::from("", "The Freenet Project Inc", "freenet") {
-            let cache_dir = dirs.cache_dir();
-            if cache_dir.exists() {
-                remove_if_exists("cache", cache_dir)?;
-            }
-        }
-
-        if let Some(log_dir) = get_log_dir() {
-            remove_if_exists("logs", &log_dir)?;
-        }
+        let leaves = DataLeaves::from_project_dirs();
+        purge_leaves_and_collapse(&leaves)?;
     }
 
     Ok(())
+}
+
+/// The full set of leaf directories `purge_data_dirs` needs to touch in
+/// non-system mode. Grouping these into a value type makes the purge logic
+/// testable without mocking `ProjectDirs` (a tricky proposition given it
+/// reads process-level env vars).
+#[derive(Debug, Default, Clone)]
+struct DataLeaves {
+    /// `data_local_dir` — on Windows this is `%LOCALAPPDATA%\...\data`.
+    data_local: Option<PathBuf>,
+    /// Pre-#3739 Roaming data path, only populated on Windows where it
+    /// differs from `data_local`.
+    data_roaming: Option<PathBuf>,
+    /// Config dir, only populated when it differs from both data paths
+    /// (matches the macOS case where `config_dir == data_dir`).
+    config: Option<PathBuf>,
+    /// `cache_dir` for the uppercase project bundle.
+    cache: Option<PathBuf>,
+    /// Lowercase-variant cache used by the webapp cache on case-sensitive
+    /// filesystems.
+    cache_lowercase: Option<PathBuf>,
+    /// Log dir (as returned by `tracing::get_log_dir`).
+    log: Option<PathBuf>,
+    /// Whether the parents of our leaves are Freenet-owned and therefore
+    /// safe to collapse if empty.
+    ///
+    /// True on Windows — `ProjectDirs` there builds
+    /// `%LOCALAPPDATA%\The Freenet Project Inc\Freenet\{data,config,cache}`
+    /// and `get_log_dir` returns `%LOCALAPPDATA%\freenet\logs`; the
+    /// immediate parents (`...\Freenet`, `...\freenet`) exist only for us.
+    ///
+    /// False on Linux/macOS — `ProjectDirs` builds `~/.local/share/Freenet`,
+    /// `~/.config/Freenet`, `~/.cache/Freenet` (Linux) and analogous paths
+    /// on macOS. The parents of those leaves are shared XDG/OS hierarchies
+    /// used by every other app on the system — collapsing them would at
+    /// best no-op (by luck) and at worst delete an otherwise-empty shared
+    /// root on a fresh account. The safety must be enforced at the type
+    /// level, not left to `remove_dir_if_empty`'s runtime check.
+    collapse_parents: bool,
+}
+
+impl DataLeaves {
+    fn from_project_dirs() -> Self {
+        let mut leaves = DataLeaves::default();
+
+        if let Some(dirs) = ProjectDirs::from("", "The Freenet Project Inc", "Freenet") {
+            let data_dir = dirs.data_local_dir().to_path_buf();
+            leaves.data_local = Some(data_dir.clone());
+
+            let roaming = dirs.data_dir().to_path_buf();
+            if roaming != data_dir {
+                leaves.data_roaming = Some(roaming.clone());
+            }
+
+            let config_dir = dirs.config_dir().to_path_buf();
+            if config_dir != data_dir && Some(&config_dir) != leaves.data_roaming.as_ref() {
+                leaves.config = Some(config_dir);
+            }
+
+            leaves.cache = Some(dirs.cache_dir().to_path_buf());
+        } else {
+            eprintln!(
+                "Warning: Could not determine Freenet directories. Data and config may not have been removed."
+            );
+        }
+
+        if let Some(dirs) = ProjectDirs::from("", "The Freenet Project Inc", "freenet") {
+            let cache_lower = dirs.cache_dir().to_path_buf();
+            if cache_lower.exists() {
+                leaves.cache_lowercase = Some(cache_lower);
+            }
+        }
+
+        leaves.log = get_log_dir();
+        leaves.collapse_parents = cfg!(target_os = "windows");
+
+        leaves
+    }
+}
+
+/// Remove every populated leaf directory and then collapse any Freenet-owned
+/// parent folder that the removal left empty. This is the #3904 fix: on
+/// Windows the per-leaf calls removed `...\Freenet\config` but not its now-
+/// empty `...\Freenet\` parent. By collecting parents, deduping, and visiting
+/// them deepest-first, we tidy up without ever attempting to remove a parent
+/// that still holds a sibling app's data.
+fn purge_leaves_and_collapse(leaves: &DataLeaves) -> Result<()> {
+    let mut parents: Vec<PathBuf> = Vec::new();
+    let collect = |leaf: &Path, acc: &mut Vec<PathBuf>| {
+        if leaves.collapse_parents {
+            push_parent(leaf, acc);
+        }
+    };
+
+    if let Some(ref data_local) = leaves.data_local {
+        remove_if_exists("data", data_local)?;
+        collect(data_local, &mut parents);
+    }
+    if let Some(ref roaming) = leaves.data_roaming {
+        remove_if_exists("data (legacy roaming)", roaming)?;
+        collect(roaming, &mut parents);
+    }
+    if let Some(ref config) = leaves.config {
+        remove_if_exists("config", config)?;
+        collect(config, &mut parents);
+    }
+    if let Some(ref cache) = leaves.cache {
+        remove_if_exists("cache", cache)?;
+        collect(cache, &mut parents);
+    }
+    if let Some(ref cache_lower) = leaves.cache_lowercase {
+        remove_if_exists("cache", cache_lower)?;
+        collect(cache_lower, &mut parents);
+    }
+    if let Some(ref log) = leaves.log {
+        remove_if_exists("logs", log)?;
+        collect(log, &mut parents);
+    }
+
+    // Sort ascending, dedup consecutive duplicates, then reverse so that
+    // deepest paths are processed first. If a hypothetical future caller
+    // ever adds a grandparent alongside its parent, this ordering ensures
+    // the grandparent is only evaluated after its child has been collapsed.
+    parents.sort();
+    parents.dedup();
+    for parent in parents.into_iter().rev() {
+        remove_dir_if_empty(&parent);
+    }
+
+    Ok(())
+}
+
+fn push_parent(leaf: &Path, acc: &mut Vec<PathBuf>) {
+    if let Some(parent) = leaf.parent() {
+        acc.push(parent.to_path_buf());
+    }
 }
 
 /// Path to the system-wide systemd service file.
@@ -2585,6 +2718,310 @@ mod tests {
     fn test_should_purge_no_flags_non_tty() {
         // In CI/test environments stdin is not a TTY, so this should default to false
         assert!(!should_purge(false, false).unwrap());
+    }
+
+    // ── remove_dir_if_empty (Windows uninstall leftover cleanup, #3904) ──
+
+    #[test]
+    fn test_remove_dir_if_empty_removes_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+
+        remove_dir_if_empty(&empty);
+
+        assert!(!empty.exists(), "empty directory should have been removed");
+    }
+
+    #[test]
+    fn test_remove_dir_if_empty_preserves_non_empty_dir() {
+        // The whole point of this helper: if someone else dropped a file into
+        // the parent (an unrelated app under `The Freenet Project Inc\`, or a
+        // user-authored config file), we must NOT wipe it out. Any "looks
+        // close to empty" heuristic would be catastrophic here.
+        let tmp = tempfile::tempdir().unwrap();
+        let nonempty = tmp.path().join("nonempty");
+        std::fs::create_dir(&nonempty).unwrap();
+        std::fs::write(nonempty.join("other_app.txt"), b"do not delete").unwrap();
+
+        remove_dir_if_empty(&nonempty);
+
+        assert!(nonempty.exists(), "non-empty directory must be preserved");
+        assert!(
+            nonempty.join("other_app.txt").exists(),
+            "foreign files inside the parent must not be touched",
+        );
+    }
+
+    #[test]
+    fn test_remove_dir_if_empty_preserves_dir_with_subtree() {
+        // Variant of the safety test above, but with a full subdirectory
+        // tree instead of a single file. `read_dir().next().is_some()` must
+        // treat a subdir as "non-empty" — we never want to pretend a parent
+        // is empty just because all its direct children are directories.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_parent = tmp.path().join("The Freenet Project Inc");
+        let sibling_app = project_parent.join("OtherApp");
+        let sibling_data = sibling_app.join("state");
+        std::fs::create_dir_all(&sibling_data).unwrap();
+        std::fs::write(sibling_data.join("state.bin"), b"unrelated").unwrap();
+
+        remove_dir_if_empty(&project_parent);
+
+        assert!(
+            project_parent.exists(),
+            "parent with a sibling app subtree must be preserved",
+        );
+        assert!(
+            sibling_data.join("state.bin").exists(),
+            "sibling app's data must not be touched",
+        );
+    }
+
+    #[test]
+    fn test_remove_dir_if_empty_noop_on_missing_path() {
+        // The caller often passes a parent path that may or may not exist
+        // (because ProjectDirs invents canonical locations even on systems
+        // that have never installed Freenet). We must not error in that case.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("never-existed");
+
+        // Must not panic and must not create the directory.
+        remove_dir_if_empty(&missing);
+
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn test_remove_dir_if_empty_noop_on_file() {
+        // If someone's config lives at a path that happens to be a file and
+        // not a directory, silently do nothing rather than erroring.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notadir");
+        std::fs::write(&file, b"contents").unwrap();
+
+        remove_dir_if_empty(&file);
+
+        assert!(file.exists(), "regular file must be left alone");
+    }
+
+    #[test]
+    fn test_remove_dir_if_empty_collapses_after_children_removed() {
+        // Simulates the #3904 scenario: after `remove_if_exists` takes out
+        // each of `data`, `config`, `cache` under a `Freenet\` parent, the
+        // now-empty `Freenet\` parent must collapse.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("Freenet");
+        let config = parent.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), b"stuff").unwrap();
+
+        // Recursive child removal then empty-parent cleanup, mirroring
+        // purge_data_dirs' new structure.
+        std::fs::remove_dir_all(&config).unwrap();
+        remove_dir_if_empty(&parent);
+
+        assert!(!parent.exists(), "parent should collapse once empty");
+    }
+
+    // ── purge_leaves_and_collapse integration (the call-site wiring) ──
+
+    /// Build a `DataLeaves` under `base` that mirrors the Windows
+    /// `%LOCALAPPDATA%` + `%APPDATA%` layout, except with tempdir-rooted
+    /// paths so the tests run on any OS.
+    fn seed_windows_like_layout(base: &Path) -> DataLeaves {
+        let project_local = base.join("Local").join("The Freenet Project Inc");
+        let project_roaming = base.join("Roaming").join("The Freenet Project Inc");
+        let freenet_local = project_local.join("Freenet");
+        let freenet_roaming = project_roaming.join("Freenet");
+
+        let data_local = freenet_local.join("data");
+        let data_roaming = freenet_roaming.join("data");
+        let config = freenet_roaming.join("config");
+        let cache = freenet_local.join("cache");
+        let log = base.join("Local").join("freenet").join("logs");
+
+        for d in [&data_local, &data_roaming, &config, &cache, &log] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("placeholder.bin"), b"x").unwrap();
+        }
+
+        DataLeaves {
+            data_local: Some(data_local),
+            data_roaming: Some(data_roaming),
+            config: Some(config),
+            cache: Some(cache),
+            cache_lowercase: None,
+            log: Some(log),
+            collapse_parents: true,
+        }
+    }
+
+    #[test]
+    fn test_purge_leaves_and_collapse_cleans_windows_layout() {
+        // This is the #3904 regression test proper: it exercises the full
+        // call chain (DataLeaves → remove_if_exists per leaf → parent
+        // collection → deepest-first collapse), not just the helper.
+        // Reverting the parent collection or the `remove_dir_if_empty`
+        // calls inside `purge_leaves_and_collapse` would cause this to fail.
+        let tmp = tempfile::tempdir().unwrap();
+        let leaves = seed_windows_like_layout(tmp.path());
+        let freenet_local = leaves
+            .data_local
+            .as_ref()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let freenet_roaming = leaves
+            .config
+            .as_ref()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let log_parent = leaves.log.as_ref().unwrap().parent().unwrap().to_path_buf();
+
+        purge_leaves_and_collapse(&leaves).unwrap();
+
+        // Every leaf is gone.
+        for leaf in [
+            leaves.data_local.as_ref(),
+            leaves.data_roaming.as_ref(),
+            leaves.config.as_ref(),
+            leaves.cache.as_ref(),
+            leaves.log.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(!leaf.exists(), "leaf {} should be removed", leaf.display());
+        }
+
+        // The Freenet-owned parents collapsed...
+        assert!(
+            !freenet_local.exists(),
+            "Local/.../Freenet/ should collapse"
+        );
+        assert!(
+            !freenet_roaming.exists(),
+            "Roaming/.../Freenet/ should collapse"
+        );
+        assert!(!log_parent.exists(), "Local/freenet/ should collapse");
+    }
+
+    #[test]
+    fn test_purge_leaves_preserves_sibling_app_grandparent() {
+        // Safety: `The Freenet Project Inc\` holds `Freenet\` (ours) and
+        // could hold `OtherApp\` (unrelated). Only `Freenet\` is expendable.
+        let tmp = tempfile::tempdir().unwrap();
+        let leaves = seed_windows_like_layout(tmp.path());
+
+        // Plant a sibling app next to our Freenet folder.
+        let sibling = tmp
+            .path()
+            .join("Roaming")
+            .join("The Freenet Project Inc")
+            .join("OtherApp")
+            .join("state.bin");
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        std::fs::write(&sibling, b"dont touch").unwrap();
+
+        purge_leaves_and_collapse(&leaves).unwrap();
+
+        // Sibling and its grandparent both preserved.
+        assert!(sibling.exists(), "sibling app data must survive");
+        assert!(
+            sibling.parent().unwrap().exists(),
+            "sibling app directory must survive",
+        );
+        assert!(
+            sibling.parent().unwrap().parent().unwrap().exists(),
+            "`The Freenet Project Inc` grandparent must survive",
+        );
+    }
+
+    #[test]
+    fn test_purge_leaves_never_collapses_shared_parents_on_unix() {
+        // Reproduces the codex-caught bug: on Linux `ProjectDirs` builds
+        // `~/.local/share/Freenet`, `~/.config/Freenet`, `~/.cache/Freenet`
+        // (and analogous macOS paths), whose parents are shared across
+        // every app on the system. Collapsing any of them, even when the
+        // `remove_dir_if_empty` non-empty check makes it safe in practice
+        // on an active system, would wipe a shared XDG root on a fresh
+        // account where Freenet was the only inhabitant. The
+        // `collapse_parents: false` setting must suppress every collapse.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Each leaf sits in its own dedicated parent to verify each
+        // collapse path independently.
+        let shared_share = tmp.path().join("share");
+        let shared_config = tmp.path().join("config");
+        let shared_cache = tmp.path().join("cache");
+        let shared_logs = tmp.path().join("state");
+
+        let data = shared_share.join("Freenet");
+        let config = shared_config.join("Freenet");
+        let cache = shared_cache.join("Freenet");
+        let log = shared_logs.join("freenet");
+
+        for d in [&data, &config, &cache, &log] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("a"), b"x").unwrap();
+        }
+
+        let leaves = DataLeaves {
+            data_local: Some(data.clone()),
+            data_roaming: None,
+            config: Some(config.clone()),
+            cache: Some(cache.clone()),
+            cache_lowercase: None,
+            log: Some(log.clone()),
+            collapse_parents: false,
+        };
+
+        purge_leaves_and_collapse(&leaves).unwrap();
+
+        // Every leaf removed.
+        for leaf in [&data, &config, &cache, &log] {
+            assert!(!leaf.exists(), "leaf {} should be removed", leaf.display());
+        }
+
+        // Every shared parent preserved — this is what protects
+        // `~/.local/share/`, `~/.config/`, `~/.cache/`, `~/.local/state/`
+        // on real systems.
+        for parent in [&shared_share, &shared_config, &shared_cache, &shared_logs] {
+            assert!(
+                parent.exists(),
+                "shared parent {} must NOT be collapsed on Unix",
+                parent.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_purge_leaves_tolerates_missing_optional_leaves() {
+        // Not every platform populates every leaf — an install that never
+        // wrote to Roaming (legacy Windows) or never produced a
+        // lowercase-cache variant still needs to clean up what IS there.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_local = tmp.path().join("data");
+        std::fs::create_dir_all(&data_local).unwrap();
+        std::fs::write(data_local.join("a"), b"x").unwrap();
+
+        let leaves = DataLeaves {
+            data_local: Some(data_local.clone()),
+            data_roaming: None,
+            config: None,
+            cache: None,
+            cache_lowercase: None,
+            log: None,
+            collapse_parents: false,
+        };
+
+        purge_leaves_and_collapse(&leaves).unwrap();
+
+        assert!(!data_local.exists(), "leaf should be removed");
     }
 
     // ── Wrapper backoff state machine tests ──
