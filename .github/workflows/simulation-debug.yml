@@ -1,0 +1,193 @@
+name: Simulation Debug (on-demand)
+
+# Manual workflow for running a single fdev simulation under the debug
+# instrumentation we normally leave off in PR CI. Useful for profiling
+# a specific sim configuration (memory growth, retained state sizes)
+# without paying the cost on every PR.
+#
+# Default config: ci-medium-50 (46 nodes, 2000 events, seed 0xDEADBEEF)
+# — the one that was moved to nightly in #3899 because of OOM pressure
+# on parallel runs. This workflow runs it in isolation on the same
+# runner class, with FREENET_MEMORY_STATS enabled and an RSS sampler
+# recording /proc/<pid>/status every second. Output is uploaded as a
+# logs artifact whether the sim passes or fails.
+#
+# Invoke via: Actions tab → Simulation Debug → Run workflow, or
+#   gh workflow run simulation-debug.yml --ref <branch> \
+#     -f sim=ci-medium-50 -f seed=0xDEADBEEF -f memory_stats=true
+
+on:
+  workflow_dispatch:
+    inputs:
+      sim:
+        description: "Simulation preset to run"
+        required: true
+        default: "ci-medium-50"
+        type: choice
+        options:
+          - ci-medium-50
+          - ci-fault-loss
+          - ci-high-latency
+          - ci-churn-20
+      seed:
+        description: "Simulation seed (hex, e.g., 0xDEADBEEF)"
+        required: false
+        default: ""
+      memory_stats:
+        description: "Enable FREENET_MEMORY_STATS (per-5s DashMap size dump)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      rust_log:
+        description: "RUST_LOG filter (defaults keep memory_stats=info)"
+        required: false
+        default: "error,memory_stats=info"
+      duration_minutes:
+        description: "Hard cap on the fdev process (minutes)"
+        required: false
+        default: "20"
+
+concurrency:
+  group: simulation-debug-${{ github.ref }}-${{ github.event.inputs.sim }}
+  cancel-in-progress: true
+
+jobs:
+  simulation-debug:
+    name: Simulation Debug (${{ github.event.inputs.sim }})
+    runs-on: ubicloud-standard-16
+    timeout-minutes: 60
+
+    env:
+      RUST_LOG: ${{ github.event.inputs.rust_log }}
+      RUST_MIN_STACK: 268435456
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: simulation-debug
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build fdev
+        run: cargo build -p fdev --release --locked
+
+      - name: Resolve sim args
+        id: simargs
+        run: |
+          case "${{ github.event.inputs.sim }}" in
+            ci-medium-50)
+              default_seed="0xDEADBEEF"
+              args=(--gateways 4 --nodes 46 --events 2000 \
+                    --ring-max-htl 12 --max-connections 20 --min-connections 6 \
+                    --latency-min 10 --latency-max 50 \
+                    --min-success-rate 1.0)
+              ;;
+            ci-fault-loss)
+              default_seed="0xFA017001"
+              args=(--gateways 3 --nodes 27 --events 1000 \
+                    --message-loss 0.15 \
+                    --latency-min 10 --latency-max 50 \
+                    --min-success-rate 0.80)
+              ;;
+            ci-high-latency)
+              default_seed="0x1A7E0C71"
+              args=(--gateways 2 --nodes 12 --events 500 \
+                    --latency-min 50 --latency-max 200 \
+                    --min-success-rate 0.95)
+              ;;
+            ci-churn-20)
+              default_seed="0xC102FEED"
+              args=(--gateways 2 --nodes 18 --events 500 \
+                    --ring-max-htl 10 --max-connections 15 --min-connections 4 \
+                    --latency-min 10 --latency-max 50 \
+                    --churn-rate 0.1 --churn-recovery-delay-ms 3000 \
+                    --churn-permanent-rate 0.05 --churn-tick-ms 5000 \
+                    --min-success-rate 0.80)
+              ;;
+            *)
+              echo "unknown sim" >&2; exit 1;;
+          esac
+          seed="${{ github.event.inputs.seed }}"
+          if [ -z "$seed" ]; then seed="$default_seed"; fi
+          {
+            echo "seed=$seed"
+            echo "args=${args[*]}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run simulation with RSS sampler
+        run: |
+          mkdir -p sim-logs
+          SIM_NAME="${{ github.event.inputs.sim }}"
+          DURATION="${{ github.event.inputs.duration_minutes }}m"
+
+          export FREENET_MEMORY_STATS="${{ github.event.inputs.memory_stats }}"
+          # Unset so "false" means empty (the code checks var presence, not value).
+          if [ "$FREENET_MEMORY_STATS" != "true" ]; then
+            unset FREENET_MEMORY_STATS
+          fi
+
+          # Launch fdev under `timeout` so a hang doesn't burn the whole budget.
+          timeout --kill-after=30s "$DURATION" target/release/fdev test \
+            --name "$SIM_NAME" \
+            --seed "${{ steps.simargs.outputs.seed }}" \
+            ${{ steps.simargs.outputs.args }} \
+            --print-summary --print-network-stats \
+            single-process > "sim-logs/${SIM_NAME}.log" 2>&1 &
+          SIM_PID=$!
+
+          # RSS sampler @ 1Hz — drops samples when the child is gone.
+          echo "ts,rss_kb,vsz_kb,state" > sim-logs/rss.csv
+          while kill -0 "$SIM_PID" 2>/dev/null; do
+            FDEV_PID=$(pgrep -f "target/release/fdev test.*${SIM_NAME}" | head -1)
+            if [ -n "$FDEV_PID" ]; then
+              read rss vsz st _ <<<"$(ps -o rss=,vsz=,stat= -p "$FDEV_PID" 2>/dev/null)"
+              if [ -n "$rss" ]; then
+                printf '%s,%s,%s,%s\n' "$(date +%s)" "$rss" "$vsz" "$st" \
+                  >> sim-logs/rss.csv
+              fi
+            fi
+            sleep 1
+          done
+
+          wait "$SIM_PID"
+          rc=$?
+          echo "sim exit rc=${rc}"
+
+          # Summary header for the log viewer.
+          {
+            echo "===== sim log tail ====="
+            tail -n 80 "sim-logs/${SIM_NAME}.log" || true
+            echo
+            echo "===== RSS sampler tail (ts,rss_kb,vsz_kb,state) ====="
+            tail -n 20 sim-logs/rss.csv || true
+            echo
+            echo "===== RSS peak ====="
+            awk -F, 'NR>1 && $2+0>max{max=$2+0} END{printf "peak_rss_mb=%d\n", max/1024}' \
+              sim-logs/rss.csv
+          }
+
+          exit "$rc"
+
+      - name: Upload sim logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: simulation-debug-${{ github.event.inputs.sim }}-${{ github.run_attempt }}
+          path: sim-logs/
+          if-no-files-found: error
+          retention-days: 14
