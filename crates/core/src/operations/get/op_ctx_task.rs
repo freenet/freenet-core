@@ -1308,7 +1308,17 @@ fn relay_advance_to_next_peer(
     retries: &mut usize,
     new_visited: &VisitedPeers,
 ) -> Option<(PeerKeyLocation, SocketAddr)> {
-    const MAX_RELAY_RETRIES: usize = 3;
+    // Legacy relay does NOT retry alternative peers at each hop — it
+    // forwards once and bubbles back whatever downstream returned. The
+    // phase-5 task-per-tx migration introduced a 3-peer retry loop here
+    // that compounded fan-out to 3^HTL per origination under virtual
+    // time (ci-fault-loss run 24602255580 showed 16.9M spawns in 95s
+    // with single-use tx reuse still in place). Cap at 1 to match
+    // legacy semantics exactly. If downstream fails, we bubble
+    // NotFound to upstream and let the originator's client driver
+    // handle cross-peer retries (which IS legitimate in
+    // `drive_client_get_inner`'s retry loop).
+    const MAX_RELAY_RETRIES: usize = 1;
     if *retries >= MAX_RELAY_RETRIES {
         return None;
     }
