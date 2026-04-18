@@ -196,7 +196,17 @@ fn host_header_ip_in_cidrs(
     let Some(ip) = parse_host_header_ip(host_header) else {
         return false;
     };
-    allowed_cidrs.contains_ip(&ip)
+    // Normalize IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to IPv4 so an operator's
+    // v4 CIDR matches regardless of which address family the browser chose
+    // when building the Host header. Mirrors `is_source_allowed` in server.rs.
+    let match_ip = match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    allowed_cidrs.contains_ip(&match_ip)
 }
 
 /// Extracts the IP part of a `Host` header value, handling `host:port`,
@@ -1884,6 +1894,27 @@ mod tests {
         // Outside the /48.
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("[fd7a:115c:a1e1::1]:7509"),
+            &allowed,
+        ));
+    }
+
+    /// IPv4-mapped IPv6 (`[::ffff:100.64.1.5]`) in the Host header must be
+    /// normalized to IPv4 so an operator's IPv4 CIDR still matches. Mirrors
+    /// the same normalization in `is_source_allowed`.
+    #[test]
+    fn host_header_ipv4_mapped_v6_normalized_to_v4() {
+        let allowed = cidrs(&["100.64.0.0/10"]);
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("[::ffff:100.64.1.5]:7509"),
+            &allowed,
+        ));
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("[::ffff:100.64.1.5]"),
+            &allowed,
+        ));
+        // Mapped v6 OUTSIDE the v4 CIDR still rejected.
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("[::ffff:8.8.8.8]:7509"),
             &allowed,
         ));
     }
