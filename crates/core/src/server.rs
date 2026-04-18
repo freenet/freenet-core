@@ -387,8 +387,12 @@ pub(crate) type AllowedHosts = Arc<HashSet<String>>;
 pub(crate) struct AllowedSourceCidrs(pub Arc<Vec<ipnet::IpNet>>);
 
 impl AllowedSourceCidrs {
-    fn contains(&self, ip: &IpAddr) -> bool {
+    pub(crate) fn contains_ip(&self, ip: &IpAddr) -> bool {
         self.0.iter().any(|net| net.contains(ip))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -453,7 +457,7 @@ pub(crate) fn is_source_allowed(ip: IpAddr, allowed: &AllowedSourceCidrs) -> boo
             .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     };
-    allowed.contains(&match_ip)
+    allowed.contains_ip(&match_ip)
 }
 
 /// Builds the allowlist of hostnames/IPs for WebSocket `Host` header validation.
@@ -590,14 +594,21 @@ async fn serve_client_api_in_impl(
         // every request 500s because the extractor finds nothing. Docker
         // NAT tests caught this (see regression in this module's `tests`
         // submodule, `middleware_has_extension_injected`).
+        //
+        // `connection_info` (inside the WebSocket router) also extracts
+        // `Extension<AllowedSourceCidrs>` for the Host-header CIDR check.
         ws_router
             .layer(Extension(allowed_hosts))
             .layer(axum::middleware::from_fn(private_network_filter))
             .layer(Extension(allowed_source_cidrs))
             .layer(TraceLayer::new_for_http())
     } else {
+        // Loopback binds still inject an (empty) `AllowedSourceCidrs` so
+        // `connection_info` always finds the extractor; missing it would
+        // 500 every WS upgrade.
         ws_router
             .layer(Extension(allowed_hosts))
+            .layer(Extension(allowed_source_cidrs))
             .layer(TraceLayer::new_for_http())
     };
 
@@ -898,40 +909,40 @@ mod tests {
     #[test]
     fn allowed_source_cidrs_empty_rejects_public() {
         let allow = AllowedSourceCidrs::default();
-        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         // Empty list means default-deny. Private IPs still pass via is_private_ip
         // at the call site, so we only assert the CIDR layer here.
-        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!allow.contains_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 
     #[test]
     fn allowed_source_cidrs_tailscale_cgnat() {
         let allow = cidrs(&["100.64.0.0/10"]);
         // Tailscale tailnet IPs
-        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
-        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 100, 50, 1))));
-        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))));
+        assert!(allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(100, 100, 50, 1))));
+        assert!(allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))));
         // Outside CGNAT
-        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
-        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 63, 255, 255))));
-        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+        assert!(!allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(100, 63, 255, 255))));
+        assert!(!allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 
     #[test]
     fn allowed_source_cidrs_narrow_tailnet() {
         // A user pinning to their assigned tailnet subnet only
         let allow = cidrs(&["100.64.1.0/24"]);
-        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 64, 1, 5))));
-        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 64, 2, 5))));
+        assert!(allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 1, 5))));
+        assert!(!allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 2, 5))));
     }
 
     #[test]
     fn allowed_source_cidrs_ipv6() {
         let allow = cidrs(&["fd7a:115c:a1e0::/48"]);
-        assert!(allow.contains(&IpAddr::V6(Ipv6Addr::new(
+        assert!(allow.contains_ip(&IpAddr::V6(Ipv6Addr::new(
             0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 1
         ))));
-        assert!(!allow.contains(&IpAddr::V6(Ipv6Addr::new(
+        assert!(!allow.contains_ip(&IpAddr::V6(Ipv6Addr::new(
             0xfd7a, 0x115c, 0xa1e1, 0, 0, 0, 0, 1
         ))));
     }
@@ -1065,9 +1076,9 @@ mod tests {
     #[test]
     fn allowed_source_cidrs_multiple_ranges() {
         let allow = cidrs(&["100.64.0.0/10", "10.100.0.0/16"]);
-        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(100, 64, 1, 1))));
-        assert!(allow.contains(&IpAddr::V4(Ipv4Addr::new(10, 100, 5, 5))));
-        assert!(!allow.contains(&IpAddr::V4(Ipv4Addr::new(10, 101, 0, 1))));
+        assert!(allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 1, 1))));
+        assert!(allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(10, 100, 5, 5))));
+        assert!(!allow.contains_ip(&IpAddr::V4(Ipv4Addr::new(10, 101, 0, 1))));
     }
 
     #[test]
@@ -1081,7 +1092,7 @@ mod tests {
             Ipv4Addr::new(203, 0, 113, 42), // Public (TEST-NET-3)
         ] {
             assert!(
-                !allow.contains(&IpAddr::V4(ip)),
+                !allow.contains_ip(&IpAddr::V4(ip)),
                 "{ip} must not be trusted by default",
             );
         }

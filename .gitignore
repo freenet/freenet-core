@@ -75,3 +75,4 @@ test-results/
 worktrees/
 logs/
 .grepai/
+.codex
