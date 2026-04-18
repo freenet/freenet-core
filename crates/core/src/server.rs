@@ -596,21 +596,16 @@ async fn serve_client_api_in_impl(
         // submodule, `middleware_has_extension_injected`).
         //
         // `connection_info` (inside the WebSocket router) also extracts
-        // `Extension<AllowedSourceCidrs>` so the WS Host-header check can
-        // accept IP literals inside an operator-allowed CIDR. That extractor
-        // is injected by the Extension layer below; because axum applies
-        // layers outermost-first, the extension is already present in the
-        // request extensions by the time `connection_info` runs on inner
-        // routes.
+        // `Extension<AllowedSourceCidrs>` for the Host-header CIDR check.
         ws_router
             .layer(Extension(allowed_hosts))
             .layer(axum::middleware::from_fn(private_network_filter))
             .layer(Extension(allowed_source_cidrs))
             .layer(TraceLayer::new_for_http())
     } else {
-        // Even on loopback binds, inject an (empty) `AllowedSourceCidrs`
-        // extension so `connection_info` always has the extractor it expects.
-        // A missing extension would manifest as 500s on every WS upgrade.
+        // Loopback binds still inject an (empty) `AllowedSourceCidrs` so
+        // `connection_info` always finds the extractor; missing it would
+        // 500 every WS upgrade.
         ws_router
             .layer(Extension(allowed_hosts))
             .layer(Extension(allowed_source_cidrs))
