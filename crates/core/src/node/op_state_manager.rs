@@ -85,6 +85,16 @@ struct SubOperationTracker {
     failed_parents: Arc<DashSet<Transaction>>,
 }
 
+/// Snapshot of per-map sizes held by `SubOperationTracker`.
+#[derive(Debug, Default)]
+struct SubOpSizes {
+    sub_operations: usize,
+    root_ops_awaiting_sub_ops: usize,
+    parent_of: usize,
+    expected_sub_operations: usize,
+    failed_parents: usize,
+}
+
 impl SubOperationTracker {
     fn new() -> Self {
         Self {
@@ -93,6 +103,16 @@ impl SubOperationTracker {
             parent_of: Arc::new(DashMap::new()),
             expected_sub_operations: Arc::new(DashMap::new()),
             failed_parents: Arc::new(DashSet::new()),
+        }
+    }
+
+    fn sizes(&self) -> SubOpSizes {
+        SubOpSizes {
+            sub_operations: self.sub_operations.len(),
+            root_ops_awaiting_sub_ops: self.root_ops_awaiting_sub_ops.len(),
+            parent_of: self.parent_of.len(),
+            expected_sub_operations: self.expected_sub_operations.len(),
+            failed_parents: self.failed_parents.len(),
         }
     }
 
@@ -214,6 +234,35 @@ struct Ops {
     update: DashMap<Transaction, UpdateOp>,
     completed: DashSet<Transaction>,
     under_progress: DashSet<Transaction>,
+}
+
+/// Snapshot of per-map sizes held by `Ops` and `SubOperationTracker`.
+/// Emitted periodically from `garbage_cleanup_task` when
+/// `FREENET_MEMORY_STATS=1` is set, to help diagnose retained-state
+/// bloat without forcing a full heap profiler run.
+#[derive(Debug, Default)]
+struct OpsSizes {
+    connect: usize,
+    put: usize,
+    get: usize,
+    subscribe: usize,
+    update: usize,
+    completed: usize,
+    under_progress: usize,
+}
+
+impl Ops {
+    fn sizes(&self) -> OpsSizes {
+        OpsSizes {
+            connect: self.connect.len(),
+            put: self.put.len(),
+            get: self.get.len(),
+            subscribe: self.subscribe.len(),
+            update: self.update.len(),
+            completed: self.completed.len(),
+            under_progress: self.under_progress.len(),
+        }
+    }
 }
 
 /// Thread safe and friendly data structure to maintain state of the different operations
@@ -1595,6 +1644,36 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
             },
             _ = tick.tick() => {
                 tick_count = tick_count.wrapping_add(1);
+
+                // Opt-in periodic memory-stats dump. Gated by env var so the
+                // hot path stays quiet in prod. Intended for local / CI sim
+                // runs where we want to correlate RSS growth with retained
+                // state in OpManager/SubOperationTracker.
+                if std::env::var("FREENET_MEMORY_STATS").is_ok() {
+                    let ops_sizes = ops.sizes();
+                    let sub_sizes = sub_op_tracker.sizes();
+                    let pending_fetches = pending_contract_fetches.len();
+                    let waiters_len = contract_waiters.lock().len();
+                    tracing::info!(
+                        target: "memory_stats",
+                        tick = tick_count,
+                        ops_connect = ops_sizes.connect,
+                        ops_put = ops_sizes.put,
+                        ops_get = ops_sizes.get,
+                        ops_subscribe = ops_sizes.subscribe,
+                        ops_update = ops_sizes.update,
+                        ops_completed = ops_sizes.completed,
+                        ops_under_progress = ops_sizes.under_progress,
+                        sub_operations = sub_sizes.sub_operations,
+                        root_ops_awaiting_sub_ops = sub_sizes.root_ops_awaiting_sub_ops,
+                        parent_of = sub_sizes.parent_of,
+                        expected_sub_operations = sub_sizes.expected_sub_operations,
+                        failed_parents = sub_sizes.failed_parents,
+                        pending_contract_fetches = pending_fetches,
+                        contract_waiters = waiters_len,
+                        "memory stats"
+                    );
+                }
 
                 // Periodically clean up stale contract_waiters entries where the
                 // receiver has been dropped (e.g., operation timed out). Without this,
