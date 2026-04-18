@@ -2350,14 +2350,15 @@ mod tests {
         assert!(
             !body.contains("relay_send_forwarding_ack"),
             "drive_relay_get_inner must NOT call relay_send_forwarding_ack \
-             — the ack collides with upstream's attempt_tx waiter and \
-             amplifies spawns 3^HTL (workflow 24600634908 showed 6.8M \
-             spawns, 63GB RSS)"
+             — the ack collided with upstream's attempt_tx waiter and \
+             amplified spawns (workflow 24600634908: 6.8M spawns, 63GB RSS)"
         );
+        // A literal `GetMsg::ForwardingAck { ... }` construction would reintroduce
+        // the bug. Comments/doc-strings mentioning "ForwardingAck" are fine.
         assert!(
-            !body.contains("ForwardingAck"),
-            "drive_relay_get_inner must not reference ForwardingAck in \
-             any form — dropped to break the spawn-amplification cycle"
+            !body.contains("GetMsg::ForwardingAck {"),
+            "drive_relay_get_inner must not construct GetMsg::ForwardingAck — \
+             dropped to break the spawn-amplification cycle"
         );
     }
 
