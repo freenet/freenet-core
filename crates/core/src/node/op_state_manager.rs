@@ -331,6 +331,14 @@ pub(crate) struct OpManager {
     /// Maps contract instance ID to the timestamp (ms since epoch via GlobalSimulationTime)
     /// when the fetch was initiated, with a cooldown to avoid repeated fetch attempts.
     pub(crate) pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
+    /// Transactions with an active task-per-tx relay-GET driver at this
+    /// node. Populated by `start_relay_get` before spawn and removed by
+    /// an RAII guard on the driver task. Consulted by the dispatch gate
+    /// in `node.rs` to reject duplicate inbound Requests for a tx that
+    /// already has a live relay driver — prevents the 3^HTL spawn
+    /// amplification observed in workflow run 24600634908 (6.8M spawns
+    /// in 100s, 63GB RSS).
+    pub(crate) active_relay_get_txs: Arc<DashSet<Transaction>>,
 }
 
 impl Clone for OpManager {
@@ -358,6 +366,7 @@ impl Clone for OpManager {
             blocked_addresses: self.blocked_addresses.clone(),
             configured_gateways: self.configured_gateways.clone(),
             pending_contract_fetches: self.pending_contract_fetches.clone(),
+            active_relay_get_txs: self.active_relay_get_txs.clone(),
         }
     }
 }
@@ -398,6 +407,7 @@ impl OpManager {
         > = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>> =
             Arc::new(DashMap::new());
+        let active_relay_get_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
 
         task_monitor.register(
             "garbage_cleanup",
@@ -415,6 +425,7 @@ impl OpManager {
                     ch_outbound.clone(),
                     contract_waiters.clone(),
                     pending_contract_fetches.clone(),
+                    active_relay_get_txs.clone(),
                 )
                 .instrument(garbage_span),
             ),
@@ -483,6 +494,7 @@ impl OpManager {
                     .collect(),
             ),
             pending_contract_fetches,
+            active_relay_get_txs,
         })
     }
 
@@ -1632,6 +1644,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
         Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
     >,
     pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
+    active_relay_get_txs: Arc<DashSet<Transaction>>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     /// How often to clean up stale contract_waiters entries (every N ticks).
@@ -1678,6 +1691,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     let relay_completed =
                         crate::operations::get::op_ctx_task::RELAY_COMPLETED_TOTAL
                             .load(Ordering::Relaxed);
+                    let relay_dedup_rejects =
+                        crate::operations::get::op_ctx_task::RELAY_DEDUP_REJECTS
+                            .load(Ordering::Relaxed);
+                    let relay_active_txs = active_relay_get_txs.len();
                     tracing::info!(
                         target: "memory_stats",
                         tick = tick_count,
@@ -1698,6 +1715,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         relay_inflight = relay_inflight,
                         relay_spawned = relay_spawned,
                         relay_completed = relay_completed,
+                        relay_dedup_rejects = relay_dedup_rejects,
+                        relay_active_txs = relay_active_txs,
                         "memory stats"
                     );
                 }

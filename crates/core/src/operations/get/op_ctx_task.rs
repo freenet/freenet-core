@@ -114,6 +114,13 @@ pub static RELAY_SPAWNED_TOTAL: std::sync::atomic::AtomicUsize =
 pub static RELAY_COMPLETED_TOTAL: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Lifetime count of relay-GET spawns rejected by the dedup gate
+/// because a driver for the same `incoming_tx` was already active on
+/// this node. Surfaced via `memory_stats` so we can confirm the gate
+/// fires under fault-loss retry retransmissions.
+pub static RELAY_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Start a client-initiated GET, returning as soon as the task has been
 /// spawned (mirrors legacy `request_get` timing).
 ///
@@ -1079,6 +1086,24 @@ pub(crate) async fn start_relay_get(
     #[cfg(any(test, feature = "testing"))]
     RELAY_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    // Dedup gate: a relay driver for this incoming_tx is already live on
+    // this node. The duplicate inbound Request is a retransmission, GC
+    // retry, or routing bloom false-positive — don't spawn a second
+    // driver. Returning Ok drops the Request silently (matches legacy
+    // semantics where a duplicate Request hitting an in-flight op
+    // returned `OpNotAvailable::Running` and was dropped by the caller).
+    if !op_manager.active_relay_get_txs.insert(incoming_tx) {
+        RELAY_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            tx = %incoming_tx,
+            %instance_id,
+            %upstream_addr,
+            phase = "relay_dedup_reject",
+            "GET relay (task-per-tx): duplicate Request for in-flight tx, dropping"
+        );
+        return Ok(());
+    }
+
     tracing::debug!(
         tx = %incoming_tx,
         %instance_id,
@@ -1101,14 +1126,21 @@ pub(crate) async fn start_relay_get(
     Ok(())
 }
 
-/// RAII guard that decrements `RELAY_INFLIGHT` and bumps
-/// `RELAY_COMPLETED_TOTAL` on drop. Using a guard (vs. matching every
-/// exit path) keeps the counter correct under panics and early
-/// returns so the memory_stats dump always reflects true steady-state.
-struct RelayInflightGuard;
+/// RAII guard that decrements `RELAY_INFLIGHT`, bumps
+/// `RELAY_COMPLETED_TOTAL`, and removes the driver's `incoming_tx`
+/// from the per-node dedup set on drop. Using a guard (vs. matching
+/// every exit path) keeps the counters and dedup set correct under
+/// panics and early returns.
+struct RelayInflightGuard {
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+}
 
 impl Drop for RelayInflightGuard {
     fn drop(&mut self) {
+        self.op_manager
+            .active_relay_get_txs
+            .remove(&self.incoming_tx);
         RELAY_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         RELAY_COMPLETED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1127,7 +1159,10 @@ async fn run_relay_get(
 ) {
     RELAY_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     RELAY_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _guard = RelayInflightGuard;
+    let _guard = RelayInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
 
     if let Err(err) = drive_relay_get(
         &op_manager,
@@ -1293,54 +1328,6 @@ fn relay_advance_to_next_peer(
     }
     tried.push(addr);
     Some((peer, addr))
-}
-
-/// Send a fire-and-forget `ForwardingAck` to `upstream_addr`.
-///
-/// This tells the upstream "I'm forwarding this GET, don't retry me" so
-/// the upstream's GC task can distinguish dead peers from slow multi-hop
-/// chains.  Mirrors `get.rs:1628-1652`.
-async fn relay_send_forwarding_ack(
-    op_manager: &OpManager,
-    tx: Transaction,
-    instance_id: ContractInstanceId,
-    upstream_addr: SocketAddr,
-) {
-    let ack = NetMessage::from(GetMsg::ForwardingAck {
-        id: tx,
-        instance_id,
-    });
-    // Fire-and-forget via op_ctx fire-and-forget send.
-    // We use op_ctx_send_fire_and_forget_to so we go through the event
-    // loop's OutboundMessageWithTarget path, which is safe from spawned tasks.
-    let mut ctx = op_manager.op_ctx(tx);
-    if let Err(err) = ctx.send_fire_and_forget(upstream_addr, ack).await {
-        tracing::warn!(
-            tx = %tx,
-            %instance_id,
-            %upstream_addr,
-            error = %err,
-            "GET relay: failed to send ForwardingAck upstream"
-        );
-    } else {
-        // Emit telemetry for ForwardingAck sent (#3570 diagnostics)
-        let upstream_peer = op_manager
-            .ring
-            .connection_manager
-            .get_peer_by_addr(upstream_addr)
-            .unwrap_or_else(|| op_manager.ring.connection_manager.own_location());
-        if let Some(event) = crate::tracing::NetEventLog::get_forwarding_ack_sent(
-            &tx,
-            &op_manager.ring,
-            instance_id,
-            upstream_peer,
-        ) {
-            op_manager
-                .ring
-                .register_events(either::Either::Left(event))
-                .await;
-        }
-    }
 }
 
 /// Build and send a `GetMsg::Response{NotFound}` to `upstream_addr`.
@@ -1511,7 +1498,6 @@ async fn drive_relay_get_inner(
     tried.push(upstream_addr);
 
     let mut retries: usize = 0;
-    let mut sent_forwarding_ack = false;
 
     loop {
         // Pick next downstream peer.
@@ -1571,13 +1557,23 @@ async fn drive_relay_get_inner(
             }
         };
 
-        // Send ForwardingAck BEFORE forwarding (mirrors get.rs:1628-1652).
-        // Only send once per relay invocation — subsequent retries don't
-        // resend it (the upstream already extended its timer on the first ack).
-        if !sent_forwarding_ack {
-            relay_send_forwarding_ack(op_manager, incoming_tx, instance_id, upstream_addr).await;
-            sent_forwarding_ack = true;
-        }
+        // NOTE: legacy path sends a ForwardingAck upstream before forwarding
+        // downstream so the upstream's GC can extend its timer on slow
+        // multi-hop chains. In the task-per-tx relay driver we OMIT that
+        // ack: the ack carried `incoming_tx` (which equals the upstream's
+        // `attempt_tx` on a relay-to-relay hop), so it matched the
+        // upstream's capacity-1 `pending_op_results` waiter and arrived
+        // FIRST, before the real Response. `classify` returned
+        // `Unexpected`, causing upstream to abandon the downstream probe
+        // and spawn a new attempt. That amplified to 3^HTL spawns per
+        // origination under ci-fault-loss, driving the 63GB RSS explosion
+        // (workflow runs 24600168871 / 24600634908 / 24601267577).
+        //
+        // Upstream's `send_to_and_await` still has its full OPERATION_TTL
+        // (60s) to receive the real Response, which is the same timeout
+        // legacy had minus the ack-driven extension. That extension is
+        // only observable under chains longer than 60s wall-clock, which
+        // `min_success_rate=0.80` tolerates at ci-fault-loss parameters.
 
         tracing::debug!(
             tx = %incoming_tx,
@@ -2319,24 +2315,37 @@ mod tests {
         );
     }
 
-    /// T6: ForwardingAck must be sent BEFORE the downstream `send_to_and_await`
-    /// call.  The source must contain `relay_send_forwarding_ack` before
-    /// `send_to_and_await` in the loop body.
+    /// T6 (superseded): Originally required `relay_send_forwarding_ack`
+    /// to be emitted before the downstream send. That ack collided with
+    /// the upstream relay driver's capacity-1 `pending_op_results`
+    /// waiter (the ack carried `incoming_tx`, which equals the
+    /// upstream's `attempt_tx` on a relay-to-relay hop). The waiter
+    /// would fire on the ack, return `AttemptOutcome::Unexpected`, and
+    /// cause the upstream to immediately retry with a fresh tx — which
+    /// the downstream's dispatch gate saw as a brand-new Request and
+    /// spawned another full relay subtree. Net amplification was
+    /// 3^HTL spawns per origination, observed as 6.8M spawns and 63GB
+    /// RSS in workflow runs 24600168871 / 24600634908 / 24601267577.
+    ///
+    /// Fix: drop the ack entirely from the task-per-tx relay driver.
+    /// Upstream's `send_to_and_await` still has OPERATION_TTL (60s) to
+    /// receive the real Response, which is what legacy effectively had
+    /// minus the ack-driven timer extension.
     #[test]
-    fn relay_driver_forwarding_ack_sent_before_downstream_request() {
+    fn relay_driver_does_not_send_forwarding_ack() {
         let src = production_source();
         let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
-        let ack_pos = body
-            .find("relay_send_forwarding_ack")
-            .expect("drive_relay_get_inner must call relay_send_forwarding_ack");
-        let send_pos = body
-            .find("send_to_and_await")
-            .expect("drive_relay_get_inner must call send_to_and_await");
         assert!(
-            ack_pos < send_pos,
-            "relay_send_forwarding_ack must be called BEFORE send_to_and_await \
-             (ForwardingAck timing: upstream must extend its timer before we \
-             fire the downstream request)"
+            !body.contains("relay_send_forwarding_ack"),
+            "drive_relay_get_inner must NOT call relay_send_forwarding_ack \
+             — the ack collides with upstream's attempt_tx waiter and \
+             amplifies spawns 3^HTL (workflow 24600634908 showed 6.8M \
+             spawns, 63GB RSS)"
+        );
+        assert!(
+            !body.contains("ForwardingAck"),
+            "drive_relay_get_inner must not reference ForwardingAck in \
+             any form — dropped to break the spawn-amplification cycle"
         );
     }
 
@@ -2646,58 +2655,15 @@ mod tests {
         );
     }
 
-    // ── R7: ForwardingAck emitted exactly once across retries ──────────────
-
-    /// The `sent_forwarding_ack` latch must be:
-    ///   - Initialized to `false` BEFORE the retry loop
-    ///   - Checked with `if !sent_forwarding_ack` inside the loop
-    ///   - Flipped to `true` after the first `relay_send_forwarding_ack` call
-    ///
-    /// If any of these are missing, the ForwardingAck either fires per-retry
-    /// (upstream sees N acks, unnecessary traffic) or never fires (upstream
-    /// times out the op after its own OPERATION_TTL).
-    #[test]
-    fn forwarding_ack_latched_and_sent_exactly_once() {
-        let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
-        let latch_init = body
-            .find("let mut sent_forwarding_ack = false;")
-            .expect("`let mut sent_forwarding_ack = false;` must precede the retry loop");
-        let loop_start = body.find("loop {").expect("retry loop must exist");
-        assert!(
-            latch_init < loop_start,
-            "`sent_forwarding_ack` latch must be initialized OUTSIDE the \
-             retry loop; initializing it inside would reset each iteration \
-             and cause the ack to fire on every retry."
-        );
-        // Inside the loop, the gate and the flip must both be present.
-        let loop_body = &body[loop_start..];
-        assert!(
-            loop_body.contains("if !sent_forwarding_ack {"),
-            "Retry loop must gate the ForwardingAck send on \
-             `if !sent_forwarding_ack` so it fires exactly once per relay \
-             invocation."
-        );
-        assert!(
-            loop_body.contains("sent_forwarding_ack = true;"),
-            "The ForwardingAck gate must flip `sent_forwarding_ack = true` \
-             after sending; otherwise the gate is never satisfied and the \
-             ack fires on every retry."
-        );
-        // Ordering: the gate check must appear before the flip in the loop
-        // body, and the flip must follow the `relay_send_forwarding_ack`
-        // call.
-        let gate_pos = loop_body.find("if !sent_forwarding_ack {").unwrap();
-        let ack_pos = loop_body
-            .find("relay_send_forwarding_ack")
-            .expect("relay_send_forwarding_ack must be called in loop");
-        let flip_pos = loop_body.find("sent_forwarding_ack = true;").unwrap();
-        assert!(
-            gate_pos < ack_pos && ack_pos < flip_pos,
-            "Loop body order must be: gate check → ack send → flip latch. \
-             Got gate={gate_pos}, ack={ack_pos}, flip={flip_pos}."
-        );
-    }
+    // ── R7 (superseded): ForwardingAck removed from task-per-tx relay ──────
+    //
+    // Superseded by `relay_driver_does_not_send_forwarding_ack` (T6
+    // rewrite). The original latch logic was pinned here to ensure the
+    // ack fired exactly once per relay invocation, which was the legacy
+    // behavior. In the task-per-tx migration the ack's `id` collides
+    // with the upstream relay driver's `attempt_tx` on its capacity-1
+    // `pending_op_results` waiter — causing 3^HTL spawn amplification.
+    // The ack is now never sent; see the T6 test for the invariant.
 
     // ── R8: Wire-side Request propagation (htl-1 + updated visited) ────────
 
