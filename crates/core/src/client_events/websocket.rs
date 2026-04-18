@@ -172,6 +172,61 @@ fn is_allowed_host(headers: &axum::http::HeaderMap, allowed_hosts: &HashSet<Stri
     allowed_hosts.contains(&host_header.to_lowercase())
 }
 
+/// Returns `true` if the request's `Host` header is an IP literal that falls
+/// within one of the operator-allowed source CIDRs.
+///
+/// When a user opts in to `--allowed-source-cidrs` (e.g. for Tailscale access),
+/// they will reach the node via an IP in that range. The browser's `Host`
+/// header for such a request is that IP literal, so we treat it as a
+/// first-class allowed host — saving operators from having to duplicate every
+/// address on every peer in a separate `allowed-host` list.
+///
+/// Hostnames (including DNS-rebinding bait like `evil.com`) are ignored here;
+/// only string-parseable IP literals are considered. This preserves the
+/// DNS-rebinding protection `is_allowed_host` exists for: the attacker cannot
+/// smuggle a hostname through by resolving it locally, because we never
+/// resolve — we only accept IPs that are already in the operator's trusted
+/// range.
+fn host_header_ip_in_cidrs(
+    headers: &axum::http::HeaderMap,
+    allowed_cidrs: &crate::server::AllowedSourceCidrs,
+) -> bool {
+    if allowed_cidrs.is_empty() {
+        return false;
+    }
+    let Some(host_header) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(ip) = parse_host_header_ip(host_header) else {
+        return false;
+    };
+    allowed_cidrs.contains_ip(&ip)
+}
+
+/// Extracts the IP part of a `Host` header value, handling `host:port`,
+/// `[v6]:port`, and bare IPv6 forms. Returns `None` if the host part isn't a
+/// parseable IP literal (i.e. it's a hostname).
+fn parse_host_header_ip(host_header: &str) -> Option<std::net::IpAddr> {
+    let host = host_header.trim();
+    // Bracketed IPv6 form: `[::1]` or `[::1]:7509`.
+    if let Some(rest) = host.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return rest[..end].parse().ok();
+    }
+    // For non-bracketed forms, treat a single colon as `host:port`; anything
+    // with more than one colon is a bare IPv6 literal without brackets
+    // (technically non-conformant, but browsers never produce it — we still
+    // try to parse it for safety).
+    let candidate = match host.as_bytes().iter().filter(|&&b| b == b':').count() {
+        0 | 1 => host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host),
+        _ => host,
+    };
+    candidate.parse().ok()
+}
+
 /// Checks if an error represents a client-side disconnect rather than a server error.
 ///
 /// Client disconnects are expected behavior when clients timeout, crash, or close
@@ -420,6 +475,7 @@ async fn connection_info(
         streaming: _,
     }): Query<ConnectionInfo>,
     Extension(allowed_hosts): Extension<crate::server::AllowedHosts>,
+    Extension(allowed_source_cidrs): Extension<crate::server::AllowedSourceCidrs>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -481,8 +537,23 @@ async fn connection_info(
     if is_ws_upgrade {
         if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
             if let Ok(origin_str) = origin.to_str() {
+                // Accept the upgrade if any of:
+                // 1. The origin is a localhost form (browser page loaded from
+                //    the same machine), OR
+                // 2. The Host header matches an auto-detected or operator-
+                //    configured hostname (DNS-rebinding protection), OR
+                // 3. The Host header is an IP literal inside one of the
+                //    operator-allowed source CIDRs. This is the path that
+                //    unblocks Tailscale-style access: the node is reached
+                //    at e.g. `http://100.64.1.5:7509`, so the Host header is
+                //    `100.64.1.5:7509` — never in `allowed_hosts` unless the
+                //    operator duplicated every peer address into it.
+                //    Matching by IP (not hostname) preserves the rebinding
+                //    defense: a malicious `evil.com` can't smuggle through
+                //    because we never resolve DNS here.
                 if !is_localhost_origin(origin_str)
                     && !is_allowed_host(req.headers(), &allowed_hosts)
+                    && !host_header_ip_in_cidrs(req.headers(), &allowed_source_cidrs)
                 {
                     let host_header = req
                         .headers()
@@ -1647,15 +1718,6 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
 
-        fn headers_with_host(host: &str) -> axum::http::HeaderMap {
-            let mut map = axum::http::HeaderMap::new();
-            map.insert(
-                axum::http::header::HOST,
-                axum::http::HeaderValue::from_str(host).unwrap(),
-            );
-            map
-        }
-
         // Allowed: host with port
         assert!(is_allowed_host(
             &headers_with_host("192.168.1.50:7509"),
@@ -1692,6 +1754,166 @@ mod tests {
         assert!(is_allowed_host(
             &headers_with_host("LOCALHOST:7509"),
             &allowed
+        ));
+    }
+
+    fn headers_with_host(host: &str) -> axum::http::HeaderMap {
+        let mut map = axum::http::HeaderMap::new();
+        map.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_str(host).unwrap(),
+        );
+        map
+    }
+
+    fn cidrs(list: &[&str]) -> crate::server::AllowedSourceCidrs {
+        crate::server::AllowedSourceCidrs(Arc::new(
+            list.iter().map(|s| s.parse().unwrap()).collect(),
+        ))
+    }
+
+    /// Parsing: `host:port`, `[v6]`, `[v6]:port`, bare v6, and hostnames.
+    #[test]
+    fn parse_host_header_ip_variants() {
+        assert_eq!(
+            parse_host_header_ip("100.64.1.5:7509"),
+            Some("100.64.1.5".parse().unwrap())
+        );
+        assert_eq!(
+            parse_host_header_ip("100.64.1.5"),
+            Some("100.64.1.5".parse().unwrap())
+        );
+        assert_eq!(
+            parse_host_header_ip("[fd7a:115c:a1e0::1]:7509"),
+            Some("fd7a:115c:a1e0::1".parse().unwrap())
+        );
+        assert_eq!(
+            parse_host_header_ip("[fd7a:115c:a1e0::1]"),
+            Some("fd7a:115c:a1e0::1".parse().unwrap())
+        );
+        // Bare IPv6 without brackets (non-conformant but parseable).
+        assert_eq!(
+            parse_host_header_ip("fd7a:115c:a1e0::1"),
+            Some("fd7a:115c:a1e0::1".parse().unwrap())
+        );
+        // Hostnames must not parse as IPs.
+        assert_eq!(parse_host_header_ip("evil.com"), None);
+        assert_eq!(parse_host_header_ip("evil.com:7509"), None);
+        assert_eq!(parse_host_header_ip("localhost:7509"), None);
+        assert_eq!(parse_host_header_ip(""), None);
+    }
+
+    /// Regression for the v0.2.47 gap: a user configuring
+    /// `allowed-source-cidrs = ["100.64.0.0/10"]` to reach their node via
+    /// Tailscale must be able to complete the WebSocket upgrade. The Host
+    /// header they send is their own tailnet IP, which is not in
+    /// `allowed_hosts` unless duplicated manually. Before the fix, `is_ws_upgrade`
+    /// rejected these with 403.
+    #[test]
+    fn host_header_ip_in_tailscale_cidr_allowed() {
+        let allowed = cidrs(&["100.64.0.0/10"]);
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5:7509"),
+            &allowed,
+        ));
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5"),
+            &allowed,
+        ));
+        // A neighbouring user's tailnet IP is still inside 100.64.0.0/10 —
+        // if the operator widened the CIDR, that's the operator's choice.
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("100.127.9.9:7509"),
+            &allowed,
+        ));
+    }
+
+    /// IPs that fall OUTSIDE the operator's CIDR must still be rejected,
+    /// even when the CIDR list is non-empty. This is the regression guard
+    /// against "CIDR match accidentally widened to any IP".
+    #[test]
+    fn host_header_ip_outside_cidr_rejected() {
+        let allowed = cidrs(&["100.64.0.0/10"]);
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("8.8.8.8:7509"),
+            &allowed,
+        ));
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("100.128.0.1:7509"),
+            &allowed,
+        ));
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("100.63.255.255:7509"),
+            &allowed,
+        ));
+    }
+
+    /// DNS-rebinding defense: hostnames must NEVER be accepted via the CIDR
+    /// path, even if the attacker sets up a DNS record that resolves to an
+    /// IP inside the allowed CIDR. We intentionally do not resolve DNS in
+    /// this middleware; only string-parseable IP literals are considered.
+    #[test]
+    fn host_header_hostname_never_accepted_via_cidr() {
+        let allowed = cidrs(&["100.64.0.0/10"]);
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("evil.com"),
+            &allowed,
+        ));
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("evil.com:7509"),
+            &allowed,
+        ));
+        // A hostname that happens to look like an IP at a glance — still a
+        // hostname to `IpAddr::from_str`, so still rejected.
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("100-64-1-5.evil.com"),
+            &allowed,
+        ));
+    }
+
+    /// Empty CIDR list is the default posture. Zero IPs must match, so a
+    /// user who never opted in gets no behaviour change. This is load-bearing
+    /// for the default-deny guarantee.
+    #[test]
+    fn host_header_empty_cidrs_matches_nothing() {
+        let empty = crate::server::AllowedSourceCidrs::default();
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5:7509"),
+            &empty,
+        ));
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("127.0.0.1:7509"),
+            &empty,
+        ));
+    }
+
+    /// IPv6 CIDRs must work end-to-end, including the bracketed `[v6]:port`
+    /// form browsers send in the Host header.
+    #[test]
+    fn host_header_ipv6_in_cidr_allowed() {
+        let allowed = cidrs(&["fd7a:115c:a1e0::/48"]);
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("[fd7a:115c:a1e0::1]:7509"),
+            &allowed,
+        ));
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("[fd7a:115c:a1e0::1]"),
+            &allowed,
+        ));
+        // Outside the /48.
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("[fd7a:115c:a1e1::1]:7509"),
+            &allowed,
+        ));
+    }
+
+    /// Missing Host header must not panic and must not accept.
+    #[test]
+    fn host_header_missing_rejected() {
+        let allowed = cidrs(&["100.64.0.0/10"]);
+        assert!(!host_header_ip_in_cidrs(
+            &axum::http::HeaderMap::new(),
+            &allowed,
         ));
     }
 
