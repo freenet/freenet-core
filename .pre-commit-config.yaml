@@ -12,6 +12,7 @@ repos:
         name: cargo fmt
         description: Run cargo fmt on Rust code
         args: ['--all', '--', '--check']
+        pass_filenames: false
 
   # Custom clippy hook that only runs on packages with changed files
   - repo: local

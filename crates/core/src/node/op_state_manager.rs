@@ -331,6 +331,14 @@ pub(crate) struct OpManager {
     /// Maps contract instance ID to the timestamp (ms since epoch via GlobalSimulationTime)
     /// when the fetch was initiated, with a cooldown to avoid repeated fetch attempts.
     pub(crate) pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
+    /// Transactions with an active task-per-tx relay-GET driver at this
+    /// node. Populated by `start_relay_get` before spawn and removed by
+    /// an RAII guard on the driver task. Consulted by the dispatch gate
+    /// in `node.rs` to reject duplicate inbound Requests for a tx that
+    /// already has a live relay driver — prevents the 3^HTL spawn
+    /// amplification observed in workflow run 24600634908 (6.8M spawns
+    /// in 100s, 63GB RSS).
+    pub(crate) active_relay_get_txs: Arc<DashSet<Transaction>>,
 }
 
 impl Clone for OpManager {
@@ -358,6 +366,7 @@ impl Clone for OpManager {
             blocked_addresses: self.blocked_addresses.clone(),
             configured_gateways: self.configured_gateways.clone(),
             pending_contract_fetches: self.pending_contract_fetches.clone(),
+            active_relay_get_txs: self.active_relay_get_txs.clone(),
         }
     }
 }
@@ -398,6 +407,7 @@ impl OpManager {
         > = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>> =
             Arc::new(DashMap::new());
+        let active_relay_get_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
 
         task_monitor.register(
             "garbage_cleanup",
@@ -415,6 +425,7 @@ impl OpManager {
                     ch_outbound.clone(),
                     contract_waiters.clone(),
                     pending_contract_fetches.clone(),
+                    active_relay_get_txs.clone(),
                 )
                 .instrument(garbage_span),
             ),
@@ -483,6 +494,7 @@ impl OpManager {
                     .collect(),
             ),
             pending_contract_fetches,
+            active_relay_get_txs,
         })
     }
 
@@ -974,6 +986,20 @@ impl OpManager {
             Self::NOTIFICATION_SEND_TIMEOUT,
         )
         .await
+    }
+
+    /// Returns `true` if there is an active `GetOp` stored in `OpManager.ops.get`
+    /// for the given transaction.
+    ///
+    /// Used by the relay GET dispatch in `node.rs` to distinguish a fresh inbound
+    /// relay request (no existing op → spawn the task-per-tx driver) from a
+    /// GC-spawned retry or `start_targeted_op` (existing op → fall through to the
+    /// legacy `handle_op_request` path).
+    ///
+    /// Does **not** check `completed` or `under_progress` — those are covered by
+    /// `pop` / `load_or_init`. This is a lightweight existence check only.
+    pub fn has_get_op(&self, id: &Transaction) -> bool {
+        self.ops.get.contains_key(id)
     }
 
     pub fn completed(&self, id: Transaction) {
@@ -1618,6 +1644,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
         Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
     >,
     pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
+    active_relay_get_txs: Arc<DashSet<Transaction>>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     /// How often to clean up stale contract_waiters entries (every N ticks).
@@ -1650,10 +1677,24 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // runs where we want to correlate RSS growth with retained
                 // state in OpManager/SubOperationTracker.
                 if std::env::var("FREENET_MEMORY_STATS").is_ok() {
+                    use std::sync::atomic::Ordering;
                     let ops_sizes = ops.sizes();
                     let sub_sizes = sub_op_tracker.sizes();
                     let pending_fetches = pending_contract_fetches.len();
                     let waiters_len = contract_waiters.lock().len();
+                    let relay_inflight =
+                        crate::operations::get::op_ctx_task::RELAY_INFLIGHT
+                            .load(Ordering::Relaxed);
+                    let relay_spawned =
+                        crate::operations::get::op_ctx_task::RELAY_SPAWNED_TOTAL
+                            .load(Ordering::Relaxed);
+                    let relay_completed =
+                        crate::operations::get::op_ctx_task::RELAY_COMPLETED_TOTAL
+                            .load(Ordering::Relaxed);
+                    let relay_dedup_rejects =
+                        crate::operations::get::op_ctx_task::RELAY_DEDUP_REJECTS
+                            .load(Ordering::Relaxed);
+                    let relay_active_txs = active_relay_get_txs.len();
                     tracing::info!(
                         target: "memory_stats",
                         tick = tick_count,
@@ -1671,6 +1712,11 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         failed_parents = sub_sizes.failed_parents,
                         pending_contract_fetches = pending_fetches,
                         contract_waiters = waiters_len,
+                        relay_inflight = relay_inflight,
+                        relay_spawned = relay_spawned,
+                        relay_completed = relay_completed,
+                        relay_dedup_rejects = relay_dedup_rejects,
+                        relay_active_txs = relay_active_txs,
                         "memory stats"
                     );
                 }
@@ -3372,5 +3418,55 @@ mod tests {
         );
 
         GlobalSimulationTime::clear_time();
+    }
+
+    // ── has_get_op unit tests ─────────────────────────────────────────────
+    //
+    // `has_get_op` is a thin wrapper over `self.ops.get.contains_key`.
+    // Since `OpManager` requires complex infrastructure to construct in unit
+    // tests, we exercise the underlying `Ops::get` DashMap directly — the
+    // same pattern used by `remove_put_returns_false_for_missing_tx` above.
+    // The delegation in `has_get_op` is one line and trivially correct.
+
+    /// has_get_op returns false for an unknown transaction.
+    #[test]
+    fn has_get_op_returns_false_for_unknown_tx() {
+        let ops = Ops::default();
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        assert!(
+            !ops.get.contains_key(&tx),
+            "ops.get should not contain a never-inserted tx"
+        );
+    }
+
+    /// has_get_op returns true after a GetOp is inserted, and false once removed.
+    #[test]
+    fn has_get_op_returns_true_after_insert_false_after_remove() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let ops = Ops::default();
+        let instance_id = ContractInstanceId::new([0u8; 32]);
+        let get_op = crate::operations::get::start_op(instance_id, false, false, false);
+        let tx = get_op.id;
+
+        // Before insert: absent
+        assert!(
+            !ops.get.contains_key(&tx),
+            "ops.get should not contain tx before insertion"
+        );
+
+        // After insert: present
+        ops.get.insert(tx, get_op);
+        assert!(
+            ops.get.contains_key(&tx),
+            "ops.get should contain tx after insertion"
+        );
+
+        // After remove: absent again
+        ops.get.remove(&tx);
+        assert!(
+            !ops.get.contains_key(&tx),
+            "ops.get should not contain tx after removal"
+        );
     }
 }
