@@ -172,16 +172,29 @@ fn is_allowed_host(headers: &axum::http::HeaderMap, allowed_hosts: &HashSet<Stri
     allowed_hosts.contains(&host_header.to_lowercase())
 }
 
-/// Returns `true` if the request's `Host` header is an IP literal that falls
-/// within one of the operator-allowed source CIDRs.
+/// Returns `true` if the request's `Host` header IP is inside an operator-allowed
+/// source CIDR **and** the `Origin` is compatible with it.
 ///
-/// Only string-parseable IP literals are considered; hostnames are never
-/// matched. This preserves the DNS-rebinding defense provided by
-/// `is_allowed_host`: an attacker at `evil.com` cannot smuggle through by
-/// resolving their hostname to an IP in the allowed range, because we never
-/// resolve DNS here.
+/// "Compatible" means one of:
+/// - `Origin: null` — sandboxed iframe served from the same node (Freenet's
+///   default dApp sandbox intentionally strips origin).
+/// - `Origin` is an IP literal matching the same Host IP (direct browser
+///   access from a user-typed URL).
+///
+/// This is strict on purpose: returning `true` here grants full WS access
+/// to the fully-privileged client API, so we require that the Origin
+/// genuinely corresponds to the Host. An attacker at `https://evil.com`
+/// whose JS targets `ws://<victim-tailnet-ip>:7509/...` sends
+/// `Origin: https://evil.com`, which parses to the hostname `evil.com` —
+/// not an IP, not matching the Host IP — so we refuse. This closes the
+/// cross-site WebSocket hijacking (CSWSH) vector flagged during review of
+/// this PR's earlier iteration.
+///
+/// Only string-parseable IP literals are considered for Host/Origin; DNS
+/// is never resolved, which preserves the DNS-rebinding defence.
 fn host_header_ip_in_cidrs(
     headers: &axum::http::HeaderMap,
+    origin_str: &str,
     allowed_cidrs: &crate::server::AllowedSourceCidrs,
 ) -> bool {
     if allowed_cidrs.is_empty() {
@@ -196,36 +209,138 @@ fn host_header_ip_in_cidrs(
     let Some(ip) = parse_host_header_ip(host_header) else {
         return false;
     };
-    // Normalize IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to IPv4 so an operator's
-    // v4 CIDR matches regardless of which address family the browser chose
-    // when building the Host header. Mirrors `is_source_allowed` in server.rs.
-    let match_ip = match ip {
+    let host_ip = normalize_mapped_v6(ip);
+    if !allowed_cidrs.contains_ip(&host_ip) {
+        return false;
+    }
+    origin_compatible_with_host_ip(origin_str, host_ip)
+}
+
+/// Decides whether an `Origin` header value is compatible with a `Host` IP
+/// that's already been confirmed to be inside an allowed CIDR.
+///
+/// See `host_header_ip_in_cidrs` for the full rationale.
+fn origin_compatible_with_host_ip(origin_str: &str, host_ip: std::net::IpAddr) -> bool {
+    // `Origin: null` is what Freenet's dApp sandbox iframe actually sends.
+    // A malicious sandboxed iframe on evil.com would also send `null`, but
+    // that's the same risk surface as an operator-configured `allowed-host`
+    // entry (existing behaviour); extending the risk to operator-configured
+    // CIDRs is a deliberate choice documented in the PR description.
+    if origin_str == "null" {
+        return true;
+    }
+    let Some(origin_host) = parse_origin_host(origin_str) else {
+        return false;
+    };
+    let Ok(origin_ip) = origin_host.parse::<std::net::IpAddr>() else {
+        // Origin is a hostname (e.g. `evil.com`). Never accept — this is the
+        // primary CSWSH guard.
+        return false;
+    };
+    normalize_mapped_v6(origin_ip) == host_ip
+}
+
+/// Extracts the IP part of a `Host` header value, handling `host:port`,
+/// `[v6]`, and `[v6]:port`. Returns `None` on any deviation from these
+/// forms, including bare unbracketed IPv6, malformed brackets, trailing
+/// garbage, and non-numeric ports.
+///
+/// Strict parsing is deliberate: this function gates a security decision
+/// (CIDR membership for WS upgrades), so any ambiguous input must fail
+/// closed. RFC 7230 requires brackets for IPv6 in the Host header;
+/// anything else is either a bug or an attempt to confuse the parser.
+fn parse_host_header_ip(host_header: &str) -> Option<std::net::IpAddr> {
+    let host = host_header.trim();
+    // Bracketed IPv6 form: `[...]` or `[...]:port`. The content inside the
+    // brackets must parse as IPv6 (not IPv4 — RFC 3986 forbids bracketed
+    // v4). Anything after `]` must be either empty or a numeric port.
+    if let Some(rest) = host.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let inside = &rest[..end];
+        let after = &rest[end + 1..];
+        let v6: std::net::Ipv6Addr = inside.parse().ok()?;
+        if !after.is_empty() && !is_colon_port(after) {
+            return None;
+        }
+        return Some(std::net::IpAddr::V6(v6));
+    }
+    // Unbracketed: must be IPv4 or IPv4:port. Bare IPv6 without brackets
+    // is non-conformant and rejected to avoid ambiguity with `host:port`
+    // where the host is a multi-colon IPv6 literal.
+    let (host_part, after) = host
+        .rsplit_once(':')
+        .map(|(h, p)| (h, Some(p)))
+        .unwrap_or((host, None));
+    let v4: std::net::Ipv4Addr = host_part.parse().ok()?;
+    if let Some(port) = after
+        && (port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(std::net::IpAddr::V4(v4))
+}
+
+/// `true` when `s` looks like a `:port` suffix with an all-digit port body.
+fn is_colon_port(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix(':') else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Extracts the host part of an `Origin` header (e.g. `https://100.64.1.5:7509`
+/// → `100.64.1.5`). Returns `None` for unparseable or scheme-less values so
+/// `origin_compatible_with_host_ip` falls through to reject.
+///
+/// We hand-roll a minimal parser rather than pull in `url`: browsers produce
+/// `scheme://authority` for Origin, and we only need the authority's host-part.
+/// Userinfo (`user@host`) in Origin is not sent by any real browser, but we
+/// tolerate it by stripping the `user@` prefix.
+fn parse_origin_host(origin: &str) -> Option<&str> {
+    let after_scheme = origin.split_once("://").map(|(_, rest)| rest)?;
+    // Strip path/query: Origin header is scheme://authority, but defence in
+    // depth against a weird value like `http://host/extra`.
+    let authority = after_scheme
+        .split_once('/')
+        .map(|(a, _)| a)
+        .unwrap_or(after_scheme);
+    // Strip userinfo.
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    // Bracketed IPv6: `[::1]:port` or `[::1]`.
+    if let Some(rest) = host_and_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return Some(&rest[..end]);
+    }
+    // Strip trailing `:port` only when there's exactly one colon (IPv4/host).
+    // Bare IPv6 without brackets is non-conformant in Origin and doesn't
+    // occur in practice; fall through to `parse()` which will simply fail.
+    Some(
+        match host_and_port
+            .as_bytes()
+            .iter()
+            .filter(|&&b| b == b':')
+            .count()
+        {
+            0 | 1 => host_and_port
+                .rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(host_and_port),
+            _ => host_and_port,
+        },
+    )
+}
+
+fn normalize_mapped_v6(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
         std::net::IpAddr::V6(v6) => v6
             .to_ipv4_mapped()
             .map(std::net::IpAddr::V4)
             .unwrap_or(std::net::IpAddr::V6(v6)),
         v4 => v4,
-    };
-    allowed_cidrs.contains_ip(&match_ip)
-}
-
-/// Extracts the IP part of a `Host` header value, handling `host:port`,
-/// `[v6]`, `[v6]:port`, and bare IPv6 forms. Returns `None` if the host part
-/// isn't a parseable IP literal (i.e. it's a hostname).
-fn parse_host_header_ip(host_header: &str) -> Option<std::net::IpAddr> {
-    let host = host_header.trim();
-    // Bracketed IPv6 form: `[::1]` or `[::1]:7509`.
-    if let Some(rest) = host.strip_prefix('[') {
-        let end = rest.find(']')?;
-        return rest[..end].parse().ok();
     }
-    // Try the whole thing first: handles bare IPv4 (`100.64.1.5`) and bare
-    // IPv6 (`fd7a::1`, non-conformant but parseable). If that fails and
-    // there's a trailing `:port`, strip it and retry.
-    if let Ok(ip) = host.parse() {
-        return Some(ip);
-    }
-    host.rsplit_once(':').and_then(|(h, _)| h.parse().ok())
 }
 
 /// Checks if an error represents a client-side disconnect rather than a server error.
@@ -538,15 +653,14 @@ async fn connection_info(
     if is_ws_upgrade {
         if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
             if let Ok(origin_str) = origin.to_str() {
-                // Accept the upgrade if the origin is localhost, the Host
-                // header matches an allowed hostname, or the Host header is
-                // an IP inside an operator-allowed source CIDR (the path
-                // that unblocks Tailscale-style access). See the
-                // `host_header_ip_in_cidrs` docs for why matching by IP
-                // preserves the DNS-rebinding defense.
+                // Accept the upgrade when the origin is localhost, the Host
+                // header matches an explicit `allowed-host` entry, or the
+                // Host is an IP in `allowed-source-cidrs` *and* the Origin
+                // is compatible with it (null sandboxed iframe or same-IP).
+                // See `host_header_ip_in_cidrs` for the CSWSH rationale.
                 if !is_localhost_origin(origin_str)
                     && !is_allowed_host(req.headers(), &allowed_hosts)
-                    && !host_header_ip_in_cidrs(req.headers(), &allowed_source_cidrs)
+                    && !host_header_ip_in_cidrs(req.headers(), origin_str, &allowed_source_cidrs)
                 {
                     let host_header = req
                         .headers()
@@ -1765,9 +1879,11 @@ mod tests {
         ))
     }
 
-    /// Parsing: `host:port`, `[v6]`, `[v6]:port`, bare v6, and hostnames.
+    /// Parsing: only the two RFC-compliant shapes (`v4[:port]` and
+    /// `[v6][:port]`) are accepted. Every other shape must fail closed.
     #[test]
     fn parse_host_header_ip_variants() {
+        // Happy path: IPv4 with and without port.
         assert_eq!(
             parse_host_header_ip("100.64.1.5:7509"),
             Some("100.64.1.5".parse().unwrap())
@@ -1776,6 +1892,7 @@ mod tests {
             parse_host_header_ip("100.64.1.5"),
             Some("100.64.1.5".parse().unwrap())
         );
+        // Happy path: bracketed IPv6 with and without port.
         assert_eq!(
             parse_host_header_ip("[fd7a:115c:a1e0::1]:7509"),
             Some("fd7a:115c:a1e0::1".parse().unwrap())
@@ -1784,12 +1901,26 @@ mod tests {
             parse_host_header_ip("[fd7a:115c:a1e0::1]"),
             Some("fd7a:115c:a1e0::1".parse().unwrap())
         );
-        // Bare IPv6 without brackets (non-conformant but parseable).
-        assert_eq!(
-            parse_host_header_ip("fd7a:115c:a1e0::1"),
-            Some("fd7a:115c:a1e0::1".parse().unwrap())
-        );
-        // Hostnames must not parse as IPs.
+
+        // Malformed bracket cases — all rejected. These are the
+        // regressions Codex review flagged: trailing junk after `]`
+        // used to be silently accepted and would have matched a CIDR.
+        assert_eq!(parse_host_header_ip("[100.64.1.5]evil.com"), None);
+        assert_eq!(parse_host_header_ip("[100.64.1.5]:7509"), None); // v4 in brackets: no
+        assert_eq!(parse_host_header_ip("[fd7a::1]:notaport"), None);
+        assert_eq!(parse_host_header_ip("[fd7a::1]garbage"), None);
+        assert_eq!(parse_host_header_ip("["), None);
+        assert_eq!(parse_host_header_ip("[]"), None);
+        assert_eq!(parse_host_header_ip("[::1"), None); // unclosed bracket
+
+        // Unbracketed IPv6 is ambiguous with `host:port`, so rejected.
+        assert_eq!(parse_host_header_ip("fd7a:115c:a1e0::1"), None);
+
+        // IPv4 with non-numeric port — rejected.
+        assert_eq!(parse_host_header_ip("100.64.1.5:abc"), None);
+        assert_eq!(parse_host_header_ip("100.64.1.5:"), None);
+
+        // Hostnames never parse as IPs.
         assert_eq!(parse_host_header_ip("evil.com"), None);
         assert_eq!(parse_host_header_ip("evil.com:7509"), None);
         assert_eq!(parse_host_header_ip("localhost:7509"), None);
@@ -1807,16 +1938,19 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("100.64.1.5:7509"),
+            "null",
             &allowed,
         ));
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("100.64.1.5"),
+            "null",
             &allowed,
         ));
         // A neighbouring user's tailnet IP is still inside 100.64.0.0/10;
         // if the operator widened the CIDR, that's the operator's choice.
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("100.127.9.9:7509"),
+            "null",
             &allowed,
         ));
     }
@@ -1828,14 +1962,17 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("8.8.8.8:7509"),
+            "null",
             &allowed,
         ));
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("100.128.0.1:7509"),
+            "null",
             &allowed,
         ));
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("100.63.255.255:7509"),
+            "null",
             &allowed,
         ));
     }
@@ -1849,16 +1986,19 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("evil.com"),
+            "null",
             &allowed,
         ));
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("evil.com:7509"),
+            "null",
             &allowed,
         ));
         // A hostname that happens to look like an IP at a glance is still a
         // hostname to `IpAddr::from_str`, so still rejected.
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("100-64-1-5.evil.com"),
+            "null",
             &allowed,
         ));
     }
@@ -1870,10 +2010,12 @@ mod tests {
         let empty = crate::server::AllowedSourceCidrs::default();
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("100.64.1.5:7509"),
+            "null",
             &empty,
         ));
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("127.0.0.1:7509"),
+            "null",
             &empty,
         ));
     }
@@ -1885,15 +2027,18 @@ mod tests {
         let allowed = cidrs(&["fd7a:115c:a1e0::/48"]);
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("[fd7a:115c:a1e0::1]:7509"),
+            "null",
             &allowed,
         ));
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("[fd7a:115c:a1e0::1]"),
+            "null",
             &allowed,
         ));
         // Outside the /48.
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("[fd7a:115c:a1e1::1]:7509"),
+            "null",
             &allowed,
         ));
     }
@@ -1906,15 +2051,18 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("[::ffff:100.64.1.5]:7509"),
+            "null",
             &allowed,
         ));
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("[::ffff:100.64.1.5]"),
+            "null",
             &allowed,
         ));
         // Mapped v6 OUTSIDE the v4 CIDR still rejected.
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("[::ffff:8.8.8.8]:7509"),
+            "null",
             &allowed,
         ));
     }
@@ -1925,8 +2073,95 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(!host_header_ip_in_cidrs(
             &axum::http::HeaderMap::new(),
+            "null",
             &allowed,
         ));
+    }
+
+    /// CSWSH regression: an attacker at `https://evil.com` whose browser-side
+    /// JS opens `new WebSocket("ws://<victim-tailnet-ip>:7509/...")` sends
+    /// `Origin: https://evil.com` along with `Host: <victim-tailnet-ip>:7509`.
+    /// The Host IP matches the operator's CIDR, but the Origin does not, so
+    /// we must reject. This is the primary guard against cross-site
+    /// WebSocket hijacking introduced in earlier iterations of this PR.
+    #[test]
+    fn cswsh_cross_origin_real_origin_rejected() {
+        let allowed = cidrs(&["100.64.0.0/10"]);
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5:7509"),
+            "https://evil.com",
+            &allowed,
+        ));
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5:7509"),
+            "http://evil.com:8080",
+            &allowed,
+        ));
+        // Even an origin that spells an IP but doesn't match the Host IP
+        // is rejected — this catches attacker pages hosted on one CIDR
+        // peer trying to hijack a different peer.
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5:7509"),
+            "http://100.64.9.9:7509",
+            &allowed,
+        ));
+    }
+
+    /// Direct browser access (user typed `http://100.64.1.5:7509/` into the
+    /// address bar): Origin and Host refer to the same IP. Must be accepted.
+    #[test]
+    fn direct_browser_access_same_ip_accepted() {
+        let allowed = cidrs(&["100.64.0.0/10"]);
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5:7509"),
+            "http://100.64.1.5:7509",
+            &allowed,
+        ));
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5:7509"),
+            "https://100.64.1.5",
+            &allowed,
+        ));
+    }
+
+    /// The `Origin: null` case covers Freenet's sandboxed dApp iframe, which
+    /// deliberately strips origin via `<iframe sandbox=...>` without
+    /// `allow-same-origin`. Must be accepted when Host IP is in CIDR. A
+    /// malicious sandboxed iframe hosted on evil.com would also send
+    /// `Origin: null` — this is the documented CSWSH risk the operator
+    /// accepts when configuring `--allowed-source-cidrs` (equivalent risk
+    /// profile to an explicit `--allowed-host` entry).
+    #[test]
+    fn origin_null_accepted_for_sandboxed_iframe() {
+        let allowed = cidrs(&["100.64.0.0/10"]);
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5:7509"),
+            "null",
+            &allowed,
+        ));
+    }
+
+    /// Unit tests for the Origin host-part extractor.
+    #[test]
+    fn parse_origin_host_variants() {
+        assert_eq!(
+            parse_origin_host("http://100.64.1.5:7509"),
+            Some("100.64.1.5")
+        );
+        assert_eq!(parse_origin_host("https://100.64.1.5"), Some("100.64.1.5"));
+        assert_eq!(
+            parse_origin_host("http://[fd7a:115c:a1e0::1]:7509"),
+            Some("fd7a:115c:a1e0::1")
+        );
+        assert_eq!(parse_origin_host("http://evil.com:8080"), Some("evil.com"));
+        // Userinfo (non-standard in Origin, but tolerated).
+        assert_eq!(
+            parse_origin_host("http://user@100.64.1.5:7509"),
+            Some("100.64.1.5")
+        );
+        // Missing scheme → not a valid Origin.
+        assert_eq!(parse_origin_host("evil.com"), None);
+        assert_eq!(parse_origin_host(""), None);
     }
 
     #[test]
