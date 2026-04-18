@@ -1261,11 +1261,22 @@ struct DataLeaves {
     cache_lowercase: Option<PathBuf>,
     /// Log dir (as returned by `tracing::get_log_dir`).
     log: Option<PathBuf>,
-    /// Whether the log parent is Freenet-owned and therefore safe to
-    /// collapse. True on Windows (`%LOCALAPPDATA%\freenet\`), false on
-    /// Linux/macOS where the parent belongs to the XDG hierarchy shared
-    /// with other apps.
-    collapse_log_parent: bool,
+    /// Whether the parents of our leaves are Freenet-owned and therefore
+    /// safe to collapse if empty.
+    ///
+    /// True on Windows — `ProjectDirs` there builds
+    /// `%LOCALAPPDATA%\The Freenet Project Inc\Freenet\{data,config,cache}`
+    /// and `get_log_dir` returns `%LOCALAPPDATA%\freenet\logs`; the
+    /// immediate parents (`...\Freenet`, `...\freenet`) exist only for us.
+    ///
+    /// False on Linux/macOS — `ProjectDirs` builds `~/.local/share/Freenet`,
+    /// `~/.config/Freenet`, `~/.cache/Freenet` (Linux) and analogous paths
+    /// on macOS. The parents of those leaves are shared XDG/OS hierarchies
+    /// used by every other app on the system — collapsing them would at
+    /// best no-op (by luck) and at worst delete an otherwise-empty shared
+    /// root on a fresh account. The safety must be enforced at the type
+    /// level, not left to `remove_dir_if_empty`'s runtime check.
+    collapse_parents: bool,
 }
 
 impl DataLeaves {
@@ -1301,7 +1312,7 @@ impl DataLeaves {
         }
 
         leaves.log = get_log_dir();
-        leaves.collapse_log_parent = cfg!(target_os = "windows");
+        leaves.collapse_parents = cfg!(target_os = "windows");
 
         leaves
     }
@@ -1315,32 +1326,35 @@ impl DataLeaves {
 /// that still holds a sibling app's data.
 fn purge_leaves_and_collapse(leaves: &DataLeaves) -> Result<()> {
     let mut parents: Vec<PathBuf> = Vec::new();
+    let collect = |leaf: &Path, acc: &mut Vec<PathBuf>| {
+        if leaves.collapse_parents {
+            push_parent(leaf, acc);
+        }
+    };
 
     if let Some(ref data_local) = leaves.data_local {
         remove_if_exists("data", data_local)?;
-        push_parent(data_local, &mut parents);
+        collect(data_local, &mut parents);
     }
     if let Some(ref roaming) = leaves.data_roaming {
         remove_if_exists("data (legacy roaming)", roaming)?;
-        push_parent(roaming, &mut parents);
+        collect(roaming, &mut parents);
     }
     if let Some(ref config) = leaves.config {
         remove_if_exists("config", config)?;
-        push_parent(config, &mut parents);
+        collect(config, &mut parents);
     }
     if let Some(ref cache) = leaves.cache {
         remove_if_exists("cache", cache)?;
-        push_parent(cache, &mut parents);
+        collect(cache, &mut parents);
     }
     if let Some(ref cache_lower) = leaves.cache_lowercase {
         remove_if_exists("cache", cache_lower)?;
-        push_parent(cache_lower, &mut parents);
+        collect(cache_lower, &mut parents);
     }
     if let Some(ref log) = leaves.log {
         remove_if_exists("logs", log)?;
-        if leaves.collapse_log_parent {
-            push_parent(log, &mut parents);
-        }
+        collect(log, &mut parents);
     }
 
     // Sort ascending, dedup consecutive duplicates, then reverse so that
@@ -2839,7 +2853,7 @@ mod tests {
             cache: Some(cache),
             cache_lowercase: None,
             log: Some(log),
-            collapse_log_parent: true,
+            collapse_parents: true,
         }
     }
 
@@ -2928,33 +2942,61 @@ mod tests {
     }
 
     #[test]
-    fn test_purge_leaves_collapses_log_parent_only_when_flagged() {
-        // On Linux/macOS, `get_log_dir()` returns a path under a shared
-        // XDG parent (`~/.local/state/`, `~/Library/Logs/`). Even if it
-        // happens to be empty at uninstall time, we must not pretend it's
-        // ours to remove. This test documents that contract.
+    fn test_purge_leaves_never_collapses_shared_parents_on_unix() {
+        // Reproduces the codex-caught bug: on Linux `ProjectDirs` builds
+        // `~/.local/share/Freenet`, `~/.config/Freenet`, `~/.cache/Freenet`
+        // (and analogous macOS paths), whose parents are shared across
+        // every app on the system. Collapsing any of them, even when the
+        // `remove_dir_if_empty` non-empty check makes it safe in practice
+        // on an active system, would wipe a shared XDG root on a fresh
+        // account where Freenet was the only inhabitant. The
+        // `collapse_parents: false` setting must suppress every collapse.
         let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("shared-state-dir").join("freenet");
-        std::fs::create_dir_all(&log).unwrap();
-        std::fs::write(log.join("trace.log"), b"log").unwrap();
+
+        // Each leaf sits in its own dedicated parent to verify each
+        // collapse path independently.
+        let shared_share = tmp.path().join("share");
+        let shared_config = tmp.path().join("config");
+        let shared_cache = tmp.path().join("cache");
+        let shared_logs = tmp.path().join("state");
+
+        let data = shared_share.join("Freenet");
+        let config = shared_config.join("Freenet");
+        let cache = shared_cache.join("Freenet");
+        let log = shared_logs.join("freenet");
+
+        for d in [&data, &config, &cache, &log] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("a"), b"x").unwrap();
+        }
 
         let leaves = DataLeaves {
-            data_local: None,
+            data_local: Some(data.clone()),
             data_roaming: None,
-            config: None,
-            cache: None,
+            config: Some(config.clone()),
+            cache: Some(cache.clone()),
             cache_lowercase: None,
             log: Some(log.clone()),
-            collapse_log_parent: false,
+            collapse_parents: false,
         };
 
         purge_leaves_and_collapse(&leaves).unwrap();
 
-        assert!(!log.exists(), "log leaf should still be removed");
-        assert!(
-            log.parent().unwrap().exists(),
-            "shared log parent must NOT be collapsed when flag is false",
-        );
+        // Every leaf removed.
+        for leaf in [&data, &config, &cache, &log] {
+            assert!(!leaf.exists(), "leaf {} should be removed", leaf.display());
+        }
+
+        // Every shared parent preserved — this is what protects
+        // `~/.local/share/`, `~/.config/`, `~/.cache/`, `~/.local/state/`
+        // on real systems.
+        for parent in [&shared_share, &shared_config, &shared_cache, &shared_logs] {
+            assert!(
+                parent.exists(),
+                "shared parent {} must NOT be collapsed on Unix",
+                parent.display(),
+            );
+        }
     }
 
     #[test]
@@ -2974,7 +3016,7 @@ mod tests {
             cache: None,
             cache_lowercase: None,
             log: None,
-            collapse_log_parent: false,
+            collapse_parents: false,
         };
 
         purge_leaves_and_collapse(&leaves).unwrap();
