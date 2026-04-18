@@ -442,7 +442,7 @@ main() {
     echo "  curl -fsSL https://freenet.org/uninstall.sh | sh        # fallback"
     echo ""
     echo "Do NOT prefix either command with 'sudo'. This installer placed Freenet"
-    echo "under $install_dir, which is typically not on sudo's PATH — sudo would"
+    echo "under $install_dir, which is typically not on sudo's PATH - sudo would"
     echo "fail with 'command not found' and leave your install untouched. Only"
     echo "use sudo if you originally installed with 'freenet service install --system'."
     echo ""

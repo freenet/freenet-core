@@ -4,8 +4,9 @@
 #
 # Removes Freenet from the current user's install:
 #  - Stops and removes the user systemd service / launchd agent.
-#  - Deletes the `freenet` and `fdev` binaries from every known install
-#    location (curl installer, cargo install, and the current exe's dir).
+#  - Deletes the freenet and fdev binaries from every known install
+#    location (install.sh default ~/.local/bin, cargo install default
+#    ~/.cargo/bin, and FREENET_INSTALL_DIR if set).
 #  - Optionally purges data, config, cache, and logs.
 #
 # This script works even when the installed `freenet` binary is missing,
@@ -61,10 +62,42 @@ has_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# --- Safety guards --------------------------------------------------------
+#
+# Everything we remove is expressed as "${HOME}/..." paths. If $HOME is
+# unset, empty, or points at an OS-owned location, those joins resolve to
+# absolute system paths (e.g. `rm -rf "/Library/Application Support/..."`
+# on macOS). Refuse before the first `rm`.
+case "${HOME:-}" in
+    "")
+        error "HOME is unset or empty. Refusing to run - the uninstall would
+target absolute system paths instead of your install."
+        ;;
+    "/"|"/root"|"/root/"|"/var/root"|"/var/root/")
+        # These are sysadmin / service-account homes. Removing Freenet
+        # artifacts there is legitimate only for a deliberate system-wide
+        # cleanup, which this script is NOT designed for.
+        error "HOME=${HOME} looks like a system/admin home directory. This
+uninstaller targets user-level installs only. For a system-wide install,
+use: sudo freenet service uninstall --system"
+        ;;
+esac
+
 # Guard against well-meaning `sudo curl | sudo sh`: this script operates on
 # the invoking user's home directory, so running under root silently wipes
-# root's home rather than the user's. Short-circuit with a clear message.
-if [ "$(id -u)" = "0" ] && [ -z "${FREENET_ALLOW_ROOT:-}" ]; then
+# root's home rather than the user's. Use an absolute path for `id` so a
+# shadowed ~/.local/bin/id can't lie to us about the effective user.
+id_real_uid() {
+    if [ -x /usr/bin/id ]; then
+        /usr/bin/id -u 2>/dev/null
+    elif [ -x /bin/id ]; then
+        /bin/id -u 2>/dev/null
+    else
+        command -p id -u 2>/dev/null || printf ''
+    fi
+}
+
+if [ "$(id_real_uid)" = "0" ] && [ -z "${FREENET_ALLOW_ROOT:-}" ]; then
     error "Do not run this uninstaller with sudo. The Freenet install lives in your own
 home directory (~/.local/bin), not root's. Re-run without sudo, or set
 FREENET_ALLOW_ROOT=1 if you really mean to uninstall root's install."
@@ -81,9 +114,10 @@ Usage: uninstall.sh [--purge | --keep-data] [-y|--yes]
 
 Removes Freenet from the current user's install: stops and removes the
 user systemd service / launchd agent, deletes the freenet and fdev
-binaries from every known install location (curl installer, cargo
-install, and the current exe's dir), and optionally purges data,
-config, cache, and logs.
+binaries from every known install location (install.sh default
+~/.local/bin, cargo install default ~/.cargo/bin, and
+FREENET_INSTALL_DIR if set), and optionally purges data, config,
+cache, and logs.
 
 Options:
   --purge         Also delete data, config, cache, and logs
@@ -158,7 +192,7 @@ if [ "$OS" = "linux" ]; then
         info "Removed ${UNIT}"
         removed_service="${removed_service:-user systemd}"
     fi
-    # System-wide unit — leave alone by default; needs sudo.
+    # System-wide unit - leave alone by default; needs sudo.
     if [ -f /etc/systemd/system/freenet.service ]; then
         warn "A system-wide service unit exists at /etc/systemd/system/freenet.service.
        This script only manages the user-level install. Remove the system unit with:
@@ -187,10 +221,20 @@ remove_binary() {
     fi
 }
 
+# Build the ordered list of directories to scan for binaries. If
+# FREENET_INSTALL_DIR was used at install time, it's the only directory
+# install.sh wrote to, so the user expects it to be cleaned up here too.
+# Always include the two default user-level locations as well, since a
+# user may have installed multiple times in different ways.
+install_dirs="${HOME}/.local/bin ${HOME}/.cargo/bin"
+if [ -n "${FREENET_INSTALL_DIR:-}" ]; then
+    install_dirs="${FREENET_INSTALL_DIR} ${install_dirs}"
+fi
+
 # Iterate install locations with a for-loop (not a pipe to `while read`) so
-# that updates to `removed_binaries` survive into the summary step — the
+# that updates to `removed_binaries` survive into the summary step - the
 # pipe variant runs the while-body in a subshell under POSIX sh.
-for dir in "${HOME}/.local/bin" "${HOME}/.cargo/bin"; do
+for dir in $install_dirs; do
     [ -d "$dir" ] || continue
     for bin in freenet fdev freenet-service-wrapper.sh; do
         remove_binary "${dir}/${bin}"
@@ -224,10 +268,14 @@ should_purge() {
 if should_purge; then
     info "Removing data, config, cache, and logs..."
     if [ "$OS" = "linux" ]; then
+        # The `directories` crate lowercases the application name on Linux
+        # (`project_dirs_from` → `trim_and_lowercase_then_replace_spaces`),
+        # so `ProjectDirs::from("", "The Freenet Project Inc", "Freenet")`
+        # resolves to lowercase `freenet` paths - not the uppercase
+        # `Freenet` that earlier versions of these docs mistakenly used.
         rm -rf \
-            "${HOME}/.local/share/Freenet" \
-            "${HOME}/.config/Freenet" \
-            "${HOME}/.cache/Freenet" \
+            "${HOME}/.local/share/freenet" \
+            "${HOME}/.config/freenet" \
             "${HOME}/.cache/freenet" \
             "${HOME}/.local/state/freenet"
     else
@@ -247,7 +295,7 @@ fi
 # --- Summary --------------------------------------------------------------
 
 if [ -z "$removed_service" ] && [ "$removed_binaries" = "0" ]; then
-    info "Nothing to uninstall — Freenet does not appear to be installed for this user."
+    info "Nothing to uninstall - Freenet does not appear to be installed for this user."
 else
     success "Freenet uninstalled."
 fi
