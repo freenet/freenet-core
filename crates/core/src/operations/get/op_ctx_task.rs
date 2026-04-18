@@ -2673,12 +2673,13 @@ mod tests {
     ///   - `htl: new_htl` where `new_htl = htl.saturating_sub(1)`
     ///   - `visited: new_visited.clone()` (the bloom filter containing
     ///     own_addr and upstream_addr plus the caller's skip set)
-    ///   - `id: attempt_tx` (fresh per-iteration tx, not `incoming_tx`)
+    ///   - `id: incoming_tx` (reused across retries — matches legacy
+    ///     end-to-end tx preservation; see the amplification comment
+    ///     on that line for why the original per-iteration `attempt_tx`
+    ///     caused 7M spawns / 100s in ci-fault-loss)
     ///
-    /// Without per-iteration `attempt_tx`, the single-use-per-tx invariant
-    /// for `send_and_await` is violated. Without `new_visited.clone()` the
-    /// downstream relay's skip list is missing upstream hops, leading to
-    /// loop formation.
+    /// Without `new_visited.clone()` the downstream relay's skip list is
+    /// missing upstream hops, leading to loop formation.
     #[test]
     fn forwarded_request_decrements_htl_and_propagates_visited() {
         let src = production_source();
@@ -2711,10 +2712,12 @@ mod tests {
              tried, forming routing loops. Window: {window}"
         );
         assert!(
-            window.contains("id: attempt_tx"),
-            "Forwarded GetMsg::Request must set `id: attempt_tx` (fresh \
-             per-iteration Transaction), not `incoming_tx`; send_and_await \
-             requires single-use-per-tx."
+            window.contains("id: incoming_tx"),
+            "Forwarded GetMsg::Request must reuse `id: incoming_tx` (legacy \
+             end-to-end tx preservation). Minting a fresh tx per retry (the \
+             original phase-5 implementation) caused downstream to treat each \
+             retry as a brand-new Request and spawn a fresh relay subtree, \
+             producing 7M spawns in 100s of ci-fault-loss and 63GB RSS."
         );
     }
 
