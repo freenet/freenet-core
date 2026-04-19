@@ -55,10 +55,20 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
   subscribe/op_ctx_task.rs → client-initiated SUBSCRIBE driver
   put/op_ctx_task.rs       → client-initiated PUT driver (Phase 3a)
   get/op_ctx_task.rs       → client-initiated GET driver (Phase 3b)
-  update/op_ctx_task.rs    → client-initiated UPDATE driver (Phase 4, fire-and-forget)
-    All use the shared `RetryDriver` trait from `op_ctx.rs` and
-    bypass the OpManager.ops DashMap, owning retry state in task locals.
-    Relay GETs stay on the legacy state machine (tracked in #3883).
+                             + fresh inbound relay GET driver (Phase 5,
+                             PR #3896, `start_relay_get`)
+  update/op_ctx_task.rs    → client-initiated UPDATE driver (Phase 4,
+                             fire-and-forget) + fresh inbound non-streaming
+                             relay UPDATE drivers (Phase 5 follow-up slice
+                             A: `start_relay_request_update`,
+                             `start_relay_broadcast_to`)
+    Client + relay GET / UPDATE share the per-node dedup gate
+    (`active_relay_get_txs`, `active_relay_update_txs`) and the
+    `Relay*InflightGuard` RAII pattern. Streaming UPDATE relay variants
+    (`RequestUpdateStreaming`, `BroadcastToStreaming`) and the
+    deprecated `Broadcasting` variant remain on the legacy path
+    pending slice B. PUT and SUBSCRIBE relay paths still go through
+    the legacy state machine.
 ```
 
 ## Module Map

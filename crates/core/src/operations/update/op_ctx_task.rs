@@ -759,12 +759,22 @@ async fn drive_relay_request_update(
     }
 
     // Forward downstream. We use the INCOMING tx (end-to-end preservation).
-    // Streaming variants are handled on the legacy path in slice A; if the
-    // payload size triggers streaming, fall back to legacy by emitting the
-    // forward via legacy plumbing in commit 2's dispatch (TODO: confirm
-    // dispatch falls through to legacy when payload requires streaming —
-    // currently slice A only routes non-streaming RequestUpdate to the
-    // driver).
+    //
+    // Slice A scope: this driver only handles inbound non-streaming
+    // `UpdateMsg::RequestUpdate` (the dispatch gate in node.rs filters
+    // out `RequestUpdateStreaming`). On the relay forward we re-emit
+    // non-streaming `RequestUpdate` regardless of payload size — the
+    // streaming-upgrade path on relay forward (legacy update.rs:518-535
+    // checks `should_use_streaming` before emitting `RequestUpdate` vs
+    // `RequestUpdateStreaming`) is deferred to slice B together with
+    // the streaming-variant migration. Tracked in
+    // docs/port-plans/relay-update-task-per-tx.md §3 / §9.
+    //
+    // Practical impact in slice A: large UPDATE payloads arriving as
+    // non-streaming `RequestUpdate` (which only happens if the upstream
+    // relay decided not to stream them) are forwarded as non-streaming
+    // — the same shape they arrived in. Slice B will add the size
+    // check + variant upgrade.
     let request = NetMessage::from(UpdateMsg::RequestUpdate {
         id: incoming_tx,
         key,
