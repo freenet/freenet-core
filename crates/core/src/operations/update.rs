@@ -2173,7 +2173,7 @@ impl IsOperationCompleted for UpdateOp {
 ///
 /// Accepts the already-computed summary from `UpdateExecution` to avoid an
 /// extra WASM `summarize_state` call.
-async fn send_proactive_summary_notification(
+pub(crate) async fn send_proactive_summary_notification(
     op_manager: &OpManager,
     key: &ContractKey,
     sender_addr: SocketAddr,

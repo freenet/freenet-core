@@ -339,6 +339,15 @@ pub(crate) struct OpManager {
     /// amplification observed in workflow run 24600634908 (6.8M spawns
     /// in 100s, 63GB RSS).
     pub(crate) active_relay_get_txs: Arc<DashSet<Transaction>>,
+    /// Set of transactions currently being driven by a relay UPDATE
+    /// task-per-tx driver on this node. Same role as
+    /// `active_relay_get_txs` but for UPDATE relay (#1454 phase 5
+    /// follow-up). UPDATE relay has no retry loop and no upstream
+    /// reply, so the amplification risk is structurally lower than GET
+    /// — the dedup gate exists primarily for robustness against
+    /// GC-spawned re-entries and routing-bloom false-positive
+    /// retransmissions.
+    pub(crate) active_relay_update_txs: Arc<DashSet<Transaction>>,
 }
 
 impl Clone for OpManager {
@@ -367,6 +376,7 @@ impl Clone for OpManager {
             configured_gateways: self.configured_gateways.clone(),
             pending_contract_fetches: self.pending_contract_fetches.clone(),
             active_relay_get_txs: self.active_relay_get_txs.clone(),
+            active_relay_update_txs: self.active_relay_update_txs.clone(),
         }
     }
 }
@@ -408,6 +418,7 @@ impl OpManager {
         let pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>> =
             Arc::new(DashMap::new());
         let active_relay_get_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
+        let active_relay_update_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
 
         task_monitor.register(
             "garbage_cleanup",
@@ -426,6 +437,7 @@ impl OpManager {
                     contract_waiters.clone(),
                     pending_contract_fetches.clone(),
                     active_relay_get_txs.clone(),
+                    active_relay_update_txs.clone(),
                 )
                 .instrument(garbage_span),
             ),
@@ -495,6 +507,7 @@ impl OpManager {
             ),
             pending_contract_fetches,
             active_relay_get_txs,
+            active_relay_update_txs,
         })
     }
 
@@ -1000,6 +1013,19 @@ impl OpManager {
     /// `pop` / `load_or_init`. This is a lightweight existence check only.
     pub fn has_get_op(&self, id: &Transaction) -> bool {
         self.ops.get.contains_key(id)
+    }
+
+    /// Returns `true` if an `UpdateOp` is currently registered for this
+    /// transaction in `OpManager.ops.update`.
+    ///
+    /// Same role as `has_get_op` but for the relay UPDATE dispatch gate
+    /// (#1454 phase 5 follow-up). Used by `node.rs` to distinguish a fresh
+    /// inbound relay update (no existing op → spawn the task-per-tx driver)
+    /// from a GC-spawned retry or `start_targeted_op`-style internal caller
+    /// (existing op → fall through to the legacy `handle_op_request` path).
+    #[allow(dead_code)] // Wired in commit 2 of this slice.
+    pub fn has_update_op(&self, id: &Transaction) -> bool {
+        self.ops.update.contains_key(id)
     }
 
     pub fn completed(&self, id: Transaction) {
@@ -1645,6 +1671,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     >,
     pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
     active_relay_get_txs: Arc<DashSet<Transaction>>,
+    active_relay_update_txs: Arc<DashSet<Transaction>>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     /// How often to clean up stale contract_waiters entries (every N ticks).
@@ -1695,6 +1722,19 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         crate::operations::get::op_ctx_task::RELAY_DEDUP_REJECTS
                             .load(Ordering::Relaxed);
                     let relay_active_txs = active_relay_get_txs.len();
+                    let relay_update_inflight =
+                        crate::operations::update::op_ctx_task::RELAY_UPDATE_INFLIGHT
+                            .load(Ordering::Relaxed);
+                    let relay_update_spawned =
+                        crate::operations::update::op_ctx_task::RELAY_UPDATE_SPAWNED_TOTAL
+                            .load(Ordering::Relaxed);
+                    let relay_update_completed =
+                        crate::operations::update::op_ctx_task::RELAY_UPDATE_COMPLETED_TOTAL
+                            .load(Ordering::Relaxed);
+                    let relay_update_dedup_rejects =
+                        crate::operations::update::op_ctx_task::RELAY_UPDATE_DEDUP_REJECTS
+                            .load(Ordering::Relaxed);
+                    let relay_update_active_txs = active_relay_update_txs.len();
                     tracing::info!(
                         target: "memory_stats",
                         tick = tick_count,
@@ -1717,6 +1757,11 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         relay_completed = relay_completed,
                         relay_dedup_rejects = relay_dedup_rejects,
                         relay_active_txs = relay_active_txs,
+                        relay_update_inflight = relay_update_inflight,
+                        relay_update_spawned = relay_update_spawned,
+                        relay_update_completed = relay_update_completed,
+                        relay_update_dedup_rejects = relay_update_dedup_rejects,
+                        relay_update_active_txs = relay_update_active_txs,
                         "memory stats"
                     );
                 }
@@ -3467,6 +3512,59 @@ mod tests {
         assert!(
             !ops.get.contains_key(&tx),
             "ops.get should not contain tx after removal"
+        );
+    }
+
+    // ── has_update_op unit tests ──────────────────────────────────────────
+    //
+    // Same shape as has_get_op tests above. `has_update_op` is a one-line
+    // wrapper over `self.ops.update.contains_key`, so we exercise the
+    // underlying map directly.
+
+    /// has_update_op returns false for an unknown transaction.
+    #[test]
+    fn has_update_op_returns_false_for_unknown_tx() {
+        let ops = Ops::default();
+        let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
+        assert!(
+            !ops.update.contains_key(&tx),
+            "ops.update should not contain a never-inserted tx"
+        );
+    }
+
+    /// has_update_op returns true after an UpdateOp is inserted, and false
+    /// once removed.
+    #[test]
+    fn has_update_op_returns_true_after_insert_false_after_remove() {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let ops = Ops::default();
+        let instance_id = ContractInstanceId::new([0u8; 32]);
+        let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([1u8; 32]));
+        let update_op = crate::operations::update::start_op(
+            key,
+            freenet_stdlib::prelude::UpdateData::State(freenet_stdlib::prelude::State::from(vec![
+                1, 2, 3,
+            ])),
+            freenet_stdlib::prelude::RelatedContracts::default(),
+        );
+        let tx = update_op.id;
+
+        assert!(
+            !ops.update.contains_key(&tx),
+            "ops.update should not contain tx before insertion"
+        );
+
+        ops.update.insert(tx, update_op);
+        assert!(
+            ops.update.contains_key(&tx),
+            "ops.update should contain tx after insertion"
+        );
+
+        ops.update.remove(&tx);
+        assert!(
+            !ops.update.contains_key(&tx),
+            "ops.update should not contain tx after removal"
         );
     }
 }
