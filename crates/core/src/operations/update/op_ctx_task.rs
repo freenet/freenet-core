@@ -428,7 +428,21 @@ pub(crate) async fn start_relay_request_update(
         "UPDATE relay (task-per-tx): spawning RequestUpdate driver"
     );
 
+    // Construct guard + bump counters BEFORE spawn so the dedup-set
+    // entry is paired with a Drop even if the spawned future is dropped
+    // before its first poll (executor shutdown, scheduling panic).
+    // Without this, a pre-poll drop would permanently leak the
+    // `active_relay_update_txs` entry — no TTL → permanent dedup
+    // blind-spot for that tx.
+    RELAY_UPDATE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RELAY_UPDATE_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = RelayUpdateInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
     GlobalExecutor::spawn(run_relay_request_update(
+        guard,
         op_manager,
         incoming_tx,
         key,
@@ -477,7 +491,17 @@ pub(crate) async fn start_relay_broadcast_to(
         "UPDATE relay (task-per-tx): spawning BroadcastTo driver"
     );
 
+    // See `start_relay_request_update` — guard pre-spawn closes the
+    // pre-poll dedup-leak window.
+    RELAY_UPDATE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RELAY_UPDATE_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = RelayUpdateInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
     GlobalExecutor::spawn(run_relay_broadcast_to(
+        guard,
         op_manager,
         incoming_tx,
         key,
@@ -508,6 +532,7 @@ impl Drop for RelayUpdateInflightGuard {
 }
 
 async fn run_relay_request_update(
+    guard: RelayUpdateInflightGuard,
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
     key: ContractKey,
@@ -515,12 +540,7 @@ async fn run_relay_request_update(
     value: WrappedState,
     sender_addr: SocketAddr,
 ) {
-    RELAY_UPDATE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    RELAY_UPDATE_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _guard = RelayUpdateInflightGuard {
-        op_manager: op_manager.clone(),
-        incoming_tx,
-    };
+    let _guard = guard;
 
     if let Err(err) = drive_relay_request_update(
         &op_manager,
@@ -543,6 +563,7 @@ async fn run_relay_request_update(
 }
 
 async fn run_relay_broadcast_to(
+    guard: RelayUpdateInflightGuard,
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
     key: ContractKey,
@@ -550,12 +571,7 @@ async fn run_relay_broadcast_to(
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
 ) {
-    RELAY_UPDATE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    RELAY_UPDATE_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _guard = RelayUpdateInflightGuard {
-        op_manager: op_manager.clone(),
-        incoming_tx,
-    };
+    let _guard = guard;
 
     if let Err(err) = drive_relay_broadcast_to(
         &op_manager,
@@ -970,7 +986,7 @@ async fn drive_relay_broadcast_to(
     // 100ms-per-contract throttle inside the task.
     let op_mgr = op_manager.clone();
     let summary = update_summary.clone();
-    tokio::spawn(async move {
+    GlobalExecutor::spawn(async move {
         super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, summary).await;
     });
 
