@@ -24,8 +24,17 @@ paths:
 > state-machine path**, which still serves: GC-spawned GET retries and
 > `start_targeted_op` UPDATE-triggered auto-fetch (streaming relay and
 > originator loopback also remain on legacy per #3883 port plan §7),
-> PUT relay/GC paths, UPDATE relay/broadcast, CONNECT, and SUBSCRIBE's
-> renewal / PUT-sub-op / executor / intermediate-peer entry points.
+> PUT relay/GC paths, UPDATE relay streaming variants
+> (`RequestUpdateStreaming`, `BroadcastToStreaming`) and the deprecated
+> `Broadcasting` wire variant, CONNECT, and SUBSCRIBE's renewal /
+> PUT-sub-op / executor / intermediate-peer entry points. Phase 5
+> follow-up slice A (PR #3910) migrated fresh inbound non-streaming
+> relay `UpdateMsg::RequestUpdate` and `UpdateMsg::BroadcastTo` to
+> `operations/update/op_ctx_task.rs::start_relay_request_update` /
+> `start_relay_broadcast_to` (gated on `source_addr.is_some()` AND
+> `!has_update_op(id)`); GC retries / `start_targeted_op` UPDATE
+> auto-fetch / originator loopback still go through legacy. Slices B
+> (streaming variants) and C (legacy arm cleanup) follow.
 >
 > Task-per-tx drivers have their own invariants documented in the
 > `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.
