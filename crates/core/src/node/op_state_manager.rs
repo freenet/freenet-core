@@ -1023,7 +1023,6 @@ impl OpManager {
     /// inbound relay update (no existing op → spawn the task-per-tx driver)
     /// from a GC-spawned retry or `start_targeted_op`-style internal caller
     /// (existing op → fall through to the legacy `handle_op_request` path).
-    #[allow(dead_code)] // Wired in commit 2 of this slice.
     pub fn has_update_op(&self, id: &Transaction) -> bool {
         self.ops.update.contains_key(id)
     }

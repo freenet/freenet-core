@@ -397,7 +397,6 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 /// Returns immediately after spawning. Driver publishes its own side
 /// effects (local merge → BroadcastStateChange via the executor, OR a
 /// single fire-and-forget downstream forward).
-#[allow(dead_code)] // Wired in commit 2 of this slice.
 pub(crate) async fn start_relay_request_update(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
@@ -447,7 +446,6 @@ pub(crate) async fn start_relay_request_update(
 /// `BroadcastStateChange` event fans out to other interested peers
 /// automatically — the driver itself never sends `BroadcastTo`
 /// downstream.
-#[allow(dead_code)] // Wired in commit 2 of this slice.
 pub(crate) async fn start_relay_broadcast_to(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
