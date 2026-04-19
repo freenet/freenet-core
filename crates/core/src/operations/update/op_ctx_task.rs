@@ -740,9 +740,18 @@ async fn drive_relay_request_update(
         }
     };
 
-    let forward_addr = forward_target
-        .socket_addr()
-        .expect("forward target must have socket address");
+    let forward_addr = match forward_target.socket_addr() {
+        Some(addr) => addr,
+        None => {
+            tracing::error!(
+                tx = %incoming_tx,
+                %key,
+                target_pub_key = %forward_target.pub_key(),
+                "UPDATE relay (task-per-tx): forward target has no socket address"
+            );
+            return Err(OpError::RingError(RingError::NoHostingPeers(*key.id())));
+        }
+    };
 
     tracing::debug!(
         tx = %incoming_tx,
