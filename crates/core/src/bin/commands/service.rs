@@ -236,8 +236,10 @@ const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
 pub(crate) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 
 /// host:port pair the dashboard HTTP server listens on. Kept in sync with
-/// `DASHBOARD_URL`.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+/// `DASHBOARD_URL`. Not cfg-gated even though only the tray wrappers use
+/// it at runtime, so the `dashboard_url_and_addr_stay_in_sync` test can
+/// assert their consistency on Linux CI.
+#[allow(dead_code)]
 const DASHBOARD_ADDR: &str = "127.0.0.1:7509";
 
 /// Open a URL in the default browser (platform-specific).
@@ -286,30 +288,54 @@ fn dashboard_port_is_listening() -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
+/// At-most-once guard for spawning the first-run dashboard opener within a
+/// single wrapper process. Without it, a wrapper that restarts its daemon
+/// child several times before the HTTP server binds (e.g. during a crash
+/// loop on initial startup) would accumulate one 30-second opener thread
+/// per relaunch, each racing to open a browser tab and write the marker.
+/// Checking a real wall-clock Instant plus polling a TCP port means we
+/// also can't reuse the per-launch marker file itself as a latch.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+static FIRST_RUN_OPENER_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Spawn a short-lived thread that waits for the dashboard HTTP server to
 /// come up, then opens it in the browser and writes the first-run marker.
-/// The thread gives up after a generous timeout — if the daemon is
-/// crashing repeatedly we'd rather skip first-run and retry next launch
-/// than open a "connection refused" page in the user's browser.
+/// The thread gives up after a generous timeout. If the daemon is crashing
+/// repeatedly we'd rather skip first-run and retry next launch than open
+/// a "connection refused" page in the user's browser.
+///
+/// Caller is responsible for gating on `FIRST_RUN_OPENER_SPAWNED` so we
+/// don't start more than one opener per process lifetime.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn spawn_first_run_dashboard_opener(log_dir: &Path) {
+    // Import locally so we use the unqualified `Instant::now()` form. Wall-
+    // clock time is correct here: this is tray/CLI onboarding, not sim-
+    // reachable core code, and the deadline is about what the user's
+    // patience will tolerate. See `crates/core/src/bin/freenet.rs` for
+    // similar bin-side wall-clock usage.
+    use std::time::{Duration, Instant};
+
     let log_dir = log_dir.to_path_buf();
     std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
             if dashboard_port_is_listening() {
                 open_url_in_browser(DASHBOARD_URL);
                 if let Some(marker) = first_run_marker_path() {
-                    if let Err(e) = mark_first_run_complete_at(&marker) {
-                        log_wrapper_event(
+                    match mark_first_run_complete_at(&marker) {
+                        Ok(()) => {
+                            log_wrapper_event(&log_dir, "First-run onboarding: dashboard opened")
+                        }
+                        Err(e) => log_wrapper_event(
                             &log_dir,
                             &format!("Failed to write first-run marker: {e}"),
-                        );
+                        ),
                     }
                 }
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(500));
         }
         log_wrapper_event(
             &log_dir,
@@ -723,9 +749,15 @@ fn run_wrapper_loop(
     // First-run onboarding: if this user has never launched the tray wrapper
     // before, open the dashboard in their browser once the HTTP server comes
     // up. Runs in a background thread so it doesn't delay the main loop.
+    // `FIRST_RUN_OPENER_SPAWNED` ensures at most one opener thread per
+    // wrapper process lifetime so a crash-looping daemon doesn't accumulate
+    // pending openers that would all race to open tabs when the port
+    // eventually binds.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     if let Some(marker) = first_run_marker_path() {
-        if is_first_run_at(&marker) {
+        if is_first_run_at(&marker)
+            && !FIRST_RUN_OPENER_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             spawn_first_run_dashboard_opener(log_dir);
         }
     }
@@ -2625,6 +2657,20 @@ fn service_logs(_error_only: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn dashboard_url_and_addr_stay_in_sync() {
+        // Guard against a future edit that changes DASHBOARD_URL (human-
+        // readable form) without updating DASHBOARD_ADDR (parsed form), or
+        // vice versa. They must agree on host:port.
+        assert!(
+            DASHBOARD_URL.contains(DASHBOARD_ADDR),
+            "DASHBOARD_URL {DASHBOARD_URL:?} must contain DASHBOARD_ADDR {DASHBOARD_ADDR:?}"
+        );
+        DASHBOARD_ADDR
+            .parse::<std::net::SocketAddr>()
+            .expect("DASHBOARD_ADDR must parse as a SocketAddr");
+    }
 
     #[test]
     fn first_run_marker_roundtrips() {

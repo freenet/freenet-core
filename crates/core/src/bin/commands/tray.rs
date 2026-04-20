@@ -95,6 +95,42 @@ fn dispatch_menu_event(event_id: &str) -> MenuDispatch {
     }
 }
 
+/// Derived UI state for a given `WrapperStatus`. Kept as a pure value so the
+/// status → UI projection is unit-testable on every platform (including Linux
+/// CI), independent of the AppKit / Win32 widget plumbing in the platform
+/// module.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+struct MenuState {
+    status_text: &'static str,
+    stop_enabled: bool,
+    start_enabled: bool,
+    restart_enabled: bool,
+    is_terminal: bool,
+}
+
+#[allow(dead_code)]
+fn compute_menu_state(status: &WrapperStatus) -> MenuState {
+    let status_text = match status {
+        WrapperStatus::Running => "Running",
+        WrapperStatus::Updating => "Checking for updates...",
+        WrapperStatus::Stopped => "Stopped",
+        WrapperStatus::UpToDate => "Up to date",
+        WrapperStatus::UpdatedRestarting => "Updated! Restarting...",
+    };
+    let is_running = matches!(
+        status,
+        WrapperStatus::Running | WrapperStatus::UpToDate | WrapperStatus::Updating
+    );
+    MenuState {
+        status_text,
+        stop_enabled: is_running,
+        start_enabled: !is_running,
+        restart_enabled: is_running,
+        is_terminal: matches!(status, WrapperStatus::UpdatedRestarting),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +171,63 @@ mod tests {
         assert_eq!(
             dispatch_menu_event("freenet.tray.nonexistent"),
             MenuDispatch::Unknown
+        );
+    }
+
+    #[test]
+    fn menu_state_enables_stop_while_running() {
+        for status in [
+            WrapperStatus::Running,
+            WrapperStatus::UpToDate,
+            WrapperStatus::Updating,
+        ] {
+            let s = compute_menu_state(&status);
+            assert!(s.stop_enabled, "Stop should be enabled for {status:?}");
+            assert!(!s.start_enabled, "Start should be disabled for {status:?}");
+            assert!(
+                s.restart_enabled,
+                "Restart should be enabled for {status:?}"
+            );
+            assert!(!s.is_terminal, "{status:?} is not terminal");
+        }
+    }
+
+    #[test]
+    fn menu_state_enables_start_while_stopped() {
+        let s = compute_menu_state(&WrapperStatus::Stopped);
+        assert!(!s.stop_enabled);
+        assert!(s.start_enabled);
+        assert!(!s.restart_enabled);
+        assert!(!s.is_terminal);
+        assert_eq!(s.status_text, "Stopped");
+    }
+
+    #[test]
+    fn menu_state_flags_terminal_on_updated_restarting() {
+        let s = compute_menu_state(&WrapperStatus::UpdatedRestarting);
+        assert!(s.is_terminal);
+        assert_eq!(s.status_text, "Updated! Restarting...");
+    }
+
+    #[test]
+    fn menu_state_status_texts_are_distinct() {
+        let texts: Vec<&'static str> = [
+            WrapperStatus::Running,
+            WrapperStatus::Updating,
+            WrapperStatus::Stopped,
+            WrapperStatus::UpToDate,
+            WrapperStatus::UpdatedRestarting,
+        ]
+        .iter()
+        .map(|s| compute_menu_state(s).status_text)
+        .collect();
+        let mut sorted = texts.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            texts.len(),
+            sorted.len(),
+            "each WrapperStatus should map to a distinct status_text"
         );
     }
 }
@@ -237,28 +330,23 @@ mod platform {
 
         /// Applies a status update to the tray UI. Returns `true` if the
         /// status is terminal (tray should exit shortly afterwards).
+        ///
+        /// All derived state (status text, enabled flags, terminal flag)
+        /// comes from `compute_menu_state`, which is pure and unit-tested
+        /// on every platform. This method is the thin AppKit/Win32 binding
+        /// that applies the computed state to the real widgets.
         fn apply_status(&self, status: &WrapperStatus) -> bool {
-            let status_text = match status {
-                WrapperStatus::Running => "Running",
-                WrapperStatus::Updating => "Checking for updates...",
-                WrapperStatus::Stopped => "Stopped",
-                WrapperStatus::UpToDate => "Up to date",
-                WrapperStatus::UpdatedRestarting => "Updated! Restarting...",
-            };
-            self.status_item.set_text(format!("Status: {status_text}"));
-            let _ = self
-                ._tray
-                .set_tooltip(Some(format!("Freenet {} - {status_text}", self.version)));
-
-            let is_running = matches!(
-                status,
-                WrapperStatus::Running | WrapperStatus::UpToDate | WrapperStatus::Updating
-            );
-            self.stop_item.set_enabled(is_running);
-            self.start_item.set_enabled(!is_running);
-            self.restart_item.set_enabled(is_running);
-
-            matches!(status, WrapperStatus::UpdatedRestarting)
+            let s = compute_menu_state(status);
+            self.status_item
+                .set_text(format!("Status: {}", s.status_text));
+            let _ = self._tray.set_tooltip(Some(format!(
+                "Freenet {} - {}",
+                self.version, s.status_text
+            )));
+            self.stop_item.set_enabled(s.stop_enabled);
+            self.start_item.set_enabled(s.start_enabled);
+            self.restart_item.set_enabled(s.restart_enabled);
+            s.is_terminal
         }
     }
 
@@ -348,11 +436,6 @@ mod platform {
     // `tray-icon` drove the NSRunLoop internally. That was not true, and
     // the menu bar icon never appeared in practice.
 
-    /// How long we wait for the wrapper thread to kill the daemon child
-    /// after signalling Quit, before letting the process exit anyway.
-    #[cfg(target_os = "macos")]
-    const CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
-
     #[cfg(target_os = "macos")]
     fn run_event_loop(
         state: TrayState,
@@ -400,11 +483,18 @@ mod platform {
                     MenuDispatch::Quit => {
                         action_tx.send(TrayAction::Quit).ok();
                         // Block until the wrapper thread confirms it has killed
-                        // the daemon child, with a bounded timeout. On macOS,
-                        // tao's run is divergent — when we set ControlFlow::Exit,
-                        // the process exits without unwinding other threads, so
-                        // we must give the wrapper time to finish cleanup first.
-                        let _ = cleanup_done_rx.recv_timeout(CLEANUP_WAIT);
+                        // the daemon child. On macOS, tao's run is divergent:
+                        // when we set ControlFlow::Exit the process exits
+                        // without unwinding other threads, so we must wait
+                        // until the wrapper has finished cleanup or we risk
+                        // orphaning the daemon. The wrapper's spawn thunk
+                        // signals `cleanup_done_rx` on every exit path of
+                        // `run_wrapper_loop`, so this waits forever only if
+                        // the wrapper itself is genuinely stuck (e.g. in a
+                        // long `freenet update` that the user triggered via
+                        // "Check for Updates"). Waiting is the right trade
+                        // because the alternative is a guaranteed orphan.
+                        let _ = cleanup_done_rx.recv();
                         *control_flow = ControlFlow::Exit;
                         return;
                     }
@@ -418,7 +508,8 @@ mod platform {
                 if is_terminal {
                     std::thread::sleep(Duration::from_secs(1));
                     action_tx.send(TrayAction::Quit).ok();
-                    let _ = cleanup_done_rx.recv_timeout(CLEANUP_WAIT);
+                    // Same rationale as the Quit handler above.
+                    let _ = cleanup_done_rx.recv();
                     *control_flow = ControlFlow::Exit;
                 }
             }

@@ -51,6 +51,33 @@ WHY: iframe sandbox blocked CORS, CSP, and WebSocket that contract web apps
 depended on. The security fix had to be fixed itself.
 ```
 
+### WHEN adding or modifying a platform-gated code path
+
+```
+A `#[cfg(target_os = "...")]` branch that CI does not build and run on
+that target is unverified, even if it compiles on other platforms.
+
+BEFORE claiming the cfg'd path works:
+  1. Smoke-test it on the actual target OS (boot the binary, exercise
+     the code path, observe the expected behaviour) — compilation is
+     not verification.
+  2. Prefer extracting the platform-independent decision logic into a
+     pure function that compiles on all targets so it can be unit-
+     tested from the CI platforms that do exist.
+     See: `dispatch_menu_event`, `compute_menu_state`, and
+     `first_run_marker_*` in `crates/core/src/bin/commands/` for the
+     pattern — behaviour split into a pure core + platform binding.
+  3. If a comment asserts third-party library behaviour (e.g.,
+     "the crate drives the NSRunLoop internally"), cite the source:
+     upstream docs, an official example, or a verified smoke-test.
+     An uncited assertion is a hypothesis, not a guarantee.
+
+WHY: PR #3928 fixed a cfg'd `target_os = "macos"` tray/menu-bar path
+that had shipped in the tree for months because no CI runner
+exercised it. An uncited "tray-icon drives the NSRunLoop internally"
+comment encoded the original mistake directly into the code.
+```
+
 ### WHEN managing dependencies
 
 ```
