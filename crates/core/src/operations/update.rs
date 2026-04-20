@@ -1310,11 +1310,9 @@ impl Operation for UpdateOp {
                             }
                         }
                         Err(err) => {
-                            // Two distinct cases (see issue #3914):
-                            //   1. Contract WASM merge rejected the incoming state
-                            //      (e.g., stale version) — benign, log INFO, no auto-fetch.
-                            //   2. Other failure (missing parameters after restart, etc.) —
-                            //      contract not ready locally; log WARN and self-heal.
+                            // See issue #3914 and `log_broadcast_to_streaming_failure`
+                            // for the classification. The bool return is `true` when
+                            // self-heal is needed (real failure, not a benign rejection).
                             if log_broadcast_to_streaming_failure(id, key, &err) {
                                 op_manager.try_auto_fetch_contract(key, sender_addr);
                             }
@@ -1623,23 +1621,29 @@ fn build_op_result(
     })
 }
 
-/// Distinguishes a contract WASM merge rejection (benign — the contract
-/// correctly refused a stale or otherwise invalid incoming state) from a
-/// real failure (missing contract code, storage error, internal bug).
+/// Logs the failure outcome of `update_contract`.
 ///
-/// Mirrors the runtime layer's classification at
-/// `contract::executor::runtime::merge_state_and_validate` (logs the same
-/// rejection at INFO with `event="merge_rejected_valid_local"`). Without
-/// this distinction, every benign re-broadcast that misses the dedup
-/// window produced an ERROR-level log, drowning real alerts on production
-/// gateways. See issue #3914.
+/// Splits into two cases (issue #3914):
+///
+/// 1. The contract WASM merge function rejected the incoming state with a
+///    typed `InvalidUpdate{,WithInfo}` error (e.g. "New state version 100
+///    must be higher than current version 100"). On production gateways
+///    this fires on every re-broadcast that misses the 60s dedup cache,
+///    generating 80-130 ERROR/hr per gateway with no actionable signal.
+///    Logged at INFO with `event="merge_rejected_invalid_update"`.
+///
+/// 2. Anything else (missing contract code, storage error, OOG, WASM trap,
+///    timeout, internal bug) keeps the original ERROR level. The
+///    discriminator is `is_invalid_update_rejection`, which matches the
+///    contract-side `InvalidUpdate{,WithInfo}` cause string EXCLUSIVELY,
+///    so runtime failures like OOG remain visible to operators.
 fn log_update_contract_failure(key: &ContractKey, err: &ExecutorError) {
-    if err.is_contract_exec_rejection() {
+    if err.is_invalid_update_rejection() {
         tracing::info!(
             contract = %key,
             error = %err,
-            event = "merge_rejected_stale",
-            "Update rejected by contract — incoming state stale, keeping local"
+            event = "merge_rejected_invalid_update",
+            "Update rejected by contract: incoming state invalid (likely stale rebroadcast), keeping local"
         );
     } else {
         tracing::error!(
@@ -1651,30 +1655,52 @@ fn log_update_contract_failure(key: &ContractKey, err: &ExecutorError) {
     }
 }
 
-/// Logs the failure of a `BroadcastToStreaming` relay attempt and returns
-/// whether the caller should trigger a self-healing GET. A benign WASM
-/// rejection (stale incoming state) is logged at INFO and returns `false`
-/// — the contract is present locally and no fetch is needed. Any other
-/// failure is logged at WARN and returns `true`. See issue #3914.
+/// Logs the failure outcome of a `BroadcastToStreaming` relay attempt and
+/// returns whether the caller should trigger a self-healing GET.
+///
+/// The two decisions (log severity, auto-fetch) use DIFFERENT predicates
+/// because they answer different questions:
+///
+/// - Log severity uses `is_invalid_update_rejection` (narrow): only the
+///   contract WASM's typed "invalid contract update" rejection counts as
+///   benign. Out-of-gas, traps, timeouts stay at WARN even though the
+///   contract code is present.
+///
+/// - Auto-fetch uses `is_contract_exec_rejection` (broad): any time the
+///   contract code DID execute (whether successfully rejecting a stale
+///   state or running out of gas), the code is present locally and a
+///   self-heal GET would be wasted. Auto-fetch only fires for failures
+///   where the contract is actually missing (e.g., missing parameters
+///   after restart, storage error).
+///
+/// Returning `true` means "fetch missing contract code"; returning `false`
+/// means "contract is present, skip auto-fetch".
+///
+/// Note: this helper takes `&OpError` while `log_update_contract_failure`
+/// takes `&ExecutorError` because the two call sites have different error
+/// types in scope (the streaming branch operates on the OpError already
+/// produced by `update_contract`'s `Err(err.into())`).
 fn log_broadcast_to_streaming_failure(tx: &Transaction, key: &ContractKey, err: &OpError) -> bool {
-    if err.is_contract_exec_rejection() {
+    if err.is_invalid_update_rejection() {
         tracing::info!(
             tx = %tx,
             %key,
             error = %err,
-            event = "merge_rejected_stale",
-            "BroadcastToStreaming merge rejected — incoming state stale, keeping local"
+            event = "merge_rejected_invalid_update",
+            "BroadcastToStreaming merge rejected: incoming state invalid (likely stale rebroadcast), keeping local"
         );
-        false
     } else {
         tracing::warn!(
             tx = %tx,
             %key,
             error = %err,
-            "BroadcastToStreaming update skipped — contract not ready locally"
+            "BroadcastToStreaming update skipped: contract not ready locally"
         );
-        true
     }
+    // Preserves the pre-#3914 auto-fetch behavior: skip the self-heal
+    // GET whenever the contract code is present (broader check than the
+    // log-severity decision above).
+    !err.is_contract_exec_rejection()
 }
 
 /// Apply an update to a contract.
@@ -2847,52 +2873,76 @@ mod tests {
     /// Regression tests for issue #3914: misleading ERROR/WARN log noise from
     /// benign WASM rejections of stale broadcast UPDATEs. The contract correctly
     /// rejects an incoming state at a version we already hold (a re-broadcast
-    /// the dedup cache missed). On production gateways this generated 80–130
-    /// ERROR-level lines per hour per gateway; tests below pin the new INFO
-    /// classification so the regression cannot reappear.
+    /// the dedup cache missed). On production gateways this generated 80-130
+    /// ERROR-level lines per hour per gateway. The tests below pin both that
+    /// the benign case is now INFO AND that real WASM failures (out-of-gas,
+    /// max-compute-time, traps) stay at ERROR/WARN, so the predicate cannot
+    /// silently broaden and hide real failures.
     mod log_severity {
         use super::*;
         use crate::contract::ExecutorError;
         use crate::test_utils::TestLogger;
-        use freenet_stdlib::client_api::ContractError as StdContractError;
+        use freenet_stdlib::client_api::{ContractError as StdContractError, RequestError};
 
-        fn stale_state_rejection() -> ExecutorError {
-            // Mirrors the production message exactly:
-            // "execution error: invalid contract update, reason: New state
-            //  version N must be higher than current version N"
-            ExecutorError::request(StdContractError::update_exec_error(
+        // Constructors use `From<RequestError> for ExecutorError` (a public
+        // impl) rather than the module-private `ExecutorError::request`, so
+        // these helpers don't require widening any visibility for tests.
+        fn invalid_update_rejection() -> ExecutorError {
+            // Mirrors the production cause string exactly: stdlib's
+            // `update_exec_error` prefixes "execution error: " and the
+            // contract WASM's `InvalidUpdateWithInfo` Display produces
+            // "invalid contract update, reason: ...".
+            let req: RequestError = StdContractError::update_exec_error(
                 make_contract_key(1),
                 "invalid contract update, reason: New state version 100 must be higher than current version 100",
-            ))
+            )
+            .into();
+            req.into()
+        }
+
+        fn out_of_gas_failure() -> ExecutorError {
+            // Real WASM fault: contract ran out of gas. Same `update_exec_error`
+            // wrapper as the benign case (so the loose `is_contract_exec_rejection`
+            // predicate matches both), but the cause string starts with
+            // "execution error: The operation ran out of gas..." which the
+            // tighter `is_invalid_update_rejection` predicate must REJECT.
+            let req: RequestError = StdContractError::update_exec_error(
+                make_contract_key(1),
+                "The operation ran out of gas. This might be caused by an infinite loop or an inefficient computation.",
+            )
+            .into();
+            req.into()
         }
 
         fn missing_parameters_failure() -> ExecutorError {
             // Real failure case: contract not ready locally, auto-fetch needed.
-            ExecutorError::request(StdContractError::Update {
+            let req: RequestError = StdContractError::Update {
                 key: make_contract_key(2),
                 cause: "missing contract parameters".into(),
-            })
+            }
+            .into();
+            req.into()
         }
 
         #[test]
-        fn update_contract_failure_logs_info_for_stale_state_rejection() {
+        fn update_contract_failure_logs_info_for_invalid_update_rejection() {
             let logger = TestLogger::new().capture_logs().with_level("info").init();
 
-            log_update_contract_failure(&make_contract_key(1), &stale_state_rejection());
+            log_update_contract_failure(&make_contract_key(1), &invalid_update_rejection());
 
             assert!(
-                logger.contains("merge_rejected_stale"),
-                "expected event=merge_rejected_stale in logs, got: {:?}",
+                logger.contains("merge_rejected_invalid_update"),
+                "expected event=merge_rejected_invalid_update in logs, got: {:?}",
                 logger.logs()
             );
             assert!(
                 logger.contains("INFO"),
-                "expected INFO-level log for stale state rejection, got: {:?}",
+                "expected INFO-level log for invalid-update rejection, got: {:?}",
                 logger.logs()
             );
             assert!(
                 !logger.logs().iter().any(|l| l.contains("ERROR")),
-                "stale state rejection must not produce ERROR-level logs, got: {:?}",
+                "invalid-update rejection must not produce ERROR-level logs, got: {:?}",
                 logger.logs()
             );
         }
@@ -2915,27 +2965,54 @@ mod tests {
             );
         }
 
+        /// CRITICAL: out-of-gas comes through the same `update_exec_error`
+        /// wrapper as the benign rejection, so the loose
+        /// `is_contract_exec_rejection` predicate matches it (used for the
+        /// auto-fetch gate, where this is correct: contract code IS present).
+        /// But for log severity, OOG is a real bug operators must see and
+        /// MUST stay at ERROR. This test pins that.
         #[test]
-        fn broadcast_to_streaming_failure_logs_info_and_skips_auto_fetch_for_stale() {
+        fn update_contract_failure_logs_error_for_out_of_gas() {
+            let logger = TestLogger::new().capture_logs().with_level("info").init();
+
+            log_update_contract_failure(&make_contract_key(1), &out_of_gas_failure());
+
+            assert!(
+                logger.contains("ERROR"),
+                "out-of-gas must remain ERROR-level (real WASM fault), got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger
+                    .logs()
+                    .iter()
+                    .any(|l| l.contains("merge_rejected_invalid_update")),
+                "out-of-gas must NOT be classified as a benign rejection, got: {:?}",
+                logger.logs()
+            );
+        }
+
+        #[test]
+        fn broadcast_to_streaming_failure_logs_info_and_skips_auto_fetch_for_invalid_update() {
             let logger = TestLogger::new().capture_logs().with_level("info").init();
             let tx = Transaction::new::<UpdateMsg>();
-            let err: OpError = stale_state_rejection().into();
+            let err: OpError = invalid_update_rejection().into();
 
             let needs_auto_fetch =
                 log_broadcast_to_streaming_failure(&tx, &make_contract_key(1), &err);
 
             assert!(
                 !needs_auto_fetch,
-                "stale state rejection must NOT trigger self-heal auto-fetch (contract code is present)"
+                "invalid-update rejection must NOT trigger self-heal auto-fetch (contract code is present)"
             );
             assert!(
-                logger.contains("merge_rejected_stale"),
-                "expected event=merge_rejected_stale in logs, got: {:?}",
+                logger.contains("merge_rejected_invalid_update"),
+                "expected event=merge_rejected_invalid_update in logs, got: {:?}",
                 logger.logs()
             );
             assert!(
                 !logger.logs().iter().any(|l| l.contains("WARN")),
-                "stale state rejection must not produce WARN-level logs (the old misleading 'contract not ready locally' line), got: {:?}",
+                "invalid-update rejection must not produce WARN-level logs (the old misleading 'contract not ready locally' line), got: {:?}",
                 logger.logs()
             );
             assert!(
@@ -2943,7 +3020,7 @@ mod tests {
                     .logs()
                     .iter()
                     .any(|l| l.contains("contract not ready locally")),
-                "the misleading 'contract not ready locally' message must not appear for stale rejections, got: {:?}",
+                "the misleading 'contract not ready locally' message must not appear for invalid-update rejections, got: {:?}",
                 logger.logs()
             );
         }
@@ -2970,6 +3047,39 @@ mod tests {
                 logger.contains("contract not ready locally"),
                 "expected the WARN message text for real failure, got: {:?}",
                 logger.logs()
+            );
+        }
+
+        /// Mirror of `update_contract_failure_logs_error_for_out_of_gas` for
+        /// the streaming branch: OOG must stay at WARN, AND auto-fetch must
+        /// be SKIPPED because the contract code is present (broader predicate
+        /// `is_contract_exec_rejection` correctly catches this case). The two
+        /// decisions are deliberately decoupled by the helper.
+        #[test]
+        fn broadcast_to_streaming_failure_logs_warn_and_skips_auto_fetch_for_out_of_gas() {
+            let logger = TestLogger::new().capture_logs().with_level("info").init();
+            let tx = Transaction::new::<UpdateMsg>();
+            let err: OpError = out_of_gas_failure().into();
+
+            let needs_auto_fetch =
+                log_broadcast_to_streaming_failure(&tx, &make_contract_key(1), &err);
+
+            assert!(
+                logger.contains("WARN"),
+                "out-of-gas must remain WARN-level for the streaming branch, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger
+                    .logs()
+                    .iter()
+                    .any(|l| l.contains("merge_rejected_invalid_update")),
+                "out-of-gas must NOT be classified as a benign rejection, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !needs_auto_fetch,
+                "out-of-gas must NOT trigger self-heal auto-fetch (contract code is present locally; the broader is_contract_exec_rejection predicate catches this case independently of log severity)"
             );
         }
     }
