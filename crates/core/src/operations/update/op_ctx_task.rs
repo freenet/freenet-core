@@ -775,8 +775,7 @@ async fn drive_relay_request_update(
     // non-streaming variant regardless of payload size — the size-based
     // upgrade to the streaming sibling on forward (legacy
     // update.rs:518-535 checks `should_use_streaming`) is deferred to
-    // slice B together with the streaming-variant migration. Tracked
-    // in docs/port-plans/relay-update-task-per-tx.md §3 / §9.
+    // slice B together with the streaming-variant migration.
     let request = NetMessage::from(UpdateMsg::RequestUpdate {
         id: incoming_tx,
         key,

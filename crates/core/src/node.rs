@@ -3689,8 +3689,7 @@ mod tests {
                 !window.contains("RequestUpdateStreaming {")
                     || window.contains("// Streaming variants"),
                 "UPDATE branch appears to dispatch RequestUpdateStreaming through \
-                 the relay driver. Slice A keeps streaming on the legacy path — \
-                 see docs/port-plans/relay-update-task-per-tx.md."
+                 the relay driver. Slice A keeps streaming on the legacy path."
             );
             assert!(
                 !window.contains("BroadcastToStreaming {")
