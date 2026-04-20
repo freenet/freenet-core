@@ -818,7 +818,7 @@ async fn drive_relay_broadcast_to(
 ) -> Result<(), OpError> {
     let self_location = op_manager.ring.connection_manager.own_location();
 
-    let sender_summary = StateSummary::from(sender_summary_bytes);
+    let sender_summary = StateSummary::from(sender_summary_bytes.clone());
 
     // ── Step 1: update sender's cached summary ────────────────────────────
     if let Some(sender_pkl) = op_manager
@@ -903,6 +903,26 @@ async fn drive_relay_broadcast_to(
     } = match update_result {
         Ok(result) => result,
         Err(err) => {
+            // On benign stale-version rejection (not OOG/traps/validation
+            // failures — see `is_invalid_update_rejection`), nudge the sender's
+            // peer-summary cache of us toward Some(our_summary). Helper gates
+            // internally on summary equality + per-contract throttle. Mirrors
+            // the matching sites in legacy `update.rs`.
+            if err.is_invalid_update_rejection() {
+                let op_mgr = op_manager.clone();
+                let contract_key = key;
+                let sender_summary = sender_summary_bytes.clone();
+                tokio::spawn(async move {
+                    super::send_summary_back_on_rejection(
+                        &op_mgr,
+                        &contract_key,
+                        sender_addr,
+                        sender_summary,
+                    )
+                    .await;
+                });
+            }
+
             if is_delta {
                 // Delta application failed → send ResyncRequest. Mirrors
                 // update.rs:710-758.
@@ -1231,6 +1251,44 @@ mod tests {
             driver_src.contains("send_proactive_summary_notification"),
             "drive_relay_broadcast_to must spawn send_proactive_summary_notification \
              after a successful state change (mirrors legacy update.rs:806-819)."
+        );
+    }
+
+    /// Pin: on `is_invalid_update_rejection()` (benign stale-version
+    /// rejection, NOT OOG/traps/validation failures), the driver MUST spawn
+    /// `send_summary_back_on_rejection` so the sender's cached peer
+    /// summary of us converges. Without this, the sender keeps
+    /// full-state-ing identical content to us every interest cycle; see
+    /// PR description for the production evidence and the
+    /// `broadcast_queue.rs:352-356` full-state fallback that this
+    /// counteracts.
+    #[test]
+    fn broadcast_to_sends_summary_back_on_rejection() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_broadcast_to(")
+            .expect("drive_relay_broadcast_to not found");
+        // Scope to the driver body only.
+        let after_start = &src[driver_start + 1..];
+        let end_offset = after_start
+            .find("\nasync fn ")
+            .or_else(|| after_start.find("\n#[cfg(test)]"))
+            .unwrap_or(after_start.len());
+        let driver_src = &src[driver_start..driver_start + 1 + end_offset];
+
+        assert!(
+            driver_src.contains("err.is_invalid_update_rejection()"),
+            "drive_relay_broadcast_to must gate summary-back on \
+             is_invalid_update_rejection (not is_contract_exec_rejection): \
+             the broader predicate matches OOG/traps which are \
+             attacker-inducible and must not amplify into summary-back"
+        );
+        assert!(
+            driver_src.contains("send_summary_back_on_rejection"),
+            "drive_relay_broadcast_to must spawn send_summary_back_on_rejection \
+             when the WASM merge rejects — otherwise the sender's cached view \
+             of us stays wrong and it keeps full-state-broadcasting identical \
+             content"
         );
     }
 
