@@ -236,7 +236,15 @@ impl ExecutorError {
 
     /// Returns true if this error indicates the contract's WASM merge function
     /// ran and rejected the update (e.g., stale version). This means the contract
-    /// code IS present locally — no auto-fetch is needed.
+    /// code IS present locally, so no auto-fetch is needed.
+    ///
+    /// This is BROADER than `is_invalid_update_rejection`: it ALSO returns true
+    /// for runtime failures like out-of-gas, max-compute-time, traps, etc.,
+    /// because those still mean the contract code is present : only the
+    /// execution itself failed. Use this for auto-fetch decisions, NOT for log
+    /// severity (a contract that runs out of gas is a real bug operators must
+    /// see at ERROR level : see `is_invalid_update_rejection` for the
+    /// log-severity discriminator).
     ///
     /// Only matches errors created via `StdContractError::update_exec_error()`
     /// (cause starts with "execution error:"), NOT other `Update` variants like
@@ -247,6 +255,36 @@ impl ExecutorError {
                 req_err.as_ref(),
                 RequestError::ContractError(StdContractError::Update { cause, .. })
                     if cause.starts_with("execution error")
+            ),
+            Either::Right(_) => false,
+        }
+    }
+
+    /// Returns true ONLY when the contract WASM merge function ran to completion
+    /// and returned a typed `InvalidUpdate` / `InvalidUpdateWithInfo` rejection
+    /// (e.g., "New state version N must be higher than current version N"). This
+    /// is the precise case that production gateways hit on every re-broadcast
+    /// missed by the dedup cache (issue #3914) and the only case where ERROR-
+    /// level logging is operationally noise.
+    ///
+    /// Excluded by design (these remain real failures and keep their ERROR/WARN
+    /// log levels):
+    /// - Out-of-gas / max-compute-time-exceeded
+    /// - WASM traps (stack overflow, division by zero, etc.)
+    /// - Compilation errors, instantiation errors, internal runtime errors
+    /// - Other contract-side `ContractError` variants (`Deser`, `InvalidState`,
+    ///   `InvalidDelta`, `Other`, `DoublePut`, `InvalidArrayLength`, etc.)
+    ///
+    /// Discriminator: stdlib's `ContractError::InvalidUpdate{,WithInfo}` Display
+    /// impls produce strings beginning with "invalid contract update", which
+    /// `update_exec_error` then prefixes with "execution error: ". Any other
+    /// flavor of execution error has a different prefix and falls through.
+    pub fn is_invalid_update_rejection(&self) -> bool {
+        match &self.inner {
+            Either::Left(req_err) => matches!(
+                req_err.as_ref(),
+                RequestError::ContractError(StdContractError::Update { cause, .. })
+                    if cause.starts_with("execution error: invalid contract update")
             ),
             Either::Right(_) => false,
         }
@@ -1283,6 +1321,88 @@ mod tests {
             assert!(
                 !err.is_contract_exec_rejection(),
                 "Non-request errors should NOT be recognized as exec rejections"
+            );
+        }
+
+        // Tests for `is_invalid_update_rejection` : the tighter predicate that
+        // gates log severity (issue #3914). It must match ONLY the contract's
+        // typed `InvalidUpdate{,WithInfo}` rejections, NOT runtime failures
+        // like OOG/timeout/traps even though those flow through the same
+        // `update_exec_error` wrapper.
+
+        #[test]
+        fn test_invalid_update_rejection_for_invalid_update() {
+            let key = test_fixtures::make_contract_key();
+            // Production cause string from issue #3914.
+            let err = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                "invalid contract update, reason: New state version 100 must be higher than current version 100",
+            ));
+            assert!(
+                err.is_invalid_update_rejection(),
+                "Contract InvalidUpdateWithInfo rejection MUST be recognized as benign"
+            );
+            assert!(
+                err.is_contract_exec_rejection(),
+                "The benign case must also satisfy the broader predicate (auto-fetch gate)"
+            );
+        }
+
+        #[test]
+        fn test_invalid_update_rejection_false_for_out_of_gas() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                "The operation ran out of gas. This might be caused by an infinite loop or an inefficient computation.",
+            ));
+            assert!(
+                !err.is_invalid_update_rejection(),
+                "Out-of-gas MUST NOT be classified as a benign invalid-update rejection (it's a real WASM fault)"
+            );
+            assert!(
+                err.is_contract_exec_rejection(),
+                "Out-of-gas IS a contract-exec error (broader predicate matches), so auto-fetch is correctly skipped"
+            );
+        }
+
+        #[test]
+        fn test_invalid_update_rejection_false_for_max_compute_time() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                "The operation exceeded the maximum allowed compute time",
+            ));
+            assert!(
+                !err.is_invalid_update_rejection(),
+                "Max-compute-time MUST NOT be classified as a benign invalid-update rejection"
+            );
+        }
+
+        #[test]
+        fn test_invalid_update_rejection_false_for_double_put() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                format!(
+                    "Attempted to perform a put for an already put contract ({key}), use update instead"
+                ),
+            ));
+            assert!(
+                !err.is_invalid_update_rejection(),
+                "DoublePut MUST NOT be classified as a benign invalid-update rejection"
+            );
+        }
+
+        #[test]
+        fn test_invalid_update_rejection_false_for_missing_parameters() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::Update {
+                key,
+                cause: "missing contract parameters".into(),
+            });
+            assert!(
+                !err.is_invalid_update_rejection(),
+                "Missing parameters is a real failure, not a benign rejection"
             );
         }
 

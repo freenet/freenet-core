@@ -493,8 +493,21 @@ impl OpError {
     /// Returns true if this error indicates a contract's WASM merge function
     /// ran and rejected the update. When true, the contract code is present
     /// locally and auto-fetching would be unnecessary.
+    ///
+    /// BROADER than `is_invalid_update_rejection` : includes runtime failures
+    /// like OOG/timeout/traps. Use this for auto-fetch decisions, NOT for log
+    /// severity. See `ExecutorError::is_contract_exec_rejection`.
     pub fn is_contract_exec_rejection(&self) -> bool {
         matches!(self, Self::ExecutorError(e) if e.is_contract_exec_rejection())
+    }
+
+    /// Returns true ONLY when the contract WASM merge function rejected the
+    /// update with a typed `InvalidUpdate{,WithInfo}` error (the benign
+    /// stale-state case from issue #3914). Use this for log-severity
+    /// decisions: real WASM faults (OOG, traps, timeouts) return false here
+    /// and stay at ERROR/WARN. See `ExecutorError::is_invalid_update_rejection`.
+    pub fn is_invalid_update_rejection(&self) -> bool {
+        matches!(self, Self::ExecutorError(e) if e.is_invalid_update_rejection())
     }
 }
 
