@@ -242,7 +242,15 @@ jobs:
 
       - name: Install packaging dependencies
         run: |
-          brew install create-dmg
+          brew install create-dmg librsvg
+
+      - name: Generate app icon from SVG
+        run: |
+          ICON_PATH="$RUNNER_TEMP/freenet.icns"
+          ./scripts/generate-macos-icns.sh \
+            crates/core/src/bin/commands/assets/freenet_logo.svg \
+            "$ICON_PATH"
+          echo "ICON_ICNS=$ICON_PATH" >> "$GITHUB_ENV"
 
       - name: Import Developer ID signing certificate
         env:
