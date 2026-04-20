@@ -707,6 +707,30 @@ impl Operation for UpdateOp {
                     } = match update_result {
                         Ok(result) => result,
                         Err(err) => {
+                            // On benign stale-version rejection, nudge the sender's
+                            // peer-summary cache of us toward Some(our_summary) so
+                            // their next broadcast skips us. Helper gates internally
+                            // on summary equality + per-contract throttle to avoid
+                            // SyncStateToPeer loops and WASM amplification. See
+                            // `send_summary_back_on_rejection` docs for the full
+                            // rationale. Gated on `is_invalid_update_rejection`
+                            // (not the broader `is_contract_exec_rejection`) so
+                            // OOG/traps/validation failures don't fire summary-back.
+                            if err.is_invalid_update_rejection() {
+                                let op_mgr = op_manager.clone();
+                                let contract_key = *key;
+                                let sender_summary = sender_summary_bytes.clone();
+                                tokio::spawn(async move {
+                                    send_summary_back_on_rejection(
+                                        &op_mgr,
+                                        &contract_key,
+                                        sender_addr,
+                                        sender_summary,
+                                    )
+                                    .await;
+                                });
+                            }
+
                             if is_delta {
                                 // Delta application failed - send ResyncRequest to get full state
                                 // This is a critical debugging event for state divergence issues
@@ -1315,6 +1339,23 @@ impl Operation for UpdateOp {
                             // self-heal is needed (real failure, not a benign rejection).
                             if log_broadcast_to_streaming_failure(id, key, &err) {
                                 op_manager.try_auto_fetch_contract(key, sender_addr);
+                            } else if err.is_invalid_update_rejection() {
+                                // Benign stale-version rejection: nudge the sender's
+                                // peer-summary cache of us so the next broadcast takes
+                                // the fast-path skip. See
+                                // `send_summary_back_on_rejection` docs.
+                                let op_mgr = op_manager.clone();
+                                let contract_key = *key;
+                                let sender_summary = sender_summary_bytes.clone();
+                                tokio::spawn(async move {
+                                    send_summary_back_on_rejection(
+                                        &op_mgr,
+                                        &contract_key,
+                                        sender_addr,
+                                        sender_summary,
+                                    )
+                                    .await;
+                                });
                             }
                         }
                     }
@@ -2318,6 +2359,123 @@ pub(crate) async fn send_proactive_summary_notification(
     );
 }
 
+/// Send our current summary to the peer whose broadcast we just rejected,
+/// **only when the peer's included summary equals our own** — i.e. the
+/// peer and we already agree on state, but the peer's cached view of
+/// our summary is stale (`None` or out of date) so their send path
+/// fell back to full-state at `broadcast_queue.rs:352-356` instead of
+/// hitting the summaries-equal fast-path skip.
+///
+/// The gate on `sender_summary_bytes == our_summary` is load-bearing.
+/// Without it, when our state is strictly ahead of the peer's and we
+/// reject their stale broadcast, the `InterestMessage::Summaries`
+/// handler at `node.rs:1791-1839` detects a mismatch and pushes the
+/// peer's state back via `SyncStateToPeer` — which we then reject
+/// again, creating a tight reject→summary→resync→reject loop bounded
+/// only by the 60 s `BroadcastDedupCache` (and defeated entirely by
+/// payload-byte variation). Restricting to the matching-summary case
+/// makes this helper a pure convergence nudge: the `Summaries`
+/// receiver's stale-detector returns `is_stale = false`, no
+/// `SyncStateToPeer` fires, the only outcome is the sender's
+/// peer-summary cache of us flipping from `None` → `Some(our_summary)`
+/// so its next broadcast takes the fast-path skip.
+///
+/// Observed in production (nova, vega): ~80–130 rejections/hour per
+/// gateway, all with `incoming_state_size == local_state_size` and
+/// "version N == N" — i.e. exactly the same-summary case this helper
+/// targets. The 5-min `Interests`/`Summaries` heartbeat eventually
+/// populates the sender's cache; this shortcut closes the loop in one
+/// round-trip instead of waiting for the next heartbeat tick.
+///
+/// Unlike `send_proactive_summary_notification` (success path, fans
+/// out to all interested peers, explicitly excludes the sender), this
+/// targets the single sender — on rejection, the sender is the ONE
+/// peer whose cache we know is wrong about us.
+///
+/// Call sites MUST gate this on `err.is_invalid_update_rejection()`
+/// (not the broader `is_contract_exec_rejection`): the stricter
+/// predicate matches ONLY the benign "new state version not higher"
+/// case, not OOG / `MaxComputeTimeExceeded` / WASM traps / validation
+/// failures — which are attacker-inducible and shouldn't amplify into
+/// extra messages.
+pub(crate) async fn send_summary_back_on_rejection(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    target_addr: SocketAddr,
+    sender_summary_bytes: Vec<u8>,
+) {
+    use crate::message::{InterestMessage, SummaryEntry};
+    use crate::ring::interest::contract_hash;
+
+    // Throttle BEFORE the WASM `summarize_state` call. Even with call
+    // sites gated on `is_invalid_update_rejection`, a flood of
+    // crafted-payload broadcasts that all produce benign rejections
+    // would otherwise force one `summarize_state` call per rejection.
+    // `should_send_summary_notification` caps at ~10 calls/sec/contract.
+    //
+    // Sharing the throttle map with `send_proactive_summary_notification`
+    // is intentional: both paths emit the same `InterestMessage::Summaries`
+    // shape, and the existing throttle's purpose (don't re-spam summary
+    // updates for the same contract in bursts) applies to both callers.
+    if !op_manager
+        .interest_manager
+        .should_send_summary_notification(key)
+    {
+        return;
+    }
+
+    let Some(our_summary) = op_manager
+        .interest_manager
+        .get_contract_summary(op_manager, key)
+        .await
+    else {
+        tracing::debug!(
+            contract = %key,
+            peer = %target_addr,
+            "Skipping summary-back on rejection — no local summary available"
+        );
+        return;
+    };
+
+    // Critical: only proceed when summaries match. See function docs for
+    // the SyncStateToPeer-loop rationale. A differing summary means the
+    // peer is genuinely out of sync, in which case the 5-min heartbeat
+    // is the right convergence mechanism — firing Summaries here would
+    // escalate into a per-rejection state ping-pong.
+    if our_summary.as_ref() != sender_summary_bytes.as_slice() {
+        tracing::debug!(
+            contract = %key,
+            peer = %target_addr,
+            "Skipping summary-back on rejection — sender's summary differs \
+             from ours (peer is genuinely out of sync; heartbeat will converge)"
+        );
+        return;
+    }
+
+    let hash = contract_hash(key);
+    let message = InterestMessage::Summaries {
+        entries: vec![SummaryEntry::from_summary(hash, Some(&our_summary))],
+    };
+
+    if let Err(e) = op_manager
+        .notify_node_event(NodeEvent::SendInterestMessage {
+            target: target_addr,
+            message,
+        })
+        .await
+    {
+        // info! not debug! — debug! is stripped in release builds via
+        // `tracing_max_level_info`, so a saturated event-loop channel
+        // would fail silently in production.
+        tracing::info!(
+            contract = %key,
+            peer = %target_addr,
+            error = %e,
+            "Failed to send summary-back after broadcast rejection"
+        );
+    }
+}
+
 mod messages {
     use std::fmt::Display;
 
@@ -3082,5 +3240,135 @@ mod tests {
                 "out-of-gas must NOT trigger self-heal auto-fetch (contract code is present locally; the broader is_contract_exec_rejection predicate catches this case independently of log severity)"
             );
         }
+    }
+
+    /// Pin: `UpdateMsg::BroadcastTo` handler in `process_message` must spawn
+    /// `send_summary_back_on_rejection` when the WASM merge rejects as an
+    /// invalid-update rejection (stale version). Skipping this causes the
+    /// sender to repeatedly full-state-broadcast identical content; see
+    /// PR description for production evidence.
+    #[test]
+    fn legacy_broadcast_to_sends_summary_back_on_rejection() {
+        let src = include_str!("update.rs");
+        let bcast_arm_pos = src
+            .find("UpdateMsg::BroadcastTo {")
+            .expect("UpdateMsg::BroadcastTo match arm not found");
+        // Scope to the Err(err) branch of this arm.
+        let err_branch_start = src[bcast_arm_pos..]
+            .find("Err(err) =>")
+            .map(|p| bcast_arm_pos + p)
+            .expect("BroadcastTo Err(err) branch not found");
+        let branch = &src[err_branch_start..err_branch_start + 3500];
+
+        assert!(
+            branch.contains("err.is_invalid_update_rejection()"),
+            "BroadcastTo rejection branch MUST gate summary-back on \
+             is_invalid_update_rejection (not is_contract_exec_rejection): \
+             the broader predicate matches OOG/traps which are \
+             attacker-inducible and must not amplify into summary-back"
+        );
+        assert!(
+            branch.contains("send_summary_back_on_rejection"),
+            "send_summary_back_on_rejection call missing — stale-version \
+             rejections in legacy BroadcastTo will keep amplifying"
+        );
+    }
+
+    /// Pin: `UpdateMsg::BroadcastToStreaming` handler must spawn
+    /// `send_summary_back_on_rejection` on the invalid-update rejection
+    /// branch (the non-`try_auto_fetch_contract` branch).
+    #[test]
+    fn legacy_broadcast_to_streaming_sends_summary_back_on_rejection() {
+        let src = include_str!("update.rs");
+        let stream_arm_pos = src
+            .find("UpdateMsg::BroadcastToStreaming")
+            .expect("BroadcastToStreaming arm not found");
+        let err_branch_start = src[stream_arm_pos..]
+            .find("Err(err) =>")
+            .map(|p| stream_arm_pos + p)
+            .expect("BroadcastToStreaming Err(err) branch not found");
+        let branch = &src[err_branch_start..err_branch_start + 3000];
+
+        assert!(
+            branch.contains("err.is_invalid_update_rejection()"),
+            "BroadcastToStreaming Err branch must gate summary-back on \
+             is_invalid_update_rejection"
+        );
+        assert!(
+            branch.contains("send_summary_back_on_rejection"),
+            "BroadcastToStreaming Err branch must spawn \
+             send_summary_back_on_rejection on invalid-update rejection"
+        );
+        assert!(
+            branch.contains("try_auto_fetch_contract"),
+            "BroadcastToStreaming Err branch must still call \
+             try_auto_fetch_contract on the non-rejection (missing-contract) path"
+        );
+    }
+
+    /// Pin: `send_summary_back_on_rejection` helper MUST gate on
+    /// `sender_summary_bytes` matching our current summary before sending
+    /// `InterestMessage::Summaries`. Without this gate, a mismatch triggers
+    /// `SyncStateToPeer` at `node.rs:1791-1839` which re-sends the sender's
+    /// stale state back to us, creating a reject→summary→resync→reject
+    /// loop. ALSO pins the throttle-before-WASM ordering to prevent
+    /// attacker-induced `summarize_state` amplification under rejection
+    /// floods. See the helper's docs and PR description.
+    #[test]
+    fn summary_back_helper_gates_on_summary_equality() {
+        let src = include_str!("update.rs");
+        let fn_start = src
+            .find("pub(crate) async fn send_summary_back_on_rejection(")
+            .expect("send_summary_back_on_rejection fn not found");
+        let fn_end_offset = src[fn_start..]
+            .find("\n}\n")
+            .expect("send_summary_back_on_rejection fn close not found");
+        let fn_body = &src[fn_start..fn_start + fn_end_offset];
+
+        assert!(
+            fn_body.contains("sender_summary_bytes"),
+            "send_summary_back_on_rejection must take sender_summary_bytes \
+             as a parameter"
+        );
+
+        // Pin throttle-before-WASM ordering. Without this, an attacker
+        // inducing rejections can force one `summarize_state` WASM call per
+        // rejection — the equality gate below guards only the outgoing send.
+        let throttle_pos = fn_body
+            .find("should_send_summary_notification")
+            .expect("helper MUST call should_send_summary_notification (throttle)");
+        let wasm_call_pos = fn_body
+            .find("get_contract_summary")
+            .expect("helper must call get_contract_summary to compute our_summary");
+        assert!(
+            throttle_pos < wasm_call_pos,
+            "should_send_summary_notification MUST run before get_contract_summary \
+             — otherwise attacker-induced rejections force unbounded WASM amplification"
+        );
+
+        // Pin the EXACT inequality direction: on difference → early return.
+        // If the direction is reversed (== → early return, meaning "send only
+        // when they differ"), the helper reintroduces the SyncStateToPeer
+        // loop that this PR fixes.
+        let inequality_check_pos = fn_body
+            .find("our_summary.as_ref() != sender_summary_bytes.as_slice()")
+            .expect(
+                "helper MUST use `our_summary.as_ref() != sender_summary_bytes.as_slice()` \
+                 as the gate condition (reversed direction reintroduces the SyncStateToPeer \
+                 loop — see node.rs:1791-1839)",
+            );
+        let after_check = &fn_body[inequality_check_pos..];
+        let return_pos = after_check.find("return;").expect(
+            "gate must early-return on inequality (reversed direction would bypass \
+             the SyncStateToPeer safeguard)",
+        );
+        let notify_pos = after_check
+            .find("notify_node_event")
+            .expect("helper must still call notify_node_event on the equality path");
+        assert!(
+            return_pos < notify_pos,
+            "early return on inequality MUST precede the notify_node_event \
+             send — otherwise mismatched summaries would still be transmitted"
+        );
     }
 }
