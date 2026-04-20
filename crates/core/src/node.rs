@@ -1019,6 +1019,63 @@ where
                     return Ok(None);
                 }
 
+                // #1454 phase 5 follow-up (slice A): relay PUT task-per-tx
+                // dispatch.
+                //
+                // For true relay hops (source_addr.is_some() AND incoming
+                // variant is PutMsg::Request AND no PutOp already exists in
+                // OpManager for this tx), spawn the relay driver and
+                // return. The driver owns local store + forward + upstream
+                // bubble-up in its task locals.
+                //
+                // source_addr.is_none() (client-initiated PUT's send_and_await
+                // loop-back) falls through to legacy — the phase-3a client
+                // driver relies on the Request-echo contract for
+                // LocalCompletion classification.
+                //
+                // GC-spawned speculative retries and start_client_put-driven
+                // legacy-path hops register a PutOp in OpManager before the
+                // Request hits the wire, so has_put_op(id) returning true
+                // means this is not a fresh inbound relay call.
+                //
+                // Streaming variants (RequestStreaming/ResponseStreaming)
+                // and ForwardingAck stay on the legacy path in slice A —
+                // the arm below only matches non-streaming PutMsg::Request.
+                if let put::PutMsg::Request {
+                    id,
+                    contract,
+                    related_contracts,
+                    value,
+                    htl,
+                    skip_list,
+                } = op
+                {
+                    if let Some(upstream_addr) = source_addr {
+                        if !op_manager.has_put_op(id) {
+                            if let Err(err) = put::op_ctx_task::start_relay_put(
+                                op_manager.clone(),
+                                *id,
+                                contract.clone(),
+                                related_contracts.clone(),
+                                value.clone(),
+                                *htl,
+                                skip_list.clone(),
+                                upstream_addr,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    contract = %contract.key(),
+                                    error = %err,
+                                    "PUT relay dispatch: start_relay_put failed"
+                                );
+                            }
+                            return Ok(None);
+                        }
+                    }
+                }
+
                 tracing::debug!(
                     tx = %op.id(),
                     "handle_pure_network_message_v1: Processing PUT message"
@@ -3701,6 +3758,70 @@ mod tests {
                 !window.contains("UpdateMsg::Broadcasting {"),
                 "UPDATE branch dispatches deprecated Broadcasting variant through \
                  the relay driver. Broadcasting must stay on the legacy path."
+            );
+        }
+
+        // ── Relay PUT dispatch structural pin tests (#1454 phase 5
+        // follow-up slice A). Mirror of the UPDATE tests above.
+
+        #[test]
+        fn put_branch_dispatches_relay_driver() {
+            const SOURCE: &str = include_str!("node.rs");
+            let anchor = "NetMessageV1::Put(ref op) => {";
+            let branch_start = SOURCE.find(anchor).expect(
+                "PUT branch of handle_pure_network_message_v1 not found; \
+                 the match arm has been renamed or moved — update this guard",
+            );
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<put::PutOp, _>")
+                .expect("PUT branch no longer calls handle_op_request — update guard")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+            assert!(
+                window.contains("start_relay_put("),
+                "PUT branch no longer calls start_relay_put for relay dispatch. \
+                 #1454 phase-5 slice A relay PUT dispatch was removed — restore it."
+            );
+        }
+
+        #[test]
+        fn put_branch_dispatch_gates_on_source_and_existing_op() {
+            const SOURCE: &str = include_str!("node.rs");
+            let anchor = "NetMessageV1::Put(ref op) => {";
+            let branch_start = SOURCE.find(anchor).expect("PUT branch not found");
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<put::PutOp, _>")
+                .expect("PUT branch no longer calls handle_op_request")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+            assert!(
+                window.contains("source_addr"),
+                "PUT relay dispatch must be gated on source_addr — internal \
+                 callers (source_addr.is_none()) must fall through to legacy."
+            );
+            assert!(
+                window.contains("has_put_op"),
+                "PUT relay dispatch must be guarded by has_put_op — GC-spawned \
+                 retries / pre-registered ops must fall through to legacy."
+            );
+        }
+
+        #[test]
+        fn put_branch_does_not_dispatch_streaming_variants() {
+            const SOURCE: &str = include_str!("node.rs");
+            let anchor = "NetMessageV1::Put(ref op) => {";
+            let branch_start = SOURCE.find(anchor).expect("PUT branch not found");
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<put::PutOp, _>")
+                .expect("PUT branch no longer calls handle_op_request")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+            // Slice A only migrates non-streaming PutMsg::Request. The
+            // streaming variants stay on the legacy path.
+            assert!(
+                !window.contains("put::PutMsg::RequestStreaming {"),
+                "PUT branch appears to dispatch RequestStreaming through the \
+                 relay driver. Slice A keeps streaming on the legacy path."
             );
         }
     }
