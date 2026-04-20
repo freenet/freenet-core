@@ -211,11 +211,117 @@ jobs:
           name: binaries-x86_64-windows-fdev
           path: target/release/fdev.exe
 
+  build-macos-dmg:
+    name: Build Freenet.dmg (universal, signed + notarized)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    needs: [build-arm64-macos, build-x86_64-macos]
+    # Run on release tags (the normal path) OR on manual workflow_dispatch
+    # invocations (so maintainers can produce a signed test DMG from any
+    # branch without cutting a release). We intentionally skip PR builds
+    # and regular main-push builds so we don't burn Apple notarization
+    # quota on every commit and so fork PRs can't see the signing secrets.
+    if: |
+      startsWith(github.ref, 'refs/tags/v')
+      || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download ARM64 macOS freenet binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-arm64-macos-freenet
+          path: bin-arm64
+
+      - name: Download x86_64 macOS freenet binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-x86_64-macos-freenet
+          path: bin-x86_64
+
+      - name: Install packaging dependencies
+        run: |
+          brew install create-dmg
+
+      - name: Import Developer ID signing certificate
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          # Decode the .p12 into a file that `security import` can read.
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          echo "$P12_BASE64" | base64 --decode > "$CERT_PATH"
+
+          # Stand up an ephemeral keychain for this job.
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import the cert and authorize codesign to use it without prompts.
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Make the new keychain the default search so codesign finds the cert.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '"')
+
+          rm "$CERT_PATH"
+
+      - name: Decode App Store Connect API key
+        env:
+          P8_BASE64: ${{ secrets.APPLE_ASC_API_KEY_P8_BASE64 }}
+        run: |
+          # notarytool reads the key from a file path at submit time.
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          echo "$P8_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "ASC_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Extract freenet version from Cargo.toml
+        id: version
+        run: |
+          V=$(grep '^version' crates/core/Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Freenet version: $V"
+
+      - name: Build signed + notarized Freenet.dmg
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          FREENET_ARM64_BIN: bin-arm64/freenet
+          FREENET_X86_BIN: bin-x86_64/freenet
+          CODESIGN_IDENTITY: "Developer ID Application: Ian CLARKE (R55ZESJCXG)"
+          ASC_API_KEY_ID: ${{ secrets.APPLE_ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.APPLE_ASC_API_KEY_ISSUER_ID }}
+          # ASC_API_KEY_PATH set by the previous step via $GITHUB_ENV.
+        run: |
+          chmod +x bin-arm64/freenet bin-x86_64/freenet
+          ./scripts/package-macos.sh
+
+      - name: Clean up secrets from runner
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/AuthKey.p8" || true
+          # The ephemeral keychain is removed automatically when the runner
+          # VM is torn down, but belt-and-braces: delete it explicitly.
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
+
+      - name: Upload DMG as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: freenet-macos-universal-dmg
+          path: dist/macos/Freenet-*.dmg
+
   attach-to-release:
     name: Attach binaries to GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [build-x86_64-linux, build-arm64-linux, build-arm64-macos, build-x86_64-macos, build-x86_64-windows]
+    needs: [build-x86_64-linux, build-arm64-linux, build-arm64-macos, build-x86_64-macos, build-x86_64-windows, build-macos-dmg]
     if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
@@ -287,6 +393,13 @@ jobs:
           name: binaries-x86_64-windows-fdev
           path: artifacts/x86_64-windows-fdev
 
+      # macOS universal DMG (signed + notarized)
+      - name: Download Freenet.dmg
+        uses: actions/download-artifact@v8
+        with:
+          name: freenet-macos-universal-dmg
+          path: artifacts/macos-dmg
+
       - name: Prepare release assets
         run: |
           # Create tar.gz files for each binary with binstall-compatible naming
@@ -311,13 +424,16 @@ jobs:
           cd artifacts/x86_64-windows-fdev && zip ../../fdev-x86_64-pc-windows-msvc.zip fdev.exe && cd ../..
           cp artifacts/x86_64-windows-freenet/freenet.exe freenet.exe
 
+          # macOS universal installer (signed + notarized)
+          cp artifacts/macos-dmg/Freenet-*.dmg .
+
           # Display the created files
-          ls -lh *.tar.gz *.zip *.exe
+          ls -lh *.tar.gz *.zip *.exe *.dmg
 
       - name: Generate SHA256 checksums
         run: |
           # Generate checksums for all available release assets
-          sha256sum *.tar.gz *.zip *.exe 2>/dev/null > SHA256SUMS.txt || true
+          sha256sum *.tar.gz *.zip *.exe *.dmg 2>/dev/null > SHA256SUMS.txt || true
 
           # Display checksums
           echo "=== SHA256 Checksums ==="
@@ -332,7 +448,7 @@ jobs:
 
           # Collect all release assets
           ASSETS=""
-          for f in *.tar.gz *.zip *.exe; do
+          for f in *.tar.gz *.zip *.exe *.dmg; do
             [ -f "$f" ] && ASSETS="$ASSETS $f"
           done
           ASSETS="$ASSETS SHA256SUMS.txt"
