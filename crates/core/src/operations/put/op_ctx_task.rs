@@ -866,6 +866,17 @@ async fn drive_relay_put(
     let round_trip =
         tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(next_addr, forward)).await;
 
+    // Release the pending_op_results slot that send_to_and_await
+    // installed. The downstream reply has already been delivered (or
+    // timed out); the upstream-reply fire-and-forget below will
+    // re-insert under the same key, and a single TransactionCompleted
+    // at driver exit only removes one entry — without this interim
+    // release the inserts/removes ledger leaks one entry per relay
+    // driver run (reproduced by test_pending_op_results_bounded at
+    // 74/461 on the PR branch before this release call was added).
+    // Mirrors GET relay's post-send_to_and_await release.
+    op_manager.release_pending_op_slot(incoming_tx).await;
+
     let reply = match round_trip {
         Ok(Ok(reply)) => reply,
         Ok(Err(err)) => {
