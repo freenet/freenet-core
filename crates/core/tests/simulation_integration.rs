@@ -7414,8 +7414,8 @@ fn test_get_routing_coverage_low_htl() {
     use std::sync::atomic::Ordering;
 
     use freenet::dev_tool::{
-        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, ScheduledOperation, SimOperation,
-        register_crdt_contract,
+        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, RELAY_PUT_DRIVER_CALL_COUNT, ScheduledOperation,
+        SimOperation, register_crdt_contract,
     };
 
     // Seed updated: per-peer acceptor reliability scoring replaces binary
@@ -7434,6 +7434,7 @@ fn test_get_routing_coverage_low_htl() {
     // to the source-scrape tests in op_ctx_task.rs that only pin the
     // dispatch-block SHAPE. #1454 phase 5 / #3883.
     let relay_baseline = GET_RELAY_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+    let relay_put_baseline = RELAY_PUT_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
 
     let rt = create_runtime();
 
@@ -7553,6 +7554,23 @@ fn test_get_routing_coverage_low_htl() {
          and ~5 caching nodes, every non-caching requester should hit at \
          least one relay hop. Dispatch gate in \
          handle_pure_network_message_v1 has likely regressed. Baseline: {relay_baseline}, after: {relay_after}."
+    );
+
+    // Behavioral companion for relay PUT slice A (#1454 phase 5
+    // follow-up, PR #3917): the gateway PUT at HTL=3 should reach at
+    // least one relay peer via start_relay_put. If this never advances,
+    // the PUT dispatch gate in handle_pure_network_message_v1 has
+    // regressed — inbound relay PutMsg::Request is going through the
+    // legacy handle_op_request path again.
+    let relay_put_after = RELAY_PUT_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+    let relay_put_delta = relay_put_after.saturating_sub(relay_put_baseline);
+    assert!(
+        relay_put_delta > 0,
+        "RELAY_PUT_DRIVER_CALL_COUNT did not advance during the test — \
+         the relay PUT task-per-tx driver never ran. Gateway PUT at HTL=3 \
+         in a {num_nodes}-node network must traverse at least one relay hop. \
+         Dispatch gate for PUT has likely regressed. \
+         Baseline: {relay_put_baseline}, after: {relay_put_after}."
     );
 
     // StateVerifier anomaly check

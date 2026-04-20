@@ -102,6 +102,14 @@ pub mod dev_tool {
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::RELAY_DRIVER_CALL_COUNT as GET_RELAY_DRIVER_CALL_COUNT;
 
+    // #1454 Phase 5 follow-up slice A (#3917) — test hook to verify
+    // the dispatch gate in `handle_pure_network_message_v1` actually
+    // routes fresh inbound relay PUTs through the task-per-tx driver
+    // (vs. the legacy `handle_op_request` fallthrough used for
+    // client-initiated loopback and GC-spawned retries).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::put::op_ctx_task::RELAY_PUT_DRIVER_CALL_COUNT;
+
     // Re-export state verification for telemetry-based consistency analysis
     pub use crate::tracing::state_verifier::{StateAnomaly, StateVerifier, VerificationReport};
 

@@ -348,6 +348,16 @@ pub(crate) struct OpManager {
     /// GC-spawned re-entries and routing-bloom false-positive
     /// retransmissions.
     pub(crate) active_relay_update_txs: Arc<DashSet<Transaction>>,
+    /// Set of transactions currently being driven by a relay PUT
+    /// task-per-tx driver on this node. Same role as
+    /// `active_relay_get_txs` but for PUT relay (#1454 phase 5
+    /// follow-up slice A). PUT relay has req/response semantics like
+    /// GET (but forwards once — no per-hop retry), so the amplification
+    /// risk is comparable to GET. The dedup gate rejects duplicate
+    /// inbound `PutMsg::Request` for a tx that already has a live
+    /// relay driver — prevents GC-spawned re-entries and routing-bloom
+    /// false-positive retransmissions from spawning redundant drivers.
+    pub(crate) active_relay_put_txs: Arc<DashSet<Transaction>>,
 }
 
 impl Clone for OpManager {
@@ -377,6 +387,7 @@ impl Clone for OpManager {
             pending_contract_fetches: self.pending_contract_fetches.clone(),
             active_relay_get_txs: self.active_relay_get_txs.clone(),
             active_relay_update_txs: self.active_relay_update_txs.clone(),
+            active_relay_put_txs: self.active_relay_put_txs.clone(),
         }
     }
 }
@@ -419,6 +430,7 @@ impl OpManager {
             Arc::new(DashMap::new());
         let active_relay_get_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
         let active_relay_update_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
+        let active_relay_put_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
 
         task_monitor.register(
             "garbage_cleanup",
@@ -438,6 +450,7 @@ impl OpManager {
                     pending_contract_fetches.clone(),
                     active_relay_get_txs.clone(),
                     active_relay_update_txs.clone(),
+                    active_relay_put_txs.clone(),
                 )
                 .instrument(garbage_span),
             ),
@@ -508,6 +521,7 @@ impl OpManager {
             pending_contract_fetches,
             active_relay_get_txs,
             active_relay_update_txs,
+            active_relay_put_txs,
         })
     }
 
@@ -1025,6 +1039,19 @@ impl OpManager {
     /// (existing op → fall through to the legacy `handle_op_request` path).
     pub fn has_update_op(&self, id: &Transaction) -> bool {
         self.ops.update.contains_key(id)
+    }
+
+    /// Returns `true` if a `PutOp` is currently registered for this
+    /// transaction in `OpManager.ops.put`.
+    ///
+    /// Same role as `has_get_op` but for the relay PUT dispatch gate
+    /// (#1454 phase 5 follow-up slice A). Used by `node.rs` to
+    /// distinguish a fresh inbound relay PUT (no existing op → spawn
+    /// the task-per-tx driver) from a GC-spawned speculative retry or
+    /// client-initiated PUT loopback (existing op → fall through to the
+    /// legacy `handle_op_request` path).
+    pub fn has_put_op(&self, id: &Transaction) -> bool {
+        self.ops.put.contains_key(id)
     }
 
     pub fn completed(&self, id: Transaction) {
@@ -1671,6 +1698,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
     active_relay_get_txs: Arc<DashSet<Transaction>>,
     active_relay_update_txs: Arc<DashSet<Transaction>>,
+    active_relay_put_txs: Arc<DashSet<Transaction>>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     /// How often to clean up stale contract_waiters entries (every N ticks).
@@ -1734,6 +1762,19 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         crate::operations::update::op_ctx_task::RELAY_UPDATE_DEDUP_REJECTS
                             .load(Ordering::Relaxed);
                     let relay_update_active_txs = active_relay_update_txs.len();
+                    let relay_put_inflight =
+                        crate::operations::put::op_ctx_task::RELAY_PUT_INFLIGHT
+                            .load(Ordering::Relaxed);
+                    let relay_put_spawned =
+                        crate::operations::put::op_ctx_task::RELAY_PUT_SPAWNED_TOTAL
+                            .load(Ordering::Relaxed);
+                    let relay_put_completed =
+                        crate::operations::put::op_ctx_task::RELAY_PUT_COMPLETED_TOTAL
+                            .load(Ordering::Relaxed);
+                    let relay_put_dedup_rejects =
+                        crate::operations::put::op_ctx_task::RELAY_PUT_DEDUP_REJECTS
+                            .load(Ordering::Relaxed);
+                    let relay_put_active_txs = active_relay_put_txs.len();
                     tracing::info!(
                         target: "memory_stats",
                         tick = tick_count,
@@ -1761,6 +1802,11 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         relay_update_completed = relay_update_completed,
                         relay_update_dedup_rejects = relay_update_dedup_rejects,
                         relay_update_active_txs = relay_update_active_txs,
+                        relay_put_inflight = relay_put_inflight,
+                        relay_put_spawned = relay_put_spawned,
+                        relay_put_completed = relay_put_completed,
+                        relay_put_dedup_rejects = relay_put_dedup_rejects,
+                        relay_put_active_txs = relay_put_active_txs,
                         "memory stats"
                     );
                 }
