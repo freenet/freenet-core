@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Freenet uses wasmtime to execute contract and delegate WASM. wasmtime
+      JIT-compiles code at runtime, which the Hardened Runtime (required
+      for notarization) blocks by default. These entitlements allow the
+      JIT path while keeping every other Hardened Runtime protection in
+      place.
+    -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>
