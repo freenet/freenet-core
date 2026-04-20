@@ -1,0 +1,117 @@
+name: Build Freenet.dmg (smoke-test)
+
+# Fast-iteration path for the macOS packaging pipeline. Downloads the
+# Mac binaries from an existing GitHub release and runs the same
+# package-macos.sh script that the real release pipeline uses, without
+# waiting for a 30-minute-per-arch cargo rebuild.
+#
+# Use the real pipeline (cross-compile.yml build-macos-dmg job) on actual
+# release tags. This workflow exists purely for validating the DMG
+# packaging logic itself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag whose Mac tarballs to repackage (e.g. v0.2.48 or "latest")'
+        required: false
+        type: string
+        default: latest
+
+jobs:
+  build-dmg:
+    name: Repackage existing Mac binaries into a signed Freenet.dmg
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "$INPUT_TAG" == "latest" || -z "$INPUT_TAG" ]]; then
+            TAG=$(gh release view --repo "${{ github.repository }}" --json tagName -q .tagName)
+          else
+            TAG="$INPUT_TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      - name: Download Mac binaries from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          mkdir -p download
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern 'freenet-aarch64-apple-darwin.tar.gz' \
+            --pattern 'freenet-x86_64-apple-darwin.tar.gz' \
+            --dir download
+          mkdir -p bin-arm64 bin-x86_64
+          tar -xzf download/freenet-aarch64-apple-darwin.tar.gz -C bin-arm64
+          tar -xzf download/freenet-x86_64-apple-darwin.tar.gz  -C bin-x86_64
+          chmod +x bin-arm64/freenet bin-x86_64/freenet
+          file bin-arm64/freenet bin-x86_64/freenet
+
+      - name: Install packaging dependencies
+        run: brew install create-dmg
+
+      - name: Import Developer ID signing certificate
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          echo "$P12_BASE64" | base64 --decode > "$CERT_PATH"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '"')
+          rm "$CERT_PATH"
+
+      - name: Decode App Store Connect API key
+        env:
+          P8_BASE64: ${{ secrets.APPLE_ASC_API_KEY_P8_BASE64 }}
+        run: |
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          echo "$P8_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "ASC_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Build signed + notarized DMG
+        env:
+          VERSION: ${{ steps.tag.outputs.tag }}
+          FREENET_ARM64_BIN: bin-arm64/freenet
+          FREENET_X86_BIN: bin-x86_64/freenet
+          CODESIGN_IDENTITY: "Developer ID Application: Ian CLARKE (R55ZESJCXG)"
+          ASC_API_KEY_ID: ${{ secrets.APPLE_ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.APPLE_ASC_API_KEY_ISSUER_ID }}
+        run: |
+          # Strip leading "v" so the DMG filename reads "Freenet-0.2.48.dmg"
+          # rather than "Freenet-v0.2.48.dmg".
+          export VERSION="${VERSION#v}"
+          ./scripts/package-macos.sh
+
+      - name: Clean up secrets from runner
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/AuthKey.p8" || true
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
+
+      - name: Upload DMG as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: freenet-macos-universal-dmg-smoketest
+          path: dist/macos/Freenet-*.dmg
