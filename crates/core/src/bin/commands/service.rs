@@ -235,10 +235,87 @@ const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
 #[allow(dead_code)] // Used on Windows/macOS (tray + wrapper loop)
 pub(crate) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 
+/// host:port pair the dashboard HTTP server listens on. Kept in sync with
+/// `DASHBOARD_URL`.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const DASHBOARD_ADDR: &str = "127.0.0.1:7509";
+
 /// Open a URL in the default browser (platform-specific).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn open_url_in_browser(url: &str) {
     super::open_url_in_browser(url);
+}
+
+// ── First-run onboarding ──
+//
+// On first launch of the tray wrapper we open the local dashboard in the
+// user's default browser so a new user can actually see Freenet doing
+// something. Subsequent launches are silent — this matches Mac menu-bar
+// conventions (Docker Desktop, Dropbox, Rectangle, etc.: guide the user
+// on first install, stay out of the way afterwards).
+//
+// The marker-file helpers are platform-independent so they can be unit-
+// tested on Linux CI; the dashboard-opening thread is tray-specific.
+
+/// Path of the first-run marker file, if we can determine a data directory.
+#[allow(dead_code)] // Used by the tray wrapper on Windows/macOS only
+fn first_run_marker_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("freenet").join(".first-run-complete"))
+}
+
+#[allow(dead_code)]
+fn is_first_run_at(marker: &Path) -> bool {
+    !marker.exists()
+}
+
+#[allow(dead_code)]
+fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::File::create(marker).map(|_| ())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn dashboard_port_is_listening() -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let Ok(addr) = DASHBOARD_ADDR.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// Spawn a short-lived thread that waits for the dashboard HTTP server to
+/// come up, then opens it in the browser and writes the first-run marker.
+/// The thread gives up after a generous timeout — if the daemon is
+/// crashing repeatedly we'd rather skip first-run and retry next launch
+/// than open a "connection refused" page in the user's browser.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn spawn_first_run_dashboard_opener(log_dir: &Path) {
+    let log_dir = log_dir.to_path_buf();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if dashboard_port_is_listening() {
+                open_url_in_browser(DASHBOARD_URL);
+                if let Some(marker) = first_run_marker_path() {
+                    if let Err(e) = mark_first_run_complete_at(&marker) {
+                        log_wrapper_event(
+                            &log_dir,
+                            &format!("Failed to write first-run marker: {e}"),
+                        );
+                    }
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        log_wrapper_event(
+            &log_dir,
+            "First-run dashboard open skipped: dashboard never became reachable",
+        );
+    });
 }
 
 /// State for the wrapper backoff state machine.
@@ -419,16 +496,25 @@ fn run_wrapper(version: &str) -> Result<()> {
 
         let (action_tx, action_rx) = mpsc::channel::<TrayAction>();
         let (status_tx, status_rx) = mpsc::channel::<WrapperStatus>();
+        // Wrapper → tray cleanup-done signal. On macOS, `tao::EventLoop::run`
+        // diverges (calls `process::exit` on `ControlFlow::Exit`), so the tray
+        // must block long enough for the wrapper thread to kill its child
+        // daemon before the process exits. The signal fires in the wrapper's
+        // spawn thunk regardless of which code path returned, so every exit
+        // route (Quit, auto-update restart, network-wait abort) is covered.
+        let (cleanup_tx, cleanup_rx) = mpsc::channel::<()>();
         let version_owned = version.to_string();
         let log_dir_clone = log_dir.clone();
 
         // Wrapper loop runs on a background thread
         let loop_handle = std::thread::spawn(move || {
-            run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)))
+            let result = run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)));
+            let _ = cleanup_tx.send(());
+            result
         });
 
         // Tray icon runs on the main thread (platform message pump)
-        super::tray::run_tray_event_loop(action_tx, status_rx, &version_owned);
+        super::tray::run_tray_event_loop(action_tx, status_rx, cleanup_rx, &version_owned);
 
         // Tray loop exited (user clicked Quit) — join the wrapper thread
         match loop_handle.join() {
@@ -633,6 +719,16 @@ fn run_wrapper_loop(
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     wait_for_network_ready(log_dir, None);
+
+    // First-run onboarding: if this user has never launched the tray wrapper
+    // before, open the dashboard in their browser once the HTTP server comes
+    // up. Runs in a background thread so it doesn't delay the main loop.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    if let Some(marker) = first_run_marker_path() {
+        if is_first_run_at(&marker) {
+            spawn_first_run_dashboard_opener(log_dir);
+        }
+    }
 
     loop {
         // Notify tray that we're starting
@@ -2529,6 +2625,26 @@ fn service_logs(_error_only: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn first_run_marker_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("freenet").join(".first-run-complete");
+
+        // Before any write, it should be a first run.
+        assert!(is_first_run_at(&marker));
+        assert!(!marker.exists());
+
+        // Writing the marker creates parent dirs and flips the state.
+        mark_first_run_complete_at(&marker).unwrap();
+        assert!(marker.exists());
+        assert!(!is_first_run_at(&marker));
+
+        // Re-writing an existing marker must not error (subsequent launches
+        // of a first-run flow that somehow re-ran shouldn't blow up).
+        mark_first_run_complete_at(&marker).unwrap();
+        assert!(!is_first_run_at(&marker));
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

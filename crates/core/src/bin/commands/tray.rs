@@ -211,8 +211,13 @@ mod platform {
 
             let icon = build_icon().map_err(|e| format!("Failed to build tray icon: {e}"))?;
 
+            // On macOS, `with_title` places the text "Freenet" alongside the
+            // icon in the menu bar so the app is identifiable at a glance.
+            // On Windows the title is ignored in the tray area but shows up
+            // in hover/tooltip context.
             let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
+                .with_title("Freenet")
                 .with_tooltip(format!("Freenet {version} - Starting..."))
                 .with_icon(icon)
                 .build()
@@ -284,7 +289,12 @@ mod platform {
         state: TrayState,
         action_tx: std_mpsc::Sender<TrayAction>,
         status_rx: std_mpsc::Receiver<WrapperStatus>,
+        _cleanup_done_rx: std_mpsc::Receiver<()>,
     ) {
+        // Windows doesn't need the cleanup signal — the Win32 message pump
+        // returns control to the caller normally, so `run_wrapper` can join
+        // the wrapper thread afterwards. The parameter exists for signature
+        // parity with the macOS path.
         let menu_rx = MenuEvent::receiver();
 
         loop {
@@ -336,11 +346,17 @@ mod platform {
     // `tray-icon` drove the NSRunLoop internally. That was not true, and
     // the menu bar icon never appeared in practice.
 
+    /// How long we wait for the wrapper thread to kill the daemon child
+    /// after signalling Quit, before letting the process exit anyway.
+    #[cfg(target_os = "macos")]
+    const CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
     #[cfg(target_os = "macos")]
     fn run_event_loop(
         state: TrayState,
         action_tx: std_mpsc::Sender<TrayAction>,
         status_rx: std_mpsc::Receiver<WrapperStatus>,
+        cleanup_done_rx: std_mpsc::Receiver<()>,
     ) {
         use std::time::{Duration, Instant};
         use tao::event::Event;
@@ -381,6 +397,12 @@ mod platform {
                     }
                     MenuDispatch::Quit => {
                         action_tx.send(TrayAction::Quit).ok();
+                        // Block until the wrapper thread confirms it has killed
+                        // the daemon child, with a bounded timeout. On macOS,
+                        // tao's run is divergent — when we set ControlFlow::Exit,
+                        // the process exits without unwinding other threads, so
+                        // we must give the wrapper time to finish cleanup first.
+                        let _ = cleanup_done_rx.recv_timeout(CLEANUP_WAIT);
                         *control_flow = ControlFlow::Exit;
                         return;
                     }
@@ -394,6 +416,7 @@ mod platform {
                 if is_terminal {
                     std::thread::sleep(Duration::from_secs(1));
                     action_tx.send(TrayAction::Quit).ok();
+                    let _ = cleanup_done_rx.recv_timeout(CLEANUP_WAIT);
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -405,11 +428,15 @@ mod platform {
     ///
     /// `action_tx` sends user menu actions to the wrapper loop running on
     /// another thread. `status_rx` receives status updates from the wrapper
-    /// loop to update the tooltip. `version` is the current freenet version
-    /// string for display.
+    /// loop to update the tooltip. `cleanup_done_rx` receives a signal once
+    /// the wrapper thread has finished its shutdown work (killing the daemon
+    /// child); the macOS event loop waits briefly on it before exiting so
+    /// the daemon doesn't get orphaned when the process exits. `version` is
+    /// the current freenet version string for display.
     pub fn run_tray_event_loop(
         action_tx: std_mpsc::Sender<TrayAction>,
         status_rx: std_mpsc::Receiver<WrapperStatus>,
+        cleanup_done_rx: std_mpsc::Receiver<()>,
         version: &str,
     ) {
         let state = match TrayState::new(version.to_string()) {
@@ -419,7 +446,7 @@ mod platform {
                 return;
             }
         };
-        run_event_loop(state, action_tx, status_rx);
+        run_event_loop(state, action_tx, status_rx, cleanup_done_rx);
     }
 }
 
@@ -434,6 +461,7 @@ mod platform {
     pub fn run_tray_event_loop(
         _action_tx: std_mpsc::Sender<TrayAction>,
         _status_rx: std_mpsc::Receiver<WrapperStatus>,
+        _cleanup_done_rx: std_mpsc::Receiver<()>,
         _version: &str,
     ) {
         // Tray icon not supported. The wrapper loop runs directly on the
