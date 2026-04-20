@@ -186,9 +186,15 @@ mod platform {
         fn new(version: String) -> Result<Self, String> {
             let menu = Menu::new();
 
+            // App header — disabled item at the top of the menu that
+            // identifies the app and shows its version. Serves the same
+            // role as the bold app-name entry at the top of standard
+            // macOS app menus; keeps the menu bar status item itself
+            // compact (icon only) rather than eating horizontal space
+            // with a text label.
+            let app_header = menu_item(MENU_ID_VERSION, &format!("Freenet {version}"), false);
             let open_dashboard = menu_item(MENU_ID_OPEN_DASHBOARD, "Open Dashboard", true);
             let status_item = menu_item(MENU_ID_STATUS, "Status: Starting...", false);
-            let version_item = menu_item(MENU_ID_VERSION, &format!("Version: {version}"), false);
             let stop_item = menu_item(MENU_ID_STOP, "Stop", true);
             let start_item = menu_item(MENU_ID_START, "Start", false);
             let restart_item = menu_item(MENU_ID_RESTART, "Restart", true);
@@ -196,10 +202,11 @@ mod platform {
             let view_logs = menu_item(MENU_ID_VIEW_LOGS, "View Logs", true);
             let quit_item = menu_item(MENU_ID_QUIT, "Quit", true);
 
+            menu.append(&app_header).ok();
+            menu.append(&PredefinedMenuItem::separator()).ok();
             menu.append(&open_dashboard).ok();
             menu.append(&PredefinedMenuItem::separator()).ok();
             menu.append(&status_item).ok();
-            menu.append(&version_item).ok();
             menu.append(&PredefinedMenuItem::separator()).ok();
             menu.append(&stop_item).ok();
             menu.append(&start_item).ok();
@@ -211,13 +218,8 @@ mod platform {
 
             let icon = build_icon().map_err(|e| format!("Failed to build tray icon: {e}"))?;
 
-            // On macOS, `with_title` places the text "Freenet" alongside the
-            // icon in the menu bar so the app is identifiable at a glance.
-            // On Windows the title is ignored in the tray area but shows up
-            // in hover/tooltip context.
             let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
-                .with_title("Freenet")
                 .with_tooltip(format!("Freenet {version} - Starting..."))
                 .with_icon(icon)
                 .build()
