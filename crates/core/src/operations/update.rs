@@ -8,7 +8,7 @@ pub(crate) use self::messages::{BroadcastStreamingPayload, UpdateMsg, UpdateStre
 use super::{
     OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult, should_use_streaming,
 };
-use crate::contract::{ContractHandlerEvent, StoreResponse};
+use crate::contract::{ContractHandlerEvent, ExecutorError, StoreResponse};
 use crate::message::{InnerMessage, NetMessage, NodeEvent, Transaction};
 use crate::node::IsOperationCompleted;
 use crate::ring::{Location, PeerKeyLocation, RingError};
@@ -1310,19 +1310,12 @@ impl Operation for UpdateOp {
                             }
                         }
                         Err(err) => {
-                            // Broadcast updates are best-effort: if we can't apply the update
-                            // (e.g., missing contract parameters after restart), log and skip.
-                            tracing::warn!(
-                                tx = %id,
-                                %key,
-                                error = %err,
-                                "BroadcastToStreaming update skipped — contract not ready locally"
-                            );
-                            if !err.is_contract_exec_rejection() {
-                                // Self-heal: trigger a background GET to fetch the missing
-                                // contract code and parameters from the network.
-                                // Skip if the merge function ran and rejected the update
-                                // (e.g., stale version) — the contract code is present.
+                            // Two distinct cases (see issue #3914):
+                            //   1. Contract WASM merge rejected the incoming state
+                            //      (e.g., stale version) — benign, log INFO, no auto-fetch.
+                            //   2. Other failure (missing parameters after restart, etc.) —
+                            //      contract not ready locally; log WARN and self-heal.
+                            if log_broadcast_to_streaming_failure(id, key, &err) {
                                 op_manager.try_auto_fetch_contract(key, sender_addr);
                             }
                         }
@@ -1630,6 +1623,60 @@ fn build_op_result(
     })
 }
 
+/// Distinguishes a contract WASM merge rejection (benign — the contract
+/// correctly refused a stale or otherwise invalid incoming state) from a
+/// real failure (missing contract code, storage error, internal bug).
+///
+/// Mirrors the runtime layer's classification at
+/// `contract::executor::runtime::merge_state_and_validate` (logs the same
+/// rejection at INFO with `event="merge_rejected_valid_local"`). Without
+/// this distinction, every benign re-broadcast that misses the dedup
+/// window produced an ERROR-level log, drowning real alerts on production
+/// gateways. See issue #3914.
+fn log_update_contract_failure(key: &ContractKey, err: &ExecutorError) {
+    if err.is_contract_exec_rejection() {
+        tracing::info!(
+            contract = %key,
+            error = %err,
+            event = "merge_rejected_stale",
+            "Update rejected by contract — incoming state stale, keeping local"
+        );
+    } else {
+        tracing::error!(
+            contract = %key,
+            error = %err,
+            phase = "error",
+            "Failed to update contract value"
+        );
+    }
+}
+
+/// Logs the failure of a `BroadcastToStreaming` relay attempt and returns
+/// whether the caller should trigger a self-healing GET. A benign WASM
+/// rejection (stale incoming state) is logged at INFO and returns `false`
+/// — the contract is present locally and no fetch is needed. Any other
+/// failure is logged at WARN and returns `true`. See issue #3914.
+fn log_broadcast_to_streaming_failure(tx: &Transaction, key: &ContractKey, err: &OpError) -> bool {
+    if err.is_contract_exec_rejection() {
+        tracing::info!(
+            tx = %tx,
+            %key,
+            error = %err,
+            event = "merge_rejected_stale",
+            "BroadcastToStreaming merge rejected — incoming state stale, keeping local"
+        );
+        false
+    } else {
+        tracing::warn!(
+            tx = %tx,
+            %key,
+            error = %err,
+            "BroadcastToStreaming update skipped — contract not ready locally"
+        );
+        true
+    }
+}
+
 /// Apply an update to a contract.
 ///
 /// This function:
@@ -1698,7 +1745,7 @@ pub(crate) async fn update_contract(
             new_value: Err(err),
             ..
         }) => {
-            tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
+            log_update_contract_failure(&key, &err);
             Err(err.into())
         }
         Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
@@ -2795,5 +2842,135 @@ mod tests {
         let (peer, loc) = op.failure_routing_info().expect("should have routing info");
         assert_eq!(peer, target);
         assert_eq!(loc, contract_location);
+    }
+
+    /// Regression tests for issue #3914: misleading ERROR/WARN log noise from
+    /// benign WASM rejections of stale broadcast UPDATEs. The contract correctly
+    /// rejects an incoming state at a version we already hold (a re-broadcast
+    /// the dedup cache missed). On production gateways this generated 80–130
+    /// ERROR-level lines per hour per gateway; tests below pin the new INFO
+    /// classification so the regression cannot reappear.
+    mod log_severity {
+        use super::*;
+        use crate::contract::ExecutorError;
+        use crate::test_utils::TestLogger;
+        use freenet_stdlib::client_api::ContractError as StdContractError;
+
+        fn stale_state_rejection() -> ExecutorError {
+            // Mirrors the production message exactly:
+            // "execution error: invalid contract update, reason: New state
+            //  version N must be higher than current version N"
+            ExecutorError::request(StdContractError::update_exec_error(
+                make_contract_key(1),
+                "invalid contract update, reason: New state version 100 must be higher than current version 100",
+            ))
+        }
+
+        fn missing_parameters_failure() -> ExecutorError {
+            // Real failure case: contract not ready locally, auto-fetch needed.
+            ExecutorError::request(StdContractError::Update {
+                key: make_contract_key(2),
+                cause: "missing contract parameters".into(),
+            })
+        }
+
+        #[test]
+        fn update_contract_failure_logs_info_for_stale_state_rejection() {
+            let logger = TestLogger::new().capture_logs().with_level("info").init();
+
+            log_update_contract_failure(&make_contract_key(1), &stale_state_rejection());
+
+            assert!(
+                logger.contains("merge_rejected_stale"),
+                "expected event=merge_rejected_stale in logs, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                logger.contains("INFO"),
+                "expected INFO-level log for stale state rejection, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger.logs().iter().any(|l| l.contains("ERROR")),
+                "stale state rejection must not produce ERROR-level logs, got: {:?}",
+                logger.logs()
+            );
+        }
+
+        #[test]
+        fn update_contract_failure_logs_error_for_real_failure() {
+            let logger = TestLogger::new().capture_logs().with_level("info").init();
+
+            log_update_contract_failure(&make_contract_key(2), &missing_parameters_failure());
+
+            assert!(
+                logger.contains("ERROR"),
+                "real failures must remain ERROR-level, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                logger.contains("Failed to update contract value"),
+                "expected ERROR message text, got: {:?}",
+                logger.logs()
+            );
+        }
+
+        #[test]
+        fn broadcast_to_streaming_failure_logs_info_and_skips_auto_fetch_for_stale() {
+            let logger = TestLogger::new().capture_logs().with_level("info").init();
+            let tx = Transaction::new::<UpdateMsg>();
+            let err: OpError = stale_state_rejection().into();
+
+            let needs_auto_fetch =
+                log_broadcast_to_streaming_failure(&tx, &make_contract_key(1), &err);
+
+            assert!(
+                !needs_auto_fetch,
+                "stale state rejection must NOT trigger self-heal auto-fetch (contract code is present)"
+            );
+            assert!(
+                logger.contains("merge_rejected_stale"),
+                "expected event=merge_rejected_stale in logs, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger.logs().iter().any(|l| l.contains("WARN")),
+                "stale state rejection must not produce WARN-level logs (the old misleading 'contract not ready locally' line), got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger
+                    .logs()
+                    .iter()
+                    .any(|l| l.contains("contract not ready locally")),
+                "the misleading 'contract not ready locally' message must not appear for stale rejections, got: {:?}",
+                logger.logs()
+            );
+        }
+
+        #[test]
+        fn broadcast_to_streaming_failure_logs_warn_and_triggers_auto_fetch_for_real_failure() {
+            let logger = TestLogger::new().capture_logs().with_level("info").init();
+            let tx = Transaction::new::<UpdateMsg>();
+            let err: OpError = missing_parameters_failure().into();
+
+            let needs_auto_fetch =
+                log_broadcast_to_streaming_failure(&tx, &make_contract_key(2), &err);
+
+            assert!(
+                needs_auto_fetch,
+                "real failures must trigger self-heal auto-fetch"
+            );
+            assert!(
+                logger.contains("WARN"),
+                "real failures remain WARN-level for the streaming branch, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                logger.contains("contract not ready locally"),
+                "expected the WARN message text for real failure, got: {:?}",
+                logger.logs()
+            );
+        }
     }
 }

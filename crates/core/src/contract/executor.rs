@@ -177,7 +177,7 @@ impl ExecutorError {
         }
     }
 
-    fn request(error: impl Into<RequestError>) -> Self {
+    pub(crate) fn request(error: impl Into<RequestError>) -> Self {
         Self {
             inner: Either::Left(Box::new(error.into())),
             fatal: false,
