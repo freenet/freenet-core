@@ -1052,26 +1052,50 @@ where
                 {
                     if let Some(upstream_addr) = source_addr {
                         if !op_manager.has_put_op(id) {
-                            if let Err(err) = put::op_ctx_task::start_relay_put(
-                                op_manager.clone(),
-                                *id,
-                                contract.clone(),
-                                related_contracts.clone(),
-                                value.clone(),
-                                *htl,
-                                skip_list.clone(),
-                                upstream_addr,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    contract = %contract.key(),
-                                    error = %err,
-                                    "PUT relay dispatch: start_relay_put failed"
-                                );
+                            // Slice A only handles end-to-end non-streaming
+                            // hops. If the serialized payload would upgrade to
+                            // streaming on the forward (legacy put.rs:648-668
+                            // re-checks this before building the outbound
+                            // variant), fall through to legacy — the task-per-tx
+                            // driver does not pass streaming chunks through
+                            // yet (deferred to slice B).
+                            let would_upgrade_to_streaming = {
+                                let payload = put::PutStreamingPayload {
+                                    contract: contract.clone(),
+                                    related_contracts: related_contracts.clone(),
+                                    value: value.clone(),
+                                };
+                                bincode::serialize(&payload)
+                                    .map(|b| {
+                                        crate::operations::should_use_streaming(
+                                            op_manager.streaming_threshold,
+                                            b.len(),
+                                        )
+                                    })
+                                    .unwrap_or(false)
+                            };
+                            if !would_upgrade_to_streaming {
+                                if let Err(err) = put::op_ctx_task::start_relay_put(
+                                    op_manager.clone(),
+                                    *id,
+                                    contract.clone(),
+                                    related_contracts.clone(),
+                                    value.clone(),
+                                    *htl,
+                                    skip_list.clone(),
+                                    upstream_addr,
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        tx = %id,
+                                        contract = %contract.key(),
+                                        error = %err,
+                                        "PUT relay dispatch: start_relay_put failed"
+                                    );
+                                }
+                                return Ok(None);
                             }
-                            return Ok(None);
                         }
                     }
                 }
@@ -3803,6 +3827,33 @@ mod tests {
                 window.contains("has_put_op"),
                 "PUT relay dispatch must be guarded by has_put_op — GC-spawned \
                  retries / pre-registered ops must fall through to legacy."
+            );
+        }
+
+        #[test]
+        fn put_branch_checks_streaming_upgrade_on_forward() {
+            const SOURCE: &str = include_str!("node.rs");
+            let anchor = "NetMessageV1::Put(ref op) => {";
+            let branch_start = SOURCE.find(anchor).expect("PUT branch not found");
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<put::PutOp, _>")
+                .expect("PUT branch no longer calls handle_op_request")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+            // H1/H2 guard: dispatch must check that the payload wouldn't
+            // upgrade to streaming on forward; otherwise slice A's
+            // non-streaming-only driver would silently drop the streamed
+            // state upstream.
+            assert!(
+                window.contains("should_use_streaming("),
+                "PUT relay dispatch must check should_use_streaming — \
+                 slice A driver only handles end-to-end non-streaming hops; \
+                 payloads that would upgrade on forward must fall through to legacy."
+            );
+            assert!(
+                window.contains("would_upgrade_to_streaming"),
+                "PUT relay dispatch must gate on the would_upgrade_to_streaming \
+                 flag — see H1/H2 review findings."
             );
         }
 
