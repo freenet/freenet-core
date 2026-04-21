@@ -67,15 +67,25 @@ const MENU_ID_START: &str = "freenet.tray.start";
 const MENU_ID_RESTART: &str = "freenet.tray.restart";
 const MENU_ID_CHECK_UPDATE: &str = "freenet.tray.check_update";
 const MENU_ID_VIEW_LOGS: &str = "freenet.tray.view_logs";
+/// Currently displayed only on macOS (Windows installs itself as a service
+/// and is auto-started by the service manager), but the ID and dispatch
+/// arm are platform-independent so the unit tests run everywhere.
+const MENU_ID_LAUNCH_AT_LOGIN: &str = "freenet.tray.launch_at_login";
 const MENU_ID_QUIT: &str = "freenet.tray.quit";
 
 /// What should happen in response to a menu event. Side-effects (opening
 /// URLs, sending actions through channels, or exiting the loop) are the
 /// caller's responsibility so this decision is pure and unit-testable.
+///
+/// `OpenDashboard` and `ToggleLaunchAtLogin` are tray-local: they don't
+/// require coordination with the wrapper thread's state or child process,
+/// so the tray event loop handles them directly. Everything else routes
+/// through `Action(TrayAction)` to the wrapper.
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 enum MenuDispatch {
     OpenDashboard,
+    ToggleLaunchAtLogin,
     Action(TrayAction),
     Quit,
     Unknown,
@@ -90,6 +100,7 @@ fn dispatch_menu_event(event_id: &str) -> MenuDispatch {
         MENU_ID_RESTART => MenuDispatch::Action(TrayAction::Restart),
         MENU_ID_CHECK_UPDATE => MenuDispatch::Action(TrayAction::CheckUpdate),
         MENU_ID_VIEW_LOGS => MenuDispatch::Action(TrayAction::ViewLogs),
+        MENU_ID_LAUNCH_AT_LOGIN => MenuDispatch::ToggleLaunchAtLogin,
         MENU_ID_QUIT => MenuDispatch::Quit,
         _ => MenuDispatch::Unknown,
     }
@@ -160,6 +171,10 @@ mod tests {
         assert_eq!(
             dispatch_menu_event(MENU_ID_VIEW_LOGS),
             MenuDispatch::Action(TrayAction::ViewLogs)
+        );
+        assert_eq!(
+            dispatch_menu_event(MENU_ID_LAUNCH_AT_LOGIN),
+            MenuDispatch::ToggleLaunchAtLogin
         );
         assert_eq!(dispatch_menu_event(MENU_ID_QUIT), MenuDispatch::Quit);
     }
@@ -237,7 +252,7 @@ mod tests {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod platform {
     use super::*;
-    use muda::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+    use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use std::sync::mpsc as std_mpsc;
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -264,7 +279,7 @@ mod platform {
     }
 
     /// Owns the tray icon and the mutable menu items whose state changes at
-    /// runtime (status text, enable/disable toggles).
+    /// runtime (status text, enable/disable toggles, login-item check).
     struct TrayState {
         // Held only to keep the tray icon alive; dropped on shutdown.
         _tray: TrayIcon,
@@ -273,6 +288,11 @@ mod platform {
         stop_item: MenuItem,
         start_item: MenuItem,
         restart_item: MenuItem,
+        // macOS shows a "Launch at Login" toggle; Windows doesn't need one
+        // (the Windows installer registers Freenet as a service that the
+        // OS auto-starts).
+        #[cfg(target_os = "macos")]
+        launch_at_login_item: CheckMenuItem,
     }
 
     impl TrayState {
@@ -293,6 +313,14 @@ mod platform {
             let restart_item = menu_item(MENU_ID_RESTART, "Restart", true);
             let check_update = menu_item(MENU_ID_CHECK_UPDATE, "Check for Updates", true);
             let view_logs = menu_item(MENU_ID_VIEW_LOGS, "View Logs", true);
+            #[cfg(target_os = "macos")]
+            let launch_at_login_item = CheckMenuItem::with_id(
+                MenuId::new(MENU_ID_LAUNCH_AT_LOGIN),
+                "Launch at Login",
+                true,
+                super::super::service::is_launch_at_login_enabled(),
+                None,
+            );
             let quit_item = menu_item(MENU_ID_QUIT, "Quit", true);
 
             menu.append(&app_header).ok();
@@ -306,6 +334,8 @@ mod platform {
             menu.append(&restart_item).ok();
             menu.append(&check_update).ok();
             menu.append(&view_logs).ok();
+            #[cfg(target_os = "macos")]
+            menu.append(&launch_at_login_item).ok();
             menu.append(&PredefinedMenuItem::separator()).ok();
             menu.append(&quit_item).ok();
 
@@ -325,7 +355,19 @@ mod platform {
                 stop_item,
                 start_item,
                 restart_item,
+                #[cfg(target_os = "macos")]
+                launch_at_login_item,
             })
+        }
+
+        /// Refresh the Launch at Login check-state from the canonical
+        /// source (presence of the user LaunchAgent plist). Called after
+        /// a user-initiated toggle or whenever something external might
+        /// have changed the state.
+        #[cfg(target_os = "macos")]
+        fn refresh_launch_at_login_state(&self) {
+            self.launch_at_login_item
+                .set_checked(super::super::service::is_launch_at_login_enabled());
         }
 
         /// Applies a status update to the tray UI. Returns `true` if the
@@ -396,6 +438,11 @@ mod platform {
             if let Ok(event) = menu_rx.try_recv() {
                 match dispatch_menu_event(event.id.as_ref()) {
                     MenuDispatch::OpenDashboard => open_url(DASHBOARD_URL),
+                    MenuDispatch::ToggleLaunchAtLogin => {
+                        // Windows installs as a service — the tray doesn't
+                        // expose a Launch at Login item, so this arm is
+                        // unreachable here. Noop for future-proofing.
+                    }
                     MenuDispatch::Action(action) => {
                         action_tx.send(action).ok();
                     }
@@ -477,6 +524,25 @@ mod platform {
             while let Ok(menu_event) = menu_rx.try_recv() {
                 match dispatch_menu_event(menu_event.id.as_ref()) {
                     MenuDispatch::OpenDashboard => open_url(DASHBOARD_URL),
+                    MenuDispatch::ToggleLaunchAtLogin => {
+                        // Flip the user preference by consulting the
+                        // current state and inverting it. Log failures but
+                        // don't propagate — the menu item's check-state
+                        // will refresh from the filesystem either way.
+                        let exe = std::env::current_exe();
+                        let result = if super::super::service::is_launch_at_login_enabled() {
+                            super::super::service::disable_launch_at_login()
+                        } else {
+                            match exe {
+                                Ok(p) => super::super::service::enable_launch_at_login(&p),
+                                Err(e) => Err(e),
+                            }
+                        };
+                        if let Err(e) = result {
+                            eprintln!("Failed to toggle Launch at Login: {e}");
+                        }
+                        state.refresh_launch_at_login_state();
+                    }
                     MenuDispatch::Action(action) => {
                         action_tx.send(action).ok();
                     }
