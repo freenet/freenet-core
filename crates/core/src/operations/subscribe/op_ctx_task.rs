@@ -833,8 +833,32 @@ pub(crate) async fn start_relay_subscribe(
             %instance_id,
             %upstream_addr,
             phase = "relay_subscribe_dedup_reject",
-            "SUBSCRIBE relay (task-per-tx): duplicate Request for in-flight tx, dropping"
+            "SUBSCRIBE relay (task-per-tx): duplicate Request for in-flight tx, replying NotFound"
         );
+        // Emit an immediate `NotFound` back to the rejected upstream so
+        // its `send_to_and_await` returns fast instead of stalling the
+        // full `OPERATION_TTL` (60 s). Silently dropping the duplicate
+        // loses the upstream's retry budget and produces a spurious
+        // "this contract is unreachable" verdict even when the winning
+        // driver fulfills the subscription. The reply uses a fresh
+        // `OpCtx` scoped to `incoming_tx` — the fire-and-forget send
+        // does not touch the winning driver's `pending_op_results`
+        // slot (that slot is keyed on the attempt_tx the WINNER
+        // forwarded downstream, not on `incoming_tx` at this node).
+        let response = NetMessage::from(SubscribeMsg::Response {
+            id: incoming_tx,
+            instance_id,
+            result: SubscribeMsgResult::NotFound,
+        });
+        let mut ctx = op_manager.op_ctx(incoming_tx);
+        if let Err(err) = ctx.send_fire_and_forget(upstream_addr, response).await {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %upstream_addr,
+                error = %err,
+                "SUBSCRIBE relay (task-per-tx): dedup-reject NotFound send failed"
+            );
+        }
         return Ok(());
     }
 
@@ -1626,6 +1650,35 @@ mod tests {
         assert!(
             insert_pos < spawn_pos,
             "active_relay_subscribe_txs.insert MUST happen before GlobalExecutor::spawn"
+        );
+    }
+
+    /// Pin: dedup rejection must emit `SubscribeMsgResult::NotFound`
+    /// back to the rejected upstream. Silently dropping the duplicate
+    /// request stalls the upstream's `send_to_and_await` for the full
+    /// `OPERATION_TTL` (60 s), wasting its retry budget.
+    #[test]
+    fn dedup_rejection_emits_not_found_reply() {
+        let src = include_str!("op_ctx_task.rs");
+        let relay = relay_section(src);
+        let after_insert = relay
+            .split("active_relay_subscribe_txs.insert(incoming_tx)")
+            .nth(1)
+            .expect("dedup insert site not found");
+        // Look at the body between the insert and the early return.
+        let window_end = after_insert
+            .find("return Ok(())")
+            .expect("early return after dedup-reject not found");
+        let window = &after_insert[..window_end];
+        assert!(
+            window.contains("SubscribeMsgResult::NotFound"),
+            "dedup-reject path must emit SubscribeMsgResult::NotFound to \
+             the rejected upstream so its send_to_and_await returns fast"
+        );
+        assert!(
+            window.contains("send_fire_and_forget"),
+            "dedup-reject NotFound must be sent via send_fire_and_forget \
+             (not send_to_and_await — upstream's own waiter owns its slot)"
         );
     }
 

@@ -1460,27 +1460,53 @@ where
                     is_renewal,
                 } = op
                 {
-                    if let Some(upstream_addr) = source_addr {
-                        if !op_manager.has_subscribe_op(id) {
-                            if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
-                                op_manager.clone(),
-                                *id,
-                                *instance_id,
-                                *htl,
-                                visited.clone(),
-                                *is_renewal,
-                                upstream_addr,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    %instance_id,
-                                    error = %err,
-                                    "SUBSCRIBE relay dispatch: start_relay_subscribe failed"
-                                );
+                    // Renewals (`is_renewal=true`) fall through to legacy
+                    // so the relay still emits `SubscribeMsg::ForwardingAck`
+                    // back to the renewal originator. The
+                    // `ring.rs::connection_maintenance` renewal loop
+                    // registers a `SubscribeOp` locally, and its GC retry
+                    // selector at `op_state_manager.rs:2094` uses
+                    // `ack_received` to pick the retry base — without the
+                    // ack the originator retries on `ACK_TIMEOUT*(n+1)`
+                    // instead of `PROGRESS_TIMEOUT + ACK_TIMEOUT*n`,
+                    // which over the ~2 min renewal cycle compounds into
+                    // the #3763 subscription-storm feedback loop.
+                    // Driver-side ack emission would race the reply on
+                    // the upstream's capacity-1 `pending_op_results` slot
+                    // for task-per-tx originators, so slice A keeps
+                    // renewals on legacy.
+                    //
+                    // Non-renewal SUBSCRIBEs come from: (a) the Phase 2b
+                    // client-init driver, which uses `pending_op_results`
+                    // and would classify a `ForwardingAck` as
+                    // `ReplyClass::Unexpected` anyway; (b) PUT sub-op
+                    // subscribes and parent-op child subscribes —
+                    // one-shot paths with bounded `MAX_RETRIES` so the
+                    // ACK-timer shortening is an accepted slice-A
+                    // amplification ceiling.
+                    if !*is_renewal {
+                        if let Some(upstream_addr) = source_addr {
+                            if !op_manager.has_subscribe_op(id) {
+                                if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
+                                    op_manager.clone(),
+                                    *id,
+                                    *instance_id,
+                                    *htl,
+                                    visited.clone(),
+                                    *is_renewal,
+                                    upstream_addr,
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        tx = %id,
+                                        %instance_id,
+                                        error = %err,
+                                        "SUBSCRIBE relay dispatch: start_relay_subscribe failed"
+                                    );
+                                }
+                                return Ok(None);
                             }
-                            return Ok(None);
                         }
                     }
                 }
@@ -3976,6 +4002,29 @@ mod tests {
                 "SUBSCRIBE relay dispatch must be guarded by has_subscribe_op — \
                  renewals, PUT sub-ops, and GC-spawned retries that pre-register \
                  a SubscribeOp must fall through to legacy."
+            );
+        }
+
+        #[test]
+        fn subscribe_branch_falls_through_on_renewal() {
+            const SOURCE: &str = include_str!("node.rs");
+            let anchor = "NetMessageV1::Subscribe(ref op) => {";
+            let branch_start = SOURCE.find(anchor).expect("SUBSCRIBE branch not found");
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<subscribe::SubscribeOp, _>")
+                .expect("SUBSCRIBE branch no longer calls handle_op_request")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+            // Renewals MUST stay on legacy — the renewal originator's GC
+            // retry selector uses `ack_received` and the driver does not
+            // emit `SubscribeMsg::ForwardingAck`. Falling through to
+            // legacy keeps the ack emission alive for renewals.
+            assert!(
+                window.contains("if !*is_renewal"),
+                "SUBSCRIBE relay dispatch must skip `is_renewal=true` \
+                 requests so renewals still receive `ForwardingAck` from \
+                 the relay. Dropping the ack on the ~2 min renewal cycle \
+                 reopens the #3763 subscription-storm feedback loop."
             );
         }
 

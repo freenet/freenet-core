@@ -7414,8 +7414,9 @@ fn test_get_routing_coverage_low_htl() {
     use std::sync::atomic::Ordering;
 
     use freenet::dev_tool::{
-        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, RELAY_PUT_DRIVER_CALL_COUNT, ScheduledOperation,
-        SimOperation, register_crdt_contract,
+        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, RELAY_PUT_DRIVER_CALL_COUNT,
+        RELAY_SUBSCRIBE_DRIVER_CALL_COUNT, ScheduledOperation, SimOperation,
+        register_crdt_contract,
     };
 
     // Seed updated: per-peer acceptor reliability scoring replaces binary
@@ -7435,6 +7436,7 @@ fn test_get_routing_coverage_low_htl() {
     // dispatch-block SHAPE. #1454 phase 5 / #3883.
     let relay_baseline = GET_RELAY_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
     let relay_put_baseline = RELAY_PUT_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+    let relay_subscribe_baseline = RELAY_SUBSCRIBE_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
 
     let rt = create_runtime();
 
@@ -7571,6 +7573,25 @@ fn test_get_routing_coverage_low_htl() {
          in a {num_nodes}-node network must traverse at least one relay hop. \
          Dispatch gate for PUT has likely regressed. \
          Baseline: {relay_put_baseline}, after: {relay_put_after}."
+    );
+
+    // Behavioral companion for relay SUBSCRIBE slice A (#1454 phase 5
+    // follow-up, PR #3932): 12 nodes subscribe above. At HTL=3 with
+    // ~5 caching nodes, at least one subscribe must traverse a relay
+    // hop and hit start_relay_subscribe. If this never advances, the
+    // dispatch gate for SUBSCRIBE has regressed — inbound relay
+    // SubscribeMsg::Request is going through the legacy
+    // handle_op_request path again.
+    let relay_subscribe_after = RELAY_SUBSCRIBE_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+    let relay_subscribe_delta = relay_subscribe_after.saturating_sub(relay_subscribe_baseline);
+    assert!(
+        relay_subscribe_delta > 0,
+        "RELAY_SUBSCRIBE_DRIVER_CALL_COUNT did not advance during the \
+         test — the relay SUBSCRIBE task-per-tx driver never ran. With \
+         12 node subscribes at HTL=3 and ~5 caching nodes, at least one \
+         subscribe must traverse a relay hop. Dispatch gate for \
+         SUBSCRIBE has likely regressed. \
+         Baseline: {relay_subscribe_baseline}, after: {relay_subscribe_after}."
     );
 
     // StateVerifier anomaly check

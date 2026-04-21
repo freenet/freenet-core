@@ -41,8 +41,22 @@ paths:
 > `source_addr.is_some()` AND `!has_put_op(id)` AND the payload size
 > would not upgrade to streaming on forward); GC speculative retries,
 > client-initiated loopback (`source_addr.is_none()`), and streaming
-> variants still go through legacy. Slices B (streaming variants) and
-> C (legacy arm cleanup) follow.
+> variants still go through legacy. Phase 5 follow-up slice A (PR
+> #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
+> `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`
+> (gated on `source_addr.is_some()` AND `!has_subscribe_op(id)`);
+> renewals, PUT sub-op subscribes, executor auto-subscribe,
+> GC-spawned retries that pre-register a `SubscribeOp`,
+> `SubscribeMsg::Unsubscribe`, and `SubscribeMsg::ForwardingAck` all
+> stay on legacy. The driver caps relay-hop retries at 1 (originator
+> owns cross-peer retry), reuses `incoming_tx` end-to-end, omits
+> `ForwardingAck` emission, and calls `register_downstream_subscriber`
+> on BOTH local-hit and relayed-Subscribed paths — but DELIBERATELY
+> omits `ring.subscribe` / `complete_subscription_request` /
+> `announce_contract_hosted` on the relayed path (relay is not itself
+> a subscriber; prevents the #3763 subscription-storm feedback loop).
+> Slices B (streaming variants for GET/PUT/UPDATE) and C (legacy arm
+> cleanup) follow.
 >
 > Task-per-tx drivers have their own invariants documented in the
 > `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.
