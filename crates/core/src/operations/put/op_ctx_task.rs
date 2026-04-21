@@ -698,72 +698,16 @@ async fn drive_relay_put(
     );
 
     // ── Step 1: Store contract locally (all nodes cache) ────────────────────
-    //
-    // Mirrors put.rs:494-568. put_contract + host_contract + interest
-    // registration + announce_contract_hosted. This node is not the
-    // originator, so we never set `mark_local_client_access`.
-    let was_hosting = op_manager.ring.is_hosting_contract(&key);
-    let (merged_value, _state_changed) = match super::put_contract(
+    let merged_value = relay_put_store_locally(
         op_manager,
+        incoming_tx,
         key,
         value.clone(),
-        related_contracts.clone(),
         &contract,
+        related_contracts.clone(),
+        htl,
     )
-    .await
-    {
-        Ok(result) => result,
-        Err(err) => {
-            tracing::error!(
-                tx = %incoming_tx,
-                contract = %key,
-                error = %err,
-                htl,
-                "PUT relay (task-per-tx): put_contract failed"
-            );
-            if let Some(event) = NetEventLog::put_failure(
-                &incoming_tx,
-                &op_manager.ring,
-                key,
-                OperationFailure::ContractError(err.to_string()),
-                Some(op_manager.ring.max_hops_to_live.saturating_sub(htl)),
-            ) {
-                op_manager.ring.register_events(Either::Left(event)).await;
-            }
-            return Err(err);
-        }
-    };
-
-    if !was_hosting {
-        let evicted = op_manager
-            .ring
-            .host_contract(key, value.size() as u64, crate::ring::AccessType::Put)
-            .evicted;
-
-        crate::operations::announce_contract_hosted(op_manager, &key).await;
-
-        let mut removed_contracts = Vec::new();
-        for evicted_key in evicted {
-            if op_manager
-                .interest_manager
-                .unregister_local_hosting(&evicted_key)
-            {
-                removed_contracts.push(evicted_key);
-            }
-        }
-
-        let became_interested = op_manager.interest_manager.register_local_hosting(&key);
-        let added = if became_interested { vec![key] } else { vec![] };
-        if !added.is_empty() || !removed_contracts.is_empty() {
-            crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
-                .await;
-        }
-    }
-
-    debug_assert!(
-        op_manager.ring.is_hosting_contract(&key),
-        "PUT relay (task-per-tx): contract {key} must be in hosting list after put_contract + host_contract"
-    );
+    .await?;
 
     // ── Step 2: Build skip list + select next hop ──────────────────────────
     let mut new_skip_list = skip_list;
@@ -938,6 +882,93 @@ async fn drive_relay_put(
             Err(OpError::UnexpectedOpState)
         }
     }
+}
+
+/// Store a relayed PUT's contract locally: `put_contract` + (if not
+/// already hosting) `host_contract` + `announce_contract_hosted` +
+/// interest register/unregister + broadcast interest changes.
+///
+/// Shared between the non-streaming relay driver (`drive_relay_put`)
+/// and the streaming relay driver (`drive_relay_put_streaming`) so both
+/// paths run identical local-store semantics. Returns the post-merge
+/// `WrappedState` the caller forwards downstream / bubbles upstream.
+///
+/// This helper is **relay-only** — it never sets
+/// `mark_local_client_access` (that's originator-side). Errors emit a
+/// `put_failure` telemetry event and propagate.
+async fn relay_put_store_locally(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    value: WrappedState,
+    contract: &ContractContainer,
+    related_contracts: RelatedContracts<'static>,
+    htl: usize,
+) -> Result<WrappedState, OpError> {
+    let was_hosting = op_manager.ring.is_hosting_contract(&key);
+    let (merged_value, _state_changed) = match super::put_contract(
+        op_manager,
+        key,
+        value.clone(),
+        related_contracts,
+        contract,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                contract = %key,
+                error = %err,
+                htl,
+                "PUT relay (task-per-tx): put_contract failed"
+            );
+            if let Some(event) = NetEventLog::put_failure(
+                &incoming_tx,
+                &op_manager.ring,
+                key,
+                OperationFailure::ContractError(err.to_string()),
+                Some(op_manager.ring.max_hops_to_live.saturating_sub(htl)),
+            ) {
+                op_manager.ring.register_events(Either::Left(event)).await;
+            }
+            return Err(err);
+        }
+    };
+
+    if !was_hosting {
+        let evicted = op_manager
+            .ring
+            .host_contract(key, value.size() as u64, crate::ring::AccessType::Put)
+            .evicted;
+
+        crate::operations::announce_contract_hosted(op_manager, &key).await;
+
+        let mut removed_contracts = Vec::new();
+        for evicted_key in evicted {
+            if op_manager
+                .interest_manager
+                .unregister_local_hosting(&evicted_key)
+            {
+                removed_contracts.push(evicted_key);
+            }
+        }
+
+        let became_interested = op_manager.interest_manager.register_local_hosting(&key);
+        let added = if became_interested { vec![key] } else { vec![] };
+        if !added.is_empty() || !removed_contracts.is_empty() {
+            crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
+                .await;
+        }
+    }
+
+    debug_assert!(
+        op_manager.ring.is_hosting_contract(&key),
+        "PUT relay (task-per-tx): contract {key} must be in hosting list after put_contract + host_contract"
+    );
+
+    Ok(merged_value)
 }
 
 /// Finalize at this node when there's no next hop. Emits `put_success`
@@ -1366,27 +1397,41 @@ mod tests {
             .find("async fn drive_relay_put(")
             .expect("drive_relay_put not found");
         let driver_end = src[driver_start..]
-            .find("\nasync fn relay_put_finalize_local(")
+            .find("\nasync fn relay_put_store_locally(")
             .expect("driver body end not found")
             + driver_start;
         let driver_src = &src[driver_start..driver_end];
-        let put_pos = driver_src
-            .find("super::put_contract(")
-            .expect("put_contract call missing in driver");
+        let store_pos = driver_src
+            .find("relay_put_store_locally(")
+            .expect("relay_put_store_locally call missing in driver");
         let forward_pos = driver_src
             .find("ctx.send_to_and_await(")
             .expect("send_to_and_await call missing in driver");
         assert!(
-            put_pos < forward_pos,
-            "put_contract MUST run before the downstream forward"
+            store_pos < forward_pos,
+            "local store MUST run before the downstream forward"
+        );
+
+        // Helper must encapsulate put_contract + host_contract + announce.
+        let helper_start = src
+            .find("async fn relay_put_store_locally(")
+            .expect("helper not found");
+        let helper_end = src[helper_start..]
+            .find("\nasync fn relay_put_finalize_local(")
+            .expect("helper body end not found")
+            + helper_start;
+        let helper_src = &src[helper_start..helper_end];
+        assert!(
+            helper_src.contains("super::put_contract("),
+            "helper MUST call put_contract"
         );
         assert!(
-            driver_src.contains("host_contract("),
-            "driver MUST call ring.host_contract for first-time hosting"
+            helper_src.contains("host_contract("),
+            "helper MUST call ring.host_contract for first-time hosting"
         );
         assert!(
-            driver_src.contains("announce_contract_hosted"),
-            "driver MUST call announce_contract_hosted for first-time hosting"
+            helper_src.contains("announce_contract_hosted"),
+            "helper MUST call announce_contract_hosted for first-time hosting"
         );
     }
 }
