@@ -259,7 +259,7 @@ jobs:
         run: |
           # Decode the .p12 into a file that `security import` can read.
           CERT_PATH="$RUNNER_TEMP/cert.p12"
-          echo "$P12_BASE64" | base64 --decode > "$CERT_PATH"
+          echo "$P12_BASE64" | base64 -d > "$CERT_PATH"
 
           # Stand up an ephemeral keychain for this job.
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
@@ -287,7 +287,7 @@ jobs:
         run: |
           # notarytool reads the key from a file path at submit time.
           KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
-          echo "$P8_BASE64" | base64 --decode > "$KEY_PATH"
+          echo "$P8_BASE64" | base64 -d > "$KEY_PATH"
           chmod 600 "$KEY_PATH"
           echo "ASC_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 

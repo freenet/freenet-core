@@ -200,14 +200,24 @@ if [ "$OS" = "linux" ]; then
        (or: sudo systemctl disable --now freenet && sudo rm /etc/systemd/system/freenet.service)"
     fi
 elif [ "$OS" = "macos" ]; then
-    PLIST="${HOME}/Library/LaunchAgents/org.freenet.node.plist"
-    if [ -f "$PLIST" ]; then
-        info "Unloading launchd agent..."
-        launchctl unload "$PLIST" >/dev/null 2>&1 || true
-        rm -f "$PLIST"
-        info "Removed ${PLIST}"
-        removed_service="launchd"
-    fi
+    # Legacy install.sh / `freenet service install` plist (pre-DMG):
+    LEGACY_PLIST="${HOME}/Library/LaunchAgents/org.freenet.node.plist"
+    # DMG-installed Freenet.app's Launch-at-Login plist:
+    DMG_PLIST="${HOME}/Library/LaunchAgents/org.freenet.Freenet.plist"
+    UID_VALUE="$(id -u 2>/dev/null || echo 501)"
+    for PLIST in "$LEGACY_PLIST" "$DMG_PLIST"; do
+        if [ -f "$PLIST" ]; then
+            info "Unloading launchd agent at $PLIST"
+            # Try modern bootout first (macOS 11+), fall back to legacy
+            # unload for older systems. Either may fail non-fatally if
+            # the agent was never actually loaded in this session.
+            launchctl bootout "gui/${UID_VALUE}" "$PLIST" >/dev/null 2>&1 || \
+                launchctl unload "$PLIST" >/dev/null 2>&1 || true
+            rm -f "$PLIST"
+            info "Removed ${PLIST}"
+            removed_service="launchd"
+        fi
+    done
 fi
 
 # --- Step 2: remove binaries from every known install location ------------

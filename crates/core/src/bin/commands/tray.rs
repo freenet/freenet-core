@@ -299,7 +299,7 @@ mod platform {
         fn new(version: String) -> Result<Self, String> {
             let menu = Menu::new();
 
-            // App header — disabled item at the top of the menu that
+            // App header: disabled item at the top of the menu that
             // identifies the app and shows its version. Serves the same
             // role as the bold app-name entry at the top of standard
             // macOS app menus; keeps the menu bar status item itself
@@ -423,7 +423,7 @@ mod platform {
         status_rx: std_mpsc::Receiver<WrapperStatus>,
         _cleanup_done_rx: std_mpsc::Receiver<()>,
     ) {
-        // Windows doesn't need the cleanup signal — the Win32 message pump
+        // Windows doesn't need the cleanup signal: the Win32 message pump
         // returns control to the caller normally, so `run_wrapper` can join
         // the wrapper thread afterwards. The parameter exists for signature
         // parity with the macOS path.
@@ -439,7 +439,7 @@ mod platform {
                 match dispatch_menu_event(event.id.as_ref()) {
                     MenuDispatch::OpenDashboard => open_url(DASHBOARD_URL),
                     MenuDispatch::ToggleLaunchAtLogin => {
-                        // Windows installs as a service — the tray doesn't
+                        // Windows installs as a service, so the tray doesn't
                         // expose a Launch at Login item, so this arm is
                         // unreachable here. Noop for future-proofing.
                     }
@@ -472,7 +472,7 @@ mod platform {
     // On macOS a menu bar status item is only rendered and interactive
     // while an NSApplication event loop is pumping on the main thread.
     // The `tray-icon` crate registers the `NSStatusItem` but does *not*
-    // drive the run loop — the host application has to. We use
+    // drive the run loop; the host application has to. We use
     // `tao::EventLoop`, which wraps `NSApplication.run()` correctly and
     // matches tray-icon's own published examples. Status updates from the
     // wrapper thread are forwarded in as user events so they land on the
@@ -516,8 +516,8 @@ mod platform {
 
         event_loop.run(move |event, _window, control_flow| {
             // Wake at least every 100ms to poll muda's menu event channel
-            // — muda delivers menu events on its own channel rather than
-            // via tao's event stream, so we can't rely on Poll/Wait alone.
+            // (muda delivers menu events on its own channel rather than
+            // via tao's event stream, so we can't rely on Poll/Wait alone).
             *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100));
 
             // Drain menu events.
@@ -525,21 +525,28 @@ mod platform {
                 match dispatch_menu_event(menu_event.id.as_ref()) {
                     MenuDispatch::OpenDashboard => open_url(DASHBOARD_URL),
                     MenuDispatch::ToggleLaunchAtLogin => {
-                        // Flip the user preference by consulting the
-                        // current state and inverting it. Log failures but
-                        // don't propagate — the menu item's check-state
-                        // will refresh from the filesystem either way.
-                        let exe = std::env::current_exe();
-                        let result = if super::super::service::is_launch_at_login_enabled() {
-                            super::super::service::disable_launch_at_login()
-                        } else {
-                            match exe {
-                                Ok(p) => super::super::service::enable_launch_at_login(&p),
-                                Err(e) => Err(e),
+                        // Flip the user preference. The decision is a pure
+                        // function so it's unit-testable on Linux CI; the
+                        // side-effects (plist write + launchctl) live in
+                        // the service module. On any failure we log and
+                        // refresh the check-state from the filesystem so
+                        // the UI reflects reality rather than intent.
+                        let outcome = super::super::service::toggle_launch_at_login_outcome(
+                            super::super::service::is_launch_at_login_enabled(),
+                        );
+                        let result = match outcome {
+                            super::super::service::ToggleLaunchAtLoginOutcome::Enable => {
+                                match std::env::current_exe() {
+                                    Ok(p) => super::super::service::enable_launch_at_login(&p),
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            super::super::service::ToggleLaunchAtLoginOutcome::Disable => {
+                                super::super::service::disable_launch_at_login()
                             }
                         };
                         if let Err(e) = result {
-                            eprintln!("Failed to toggle Launch at Login: {e}");
+                            tracing::warn!("Failed to toggle Launch at Login: {}", e);
                         }
                         state.refresh_launch_at_login_state();
                     }
@@ -583,7 +590,7 @@ mod platform {
     }
 
     /// Run the tray icon event loop on the current thread (must be the main
-    /// thread — both Windows and macOS require UI work on the main thread).
+    /// thread: both Windows and macOS require UI work on the main thread).
     ///
     /// `action_tx` sends user menu actions to the wrapper loop running on
     /// another thread. `status_rx` receives status updates from the wrapper

@@ -252,7 +252,7 @@ fn open_url_in_browser(url: &str) {
 //
 // On first launch of the tray wrapper we open the local dashboard in the
 // user's default browser so a new user can actually see Freenet doing
-// something. Subsequent launches are silent — this matches Mac menu-bar
+// something. Subsequent launches are silent, matching Mac menu-bar
 // conventions (Docker Desktop, Dropbox, Rectangle, etc.: guide the user
 // on first install, stay out of the way afterwards).
 //
@@ -302,31 +302,42 @@ static FIRST_RUN_OPENER_SPAWNED: std::sync::atomic::AtomicBool =
 // ── Launch at Login (macOS) ──
 //
 // On macOS, the DMG-installed Freenet.app does not auto-start on login by
-// itself — the .app bundle is just a folder in /Applications. To match
+// itself: the .app bundle is just a folder in /Applications. To match
 // the Windows-installer experience (service registers with the OS and
 // starts on boot) we write a user LaunchAgent plist that points at the
-// .app bundle's executable and sets `RunAtLoad=true`.
+// .app bundle's CFBundleExecutable shell wrapper and sets RunAtLoad=true.
 //
 // The presence/absence of the plist file is the single source of truth
-// for the user's preference: plist exists ⇒ launch at login enabled.
+// for the user's preference: plist exists means launch at login enabled.
 // The tray menu's Launch at Login check item reads this state.
 //
-// Implementation uses the modern `launchctl bootstrap gui/$UID` path,
-// which loads the agent into the current GUI session and honours
-// RunAtLoad on future logins. Falls back to legacy `launchctl load` if
-// bootstrap fails (older macOS, unusual session state).
+// Implementation uses `launchctl bootstrap gui/$UID <plist>`, which loads
+// the agent into the current GUI session and honours RunAtLoad on future
+// logins. launchctl exit status is logged via tracing::warn for diagnosis
+// but not propagated to callers; the plist is the authoritative preference.
 
 /// Identifier that also serves as the plist filename and launchd label.
 #[allow(dead_code)]
 const LAUNCH_AT_LOGIN_LABEL: &str = "org.freenet.Freenet";
 
+/// Legacy plist label written by the old `install.sh` / `freenet service
+/// install` path. We log a warning when we detect it so users know to
+/// clean up the duplicate before it races for port 7509.
+#[allow(dead_code)]
+const LEGACY_SERVICE_LAUNCHD_LABEL: &str = "org.freenet.node";
+
 /// Absolute path of the user LaunchAgent plist, if `$HOME` is resolvable.
 #[allow(dead_code)]
 fn launch_agent_plist_path() -> Option<PathBuf> {
+    launch_agent_plist_path_for(LAUNCH_AT_LOGIN_LABEL)
+}
+
+#[allow(dead_code)]
+fn launch_agent_plist_path_for(label: &str) -> Option<PathBuf> {
     dirs::home_dir().map(|h| {
         h.join("Library")
             .join("LaunchAgents")
-            .join(format!("{LAUNCH_AT_LOGIN_LABEL}.plist"))
+            .join(format!("{label}.plist"))
     })
 }
 
@@ -335,23 +346,87 @@ fn is_launch_at_login_enabled_at(plist: &Path) -> bool {
     plist.exists()
 }
 
-/// Build the plist XML for the user LaunchAgent. Split out so it's unit-
-/// testable without touching the filesystem or launchctl.
+/// If `exe` lives inside a macOS `.app` bundle, return that bundle's
+/// absolute path. Walks up the parent directories until a path segment
+/// ending in `.app` is found, or the filesystem root is reached.
+///
+/// Exposed at `pub(super)` so `update.rs` can detect bundle context for
+/// its DMG-swap auto-update path.
 #[allow(dead_code)]
-fn launch_agent_plist_contents(executable: &Path) -> String {
-    // The path could contain characters that aren't valid in a plist <string>
-    // (e.g. `&`, `<`), so we XML-escape defensively even though macOS
-    // installer paths almost never need it.
-    let mut escaped = String::with_capacity(executable.as_os_str().len());
-    for ch in executable.to_string_lossy().chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&apos;"),
-            c => escaped.push(c),
+pub(super) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
+    for ancestor in exe.ancestors() {
+        if ancestor
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".app"))
+        {
+            return Some(ancestor.to_path_buf());
         }
+    }
+    None
+}
+
+/// The path to a `.app` bundle's CFBundleExecutable shell wrapper, by our
+/// packaging convention. See `scripts/package-macos.sh` for how this
+/// wrapper is produced: it execs the inner `freenet-bin` with the
+/// `service run-wrapper` subcommand.
+#[allow(dead_code)]
+fn macos_app_bundle_wrapper(bundle: &Path) -> PathBuf {
+    bundle.join("Contents").join("MacOS").join("Freenet")
+}
+
+/// Compute the ProgramArguments array for the user LaunchAgent. If we're
+/// running from inside an `.app` bundle, launchd should relaunch the
+/// bundle's CFBundleExecutable shell wrapper (which in turn execs
+/// `freenet-bin service run-wrapper`, entering the tray path). Otherwise
+/// (cargo-run, raw binary install, dev build) launchd needs to invoke
+/// the binary with the explicit `service run-wrapper` subcommand or it
+/// would default to `Network` mode and skip the tray entirely.
+#[allow(dead_code)]
+fn launch_agent_program_arguments(exe: &Path) -> Vec<String> {
+    match macos_app_bundle_path(exe) {
+        Some(bundle) => vec![
+            macos_app_bundle_wrapper(&bundle)
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        None => vec![
+            exe.to_string_lossy().into_owned(),
+            "service".to_string(),
+            "run-wrapper".to_string(),
+        ],
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    // XML 1.0 predefined entities. Filesystem paths very rarely contain
+    // these, but launchd silently fails to load a malformed plist, so
+    // defensive escaping avoids a hard-to-diagnose "Launch at Login
+    // silently does nothing" for pathological paths.
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build the plist XML for the user LaunchAgent given explicit
+/// ProgramArguments. Pure function so the output format is unit-testable
+/// without touching the filesystem or launchctl.
+#[allow(dead_code)]
+fn launch_agent_plist_contents(program_arguments: &[String]) -> String {
+    let mut args_xml = String::new();
+    for arg in program_arguments {
+        args_xml.push_str("        <string>");
+        args_xml.push_str(&xml_escape(arg));
+        args_xml.push_str("</string>\n");
     }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -362,8 +437,7 @@ fn launch_agent_plist_contents(executable: &Path) -> String {
     <string>{LAUNCH_AT_LOGIN_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{escaped}</string>
-    </array>
+{args_xml}    </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -377,14 +451,14 @@ fn launch_agent_plist_contents(executable: &Path) -> String {
 }
 
 /// Write the plist to disk, creating `~/Library/LaunchAgents` if needed.
-/// Does NOT activate the agent with launchctl — that's the caller's job
+/// Does NOT activate the agent with launchctl: that's the caller's job
 /// (separated so the filesystem half is unit-testable on Linux).
 #[allow(dead_code)]
-fn write_launch_agent_plist_at(plist: &Path, executable: &Path) -> std::io::Result<()> {
+fn write_launch_agent_plist_at(plist: &Path, program_arguments: &[String]) -> std::io::Result<()> {
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(plist, launch_agent_plist_contents(executable))
+    std::fs::write(plist, launch_agent_plist_contents(program_arguments))
 }
 
 /// Remove the plist. Idempotent: returns Ok if the file was already gone.
@@ -397,29 +471,79 @@ fn remove_launch_agent_plist_at(plist: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Activate or deactivate the agent via `launchctl`. macOS-only; a no-op
-/// on other platforms so callers don't have to cfg-gate.
+/// Returns true if the on-disk plist already contains the expected
+/// leading ProgramArguments path, false otherwise (including on read
+/// error). Used for the self-heal check at wrapper startup so the
+/// plist gets rewritten after the user moves or replaces the .app.
+#[allow(dead_code)]
+fn launch_agent_plist_has_expected_leader(plist: &Path, expected_leader: &str) -> bool {
+    let escaped = format!("<string>{}</string>", xml_escape(expected_leader));
+    match std::fs::read_to_string(plist) {
+        Ok(contents) => contents.contains(&escaped),
+        Err(_) => false,
+    }
+}
+
+/// Call `launchctl bootstrap gui/$UID <plist>`. Logs non-zero exit
+/// (with stderr) via tracing::warn so silent "plist written but launchd
+/// never loaded it" breakages are diagnosable after the fact.
 #[cfg(target_os = "macos")]
 fn launchctl_bootstrap(plist: &Path) {
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}");
-    // Bootstrap the agent into the GUI session. Ignore errors: if the
-    // agent is already loaded (e.g. from a previous run), bootstrap
-    // returns non-zero but that's fine.
-    let _ = std::process::Command::new("launchctl")
+    match std::process::Command::new("launchctl")
         .args(["bootstrap", &target])
         .arg(plist)
-        .output();
+        .output()
+    {
+        Ok(o) if !o.status.success() => {
+            tracing::warn!(
+                "launchctl bootstrap {} returned {}: {}",
+                plist.display(),
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "launchctl bootstrap {} failed to spawn: {}",
+                plist.display(),
+                e
+            );
+        }
+        _ => {}
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn launchctl_bootout(plist: &Path) {
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}");
-    let _ = std::process::Command::new("launchctl")
+    match std::process::Command::new("launchctl")
         .args(["bootout", &target])
         .arg(plist)
-        .output();
+        .output()
+    {
+        Ok(o) if !o.status.success() => {
+            // bootout returns non-zero when the agent isn't currently
+            // loaded, which is expected when we're disabling after a
+            // previous session already exited. Log at debug, not warn.
+            tracing::debug!(
+                "launchctl bootout {} returned {}: {}",
+                plist.display(),
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "launchctl bootout {} failed to spawn: {}",
+                plist.display(),
+                e
+            );
+        }
+        _ => {}
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -439,13 +563,14 @@ pub(super) fn enable_launch_at_login(executable: &Path) -> std::io::Result<()> {
             "could not resolve home directory for launch agent path",
         ));
     };
+    let args = launch_agent_program_arguments(executable);
     // If an older plist is already loaded, bootout first so bootstrap
     // picks up any change to the executable path (e.g. user moved the
     // .app from /Applications to ~/Applications between launches).
     if plist.exists() {
         launchctl_bootout(&plist);
     }
-    write_launch_agent_plist_at(&plist, executable)?;
+    write_launch_agent_plist_at(&plist, &args)?;
     launchctl_bootstrap(&plist);
     Ok(())
 }
@@ -466,6 +591,164 @@ pub(super) fn is_launch_at_login_enabled() -> bool {
         .map(|p| is_launch_at_login_enabled_at(&p))
         .unwrap_or(false)
 }
+
+/// Decision outcome for first-run Launch at Login registration. Pure so
+/// the decision logic can be unit-tested independently of filesystem or
+/// launchctl side-effects, per the deployment-rule pattern established
+/// earlier in this PR.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum FirstRunLaunchAtLoginAction {
+    /// User hasn't launched before and Launch at Login is disabled: enable it.
+    Register,
+    /// User hasn't launched before but Launch at Login is already enabled
+    /// (e.g. from the legacy install.sh path). Leave as-is.
+    AlreadyEnabled,
+    /// Not a first-run invocation.
+    NotFirstRun,
+}
+
+#[allow(dead_code)]
+pub(super) fn first_run_launch_at_login_action(
+    is_first_run: bool,
+    already_enabled: bool,
+) -> FirstRunLaunchAtLoginAction {
+    if !is_first_run {
+        FirstRunLaunchAtLoginAction::NotFirstRun
+    } else if already_enabled {
+        FirstRunLaunchAtLoginAction::AlreadyEnabled
+    } else {
+        FirstRunLaunchAtLoginAction::Register
+    }
+}
+
+/// Decision outcome for a user-initiated Launch at Login toggle (click
+/// on the tray menu check item). Pure function, same testability
+/// rationale as `first_run_launch_at_login_action`.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum ToggleLaunchAtLoginOutcome {
+    Enable,
+    Disable,
+}
+
+#[allow(dead_code)]
+pub(super) fn toggle_launch_at_login_outcome(
+    currently_enabled: bool,
+) -> ToggleLaunchAtLoginOutcome {
+    if currently_enabled {
+        ToggleLaunchAtLoginOutcome::Disable
+    } else {
+        ToggleLaunchAtLoginOutcome::Enable
+    }
+}
+
+/// Startup self-heal: if Launch at Login is enabled but the plist points
+/// somewhere other than where we'd write it now (user moved the .app,
+/// upgraded via a new DMG install location, etc.), rewrite it. Idempotent:
+/// no-op when the plist is already current, or when Launch at Login is
+/// disabled, or when we can't figure out the expected location.
+#[allow(dead_code)]
+pub(super) fn refresh_launch_at_login_plist_if_stale() {
+    if !is_launch_at_login_enabled() {
+        return;
+    }
+    let Some(plist) = launch_agent_plist_path() else {
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let args = launch_agent_program_arguments(&exe);
+    let Some(leader) = args.first() else {
+        return;
+    };
+    if launch_agent_plist_has_expected_leader(&plist, leader) {
+        return;
+    }
+    tracing::info!(
+        "Refreshing stale Launch at Login plist (was pointing elsewhere, now {})",
+        leader
+    );
+    if let Err(e) = enable_launch_at_login(&exe) {
+        tracing::warn!("Failed to refresh Launch at Login plist: {}", e);
+    }
+}
+
+/// Returns true if the legacy `org.freenet.node` LaunchAgent plist
+/// exists. Used to warn users migrating from `install.sh` that they
+/// have two auto-starts racing for the same ports.
+#[allow(dead_code)]
+pub(super) fn legacy_launchd_agent_present() -> bool {
+    launch_agent_plist_path_for(LEGACY_SERVICE_LAUNCHD_LABEL)
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Run all the macOS-only Launch-at-Login housekeeping that must happen
+/// before the tray is built. Specifically:
+///
+/// - On first wrapper launch, register a user LaunchAgent so Freenet
+///   auto-starts on future logins (Windows-parity auto-start).
+/// - On every subsequent launch, if the user had previously enabled
+///   Launch at Login but the plist's embedded executable path no longer
+///   matches the current one (user moved the .app, upgraded via a new
+///   DMG installed elsewhere, etc.), rewrite it.
+/// - If the legacy `org.freenet.node` LaunchAgent from the install.sh
+///   era is still present, log a prominent warning so migrating users
+///   know to clean it up before the two agents race for port 7509.
+///
+/// Called synchronously (not from the wrapper thread) so the tray's
+/// Launch-at-Login check item reads the final filesystem state when
+/// `TrayState::new` consults it. Previously the first-run registration
+/// lived inside `run_wrapper_loop`, which ran on a background thread
+/// AFTER the tray was built, so the menu item shipped stale-unchecked
+/// on first launch even though Launch at Login had been enabled.
+#[cfg(target_os = "macos")]
+pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
+    // Legacy-agent warning: fire once per startup regardless of first-run.
+    if legacy_launchd_agent_present() {
+        log_wrapper_event(
+            log_dir,
+            "Legacy launchd agent ~/Library/LaunchAgents/org.freenet.node.plist \
+             detected. Two agents will race for port 7509; remove the legacy one \
+             with: launchctl bootout gui/$UID ~/Library/LaunchAgents/org.freenet.node.plist \
+             && rm ~/Library/LaunchAgents/org.freenet.node.plist",
+        );
+    }
+
+    // First-run auto-register.
+    let Some(marker) = first_run_marker_path() else {
+        return;
+    };
+    let already_enabled = is_launch_at_login_enabled();
+    match first_run_launch_at_login_action(is_first_run_at(&marker), already_enabled) {
+        FirstRunLaunchAtLoginAction::Register => match std::env::current_exe() {
+            Ok(exe) => match enable_launch_at_login(&exe) {
+                Ok(()) => log_wrapper_event(log_dir, "First-run: registered Launch at Login agent"),
+                Err(e) => log_wrapper_event(
+                    log_dir,
+                    &format!("First-run Launch at Login registration failed: {e}"),
+                ),
+            },
+            Err(e) => log_wrapper_event(
+                log_dir,
+                &format!("First-run Launch at Login: could not resolve current exe: {e}"),
+            ),
+        },
+        FirstRunLaunchAtLoginAction::AlreadyEnabled => {
+            // Nothing to do for first-run, but the plist may still be stale.
+            refresh_launch_at_login_plist_if_stale();
+        }
+        FirstRunLaunchAtLoginAction::NotFirstRun => {
+            refresh_launch_at_login_plist_if_stale();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+pub(super) fn macos_launch_at_login_startup(_log_dir: &Path) {}
 
 /// Spawn a short-lived thread that waits for the dashboard HTTP server to
 /// come up, then opens it in the browser and writes the first-run marker.
@@ -700,6 +983,16 @@ fn run_wrapper(version: &str) -> Result<()> {
         let version_owned = version.to_string();
         let log_dir_clone = log_dir.clone();
 
+        // macOS: handle Launch at Login state BEFORE building the tray so
+        // the menu item's check state reads the final filesystem truth.
+        // Previously this ran on the wrapper thread, after the tray was
+        // already built, so first-run users saw a stale-unchecked box
+        // despite the agent being registered. Also rewrites a stale plist
+        // when the user moved the .app, and warns if the legacy install.sh
+        // launchd agent is still present.
+        #[cfg(target_os = "macos")]
+        macos_launch_at_login_startup(&log_dir);
+
         // Wrapper loop runs on a background thread
         let loop_handle = std::thread::spawn(move || {
             let result = run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)));
@@ -917,7 +1210,7 @@ fn run_wrapper_loop(
     // First-run onboarding: if this user has never launched the tray wrapper
     // before, open the dashboard in their browser once the HTTP server comes
     // up, and (on macOS) register the app for launch-at-login so Freenet
-    // behaves like the Windows-installed service — always on, starts at
+    // behaves like the Windows-installed service: always on, starts at
     // boot, no extra action required from the user. Runs the dashboard
     // opener in a background thread so it doesn't delay the main loop.
     // `FIRST_RUN_OPENER_SPAWNED` ensures at most one opener thread per
@@ -930,33 +1223,6 @@ fn run_wrapper_loop(
             && !FIRST_RUN_OPENER_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             spawn_first_run_dashboard_opener(log_dir);
-
-            // Default Launch at Login to on for new users (macOS only;
-            // Windows installs as a service). The user can uncheck the
-            // menu item to disable. On failure, log and continue — the
-            // user can still enable manually via the menu item.
-            #[cfg(target_os = "macos")]
-            if !is_launch_at_login_enabled() {
-                match std::env::current_exe() {
-                    Ok(exe) => {
-                        if let Err(e) = enable_launch_at_login(&exe) {
-                            log_wrapper_event(
-                                log_dir,
-                                &format!("First-run Launch at Login registration failed: {e}"),
-                            );
-                        } else {
-                            log_wrapper_event(
-                                log_dir,
-                                "First-run: registered Launch at Login agent",
-                            );
-                        }
-                    }
-                    Err(e) => log_wrapper_event(
-                        log_dir,
-                        &format!("First-run Launch at Login: could not resolve current exe: {e}"),
-                    ),
-                }
-            }
         }
     }
 
@@ -1064,10 +1330,27 @@ fn run_wrapper_loop(
                                     if spawn_new_wrapper(&exe_path, log_dir) {
                                         return Ok(());
                                     }
-                                    // Spawn failed — fall through to relaunch child
+                                    // Spawn failed. Fall through to relaunch child
                                     // with the current (old) wrapper rather than
                                     // leaving no node running.
                                     break SENTINEL_RESTART;
+                                }
+                                Ok(s)
+                                    if s.code()
+                                        == Some(super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED) =>
+                                {
+                                    // macOS DMG-swap: the detached updater
+                                    // will swap /Applications/Freenet.app
+                                    // after this process exits and relaunch
+                                    // the new bundle. Do NOT re-exec.
+                                    log_wrapper_event(
+                                        log_dir,
+                                        "Bundle update staged; exiting for updater to take over",
+                                    );
+                                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                    drop(child.kill());
+                                    drop(child.wait());
+                                    return Ok(());
                                 }
                                 Ok(_) => {
                                     // Exit code 2 = already up to date, or other
@@ -1132,9 +1415,22 @@ fn run_wrapper_loop(
                                         if spawn_new_wrapper(&exe_path, log_dir) {
                                             return Ok(());
                                         }
-                                        // Spawn failed — exit stopped state and
+                                        // Spawn failed. Exit stopped state and
                                         // relaunch child with the current wrapper.
                                         break;
+                                    }
+                                    Ok(s)
+                                        if s.code()
+                                            == Some(
+                                                super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED,
+                                            ) =>
+                                    {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            "Bundle update staged while stopped; exiting for updater",
+                                        );
+                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                        return Ok(());
                                     }
                                     Ok(_) => {
                                         log_wrapper_event(log_dir, "No update available");
@@ -1180,9 +1476,26 @@ fn run_wrapper_loop(
                 status_tx.send(WrapperStatus::Updating).ok();
             }
 
-            let ok = spawn_update_command(&exe_path)
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let result = spawn_update_command(&exe_path);
+            // macOS DMG-swap: if the update subprocess exits with the
+            // bundle-staged code, the detached updater takes over after
+            // this process exits. We must not re-exec or retry; just
+            // return Ok so the wrapper exits cleanly and the updater can
+            // swap /Applications/Freenet.app.
+            if let Ok(ref s) = result {
+                if s.code() == Some(super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED) {
+                    log_wrapper_event(
+                        log_dir,
+                        "Bundle update staged during auto-update; exiting for updater",
+                    );
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                    if let Some((_, status_tx)) = tray {
+                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                    }
+                    return Ok(());
+                }
+            }
+            let ok = result.map(|s| s.success()).unwrap_or(false);
 
             if ok {
                 log_wrapper_event(log_dir, "Update successful, restarting...");
@@ -1289,9 +1602,22 @@ fn run_wrapper_loop(
                                         if spawn_new_wrapper(&exe_path, log_dir) {
                                             return Ok(());
                                         }
-                                        // Spawn failed — relaunch with current wrapper
+                                        // Spawn failed. Relaunch with current wrapper.
                                         state.consecutive_failures = 0;
                                         break;
+                                    }
+                                    Ok(s)
+                                        if s.code()
+                                            == Some(
+                                                super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED,
+                                            ) =>
+                                    {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            "Bundle update staged during backoff; exiting for updater",
+                                        );
+                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                        return Ok(());
                                     }
                                     Ok(_) => {
                                         log_wrapper_event(log_dir, "No update available");
@@ -2871,27 +3197,30 @@ mod tests {
     }
 
     #[test]
-    fn launch_agent_plist_contents_escapes_and_embeds_executable_path() {
-        let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/Freenet");
-        let xml = launch_agent_plist_contents(&exe);
+    fn launch_agent_plist_contents_embeds_all_program_arguments() {
+        let args = vec![
+            "/usr/local/bin/freenet".to_string(),
+            "service".to_string(),
+            "run-wrapper".to_string(),
+        ];
+        let xml = launch_agent_plist_contents(&args);
         assert!(xml.starts_with("<?xml version=\"1.0\""));
         assert!(xml.contains("<key>Label</key>"));
         assert!(xml.contains("org.freenet.Freenet"));
         assert!(xml.contains("<key>RunAtLoad</key>"));
         assert!(xml.contains("<true/>"));
-        assert!(
-            xml.contains("/Applications/Freenet.app/Contents/MacOS/Freenet"),
-            "plist must embed the concrete executable path"
-        );
+        assert!(xml.contains("<string>/usr/local/bin/freenet</string>"));
+        assert!(xml.contains("<string>service</string>"));
+        assert!(xml.contains("<string>run-wrapper</string>"));
     }
 
     #[test]
     fn launch_agent_plist_contents_xml_escapes_unusual_paths() {
-        // Unusual but legal filesystem path characters must be XML-escaped,
-        // otherwise launchd fails to parse the plist at load time and the
-        // user's Launch at Login setting silently does nothing.
-        let exe = PathBuf::from("/tmp/has <angles> & \"quotes\"/Freenet");
-        let xml = launch_agent_plist_contents(&exe);
+        // Unusual but legal filesystem path characters must be XML-escaped
+        // or launchd fails to parse the plist at load time and the user's
+        // Launch at Login setting silently does nothing.
+        let args = vec!["/tmp/has <angles> & \"quotes\"/Freenet".to_string()];
+        let xml = launch_agent_plist_contents(&args);
         assert!(xml.contains("&lt;angles&gt;"));
         assert!(xml.contains("&amp;"));
         assert!(xml.contains("&quot;quotes&quot;"));
@@ -2900,22 +3229,142 @@ mod tests {
     }
 
     #[test]
+    fn launch_agent_program_arguments_for_bundle_points_at_wrapper() {
+        // Inside a .app bundle, ProgramArguments must be the CFBundleExecutable
+        // shell wrapper (Contents/MacOS/Freenet). Launching it re-enters the
+        // tray path via the `exec freenet-bin service run-wrapper` line in
+        // scripts/package-macos.sh. If this regresses and ProgramArguments
+        // becomes just `freenet-bin`, launchd runs bare freenet which
+        // defaults to Network mode and the tray never appears: the exact
+        // shipping bug that Codex P2 and the code-first/big-picture reviews
+        // flagged on the first round of this commit.
+        let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
+        let args = launch_agent_program_arguments(&exe);
+        assert_eq!(
+            args,
+            vec!["/Applications/Freenet.app/Contents/MacOS/Freenet".to_string()]
+        );
+    }
+
+    #[test]
+    fn launch_agent_program_arguments_for_nested_bundle_path() {
+        // User dragged Freenet.app into a subfolder.
+        let exe = PathBuf::from(
+            "/Users/someone/Applications/Tools/Freenet.app/Contents/MacOS/freenet-bin",
+        );
+        let args = launch_agent_program_arguments(&exe);
+        assert_eq!(
+            args,
+            vec![
+                "/Users/someone/Applications/Tools/Freenet.app/Contents/MacOS/Freenet".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_agent_program_arguments_for_non_bundle_binary_includes_subcommand() {
+        // Non-bundle path (cargo run, raw binary install, dev build): the
+        // plist must explicitly pass `service run-wrapper` so launchd
+        // doesn't default the binary to Network mode.
+        let exe = PathBuf::from("/usr/local/bin/freenet");
+        let args = launch_agent_program_arguments(&exe);
+        assert_eq!(
+            args,
+            vec![
+                "/usr/local/bin/freenet".to_string(),
+                "service".to_string(),
+                "run-wrapper".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_app_bundle_path_finds_bundle_from_inner_binary() {
+        let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
+        assert_eq!(
+            macos_app_bundle_path(&exe).as_deref(),
+            Some(Path::new("/Applications/Freenet.app"))
+        );
+    }
+
+    #[test]
+    fn macos_app_bundle_path_returns_none_for_non_bundle_path() {
+        assert_eq!(
+            macos_app_bundle_path(Path::new("/usr/local/bin/freenet")),
+            None
+        );
+        assert_eq!(macos_app_bundle_path(Path::new("/tmp/freenet")), None);
+    }
+
+    #[test]
+    fn first_run_launch_at_login_action_covers_all_cases() {
+        assert_eq!(
+            first_run_launch_at_login_action(true, false),
+            FirstRunLaunchAtLoginAction::Register
+        );
+        assert_eq!(
+            first_run_launch_at_login_action(true, true),
+            FirstRunLaunchAtLoginAction::AlreadyEnabled
+        );
+        assert_eq!(
+            first_run_launch_at_login_action(false, false),
+            FirstRunLaunchAtLoginAction::NotFirstRun
+        );
+        assert_eq!(
+            first_run_launch_at_login_action(false, true),
+            FirstRunLaunchAtLoginAction::NotFirstRun
+        );
+    }
+
+    #[test]
+    fn toggle_launch_at_login_outcome_inverts_current_state() {
+        assert_eq!(
+            toggle_launch_at_login_outcome(false),
+            ToggleLaunchAtLoginOutcome::Enable
+        );
+        assert_eq!(
+            toggle_launch_at_login_outcome(true),
+            ToggleLaunchAtLoginOutcome::Disable
+        );
+    }
+
+    #[test]
     fn launch_at_login_plist_roundtrips() {
         let tmp = tempfile::tempdir().unwrap();
         let plist = tmp
             .path()
             .join("nested/Library/LaunchAgents/org.freenet.Freenet.plist");
-        let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/Freenet");
+        let args = vec!["/Applications/Freenet.app/Contents/MacOS/Freenet".to_string()];
 
         assert!(!is_launch_at_login_enabled_at(&plist));
 
         // Writing creates parent dirs and flips the state.
-        write_launch_agent_plist_at(&plist, &exe).unwrap();
+        write_launch_agent_plist_at(&plist, &args).unwrap();
         assert!(is_launch_at_login_enabled_at(&plist));
         let body = std::fs::read_to_string(&plist).unwrap();
         assert!(body.contains("/Applications/Freenet.app/Contents/MacOS/Freenet"));
 
-        // Removing flips it back. Idempotent: removing when already gone is Ok.
+        // Self-heal detection: happy-path match, then mismatch after a
+        // subsequent write with a different leader (simulates the user
+        // moving the .app).
+        assert!(launch_agent_plist_has_expected_leader(
+            &plist,
+            "/Applications/Freenet.app/Contents/MacOS/Freenet"
+        ));
+        assert!(!launch_agent_plist_has_expected_leader(
+            &plist,
+            "/Users/someone/Applications/Freenet.app/Contents/MacOS/Freenet"
+        ));
+
+        let moved =
+            vec!["/Users/someone/Applications/Freenet.app/Contents/MacOS/Freenet".to_string()];
+        write_launch_agent_plist_at(&plist, &moved).unwrap();
+        assert!(launch_agent_plist_has_expected_leader(
+            &plist,
+            "/Users/someone/Applications/Freenet.app/Contents/MacOS/Freenet"
+        ));
+
+        // Removing flips it back. Idempotent on repeat.
         remove_launch_agent_plist_at(&plist).unwrap();
         assert!(!is_launch_at_login_enabled_at(&plist));
         remove_launch_agent_plist_at(&plist).unwrap();
