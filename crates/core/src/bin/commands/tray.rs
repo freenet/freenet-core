@@ -381,10 +381,12 @@ mod platform {
             let s = compute_menu_state(status);
             self.status_item
                 .set_text(format!("Status: {}", s.status_text));
-            let _ = self._tray.set_tooltip(Some(format!(
-                "Freenet {} - {}",
-                self.version, s.status_text
-            )));
+            self._tray
+                .set_tooltip(Some(format!(
+                    "Freenet {} - {}",
+                    self.version, s.status_text
+                )))
+                .ok();
             self.stop_item.set_enabled(s.stop_enabled);
             self.start_item.set_enabled(s.start_enabled);
             self.restart_item.set_enabled(s.restart_enabled);
@@ -567,7 +569,7 @@ mod platform {
                         // long `freenet update` that the user triggered via
                         // "Check for Updates"). Waiting is the right trade
                         // because the alternative is a guaranteed orphan.
-                        let _ = cleanup_done_rx.recv();
+                        cleanup_done_rx.recv().ok();
                         *control_flow = ControlFlow::Exit;
                         return;
                     }
@@ -582,7 +584,7 @@ mod platform {
                     std::thread::sleep(Duration::from_secs(1));
                     action_tx.send(TrayAction::Quit).ok();
                     // Same rationale as the Quit handler above.
-                    let _ = cleanup_done_rx.recv();
+                    cleanup_done_rx.recv().ok();
                     *control_flow = ControlFlow::Exit;
                 }
             }
