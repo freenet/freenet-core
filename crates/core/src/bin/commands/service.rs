@@ -707,21 +707,31 @@ pub(super) fn legacy_launchd_agent_present() -> bool {
 #[cfg(target_os = "macos")]
 pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
     // Legacy-agent warning: fire once per startup regardless of first-run.
-    if legacy_launchd_agent_present() {
+    // If users see this, they have an auto-start from the old install.sh
+    // flow still configured; if we also write our own plist below, both
+    // agents race for port 7509 on every login. To avoid that race we
+    // treat the legacy plist's presence as "already enabled" for the
+    // first-run decision, so we don't layer a second auto-start on top.
+    // User is still instructed to clean up the legacy one manually.
+    let legacy_present = legacy_launchd_agent_present();
+    if legacy_present {
         log_wrapper_event(
             log_dir,
             "Legacy launchd agent ~/Library/LaunchAgents/org.freenet.node.plist \
-             detected. Two agents will race for port 7509; remove the legacy one \
-             with: launchctl bootout gui/$UID ~/Library/LaunchAgents/org.freenet.node.plist \
-             && rm ~/Library/LaunchAgents/org.freenet.node.plist",
+             detected. Freenet is already configured to auto-start via that \
+             agent; the new DMG install will NOT create a duplicate agent. \
+             To clean up the legacy one when convenient: launchctl bootout \
+             gui/$UID ~/Library/LaunchAgents/org.freenet.node.plist && rm \
+             ~/Library/LaunchAgents/org.freenet.node.plist",
         );
     }
 
-    // First-run auto-register.
+    // First-run auto-register. Treat the legacy plist as already-enabled
+    // so migrating users don't end up with two plists (Codex P2).
     let Some(marker) = first_run_marker_path() else {
         return;
     };
-    let already_enabled = is_launch_at_login_enabled();
+    let already_enabled = is_launch_at_login_enabled() || legacy_present;
     match first_run_launch_at_login_action(is_first_run_at(&marker), already_enabled) {
         FirstRunLaunchAtLoginAction::Register => match std::env::current_exe() {
             Ok(exe) => match enable_launch_at_login(&exe) {
@@ -738,10 +748,16 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
         },
         FirstRunLaunchAtLoginAction::AlreadyEnabled => {
             // Nothing to do for first-run, but the plist may still be stale.
-            refresh_launch_at_login_plist_if_stale();
+            // Only refresh if our OWN plist is present — don't resurrect
+            // a rewrite cycle on a legacy-only install.
+            if is_launch_at_login_enabled() {
+                refresh_launch_at_login_plist_if_stale();
+            }
         }
         FirstRunLaunchAtLoginAction::NotFirstRun => {
-            refresh_launch_at_login_plist_if_stale();
+            if is_launch_at_login_enabled() {
+                refresh_launch_at_login_plist_if_stale();
+            }
         }
     }
 }
