@@ -42,7 +42,7 @@ const MIN_RETRY_HTL: usize = 3;
 
 /// Timeout for waiting on contract storage notification.
 /// Used when a subscription arrives before the contract has been propagated via PUT.
-const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
+pub(super) const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
 
 /// Wait for a contract to become available, using channel-based notification.
 ///
@@ -53,7 +53,7 @@ const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
 /// 3. Check again (handles race between step 1 and 2)
 /// 4. Wait for notification or timeout
 /// 5. Final verification of actual state
-async fn wait_for_contract_with_timeout(
+pub(super) async fn wait_for_contract_with_timeout(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,
     timeout_ms: u64,
@@ -2248,7 +2248,7 @@ mod tests;
 
 /// Task-per-transaction client-initiated SUBSCRIBE path (#1454 Phase 2b).
 /// First production consumer of `OpCtx::send_and_await`.
-mod op_ctx_task;
+pub(crate) mod op_ctx_task;
 
 pub(crate) use op_ctx_task::{run_client_subscribe, start_client_subscribe};
 

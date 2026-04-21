@@ -358,6 +358,15 @@ pub(crate) struct OpManager {
     /// relay driver — prevents GC-spawned re-entries and routing-bloom
     /// false-positive retransmissions from spawning redundant drivers.
     pub(crate) active_relay_put_txs: Arc<DashSet<Transaction>>,
+    /// Set of transactions currently being driven by a relay SUBSCRIBE
+    /// task-per-tx driver on this node. Same role as
+    /// `active_relay_get_txs` but for SUBSCRIBE relay (#1454 phase 5
+    /// follow-up slice A). SUBSCRIBE relay has req/response semantics
+    /// like GET/PUT but forwards once — no per-hop retry — because the
+    /// client-init driver (Phase 2b) owns cross-peer retry. The dedup
+    /// gate rejects duplicate inbound `SubscribeMsg::Request` for a tx
+    /// that already has a live relay driver.
+    pub(crate) active_relay_subscribe_txs: Arc<DashSet<Transaction>>,
 }
 
 impl Clone for OpManager {
@@ -388,6 +397,7 @@ impl Clone for OpManager {
             active_relay_get_txs: self.active_relay_get_txs.clone(),
             active_relay_update_txs: self.active_relay_update_txs.clone(),
             active_relay_put_txs: self.active_relay_put_txs.clone(),
+            active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
         }
     }
 }
@@ -431,6 +441,7 @@ impl OpManager {
         let active_relay_get_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
         let active_relay_update_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
         let active_relay_put_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
+        let active_relay_subscribe_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
 
         task_monitor.register(
             "garbage_cleanup",
@@ -451,6 +462,7 @@ impl OpManager {
                     active_relay_get_txs.clone(),
                     active_relay_update_txs.clone(),
                     active_relay_put_txs.clone(),
+                    active_relay_subscribe_txs.clone(),
                 )
                 .instrument(garbage_span),
             ),
@@ -522,6 +534,7 @@ impl OpManager {
             active_relay_get_txs,
             active_relay_update_txs,
             active_relay_put_txs,
+            active_relay_subscribe_txs,
         })
     }
 
@@ -1052,6 +1065,19 @@ impl OpManager {
     /// legacy `handle_op_request` path).
     pub fn has_put_op(&self, id: &Transaction) -> bool {
         self.ops.put.contains_key(id)
+    }
+
+    /// Returns `true` if a `SubscribeOp` is currently registered for this
+    /// transaction in `OpManager.ops.subscribe`.
+    ///
+    /// Same role as `has_get_op` but for the relay SUBSCRIBE dispatch gate
+    /// (#1454 phase 5 follow-up slice A). Used by `node.rs` to distinguish
+    /// a fresh inbound relay SUBSCRIBE (no existing op → spawn the
+    /// task-per-tx driver) from a renewal, PUT sub-op, or GC-spawned retry
+    /// (existing op → fall through to the legacy `handle_op_request`
+    /// path).
+    pub fn has_subscribe_op(&self, id: &Transaction) -> bool {
+        self.ops.subscribe.contains_key(id)
     }
 
     pub fn completed(&self, id: Transaction) {
@@ -1699,6 +1725,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     active_relay_get_txs: Arc<DashSet<Transaction>>,
     active_relay_update_txs: Arc<DashSet<Transaction>>,
     active_relay_put_txs: Arc<DashSet<Transaction>>,
+    active_relay_subscribe_txs: Arc<DashSet<Transaction>>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     /// How often to clean up stale contract_waiters entries (every N ticks).
@@ -1775,6 +1802,19 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         crate::operations::put::op_ctx_task::RELAY_PUT_DEDUP_REJECTS
                             .load(Ordering::Relaxed);
                     let relay_put_active_txs = active_relay_put_txs.len();
+                    let relay_subscribe_inflight =
+                        crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_INFLIGHT
+                            .load(Ordering::Relaxed);
+                    let relay_subscribe_spawned =
+                        crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_SPAWNED_TOTAL
+                            .load(Ordering::Relaxed);
+                    let relay_subscribe_completed =
+                        crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_COMPLETED_TOTAL
+                            .load(Ordering::Relaxed);
+                    let relay_subscribe_dedup_rejects =
+                        crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DEDUP_REJECTS
+                            .load(Ordering::Relaxed);
+                    let relay_subscribe_active_txs = active_relay_subscribe_txs.len();
                     tracing::info!(
                         target: "memory_stats",
                         tick = tick_count,
@@ -1807,6 +1847,11 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         relay_put_completed = relay_put_completed,
                         relay_put_dedup_rejects = relay_put_dedup_rejects,
                         relay_put_active_txs = relay_put_active_txs,
+                        relay_subscribe_inflight = relay_subscribe_inflight,
+                        relay_subscribe_spawned = relay_subscribe_spawned,
+                        relay_subscribe_completed = relay_subscribe_completed,
+                        relay_subscribe_dedup_rejects = relay_subscribe_dedup_rejects,
+                        relay_subscribe_active_txs = relay_subscribe_active_txs,
                         "memory stats"
                     );
                 }

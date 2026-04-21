@@ -1429,6 +1429,62 @@ where
                     return Ok(None);
                 }
 
+                // #1454 phase 5 follow-up (slice A): relay SUBSCRIBE
+                // task-per-tx dispatch.
+                //
+                // For true relay hops (source_addr.is_some() AND incoming
+                // variant is SubscribeMsg::Request AND no SubscribeOp
+                // already exists in OpManager for this tx), spawn the
+                // relay driver and return. The driver owns local-hit
+                // response + single downstream forward + upstream
+                // bubble-up in its task locals.
+                //
+                // source_addr.is_none() (originator loop-back from the
+                // phase-2b client-init driver's send_to_and_await) falls
+                // through to legacy. The client driver never relies on
+                // a Request-echo — it awaits Response — so the
+                // `SubscribeMsg::Response` bypass above handles the
+                // originator reply.
+                //
+                // Existing SubscribeOp means a renewal, PUT sub-op, or
+                // GC-spawned retry already registered state in the
+                // DashMap — those paths must stay on legacy.
+                //
+                // ForwardingAck / Unsubscribe never match the Request
+                // arm so they flow to legacy naturally.
+                if let subscribe::SubscribeMsg::Request {
+                    id,
+                    instance_id,
+                    htl,
+                    visited,
+                    is_renewal,
+                } = op
+                {
+                    if let Some(upstream_addr) = source_addr {
+                        if !op_manager.has_subscribe_op(id) {
+                            if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
+                                op_manager.clone(),
+                                *id,
+                                *instance_id,
+                                *htl,
+                                visited.clone(),
+                                *is_renewal,
+                                upstream_addr,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    %instance_id,
+                                    error = %err,
+                                    "SUBSCRIBE relay dispatch: start_relay_subscribe failed"
+                                );
+                            }
+                            return Ok(None);
+                        }
+                    }
+                }
+
                 let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
                     &op_manager,
                     &mut conn_manager,
@@ -3873,6 +3929,79 @@ mod tests {
                 !window.contains("put::PutMsg::RequestStreaming {"),
                 "PUT branch appears to dispatch RequestStreaming through the \
                  relay driver. Slice A keeps streaming on the legacy path."
+            );
+        }
+
+        // ── Relay SUBSCRIBE dispatch structural pin tests (#1454 phase 5
+        // follow-up slice A). Mirror of the PUT / UPDATE pin tests.
+
+        #[test]
+        fn subscribe_branch_dispatches_relay_driver() {
+            const SOURCE: &str = include_str!("node.rs");
+            let anchor = "NetMessageV1::Subscribe(ref op) => {";
+            let branch_start = SOURCE.find(anchor).expect(
+                "SUBSCRIBE branch of handle_pure_network_message_v1 not found; \
+                 the match arm has been renamed or moved — update this guard",
+            );
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<subscribe::SubscribeOp, _>")
+                .expect("SUBSCRIBE branch no longer calls handle_op_request — update guard")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+            assert!(
+                window.contains("start_relay_subscribe("),
+                "SUBSCRIBE branch no longer calls start_relay_subscribe for relay \
+                 dispatch. #1454 phase-5 slice A SUBSCRIBE relay dispatch was \
+                 removed — restore it."
+            );
+        }
+
+        #[test]
+        fn subscribe_branch_dispatch_gates_on_source_and_existing_op() {
+            const SOURCE: &str = include_str!("node.rs");
+            let anchor = "NetMessageV1::Subscribe(ref op) => {";
+            let branch_start = SOURCE.find(anchor).expect("SUBSCRIBE branch not found");
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<subscribe::SubscribeOp, _>")
+                .expect("SUBSCRIBE branch no longer calls handle_op_request")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+            assert!(
+                window.contains("source_addr"),
+                "SUBSCRIBE relay dispatch must be gated on source_addr — internal \
+                 / originator callers (source_addr.is_none()) must fall through."
+            );
+            assert!(
+                window.contains("has_subscribe_op"),
+                "SUBSCRIBE relay dispatch must be guarded by has_subscribe_op — \
+                 renewals, PUT sub-ops, and GC-spawned retries that pre-register \
+                 a SubscribeOp must fall through to legacy."
+            );
+        }
+
+        #[test]
+        fn subscribe_branch_only_dispatches_request_variant() {
+            const SOURCE: &str = include_str!("node.rs");
+            let anchor = "NetMessageV1::Subscribe(ref op) => {";
+            let branch_start = SOURCE.find(anchor).expect("SUBSCRIBE branch not found");
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<subscribe::SubscribeOp, _>")
+                .expect("SUBSCRIBE branch no longer calls handle_op_request")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+            // Driver site should only destructure the Request variant.
+            // Unsubscribe/ForwardingAck stay on legacy — binding them
+            // into the relay dispatch would misroute fire-and-forget
+            // cleanup traffic.
+            assert!(
+                !window.contains("SubscribeMsg::Unsubscribe {"),
+                "SUBSCRIBE dispatch must NOT destructure Unsubscribe variant \
+                 for relay driver — fire-and-forget cleanup stays on legacy."
+            );
+            assert!(
+                !window.contains("SubscribeMsg::ForwardingAck {"),
+                "SUBSCRIBE dispatch must NOT destructure ForwardingAck variant \
+                 for relay driver — fire-and-forget ack stays on legacy."
             );
         }
     }
