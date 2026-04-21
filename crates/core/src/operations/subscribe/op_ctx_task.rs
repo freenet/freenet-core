@@ -862,6 +862,18 @@ pub(crate) async fn start_relay_subscribe(
         return Ok(());
     }
 
+    // Construct the guard IMMEDIATELY after `insert` so a panic in any
+    // intervening work (fmt-allocating logs, future OOM) cannot leak
+    // the dedup-set entry. The guard's Drop clears the entry; without
+    // the guard, there is no TTL and no recovery path. (Review M3,
+    // skeptical #3932.)
+    RELAY_SUBSCRIBE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RELAY_SUBSCRIBE_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = RelaySubscribeInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
     tracing::debug!(
         tx = %incoming_tx,
         %instance_id,
@@ -871,16 +883,6 @@ pub(crate) async fn start_relay_subscribe(
         phase = "relay_subscribe_start",
         "SUBSCRIBE relay (task-per-tx): spawning driver"
     );
-
-    // Construct guard + bump counters BEFORE spawn so the dedup-set
-    // entry is paired with a Drop even if the spawned future is dropped
-    // before its first poll. Same reasoning as GET/PUT/UPDATE.
-    RELAY_SUBSCRIBE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    RELAY_SUBSCRIBE_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let guard = RelaySubscribeInflightGuard {
-        op_manager: op_manager.clone(),
-        incoming_tx,
-    };
 
     GlobalExecutor::spawn(run_relay_subscribe(
         guard,
@@ -954,6 +956,34 @@ async fn run_relay_subscribe(
     op_manager.release_pending_op_slot(incoming_tx).await;
 }
 
+/// Drive a fresh inbound relay `SubscribeMsg::Request`: fast-path on
+/// local contract hit, otherwise forward to the closest potentially
+/// hosting peer and bubble the Response upstream.
+///
+/// # Intentional signal drop: `PeerHealthTracker` on downstream timeout
+///
+/// The legacy relay Request arm attached a `SubscribeStats {
+/// target_peer, contract_location, request_sent_at }` to the
+/// `AwaitingResponse` state so that downstream timeouts (reported via
+/// `handle_abort`) fed `PeerHealthTracker` and the failure estimator.
+/// The task-per-tx driver DROPS this signal on the relay node: on
+/// `send_to_and_await` timeout we bubble `NotFound` upstream and exit
+/// without touching `PeerHealthTracker`.
+///
+/// This is deliberate for slice A. Cross-peer retry at the relay was
+/// the phase-5 memory-explosion amplifier (see `project_1454_phase5_memory.md`
+/// and PR #3896's fix stack) — the task-per-tx design moves ALL
+/// cross-peer retry to the originator's client-init driver. The
+/// originator's `send_to_and_await` timeout path there is the correct
+/// site for peer-health updates; reporting them at a relay that does
+/// not retry adds no actionable signal and makes the symmetry with
+/// GET/PUT/UPDATE slice A harder to reason about.
+///
+/// Follow-up: if peer-health reporting at the relay becomes necessary
+/// for other reasons (e.g. targeting a specific slow peer cluster
+/// without originating traffic), extend `OpCtx::send_to_and_await`
+/// to emit a stat update on `Err(_elapsed)` via a hook rather than
+/// reintroducing the signal on each relay driver.
 async fn drive_relay_subscribe(
     op_manager: &Arc<OpManager>,
     incoming_tx: Transaction,
