@@ -1291,13 +1291,16 @@ where
 
     // ── Step 3: If next hop + streaming appropriate, set up piped forward ─
     //
-    // Layout: we send metadata via `ctx.send_to_and_await` (installs the
-    // pending_op_results waiter + dispatches the RequestStreaming to the
-    // downstream peer), then call `conn_manager.pipe_stream` to push
-    // fragments on the forked handle. The downstream's reply routes back
-    // via the installed callback. This mirrors legacy put.rs:1062-1072
-    // semantically — metadata-first, then pipe — but with the waiter
-    // install rolled into the same primitive as the dispatch.
+    // Layout: we send metadata via `ctx.send_to_and_register_waiter`
+    // (enqueues RequestStreaming on `op_execution_sender` + returns
+    // the reply receiver once the waiter-install is sequenced into
+    // the event loop), then call `conn_manager.pipe_stream` to push
+    // fragments on the forked handle. Ordering is load-bearing: a
+    // fast downstream reply would race a `pipe_stream`-first ordering
+    // and be dropped as OpNotPresent before the waiter lands. Matches
+    // legacy put.rs:1062-1072 semantically — metadata-first, then
+    // pipe — but split so the reply can be awaited in parallel with
+    // local stream assembly.
     let piping = if let Some(next_addr) = next_hop_addr {
         if crate::operations::should_use_streaming(
             op_manager.streaming_threshold,
@@ -2108,6 +2111,127 @@ mod tests {
         assert!(
             window.contains("id: incoming_tx"),
             "piped metadata must reuse incoming_tx (not mint fresh)"
+        );
+    }
+
+    /// Pin: `AlreadyClaimed` early-return must exit silently (no
+    /// upstream fabrication, no error bubble). The other driver
+    /// instance that claimed the stream owns the upstream reply.
+    #[test]
+    fn drive_relay_put_streaming_already_claimed_is_silent() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let ac_pos = b
+            .find("OrphanStreamError::AlreadyClaimed")
+            .expect("AlreadyClaimed arm not found");
+        let arm = &b[ac_pos..ac_pos + 600.min(b.len() - ac_pos)];
+        assert!(
+            arm.contains("return Ok(())"),
+            "AlreadyClaimed arm must return Ok(()) — the still-in-flight \
+             driver owns the upstream reply; this duplicate must exit silently"
+        );
+        assert!(
+            !arm.contains("send_fire_and_forget"),
+            "AlreadyClaimed arm must NOT fabricate a Response upstream"
+        );
+    }
+
+    /// Pin: orphan-claim-failure (non-AlreadyClaimed) returns an
+    /// error without fabricating a success Response upstream.
+    #[test]
+    fn drive_relay_put_streaming_claim_failure_is_silent() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let pos = b
+            .find("OrphanStreamClaimFailed")
+            .expect("OrphanStreamClaimFailed not found in slice B");
+        let window = &b[..pos];
+        let err_arm_start = window
+            .rfind("Err(err) =>")
+            .expect("orphan-claim Err arm not found");
+        let arm = &b[err_arm_start..pos + 100];
+        assert!(
+            !arm.contains("send_fire_and_forget"),
+            "orphan-claim failure must NOT fabricate a success Response upstream"
+        );
+    }
+
+    /// Pin: downstream reply timeout falls through to
+    /// `relay_put_send_response` (bubbles a best-effort Response
+    /// upstream) rather than propagating an error.
+    #[test]
+    fn drive_relay_put_streaming_timeout_bubbles_response() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let pos = b
+            .find("downstream reply timed out")
+            .expect("timeout arm not found");
+        let arm = &b[pos..pos + 400.min(b.len() - pos)];
+        assert!(
+            arm.contains("relay_put_send_response"),
+            "timeout arm must still call relay_put_send_response so the \
+             upstream waiter is not left to its own OPERATION_TTL"
+        );
+    }
+
+    /// Pin: stream assembly failure + contract-key mismatch +
+    /// payload deserialize failure all return Err without
+    /// fabricating a Response. They intentionally let the upstream's
+    /// OPERATION_TTL expire rather than lie about what was stored.
+    #[test]
+    fn drive_relay_put_streaming_store_failure_paths_do_not_fabricate() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let driver_start = b
+            .find("async fn drive_relay_put_streaming")
+            .expect("driver not found");
+        let driver = &b[driver_start..];
+
+        for phrase in [
+            "stream assembly failed",
+            "contract key mismatch",
+            "payload deserialize failed",
+        ] {
+            let anchor = driver
+                .find(phrase)
+                .unwrap_or_else(|| panic!("failure-path anchor {phrase:?} not found"));
+            // Starting at `anchor`, find the next `return Err(` —
+            // everything between must be free of send_fire_and_forget.
+            let tail = &driver[anchor..];
+            let ret_pos = tail
+                .find("return Err(")
+                .unwrap_or_else(|| panic!("no return Err after {phrase:?}"));
+            let pre_return = &tail[..ret_pos];
+            assert!(
+                !pre_return.contains("send_fire_and_forget"),
+                "failure path {phrase:?} must not fabricate a Response upstream"
+            );
+        }
+    }
+
+    /// Pin: `send_to_and_register_waiter` is called BEFORE
+    /// `conn_manager.pipe_stream` so the `pending_op_results`
+    /// callback is installed before downstream fragments land and a
+    /// fast downstream reply can't race past the waiter install.
+    #[test]
+    fn drive_relay_put_streaming_registers_waiter_before_pipe_stream() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let driver_start = b
+            .find("async fn drive_relay_put_streaming")
+            .expect("driver not found");
+        let driver = &b[driver_start..];
+        let register_pos = driver
+            .find("send_to_and_register_waiter(")
+            .expect("register_waiter call not found");
+        let pipe_pos = driver
+            .find(".pipe_stream(")
+            .expect("pipe_stream call not found");
+        assert!(
+            register_pos < pipe_pos,
+            "send_to_and_register_waiter MUST precede pipe_stream so the \
+             pending_op_results callback is installed before fragments \
+             land downstream (otherwise a fast reply races past the waiter)"
         );
     }
 }

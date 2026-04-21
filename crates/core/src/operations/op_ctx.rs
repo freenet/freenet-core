@@ -249,6 +249,13 @@ impl OpCtx {
     ///     None => /* channel closed — treat as infra error */,
     /// }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpError::NotificationError`] if the event-loop
+    /// `op_execution_sender` channel is closed (receiver dropped —
+    /// typically only happens during node shutdown). The caller
+    /// should treat this as an infrastructure failure.
     pub async fn send_to_and_register_waiter(
         &mut self,
         target_addr: SocketAddr,
