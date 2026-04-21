@@ -19,6 +19,13 @@ const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/
 /// Used by the service wrapper to avoid unnecessary restarts.
 pub const EXIT_CODE_ALREADY_UP_TO_DATE: i32 = 2;
 
+/// Exit code returned when a macOS DMG-swap update has been staged and the
+/// detached updater script is ready to take over. The wrapper MUST NOT
+/// re-exec itself on this code (the current .app bundle is about to be
+/// replaced out from under us); instead it should exit cleanly so the
+/// updater can complete the swap and relaunch.
+pub const EXIT_CODE_BUNDLE_UPDATE_STAGED: i32 = 3;
+
 #[derive(Args, Debug, Clone)]
 pub struct UpdateCommand {
     /// Only check if an update is available without installing
@@ -85,6 +92,37 @@ impl UpdateCommand {
     }
 
     async fn download_and_install(&self, release: &Release) -> Result<()> {
+        // macOS DMG-swap path: when running from inside a .app bundle,
+        // in-place binary replacement would invalidate the bundle's code
+        // signature and Gatekeeper would refuse to launch the result on
+        // next login. Instead we download the signed+notarized DMG and
+        // hand off to a detached updater script that swaps the whole
+        // bundle once this process exits. See fn maybe_perform_bundle_update.
+        #[cfg(target_os = "macos")]
+        {
+            match self.maybe_perform_bundle_update(release).await {
+                Ok(true) => {
+                    if !self.quiet {
+                        println!("Bundle update staged. Freenet will relaunch shortly.");
+                    }
+                    std::process::exit(EXIT_CODE_BUNDLE_UPDATE_STAGED);
+                }
+                Ok(false) => {
+                    // Not running inside a .app bundle (cargo run, raw
+                    // binary install, dev build): fall through to the
+                    // standard in-place binary replacement path below.
+                }
+                Err(e) => {
+                    if !self.quiet {
+                        eprintln!(
+                            "Bundle update failed ({}). Falling back to in-place binary replacement.",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         let target = get_target_triple();
         let extension = get_archive_extension();
         let freenet_asset_name = format!("freenet-{}.{}", target, extension);
@@ -388,6 +426,103 @@ impl UpdateCommand {
         } else if !self.quiet {
             println!("Successfully updated fdev.");
         }
+    }
+
+    /// macOS DMG-swap update. Invoked from `download_and_install` when we
+    /// detect we're running inside a .app bundle. Downloads the new
+    /// `Freenet-<version>.dmg`, verifies its checksum against
+    /// SHA256SUMS.txt, mounts it, stages the new bundle in
+    /// `~/Library/Caches/Freenet/staging/Freenet.app`, and spawns the
+    /// detached `macos-bundle-updater.sh` script which waits for the
+    /// running process to exit and then swaps the bundle.
+    ///
+    /// Returns:
+    ///   Ok(true)  update was staged; caller should exit with
+    ///             EXIT_CODE_BUNDLE_UPDATE_STAGED
+    ///   Ok(false) not running in a bundle; caller should use the
+    ///             standard binary-replacement flow instead
+    ///   Err       failed; caller may fall back to binary replacement
+    #[cfg(target_os = "macos")]
+    async fn maybe_perform_bundle_update(&self, release: &Release) -> Result<bool> {
+        let current_exe = std::env::current_exe()
+            .context("Failed to resolve current executable for bundle-update check")?;
+        let Some(bundle_path) = super::service::macos_app_bundle_path(&current_exe) else {
+            return Ok(false);
+        };
+
+        let version = release.tag_name.trim_start_matches('v');
+        let dmg_asset_name = format!("Freenet-{version}.dmg");
+        let dmg_asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == dmg_asset_name)
+            .ok_or_else(|| anyhow::anyhow!("No DMG asset named {} in release", dmg_asset_name))?;
+
+        let checksums = match release.assets.iter().find(|a| a.name == "SHA256SUMS.txt") {
+            Some(a) => download_checksums(&a.browser_download_url).await.ok(),
+            None => None,
+        };
+
+        let scratch = tempfile::tempdir().context("Failed to create temp directory")?;
+        let dmg_path = scratch.path().join(&dmg_asset_name);
+        download_file(&dmg_asset.browser_download_url, &dmg_path, self.quiet).await?;
+
+        if let Some(checksums) = &checksums {
+            if let Some(expected) = checksums.get(&dmg_asset_name) {
+                verify_checksum(&dmg_path, expected)?;
+            } else if !self.quiet {
+                eprintln!(
+                    "Warning: no checksum for {dmg_asset_name}. Continuing without verification."
+                );
+            }
+        }
+
+        let mount_point = scratch.path().join("mount");
+        std::fs::create_dir_all(&mount_point)?;
+        hdiutil_attach(&dmg_path, &mount_point)?;
+
+        let mounted_app = mount_point.join("Freenet.app");
+        if !mounted_app.exists() {
+            let _ = hdiutil_detach(&mount_point);
+            anyhow::bail!(
+                "DMG mounted at {} does not contain Freenet.app",
+                mount_point.display()
+            );
+        }
+
+        // Stage into a persistent location outside `scratch` (which is
+        // deleted as soon as this function returns). The updater script
+        // reads the staged bundle AFTER we exit, so it must survive.
+        let staging = staging_dir()?;
+        std::fs::create_dir_all(&staging)?;
+        let staged_app = staging.join("Freenet.app");
+        if staged_app.exists() {
+            std::fs::remove_dir_all(&staged_app)
+                .context("Failed to clean previous staging directory")?;
+        }
+
+        // `ditto` preserves HFS+/APFS metadata and extended attributes
+        // (including the code-signature bits and stapled notarization).
+        // A plain `cp -R` would strip quarantine/notarization attrs and
+        // Gatekeeper would then reject the bundle on next launch.
+        let ditto = std::process::Command::new("/usr/bin/ditto")
+            .arg(&mounted_app)
+            .arg(&staged_app)
+            .output()
+            .context("Failed to spawn /usr/bin/ditto")?;
+        let _ = hdiutil_detach(&mount_point);
+        if !ditto.status.success() {
+            anyhow::bail!(
+                "ditto copy failed ({}): {}",
+                ditto.status,
+                String::from_utf8_lossy(&ditto.stderr).trim()
+            );
+        }
+
+        let script_path = write_updater_script()?;
+        spawn_detached_updater(&script_path, &bundle_path, &staged_app)?;
+
+        Ok(true)
     }
 }
 
@@ -1104,4 +1239,110 @@ fn is_windows_wrapper_running() -> bool {
             stdout.matches("freenet.exe").count() > 1
         })
         .unwrap_or(false)
+}
+
+// ── macOS DMG-swap update support ──
+
+/// Cache directory for staged bundles and the updater script. Separate
+/// sub-paths live under this root. Uses `dirs::cache_dir()` which on
+/// macOS resolves to `~/Library/Caches`.
+#[cfg(target_os = "macos")]
+fn bundle_updater_cache_root() -> Result<PathBuf> {
+    dirs::cache_dir()
+        .map(|d| d.join("Freenet"))
+        .context("Could not resolve user cache directory")
+}
+
+#[cfg(target_os = "macos")]
+fn staging_dir() -> Result<PathBuf> {
+    Ok(bundle_updater_cache_root()?.join("staging"))
+}
+
+#[cfg(target_os = "macos")]
+fn updater_runtime_dir() -> Result<PathBuf> {
+    Ok(bundle_updater_cache_root()?.join("updater"))
+}
+
+#[cfg(target_os = "macos")]
+fn hdiutil_attach(dmg: &Path, mount_point: &Path) -> Result<()> {
+    let output = std::process::Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
+        .arg(mount_point)
+        .arg(dmg)
+        .output()
+        .context("Failed to spawn hdiutil")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "hdiutil attach failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn hdiutil_detach(mount_point: &Path) -> Result<()> {
+    // `-force` so a stuck unmount from a prior crashed run doesn't pin
+    // us indefinitely. Attach is read-only, so there's no data at risk.
+    let output = std::process::Command::new("hdiutil")
+        .args(["detach", "-force"])
+        .arg(mount_point)
+        .output()
+        .context("Failed to spawn hdiutil")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "hdiutil detach failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Materialize the macOS bundle updater script onto disk. We ship it as
+/// an embedded `include_str!` so the Freenet binary is self-contained
+/// even when installed from crates.io without the `scripts/` directory.
+#[cfg(target_os = "macos")]
+fn write_updater_script() -> Result<PathBuf> {
+    const SCRIPT: &str = include_str!("../../../../../scripts/macos-bundle-updater.sh");
+    let dir = updater_runtime_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("macos-bundle-updater.sh");
+    std::fs::write(&path, SCRIPT)?;
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms)?;
+    Ok(path)
+}
+
+/// Spawn the bundle updater in a detached process group so it survives
+/// when the current process exits (which it is about to, so the bundle
+/// can be swapped).
+#[cfg(target_os = "macos")]
+fn spawn_detached_updater(script: &Path, current_app: &Path, staged_app: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let log_path = updater_runtime_dir()?.join("updater.log");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg(script)
+        .arg(current_app)
+        .arg(staged_app)
+        .arg(&log_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Put the updater in its own process group so the shell that spawned
+    // Freenet (or our own process-exit signal) can't accidentally sweep
+    // it up as a child. `setsid` is unavailable on macOS but `setpgid(0, 0)`
+    // via `before_exec` works.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    cmd.spawn().context("Failed to spawn detached updater")?;
+    Ok(())
 }

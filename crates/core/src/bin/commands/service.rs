@@ -349,8 +349,11 @@ fn is_launch_at_login_enabled_at(plist: &Path) -> bool {
 /// If `exe` lives inside a macOS `.app` bundle, return that bundle's
 /// absolute path. Walks up the parent directories until a path segment
 /// ending in `.app` is found, or the filesystem root is reached.
+///
+/// Exposed at `pub(super)` so `update.rs` can detect bundle context for
+/// its DMG-swap auto-update path.
 #[allow(dead_code)]
-fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
+pub(super) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
     for ancestor in exe.ancestors() {
         if ancestor
             .file_name()
@@ -1327,10 +1330,27 @@ fn run_wrapper_loop(
                                     if spawn_new_wrapper(&exe_path, log_dir) {
                                         return Ok(());
                                     }
-                                    // Spawn failed — fall through to relaunch child
+                                    // Spawn failed. Fall through to relaunch child
                                     // with the current (old) wrapper rather than
                                     // leaving no node running.
                                     break SENTINEL_RESTART;
+                                }
+                                Ok(s)
+                                    if s.code()
+                                        == Some(super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED) =>
+                                {
+                                    // macOS DMG-swap: the detached updater
+                                    // will swap /Applications/Freenet.app
+                                    // after this process exits and relaunch
+                                    // the new bundle. Do NOT re-exec.
+                                    log_wrapper_event(
+                                        log_dir,
+                                        "Bundle update staged; exiting for updater to take over",
+                                    );
+                                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                    drop(child.kill());
+                                    drop(child.wait());
+                                    return Ok(());
                                 }
                                 Ok(_) => {
                                     // Exit code 2 = already up to date, or other
@@ -1395,9 +1415,22 @@ fn run_wrapper_loop(
                                         if spawn_new_wrapper(&exe_path, log_dir) {
                                             return Ok(());
                                         }
-                                        // Spawn failed — exit stopped state and
+                                        // Spawn failed. Exit stopped state and
                                         // relaunch child with the current wrapper.
                                         break;
+                                    }
+                                    Ok(s)
+                                        if s.code()
+                                            == Some(
+                                                super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED,
+                                            ) =>
+                                    {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            "Bundle update staged while stopped; exiting for updater",
+                                        );
+                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                        return Ok(());
                                     }
                                     Ok(_) => {
                                         log_wrapper_event(log_dir, "No update available");
@@ -1443,9 +1476,26 @@ fn run_wrapper_loop(
                 status_tx.send(WrapperStatus::Updating).ok();
             }
 
-            let ok = spawn_update_command(&exe_path)
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let result = spawn_update_command(&exe_path);
+            // macOS DMG-swap: if the update subprocess exits with the
+            // bundle-staged code, the detached updater takes over after
+            // this process exits. We must not re-exec or retry; just
+            // return Ok so the wrapper exits cleanly and the updater can
+            // swap /Applications/Freenet.app.
+            if let Ok(ref s) = result {
+                if s.code() == Some(super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED) {
+                    log_wrapper_event(
+                        log_dir,
+                        "Bundle update staged during auto-update; exiting for updater",
+                    );
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                    if let Some((_, status_tx)) = tray {
+                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                    }
+                    return Ok(());
+                }
+            }
+            let ok = result.map(|s| s.success()).unwrap_or(false);
 
             if ok {
                 log_wrapper_event(log_dir, "Update successful, restarting...");
@@ -1552,9 +1602,22 @@ fn run_wrapper_loop(
                                         if spawn_new_wrapper(&exe_path, log_dir) {
                                             return Ok(());
                                         }
-                                        // Spawn failed — relaunch with current wrapper
+                                        // Spawn failed. Relaunch with current wrapper.
                                         state.consecutive_failures = 0;
                                         break;
+                                    }
+                                    Ok(s)
+                                        if s.code()
+                                            == Some(
+                                                super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED,
+                                            ) =>
+                                    {
+                                        log_wrapper_event(
+                                            log_dir,
+                                            "Bundle update staged during backoff; exiting for updater",
+                                        );
+                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                                        return Ok(());
                                     }
                                     Ok(_) => {
                                         log_wrapper_event(log_dir, "No update available");
