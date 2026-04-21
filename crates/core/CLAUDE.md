@@ -59,6 +59,13 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              + fresh inbound non-streaming relay PUT
                              driver (Phase 5 follow-up slice A, PR #3917,
                              `start_relay_put`)
+                             + fresh inbound streaming relay PUT
+                             driver (Phase 5 follow-up slice B,
+                             `start_relay_put_streaming`: claims
+                             inbound stream via orphan_stream_registry,
+                             pipes fragments downstream via
+                             NetworkBridge::pipe_stream, bubbles a
+                             downgraded non-streaming Response upstream)
   get/op_ctx_task.rs       → client-initiated GET driver (Phase 3b)
                              + fresh inbound relay GET driver (Phase 5,
                              PR #3896, `start_relay_get`)
@@ -69,10 +76,11 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              `start_relay_broadcast_to`)
     All four relay drivers share the per-node dedup gate pattern
     (`active_relay_{get,update,put,subscribe}_txs`) and the
-    `Relay*InflightGuard` RAII. Streaming UPDATE relay variants
-    (`RequestUpdateStreaming`, `BroadcastToStreaming`) and the
-    deprecated `Broadcasting` wire variant, plus PUT streaming
-    variants, remain on legacy pending slice B. SUBSCRIBE has no
+    `Relay*InflightGuard` RAII. PUT streaming relays now run on the
+    task-per-tx path (slice B, `start_relay_put_streaming`).
+    Streaming UPDATE relay variants (`RequestUpdateStreaming`,
+    `BroadcastToStreaming`) and the deprecated `Broadcasting` wire
+    variant remain on legacy pending future slices. SUBSCRIBE has no
     streaming variants but renewals, PUT sub-op subscribes, executor
     auto-subscribe paths, `Unsubscribe`, and `ForwardingAck` all stay
     on the legacy state machine.

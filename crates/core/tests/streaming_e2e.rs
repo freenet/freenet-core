@@ -544,6 +544,12 @@ fn test_streaming_multi_hop_forwarding() {
         },
     )];
 
+    // #1454 phase 5 slice B: snapshot the streaming relay driver
+    // call count so we can assert the task-per-tx path handled at
+    // least one relay hop (vs. legacy `handle_op_request` fallthrough).
+    let driver_calls_before = freenet::dev_tool::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT
+        .load(std::sync::atomic::Ordering::SeqCst);
+
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
@@ -555,6 +561,16 @@ fn test_streaming_multi_hop_forwarding() {
         result.turmoil_result.is_ok(),
         "Multi-hop streaming PUT should complete: {:?}",
         result.turmoil_result.err()
+    );
+
+    let driver_calls_after = freenet::dev_tool::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        driver_calls_after > driver_calls_before,
+        "Expected the streaming PUT relay driver to run at least once \
+         during a 200KB multi-hop PUT (before={driver_calls_before}, \
+         after={driver_calls_after}). Counter stuck → slice B dispatch \
+         gate fell through to legacy `handle_op_request`."
     );
 
     let stored = find_contract_in_non_gateway_storages(&result.node_storages, &contract_key);

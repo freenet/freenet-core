@@ -110,6 +110,14 @@ pub mod dev_tool {
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_DRIVER_CALL_COUNT;
 
+    // #1454 Phase 5 follow-up slice B — test hook for streaming PUT
+    // relay dispatch. Fires when the streaming driver is spawned for
+    // a fresh inbound `PutMsg::RequestStreaming` (vs. legacy
+    // `handle_op_request` fallthrough for GC retries / loopback /
+    // variants that stay on the legacy path).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT;
+
     // #1454 Phase 5 follow-up slice A (#3932) — test hook to verify
     // the dispatch gate in `handle_pure_network_message_v1` actually
     // routes fresh inbound relay SUBSCRIBEs through the task-per-tx
