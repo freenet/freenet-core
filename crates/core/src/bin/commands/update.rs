@@ -24,7 +24,71 @@ pub const EXIT_CODE_ALREADY_UP_TO_DATE: i32 = 2;
 /// re-exec itself on this code (the current .app bundle is about to be
 /// replaced out from under us); instead it should exit cleanly so the
 /// updater can complete the swap and relaunch.
-pub const EXIT_CODE_BUNDLE_UPDATE_STAGED: i32 = 3;
+///
+/// Value 44 chosen to follow the existing WRAPPER_EXIT_* convention in
+/// service.rs (42 = update needed, 43 = already running) and to avoid
+/// collision with the exit-3 signal that `freenet service status` uses
+/// for "service not running" (which a caller might legitimately
+/// disambiguate from "update staged" by exit code alone).
+pub const EXIT_CODE_BUNDLE_UPDATE_STAGED: i32 = 44;
+
+/// Classified outcome of a `freenet update` subprocess invocation, from
+/// the wrapper's point of view. Pure function so the four existing
+/// dispatch sites in `service.rs` stay in sync: a typo like forgetting
+/// the `Some(...)` arm at one of them would route the wrapper into
+/// re-exec'ing a bundle that's about to be replaced out from under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum UpdateSubprocessOutcome {
+    /// In-place binary replacement succeeded. Wrapper should re-exec via
+    /// `spawn_new_wrapper` so the tray reflects the new version.
+    BinaryReplaced,
+    /// macOS DMG-swap: the detached updater will finish the update and
+    /// relaunch the new bundle after this process exits. Wrapper MUST
+    /// exit cleanly without re-exec.
+    BundleUpdateStaged,
+    /// Update check ran; already on the latest version.
+    AlreadyUpToDate,
+    /// Update attempted but failed (spawn error, network error, or non-
+    /// zero exit other than `ALREADY_UP_TO_DATE` / `BUNDLE_UPDATE_STAGED`).
+    Failed,
+}
+
+/// Classify the exit status of a `freenet update` subprocess invocation.
+/// Pure over just the `io::Result<ExitStatus>` so it can be unit-tested
+/// with synthetic inputs.
+#[allow(dead_code)]
+pub fn classify_update_subprocess(
+    result: &std::io::Result<std::process::ExitStatus>,
+) -> UpdateSubprocessOutcome {
+    match result {
+        Ok(s) if s.success() => UpdateSubprocessOutcome::BinaryReplaced,
+        Ok(s) if s.code() == Some(EXIT_CODE_BUNDLE_UPDATE_STAGED) => {
+            UpdateSubprocessOutcome::BundleUpdateStaged
+        }
+        Ok(s) if s.code() == Some(EXIT_CODE_ALREADY_UP_TO_DATE) => {
+            UpdateSubprocessOutcome::AlreadyUpToDate
+        }
+        Ok(_) => UpdateSubprocessOutcome::Failed,
+        Err(_) => UpdateSubprocessOutcome::Failed,
+    }
+}
+
+/// Compute the macOS DMG asset filename for a given release tag. Strips
+/// a leading `v` if present (releases are tagged `v0.2.49` but the DMG
+/// filename embeds the bare version, per the release pipeline in
+/// `.github/workflows/cross-compile.yml`). Pure so the derivation is
+/// testable without a real `Release` fixture.
+#[allow(dead_code)]
+pub fn macos_dmg_asset_name(tag_name: &str) -> String {
+    // `strip_prefix` removes at most one leading `v`, unlike
+    // `trim_start_matches` which would eat multiple (e.g. a typo tag
+    // like `vv0.2.49` would silently double-strip and produce the wrong
+    // DMG name, then fail the asset lookup with a confusing "not
+    // found" rather than surfacing the bad tag).
+    let version = tag_name.strip_prefix('v').unwrap_or(tag_name);
+    format!("Freenet-{}.dmg", version)
+}
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateCommand {
@@ -100,8 +164,22 @@ impl UpdateCommand {
         // bundle once this process exits. See fn maybe_perform_bundle_update.
         #[cfg(target_os = "macos")]
         {
+            // Detect the bundle context once up front so the error arm
+            // can tell the difference between "not in a bundle, fall
+            // through to binary-replace" and "in a bundle, DMG-swap
+            // failed, abort to protect the signature". Falling through
+            // on error would overwrite Contents/MacOS/freenet-bin and
+            // invalidate the bundle's code signature, bricking the app
+            // on next Gatekeeper check (per Codex P1 and code-first
+            // review on this PR).
+            let running_in_bundle = std::env::current_exe()
+                .ok()
+                .and_then(|exe| super::service::macos_app_bundle_path(&exe))
+                .is_some();
+
             match self.maybe_perform_bundle_update(release).await {
                 Ok(true) => {
+                    tracing::info!("DMG-swap update staged for release {}", release.tag_name);
                     if !self.quiet {
                         println!("Bundle update staged. Freenet will relaunch shortly.");
                     }
@@ -112,11 +190,31 @@ impl UpdateCommand {
                     // binary install, dev build): fall through to the
                     // standard in-place binary replacement path below.
                 }
-                Err(e) => {
+                Err(e) if running_in_bundle => {
+                    // Running in a bundle AND the DMG-swap failed. Do
+                    // NOT fall through: binary-replace would corrupt the
+                    // signature and break Gatekeeper on next boot. Log
+                    // and return so the user stays on the working old
+                    // version; the next auto-update cycle can retry.
+                    tracing::warn!(
+                        "DMG-swap bundle update failed for {}: {}. Skipping update to preserve code signature.",
+                        release.tag_name,
+                        e
+                    );
                     if !self.quiet {
                         eprintln!(
-                            "Bundle update failed ({}). Falling back to in-place binary replacement.",
-                            e
+                            "Bundle update failed: {e}. Skipping update to avoid corrupting the signed bundle. Next attempt will retry."
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Not in a bundle: safe to fall through to binary-
+                    // replace. Log the bundle-attempt failure for
+                    // diagnosability; continue with the standard path.
+                    if !self.quiet {
+                        eprintln!(
+                            "Bundle update check failed ({e}); continuing with in-place binary replacement."
                         );
                     }
                 }
@@ -450,13 +548,18 @@ impl UpdateCommand {
             return Ok(false);
         };
 
-        let version = release.tag_name.trim_start_matches('v');
-        let dmg_asset_name = format!("Freenet-{version}.dmg");
+        let dmg_asset_name = macos_dmg_asset_name(&release.tag_name);
         let dmg_asset = release
             .assets
             .iter()
             .find(|a| a.name == dmg_asset_name)
             .ok_or_else(|| anyhow::anyhow!("No DMG asset named {} in release", dmg_asset_name))?;
+
+        // Acquire a flock on a lockfile in the cache dir so two concurrent
+        // updates (e.g. tray "Check for Updates" racing with auto-update)
+        // can't stomp each other's staging directories and leave the user
+        // with no /Applications/Freenet.app (skeptical review H1).
+        let _update_lock = acquire_update_lock()?;
 
         let checksums = match release.assets.iter().find(|a| a.name == "SHA256SUMS.txt") {
             Some(a) => download_checksums(&a.browser_download_url).await.ok(),
@@ -467,38 +570,56 @@ impl UpdateCommand {
         let dmg_path = scratch.path().join(&dmg_asset_name);
         download_file(&dmg_asset.browser_download_url, &dmg_path, self.quiet).await?;
 
-        if let Some(checksums) = &checksums {
-            if let Some(expected) = checksums.get(&dmg_asset_name) {
-                verify_checksum(&dmg_path, expected)?;
-            } else if !self.quiet {
-                eprintln!(
-                    "Warning: no checksum for {dmg_asset_name}. Continuing without verification."
-                );
-            }
+        // Require checksum verification for bundle updates. Unverified
+        // DMG install is a supply-chain risk that macOS Gatekeeper alone
+        // should not have to mitigate. If SHA256SUMS.txt doesn't list
+        // the DMG, abort rather than silently proceed (code-first,
+        // skeptical M7).
+        match checksums.as_ref().and_then(|c| c.get(&dmg_asset_name)) {
+            Some(expected) => verify_checksum(&dmg_path, expected)?,
+            None => anyhow::bail!(
+                "No SHA256 checksum listed for {}; refusing unverified DMG install. \
+                 Check that the release uploaded SHA256SUMS.txt covering the DMG asset.",
+                dmg_asset_name
+            ),
         }
 
         let mount_point = scratch.path().join("mount");
         std::fs::create_dir_all(&mount_point)?;
         hdiutil_attach(&dmg_path, &mount_point)?;
+        // Scope guard: detach in every control-flow path below, including
+        // `?` early returns from `ditto` spawn failure. Without this, the
+        // volume stays mounted after the function returns and the tempdir
+        // drop tries to remove_dir_all under a live mount, which at best
+        // fails and at worst (if hdiutil is confused) could touch the
+        // mounted contents.
+        let detach_guard = MountDetachOnDrop {
+            mount_point: mount_point.clone(),
+        };
 
         let mounted_app = mount_point.join("Freenet.app");
         if !mounted_app.exists() {
-            let _ = hdiutil_detach(&mount_point);
+            drop(detach_guard);
             anyhow::bail!(
                 "DMG mounted at {} does not contain Freenet.app",
                 mount_point.display()
             );
         }
 
-        // Stage into a persistent location outside `scratch` (which is
-        // deleted as soon as this function returns). The updater script
-        // reads the staged bundle AFTER we exit, so it must survive.
-        let staging = staging_dir()?;
-        std::fs::create_dir_all(&staging)?;
-        let staged_app = staging.join("Freenet.app");
+        // Stage as a SIBLING of the target bundle, not in
+        // ~/Library/Caches. The final `rename(2)` the updater script
+        // performs must stay on the same APFS volume or the fallback
+        // cp+rm is not crash-safe (skeptical review H2). Using a
+        // hidden sibling also keeps the staging dir cleaned up even
+        // if the updater crashes mid-flight — any `/Applications/.Freenet.app.staging.*`
+        // leftover is obviously unrelated to the real install.
+        let staged_app = bundle_staging_path(&bundle_path)?;
         if staged_app.exists() {
             std::fs::remove_dir_all(&staged_app)
                 .context("Failed to clean previous staging directory")?;
+        }
+        if let Some(parent) = staged_app.parent() {
+            std::fs::create_dir_all(parent)?;
         }
 
         // `ditto` preserves HFS+/APFS metadata and extended attributes
@@ -510,7 +631,7 @@ impl UpdateCommand {
             .arg(&staged_app)
             .output()
             .context("Failed to spawn /usr/bin/ditto")?;
-        let _ = hdiutil_detach(&mount_point);
+        drop(detach_guard);
         if !ditto.status.success() {
             anyhow::bail!(
                 "ditto copy failed ({}): {}",
@@ -1243,9 +1364,10 @@ fn is_windows_wrapper_running() -> bool {
 
 // ── macOS DMG-swap update support ──
 
-/// Cache directory for staged bundles and the updater script. Separate
-/// sub-paths live under this root. Uses `dirs::cache_dir()` which on
-/// macOS resolves to `~/Library/Caches`.
+/// Cache directory for the updater script runtime + log. Staged bundles
+/// live beside the target (see `bundle_staging_path`) so `rename(2)`
+/// stays same-volume. Uses `dirs::cache_dir()` which on macOS resolves
+/// to `~/Library/Caches`.
 #[cfg(target_os = "macos")]
 fn bundle_updater_cache_root() -> Result<PathBuf> {
     dirs::cache_dir()
@@ -1253,14 +1375,73 @@ fn bundle_updater_cache_root() -> Result<PathBuf> {
         .context("Could not resolve user cache directory")
 }
 
+/// Path where we stage the new .app during an update. Must be on the
+/// same APFS volume as the target bundle so the final `rename(2)` the
+/// updater script performs is atomic (skeptical H2). We use a hidden
+/// sibling of the target named with our PID to avoid clashing with
+/// concurrent updates and to keep filesystem cleanup obvious.
 #[cfg(target_os = "macos")]
-fn staging_dir() -> Result<PathBuf> {
-    Ok(bundle_updater_cache_root()?.join("staging"))
+fn bundle_staging_path(target_bundle: &Path) -> Result<PathBuf> {
+    let parent = target_bundle
+        .parent()
+        .context("Target bundle has no parent directory")?;
+    let pid = std::process::id();
+    Ok(parent.join(format!(".Freenet.app.staging.{pid}")))
 }
 
 #[cfg(target_os = "macos")]
 fn updater_runtime_dir() -> Result<PathBuf> {
     Ok(bundle_updater_cache_root()?.join("updater"))
+}
+
+/// Lockfile-backed exclusion for concurrent update attempts. Returns a
+/// guard that holds the flock until dropped. Concurrent `freenet update`
+/// invocations (e.g. tray-triggered racing with auto-update-on-exit-42)
+/// must be serialized or they can stomp each other's staging and leave
+/// the user with no installed bundle (skeptical H1).
+#[cfg(target_os = "macos")]
+fn acquire_update_lock() -> Result<UpdateLock> {
+    use std::os::unix::io::AsRawFd;
+    let dir = updater_runtime_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let lock_path = dir.join("update.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .context("Failed to open update lockfile")?;
+    // flock with LOCK_EX | LOCK_NB: fail fast instead of queueing. A
+    // parallel updater should bail rather than serialize behind us.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        anyhow::bail!(
+            "Another Freenet update is already in progress (lockfile held: {})",
+            lock_path.display()
+        );
+    }
+    Ok(UpdateLock { _file: file })
+}
+
+#[cfg(target_os = "macos")]
+struct UpdateLock {
+    // Held only to keep the flock alive; dropped releases the lock.
+    _file: std::fs::File,
+}
+
+/// Scope guard that detaches an hdiutil-mounted volume when it goes out
+/// of scope. Ensures the mount is cleaned up on every exit path from
+/// `maybe_perform_bundle_update`, including `?` early-returns.
+#[cfg(target_os = "macos")]
+struct MountDetachOnDrop {
+    mount_point: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MountDetachOnDrop {
+    fn drop(&mut self) {
+        let _ = hdiutil_detach(&self.mount_point);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1333,16 +1514,117 @@ fn spawn_detached_updater(script: &Path, current_app: &Path, staged_app: &Path) 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // Put the updater in its own process group so the shell that spawned
-    // Freenet (or our own process-exit signal) can't accidentally sweep
-    // it up as a child. `setsid` is unavailable on macOS but `setpgid(0, 0)`
-    // via `before_exec` works.
+    // Detach the updater from the parent's session AND process group so
+    // it survives SIGHUP if the user closes a parent Terminal, and isn't
+    // swept up as our own child on exit. `setsid` makes a new session
+    // (which implicitly makes a new process group); the subsequent
+    // `setpgid(0, 0)` is redundant but cheap belt-and-braces. Without
+    // `setsid`, a terminal-parent session delivers SIGHUP to all
+    // descendants on close, killing the updater mid-swap (skeptical M5).
     unsafe {
         cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                // setsid fails if we're already a session leader.
+                // That's fine; the setpgid below still detaches us
+                // from the parent's process group.
+            }
             libc::setpgid(0, 0);
             Ok(())
         });
     }
     cmd.spawn().context("Failed to spawn detached updater")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Synthesize an ExitStatus with a specific numeric code. Uses the
+    // Unix-specific `ExitStatusExt::from_raw` so this test module is
+    // implicitly unix-only; that matches where the production classifier
+    // actually matters (Linux + macOS wrapper flow; Windows also hits
+    // these tests since it compiles the classifier).
+    #[cfg(unix)]
+    fn exit_with(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        // wait()-style status bits: (code << 8) for a normal exit.
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_update_subprocess_success() {
+        let result: std::io::Result<std::process::ExitStatus> = Ok(exit_with(0));
+        assert_eq!(
+            classify_update_subprocess(&result),
+            UpdateSubprocessOutcome::BinaryReplaced
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_update_subprocess_already_up_to_date() {
+        let result = Ok(exit_with(EXIT_CODE_ALREADY_UP_TO_DATE));
+        assert_eq!(
+            classify_update_subprocess(&result),
+            UpdateSubprocessOutcome::AlreadyUpToDate
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_update_subprocess_bundle_update_staged() {
+        let result = Ok(exit_with(EXIT_CODE_BUNDLE_UPDATE_STAGED));
+        assert_eq!(
+            classify_update_subprocess(&result),
+            UpdateSubprocessOutcome::BundleUpdateStaged
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_update_subprocess_arbitrary_failure() {
+        let result = Ok(exit_with(1));
+        assert_eq!(
+            classify_update_subprocess(&result),
+            UpdateSubprocessOutcome::Failed
+        );
+        let result = Ok(exit_with(42));
+        assert_eq!(
+            classify_update_subprocess(&result),
+            UpdateSubprocessOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn classify_update_subprocess_spawn_error() {
+        let result: std::io::Result<std::process::ExitStatus> =
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "boom"));
+        assert_eq!(
+            classify_update_subprocess(&result),
+            UpdateSubprocessOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn macos_dmg_asset_name_strips_leading_v() {
+        assert_eq!(macos_dmg_asset_name("v0.2.49"), "Freenet-0.2.49.dmg");
+        assert_eq!(
+            macos_dmg_asset_name("v0.2.49-rc.1"),
+            "Freenet-0.2.49-rc.1.dmg"
+        );
+    }
+
+    #[test]
+    fn macos_dmg_asset_name_passes_through_bare_version() {
+        assert_eq!(macos_dmg_asset_name("0.2.49"), "Freenet-0.2.49.dmg");
+    }
+
+    #[test]
+    fn macos_dmg_asset_name_only_strips_one_leading_v() {
+        // A hypothetical tag like `vv0.2.49` (broken, but should not
+        // silently eat both leading chars): verify we strip just one.
+        assert_eq!(macos_dmg_asset_name("vv0.2.49"), "Freenet-v0.2.49.dmg");
+    }
 }
