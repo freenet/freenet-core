@@ -235,10 +235,281 @@ const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
 #[allow(dead_code)] // Used on Windows/macOS (tray + wrapper loop)
 pub(crate) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 
+/// host:port pair the dashboard HTTP server listens on. Kept in sync with
+/// `DASHBOARD_URL`. Not cfg-gated even though only the tray wrappers use
+/// it at runtime, so the `dashboard_url_and_addr_stay_in_sync` test can
+/// assert their consistency on Linux CI.
+#[allow(dead_code)]
+const DASHBOARD_ADDR: &str = "127.0.0.1:7509";
+
 /// Open a URL in the default browser (platform-specific).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn open_url_in_browser(url: &str) {
     super::open_url_in_browser(url);
+}
+
+// ── First-run onboarding ──
+//
+// On first launch of the tray wrapper we open the local dashboard in the
+// user's default browser so a new user can actually see Freenet doing
+// something. Subsequent launches are silent — this matches Mac menu-bar
+// conventions (Docker Desktop, Dropbox, Rectangle, etc.: guide the user
+// on first install, stay out of the way afterwards).
+//
+// The marker-file helpers are platform-independent so they can be unit-
+// tested on Linux CI; the dashboard-opening thread is tray-specific.
+
+/// Path of the first-run marker file, if we can determine a data directory.
+#[allow(dead_code)] // Used by the tray wrapper on Windows/macOS only
+fn first_run_marker_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("freenet").join(".first-run-complete"))
+}
+
+#[allow(dead_code)]
+fn is_first_run_at(marker: &Path) -> bool {
+    !marker.exists()
+}
+
+#[allow(dead_code)]
+fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::File::create(marker).map(|_| ())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn dashboard_port_is_listening() -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let Ok(addr) = DASHBOARD_ADDR.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// At-most-once guard for spawning the first-run dashboard opener within a
+/// single wrapper process. Without it, a wrapper that restarts its daemon
+/// child several times before the HTTP server binds (e.g. during a crash
+/// loop on initial startup) would accumulate one 30-second opener thread
+/// per relaunch, each racing to open a browser tab and write the marker.
+/// Checking a real wall-clock Instant plus polling a TCP port means we
+/// also can't reuse the per-launch marker file itself as a latch.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+static FIRST_RUN_OPENER_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// ── Launch at Login (macOS) ──
+//
+// On macOS, the DMG-installed Freenet.app does not auto-start on login by
+// itself — the .app bundle is just a folder in /Applications. To match
+// the Windows-installer experience (service registers with the OS and
+// starts on boot) we write a user LaunchAgent plist that points at the
+// .app bundle's executable and sets `RunAtLoad=true`.
+//
+// The presence/absence of the plist file is the single source of truth
+// for the user's preference: plist exists ⇒ launch at login enabled.
+// The tray menu's Launch at Login check item reads this state.
+//
+// Implementation uses the modern `launchctl bootstrap gui/$UID` path,
+// which loads the agent into the current GUI session and honours
+// RunAtLoad on future logins. Falls back to legacy `launchctl load` if
+// bootstrap fails (older macOS, unusual session state).
+
+/// Identifier that also serves as the plist filename and launchd label.
+#[allow(dead_code)]
+const LAUNCH_AT_LOGIN_LABEL: &str = "org.freenet.Freenet";
+
+/// Absolute path of the user LaunchAgent plist, if `$HOME` is resolvable.
+#[allow(dead_code)]
+fn launch_agent_plist_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LAUNCH_AT_LOGIN_LABEL}.plist"))
+    })
+}
+
+#[allow(dead_code)]
+fn is_launch_at_login_enabled_at(plist: &Path) -> bool {
+    plist.exists()
+}
+
+/// Build the plist XML for the user LaunchAgent. Split out so it's unit-
+/// testable without touching the filesystem or launchctl.
+#[allow(dead_code)]
+fn launch_agent_plist_contents(executable: &Path) -> String {
+    // The path could contain characters that aren't valid in a plist <string>
+    // (e.g. `&`, `<`), so we XML-escape defensively even though macOS
+    // installer paths almost never need it.
+    let mut escaped = String::with_capacity(executable.as_os_str().len());
+    for ch in executable.to_string_lossy().chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            c => escaped.push(c),
+        }
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCH_AT_LOGIN_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{escaped}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// Write the plist to disk, creating `~/Library/LaunchAgents` if needed.
+/// Does NOT activate the agent with launchctl — that's the caller's job
+/// (separated so the filesystem half is unit-testable on Linux).
+#[allow(dead_code)]
+fn write_launch_agent_plist_at(plist: &Path, executable: &Path) -> std::io::Result<()> {
+    if let Some(parent) = plist.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(plist, launch_agent_plist_contents(executable))
+}
+
+/// Remove the plist. Idempotent: returns Ok if the file was already gone.
+#[allow(dead_code)]
+fn remove_launch_agent_plist_at(plist: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(plist) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Activate or deactivate the agent via `launchctl`. macOS-only; a no-op
+/// on other platforms so callers don't have to cfg-gate.
+#[cfg(target_os = "macos")]
+fn launchctl_bootstrap(plist: &Path) {
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}");
+    // Bootstrap the agent into the GUI session. Ignore errors: if the
+    // agent is already loaded (e.g. from a previous run), bootstrap
+    // returns non-zero but that's fine.
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootstrap", &target])
+        .arg(plist)
+        .output();
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_bootout(plist: &Path) {
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}");
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &target])
+        .arg(plist)
+        .output();
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+fn launchctl_bootstrap(_plist: &Path) {}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+fn launchctl_bootout(_plist: &Path) {}
+
+/// Enable launch-at-login: write the plist and ask launchd to load it.
+#[allow(dead_code)]
+pub(super) fn enable_launch_at_login(executable: &Path) -> std::io::Result<()> {
+    let Some(plist) = launch_agent_plist_path() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "could not resolve home directory for launch agent path",
+        ));
+    };
+    // If an older plist is already loaded, bootout first so bootstrap
+    // picks up any change to the executable path (e.g. user moved the
+    // .app from /Applications to ~/Applications between launches).
+    if plist.exists() {
+        launchctl_bootout(&plist);
+    }
+    write_launch_agent_plist_at(&plist, executable)?;
+    launchctl_bootstrap(&plist);
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(super) fn disable_launch_at_login() -> std::io::Result<()> {
+    let Some(plist) = launch_agent_plist_path() else {
+        return Ok(());
+    };
+    launchctl_bootout(&plist);
+    remove_launch_agent_plist_at(&plist)
+}
+
+/// User-facing query: is launch-at-login currently on?
+#[allow(dead_code)]
+pub(super) fn is_launch_at_login_enabled() -> bool {
+    launch_agent_plist_path()
+        .map(|p| is_launch_at_login_enabled_at(&p))
+        .unwrap_or(false)
+}
+
+/// Spawn a short-lived thread that waits for the dashboard HTTP server to
+/// come up, then opens it in the browser and writes the first-run marker.
+/// The thread gives up after a generous timeout. If the daemon is crashing
+/// repeatedly we'd rather skip first-run and retry next launch than open
+/// a "connection refused" page in the user's browser.
+///
+/// Caller is responsible for gating on `FIRST_RUN_OPENER_SPAWNED` so we
+/// don't start more than one opener per process lifetime.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn spawn_first_run_dashboard_opener(log_dir: &Path) {
+    // Import locally so we use the unqualified `Instant::now()` form. Wall-
+    // clock time is correct here: this is tray/CLI onboarding, not sim-
+    // reachable core code, and the deadline is about what the user's
+    // patience will tolerate. See `crates/core/src/bin/freenet.rs` for
+    // similar bin-side wall-clock usage.
+    use std::time::{Duration, Instant};
+
+    let log_dir = log_dir.to_path_buf();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if dashboard_port_is_listening() {
+                open_url_in_browser(DASHBOARD_URL);
+                if let Some(marker) = first_run_marker_path() {
+                    match mark_first_run_complete_at(&marker) {
+                        Ok(()) => {
+                            log_wrapper_event(&log_dir, "First-run onboarding: dashboard opened")
+                        }
+                        Err(e) => log_wrapper_event(
+                            &log_dir,
+                            &format!("Failed to write first-run marker: {e}"),
+                        ),
+                    }
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        log_wrapper_event(
+            &log_dir,
+            "First-run dashboard open skipped: dashboard never became reachable",
+        );
+    });
 }
 
 /// State for the wrapper backoff state machine.
@@ -419,16 +690,25 @@ fn run_wrapper(version: &str) -> Result<()> {
 
         let (action_tx, action_rx) = mpsc::channel::<TrayAction>();
         let (status_tx, status_rx) = mpsc::channel::<WrapperStatus>();
+        // Wrapper → tray cleanup-done signal. On macOS, `tao::EventLoop::run`
+        // diverges (calls `process::exit` on `ControlFlow::Exit`), so the tray
+        // must block long enough for the wrapper thread to kill its child
+        // daemon before the process exits. The signal fires in the wrapper's
+        // spawn thunk regardless of which code path returned, so every exit
+        // route (Quit, auto-update restart, network-wait abort) is covered.
+        let (cleanup_tx, cleanup_rx) = mpsc::channel::<()>();
         let version_owned = version.to_string();
         let log_dir_clone = log_dir.clone();
 
         // Wrapper loop runs on a background thread
         let loop_handle = std::thread::spawn(move || {
-            run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)))
+            let result = run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)));
+            let _ = cleanup_tx.send(());
+            result
         });
 
         // Tray icon runs on the main thread (platform message pump)
-        super::tray::run_tray_event_loop(action_tx, status_rx, &version_owned);
+        super::tray::run_tray_event_loop(action_tx, status_rx, cleanup_rx, &version_owned);
 
         // Tray loop exited (user clicked Quit) — join the wrapper thread
         match loop_handle.join() {
@@ -633,6 +913,52 @@ fn run_wrapper_loop(
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     wait_for_network_ready(log_dir, None);
+
+    // First-run onboarding: if this user has never launched the tray wrapper
+    // before, open the dashboard in their browser once the HTTP server comes
+    // up, and (on macOS) register the app for launch-at-login so Freenet
+    // behaves like the Windows-installed service — always on, starts at
+    // boot, no extra action required from the user. Runs the dashboard
+    // opener in a background thread so it doesn't delay the main loop.
+    // `FIRST_RUN_OPENER_SPAWNED` ensures at most one opener thread per
+    // wrapper process lifetime so a crash-looping daemon doesn't accumulate
+    // pending openers that would all race to open tabs when the port
+    // eventually binds.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    if let Some(marker) = first_run_marker_path() {
+        if is_first_run_at(&marker)
+            && !FIRST_RUN_OPENER_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            spawn_first_run_dashboard_opener(log_dir);
+
+            // Default Launch at Login to on for new users (macOS only;
+            // Windows installs as a service). The user can uncheck the
+            // menu item to disable. On failure, log and continue — the
+            // user can still enable manually via the menu item.
+            #[cfg(target_os = "macos")]
+            if !is_launch_at_login_enabled() {
+                match std::env::current_exe() {
+                    Ok(exe) => {
+                        if let Err(e) = enable_launch_at_login(&exe) {
+                            log_wrapper_event(
+                                log_dir,
+                                &format!("First-run Launch at Login registration failed: {e}"),
+                            );
+                        } else {
+                            log_wrapper_event(
+                                log_dir,
+                                "First-run: registered Launch at Login agent",
+                            );
+                        }
+                    }
+                    Err(e) => log_wrapper_event(
+                        log_dir,
+                        &format!("First-run Launch at Login: could not resolve current exe: {e}"),
+                    ),
+                }
+            }
+        }
+    }
 
     loop {
         // Notify tray that we're starting
@@ -2529,6 +2855,91 @@ fn service_logs(_error_only: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn dashboard_url_and_addr_stay_in_sync() {
+        // Guard against a future edit that changes DASHBOARD_URL (human-
+        // readable form) without updating DASHBOARD_ADDR (parsed form), or
+        // vice versa. They must agree on host:port.
+        assert!(
+            DASHBOARD_URL.contains(DASHBOARD_ADDR),
+            "DASHBOARD_URL {DASHBOARD_URL:?} must contain DASHBOARD_ADDR {DASHBOARD_ADDR:?}"
+        );
+        DASHBOARD_ADDR
+            .parse::<std::net::SocketAddr>()
+            .expect("DASHBOARD_ADDR must parse as a SocketAddr");
+    }
+
+    #[test]
+    fn launch_agent_plist_contents_escapes_and_embeds_executable_path() {
+        let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/Freenet");
+        let xml = launch_agent_plist_contents(&exe);
+        assert!(xml.starts_with("<?xml version=\"1.0\""));
+        assert!(xml.contains("<key>Label</key>"));
+        assert!(xml.contains("org.freenet.Freenet"));
+        assert!(xml.contains("<key>RunAtLoad</key>"));
+        assert!(xml.contains("<true/>"));
+        assert!(
+            xml.contains("/Applications/Freenet.app/Contents/MacOS/Freenet"),
+            "plist must embed the concrete executable path"
+        );
+    }
+
+    #[test]
+    fn launch_agent_plist_contents_xml_escapes_unusual_paths() {
+        // Unusual but legal filesystem path characters must be XML-escaped,
+        // otherwise launchd fails to parse the plist at load time and the
+        // user's Launch at Login setting silently does nothing.
+        let exe = PathBuf::from("/tmp/has <angles> & \"quotes\"/Freenet");
+        let xml = launch_agent_plist_contents(&exe);
+        assert!(xml.contains("&lt;angles&gt;"));
+        assert!(xml.contains("&amp;"));
+        assert!(xml.contains("&quot;quotes&quot;"));
+        assert!(!xml.contains(" <angles> "));
+        assert!(!xml.contains("& \""));
+    }
+
+    #[test]
+    fn launch_at_login_plist_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plist = tmp
+            .path()
+            .join("nested/Library/LaunchAgents/org.freenet.Freenet.plist");
+        let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/Freenet");
+
+        assert!(!is_launch_at_login_enabled_at(&plist));
+
+        // Writing creates parent dirs and flips the state.
+        write_launch_agent_plist_at(&plist, &exe).unwrap();
+        assert!(is_launch_at_login_enabled_at(&plist));
+        let body = std::fs::read_to_string(&plist).unwrap();
+        assert!(body.contains("/Applications/Freenet.app/Contents/MacOS/Freenet"));
+
+        // Removing flips it back. Idempotent: removing when already gone is Ok.
+        remove_launch_agent_plist_at(&plist).unwrap();
+        assert!(!is_launch_at_login_enabled_at(&plist));
+        remove_launch_agent_plist_at(&plist).unwrap();
+    }
+
+    #[test]
+    fn first_run_marker_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("freenet").join(".first-run-complete");
+
+        // Before any write, it should be a first run.
+        assert!(is_first_run_at(&marker));
+        assert!(!marker.exists());
+
+        // Writing the marker creates parent dirs and flips the state.
+        mark_first_run_complete_at(&marker).unwrap();
+        assert!(marker.exists());
+        assert!(!is_first_run_at(&marker));
+
+        // Re-writing an existing marker must not error (subsequent launches
+        // of a first-run flow that somehow re-ran shouldn't blow up).
+        mark_first_run_complete_at(&marker).unwrap();
+        assert!(!is_first_run_at(&marker));
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
