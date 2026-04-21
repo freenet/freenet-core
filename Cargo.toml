@@ -102,7 +102,7 @@ console-subscriber = "0.5.0"
 # stack-switching feature (undefined symbol wasmtime_continuation_start).
 # Disable default features and re-enable all defaults except stack-switching.
 # TODO: Re-enable default features once upstream fixes the linker regression.
-wasmtime = { version = "43", default-features = false, features = [
+wasmtime = { version = "44", default-features = false, features = [
     "anyhow", "async", "backtrace", "cache", "cranelift",
     "compile-time-builtins", "component-model", "component-model-async",
     "coredump", "debug", "debug-builtins", "demangle", "addr2line",
