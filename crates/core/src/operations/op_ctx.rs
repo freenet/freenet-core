@@ -226,6 +226,50 @@ impl OpCtx {
             .map_err(|_| OpError::NotificationError)
     }
 
+    /// Dispatch `msg` to `target_addr` and return the reply receiver
+    /// without awaiting the response.
+    ///
+    /// Callers that need to interleave the reply await with other work
+    /// (e.g., driving a stream-fork piping path in parallel with the
+    /// downstream request/reply round-trip) use this primitive so the
+    /// `pending_op_results` waiter is installed BEFORE the caller
+    /// kicks off side work. Installing the waiter first closes a race
+    /// where a fast downstream reply would land on the event loop
+    /// before `handle_op_execution` has inserted the callback —
+    /// `try_forward_task_per_tx_reply` would then drop the reply as
+    /// `OpNotPresent`.
+    ///
+    /// Await the returned receiver to get the terminal reply:
+    ///
+    /// ```ignore
+    /// let mut rx = ctx.send_to_and_register_waiter(addr, msg).await?;
+    /// // ... side work that must run in parallel ...
+    /// match rx.recv().await {
+    ///     Some(reply) => /* ... */,
+    ///     None => /* channel closed — treat as infra error */,
+    /// }
+    /// ```
+    pub async fn send_to_and_register_waiter(
+        &mut self,
+        target_addr: SocketAddr,
+        msg: NetMessage,
+    ) -> Result<mpsc::Receiver<NetMessage>, OpError> {
+        debug_assert_eq!(
+            msg.id(),
+            &self.tx,
+            "OpCtx::send_to_and_register_waiter: msg.id must match ctx.tx"
+        );
+
+        let (response_sender, response_receiver) = mpsc::channel::<NetMessage>(1);
+
+        self.op_execution_sender
+            .send((response_sender, msg, Some(target_addr)))
+            .await
+            .map_err(|_| OpError::NotificationError)?;
+
+        Ok(response_receiver)
+    }
+
     async fn send_and_await_inner(
         &mut self,
         msg: NetMessage,

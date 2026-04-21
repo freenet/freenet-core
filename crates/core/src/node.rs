@@ -1050,22 +1050,20 @@ where
                 {
                     if let Some(upstream_addr) = source_addr {
                         if !op_manager.has_put_op(id) {
-                            let (would_upgrade_to_streaming, streaming_total_size) = {
+                            let would_upgrade_to_streaming = {
                                 let payload = put::PutStreamingPayload {
                                     contract: contract.clone(),
                                     related_contracts: related_contracts.clone(),
                                     value: value.clone(),
                                 };
-                                match bincode::serialize(&payload) {
-                                    Ok(bytes) => {
-                                        let upgrade = crate::operations::should_use_streaming(
+                                bincode::serialize(&payload)
+                                    .map(|b| {
+                                        crate::operations::should_use_streaming(
                                             op_manager.streaming_threshold,
-                                            bytes.len(),
-                                        );
-                                        (upgrade, bytes.len() as u64)
-                                    }
-                                    Err(_) => (false, 0),
-                                }
+                                            b.len(),
+                                        )
+                                    })
+                                    .unwrap_or(false)
                             };
                             if !would_upgrade_to_streaming {
                                 if let Err(err) = put::op_ctx_task::start_relay_put(
@@ -1089,13 +1087,15 @@ where
                                 }
                                 return Ok(None);
                             }
-                            // Upgrade-to-streaming path: driver reclaims
-                            // the inbound buffer as a (synthetic) local
-                            // stream — slice B does not yet handle this
-                            // case (no inbound StreamId), so fall through
-                            // to legacy for now. Direct RequestStreaming
-                            // inbounds are handled below.
-                            let _ = streaming_total_size;
+                            // Upgrade-to-streaming path (non-streaming
+                            // inbound `PutMsg::Request` whose serialized
+                            // payload exceeds `streaming_threshold` on
+                            // forward) stays on the legacy path: there
+                            // is no inbound `StreamId` to claim via
+                            // `orphan_stream_registry`, so slice B's
+                            // driver does not apply. Direct
+                            // `RequestStreaming` inbounds are dispatched
+                            // by the arm below.
                         }
                     }
                 }

@@ -1023,10 +1023,12 @@ async fn relay_put_send_response(
 
 // ── Relay streaming PUT driver (#1454 phase 5 follow-up slice B) ────────────
 
-/// Counter: number of times `start_relay_put_streaming` was invoked.
-/// Incremented under test/testing feature only — used by runtime pin
-/// tests to prove the dispatch gate routes fresh inbound streaming
-/// PUT relays through the task-per-tx driver.
+/// Counter: number of times `start_relay_put_streaming` was invoked
+/// (BEFORE the dedup gate). Incremented under test/testing feature
+/// only — used by runtime pin tests to prove the dispatch gate routes
+/// fresh inbound streaming PUT relays through the task-per-tx driver.
+/// Counts both admitted and dedup-rejected calls; pair with
+/// `RELAY_PUT_STREAMING_DEDUP_REJECTS` to reason about admitted ones.
 #[cfg(any(test, feature = "testing"))]
 pub static RELAY_PUT_STREAMING_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1105,16 +1107,14 @@ where
             phase = "relay_put_streaming_dedup_reject",
             "PUT streaming relay (task-per-tx): duplicate Request for in-flight tx, dropping"
         );
-        // Fire-and-forget NotFound upstream so the upstream relay's
-        // send_to_and_await wakes up instead of waiting OPERATION_TTL.
-        // Mirror of slice A dedup-reject; there is no Streaming-specific
-        // NotFound variant so we downgrade to PutMsg::Response.
-        let msg = NetMessage::from(PutMsg::Response {
-            id: incoming_tx,
-            key: contract_key,
-        });
-        let mut ctx = op_manager.op_ctx(incoming_tx);
-        drop(ctx.send_fire_and_forget(upstream_addr, msg).await);
+        // Mirror slice A dedup-reject semantics: silently drop. The
+        // still-in-flight driver owns the upstream reply for this tx;
+        // fabricating a PutMsg::Response here would wake the
+        // upstream's pending_op_results waiter with a false-success
+        // BEFORE the real driver's reply lands. PutMsg has no
+        // NotFound variant — synthesizing a success reply for a
+        // rejected duplicate would tell the upstream that the
+        // contract stored when it did not.
         return Ok(());
     }
 
@@ -1263,13 +1263,11 @@ where
                 error = %err,
                 "PUT streaming relay (task-per-tx): orphan stream claim failed"
             );
-            // Bubble NotFound upstream so its waiter wakes.
-            let msg = NetMessage::from(PutMsg::Response {
-                id: incoming_tx,
-                key: contract_key,
-            });
-            let mut ctx = op_manager.op_ctx(incoming_tx);
-            drop(ctx.send_fire_and_forget(upstream_addr, msg).await);
+            // Silently fail — upstream's waiter falls back to its own
+            // OPERATION_TTL. Same rationale as dedup-reject above:
+            // PutMsg has no NotFound variant, and fabricating a
+            // PutMsg::Response would tell upstream "contract stored"
+            // when in fact no fragments were consumed at all.
             return Err(OpError::OrphanStreamClaimFailed);
         }
     };
@@ -1366,49 +1364,57 @@ where
         None
     };
 
-    // ── Step 4: Kick off metadata dispatch + wait for downstream reply in
-    //           parallel with local stream assembly. ──────────────────────
+    // ── Step 4: Install reply waiter + dispatch metadata, then pipe
+    //           fragments — in that strict order. ────────────────────────
     //
-    // When piping: ctx.send_to_and_await installs the reply waiter AND
-    // dispatches the RequestStreaming metadata to the downstream peer.
-    // pipe_stream then pushes fragments on the forked handle. Both run
-    // before we start assembling the inbound buffer locally so the
-    // downstream can begin piping onward as fragments arrive (matches
-    // legacy piped forwarding).
-    let downstream_reply_fut: Option<_> =
+    // CRITICAL ordering: `send_to_and_register_waiter` enqueues the
+    // metadata onto `op_execution_sender` and returns the reply
+    // receiver AFTER the send lands. The waiter is installed when the
+    // event loop drains that payload (atomic with the outbound
+    // dispatch — see `handle_op_execution` in p2p_protoc.rs). Only
+    // AFTER that do we enqueue `pipe_stream` onto the bridge channel.
+    // If we inverted the order, a fast downstream reply could reach
+    // `handle_pure_network_message_v1` before the waiter installs —
+    // `try_forward_task_per_tx_reply` would drop the reply as
+    // OpNotPresent and the driver would hang until `OPERATION_TTL`.
+    let downstream_reply_rx: Option<(SocketAddr, tokio::sync::mpsc::Receiver<NetMessage>)> =
         if let Some((next_addr, metadata_net, outbound_sid, forked_handle, embedded_metadata)) =
             piping
         {
-            // Fire pipe_stream first so the transport has the outbound
-            // streaming slot wired before metadata fragment #1 lands. Both
-            // calls are quick (they enqueue onto the bridge channel and
-            // return).
-            if let Err(err) = conn_manager
-                .pipe_stream(next_addr, outbound_sid, forked_handle, embedded_metadata)
+            let mut ctx = op_manager.op_ctx(incoming_tx);
+            let rx_opt: Option<tokio::sync::mpsc::Receiver<NetMessage>> = match ctx
+                .send_to_and_register_waiter(next_addr, metadata_net)
                 .await
             {
-                tracing::warn!(
-                    tx = %incoming_tx,
-                    target = %next_addr,
-                    error = %err,
-                    "PUT streaming relay (task-per-tx): pipe_stream failed; will finalize locally"
-                );
-                None
-            } else {
-                let mut ctx = op_manager.op_ctx(incoming_tx);
-                // NOTE: spawn the await so we can interleave with stream
-                // assembly below. The awaited future owns `ctx`.
-                Some((
-                    next_addr,
-                    tokio::spawn(async move {
-                        tokio::time::timeout(
-                            OPERATION_TTL,
-                            ctx.send_to_and_await(next_addr, metadata_net),
-                        )
-                        .await
-                    }),
-                ))
+                Ok(rx) => Some(rx),
+                Err(err) => {
+                    tracing::warn!(
+                        tx = %incoming_tx,
+                        target = %next_addr,
+                        error = %err,
+                        "PUT streaming relay (task-per-tx): metadata register_waiter failed; will finalize locally"
+                    );
+                    None
+                }
+            };
+            if rx_opt.is_some() {
+                if let Err(err) = conn_manager
+                    .pipe_stream(next_addr, outbound_sid, forked_handle, embedded_metadata)
+                    .await
+                {
+                    tracing::warn!(
+                        tx = %incoming_tx,
+                        target = %next_addr,
+                        error = %err,
+                        "PUT streaming relay (task-per-tx): pipe_stream failed after waiter install; \
+                         will wait on downstream reply and bubble what we get"
+                    );
+                    // Waiter is already installed; the downstream may still
+                    // reply to the metadata alone (legacy would also try).
+                    // Keep the receiver so the reply can be consumed.
+                }
             }
+            rx_opt.map(|rx| (next_addr, rx))
         } else {
             None
         };
@@ -1469,33 +1475,23 @@ where
     .await?;
 
     // ── Step 7: Await downstream reply (if piping), then bubble upstream ──
-    if let Some((next_addr, reply_fut)) = downstream_reply_fut {
-        let reply = match reply_fut.await {
-            Ok(Ok(Ok(reply))) => reply,
-            Ok(Ok(Err(err))) => {
+    if let Some((next_addr, mut rx)) = downstream_reply_rx {
+        let reply = match tokio::time::timeout(OPERATION_TTL, rx.recv()).await {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %next_addr,
-                    error = %err,
-                    "PUT streaming relay (task-per-tx): downstream send_to_and_await failed"
+                    "PUT streaming relay (task-per-tx): downstream reply channel closed before reply"
                 );
                 op_manager.release_pending_op_slot(incoming_tx).await;
                 return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
             }
-            Ok(Err(_elapsed)) => {
+            Err(_elapsed) => {
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %next_addr,
                     "PUT streaming relay (task-per-tx): downstream reply timed out"
-                );
-                op_manager.release_pending_op_slot(incoming_tx).await;
-                return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
-            }
-            Err(join_err) => {
-                tracing::warn!(
-                    tx = %incoming_tx,
-                    error = %join_err,
-                    "PUT streaming relay (task-per-tx): reply task join failed"
                 );
                 op_manager.release_pending_op_slot(incoming_tx).await;
                 return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
@@ -1527,7 +1523,7 @@ where
             }
         }
     } else {
-        // No next hop, streaming not appropriate, or pipe_stream failed —
+        // No next hop, streaming not appropriate, or register_waiter failed —
         // finalize locally and bubble Response upstream.
         relay_put_finalize_local(op_manager, incoming_tx, key, merged_value, upstream_addr).await
     }
@@ -1992,21 +1988,30 @@ mod tests {
         );
     }
 
-    /// Pin: dedup-reject must bump counter + fire NotFound upstream.
+    /// Pin: dedup-reject must bump counter + return silently (NO
+    /// fabricated `PutMsg::Response` — doing so would tell the
+    /// upstream's `pending_op_results` waiter that the contract
+    /// stored when the duplicate request stored nothing).
     #[test]
-    fn start_relay_put_streaming_dedup_reject_emits_response() {
+    fn start_relay_put_streaming_dedup_reject_is_silent() {
         let src = include_str!("op_ctx_task.rs");
         let b = relay_slice_b_section(src);
-        let window = &b[b
+        let insert_pos = b
             .find("active_relay_put_txs.insert(incoming_tx)")
-            .expect("dedup anchor not found")..];
+            .expect("dedup anchor not found");
+        // Window: from insert site to the closing of the `if !insert { ... }` branch.
+        let window = &b[insert_pos..];
+        let close_pos = window
+            .find("\n    }\n")
+            .expect("dedup-branch close not found");
+        let branch = &window[..close_pos];
         assert!(
-            window.contains("RELAY_PUT_STREAMING_DEDUP_REJECTS.fetch_add"),
+            branch.contains("RELAY_PUT_STREAMING_DEDUP_REJECTS.fetch_add"),
             "dedup gate must increment RELAY_PUT_STREAMING_DEDUP_REJECTS on rejection"
         );
         assert!(
-            window.contains("send_fire_and_forget"),
-            "dedup-reject must fire-and-forget a NotFound Response upstream"
+            !branch.contains("send_fire_and_forget"),
+            "dedup-reject must NOT fire a fabricated Response (no NotFound variant in PutMsg)"
         );
     }
 
