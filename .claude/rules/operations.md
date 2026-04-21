@@ -39,9 +39,23 @@ paths:
 > relay `PutMsg::Request` to
 > `operations/put/op_ctx_task.rs::start_relay_put` (gated on
 > `source_addr.is_some()` AND `!has_put_op(id)` AND the payload size
-> would not upgrade to streaming on forward); GC speculative retries,
-> client-initiated loopback (`source_addr.is_none()`), and streaming
-> variants still go through legacy. Phase 5 follow-up slice A (PR
+> would not upgrade to streaming on forward); GC speculative retries and
+> client-initiated loopback (`source_addr.is_none()`) still go through
+> legacy. Phase 5 follow-up slice B migrated fresh inbound streaming
+> relay `PutMsg::RequestStreaming` to
+> `operations/put/op_ctx_task.rs::start_relay_put_streaming` (same
+> `source_addr.is_some()` AND `!has_put_op(id)` gate). The streaming
+> driver claims the inbound stream via
+> `orphan_stream_registry().claim_or_wait`, forks the handle for
+> downstream piping via `NetworkBridge::pipe_stream`, assembles
+> locally via the shared `relay_put_store_locally` helper, and
+> bubbles a non-streaming `PutMsg::Response` upstream (mirrors the
+> legacy downgrade at `put.rs:1506`). The dispatch site passes a
+> cloned `NetworkBridge` into the spawn so the driver can call
+> `pipe_stream` without a detour through `OpCtx`. The upgrade-only
+> case — `PutMsg::Request` whose serialized payload would exceed
+> `streaming_threshold` on forward but has no inbound `StreamId` to
+> claim — stays on the legacy path in slice B. Phase 5 follow-up slice A (PR
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
 > `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`
 > (gated on `source_addr.is_some()` AND `!has_subscribe_op(id)`);
