@@ -53,22 +53,29 @@ Each file is a state machine:
 
 Plus task-per-transaction drivers from #1454 Phase 2b onwards:
   subscribe/op_ctx_task.rs → client-initiated SUBSCRIBE driver
+                             + fresh inbound relay SUBSCRIBE driver
+                             (Phase 5 follow-up slice A, `start_relay_subscribe`)
   put/op_ctx_task.rs       → client-initiated PUT driver (Phase 3a)
+                             + fresh inbound non-streaming relay PUT
+                             driver (Phase 5 follow-up slice A, PR #3917,
+                             `start_relay_put`)
   get/op_ctx_task.rs       → client-initiated GET driver (Phase 3b)
                              + fresh inbound relay GET driver (Phase 5,
                              PR #3896, `start_relay_get`)
   update/op_ctx_task.rs    → client-initiated UPDATE driver (Phase 4,
                              fire-and-forget) + fresh inbound non-streaming
                              relay UPDATE drivers (Phase 5 follow-up slice
-                             A: `start_relay_request_update`,
+                             A, PR #3910: `start_relay_request_update`,
                              `start_relay_broadcast_to`)
-    Client + relay GET / UPDATE share the per-node dedup gate
-    (`active_relay_get_txs`, `active_relay_update_txs`) and the
-    `Relay*InflightGuard` RAII pattern. Streaming UPDATE relay variants
+    All four relay drivers share the per-node dedup gate pattern
+    (`active_relay_{get,update,put,subscribe}_txs`) and the
+    `Relay*InflightGuard` RAII. Streaming UPDATE relay variants
     (`RequestUpdateStreaming`, `BroadcastToStreaming`) and the
-    deprecated `Broadcasting` variant remain on the legacy path
-    pending slice B. PUT and SUBSCRIBE relay paths still go through
-    the legacy state machine.
+    deprecated `Broadcasting` wire variant, plus PUT streaming
+    variants, remain on legacy pending slice B. SUBSCRIBE has no
+    streaming variants but renewals, PUT sub-op subscribes, executor
+    auto-subscribe paths, `Unsubscribe`, and `ForwardingAck` all stay
+    on the legacy state machine.
 ```
 
 ## Module Map

@@ -81,7 +81,7 @@ use crate::ring::{PeerKeyLocation, RingError};
 
 use super::{
     InitialRequest, MAX_BREADTH, MAX_RETRIES, SubscribeMsg, SubscribeMsgResult,
-    complete_local_subscription, prepare_initial_request,
+    complete_local_subscription, prepare_initial_request, register_downstream_subscriber,
 };
 
 /// Start a client-initiated subscribe, returning as soon as the task has
@@ -753,6 +753,545 @@ fn deliver_outcome(
     }
 }
 
+// ── Relay SUBSCRIBE driver (#1454 phase 5 follow-up slice A) ─────────────────
+
+/// Counter: relay SUBSCRIBE drivers currently in flight. Decremented in
+/// the RAII guard on driver exit. Diagnostic for `FREENET_MEMORY_STATS`.
+pub static RELAY_SUBSCRIBE_INFLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: total relay SUBSCRIBE drivers ever spawned on this node.
+pub static RELAY_SUBSCRIBE_SPAWNED_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: total relay SUBSCRIBE drivers that exited (any path).
+pub static RELAY_SUBSCRIBE_COMPLETED_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: duplicate inbound `SubscribeMsg::Request` rejected by the
+/// per-node dedup gate (`active_relay_subscribe_txs`).
+pub static RELAY_SUBSCRIBE_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: number of times `start_relay_subscribe` was invoked. Used by
+/// structural pin tests to prove the dispatch gate routes fresh inbound
+/// `SubscribeMsg::Request` through the task-per-tx driver rather than
+/// legacy `handle_op_request`.
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_SUBSCRIBE_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Spawn a relay driver for a fresh inbound `SubscribeMsg::Request`.
+///
+/// Gated by the dispatch site in `node.rs::handle_pure_network_message_v1`
+/// on `source_addr.is_some() && !has_subscribe_op(id)`. The driver owns
+/// local-hit response + single downstream forward + upstream bubble-up
+/// in its task locals — no `SubscribeOp` is stored in
+/// `OpManager.ops.subscribe` for this transaction.
+///
+/// # Slice A
+///
+/// Migrated:
+/// - `SubscribeMsg::Request` relay arm: has-contract check (including the
+///   brief wait-for-in-flight-PUT helper), `register_downstream_subscriber`
+///   on local hit, forward-and-await-Response on next hop, bubble
+///   `SubscribeMsg::Response` back upstream after registering the
+///   requester as a downstream subscriber.
+/// - `ForwardingAck` OMITTED deliberately — same reasoning as GET/PUT/
+///   UPDATE slice A: the ack shares `incoming_tx` with the reply and
+///   would satisfy upstream's capacity-1 `pending_op_results` waiter
+///   before the real `Response`.
+/// - Cross-peer retries OMITTED at the relay — legacy breadth/retry loop
+///   at relay hops is the phase-5 memory-explosion amplifier (see
+///   `project_1454_phase5_memory.md`). Originator-side driver (Phase 2b)
+///   owns cross-peer retry; relay forwards once.
+///
+/// NOT migrated (stays on legacy path):
+/// - `SubscribeMsg::Response` originator arm (Phase 2b driver handles it
+///   via `pending_op_results` bypass).
+/// - `SubscribeMsg::Unsubscribe` and `SubscribeMsg::ForwardingAck` — fire
+///   and forget fast-path, no op state needed.
+/// - Renewals, PUT sub-op subscribes, and intermediate-peer forwarding
+///   through renewal/executor entry points — no `source_addr` or
+///   pre-existing `SubscribeOp` makes them fall through.
+pub(crate) async fn start_relay_subscribe(
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    instance_id: ContractInstanceId,
+    htl: usize,
+    visited: VisitedPeers,
+    is_renewal: bool,
+    upstream_addr: std::net::SocketAddr,
+) -> Result<(), OpError> {
+    #[cfg(any(test, feature = "testing"))]
+    RELAY_SUBSCRIBE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    if !op_manager.active_relay_subscribe_txs.insert(incoming_tx) {
+        RELAY_SUBSCRIBE_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            tx = %incoming_tx,
+            %instance_id,
+            %upstream_addr,
+            phase = "relay_subscribe_dedup_reject",
+            "SUBSCRIBE relay (task-per-tx): duplicate Request for in-flight tx, replying NotFound"
+        );
+        // Emit an immediate `NotFound` back to the rejected upstream so
+        // its `send_to_and_await` returns fast instead of stalling the
+        // full `OPERATION_TTL` (60 s). Silently dropping the duplicate
+        // loses the upstream's retry budget and produces a spurious
+        // "this contract is unreachable" verdict even when the winning
+        // driver fulfills the subscription. The reply uses a fresh
+        // `OpCtx` scoped to `incoming_tx` — the fire-and-forget send
+        // does not touch the winning driver's `pending_op_results`
+        // slot (that slot is keyed on the attempt_tx the WINNER
+        // forwarded downstream, not on `incoming_tx` at this node).
+        let response = NetMessage::from(SubscribeMsg::Response {
+            id: incoming_tx,
+            instance_id,
+            result: SubscribeMsgResult::NotFound,
+        });
+        let mut ctx = op_manager.op_ctx(incoming_tx);
+        if let Err(err) = ctx.send_fire_and_forget(upstream_addr, response).await {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %upstream_addr,
+                error = %err,
+                "SUBSCRIBE relay (task-per-tx): dedup-reject NotFound send failed"
+            );
+        }
+        return Ok(());
+    }
+
+    // Construct the guard IMMEDIATELY after `insert` so a panic in any
+    // intervening work (fmt-allocating logs, future OOM) cannot leak
+    // the dedup-set entry. The guard's Drop clears the entry; without
+    // the guard, there is no TTL and no recovery path. (Review M3,
+    // skeptical #3932.)
+    RELAY_SUBSCRIBE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RELAY_SUBSCRIBE_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = RelaySubscribeInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
+    tracing::debug!(
+        tx = %incoming_tx,
+        %instance_id,
+        htl,
+        %upstream_addr,
+        is_renewal,
+        phase = "relay_subscribe_start",
+        "SUBSCRIBE relay (task-per-tx): spawning driver"
+    );
+
+    GlobalExecutor::spawn(run_relay_subscribe(
+        guard,
+        op_manager,
+        incoming_tx,
+        instance_id,
+        htl,
+        visited,
+        is_renewal,
+        upstream_addr,
+    ));
+    Ok(())
+}
+
+/// RAII guard that decrements `RELAY_SUBSCRIBE_INFLIGHT`, bumps
+/// `RELAY_SUBSCRIBE_COMPLETED_TOTAL`, and removes the driver's
+/// `incoming_tx` from `active_relay_subscribe_txs` on drop.
+struct RelaySubscribeInflightGuard {
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+}
+
+impl Drop for RelaySubscribeInflightGuard {
+    fn drop(&mut self) {
+        self.op_manager
+            .active_relay_subscribe_txs
+            .remove(&self.incoming_tx);
+        RELAY_SUBSCRIBE_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        RELAY_SUBSCRIBE_COMPLETED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_subscribe(
+    guard: RelaySubscribeInflightGuard,
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    instance_id: ContractInstanceId,
+    htl: usize,
+    visited: VisitedPeers,
+    is_renewal: bool,
+    upstream_addr: std::net::SocketAddr,
+) {
+    let _guard = guard;
+
+    if let Err(err) = drive_relay_subscribe(
+        &op_manager,
+        incoming_tx,
+        instance_id,
+        htl,
+        visited,
+        is_renewal,
+        upstream_addr,
+    )
+    .await
+    {
+        tracing::warn!(
+            tx = %incoming_tx,
+            %instance_id,
+            error = %err,
+            phase = "relay_subscribe_error",
+            "SUBSCRIBE relay (task-per-tx): driver returned error"
+        );
+    }
+
+    // Release the pending_op_results slot at driver exit. Same reasoning
+    // as GET/PUT relay — `send_to_and_await` leaves a closed sender in
+    // the slot that only the 60s sweep would reclaim without this
+    // explicit release.
+    tokio::task::yield_now().await;
+    op_manager.release_pending_op_slot(incoming_tx).await;
+}
+
+/// Drive a fresh inbound relay `SubscribeMsg::Request`: fast-path on
+/// local contract hit, otherwise forward to the closest potentially
+/// hosting peer and bubble the Response upstream.
+///
+/// # Intentional signal drop: `PeerHealthTracker` on downstream timeout
+///
+/// The legacy relay Request arm attached a `SubscribeStats {
+/// target_peer, contract_location, request_sent_at }` to the
+/// `AwaitingResponse` state so that downstream timeouts (reported via
+/// `handle_abort`) fed `PeerHealthTracker` and the failure estimator.
+/// The task-per-tx driver DROPS this signal on the relay node: on
+/// `send_to_and_await` timeout we bubble `NotFound` upstream and exit
+/// without touching `PeerHealthTracker`.
+///
+/// This is deliberate for slice A. Cross-peer retry at the relay was
+/// the phase-5 memory-explosion amplifier (see `project_1454_phase5_memory.md`
+/// and PR #3896's fix stack) — the task-per-tx design moves ALL
+/// cross-peer retry to the originator's client-init driver. The
+/// originator's `send_to_and_await` timeout path there is the correct
+/// site for peer-health updates; reporting them at a relay that does
+/// not retry adds no actionable signal and makes the symmetry with
+/// GET/PUT/UPDATE slice A harder to reason about.
+///
+/// Follow-up: if peer-health reporting at the relay becomes necessary
+/// for other reasons (e.g. targeting a specific slow peer cluster
+/// without originating traffic), extend `OpCtx::send_to_and_await`
+/// to emit a stat update on `Err(_elapsed)` via a hook rather than
+/// reintroducing the signal on each relay driver.
+async fn drive_relay_subscribe(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    instance_id: ContractInstanceId,
+    htl: usize,
+    visited: VisitedPeers,
+    is_renewal: bool,
+    upstream_addr: std::net::SocketAddr,
+) -> Result<(), OpError> {
+    tracing::info!(
+        tx = %incoming_tx,
+        %instance_id,
+        htl,
+        %upstream_addr,
+        is_renewal,
+        phase = "relay_subscribe_request",
+        "SUBSCRIBE relay (task-per-tx): processing Request"
+    );
+
+    // ── Step 1: Local-hit fast path (with brief wait-for-in-flight-PUT) ──
+    if let Some(key) = super::wait_for_contract_with_timeout(
+        op_manager,
+        instance_id,
+        super::CONTRACT_WAIT_TIMEOUT_MS,
+    )
+    .await?
+    {
+        // Register the subscribing peer as a downstream subscriber.
+        // The relay task-per-tx path does not know the requester's
+        // `TransportPublicKey` (the legacy path had it because the op
+        // state carried `requester_pub_key`); `register_downstream_subscriber`
+        // falls back to addr-based lookup in that case, which is adequate
+        // for relay hops where the upstream is a direct connection.
+        register_downstream_subscriber(
+            op_manager,
+            &key,
+            upstream_addr,
+            None,
+            Some(upstream_addr),
+            &incoming_tx,
+            " (task-per-tx relay local hit)",
+        )
+        .await;
+
+        tracing::info!(
+            tx = %incoming_tx,
+            contract = %key,
+            is_renewal,
+            phase = "relay_subscribe_local_hit",
+            "SUBSCRIBE relay (task-per-tx): fulfilled locally, sending Response"
+        );
+        return relay_subscribe_send_response(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            SubscribeMsgResult::Subscribed { key },
+            upstream_addr,
+        )
+        .await;
+    }
+
+    // ── Step 2: HTL / candidate selection ────────────────────────────────
+    if htl == 0 {
+        tracing::warn!(
+            tx = %incoming_tx,
+            contract = %instance_id,
+            htl = 0,
+            phase = "relay_subscribe_not_found",
+            "SUBSCRIBE relay (task-per-tx): HTL exhausted"
+        );
+        if let Some(event) = crate::tracing::NetEventLog::subscribe_not_found(
+            &incoming_tx,
+            &op_manager.ring,
+            instance_id,
+            Some(op_manager.ring.max_hops_to_live),
+        ) {
+            op_manager
+                .ring
+                .register_events(either::Either::Left(event))
+                .await;
+        }
+        return relay_subscribe_send_response(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            SubscribeMsgResult::NotFound,
+            upstream_addr,
+        )
+        .await;
+    }
+
+    // Restore hash keys after deserialization + mark ourselves + upstream
+    // as visited so we never loop back.
+    let own_addr = op_manager.ring.connection_manager.peer_addr()?;
+    let mut new_visited = visited.with_transaction(&incoming_tx);
+    new_visited.mark_visited(own_addr);
+    new_visited.mark_visited(upstream_addr);
+
+    let mut candidates =
+        op_manager
+            .ring
+            .k_closest_potentially_hosting(&instance_id, &new_visited, MAX_BREADTH);
+
+    if candidates.is_empty() {
+        tracing::warn!(
+            tx = %incoming_tx,
+            contract = %instance_id,
+            phase = "relay_subscribe_not_found",
+            "SUBSCRIBE relay (task-per-tx): no closer peers to forward"
+        );
+        if let Some(event) = crate::tracing::NetEventLog::subscribe_not_found(
+            &incoming_tx,
+            &op_manager.ring,
+            instance_id,
+            None,
+        ) {
+            op_manager
+                .ring
+                .register_events(either::Either::Left(event))
+                .await;
+        }
+        return relay_subscribe_send_response(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            SubscribeMsgResult::NotFound,
+            upstream_addr,
+        )
+        .await;
+    }
+
+    let next_hop = candidates.remove(0);
+    let next_addr = match next_hop.socket_addr() {
+        Some(addr) => addr,
+        None => {
+            tracing::error!(
+                tx = %incoming_tx,
+                %instance_id,
+                target_pub_key = %next_hop.pub_key(),
+                "SUBSCRIBE relay (task-per-tx): next hop has no socket address"
+            );
+            return relay_subscribe_send_response(
+                op_manager,
+                incoming_tx,
+                instance_id,
+                SubscribeMsgResult::NotFound,
+                upstream_addr,
+            )
+            .await;
+        }
+    };
+    new_visited.mark_visited(next_addr);
+
+    // ── Step 3: Forward downstream, await Response ───────────────────────
+    let new_htl = htl.saturating_sub(1);
+
+    if let Some(event) = crate::tracing::NetEventLog::subscribe_request(
+        &incoming_tx,
+        &op_manager.ring,
+        instance_id,
+        next_hop.clone(),
+        new_htl,
+    ) {
+        op_manager
+            .ring
+            .register_events(either::Either::Left(event))
+            .await;
+    }
+
+    tracing::debug!(
+        tx = %incoming_tx,
+        %instance_id,
+        peer_addr = %next_addr,
+        htl = new_htl,
+        phase = "relay_subscribe_forward",
+        "SUBSCRIBE relay (task-per-tx): forwarding to next hop"
+    );
+
+    let forward = NetMessage::from(SubscribeMsg::Request {
+        id: incoming_tx,
+        instance_id,
+        htl: new_htl,
+        visited: new_visited,
+        is_renewal,
+    });
+
+    let mut ctx = op_manager.op_ctx(incoming_tx);
+    let round_trip =
+        tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(next_addr, forward)).await;
+
+    // Release the pending_op_results slot installed by send_to_and_await.
+    // Mirrors PUT/GET relay — the upstream fire-and-forget reply below
+    // would otherwise leak a slot entry per driver run.
+    op_manager.release_pending_op_slot(incoming_tx).await;
+
+    let reply = match round_trip {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                tx = %incoming_tx,
+                %instance_id,
+                target = %next_addr,
+                error = %err,
+                "SUBSCRIBE relay (task-per-tx): send_to_and_await failed"
+            );
+            return relay_subscribe_send_response(
+                op_manager,
+                incoming_tx,
+                instance_id,
+                SubscribeMsgResult::NotFound,
+                upstream_addr,
+            )
+            .await;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                tx = %incoming_tx,
+                %instance_id,
+                target = %next_addr,
+                timeout_secs = OPERATION_TTL.as_secs(),
+                "SUBSCRIBE relay (task-per-tx): downstream timed out"
+            );
+            return relay_subscribe_send_response(
+                op_manager,
+                incoming_tx,
+                instance_id,
+                SubscribeMsgResult::NotFound,
+                upstream_addr,
+            )
+            .await;
+        }
+    };
+
+    // ── Step 4: Classify reply, register requester if Subscribed, bubble up ──
+    let result = match reply {
+        NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+            result: SubscribeMsgResult::Subscribed { key },
+            ..
+        })) => {
+            // Relay-side Subscribed registration — mirror legacy
+            // subscribe.rs:1690 arm. DO NOT call ring.subscribe /
+            // record_subscription / announce_contract_hosted here; a
+            // relay is not itself a subscriber. See subscribe.rs:1655–1688
+            // for the full reasoning (prevents the #3763 subscription
+            // storm feedback loop).
+            register_downstream_subscriber(
+                op_manager,
+                &key,
+                upstream_addr,
+                None,
+                Some(upstream_addr),
+                &incoming_tx,
+                " (task-per-tx relay registration on Response)",
+            )
+            .await;
+
+            tracing::info!(
+                tx = %incoming_tx,
+                contract = %key,
+                phase = "relay_subscribe_bubble",
+                "SUBSCRIBE relay (task-per-tx): downstream Subscribed; bubbling upstream"
+            );
+            SubscribeMsgResult::Subscribed { key }
+        }
+        NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+            result: SubscribeMsgResult::NotFound,
+            ..
+        })) => {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %instance_id,
+                phase = "relay_subscribe_bubble_not_found",
+                "SUBSCRIBE relay (task-per-tx): downstream NotFound; bubbling upstream"
+            );
+            SubscribeMsgResult::NotFound
+        }
+        other => {
+            tracing::warn!(
+                tx = %incoming_tx,
+                %instance_id,
+                reply_variant = ?std::mem::discriminant(&other),
+                "SUBSCRIBE relay (task-per-tx): unexpected reply variant; treating as NotFound"
+            );
+            SubscribeMsgResult::NotFound
+        }
+    };
+
+    relay_subscribe_send_response(op_manager, incoming_tx, instance_id, result, upstream_addr).await
+}
+
+/// Send `SubscribeMsg::Response` upstream (fire-and-forget: upstream
+/// relay awaits via its own `send_to_and_await`, no reply expected).
+async fn relay_subscribe_send_response(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    instance_id: ContractInstanceId,
+    result: SubscribeMsgResult,
+    upstream_addr: std::net::SocketAddr,
+) -> Result<(), OpError> {
+    let response = NetMessage::from(SubscribeMsg::Response {
+        id: incoming_tx,
+        instance_id,
+        result,
+    });
+    let mut ctx = op_manager.op_ctx(incoming_tx);
+    ctx.send_fire_and_forget(upstream_addr, response).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,5 +1641,257 @@ mod tests {
             .collect();
         assert!(alt_addrs.contains(&p2_addr));
         assert!(alt_addrs.contains(&p3_addr));
+    }
+
+    // ── Relay SUBSCRIBE driver structural pin tests (#1454 phase 5
+    // follow-up slice A). Anchor on the `start_relay_subscribe`
+    // entry-point fn so module-level docs referencing variant names
+    // don't contaminate the scan.
+
+    fn relay_section(src: &str) -> &str {
+        let start = src
+            .find("pub(crate) async fn start_relay_subscribe(")
+            .expect("start_relay_subscribe not found");
+        let end = src
+            .find("\n#[cfg(test)]")
+            .expect("test module marker not found");
+        &src[start..end]
+    }
+
+    /// Pin: dispatch entry must insert into `active_relay_subscribe_txs`
+    /// BEFORE spawning. Same dedup-gate-ordering invariant as GET/PUT/
+    /// UPDATE — without this, duplicate inbound `SubscribeMsg::Request`
+    /// for an in-flight tx would spawn redundant drivers.
+    #[test]
+    fn start_relay_subscribe_checks_dedup_gate() {
+        let src = include_str!("op_ctx_task.rs");
+        let relay = relay_section(src);
+        let window_start = relay
+            .find("pub(crate) async fn start_relay_subscribe(")
+            .expect("entry-point not found");
+        let spawn_pos = relay[window_start..]
+            .find("GlobalExecutor::spawn(run_relay_subscribe(")
+            .expect("spawn site not found")
+            + window_start;
+        let insert_pos = relay[window_start..]
+            .find("active_relay_subscribe_txs.insert(incoming_tx)")
+            .expect("dedup insert site not found")
+            + window_start;
+        assert!(
+            insert_pos < spawn_pos,
+            "active_relay_subscribe_txs.insert MUST happen before GlobalExecutor::spawn"
+        );
+    }
+
+    /// Pin: dedup rejection must emit `SubscribeMsgResult::NotFound`
+    /// back to the rejected upstream. Silently dropping the duplicate
+    /// request stalls the upstream's `send_to_and_await` for the full
+    /// `OPERATION_TTL` (60 s), wasting its retry budget.
+    #[test]
+    fn dedup_rejection_emits_not_found_reply() {
+        let src = include_str!("op_ctx_task.rs");
+        let relay = relay_section(src);
+        let after_insert = relay
+            .split("active_relay_subscribe_txs.insert(incoming_tx)")
+            .nth(1)
+            .expect("dedup insert site not found");
+        // Look at the body between the insert and the early return.
+        let window_end = after_insert
+            .find("return Ok(())")
+            .expect("early return after dedup-reject not found");
+        let window = &after_insert[..window_end];
+        assert!(
+            window.contains("SubscribeMsgResult::NotFound"),
+            "dedup-reject path must emit SubscribeMsgResult::NotFound to \
+             the rejected upstream so its send_to_and_await returns fast"
+        );
+        assert!(
+            window.contains("send_fire_and_forget"),
+            "dedup-reject NotFound must be sent via send_fire_and_forget \
+             (not send_to_and_await — upstream's own waiter owns its slot)"
+        );
+    }
+
+    /// Pin: dedup rejection must bump `RELAY_SUBSCRIBE_DEDUP_REJECTS`.
+    #[test]
+    fn dedup_rejection_increments_counter() {
+        let src = include_str!("op_ctx_task.rs");
+        let relay = relay_section(src);
+        let after_insert = relay
+            .split("active_relay_subscribe_txs.insert(incoming_tx)")
+            .nth(1)
+            .expect("dedup insert site not found");
+        let window = &after_insert[..500.min(after_insert.len())];
+        assert!(
+            window.contains("RELAY_SUBSCRIBE_DEDUP_REJECTS.fetch_add"),
+            "dedup gate must increment RELAY_SUBSCRIBE_DEDUP_REJECTS on rejection"
+        );
+    }
+
+    /// Pin: RAII guard must clear `active_relay_subscribe_txs` + bump
+    /// completion counters on drop.
+    #[test]
+    fn raii_guard_clears_dedup_set_on_drop() {
+        let src = include_str!("op_ctx_task.rs");
+        let drop_start = src
+            .find("impl Drop for RelaySubscribeInflightGuard")
+            .expect("RelaySubscribeInflightGuard Drop impl not found");
+        let drop_body = &src[drop_start..drop_start + 600];
+        assert!(
+            drop_body.contains("active_relay_subscribe_txs"),
+            "RelaySubscribeInflightGuard::drop must remove from active_relay_subscribe_txs"
+        );
+        assert!(
+            drop_body.contains("RELAY_SUBSCRIBE_INFLIGHT.fetch_sub"),
+            "RelaySubscribeInflightGuard::drop must decrement RELAY_SUBSCRIBE_INFLIGHT"
+        );
+        assert!(
+            drop_body.contains("RELAY_SUBSCRIBE_COMPLETED_TOTAL.fetch_add"),
+            "RelaySubscribeInflightGuard::drop must increment RELAY_SUBSCRIBE_COMPLETED_TOTAL"
+        );
+    }
+
+    /// Pin: driver forwards downstream via `send_to_and_await` — SUBSCRIBE
+    /// relay IS req/response. Fire-and-forget here would lose the reply.
+    #[test]
+    fn drive_relay_subscribe_forwards_via_send_to_and_await() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let driver_end = src[driver_start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .expect("driver body end not found")
+            + driver_start;
+        let driver_src = &src[driver_start..driver_end];
+        assert!(
+            driver_src.contains("ctx.send_to_and_await("),
+            "drive_relay_subscribe must forward downstream via send_to_and_await"
+        );
+    }
+
+    /// Pin: relay forward must reuse `incoming_tx`. Minting a fresh tx
+    /// at each hop was the phase-5 GET 3^HTL amplifier.
+    #[test]
+    fn drive_relay_subscribe_reuses_incoming_tx_on_forward() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let driver_end = src[driver_start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .expect("driver body end not found")
+            + driver_start;
+        let driver_src = &src[driver_start..driver_end];
+        let forward_pos = driver_src
+            .find("SubscribeMsg::Request {")
+            .expect("forward SubscribeMsg::Request not found in driver");
+        let forward_window = &driver_src[forward_pos..forward_pos + 400];
+        assert!(
+            forward_window.contains("id: incoming_tx"),
+            "relay forward must reuse incoming_tx"
+        );
+        assert!(
+            !forward_window.contains("Transaction::new::<SubscribeMsg>()"),
+            "relay forward must NOT mint a fresh Transaction"
+        );
+    }
+
+    /// Pin: relay upstream reply MUST use `send_fire_and_forget`.
+    /// Upstream's own `send_to_and_await` owns the reply slot.
+    #[test]
+    fn relay_subscribe_send_response_is_fire_and_forget() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn relay_subscribe_send_response(")
+            .expect("relay_subscribe_send_response not found");
+        let fn_end = src[fn_start..]
+            .find("\n}\n")
+            .expect("function body end not found")
+            + fn_start;
+        let fn_src = &src[fn_start..fn_end];
+        assert!(
+            fn_src.contains("send_fire_and_forget"),
+            "relay_subscribe_send_response must use send_fire_and_forget for the upstream response"
+        );
+    }
+
+    /// Pin: relay driver MUST NOT emit `ForwardingAck`. The ack would
+    /// share `incoming_tx` with the reply and satisfy upstream's
+    /// capacity-1 `pending_op_results` waiter before the real Response.
+    #[test]
+    fn relay_subscribe_does_not_emit_forwarding_ack() {
+        let src = include_str!("op_ctx_task.rs");
+        let relay = relay_section(src);
+        assert!(
+            !relay.contains("SubscribeMsg::ForwardingAck {"),
+            "relay SUBSCRIBE driver must NOT construct a ForwardingAck — \
+             sharing incoming_tx with the reply collides with upstream's waiter"
+        );
+    }
+
+    /// Pin: relay driver MUST call `register_downstream_subscriber`
+    /// on BOTH the local-hit and downstream-Subscribed paths. Missing
+    /// this registration breaks UPDATE propagation to the original
+    /// requester (see subscribe.rs:1655–1688 for full reasoning).
+    #[test]
+    fn relay_subscribe_registers_downstream_on_both_paths() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let driver_end = src[driver_start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .expect("driver body end not found")
+            + driver_start;
+        let driver_src = &src[driver_start..driver_end];
+        let hits = driver_src
+            .matches("register_downstream_subscriber(")
+            .count();
+        assert!(
+            hits >= 2,
+            "driver must call register_downstream_subscriber on BOTH local-hit \
+             and downstream-Subscribed paths (found {hits})"
+        );
+    }
+
+    /// Pin: relay driver MUST NOT call `ring.subscribe`, `record_subscription`,
+    /// or `announce_contract_hosted` on behalf of the relayed Subscribed
+    /// response. A relay is not itself a subscriber; doing so would
+    /// install a lease and trigger #3763 subscription-storm feedback
+    /// loops via the renewal cycle.
+    #[test]
+    fn relay_subscribe_does_not_install_lease_on_relayed_response() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let driver_end = src[driver_start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .expect("driver body end not found")
+            + driver_start;
+        let driver_src = &src[driver_start..driver_end];
+        // Strip line comments so doc strings that mention these call-sites
+        // as negative constraints do not trip the substring scan.
+        let stripped: String = driver_src
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !stripped.contains("ring.subscribe("),
+            "relay driver must NOT call ring.subscribe on relayed response"
+        );
+        assert!(
+            !stripped.contains("complete_subscription_request"),
+            "relay driver must NOT call complete_subscription_request on relayed response"
+        );
+        assert!(
+            !stripped.contains("announce_contract_hosted"),
+            "relay driver must NOT call announce_contract_hosted on relayed response"
+        );
     }
 }

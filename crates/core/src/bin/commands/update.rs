@@ -1413,6 +1413,9 @@ fn acquire_update_lock() -> Result<UpdateLock> {
         .context("Failed to open update lockfile")?;
     // flock with LOCK_EX | LOCK_NB: fail fast instead of queueing. A
     // parallel updater should bail rather than serialize behind us.
+    // SAFETY: `file.as_raw_fd()` returns an owned, open file descriptor
+    // for the duration of this function; libc::flock only consults the
+    // fd and the constant flag bits, with no pointer arguments.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         anyhow::bail!(
@@ -1440,7 +1443,7 @@ struct MountDetachOnDrop {
 #[cfg(target_os = "macos")]
 impl Drop for MountDetachOnDrop {
     fn drop(&mut self) {
-        let _ = hdiutil_detach(&self.mount_point);
+        hdiutil_detach(&self.mount_point).ok();
     }
 }
 
@@ -1521,6 +1524,12 @@ fn spawn_detached_updater(script: &Path, current_app: &Path, staged_app: &Path) 
     // `setpgid(0, 0)` is redundant but cheap belt-and-braces. Without
     // `setsid`, a terminal-parent session delivers SIGHUP to all
     // descendants on close, killing the updater mid-swap (skeptical M5).
+    //
+    // SAFETY: `pre_exec` is unsafe because the closure runs between
+    // fork and exec, where only async-signal-safe functions are
+    // allowed. `libc::setsid` and `libc::setpgid(0, 0)` are both
+    // async-signal-safe per POSIX and do not allocate or touch
+    // user-provided pointers.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {

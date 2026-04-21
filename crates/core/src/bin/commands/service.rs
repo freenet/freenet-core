@@ -489,6 +489,8 @@ fn launch_agent_plist_has_expected_leader(plist: &Path, expected_leader: &str) -
 /// never loaded it" breakages are diagnosable after the fact.
 #[cfg(target_os = "macos")]
 fn launchctl_bootstrap(plist: &Path) {
+    // SAFETY: libc::getuid is always safe; it returns the current user
+    // ID without touching user-provided pointers.
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}");
     match std::process::Command::new("launchctl")
@@ -517,6 +519,8 @@ fn launchctl_bootstrap(plist: &Path) {
 
 #[cfg(target_os = "macos")]
 fn launchctl_bootout(plist: &Path) {
+    // SAFETY: libc::getuid is always safe; it returns the current user
+    // ID without touching user-provided pointers.
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}");
     match std::process::Command::new("launchctl")
@@ -1012,7 +1016,7 @@ fn run_wrapper(version: &str) -> Result<()> {
         // Wrapper loop runs on a background thread
         let loop_handle = std::thread::spawn(move || {
             let result = run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)));
-            let _ = cleanup_tx.send(());
+            cleanup_tx.send(()).ok();
             result
         });
 
