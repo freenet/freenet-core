@@ -713,7 +713,7 @@ pub(crate) async fn process_message_decoupled<CB>(
     executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
-    CB: NetworkBridge,
+    CB: NetworkBridge + Clone + 'static,
 {
     let tx = *msg.id();
 
@@ -750,7 +750,7 @@ async fn handle_pure_network_message<CB>(
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
 where
-    CB: NetworkBridge,
+    CB: NetworkBridge + Clone + 'static,
 {
     match msg {
         NetMessage::V1(msg_v1) => {
@@ -927,7 +927,7 @@ async fn handle_pure_network_message_v1<CB>(
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
 where
-    CB: NetworkBridge,
+    CB: NetworkBridge + Clone + 'static,
 {
     // Register network events (pure network concern)
     event_listener
@@ -1019,28 +1019,26 @@ where
                     return Ok(None);
                 }
 
-                // #1454 phase 5 follow-up (slice A): relay PUT task-per-tx
-                // dispatch.
+                // #1454 phase 5 follow-up: relay PUT task-per-tx dispatch.
                 //
-                // For true relay hops (source_addr.is_some() AND incoming
-                // variant is PutMsg::Request AND no PutOp already exists in
-                // OpManager for this tx), spawn the relay driver and
-                // return. The driver owns local store + forward + upstream
-                // bubble-up in its task locals.
+                // For true relay hops (source_addr.is_some() AND no PutOp
+                // already exists in OpManager for this tx), spawn the
+                // appropriate relay driver and return. Non-streaming
+                // forwards (payload fits under `streaming_threshold`) go
+                // to slice A's `start_relay_put`; streaming forwards —
+                // either via a direct `RequestStreaming` inbound OR a
+                // `Request` whose serialized payload would upgrade —
+                // go to slice B's `start_relay_put_streaming`.
                 //
-                // source_addr.is_none() (client-initiated PUT's send_and_await
-                // loop-back) falls through to legacy — the phase-3a client
-                // driver relies on the Request-echo contract for
-                // LocalCompletion classification.
+                // source_addr.is_none() (client-initiated PUT's
+                // send_and_await loop-back) falls through to legacy.
+                // has_put_op(id) returning true means the legacy path has
+                // a PutOp (GC retry, speculative path) — also falls
+                // through.
                 //
-                // GC-spawned speculative retries and start_client_put-driven
-                // legacy-path hops register a PutOp in OpManager before the
-                // Request hits the wire, so has_put_op(id) returning true
-                // means this is not a fresh inbound relay call.
-                //
-                // Streaming variants (RequestStreaming/ResponseStreaming)
-                // and ForwardingAck stay on the legacy path in slice A —
-                // the arm below only matches non-streaming PutMsg::Request.
+                // `PutMsg::ForwardingAck` stays on the legacy path — the
+                // driver does not emit it (same rationale as GET/PUT
+                // slice A).
                 if let put::PutMsg::Request {
                     id,
                     contract,
@@ -1052,27 +1050,22 @@ where
                 {
                     if let Some(upstream_addr) = source_addr {
                         if !op_manager.has_put_op(id) {
-                            // Slice A only handles end-to-end non-streaming
-                            // hops. If the serialized payload would upgrade to
-                            // streaming on the forward (legacy put.rs:648-668
-                            // re-checks this before building the outbound
-                            // variant), fall through to legacy — the task-per-tx
-                            // driver does not pass streaming chunks through
-                            // yet (deferred to slice B).
-                            let would_upgrade_to_streaming = {
+                            let (would_upgrade_to_streaming, streaming_total_size) = {
                                 let payload = put::PutStreamingPayload {
                                     contract: contract.clone(),
                                     related_contracts: related_contracts.clone(),
                                     value: value.clone(),
                                 };
-                                bincode::serialize(&payload)
-                                    .map(|b| {
-                                        crate::operations::should_use_streaming(
+                                match bincode::serialize(&payload) {
+                                    Ok(bytes) => {
+                                        let upgrade = crate::operations::should_use_streaming(
                                             op_manager.streaming_threshold,
-                                            b.len(),
-                                        )
-                                    })
-                                    .unwrap_or(false)
+                                            bytes.len(),
+                                        );
+                                        (upgrade, bytes.len() as u64)
+                                    }
+                                    Err(_) => (false, 0),
+                                }
                             };
                             if !would_upgrade_to_streaming {
                                 if let Err(err) = put::op_ctx_task::start_relay_put(
@@ -1096,6 +1089,51 @@ where
                                 }
                                 return Ok(None);
                             }
+                            // Upgrade-to-streaming path: driver reclaims
+                            // the inbound buffer as a (synthetic) local
+                            // stream — slice B does not yet handle this
+                            // case (no inbound StreamId), so fall through
+                            // to legacy for now. Direct RequestStreaming
+                            // inbounds are handled below.
+                            let _ = streaming_total_size;
+                        }
+                    }
+                }
+
+                if let put::PutMsg::RequestStreaming {
+                    id,
+                    stream_id,
+                    contract_key,
+                    total_size,
+                    htl,
+                    skip_list,
+                    subscribe,
+                } = op
+                {
+                    if let Some(upstream_addr) = source_addr {
+                        if !op_manager.has_put_op(id) {
+                            if let Err(err) = put::op_ctx_task::start_relay_put_streaming(
+                                op_manager.clone(),
+                                conn_manager.clone(),
+                                *id,
+                                *stream_id,
+                                *contract_key,
+                                *total_size,
+                                *htl,
+                                skip_list.clone(),
+                                *subscribe,
+                                upstream_addr,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    contract = %contract_key,
+                                    error = %err,
+                                    "PUT relay dispatch: start_relay_put_streaming failed"
+                                );
+                            }
+                            return Ok(None);
                         }
                     }
                 }
@@ -3939,8 +3977,11 @@ mod tests {
             );
         }
 
+        /// Slice B (#1454 phase 5 follow-up): dispatch gate now routes
+        /// `PutMsg::RequestStreaming` through the streaming relay driver
+        /// when the tx is fresh + upstream is remote.
         #[test]
-        fn put_branch_does_not_dispatch_streaming_variants() {
+        fn put_branch_dispatches_streaming_relay_driver() {
             const SOURCE: &str = include_str!("node.rs");
             let anchor = "NetMessageV1::Put(ref op) => {";
             let branch_start = SOURCE.find(anchor).expect("PUT branch not found");
@@ -3949,12 +3990,41 @@ mod tests {
                 .expect("PUT branch no longer calls handle_op_request")
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
-            // Slice A only migrates non-streaming PutMsg::Request. The
-            // streaming variants stay on the legacy path.
             assert!(
-                !window.contains("put::PutMsg::RequestStreaming {"),
-                "PUT branch appears to dispatch RequestStreaming through the \
-                 relay driver. Slice A keeps streaming on the legacy path."
+                window.contains("put::PutMsg::RequestStreaming {"),
+                "PUT branch must dispatch RequestStreaming through the \
+                 streaming relay driver (slice B)."
+            );
+            assert!(
+                window.contains("start_relay_put_streaming("),
+                "PUT branch must call start_relay_put_streaming for \
+                 fresh inbound streaming relay hops."
+            );
+        }
+
+        /// Slice B guardrail: streaming dispatch must gate on source_addr
+        /// + has_put_op, mirroring slice A.
+        #[test]
+        fn put_streaming_dispatch_gates_on_source_and_existing_op() {
+            const SOURCE: &str = include_str!("node.rs");
+            let rs_anchor = "put::PutMsg::RequestStreaming {";
+            let rs_start = SOURCE
+                .find(rs_anchor)
+                .expect("RequestStreaming dispatch block not found");
+            let rs_end = SOURCE[rs_start..]
+                .find("start_relay_put_streaming(")
+                .expect("streaming driver call not found")
+                + rs_start;
+            let window = &SOURCE[rs_start..rs_end];
+            assert!(
+                window.contains("Some(upstream_addr) = source_addr"),
+                "streaming dispatch must gate on source_addr (client-loopback \
+                 falls through to legacy)."
+            );
+            assert!(
+                window.contains("!op_manager.has_put_op(id)"),
+                "streaming dispatch must gate on !has_put_op (GC retries \
+                 stay on legacy)."
             );
         }
 

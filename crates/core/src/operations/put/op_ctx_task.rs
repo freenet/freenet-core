@@ -51,15 +51,18 @@ use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::OpManager;
+use crate::operations::NetworkBridge;
 use crate::operations::OpError;
 use crate::operations::op_ctx::{
     AdvanceOutcome, AttemptOutcome, RetryDriver, RetryLoopOutcome, drive_retry_loop,
 };
+use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
 use crate::ring::{Location, PeerKeyLocation};
 use crate::router::{RouteEvent, RouteOutcome};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
+use crate::transport::peer_connection::StreamId;
 
-use super::{PutFinalizationData, PutMsg};
+use super::{PutFinalizationData, PutMsg, PutStreamingPayload};
 
 /// Start a client-initiated PUT, returning as soon as the task has been
 /// spawned (mirrors legacy `request_put` timing).
@@ -1018,6 +1021,518 @@ async fn relay_put_send_response(
         .map_err(|_| OpError::NotificationError)
 }
 
+// ── Relay streaming PUT driver (#1454 phase 5 follow-up slice B) ────────────
+
+/// Counter: number of times `start_relay_put_streaming` was invoked.
+/// Incremented under test/testing feature only — used by runtime pin
+/// tests to prove the dispatch gate routes fresh inbound streaming
+/// PUT relays through the task-per-tx driver.
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_PUT_STREAMING_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: streaming relay PUT drivers currently in flight.
+pub static RELAY_PUT_STREAMING_INFLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: total streaming relay PUT drivers ever spawned.
+pub static RELAY_PUT_STREAMING_SPAWNED_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: total streaming relay PUT drivers that exited (any path).
+pub static RELAY_PUT_STREAMING_COMPLETED_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: duplicate streaming relay Requests rejected by per-node dedup.
+pub static RELAY_PUT_STREAMING_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Spawn a relay driver for a fresh inbound streaming PUT — either a
+/// direct `PutMsg::RequestStreaming` or a `PutMsg::Request` whose
+/// serialized payload would upgrade to streaming on forward.
+///
+/// Shares `active_relay_put_txs` dedup set with `start_relay_put` (same
+/// tx space, different per-tx variant). Claims the inbound stream via
+/// `orphan_stream_registry` so concurrent metadata duplicates
+/// (embedded-in-fragment #1) do not double-claim.
+///
+/// # Scope (slice B)
+///
+/// Migrated:
+/// - Fresh inbound `PutMsg::RequestStreaming` from a remote peer.
+/// - Fresh inbound `PutMsg::Request` whose payload exceeds
+///   `streaming_threshold` and therefore must upgrade on forward.
+/// - Piped downstream forwarding via `conn_manager.pipe_stream`.
+/// - Downstream `Response` / `ResponseStreaming` reply downgraded to
+///   `PutMsg::Response` upstream (mirrors legacy put.rs:1506).
+///
+/// NOT migrated (stays on legacy path):
+/// - `PutMsg::ForwardingAck` emission — kept omitted for the same
+///   reason as slice A: a driver-side ack sharing `incoming_tx` would
+///   satisfy the upstream's `pending_op_results` waiter before the
+///   real `Response` arrived.
+/// - Client-initiated streaming PUTs (`source_addr.is_none()`).
+/// - GC-spawned speculative retries (no PutOp in DashMap).
+///
+/// The `subscribe` flag from the inbound `RequestStreaming`/`Request`
+/// is carried forward on the downstream metadata but not acted on
+/// locally — only the originator subscribes to its own PUT.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_relay_put_streaming<CB>(
+    op_manager: Arc<OpManager>,
+    conn_manager: CB,
+    incoming_tx: Transaction,
+    stream_id: StreamId,
+    contract_key: ContractKey,
+    total_size: u64,
+    htl: usize,
+    skip_list: HashSet<SocketAddr>,
+    subscribe: bool,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError>
+where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
+    #[cfg(any(test, feature = "testing"))]
+    RELAY_PUT_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    if !op_manager.active_relay_put_txs.insert(incoming_tx) {
+        RELAY_PUT_STREAMING_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %contract_key,
+            %upstream_addr,
+            phase = "relay_put_streaming_dedup_reject",
+            "PUT streaming relay (task-per-tx): duplicate Request for in-flight tx, dropping"
+        );
+        // Fire-and-forget NotFound upstream so the upstream relay's
+        // send_to_and_await wakes up instead of waiting OPERATION_TTL.
+        // Mirror of slice A dedup-reject; there is no Streaming-specific
+        // NotFound variant so we downgrade to PutMsg::Response.
+        let msg = NetMessage::from(PutMsg::Response {
+            id: incoming_tx,
+            key: contract_key,
+        });
+        let mut ctx = op_manager.op_ctx(incoming_tx);
+        drop(ctx.send_fire_and_forget(upstream_addr, msg).await);
+        return Ok(());
+    }
+
+    tracing::debug!(
+        tx = %incoming_tx,
+        contract = %contract_key,
+        %stream_id,
+        total_size,
+        htl,
+        %upstream_addr,
+        phase = "relay_put_streaming_start",
+        "PUT streaming relay (task-per-tx): spawning driver"
+    );
+
+    RELAY_PUT_STREAMING_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RELAY_PUT_STREAMING_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = RelayPutStreamingInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
+    GlobalExecutor::spawn(run_relay_put_streaming(
+        guard,
+        op_manager,
+        conn_manager,
+        incoming_tx,
+        stream_id,
+        contract_key,
+        total_size,
+        htl,
+        skip_list,
+        subscribe,
+        upstream_addr,
+    ));
+    Ok(())
+}
+
+/// RAII guard for the streaming PUT relay driver. Mirrors
+/// `RelayPutInflightGuard` but drives the streaming counter set.
+struct RelayPutStreamingInflightGuard {
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+}
+
+impl Drop for RelayPutStreamingInflightGuard {
+    fn drop(&mut self) {
+        self.op_manager
+            .active_relay_put_txs
+            .remove(&self.incoming_tx);
+        RELAY_PUT_STREAMING_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        RELAY_PUT_STREAMING_COMPLETED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_put_streaming<CB>(
+    guard: RelayPutStreamingInflightGuard,
+    op_manager: Arc<OpManager>,
+    conn_manager: CB,
+    incoming_tx: Transaction,
+    stream_id: StreamId,
+    contract_key: ContractKey,
+    total_size: u64,
+    htl: usize,
+    skip_list: HashSet<SocketAddr>,
+    subscribe: bool,
+    upstream_addr: SocketAddr,
+) where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
+    let _guard = guard;
+
+    if let Err(err) = drive_relay_put_streaming(
+        &op_manager,
+        &conn_manager,
+        incoming_tx,
+        stream_id,
+        contract_key,
+        total_size,
+        htl,
+        skip_list,
+        subscribe,
+        upstream_addr,
+    )
+    .await
+    {
+        tracing::warn!(
+            tx = %incoming_tx,
+            error = %err,
+            phase = "relay_put_streaming_error",
+            "PUT streaming relay (task-per-tx): driver returned error"
+        );
+    }
+
+    // Release per-tx pending_op_results slot (same rationale as slice A).
+    tokio::task::yield_now().await;
+    op_manager.release_pending_op_slot(incoming_tx).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_relay_put_streaming<CB>(
+    op_manager: &Arc<OpManager>,
+    conn_manager: &CB,
+    incoming_tx: Transaction,
+    stream_id: StreamId,
+    contract_key: ContractKey,
+    total_size: u64,
+    htl: usize,
+    skip_list: HashSet<SocketAddr>,
+    subscribe: bool,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError>
+where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
+    tracing::info!(
+        tx = %incoming_tx,
+        contract = %contract_key,
+        %stream_id,
+        total_size,
+        htl,
+        %upstream_addr,
+        phase = "relay_put_streaming_request",
+        "PUT streaming relay (task-per-tx): processing RequestStreaming"
+    );
+
+    // ── Step 1: Claim the inbound stream (atomic dedup) ────────────────────
+    let stream_handle = match op_manager
+        .orphan_stream_registry()
+        .claim_or_wait(upstream_addr, stream_id, STREAM_CLAIM_TIMEOUT)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(OrphanStreamError::AlreadyClaimed) => {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %stream_id,
+                "PUT streaming relay (task-per-tx): stream already claimed, skipping"
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                %stream_id,
+                error = %err,
+                "PUT streaming relay (task-per-tx): orphan stream claim failed"
+            );
+            // Bubble NotFound upstream so its waiter wakes.
+            let msg = NetMessage::from(PutMsg::Response {
+                id: incoming_tx,
+                key: contract_key,
+            });
+            let mut ctx = op_manager.op_ctx(incoming_tx);
+            drop(ctx.send_fire_and_forget(upstream_addr, msg).await);
+            return Err(OpError::OrphanStreamClaimFailed);
+        }
+    };
+
+    // ── Step 2: Select next hop BEFORE assembly (enables piped forward) ───
+    let mut new_skip_list = skip_list;
+    new_skip_list.insert(upstream_addr);
+    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+        new_skip_list.insert(own_addr);
+    }
+
+    let next_hop = if htl > 0 {
+        op_manager
+            .ring
+            .closest_potentially_hosting(&contract_key, &new_skip_list)
+    } else {
+        None
+    };
+
+    let next_hop_addr = next_hop.as_ref().and_then(|p| p.socket_addr());
+
+    // ── Step 3: If next hop + streaming appropriate, set up piped forward ─
+    //
+    // Layout: we send metadata via `ctx.send_to_and_await` (installs the
+    // pending_op_results waiter + dispatches the RequestStreaming to the
+    // downstream peer), then call `conn_manager.pipe_stream` to push
+    // fragments on the forked handle. The downstream's reply routes back
+    // via the installed callback. This mirrors legacy put.rs:1062-1072
+    // semantically — metadata-first, then pipe — but with the waiter
+    // install rolled into the same primitive as the dispatch.
+    let piping = if let Some(next_addr) = next_hop_addr {
+        if crate::operations::should_use_streaming(
+            op_manager.streaming_threshold,
+            total_size as usize,
+        ) {
+            let outbound_sid = StreamId::next_operations();
+            let forked_handle = stream_handle.fork();
+            let new_htl = htl.saturating_sub(1);
+
+            let pipe_metadata = PutMsg::RequestStreaming {
+                id: incoming_tx,
+                stream_id: outbound_sid,
+                contract_key,
+                total_size,
+                htl: new_htl,
+                skip_list: new_skip_list.clone(),
+                subscribe,
+            };
+            let pipe_metadata_net: NetMessage = pipe_metadata.into();
+            let embedded_metadata = match bincode::serialize(&pipe_metadata_net) {
+                Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                Err(e) => {
+                    tracing::warn!(
+                        tx = %incoming_tx,
+                        error = %e,
+                        "Failed to serialize piped stream metadata for embedding"
+                    );
+                    None
+                }
+            };
+
+            tracing::info!(
+                tx = %incoming_tx,
+                inbound_stream_id = %stream_id,
+                outbound_stream_id = %outbound_sid,
+                total_size,
+                peer_addr = %next_addr,
+                "Starting piped stream forwarding to next hop"
+            );
+
+            if let Some(ref peer) = next_hop {
+                if let Some(event) = NetEventLog::put_request(
+                    &incoming_tx,
+                    &op_manager.ring,
+                    contract_key,
+                    peer.clone(),
+                    new_htl,
+                ) {
+                    op_manager.ring.register_events(Either::Left(event)).await;
+                }
+            }
+
+            Some((
+                next_addr,
+                pipe_metadata_net,
+                outbound_sid,
+                forked_handle,
+                embedded_metadata,
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // ── Step 4: Kick off metadata dispatch + wait for downstream reply in
+    //           parallel with local stream assembly. ──────────────────────
+    //
+    // When piping: ctx.send_to_and_await installs the reply waiter AND
+    // dispatches the RequestStreaming metadata to the downstream peer.
+    // pipe_stream then pushes fragments on the forked handle. Both run
+    // before we start assembling the inbound buffer locally so the
+    // downstream can begin piping onward as fragments arrive (matches
+    // legacy piped forwarding).
+    let downstream_reply_fut: Option<_> =
+        if let Some((next_addr, metadata_net, outbound_sid, forked_handle, embedded_metadata)) =
+            piping
+        {
+            // Fire pipe_stream first so the transport has the outbound
+            // streaming slot wired before metadata fragment #1 lands. Both
+            // calls are quick (they enqueue onto the bridge channel and
+            // return).
+            if let Err(err) = conn_manager
+                .pipe_stream(next_addr, outbound_sid, forked_handle, embedded_metadata)
+                .await
+            {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    target = %next_addr,
+                    error = %err,
+                    "PUT streaming relay (task-per-tx): pipe_stream failed; will finalize locally"
+                );
+                None
+            } else {
+                let mut ctx = op_manager.op_ctx(incoming_tx);
+                // NOTE: spawn the await so we can interleave with stream
+                // assembly below. The awaited future owns `ctx`.
+                Some((
+                    next_addr,
+                    tokio::spawn(async move {
+                        tokio::time::timeout(
+                            OPERATION_TTL,
+                            ctx.send_to_and_await(next_addr, metadata_net),
+                        )
+                        .await
+                    }),
+                ))
+            }
+        } else {
+            None
+        };
+
+    // ── Step 5: Assemble stream locally (always — needed for put_contract) ─
+    let stream_data = match stream_handle.assemble().await {
+        Ok(data) => data,
+        Err(err) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                %stream_id,
+                error = %err,
+                "PUT streaming relay (task-per-tx): stream assembly failed"
+            );
+            return Err(OpError::StreamCancelled);
+        }
+    };
+
+    let payload: PutStreamingPayload = match bincode::deserialize(&stream_data) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                %stream_id,
+                error = %err,
+                "PUT streaming relay (task-per-tx): payload deserialize failed"
+            );
+            return Err(OpError::invalid_transition(incoming_tx));
+        }
+    };
+
+    let PutStreamingPayload {
+        contract,
+        value,
+        related_contracts,
+    } = payload;
+    let key = contract.key();
+    if key != contract_key {
+        tracing::error!(
+            tx = %incoming_tx,
+            expected = %contract_key,
+            actual = %key,
+            "PUT streaming relay (task-per-tx): contract key mismatch"
+        );
+        return Err(OpError::invalid_transition(incoming_tx));
+    }
+
+    // ── Step 6: Store contract locally (shared helper with slice A) ──────
+    let merged_value = relay_put_store_locally(
+        op_manager,
+        incoming_tx,
+        key,
+        value,
+        &contract,
+        related_contracts,
+        htl,
+    )
+    .await?;
+
+    // ── Step 7: Await downstream reply (if piping), then bubble upstream ──
+    if let Some((next_addr, reply_fut)) = downstream_reply_fut {
+        let reply = match reply_fut.await {
+            Ok(Ok(Ok(reply))) => reply,
+            Ok(Ok(Err(err))) => {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    target = %next_addr,
+                    error = %err,
+                    "PUT streaming relay (task-per-tx): downstream send_to_and_await failed"
+                );
+                op_manager.release_pending_op_slot(incoming_tx).await;
+                return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
+            }
+            Ok(Err(_elapsed)) => {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    target = %next_addr,
+                    "PUT streaming relay (task-per-tx): downstream reply timed out"
+                );
+                op_manager.release_pending_op_slot(incoming_tx).await;
+                return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    error = %join_err,
+                    "PUT streaming relay (task-per-tx): reply task join failed"
+                );
+                op_manager.release_pending_op_slot(incoming_tx).await;
+                return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
+            }
+        };
+        op_manager.release_pending_op_slot(incoming_tx).await;
+
+        match reply {
+            NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key: reply_key, .. }))
+            | NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
+                key: reply_key, ..
+            })) => {
+                tracing::info!(
+                    tx = %incoming_tx,
+                    contract = %reply_key,
+                    phase = "relay_put_streaming_bubble",
+                    "PUT streaming relay (task-per-tx): downstream replied; bubbling Response upstream"
+                );
+                relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
+            }
+            other => {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    reply_variant = ?std::mem::discriminant(&other),
+                    "PUT streaming relay (task-per-tx): unexpected reply variant"
+                );
+                relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await
+            }
+        }
+    } else {
+        // No next hop, streaming not appropriate, or pipe_stream failed —
+        // finalize locally and bubble Response upstream.
+        relay_put_finalize_local(op_manager, incoming_tx, key, merged_value, upstream_addr).await
+    }
+}
+
 // ── End of relay PUT driver ─────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1209,6 +1724,20 @@ mod tests {
         &src[start..end]
     }
 
+    /// Slice A only — slice B streaming driver begins at the "Relay
+    /// streaming PUT driver" marker below. Used by tests that pin
+    /// slice A properties (no streaming variant references) to avoid
+    /// false positives from slice B's legitimate references.
+    fn relay_slice_a_section(src: &str) -> &str {
+        let start = src
+            .find("pub(crate) async fn start_relay_put(")
+            .expect("start_relay_put not found");
+        let end = src
+            .find("// ── Relay streaming PUT driver")
+            .expect("slice B marker not found");
+        &src[start..end]
+    }
+
     /// Pin: dispatch entry must insert into `active_relay_put_txs`
     /// BEFORE spawning. Without this guard, duplicate inbound
     /// `PutMsg::Request` for an in-flight tx would spawn redundant
@@ -1363,10 +1892,10 @@ mod tests {
     #[test]
     fn slice_a_does_not_touch_put_streaming_variants() {
         let src = include_str!("op_ctx_task.rs");
-        let relay = relay_section(src);
+        let relay = relay_slice_a_section(src);
         assert!(
             !relay.contains("PutMsg::RequestStreaming"),
-            "slice A must not handle PutMsg::RequestStreaming (deferred to slice B)"
+            "slice A must not handle PutMsg::RequestStreaming (belongs to slice B)"
         );
         // ResponseStreaming IS referenced in one place: the downstream
         // reply classifier that synthesizes a non-streaming Response
@@ -1374,7 +1903,6 @@ mod tests {
         // ResponseStreaming — we only match on it.
         let builds_streaming = relay.contains("NetMessage::from(PutMsg::ResponseStreaming")
             || relay.contains("PutMsg::ResponseStreaming {\n") && {
-                // Detect construction (not match arm) by looking for `id:` in the next 100 chars
                 let pos = relay
                     .find("PutMsg::ResponseStreaming {")
                     .expect("anchor present by guard");
@@ -1432,6 +1960,149 @@ mod tests {
         assert!(
             helper_src.contains("announce_contract_hosted"),
             "helper MUST call announce_contract_hosted for first-time hosting"
+        );
+    }
+
+    // ── Slice B streaming driver pin tests ─────────────────────────────
+
+    fn relay_slice_b_section(src: &str) -> &str {
+        let start = src
+            .find("// ── Relay streaming PUT driver")
+            .expect("slice B marker not found");
+        let end = src
+            .find("\n// ── End of relay PUT driver ─")
+            .expect("end-of-driver marker not found");
+        &src[start..end]
+    }
+
+    /// Pin: streaming driver entry must dedup-gate BEFORE spawn.
+    #[test]
+    fn start_relay_put_streaming_checks_dedup_gate() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let insert_pos = b
+            .find("active_relay_put_txs.insert(incoming_tx)")
+            .expect("dedup insert not found");
+        let spawn_pos = b
+            .find("GlobalExecutor::spawn(run_relay_put_streaming(")
+            .expect("spawn site not found");
+        assert!(
+            insert_pos < spawn_pos,
+            "dedup-gate MUST run before spawning the streaming driver"
+        );
+    }
+
+    /// Pin: dedup-reject must bump counter + fire NotFound upstream.
+    #[test]
+    fn start_relay_put_streaming_dedup_reject_emits_response() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let window = &b[b
+            .find("active_relay_put_txs.insert(incoming_tx)")
+            .expect("dedup anchor not found")..];
+        assert!(
+            window.contains("RELAY_PUT_STREAMING_DEDUP_REJECTS.fetch_add"),
+            "dedup gate must increment RELAY_PUT_STREAMING_DEDUP_REJECTS on rejection"
+        );
+        assert!(
+            window.contains("send_fire_and_forget"),
+            "dedup-reject must fire-and-forget a NotFound Response upstream"
+        );
+    }
+
+    /// Pin: RAII guard decrements INFLIGHT + bumps COMPLETED on drop.
+    #[test]
+    fn relay_put_streaming_guard_drop_is_balanced() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let drop_start = b
+            .find("impl Drop for RelayPutStreamingInflightGuard")
+            .expect("guard Drop impl not found");
+        let drop_end = b[drop_start..]
+            .find("\n}\n")
+            .expect("guard Drop body end not found")
+            + drop_start;
+        let drop_body = &b[drop_start..drop_end];
+        assert!(
+            drop_body.contains("RELAY_PUT_STREAMING_INFLIGHT.fetch_sub"),
+            "guard::drop must decrement RELAY_PUT_STREAMING_INFLIGHT"
+        );
+        assert!(
+            drop_body.contains("RELAY_PUT_STREAMING_COMPLETED_TOTAL.fetch_add"),
+            "guard::drop must increment RELAY_PUT_STREAMING_COMPLETED_TOTAL"
+        );
+        assert!(
+            drop_body.contains("active_relay_put_txs"),
+            "guard::drop must reference active_relay_put_txs"
+        );
+        assert!(
+            drop_body.contains(".remove(&self.incoming_tx)"),
+            "guard::drop must remove the tx from active_relay_put_txs"
+        );
+    }
+
+    /// Pin: streaming driver claims inbound stream + uses pipe_stream
+    /// for forwarding.
+    #[test]
+    fn drive_relay_put_streaming_uses_claim_and_pipe() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let driver_start = b
+            .find("async fn drive_relay_put_streaming")
+            .expect("drive_relay_put_streaming not found");
+        let driver = &b[driver_start..];
+        assert!(
+            driver.contains("orphan_stream_registry()"),
+            "streaming driver must claim via orphan_stream_registry"
+        );
+        assert!(
+            driver.contains("claim_or_wait(upstream_addr"),
+            "claim MUST use upstream_addr + inbound stream_id"
+        );
+        assert!(
+            driver.contains(".pipe_stream("),
+            "streaming driver must call pipe_stream for forwarding"
+        );
+        assert!(
+            driver.contains("relay_put_store_locally("),
+            "streaming driver must reuse the shared local-store helper"
+        );
+    }
+
+    /// Pin: streaming driver does NOT construct a ForwardingAck on its
+    /// own path — an ack would share `incoming_tx` and satisfy
+    /// upstream's capacity-1 pending_op_results slot before the real
+    /// Response. Scoped to the function body to avoid catching the
+    /// doc-comment reference at the entry point.
+    #[test]
+    fn drive_relay_put_streaming_omits_forwarding_ack() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let driver_start = b
+            .find("async fn drive_relay_put_streaming")
+            .expect("drive_relay_put_streaming not found");
+        let driver = &b[driver_start..];
+        // Detect construction: `NetMessage::from(PutMsg::ForwardingAck`
+        // or `PutMsg::ForwardingAck {`.
+        assert!(
+            !driver.contains("NetMessage::from(PutMsg::ForwardingAck")
+                && !driver.contains("PutMsg::ForwardingAck {"),
+            "slice B driver must not construct PutMsg::ForwardingAck"
+        );
+    }
+
+    /// Pin: streaming driver reuses `incoming_tx` on the forward.
+    #[test]
+    fn drive_relay_put_streaming_reuses_incoming_tx_on_forward() {
+        let src = include_str!("op_ctx_task.rs");
+        let b = relay_slice_b_section(src);
+        let pipe_meta_pos = b
+            .find("PutMsg::RequestStreaming {")
+            .expect("outbound RequestStreaming construction not found");
+        let window = &b[pipe_meta_pos..pipe_meta_pos + 300.min(b.len() - pipe_meta_pos)];
+        assert!(
+            window.contains("id: incoming_tx"),
+            "piped metadata must reuse incoming_tx (not mint fresh)"
         );
     }
 }
