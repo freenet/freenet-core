@@ -28,6 +28,7 @@ async fn web_subpages_v2(
     Path((key, last_path)): Path<(String, String)>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
+    Extension(rs): Extension<HttpClientApiRequest>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    web_subpages(key, last_path, ApiVersion::V2, query, headers).await
+    web_subpages(key, last_path, ApiVersion::V2, query, headers, rs).await
 }

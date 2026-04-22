@@ -9,9 +9,13 @@
 //! are opened via the `open_url` shell bridge message to avoid CORS issues. Sandbox content
 //! is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock},
+};
 
 use axum::response::{Html, IntoResponse};
+use dashmap::DashMap;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
@@ -28,6 +32,29 @@ use super::{
 };
 use tracing::{debug, instrument};
 
+/// Per-contract lock serializing mutations of the webapp cache directory.
+///
+/// A typical first-time page load of a contract fans out several concurrent
+/// subresource requests (`<script>`, `<link>`, `<img>`). Before this lock
+/// existed, each one independently observed the cache as cold and raced
+/// through `remove_dir_all` + `create_dir_all` + `unpack` against the same
+/// target directory, corrupting the unpacked tree and sometimes leaving a
+/// valid-looking hash file pointing at a partially-written archive.
+///
+/// Entries are retained for the lifetime of the process. Each lock is a
+/// three-word `tokio::sync::Mutex`, so the memory overhead for a node that
+/// has seen N distinct web contracts is trivially bounded.
+static CONTRACT_CACHE_LOCKS: LazyLock<DashMap<ContractInstanceId, Arc<tokio::sync::Mutex<()>>>> =
+    LazyLock::new(DashMap::new);
+
+async fn acquire_cache_lock(instance_id: &ContractInstanceId) -> tokio::sync::OwnedMutexGuard<()> {
+    let mutex = CONTRACT_CACHE_LOCKS
+        .entry(*instance_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    mutex.lock_owned().await
+}
+
 #[instrument(level = "debug", skip(request_sender))]
 pub(super) async fn contract_home(
     key: String,
@@ -36,23 +63,63 @@ pub(super) async fn contract_home(
     api_version: ApiVersion,
     query_string: Option<String>,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
-    debug!(
-        "contract_home: Converting string key to ContractInstanceId: {}",
-        key
-    );
     let instance_id = ContractInstanceId::from_bytes(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
         WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
         }
     })?;
-    debug!("contract_home: Successfully parsed contract instance id");
+
+    // Register the assigned token with origin_contracts so subsequent
+    // WebSocket connections from the shell iframe authenticate against
+    // the correct contract identity, then fetch + unpack the contract.
+    ensure_contract_cached(
+        instance_id,
+        &request_sender,
+        Some((assigned_token.clone(), instance_id)),
+    )
+    .await?;
+
+    // Return the shell page instead of the contract HTML directly.
+    // The shell page wraps the contract in a sandboxed iframe for
+    // origin isolation (GHSA-824h-7x5x-wfmf).
+    match shell_page(&assigned_token, &key, api_version, query_string) {
+        Ok(b) => Ok(b.into_response()),
+        Err(err) => {
+            tracing::error!("Failed to generate shell page: {err}");
+            Err(WebSocketApiError::NodeError {
+                error_cause: format!("Failed to generate shell page: {err}"),
+            })
+        }
+    }
+}
+
+/// Fetches the contract from the network (or local storage) and unpacks
+/// it into the webapp cache directory if the state hash differs from what
+/// is already cached. Returns once the cache is guaranteed to be populated
+/// for `instance_id`.
+///
+/// The optional `assigned_token` is forwarded to `ClientConnection::NewConnection`
+/// so the caller can bind a freshly generated auth token to the instance for
+/// later WebSocket authentication. Subresource fetches (images, JS, CSS) pass
+/// `None` — they only need the cache side-effect.
+///
+/// # Why subresource requests need this
+///
+/// `variable_content` used to serve directly from the cache. If a browser
+/// requested `/v1/contract/web/<KEY>/image.jpg` before any load of the
+/// contract root (e.g. cross-contract `<img src>` from a different webapp),
+/// the cache directory did not exist and the request 404'd. See #3940.
+async fn ensure_contract_cached(
+    instance_id: ContractInstanceId,
+    request_sender: &HttpClientApiRequest,
+    assigned_token: Option<(AuthToken, ContractInstanceId)>,
+) -> Result<(), WebSocketApiError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
-    debug!("contract_home: Sending NewConnection request");
     request_sender
         .send(ClientConnection::NewConnection {
             callbacks: response_sender,
-            assigned_token: Some((assigned_token.clone(), instance_id)),
+            assigned_token,
         })
         .await
         .map_err(|err| WebSocketApiError::NodeError {
@@ -65,7 +132,6 @@ pub(super) async fn contract_home(
             error_cause: "Couldn't register new client in the node".into(),
         });
     };
-    debug!("contract_home: Sending GET request for contract");
     request_sender
         .send(ClientConnection::Request {
             client_id,
@@ -86,112 +152,17 @@ pub(super) async fn contract_home(
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
-    debug!("contract_home: Waiting for GET response");
+
     let recv_result =
         tokio::time::timeout(std::time::Duration::from_secs(30), response_recv.recv()).await;
-    let response = match recv_result {
-        Err(_) => {
-            return Err(WebSocketApiError::NodeError {
-                error_cause: "GET request timed out after 30s".into(),
-            });
-        }
-        Ok(None) => {
-            return Err(WebSocketApiError::NodeError {
-                error_cause: "GET response channel closed (node may be shutting down)".into(),
-            });
-        }
-        Ok(Some(HostCallbackResult::Result {
-            result:
-                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                    contract,
-                    state,
-                    ..
-                })),
-            ..
-        })) => match contract {
-            Some(contract) => {
-                let contract_key = contract.key();
-                let path = contract_web_path(contract_key.id());
-                let state_bytes = state.as_ref();
-                let current_hash = hash_state(state_bytes);
-                let hash_path = state_hash_path(contract_key.id());
+    let outcome = handle_get_response(instance_id, recv_result).await;
 
-                let needs_update = match tokio::fs::read(&hash_path).await {
-                    Ok(stored_hash_bytes) if stored_hash_bytes.len() == 8 => {
-                        let stored_hash = u64::from_be_bytes(stored_hash_bytes.try_into().unwrap());
-                        stored_hash != current_hash
-                    }
-                    _ => true,
-                };
-
-                if needs_update {
-                    debug!("State changed or not cached, unpacking webapp");
-                    let state = State::from(state_bytes);
-
-                    fn err(
-                        err: WebContractError,
-                        contract: &ContractContainer,
-                    ) -> WebSocketApiError {
-                        let key = contract.key();
-                        tracing::error!("{err}");
-                        WebSocketApiError::InvalidParam {
-                            error_cause: format!("failed unpacking contract: {key}"),
-                        }
-                    }
-
-                    // Clear existing cache if any; may not exist yet
-                    let _cleanup = tokio::fs::remove_dir_all(&path).await;
-                    tokio::fs::create_dir_all(&path).await.map_err(|e| {
-                        WebSocketApiError::NodeError {
-                            error_cause: format!("Failed to create cache dir: {e}"),
-                        }
-                    })?;
-
-                    let mut web =
-                        WebApp::try_from(state.as_ref()).map_err(|e| err(e, &contract))?;
-                    web.unpack(&path).map_err(|e| err(e, &contract))?;
-
-                    // Store new hash
-                    tokio::fs::write(&hash_path, current_hash.to_be_bytes())
-                        .await
-                        .map_err(|e| WebSocketApiError::NodeError {
-                            error_cause: format!("Failed to write state hash: {e}"),
-                        })?;
-                }
-
-                // Return the shell page instead of the contract HTML directly.
-                // The shell page wraps the contract in a sandboxed iframe for
-                // origin isolation (GHSA-824h-7x5x-wfmf).
-                match shell_page(&assigned_token, &key, api_version, query_string) {
-                    Ok(b) => b.into_response(),
-                    Err(err) => {
-                        tracing::error!("Failed to generate shell page: {err}");
-                        return Err(WebSocketApiError::NodeError {
-                            error_cause: format!("Failed to generate shell page: {err}"),
-                        });
-                    }
-                }
-            }
-            None => {
-                return Err(WebSocketApiError::MissingContract { instance_id });
-            }
-        },
-        Ok(Some(HostCallbackResult::Result {
-            result: Err(err), ..
-        })) => {
-            tracing::error!("error getting contract `{key}`: {err}");
-            return Err(WebSocketApiError::AxumError {
-                error: err.kind().clone(),
-            });
-        }
-        Ok(other) => {
-            tracing::error!("Unexpected node response: {other:?}");
-            return Err(WebSocketApiError::NodeError {
-                error_cause: format!("Unexpected response from node: {other:?}"),
-            });
-        }
-    };
-    request_sender
+    // Disconnect regardless of whether the fetch succeeded, so the node
+    // can reap the transient client registration. A send failure means the
+    // node is gone, which is already the important signal — we don't fail
+    // the user's request over it, but we log at warn! so an operator sees
+    // the trail if WebSocket connections subsequently hang.
+    if let Err(err) = request_sender
         .send(ClientConnection::Request {
             client_id,
             req: Box::new(ClientRequest::Disconnect { cause: None }),
@@ -200,17 +171,136 @@ pub(super) async fn contract_home(
             api_version: Default::default(),
         })
         .await
-        .map_err(|err| WebSocketApiError::NodeError {
-            error_cause: format!("{err}"),
-        })?;
-    Ok(response)
+    {
+        tracing::warn!("ensure_contract_cached: disconnect send failed: {err}");
+    }
+
+    outcome
 }
 
-#[instrument(level = "debug")]
+/// Processes the GetResponse from the node, unpacking into the cache if needed.
+async fn handle_get_response(
+    instance_id: ContractInstanceId,
+    recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed>,
+) -> Result<(), WebSocketApiError> {
+    match recv_result {
+        Err(_) => Err(WebSocketApiError::NodeError {
+            error_cause: "GET request timed out after 30s".into(),
+        }),
+        Ok(None) => Err(WebSocketApiError::NodeError {
+            error_cause: "GET response channel closed (node may be shutting down)".into(),
+        }),
+        Ok(Some(HostCallbackResult::Result {
+            result:
+                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    contract: Some(contract),
+                    state,
+                    ..
+                })),
+            ..
+        })) => unpack_if_stale(&contract, state.as_ref()).await,
+        Ok(Some(HostCallbackResult::Result {
+            result:
+                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    contract: None, ..
+                })),
+            ..
+        })) => Err(WebSocketApiError::MissingContract { instance_id }),
+        Ok(Some(HostCallbackResult::Result {
+            result: Err(err), ..
+        })) => {
+            tracing::error!("error getting contract `{}`: {err}", instance_id.encode());
+            Err(WebSocketApiError::AxumError {
+                error: err.kind().clone(),
+            })
+        }
+        Ok(other) => {
+            tracing::error!("Unexpected node response: {other:?}");
+            Err(WebSocketApiError::NodeError {
+                error_cause: format!("Unexpected response from node: {other:?}"),
+            })
+        }
+    }
+}
+
+/// Unpacks the contract's web archive into the cache directory if the stored
+/// hash differs from the current state hash, or if there is no prior hash on
+/// disk. The presence of the hash file is what `variable_content` uses as the
+/// "cache is populated" signal — it is written last to make cache staleness
+/// detection atomic.
+///
+/// Takes `CONTRACT_CACHE_LOCKS[instance_id]` for the duration of the mutation
+/// so concurrent unpacks for the same contract serialize instead of racing
+/// on `remove_dir_all` + `create_dir_all` + `unpack`. The hash is re-read
+/// inside the lock — if a prior holder already wrote the current state, the
+/// follower exits without repeating the work.
+async fn unpack_if_stale(
+    contract: &ContractContainer,
+    state_bytes: &[u8],
+) -> Result<(), WebSocketApiError> {
+    let contract_key = contract.key();
+    let instance_id = *contract_key.id();
+    let path = contract_web_path(&instance_id);
+    let current_hash = hash_state(state_bytes);
+    let hash_path = state_hash_path(&instance_id);
+
+    let _guard = acquire_cache_lock(&instance_id).await;
+
+    // Re-read the hash under the lock. Concurrent `ensure_contract_cached`
+    // callers for the same cold contract each arrive here with their own
+    // GetResponse; the first to acquire the lock unpacks and writes the
+    // hash, and any that queued behind it see the fresh hash here and
+    // return without touching the filesystem again.
+    let needs_update = match tokio::fs::read(&hash_path).await {
+        Ok(stored_hash_bytes) if stored_hash_bytes.len() == 8 => {
+            let stored_hash = u64::from_be_bytes(stored_hash_bytes.try_into().unwrap());
+            stored_hash != current_hash
+        }
+        _ => true,
+    };
+    if !needs_update {
+        return Ok(());
+    }
+
+    debug!("State changed or not cached, unpacking webapp");
+    let state = State::from(state_bytes);
+
+    fn err(err: WebContractError, contract: &ContractContainer) -> WebSocketApiError {
+        let key = contract.key();
+        tracing::error!("{err}");
+        WebSocketApiError::InvalidParam {
+            error_cause: format!("failed unpacking contract: {key}"),
+        }
+    }
+
+    // Clear existing cache if any; may not exist yet
+    let _cleanup = tokio::fs::remove_dir_all(&path).await;
+    tokio::fs::create_dir_all(&path)
+        .await
+        .map_err(|e| WebSocketApiError::NodeError {
+            error_cause: format!("Failed to create cache dir: {e}"),
+        })?;
+
+    let mut web = WebApp::try_from(state.as_ref()).map_err(|e| err(e, contract))?;
+    web.unpack(&path).map_err(|e| err(e, contract))?;
+
+    // Store new hash LAST, so a partial unpack does not leave a stale
+    // hash file that would make future requests skip the fetch.
+    tokio::fs::write(&hash_path, current_hash.to_be_bytes())
+        .await
+        .map_err(|e| WebSocketApiError::NodeError {
+            error_cause: format!("Failed to write state hash: {e}"),
+        })?;
+
+    Ok(())
+}
+
+#[instrument(level = "debug", skip(request_sender))]
 pub(super) async fn variable_content(
     key: String,
     req_path: String,
     api_version: ApiVersion,
+    request_sender: HttpClientApiRequest,
 ) -> Result<impl IntoResponse, Box<WebSocketApiError>> {
     debug!(
         "variable_content: Processing request for key: {}, path: {}",
@@ -223,6 +313,23 @@ pub(super) async fn variable_content(
         })?;
     let base_path = contract_web_path(&instance_id);
     debug!("variable_content: Base path resolved to: {:?}", base_path);
+
+    // Fetch + unpack the contract if its cache is cold. Without this, any
+    // request for a subresource (e.g. an <img src> pointing at this contract
+    // from a different webapp) would 404 because the cache is only populated
+    // by the shell-root handler (`contract_home`). See #3940.
+    //
+    // The hash file is written last by `unpack_if_stale`, so its presence is
+    // a reliable marker that a prior unpack completed successfully.
+    let hash_path = state_hash_path(&instance_id);
+    if tokio::fs::try_exists(&hash_path).await.unwrap_or(false) {
+        debug!("variable_content: Cache already populated, serving from disk");
+    } else {
+        debug!("variable_content: Cache miss, fetching contract before serving");
+        ensure_contract_cached(instance_id, &request_sender, None)
+            .await
+            .map_err(Box::new)?;
+    }
 
     // Parse the full request path URI to extract the relative path using the v1 helper.
     let req_uri =
@@ -1416,6 +1523,223 @@ fn state_hash_path(instance_id: &ContractInstanceId) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a pair (sender, receiver) suitable for capturing what
+    /// `ensure_contract_cached` emits on the client-connection channel.
+    fn request_channel() -> (
+        HttpClientApiRequest,
+        tokio::sync::mpsc::Receiver<ClientConnection>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ClientConnection>(4);
+        (HttpClientApiRequest::from_sender(tx), rx)
+    }
+
+    /// Clears any webapp cache state for `instance_id` on disk. `contract_web_path`
+    /// and `state_hash_path` resolve to a shared process-global directory, so
+    /// tests that exercise the cache must use unique keys AND scrub any stale
+    /// filesystem residue from a prior run before asserting on behaviour.
+    async fn clear_cache(instance_id: &ContractInstanceId) {
+        tokio::fs::remove_file(state_hash_path(instance_id))
+            .await
+            .ok();
+        tokio::fs::remove_dir_all(contract_web_path(instance_id))
+            .await
+            .ok();
+    }
+
+    /// Regression test for #3940. `variable_content` must trigger a network
+    /// fetch when the contract's webapp cache is cold. Prior to the fix, a
+    /// cold-cache subpath request (e.g. an `<img src>` pointing at a contract
+    /// that was never loaded at its root) returned 404 because the handler
+    /// only served pre-cached files.
+    ///
+    /// Verifies the handler emits the `NewConnection` + `Request(Get)` pair
+    /// on the client-connection channel when the cache is cold. The fetch is
+    /// cancelled mid-flight (we don't deliver a response) so the test stays
+    /// bounded.
+    #[tokio::test]
+    async fn variable_content_triggers_fetch_on_cache_miss() {
+        // Unique 32-byte seed so the resulting contract key does not collide
+        // with other tests, and any cache residue from prior runs is scrubbed
+        // via `clear_cache`.
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x40;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let (sender, mut rx) = request_channel();
+        let handler = {
+            let key = key.clone();
+            tokio::spawn(async move {
+                variable_content(
+                    key.clone(),
+                    format!("/v1/contract/web/{key}/image.jpg"),
+                    ApiVersion::V1,
+                    sender,
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+
+        // Expect a NewConnection first. The handler then blocks on a
+        // `HostCallbackResult::NewId` reply, so we stash the callback and
+        // reply with a synthetic client id — otherwise the handler never
+        // progresses to the Get request and the second recv below would
+        // hang until the 30s fetch timeout.
+        let new_conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("handler must send NewConnection on cold cache")
+            .expect("channel must remain open for the duration of the send");
+        let callbacks = match new_conn {
+            ClientConnection::NewConnection { callbacks, .. } => callbacks,
+            other => panic!("first message must be NewConnection, got: {other:?}"),
+        };
+        callbacks
+            .send(HostCallbackResult::NewId {
+                id: crate::client_events::ClientId::next(),
+            })
+            .expect("callback receiver must be live while handler awaits NewId");
+
+        // Next must be the Get request for our contract key.
+        let get_req = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("handler must follow up with a Get request")
+            .expect("channel must remain open");
+        match get_req {
+            ClientConnection::Request { req, .. } => {
+                assert!(
+                    matches!(
+                        req.as_ref(),
+                        ClientRequest::ContractOp(ContractRequest::Get { key: k, .. })
+                            if *k == instance_id
+                    ),
+                    "second message must be Get({instance_id}), got: {req:?}"
+                );
+            }
+            other => panic!("expected ClientConnection::Request, got: {other:?}"),
+        }
+
+        handler.abort();
+        // Clean up after the test — handler was aborted mid-fetch, so no
+        // cache was written, but clear defensively to avoid accumulating
+        // state in the shared XDG cache dir across runs.
+        clear_cache(&instance_id).await;
+    }
+
+    /// Companion to `variable_content_triggers_fetch_on_cache_miss`: when the
+    /// hash file is present (the signal that a prior unpack completed), the
+    /// handler must NOT issue a fetch. This pins the cache-hit fast path and
+    /// prevents a regression where every subpath request would re-fetch.
+    #[tokio::test]
+    async fn variable_content_skips_fetch_when_cache_present() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x41;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        // Prime the cache marker and a served file.
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(cache_dir.join("image.jpg"), b"fake-jpeg-bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+
+        let (sender, mut rx) = request_channel();
+        let result = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/image.jpg"),
+            ApiVersion::V1,
+            sender,
+        )
+        .await;
+
+        let response = result.expect("warm-cache request must succeed");
+        let body = response_body(response).await;
+        assert_eq!(
+            body, "fake-jpeg-bytes",
+            "warm-cache path must serve the primed file byte-for-byte"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "cache-hit path must not send any NewConnection/Get on the channel"
+        );
+
+        // Clean up last so a failed assertion above doesn't leave residue
+        // that flips the next run's cold-cache check into warm-cache state.
+        clear_cache(&instance_id).await;
+    }
+
+    /// Direct unit test for `handle_get_response`'s `MissingContract`
+    /// branch. Refactoring `handle_get_response` introduced this seam as a
+    /// pure-logic boundary; covering each arm here catches regressions
+    /// without the full async plumbing of an integration test.
+    #[tokio::test]
+    async fn handle_get_response_maps_none_contract_to_missing_contract_error() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x42;
+        let instance_id = ContractInstanceId::new(bytes);
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            instance_id,
+            freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+        );
+        let result = handle_get_response(
+            instance_id,
+            Ok(Some(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(
+                    ContractResponse::GetResponse {
+                        key,
+                        contract: None,
+                        state: WrappedState::new(Vec::new()),
+                    },
+                )),
+            })),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WebSocketApiError::MissingContract { instance_id: id }) if id == instance_id
+            ),
+            "None-contract GetResponse must surface as MissingContract({instance_id}), got: {result:?}"
+        );
+    }
+
+    /// Companion to the above: a `tokio::time::error::Elapsed` (30s fetch
+    /// timeout) surfaces as a `NodeError`, not a panic or hang.
+    #[tokio::test]
+    async fn handle_get_response_maps_timeout_to_node_error() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x43;
+        let instance_id = ContractInstanceId::new(bytes);
+
+        // Manufacture an Elapsed by racing an already-expired sleep.
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::from_millis(0),
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("timeout must fire");
+        let recv_result: Result<Option<HostCallbackResult>, _> = Err(elapsed);
+
+        let result = handle_get_response(instance_id, recv_result).await;
+        assert!(
+            matches!(result, Err(WebSocketApiError::NodeError { .. })),
+            "30s timeout must map to NodeError, got: {result:?}"
+        );
+    }
 
     /// Extracts the response body as a UTF-8 string for test assertions.
     async fn response_body(resp: impl IntoResponse) -> String {
