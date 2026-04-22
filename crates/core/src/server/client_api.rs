@@ -61,6 +61,15 @@ impl std::ops::Deref for HttpClientApiRequest {
     }
 }
 
+impl HttpClientApiRequest {
+    /// Constructs a request wrapper around an existing sender. Used by
+    /// sibling-module tests that need to feed in a mocked channel.
+    #[cfg(test)]
+    pub(super) fn from_sender(sender: mpsc::Sender<ClientConnection>) -> Self {
+        Self(sender)
+    }
+}
+
 /// Represents an origin contract entry with metadata for token expiration.
 #[derive(Clone, Debug)]
 pub struct OriginContract {
@@ -250,6 +259,7 @@ async fn web_subpages(
     api_version: ApiVersion,
     query_string: Option<String>,
     req_headers: axum::http::HeaderMap,
+    request_sender: HttpClientApiRequest,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     let is_sandbox = query_string
         .as_ref()
@@ -290,7 +300,7 @@ async fn web_subpages(
 
     let version_prefix = api_version.prefix();
     let full_path: String = format!("/{version_prefix}/contract/web/{key}/{last_path}");
-    path_handlers::variable_content(key, full_path, api_version)
+    path_handlers::variable_content(key, full_path, api_version, request_sender)
         .await
         .map_err(|e| *e)
         .map(|r| {
@@ -526,6 +536,17 @@ impl ClientEventsProxy for HttpClientApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds an `HttpClientApiRequest` whose receiver is dropped immediately,
+    /// so any attempt to send on it fails fast with a closed-channel error.
+    /// Suitable for redirect-branch tests that must never reach the full
+    /// fetch/unpack pipeline — the handler short-circuits to a redirect before
+    /// the sender is used, and if it doesn't the send error surfaces as a
+    /// bounded test failure instead of a 30-second timeout.
+    fn dead_request_sender() -> HttpClientApiRequest {
+        let (tx, _rx) = mpsc::channel(1);
+        HttpClientApiRequest::from_sender(tx)
+    }
 
     #[test]
     fn is_html_page_detects_html_extensions() {
@@ -816,6 +837,7 @@ mod tests {
             ApiVersion::V1,
             Some("authToken=attacker&invite=abc".to_string()),
             headers,
+            dead_request_sender(),
         )
         .await
         .expect("redirect response must be Ok");
@@ -847,6 +869,7 @@ mod tests {
             ApiVersion::V1,
             Some("__sandbox=1".to_string()),
             headers,
+            dead_request_sender(),
         )
         .await
         .expect("sandbox document load must redirect, not error");
@@ -854,22 +877,24 @@ mod tests {
 
         // Case 2: missing Sec-Fetch-Dest (curl, older browsers) falls
         // through to variable_content — pre-PR behaviour preserved, no
-        // redirect loop for non-browser clients. Call returns an error
-        // (file does not exist in the test cache); we assert only that
-        // it is NOT a shell-root redirect.
+        // redirect loop for non-browser clients. With a dead request
+        // sender the cache-miss fetch fails fast with a closed-channel
+        // error (see `dead_request_sender` for why). We assert only
+        // that the response is NOT a shell-root redirect.
         let res = web_subpages(
             key.clone(),
             "page2".to_string(),
             ApiVersion::V1,
             None,
             axum::http::HeaderMap::new(),
+            dead_request_sender(),
         )
         .await;
         match res {
             Ok(resp) => assert_ne!(resp.status(), axum::http::StatusCode::SEE_OTHER),
             Err(_) => {
-                // variable_content returned an error for a missing
-                // cache file, which is fine — the point is that we did
+                // variable_content returned an error for the cache-miss
+                // fetch attempt — that's fine, the point is that we did
                 // not take the redirect branch.
             }
         }
