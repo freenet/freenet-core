@@ -288,6 +288,31 @@ fn dashboard_port_is_listening() -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
+/// Pure decision function for the macOS wrapper preflight. Extracted so
+/// the decision logic can be unit-tested on any platform without binding
+/// real sockets. Today's rule is trivially "exit if another wrapper's
+/// port is already bound", but keeping it as a named function leaves
+/// room to layer on version-mismatch checks, legacy-install collisions,
+/// etc. without touching `run_wrapper`.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum WrapperPreflightDecision {
+    /// Another wrapper owns the dashboard port. Exit without showing a
+    /// tray so the user doesn't see a duplicate menu-bar icon.
+    ExitSilently,
+    /// No conflict detected; continue with normal wrapper startup.
+    Proceed,
+}
+
+#[allow(dead_code)]
+fn macos_wrapper_preflight_decision(dashboard_port_in_use: bool) -> WrapperPreflightDecision {
+    if dashboard_port_in_use {
+        WrapperPreflightDecision::ExitSilently
+    } else {
+        WrapperPreflightDecision::Proceed
+    }
+}
+
 /// At-most-once guard for spawning the first-run dashboard opener within a
 /// single wrapper process. Without it, a wrapper that restarts its daemon
 /// child several times before the HTTP server binds (e.g. during a crash
@@ -986,6 +1011,36 @@ fn run_wrapper(version: &str) -> Result<()> {
 
     // Kill stale freenet network processes from a previous wrapper instance
     kill_stale_freenet_processes(&log_dir);
+
+    // macOS preflight: if another Freenet wrapper is already running,
+    // exit before doing anything user-visible. Without this, when
+    // launchd fires RunAtLoad on the Launch-at-Login agent while the
+    // user's open-launched wrapper is still alive, the second wrapper
+    // spawns a duplicate tray icon. The backend-level single-instance
+    // guard (EXIT_CODE_ALREADY_RUNNING) correctly kicks in on the
+    // child daemon, but by then the second wrapper's tao event loop
+    // is already running on the main thread and owns an NSStatusItem.
+    // Preflighting BEFORE we touch launchctl, the tray, or the
+    // Launch-at-Login plist keeps the overlap case invisible to the
+    // user. Confirmed reproducible in phase-1 smoke test 2026-04-22.
+    //
+    // Linux has no tray so the backend-level guard alone is sufficient.
+    // Windows has `is_windows_wrapper_running` at install time but not
+    // at wrapper startup; if a similar dup-tray materialises there,
+    // extending this preflight is the same one-line change.
+    #[cfg(target_os = "macos")]
+    if macos_wrapper_preflight_decision(dashboard_port_is_listening())
+        == WrapperPreflightDecision::ExitSilently
+    {
+        log_wrapper_event(
+            &log_dir,
+            "Another Freenet wrapper already running (dashboard port held); \
+             exiting without showing a tray. This is expected when launchd \
+             fires RunAtLoad while the user's open-launched wrapper is still \
+             active, or when Freenet.app is double-launched.",
+        );
+        return Ok(());
+    }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
@@ -3201,6 +3256,33 @@ fn service_logs(_error_only: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn wrapper_preflight_exits_when_port_held_by_other_wrapper() {
+        // Regression for the dup-tray bug observed in the macOS phase-1
+        // smoke test on 2026-04-22: launchd fires RunAtLoad while the
+        // user's open-launched wrapper is still running, the second
+        // wrapper's backend daemon exits cleanly on port conflict, but
+        // the second wrapper's tao tray stays up and shows a duplicate
+        // menu-bar icon. The fix is to preflight-check the port before
+        // building the tray and exit silently if another wrapper is
+        // already running. This test pins the decision so a refactor
+        // can't silently re-enable the dup-tray path.
+        assert_eq!(
+            macos_wrapper_preflight_decision(true),
+            WrapperPreflightDecision::ExitSilently
+        );
+    }
+
+    #[test]
+    fn wrapper_preflight_proceeds_when_port_is_free() {
+        // The happy path: no other wrapper running, we build the tray
+        // and proceed normally.
+        assert_eq!(
+            macos_wrapper_preflight_decision(false),
+            WrapperPreflightDecision::Proceed
+        );
+    }
 
     #[test]
     fn dashboard_url_and_addr_stay_in_sync() {
