@@ -3221,14 +3221,7 @@ mod tests {
         let ops = Ops::default();
         let tx = Transaction::new::<crate::operations::put::PutMsg>();
 
-        let put_op = crate::operations::put::start_op(
-            crate::operations::test_utils::make_test_contract(&[1u8]),
-            freenet_stdlib::prelude::RelatedContracts::default(),
-            freenet_stdlib::prelude::WrappedState::new(vec![]),
-            10,
-            false,
-            false,
-        );
+        let put_op = crate::operations::put::PutOp::new_empty_for_test(tx);
         ops.put.insert(tx, put_op);
         assert!(ops.put.contains_key(&tx));
 
