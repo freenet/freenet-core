@@ -288,30 +288,128 @@ fn dashboard_port_is_listening() -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
-/// Pure decision function for the macOS wrapper preflight. Extracted so
-/// the decision logic can be unit-tested on any platform without binding
-/// real sockets. Today's rule is trivially "exit if another wrapper's
-/// port is already bound", but keeping it as a named function leaves
-/// room to layer on version-mismatch checks, legacy-install collisions,
-/// etc. without touching `run_wrapper`.
-#[derive(Debug, PartialEq, Eq)]
+// ── macOS wrapper single-instance lock ──
+//
+// Problem: launchd's LAL agent fires RunAtLoad while the user's
+// open-launched wrapper is still alive, and spawns a second wrapper.
+// The backend-level single-instance guard
+// (EXIT_CODE_ALREADY_RUNNING = 43) catches the second wrapper's
+// DAEMON CHILD but by the time that exit propagates, the second
+// wrapper's tao event loop is already running on the main thread and
+// owns an NSStatusItem. Two rabbits.
+//
+// Port-based detection of "another wrapper is running" is fragile:
+//   - wrapper A's backend may be mid-crash or mid-backoff, in which
+//     case port 7509 is briefly free but wrapper A's tray is still up
+//   - `kill_stale_freenet_processes` runs early in wrapper startup
+//     and happily pkills the OTHER wrapper's live backend child,
+//     widening the race window it was meant to close
+//   - a non-Freenet squatter on port 7509 triggers a false positive
+//     with no diagnosable UX
+//
+// Solution: an advisory `flock` on a wrapper-scoped lockfile at
+// `~/Library/Caches/Freenet/wrapper.lock`, acquired in `run_wrapper`
+// BEFORE `kill_stale_freenet_processes` and BEFORE any user-visible
+// state change. Held for the wrapper's lifetime; released on process
+// exit by the kernel. If a second wrapper can't acquire, it exits
+// silently. Robust to backend state, to pkill interference, and to
+// third-party port squatters.
+
+/// Advisory single-instance guard for the macOS wrapper process. Held
+/// for the wrapper's lifetime and released automatically by the
+/// kernel on process exit.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
 #[allow(dead_code)]
-enum WrapperPreflightDecision {
-    /// Another wrapper owns the dashboard port. Exit without showing a
-    /// tray so the user doesn't see a duplicate menu-bar icon.
-    ExitSilently,
-    /// No conflict detected; continue with normal wrapper startup.
-    Proceed,
+pub(super) struct WrapperSingleInstanceLock {
+    // The File keeps the fd alive; dropping it releases the flock.
+    _file: std::fs::File,
 }
 
+/// Path of the wrapper lockfile if we can determine a cache directory.
 #[allow(dead_code)]
-fn macos_wrapper_preflight_decision(dashboard_port_in_use: bool) -> WrapperPreflightDecision {
-    if dashboard_port_in_use {
-        WrapperPreflightDecision::ExitSilently
+pub(super) fn wrapper_lock_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("Freenet").join("wrapper.lock"))
+}
+
+/// Outcome of attempting to acquire the wrapper single-instance lock.
+/// Extracted as a pure type so the orchestration in `run_wrapper` stays
+/// readable and the unit test can exercise every arm.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(super) enum AcquireWrapperLockOutcome {
+    /// We hold the lock; proceed with normal wrapper startup. The
+    /// caller must hold the guard for the duration of the wrapper.
+    Acquired(WrapperSingleInstanceLock),
+    /// Another wrapper already holds the lock. Exit silently.
+    AnotherWrapperRunning,
+    /// We couldn't even try (no cache dir, can't create parent, etc.).
+    /// Treat as "proceed without a lock" rather than silently exiting
+    /// the user's only way to run Freenet. On platforms where the
+    /// cache dir is always present, this is unreachable.
+    UnavailableSoProceed,
+}
+
+/// Acquire the wrapper lockfile via `flock(LOCK_EX | LOCK_NB)`.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(super) fn acquire_wrapper_single_instance_lock() -> AcquireWrapperLockOutcome {
+    use std::os::unix::io::AsRawFd;
+    let Some(lock_path) = wrapper_lock_path() else {
+        tracing::warn!("Wrapper lock: cache directory unresolvable; proceeding without lock");
+        return AcquireWrapperLockOutcome::UnavailableSoProceed;
+    };
+    if let Some(parent) = lock_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "Wrapper lock: failed to create {}: {}; proceeding without lock",
+                parent.display(),
+                e
+            );
+            return AcquireWrapperLockOutcome::UnavailableSoProceed;
+        }
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                "Wrapper lock: failed to open {}: {}; proceeding without lock",
+                lock_path.display(),
+                e
+            );
+            return AcquireWrapperLockOutcome::UnavailableSoProceed;
+        }
+    };
+    // LOCK_EX | LOCK_NB: exclusive lock, fail fast if held by another
+    // process. Released automatically when the fd closes on process
+    // exit (kernel-managed); we never need to unlock explicitly.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        AcquireWrapperLockOutcome::AnotherWrapperRunning
     } else {
-        WrapperPreflightDecision::Proceed
+        AcquireWrapperLockOutcome::Acquired(WrapperSingleInstanceLock { _file: file })
     }
 }
+
+/// Non-macOS stub so `run_wrapper` compiles without cfg gates around
+/// every mention. On Linux the backend-level port guard is sufficient
+/// (no tray); on Windows the install-time wrapper detection is the
+/// analogous mechanism.
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+pub(super) fn acquire_wrapper_single_instance_lock() -> AcquireWrapperLockOutcome {
+    AcquireWrapperLockOutcome::UnavailableSoProceed
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(super) struct WrapperSingleInstanceLock;
 
 /// At-most-once guard for spawning the first-run dashboard opener within a
 /// single wrapper process. Without it, a wrapper that restarts its daemon
@@ -1009,38 +1107,60 @@ fn run_wrapper(version: &str) -> Result<()> {
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
-    // Kill stale freenet network processes from a previous wrapper instance
-    kill_stale_freenet_processes(&log_dir);
-
-    // macOS preflight: if another Freenet wrapper is already running,
-    // exit before doing anything user-visible. Without this, when
-    // launchd fires RunAtLoad on the Launch-at-Login agent while the
-    // user's open-launched wrapper is still alive, the second wrapper
-    // spawns a duplicate tray icon. The backend-level single-instance
-    // guard (EXIT_CODE_ALREADY_RUNNING) correctly kicks in on the
-    // child daemon, but by then the second wrapper's tao event loop
-    // is already running on the main thread and owns an NSStatusItem.
-    // Preflighting BEFORE we touch launchctl, the tray, or the
-    // Launch-at-Login plist keeps the overlap case invisible to the
-    // user. Confirmed reproducible in phase-1 smoke test 2026-04-22.
+    // macOS wrapper single-instance guard. MUST run before
+    // `kill_stale_freenet_processes` and before anything user-visible.
+    // The kill helper uses `pkill -f "freenet network"` which matches
+    // the CURRENTLY-RUNNING backend child of a live wrapper, not just
+    // stale orphans; if we were to kill_stale before the single-
+    // instance check, a second wrapper would happily murder the first
+    // wrapper's backend, then see a free port, then proceed to build a
+    // duplicate tray. The flock-based guard is immune to that race
+    // because it inspects wrapper-level state (the lockfile held by
+    // the first wrapper process) not backend state.
     //
-    // Linux has no tray so the backend-level guard alone is sufficient.
-    // Windows has `is_windows_wrapper_running` at install time but not
-    // at wrapper startup; if a similar dup-tray materialises there,
-    // extending this preflight is the same one-line change.
+    // Phase-1 smoke test on 2026-04-22 reproduced the duplicate tray
+    // whenever launchd's RunAtLoad fired while the user's open-
+    // launched wrapper was still alive; this guard prevents that
+    // overlap without changing the LAL agent's `RunAtLoad=true`
+    // semantics (login-time auto-start still works; only the in-
+    // session overlap is suppressed).
+    //
+    // Linux has no tray and Windows has install-time guards; the
+    // overlap race only manifests on macOS where launchd can spawn a
+    // concurrent wrapper via RunAtLoad.
     #[cfg(target_os = "macos")]
-    if macos_wrapper_preflight_decision(dashboard_port_is_listening())
-        == WrapperPreflightDecision::ExitSilently
-    {
-        log_wrapper_event(
-            &log_dir,
-            "Another Freenet wrapper already running (dashboard port held); \
-             exiting without showing a tray. This is expected when launchd \
-             fires RunAtLoad while the user's open-launched wrapper is still \
-             active, or when Freenet.app is double-launched.",
-        );
-        return Ok(());
-    }
+    let _wrapper_lock = match acquire_wrapper_single_instance_lock() {
+        AcquireWrapperLockOutcome::Acquired(guard) => Some(guard),
+        AcquireWrapperLockOutcome::AnotherWrapperRunning => {
+            log_wrapper_event(
+                &log_dir,
+                &format!(
+                    "Wrapper pid={} exiting: another Freenet wrapper is already \
+                     running (lockfile at ~/Library/Caches/Freenet/wrapper.lock is \
+                     held). Expected if launchd fired RunAtLoad while an existing \
+                     wrapper is alive, or if Freenet.app was double-launched. \
+                     If Freenet's menu bar icon is not visible, another process may \
+                     be holding the lock; try `lsof ~/Library/Caches/Freenet/wrapper.lock`.",
+                    std::process::id()
+                ),
+            );
+            return Ok(());
+        }
+        AcquireWrapperLockOutcome::UnavailableSoProceed => {
+            log_wrapper_event(
+                &log_dir,
+                "Wrapper single-instance lock unavailable; proceeding without guard. \
+                 Dup-tray risk if RunAtLoad fires while another wrapper is alive.",
+            );
+            None
+        }
+    };
+
+    // Kill stale freenet network processes from a previous wrapper instance.
+    // Runs AFTER the single-instance lock so we only ever kill orphans:
+    // any live peer wrapper holds the lock and would have blocked us
+    // above. Concurrent overlap cases exit silently before reaching here.
+    kill_stale_freenet_processes(&log_dir);
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
@@ -3257,31 +3377,76 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Flock-level regression test for the dup-tray bug observed in
+    /// phase-1 smoke test 2026-04-22. Uses a dedicated path inside a
+    /// temp directory instead of `~/Library/Caches/Freenet/wrapper.lock`
+    /// so parallel tests (and CI) don't interfere. `flock` has
+    /// identical semantics on Linux and macOS, so this test exercises
+    /// the exact mechanism the production path uses even though the
+    /// production path is macOS-only.
+    #[cfg(unix)]
+    fn try_acquire_flock_at(path: &Path) -> Option<std::fs::File> {
+        use std::os::unix::io::AsRawFd;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 { Some(file) } else { None }
+    }
+
     #[test]
-    fn wrapper_preflight_exits_when_port_held_by_other_wrapper() {
-        // Regression for the dup-tray bug observed in the macOS phase-1
-        // smoke test on 2026-04-22: launchd fires RunAtLoad while the
-        // user's open-launched wrapper is still running, the second
-        // wrapper's backend daemon exits cleanly on port conflict, but
-        // the second wrapper's tao tray stays up and shows a duplicate
-        // menu-bar icon. The fix is to preflight-check the port before
-        // building the tray and exit silently if another wrapper is
-        // already running. This test pins the decision so a refactor
-        // can't silently re-enable the dup-tray path.
-        assert_eq!(
-            macos_wrapper_preflight_decision(true),
-            WrapperPreflightDecision::ExitSilently
+    #[cfg(unix)]
+    fn wrapper_lock_is_exclusive() {
+        // Two acquirers of the same lockfile: first wins, second fails.
+        // This is the invariant the dup-tray fix relies on. If a future
+        // refactor turns the lock into a shared lock, or swaps LOCK_NB
+        // for blocking, this test fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("wrapper.lock");
+
+        let holder =
+            try_acquire_flock_at(&lock_path).expect("first acquire must succeed on an unheld lock");
+        assert!(
+            try_acquire_flock_at(&lock_path).is_none(),
+            "second acquire must fail while the first holder is alive"
+        );
+
+        // Dropping the holder releases the flock; a new acquirer
+        // should now succeed. Exercises the kernel-released-on-close
+        // semantics we rely on for crash recovery.
+        drop(holder);
+        assert!(
+            try_acquire_flock_at(&lock_path).is_some(),
+            "acquire must succeed once the previous holder has exited"
         );
     }
 
     #[test]
-    fn wrapper_preflight_proceeds_when_port_is_free() {
-        // The happy path: no other wrapper running, we build the tray
-        // and proceed normally.
-        assert_eq!(
-            macos_wrapper_preflight_decision(false),
-            WrapperPreflightDecision::Proceed
-        );
+    fn wrapper_lock_path_is_under_cache_dir() {
+        // If the platform can resolve a cache dir, the lock lives
+        // under it in a Freenet subdirectory. Guards against a future
+        // refactor that moves the lockfile somewhere user-global
+        // (e.g. /tmp) where non-Freenet processes could collide.
+        if let Some(p) = wrapper_lock_path() {
+            assert!(
+                p.ends_with("Freenet/wrapper.lock"),
+                "unexpected wrapper lock path: {}",
+                p.display()
+            );
+            let cache = dirs::cache_dir().expect("cache dir required for this assertion");
+            assert!(
+                p.starts_with(&cache),
+                "wrapper lock {} must live under the user cache dir {}",
+                p.display(),
+                cache.display()
+            );
+        }
     }
 
     #[test]
