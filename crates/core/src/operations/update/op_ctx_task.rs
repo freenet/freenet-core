@@ -36,7 +36,8 @@ use crate::operations::OpError;
 use crate::ring::{PeerKeyLocation, RingError};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
 
-use super::{UpdateExecution, UpdateMsg};
+use super::{BroadcastStreamingPayload, UpdateExecution, UpdateMsg, UpdateStreamingPayload};
+use crate::transport::peer_connection::StreamId;
 
 /// Counter: number of times `start_relay_request_update` or
 /// `start_relay_broadcast_to` was invoked. Incremented under test/testing
@@ -64,6 +65,35 @@ pub static RELAY_UPDATE_COMPLETED_TOTAL: std::sync::atomic::AtomicUsize =
 /// Counter: number of duplicate inbound `RequestUpdate` /
 /// `BroadcastTo` Requests rejected by the per-node dedup gate.
 pub static RELAY_UPDATE_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// ── Slice C streaming relay UPDATE counters (#1454 phase 5) ──────────────
+//
+// Separate from slice A's `RELAY_UPDATE_*` counters so operators can
+// ramp-compare observability between non-streaming and streaming
+// relay drivers. The tx dedup set (`active_relay_update_txs`) is shared
+// across both slices since tx identity is unified; the
+// `RELAY_UPDATE_DEDUP_REJECTS` counter is also shared.
+
+/// Counter: number of times `start_relay_request_update_streaming` or
+/// `start_relay_broadcast_to_streaming` was invoked. Used by dispatch
+/// gate pin tests to prove streaming relays route through the
+/// task-per-tx driver rather than `handle_op_request`.
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_UPDATE_STREAMING_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: streaming relay UPDATE drivers currently in flight.
+pub static RELAY_UPDATE_STREAMING_INFLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: total streaming relay UPDATE drivers ever spawned on this
+/// node.
+pub static RELAY_UPDATE_STREAMING_SPAWNED_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: total streaming relay UPDATE drivers that exited.
+pub static RELAY_UPDATE_STREAMING_COMPLETED_TOTAL: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Start a client-initiated UPDATE, returning as soon as the task has been
@@ -1024,6 +1054,601 @@ async fn drive_relay_broadcast_to(
     Ok(())
 }
 
+// ── Relay UPDATE streaming drivers (#1454 phase 5 — slice C) ────────────
+//
+// Streaming UPDATE relays are qualitatively simpler than streaming PUT
+// relays:
+//   - No upstream reply to bubble (UPDATE is fire-and-forget e2e).
+//   - No downstream forward via `pipe_stream` — network propagation is
+//     automatic via `BroadcastStateChange` after local apply.
+//   - The driver's job = claim inbound stream → assemble → deserialize
+//     payload → `update_contract` → emit telemetry + (BroadcastTo only)
+//     dedup + proactive summary.
+//
+// Shared with slice A:
+//   - `active_relay_update_txs` dedup set (tx space is unified).
+//   - `RelayUpdateInflightGuard` RAII (same tx cleanup semantics).
+//   - `RELAY_UPDATE_DEDUP_REJECTS` counter for dedup observability.
+//
+// NOT shared (slice-C-specific counters):
+//   - `RELAY_UPDATE_STREAMING_INFLIGHT` / `_SPAWNED_TOTAL` /
+//     `_COMPLETED_TOTAL` / `_DRIVER_CALL_COUNT` — separate streams for
+//     ramp comparison, mirroring PUT slice B rationale.
+//
+// Fragment-level dedup is handled by `orphan_stream_registry` via
+// `claim_or_wait`; tx-level dedup is handled by `active_relay_update_txs`.
+// These are complementary — fragment metadata may arrive on a new tx
+// while tx dedup catches wire-level retries of the metadata message.
+
+/// Spawn a relay driver for a fresh inbound
+/// `UpdateMsg::RequestUpdateStreaming`.
+///
+/// Caller-side gates (in `node.rs`): `source_addr.is_some()` AND no
+/// existing `UpdateOp` in `OpManager.ops.update` for `incoming_tx`.
+pub(crate) async fn start_relay_request_update_streaming(
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    stream_id: StreamId,
+    total_size: u64,
+    sender_addr: SocketAddr,
+) -> Result<(), OpError> {
+    #[cfg(any(test, feature = "testing"))]
+    RELAY_UPDATE_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    if !op_manager.active_relay_update_txs.insert(incoming_tx) {
+        RELAY_UPDATE_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            %sender_addr,
+            phase = "relay_update_streaming_dedup_reject",
+            "UPDATE relay (task-per-tx streaming): duplicate RequestUpdateStreaming for in-flight tx, dropping"
+        );
+        return Ok(());
+    }
+
+    tracing::debug!(
+        tx = %incoming_tx,
+        %key,
+        %sender_addr,
+        %stream_id,
+        total_size,
+        phase = "relay_update_streaming_request_start",
+        "UPDATE relay (task-per-tx streaming): spawning RequestUpdateStreaming driver"
+    );
+
+    // Guard pre-spawn (see `start_relay_request_update` rationale).
+    RELAY_UPDATE_STREAMING_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RELAY_UPDATE_STREAMING_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = RelayUpdateStreamingInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
+    GlobalExecutor::spawn(run_relay_request_update_streaming(
+        guard,
+        op_manager,
+        incoming_tx,
+        key,
+        stream_id,
+        total_size,
+        sender_addr,
+    ));
+    Ok(())
+}
+
+/// Spawn a relay driver for a fresh inbound
+/// `UpdateMsg::BroadcastToStreaming`.
+pub(crate) async fn start_relay_broadcast_to_streaming(
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    stream_id: StreamId,
+    total_size: u64,
+    sender_addr: SocketAddr,
+) -> Result<(), OpError> {
+    #[cfg(any(test, feature = "testing"))]
+    RELAY_UPDATE_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    if !op_manager.active_relay_update_txs.insert(incoming_tx) {
+        RELAY_UPDATE_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            %sender_addr,
+            phase = "relay_update_streaming_dedup_reject",
+            "UPDATE relay (task-per-tx streaming): duplicate BroadcastToStreaming for in-flight tx, dropping"
+        );
+        return Ok(());
+    }
+
+    tracing::debug!(
+        tx = %incoming_tx,
+        %key,
+        %sender_addr,
+        %stream_id,
+        total_size,
+        phase = "relay_update_streaming_broadcast_start",
+        "UPDATE relay (task-per-tx streaming): spawning BroadcastToStreaming driver"
+    );
+
+    RELAY_UPDATE_STREAMING_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RELAY_UPDATE_STREAMING_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = RelayUpdateStreamingInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
+    GlobalExecutor::spawn(run_relay_broadcast_to_streaming(
+        guard,
+        op_manager,
+        incoming_tx,
+        key,
+        stream_id,
+        total_size,
+        sender_addr,
+    ));
+    Ok(())
+}
+
+/// RAII guard for streaming relay UPDATE drivers. Mirrors slice A's
+/// `RelayUpdateInflightGuard` but uses the streaming-specific counters.
+/// Still cleans up `active_relay_update_txs` (unified tx space).
+struct RelayUpdateStreamingInflightGuard {
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+}
+
+impl Drop for RelayUpdateStreamingInflightGuard {
+    fn drop(&mut self) {
+        self.op_manager
+            .active_relay_update_txs
+            .remove(&self.incoming_tx);
+        RELAY_UPDATE_STREAMING_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        RELAY_UPDATE_STREAMING_COMPLETED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn run_relay_request_update_streaming(
+    guard: RelayUpdateStreamingInflightGuard,
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    stream_id: StreamId,
+    total_size: u64,
+    sender_addr: SocketAddr,
+) {
+    let _guard = guard;
+
+    if let Err(err) = drive_relay_request_update_streaming(
+        &op_manager,
+        incoming_tx,
+        key,
+        stream_id,
+        total_size,
+        sender_addr,
+    )
+    .await
+    {
+        tracing::warn!(
+            tx = %incoming_tx,
+            %key,
+            error = %err,
+            phase = "relay_update_streaming_request_error",
+            "UPDATE relay (task-per-tx streaming): RequestUpdateStreaming driver returned error"
+        );
+    }
+}
+
+async fn run_relay_broadcast_to_streaming(
+    guard: RelayUpdateStreamingInflightGuard,
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    stream_id: StreamId,
+    total_size: u64,
+    sender_addr: SocketAddr,
+) {
+    let _guard = guard;
+
+    if let Err(err) = drive_relay_broadcast_to_streaming(
+        &op_manager,
+        incoming_tx,
+        key,
+        stream_id,
+        total_size,
+        sender_addr,
+    )
+    .await
+    {
+        tracing::warn!(
+            tx = %incoming_tx,
+            %key,
+            error = %err,
+            phase = "relay_update_streaming_broadcast_error",
+            "UPDATE relay (task-per-tx streaming): BroadcastToStreaming driver returned error"
+        );
+    }
+}
+
+/// Inner driver for `RequestUpdateStreaming`. Mirrors the legacy
+/// handler at `update.rs:871-1071`:
+///
+/// 1. Claim inbound stream via orphan registry (atomic dedup on
+///    `stream_id`).
+/// 2. Assemble stream data.
+/// 3. Deserialize `UpdateStreamingPayload`.
+/// 4. `update_contract` (state update — related contracts preserved).
+/// 5. Emit `update_success` telemetry.
+///
+/// Network propagation is automatic via `BroadcastStateChange`.
+async fn drive_relay_request_update_streaming(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    stream_id: StreamId,
+    total_size: u64,
+    sender_addr: SocketAddr,
+) -> Result<(), OpError> {
+    use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
+
+    tracing::info!(
+        tx = %incoming_tx,
+        contract = %key,
+        %stream_id,
+        total_size,
+        "UPDATE relay (task-per-tx streaming): processing RequestUpdateStreaming"
+    );
+
+    // Step 1: claim stream.
+    let stream_handle = match op_manager
+        .orphan_stream_registry()
+        .claim_or_wait(sender_addr, stream_id, STREAM_CLAIM_TIMEOUT)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(OrphanStreamError::AlreadyClaimed) => {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %stream_id,
+                "UPDATE relay (task-per-tx streaming): RequestUpdateStreaming skipped — stream already claimed (dedup)"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                %stream_id,
+                error = %e,
+                "UPDATE relay (task-per-tx streaming): failed to claim stream from orphan registry"
+            );
+            return Err(OpError::OrphanStreamClaimFailed);
+        }
+    };
+
+    // Step 2: assemble stream.
+    let stream_data = match stream_handle.assemble().await {
+        Ok(data) => {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %stream_id,
+                assembled_size = data.len(),
+                expected_size = total_size,
+                "UPDATE relay (task-per-tx streaming): stream assembled"
+            );
+            data
+        }
+        Err(e) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                %stream_id,
+                error = %e,
+                "UPDATE relay (task-per-tx streaming): failed to assemble stream"
+            );
+            return Err(OpError::StreamCancelled);
+        }
+    };
+
+    // Step 3: deserialize payload.
+    let payload: UpdateStreamingPayload = match bincode::deserialize(&stream_data) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                error = %e,
+                "UPDATE relay (task-per-tx streaming): failed to deserialize UpdateStreamingPayload"
+            );
+            return Err(OpError::invalid_transition(incoming_tx));
+        }
+    };
+
+    let UpdateStreamingPayload {
+        related_contracts,
+        value,
+    } = payload;
+
+    // Step 4: apply update. BroadcastStateChange propagates automatically.
+    let UpdateExecution {
+        value: updated_value,
+        summary: _,
+        changed,
+        ..
+    } = super::update_contract(
+        op_manager,
+        key,
+        UpdateData::State(State::from(value.clone())),
+        related_contracts,
+    )
+    .await?;
+
+    // Step 5: telemetry.
+    let hash_after = Some(state_hash_full(&updated_value));
+    if let Some(requester_pkl) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(sender_addr)
+    {
+        if let Some(event) = NetEventLog::update_success(
+            &incoming_tx,
+            &op_manager.ring,
+            key,
+            requester_pkl,
+            None, // No before-hash for streaming (legacy match).
+            hash_after,
+            Some(updated_value.len()),
+        ) {
+            op_manager.ring.register_events(Either::Left(event)).await;
+        }
+    }
+
+    if changed {
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay (task-per-tx streaming): RequestUpdateStreaming succeeded, state changed"
+        );
+    } else {
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay (task-per-tx streaming): RequestUpdateStreaming yielded no state change"
+        );
+    }
+
+    Ok(())
+}
+
+/// Inner driver for `BroadcastToStreaming`. Mirrors the legacy
+/// handler at `update.rs:1073-1366`:
+///
+/// 1. Claim inbound stream.
+/// 2. Assemble stream.
+/// 3. Deserialize `BroadcastStreamingPayload`.
+/// 4. Update sender's cached summary.
+/// 5. Dedup check against broadcast_dedup_cache (BEFORE WASM merge).
+/// 6. Telemetry: `update_broadcast_received`.
+/// 7. `update_contract` (state update).
+/// 8. On success: telemetry + proactive summary notification.
+/// 9. On failure: classify via `log_broadcast_to_streaming_failure`;
+///    `try_auto_fetch_contract` on real failure,
+///    `send_summary_back_on_rejection` on benign stale-version.
+async fn drive_relay_broadcast_to_streaming(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    stream_id: StreamId,
+    total_size: u64,
+    sender_addr: SocketAddr,
+) -> Result<(), OpError> {
+    use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
+
+    tracing::info!(
+        tx = %incoming_tx,
+        contract = %key,
+        %stream_id,
+        total_size,
+        sender = %sender_addr,
+        "UPDATE relay (task-per-tx streaming): processing BroadcastToStreaming"
+    );
+
+    // Step 1: claim stream.
+    let stream_handle = match op_manager
+        .orphan_stream_registry()
+        .claim_or_wait(sender_addr, stream_id, STREAM_CLAIM_TIMEOUT)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(OrphanStreamError::AlreadyClaimed) => {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %stream_id,
+                "UPDATE relay (task-per-tx streaming): BroadcastToStreaming skipped — stream already claimed (dedup)"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                %stream_id,
+                error = %e,
+                "UPDATE relay (task-per-tx streaming): failed to claim stream from orphan registry (broadcast)"
+            );
+            return Err(OpError::OrphanStreamClaimFailed);
+        }
+    };
+
+    // Step 2: assemble stream.
+    let stream_data = match stream_handle.assemble().await {
+        Ok(data) => {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %stream_id,
+                assembled_size = data.len(),
+                expected_size = total_size,
+                "UPDATE relay (task-per-tx streaming): stream assembled (broadcast)"
+            );
+            data
+        }
+        Err(e) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                %stream_id,
+                error = %e,
+                "UPDATE relay (task-per-tx streaming): failed to assemble stream (broadcast)"
+            );
+            return Err(OpError::StreamCancelled);
+        }
+    };
+
+    // Step 3: deserialize payload.
+    let payload: BroadcastStreamingPayload = match bincode::deserialize(&stream_data) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                error = %e,
+                "UPDATE relay (task-per-tx streaming): failed to deserialize BroadcastStreamingPayload"
+            );
+            return Err(OpError::invalid_transition(incoming_tx));
+        }
+    };
+
+    let BroadcastStreamingPayload {
+        state_bytes,
+        sender_summary_bytes,
+    } = payload;
+
+    // Step 4: update sender's cached summary.
+    let sender_summary = StateSummary::from(sender_summary_bytes.clone());
+    if let Some(sender_pkl) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(sender_addr)
+    {
+        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+        op_manager.interest_manager.update_peer_summary(
+            &key,
+            &sender_key,
+            Some(sender_summary.clone()),
+        );
+    }
+
+    // Step 5: dedup cache BEFORE merge (mirrors non-streaming slice A
+    // ordering — skipping WASM merge on duplicate broadcast is the key
+    // amplifier mitigation). Streaming broadcasts are always full state
+    // (`is_delta = false`).
+    if op_manager.broadcast_dedup_cache.check_and_insert(
+        &key,
+        &state_bytes,
+        false,
+        op_manager.interest_manager.now(),
+    ) {
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay (task-per-tx streaming): BroadcastToStreaming skipped — duplicate payload (dedup hit)"
+        );
+        return Ok(());
+    }
+
+    let state_for_telemetry = WrappedState::from(state_bytes.clone());
+
+    // Step 6: telemetry — broadcast received.
+    if let Some(requester_pkl) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(sender_addr)
+    {
+        if let Some(event) = NetEventLog::update_broadcast_received(
+            &incoming_tx,
+            &op_manager.ring,
+            key,
+            requester_pkl,
+            state_for_telemetry.clone(),
+        ) {
+            op_manager.ring.register_events(Either::Left(event)).await;
+        }
+    }
+
+    // Step 7: WASM merge.
+    let update_result = super::update_contract(
+        op_manager,
+        key,
+        UpdateData::State(State::from(state_bytes.clone())),
+        RelatedContracts::default(),
+    )
+    .await;
+
+    let UpdateExecution {
+        value: updated_value,
+        summary: streaming_update_summary,
+        changed,
+        ..
+    } = match update_result {
+        Ok(exec) => exec,
+        Err(err) => {
+            // Classify failure: real failure → self-heal via
+            // try_auto_fetch_contract; benign stale-version rejection →
+            // send_summary_back_on_rejection. Mirrors legacy at
+            // update.rs:1336-1361.
+            if super::log_broadcast_to_streaming_failure(&incoming_tx, &key, &err) {
+                op_manager.try_auto_fetch_contract(&key, sender_addr);
+            } else if err.is_invalid_update_rejection() {
+                let op_mgr = op_manager.clone();
+                let contract_key = key;
+                let sender_summary_bytes = sender_summary_bytes.clone();
+                GlobalExecutor::spawn(async move {
+                    super::send_summary_back_on_rejection(
+                        &op_mgr,
+                        &contract_key,
+                        sender_addr,
+                        sender_summary_bytes,
+                    )
+                    .await;
+                });
+            }
+            return Err(err);
+        }
+    };
+
+    // Step 8: telemetry — broadcast applied + proactive summary.
+    if let Some(event) = NetEventLog::update_broadcast_applied(
+        &incoming_tx,
+        &op_manager.ring,
+        key,
+        &state_for_telemetry,
+        &updated_value,
+        changed,
+    ) {
+        op_manager.ring.register_events(Either::Left(event)).await;
+    }
+
+    if !changed {
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay (task-per-tx streaming): BroadcastToStreaming produced no change"
+        );
+        return Ok(());
+    }
+
+    crate::node::network_status::record_update_received();
+    tracing::debug!(
+        tx = %incoming_tx,
+        %key,
+        "UPDATE relay (task-per-tx streaming): BroadcastToStreaming applied (state changed)"
+    );
+
+    let op_mgr = op_manager.clone();
+    let summary = streaming_update_summary.clone();
+    GlobalExecutor::spawn(async move {
+        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, summary).await;
+    });
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     /// Guard: `client_events.rs` must call `start_client_update` for both the
@@ -1340,8 +1965,9 @@ mod tests {
             .collect();
         assert_eq!(
             sites.len(),
-            2,
-            "expected exactly two dedup sites (RequestUpdate + BroadcastTo)"
+            4,
+            "expected four dedup sites (RequestUpdate + BroadcastTo + \
+             RequestUpdateStreaming + BroadcastToStreaming)"
         );
         for (idx, section) in sites.iter().enumerate() {
             let window = &section[..500.min(section.len())];
@@ -1376,29 +2002,244 @@ mod tests {
         );
     }
 
-    /// Pin: streaming variants MUST NOT be touched by the driver in slice A.
-    /// They stay on the legacy path until slice B. Reference the variant
-    /// names by their wire-message identifiers.
+    /// Pin: the slice A non-streaming drivers (`drive_relay_request_update`
+    /// / `drive_relay_broadcast_to`) must NOT reference the streaming
+    /// wire variants. Streaming logic lives in the slice C drivers.
     #[test]
-    fn slice_a_does_not_touch_streaming_variants() {
+    fn slice_a_drivers_do_not_touch_streaming_variants() {
         let src = include_str!("op_ctx_task.rs");
-        // Skip past the section header / module-level scope doc comment
-        // (which references variant names by design) by anchoring on the
-        // first relay entry-point fn.
-        let relay_start = src
-            .find("pub(crate) async fn start_relay_request_update(")
-            .expect("start_relay_request_update not found");
-        let relay_end = src
-            .find("#[cfg(test)]")
-            .expect("test module marker not found");
-        let relay_src = &src[relay_start..relay_end];
+        for driver_name in ["drive_relay_request_update(", "drive_relay_broadcast_to("] {
+            let start = src
+                .find(&format!("async fn {driver_name}"))
+                .unwrap_or_else(|| panic!("{driver_name} not found"));
+            // End at the fn's closing brace at column 0 — "\n}\n" — which
+            // is the cargo-fmt-canonical shape for a top-level fn body.
+            let after = &src[start..];
+            let end = after.find("\n}\n").expect("fn body end not found");
+            let driver_src = &after[..end];
+            assert!(
+                !driver_src.contains("RequestUpdateStreaming"),
+                "{driver_name} (slice A) must not reference RequestUpdateStreaming"
+            );
+            assert!(
+                !driver_src.contains("BroadcastToStreaming"),
+                "{driver_name} (slice A) must not reference BroadcastToStreaming"
+            );
+        }
+    }
+
+    // ── Slice C streaming relay driver structural pin tests ─────────────
+    // (#1454 phase 5) — pin the streaming drivers against their
+    // documented invariants.
+
+    /// Pin: slice C streaming drivers must exist and be public at the
+    /// crate level.
+    #[test]
+    fn slice_c_streaming_drivers_exist() {
+        let src = include_str!("op_ctx_task.rs");
         assert!(
-            !relay_src.contains("RequestUpdateStreaming"),
-            "slice A must not handle RequestUpdateStreaming (deferred to slice B)"
+            src.contains("pub(crate) async fn start_relay_request_update_streaming("),
+            "start_relay_request_update_streaming must exist (slice C entry point)"
         );
         assert!(
-            !relay_src.contains("BroadcastToStreaming"),
-            "slice A must not handle BroadcastToStreaming (deferred to slice B)"
+            src.contains("pub(crate) async fn start_relay_broadcast_to_streaming("),
+            "start_relay_broadcast_to_streaming must exist (slice C entry point)"
+        );
+    }
+
+    /// Pin: streaming drivers must gate on `active_relay_update_txs`
+    /// (unified tx dedup set across slices A and C).
+    #[test]
+    fn slice_c_drivers_use_tx_dedup_gate() {
+        let src = include_str!("op_ctx_task.rs");
+        for entry in [
+            "pub(crate) async fn start_relay_request_update_streaming(",
+            "pub(crate) async fn start_relay_broadcast_to_streaming(",
+        ] {
+            let start = src.find(entry).unwrap_or_else(|| panic!("{entry} missing"));
+            let body = &src[start..start + 1500];
+            assert!(
+                body.contains("active_relay_update_txs.insert"),
+                "{entry} must insert into active_relay_update_txs for per-tx dedup"
+            );
+            assert!(
+                body.contains("RELAY_UPDATE_DEDUP_REJECTS.fetch_add"),
+                "{entry} must increment RELAY_UPDATE_DEDUP_REJECTS on dedup reject"
+            );
+        }
+    }
+
+    /// Pin: streaming drivers must claim via
+    /// `orphan_stream_registry().claim_or_wait` — this is the atomic
+    /// stream-level dedup that prevents duplicate assembly runs.
+    #[test]
+    fn slice_c_drivers_claim_orphan_stream() {
+        let src = include_str!("op_ctx_task.rs");
+        for driver in [
+            "drive_relay_request_update_streaming(",
+            "drive_relay_broadcast_to_streaming(",
+        ] {
+            let start = src
+                .find(&format!("async fn {driver}"))
+                .unwrap_or_else(|| panic!("{driver} not found"));
+            let after = &src[start + 1..];
+            let end = after
+                .find("\nasync fn ")
+                .or_else(|| after.find("\n#[cfg(test)]"))
+                .unwrap_or(after.len());
+            let driver_src = &src[start..start + 1 + end];
+            assert!(
+                driver_src.contains("orphan_stream_registry()"),
+                "{driver} must claim via orphan_stream_registry() for atomic \
+                 stream dedup"
+            );
+            assert!(
+                driver_src.contains("claim_or_wait("),
+                "{driver} must use claim_or_wait on the orphan stream registry"
+            );
+        }
+    }
+
+    /// Pin: streaming drivers are fire-and-forget. They MUST NOT call
+    /// `send_and_await` (no upstream reply) and MUST NOT call
+    /// `pipe_stream` (propagation is via BroadcastStateChange, not
+    /// explicit forward).
+    #[test]
+    fn slice_c_drivers_are_fire_and_forget() {
+        let src = include_str!("op_ctx_task.rs");
+        for driver in [
+            "drive_relay_request_update_streaming(",
+            "drive_relay_broadcast_to_streaming(",
+        ] {
+            let start = src
+                .find(&format!("async fn {driver}"))
+                .unwrap_or_else(|| panic!("{driver} not found"));
+            let after = &src[start + 1..];
+            let end = after
+                .find("\nasync fn ")
+                .or_else(|| after.find("\n#[cfg(test)]"))
+                .unwrap_or(after.len());
+            let driver_src = &src[start..start + 1 + end];
+            assert!(
+                !driver_src.contains(".send_and_await("),
+                "{driver} must not call send_and_await — UPDATE streaming is \
+                 fire-and-forget"
+            );
+            assert!(
+                !driver_src.contains(".pipe_stream("),
+                "{driver} must not call pipe_stream — streaming UPDATE relay \
+                 propagation is via BroadcastStateChange after local apply, \
+                 not explicit downstream piping"
+            );
+        }
+    }
+
+    /// Pin: `BroadcastToStreaming` driver must check dedup cache BEFORE
+    /// calling `update_contract`. If the order flips, duplicate
+    /// broadcasts re-run WASM merge and amplify cost.
+    #[test]
+    fn broadcast_to_streaming_dedup_runs_before_merge() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_broadcast_to_streaming(")
+            .expect("drive_relay_broadcast_to_streaming not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        let driver_src = &src[start..start + 1 + end];
+
+        let dedup_pos = driver_src
+            .find("broadcast_dedup_cache.check_and_insert")
+            .expect("dedup check missing in BroadcastToStreaming driver");
+        let merge_pos = driver_src
+            .find("super::update_contract(")
+            .expect("update_contract call missing in BroadcastToStreaming driver");
+        assert!(
+            dedup_pos < merge_pos,
+            "broadcast_dedup_cache.check_and_insert MUST appear before \
+             update_contract() in drive_relay_broadcast_to_streaming"
+        );
+    }
+
+    /// Pin: `BroadcastToStreaming` driver must classify failures via
+    /// `log_broadcast_to_streaming_failure` and spawn auto-fetch or
+    /// summary-back based on the result (mirror of slice A invariant).
+    #[test]
+    fn broadcast_to_streaming_classifies_failures() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_broadcast_to_streaming(")
+            .expect("drive_relay_broadcast_to_streaming not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        let driver_src = &src[start..start + 1 + end];
+
+        assert!(
+            driver_src.contains("log_broadcast_to_streaming_failure"),
+            "drive_relay_broadcast_to_streaming must call \
+             log_broadcast_to_streaming_failure for failure classification"
+        );
+        assert!(
+            driver_src.contains("try_auto_fetch_contract"),
+            "drive_relay_broadcast_to_streaming must call try_auto_fetch_contract \
+             on real (non-benign) failures for self-heal"
+        );
+        assert!(
+            driver_src.contains("send_summary_back_on_rejection"),
+            "drive_relay_broadcast_to_streaming must spawn \
+             send_summary_back_on_rejection on is_invalid_update_rejection"
+        );
+    }
+
+    /// Pin: `BroadcastToStreaming` driver must spawn the proactive
+    /// summary notification on successful state change (mirrors slice
+    /// A invariant at `broadcast_to_spawns_proactive_summary`).
+    #[test]
+    fn broadcast_to_streaming_spawns_proactive_summary() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_broadcast_to_streaming(")
+            .expect("drive_relay_broadcast_to_streaming not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        let driver_src = &src[start..start + 1 + end];
+        assert!(
+            driver_src.contains("send_proactive_summary_notification"),
+            "drive_relay_broadcast_to_streaming must spawn \
+             send_proactive_summary_notification on successful state change"
+        );
+    }
+
+    /// Pin: the streaming RAII guard must remove from
+    /// `active_relay_update_txs` and touch the slice-C-specific
+    /// counters on drop (not the slice A counters).
+    #[test]
+    fn streaming_raii_guard_clears_dedup_and_streaming_counters() {
+        let src = include_str!("op_ctx_task.rs");
+        let drop_start = src
+            .find("impl Drop for RelayUpdateStreamingInflightGuard")
+            .expect("RelayUpdateStreamingInflightGuard Drop impl not found");
+        let drop_body = &src[drop_start..drop_start + 700];
+        assert!(
+            drop_body.contains("active_relay_update_txs"),
+            "streaming guard Drop must remove from active_relay_update_txs"
+        );
+        assert!(
+            drop_body.contains("RELAY_UPDATE_STREAMING_INFLIGHT.fetch_sub"),
+            "streaming guard Drop must decrement RELAY_UPDATE_STREAMING_INFLIGHT"
+        );
+        assert!(
+            drop_body.contains("RELAY_UPDATE_STREAMING_COMPLETED_TOTAL.fetch_add"),
+            "streaming guard Drop must increment \
+             RELAY_UPDATE_STREAMING_COMPLETED_TOTAL"
         );
     }
 
