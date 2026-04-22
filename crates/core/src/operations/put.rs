@@ -2081,12 +2081,19 @@ mod tests {
         );
     }
 
-    // Tests for blocking_subscribe propagation on AwaitingResponse state
-    #[test]
-    fn awaiting_response_carries_blocking_subscribe_true() {
-        let op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
-            subscribe: true,
-            blocking_subscribe: true,
+    // Tests for blocking_subscribe propagation on AwaitingResponse state.
+    //
+    // Replace deleted `start_op_*` constructor tests: since the
+    // task-per-tx driver (operations/put/op_ctx_task.rs) owns the
+    // originator path, the `PrepareRequest` state was removed and the
+    // first reachable PutState is AwaitingResponse. These tests lock
+    // the behavior the deleted tests covered (blocking_subscribe
+    // propagation, stats-none on fresh op) against the new shape.
+
+    fn awaiting_response_data(subscribe: bool, blocking_subscribe: bool) -> AwaitingResponseData {
+        AwaitingResponseData {
+            subscribe,
+            blocking_subscribe,
             next_hop: None,
             current_htl: 10,
             contract_key: make_contract_key(0),
@@ -2095,16 +2102,77 @@ mod tests {
             attempts_at_hop: 1,
             visited: VisitedPeers::default(),
             retry_payload: None,
-        })));
+        }
+    }
+
+    #[test]
+    fn awaiting_response_carries_blocking_subscribe_true() {
+        let op = make_put_op(Some(PutState::AwaitingResponse(awaiting_response_data(
+            true, true,
+        ))));
         match op.state {
-            Some(PutState::AwaitingResponse(data)) => {
-                assert!(
-                    data.blocking_subscribe,
-                    "blocking_subscribe should be true in AwaitingResponse"
-                );
-            }
+            Some(PutState::AwaitingResponse(data)) => assert!(
+                data.blocking_subscribe,
+                "blocking_subscribe should be true in AwaitingResponse"
+            ),
             other => panic!("Expected AwaitingResponse state, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn awaiting_response_with_explicit_tx_carries_blocking_subscribe_true() {
+        // Covers the removed start_op_with_id_propagates_blocking_subscribe_true:
+        // verify an explicit tx is preserved on the originator-side state.
+        let tx = Transaction::new::<PutMsg>();
+        let op = PutOp {
+            id: tx,
+            state: Some(PutState::AwaitingResponse(awaiting_response_data(
+                true, true,
+            ))),
+            upstream_addr: None,
+            stats: None,
+            ack_received: false,
+            speculative_paths: 0,
+        };
+        assert_eq!(op.id, tx, "explicit tx must round-trip into PutOp.id");
+        match op.state {
+            Some(PutState::AwaitingResponse(data)) => assert!(
+                data.blocking_subscribe,
+                "blocking_subscribe carries through AwaitingResponse when constructed with explicit tx"
+            ),
+            other => panic!("Expected AwaitingResponse state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn awaiting_response_defaults_blocking_subscribe_false() {
+        // Covers the removed start_op_defaults_blocking_subscribe_false:
+        // subscribe=true + blocking_subscribe=false is a valid combo.
+        let op = make_put_op(Some(PutState::AwaitingResponse(awaiting_response_data(
+            true, false,
+        ))));
+        match op.state {
+            Some(PutState::AwaitingResponse(data)) => assert!(
+                !data.blocking_subscribe,
+                "blocking_subscribe should be false when unset, even if subscribe=true"
+            ),
+            other => panic!("Expected AwaitingResponse state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fresh_awaiting_response_op_has_no_stats() {
+        // Covers the removed start_op_creates_put_with_no_stats: a freshly
+        // spawned originator-side PutOp has stats=None until a target peer
+        // is chosen, so outcome() must be Incomplete.
+        let op = make_put_op(Some(PutState::AwaitingResponse(awaiting_response_data(
+            false, false,
+        ))));
+        assert!(
+            op.stats.is_none(),
+            "fresh AwaitingResponse PutOp should have stats=None"
+        );
+        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
     }
 
     // Tests for outcome() method
