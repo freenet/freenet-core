@@ -24,9 +24,8 @@ paths:
 > state-machine path**, which still serves: GC-spawned GET retries and
 > `start_targeted_op` UPDATE-triggered auto-fetch (streaming relay and
 > originator loopback also remain on legacy per #3883 port plan §7),
-> PUT GC / streaming / originator-loopback paths, UPDATE relay
-> streaming variants (`RequestUpdateStreaming`, `BroadcastToStreaming`)
-> and the deprecated `Broadcasting` wire variant, CONNECT, and
+> PUT GC / streaming / originator-loopback paths, the deprecated
+> UPDATE `Broadcasting` wire variant (no-op handler), CONNECT, and
 > SUBSCRIBE's renewal / PUT-sub-op / executor / intermediate-peer
 > entry points. Phase 5 follow-up slice A (PR #3910) migrated fresh
 > inbound non-streaming relay `UpdateMsg::RequestUpdate` and
@@ -70,7 +69,23 @@ paths:
 > `announce_contract_hosted` on the relayed path (relay is not itself
 > a subscriber; prevents the #3763 subscription-storm feedback loop).
 > Slices B (streaming variants for GET/PUT/UPDATE) and C (legacy arm
-> cleanup) follow.
+> cleanup) follow. Phase 5 follow-up slice C migrated fresh inbound
+> streaming relay `UpdateMsg::RequestUpdateStreaming` and
+> `UpdateMsg::BroadcastToStreaming` to
+> `operations/update/op_ctx_task.rs::start_relay_request_update_streaming`
+> / `start_relay_broadcast_to_streaming` (same
+> `source_addr.is_some()` AND `!has_update_op(id)` gate as slice A).
+> Streaming UPDATE relays are fire-and-forget — the drivers claim the
+> inbound stream via `orphan_stream_registry().claim_or_wait`,
+> assemble the payload, apply locally via `update_contract`, and rely
+> on `BroadcastStateChange` for network propagation. No downstream
+> `pipe_stream`, no upstream reply. The `BroadcastToStreaming` driver
+> reuses the shared `log_broadcast_to_streaming_failure` classifier
+> and triggers `try_auto_fetch_contract` / `send_summary_back_on_rejection`
+> on the same branches as the legacy handler. The deprecated
+> `UpdateMsg::Broadcasting` wire variant remains on the legacy no-op
+> handler; Phase 6 wire cleanup will delete both the legacy streaming
+> arms in `update.rs:871-1366` and the `Broadcasting` variant.
 >
 > Task-per-tx drivers have their own invariants documented in the
 > `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.

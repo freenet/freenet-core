@@ -1721,7 +1721,11 @@ fn log_update_contract_failure(key: &ContractKey, err: &ExecutorError) {
 /// takes `&ExecutorError` because the two call sites have different error
 /// types in scope (the streaming branch operates on the OpError already
 /// produced by `update_contract`'s `Err(err.into())`).
-fn log_broadcast_to_streaming_failure(tx: &Transaction, key: &ContractKey, err: &OpError) -> bool {
+pub(crate) fn log_broadcast_to_streaming_failure(
+    tx: &Transaction,
+    key: &ContractKey,
+    err: &OpError,
+) -> bool {
     if err.is_invalid_update_rejection() {
         tracing::info!(
             tx = %tx,

@@ -73,17 +73,21 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              fire-and-forget) + fresh inbound non-streaming
                              relay UPDATE drivers (Phase 5 follow-up slice
                              A, PR #3910: `start_relay_request_update`,
-                             `start_relay_broadcast_to`)
+                             `start_relay_broadcast_to`) + fresh inbound
+                             streaming relay UPDATE drivers (Phase 5
+                             follow-up slice C:
+                             `start_relay_request_update_streaming`,
+                             `start_relay_broadcast_to_streaming` —
+                             claim inbound stream, assemble, apply
+                             locally; BroadcastStateChange propagates)
     All four relay drivers share the per-node dedup gate pattern
     (`active_relay_{get,update,put,subscribe}_txs`) and the
-    `Relay*InflightGuard` RAII. PUT streaming relays now run on the
-    task-per-tx path (slice B, `start_relay_put_streaming`).
-    Streaming UPDATE relay variants (`RequestUpdateStreaming`,
-    `BroadcastToStreaming`) and the deprecated `Broadcasting` wire
-    variant remain on legacy pending future slices. SUBSCRIBE has no
-    streaming variants but renewals, PUT sub-op subscribes, executor
-    auto-subscribe paths, `Unsubscribe`, and `ForwardingAck` all stay
-    on the legacy state machine.
+    `Relay*InflightGuard` RAII. PUT and UPDATE streaming relays now run
+    on the task-per-tx path. The deprecated UPDATE `Broadcasting` wire
+    variant remains on the legacy no-op handler (Phase 6 wire cleanup
+    removes it). SUBSCRIBE has no streaming variants but renewals, PUT
+    sub-op subscribes, executor auto-subscribe paths, `Unsubscribe`,
+    and `ForwardingAck` all stay on the legacy state machine.
 ```
 
 ## Module Map

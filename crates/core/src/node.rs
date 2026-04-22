@@ -1324,10 +1324,12 @@ where
                 // to the legacy path. Existing UpdateOp means GC-spawned
                 // retry or pre-registered op: also fall through.
                 //
-                // Streaming variants (RequestUpdateStreaming /
-                // BroadcastToStreaming) and the deprecated Broadcasting
-                // wire variant stay on the legacy path in slice A — see
-                // port plan §3 / §9.
+                // Slice C (PR for phase 5) additionally dispatches
+                // streaming variants (RequestUpdateStreaming /
+                // BroadcastToStreaming) through task-per-tx drivers
+                // under the same source_addr + !has_update_op gates.
+                // The deprecated Broadcasting wire variant stays on
+                // the legacy path (no-op handler).
                 if let Some(sender_addr) = source_addr {
                     #[allow(clippy::wildcard_enum_match_arm)]
                     match op {
@@ -1381,13 +1383,68 @@ where
                             }
                             return Ok(None);
                         }
-                        // Streaming variants (RequestUpdateStreaming /
-                        // BroadcastToStreaming), deprecated Broadcasting,
-                        // existing UpdateOp, or guarded RequestUpdate /
-                        // BroadcastTo with has_update_op == true → legacy
-                        // path. Wildcard arm exists ONLY to satisfy
-                        // non-exhaustive matches against the slice-A
-                        // dispatch gate; do not expand.
+                        // #1454 phase 5 follow-up (slice C): streaming
+                        // relay UPDATE dispatch. Fire-and-forget:
+                        // claim stream → assemble → apply →
+                        // BroadcastStateChange fans out automatically.
+                        update::UpdateMsg::RequestUpdateStreaming {
+                            id,
+                            key,
+                            stream_id,
+                            total_size,
+                        } if !op_manager.has_update_op(id) => {
+                            if let Err(err) =
+                                update::op_ctx_task::start_relay_request_update_streaming(
+                                    op_manager.clone(),
+                                    *id,
+                                    *key,
+                                    *stream_id,
+                                    *total_size,
+                                    sender_addr,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    %key,
+                                    error = %err,
+                                    "UPDATE relay dispatch: start_relay_request_update_streaming failed"
+                                );
+                            }
+                            return Ok(None);
+                        }
+                        update::UpdateMsg::BroadcastToStreaming {
+                            id,
+                            key,
+                            stream_id,
+                            total_size,
+                        } if !op_manager.has_update_op(id) => {
+                            if let Err(err) =
+                                update::op_ctx_task::start_relay_broadcast_to_streaming(
+                                    op_manager.clone(),
+                                    *id,
+                                    *key,
+                                    *stream_id,
+                                    *total_size,
+                                    sender_addr,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    %key,
+                                    error = %err,
+                                    "UPDATE relay dispatch: start_relay_broadcast_to_streaming failed"
+                                );
+                            }
+                            return Ok(None);
+                        }
+                        // Deprecated `Broadcasting` variant stays legacy
+                        // (no-op handler). Pre-registered UpdateOps
+                        // (has_update_op == true) also fall through to
+                        // legacy for GC / originator-loopback paths.
+                        // Wildcard arm exists ONLY to satisfy
+                        // non-exhaustive matches; do not expand.
                         _ => {}
                     }
                 }
@@ -3872,8 +3929,12 @@ mod tests {
             );
         }
 
+        /// Slice C (#1454 phase 5): streaming relay UPDATE variants
+        /// are now dispatched through task-per-tx drivers. The
+        /// deprecated `Broadcasting` wire variant stays on the legacy
+        /// no-op path.
         #[test]
-        fn update_branch_does_not_dispatch_streaming_or_broadcasting() {
+        fn update_branch_dispatches_streaming_drivers_but_not_broadcasting() {
             const SOURCE: &str = include_str!("node.rs");
 
             let anchor = "NetMessageV1::Update(ref op) => {";
@@ -3884,25 +3945,53 @@ mod tests {
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
 
-            // Streaming + Broadcasting variants stay on legacy path in slice A.
-            // Drivers must not be invoked for them.
             assert!(
-                !window.contains("RequestUpdateStreaming {")
-                    || window.contains("// Streaming variants"),
-                "UPDATE branch appears to dispatch RequestUpdateStreaming through \
-                 the relay driver. Slice A keeps streaming on the legacy path."
+                window.contains("start_relay_request_update_streaming("),
+                "UPDATE branch must call start_relay_request_update_streaming \
+                 for streaming relay dispatch (slice C)."
             );
             assert!(
-                !window.contains("BroadcastToStreaming {")
-                    || window.contains("// Streaming variants"),
-                "UPDATE branch appears to dispatch BroadcastToStreaming through \
-                 the relay driver. Slice A keeps streaming on the legacy path."
+                window.contains("start_relay_broadcast_to_streaming("),
+                "UPDATE branch must call start_relay_broadcast_to_streaming \
+                 for streaming relay dispatch (slice C)."
             );
             assert!(
                 !window.contains("UpdateMsg::Broadcasting {"),
-                "UPDATE branch dispatches deprecated Broadcasting variant through \
-                 the relay driver. Broadcasting must stay on the legacy path."
+                "UPDATE branch must not dispatch the deprecated Broadcasting \
+                 variant — it stays on the legacy no-op handler."
             );
+        }
+
+        /// Pin: the slice C streaming dispatch arms MUST be guarded by
+        /// `has_update_op`. Without the guard, pre-registered UpdateOps
+        /// (GC / originator-loopback) would be stolen from the legacy
+        /// state machine mid-flight, losing `load_or_init`/`push`
+        /// bookkeeping that those paths still depend on.
+        #[test]
+        fn update_streaming_arms_gate_on_has_update_op() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            for arm_anchor in [
+                "update::UpdateMsg::RequestUpdateStreaming {",
+                "update::UpdateMsg::BroadcastToStreaming {",
+            ] {
+                let arm_start = SOURCE
+                    .find(arm_anchor)
+                    .unwrap_or_else(|| panic!("{arm_anchor} arm not found in UPDATE dispatch"));
+                // Scope: from arm header to its closing `return Ok(None);`
+                // — covers the match-guard clause + body.
+                let after = &SOURCE[arm_start..];
+                let arm_end = after
+                    .find("return Ok(None);")
+                    .expect("streaming arm must return Ok(None) after driver spawn");
+                let arm_src = &SOURCE[arm_start..arm_start + arm_end];
+                assert!(
+                    arm_src.contains("!op_manager.has_update_op(id)"),
+                    "streaming arm {arm_anchor} must be gated on \
+                     !op_manager.has_update_op(id); pre-registered UpdateOps \
+                     must fall through to legacy."
+                );
+            }
         }
 
         // ── Relay PUT dispatch structural pin tests (#1454 phase 5
