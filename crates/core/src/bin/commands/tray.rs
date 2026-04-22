@@ -654,21 +654,25 @@ pub fn open_log_file() {
 
     match latest {
         Some(path) => {
+            // Null stdio on all three handles. On Windows this is required
+            // because the tray wrapper calls `FreeConsole()` at startup (and
+            // has no console at all when launched by Windows autostart),
+            // which invalidates the inherited standard handles. Without
+            // explicit nulling, `spawn()` fails with "The handle is invalid"
+            // (os error 6) and View Logs silently does nothing — see #3933.
+            // Null stdio is harmless on macOS/Linux: the GUI viewers don't
+            // use stdin/stdout/stderr.
             #[cfg(target_os = "windows")]
-            {
-                std::process::Command::new("notepad")
-                    .arg(&path)
-                    .spawn()
-                    .ok();
-            }
+            let mut cmd = std::process::Command::new("notepad");
             #[cfg(target_os = "macos")]
-            {
-                std::process::Command::new("open").arg(&path).spawn().ok();
-            }
+            let mut cmd = std::process::Command::new("open");
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                drop(std::process::Command::new("xdg-open").arg(&path).spawn());
-            }
+            let mut cmd = std::process::Command::new("xdg-open");
+            cmd.arg(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            drop(cmd.spawn());
         }
         None => {
             eprintln!("No log files found in {}", log_dir.display());

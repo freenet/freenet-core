@@ -1221,9 +1221,23 @@ fn run_wrapper(version: &str) -> Result<()> {
 /// Spawn `freenet update --quiet` and wait for it to complete.
 /// On Windows, uses `CREATE_NO_WINDOW` to avoid flashing a console window
 /// (the wrapper has already detached from the console via `FreeConsole`).
+///
+/// stdin/stdout/stderr are nulled on every platform. On Windows this is
+/// load-bearing: the wrapper has already called `FreeConsole()` (and may
+/// never have had a console at all when launched by autostart), so
+/// inheriting the parent's invalid standard handles makes `spawn()` fail
+/// with "The handle is invalid" (os error 6). Without these nulls, the
+/// update subprocess silently fails to start and the wrapper falls into
+/// the exit-42 / update-failed / backoff-relaunch loop documented in
+/// #3934 (which was also the root cause of "Check for Updates" being
+/// broken in #3933). Null stdio is harmless on macOS/Linux because
+/// `--quiet` already suppresses all output.
 fn spawn_update_command(exe_path: &Path) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(exe_path);
-    cmd.args(["update", "--quiet"]);
+    cmd.args(["update", "--quiet"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     #[cfg(target_os = "windows")]
     {
@@ -1672,26 +1686,42 @@ fn run_wrapper_loop(
             }
 
             let result = spawn_update_command(&exe_path);
+            let outcome = super::update::classify_update_subprocess(&result);
             // macOS DMG-swap: if the update subprocess exits with the
             // bundle-staged code, the detached updater takes over after
             // this process exits. We must not re-exec or retry; just
             // return Ok so the wrapper exits cleanly and the updater can
             // swap /Applications/Freenet.app.
-            if let Ok(ref s) = result {
-                if s.code() == Some(super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED) {
-                    log_wrapper_event(
-                        log_dir,
-                        "Bundle update staged during auto-update; exiting for updater",
-                    );
-                    #[cfg(any(target_os = "windows", target_os = "macos"))]
-                    if let Some((_, status_tx)) = tray {
-                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                    }
-                    return Ok(());
+            if outcome == super::update::UpdateSubprocessOutcome::BundleUpdateStaged {
+                super::auto_update::clear_update_failures();
+                log_wrapper_event(
+                    log_dir,
+                    "Bundle update staged during auto-update; exiting for updater",
+                );
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                if let Some((_, status_tx)) = tray {
+                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
                 }
+                return Ok(());
             }
-            let ok = result.map(|s| s.success()).unwrap_or(false);
 
+            // Record / clear the persistent auto-update failure counter
+            // used by `check_if_update_available` to break the exit-42
+            // restart loop (#3934) when installs fail persistently.
+            // `AlreadyUpToDate` is a benign race (child said update needed,
+            // binary already current) — don't count it toward the lockout.
+            match outcome {
+                super::update::UpdateSubprocessOutcome::BinaryReplaced => {
+                    super::auto_update::clear_update_failures();
+                }
+                super::update::UpdateSubprocessOutcome::Failed => {
+                    super::auto_update::record_update_failure();
+                }
+                super::update::UpdateSubprocessOutcome::AlreadyUpToDate
+                | super::update::UpdateSubprocessOutcome::BundleUpdateStaged => {}
+            }
+
+            let ok = outcome == super::update::UpdateSubprocessOutcome::BinaryReplaced;
             if ok {
                 log_wrapper_event(log_dir, "Update successful, restarting...");
             } else {
@@ -1787,8 +1817,25 @@ fn run_wrapper_loop(
                             if let Some((_, status_tx)) = tray {
                                 status_tx.send(WrapperStatus::Updating).ok();
                                 let result = spawn_update_command(&exe_path);
-                                match result {
-                                    Ok(s) if s.success() => {
+                                let outcome = super::update::classify_update_subprocess(&result);
+                                // Drive the persistent failure counter (used
+                                // by check_if_update_available to break the
+                                // exit-42 loop in #3934) consistently with
+                                // the auto-update path above. AlreadyUpToDate
+                                // is not a failure; BundleUpdateStaged will
+                                // finish in a detached updater.
+                                match outcome {
+                                    super::update::UpdateSubprocessOutcome::BinaryReplaced
+                                    | super::update::UpdateSubprocessOutcome::BundleUpdateStaged => {
+                                        super::auto_update::clear_update_failures();
+                                    }
+                                    super::update::UpdateSubprocessOutcome::Failed => {
+                                        super::auto_update::record_update_failure();
+                                    }
+                                    super::update::UpdateSubprocessOutcome::AlreadyUpToDate => {}
+                                }
+                                match outcome {
+                                    super::update::UpdateSubprocessOutcome::BinaryReplaced => {
                                         log_wrapper_event(
                                             log_dir,
                                             "Update installed during backoff, restarting wrapper...",
@@ -1801,12 +1848,7 @@ fn run_wrapper_loop(
                                         state.consecutive_failures = 0;
                                         break;
                                     }
-                                    Ok(s)
-                                        if s.code()
-                                            == Some(
-                                                super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED,
-                                            ) =>
-                                    {
+                                    super::update::UpdateSubprocessOutcome::BundleUpdateStaged => {
                                         log_wrapper_event(
                                             log_dir,
                                             "Bundle update staged during backoff; exiting for updater",
@@ -1814,15 +1856,19 @@ fn run_wrapper_loop(
                                         status_tx.send(WrapperStatus::UpdatedRestarting).ok();
                                         return Ok(());
                                     }
-                                    Ok(_) => {
+                                    super::update::UpdateSubprocessOutcome::AlreadyUpToDate => {
                                         log_wrapper_event(log_dir, "No update available");
                                         status_tx.send(WrapperStatus::UpToDate).ok();
                                     }
-                                    Err(e) => {
-                                        log_wrapper_event(
-                                            log_dir,
-                                            &format!("Update check failed: {e}"),
-                                        );
+                                    super::update::UpdateSubprocessOutcome::Failed => {
+                                        let msg = match &result {
+                                            Err(e) => format!("Update check failed: {e}"),
+                                            Ok(s) => format!(
+                                                "Update check failed with exit code {:?}",
+                                                s.code()
+                                            ),
+                                        };
+                                        log_wrapper_event(log_dir, &msg);
                                         status_tx.send(WrapperStatus::Stopped).ok();
                                     }
                                 }

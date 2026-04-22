@@ -38,7 +38,6 @@ pub const EXIT_CODE_BUNDLE_UPDATE_STAGED: i32 = 44;
 /// the `Some(...)` arm at one of them would route the wrapper into
 /// re-exec'ing a bundle that's about to be replaced out from under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum UpdateSubprocessOutcome {
     /// In-place binary replacement succeeded. Wrapper should re-exec via
     /// `spawn_new_wrapper` so the tray reflects the new version.
@@ -57,7 +56,6 @@ pub enum UpdateSubprocessOutcome {
 /// Classify the exit status of a `freenet update` subprocess invocation.
 /// Pure over just the `io::Result<ExitStatus>` so it can be unit-tested
 /// with synthetic inputs.
-#[allow(dead_code)]
 pub fn classify_update_subprocess(
     result: &std::io::Result<std::process::ExitStatus>,
 ) -> UpdateSubprocessOutcome {
@@ -306,6 +304,15 @@ impl UpdateCommand {
 
         let current_exe = std::env::current_exe().context("Failed to get current executable")?;
         replace_binary(&extracted_freenet, &current_exe)?;
+
+        // A successful in-place install clears the persistent failure
+        // counter that gates `check_if_update_available` (#3934). This
+        // matters for manual `freenet update` from a terminal: without it,
+        // once a user hit the MAX_UPDATE_FAILURES lockout (e.g. prior
+        // replace_binary failures on Windows), even a successful manual
+        // install would leave the counter stuck and auto-update would
+        // stay disabled.
+        super::auto_update::clear_update_failures();
 
         if !self.quiet {
             println!(
