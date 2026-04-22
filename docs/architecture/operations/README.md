@@ -112,14 +112,21 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PrepareRequest
-    PrepareRequest --> AwaitingResponse : send to network
+    [*] --> AwaitingResponse : task-per-tx driver emits Request
     AwaitingResponse --> Finished : acknowledgment received
 
-    PrepareRequest : contract, value, htl, subscribe flag
-    AwaitingResponse : forwarding to peers
+    AwaitingResponse : contract, value, htl, subscribe flag;<br/>forwarding to peers
     Finished : stored successfully
 ```
+
+**Note:** Since #1454 Phase 3a, PUT originators no longer transition
+through a `PrepareRequest` state — the task-per-transaction driver
+(`operations/put/op_ctx_task.rs::start_client_put`) constructs the
+`Request` message and registers the op directly in `AwaitingResponse`.
+Relay PUTs (inbound `Request`/`RequestStreaming` from peers) are
+driven by `start_relay_put` / `start_relay_put_streaming` without
+materializing an `AwaitingResponse` state at all — the driver bubbles
+the upstream `Response` when the downstream ack arrives.
 
 **Key features:**
 - Hop-by-hop routing toward contract location

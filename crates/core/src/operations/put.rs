@@ -472,11 +472,11 @@ impl Operation for PutOp {
             // Extract subscribe flags from state (only relevant for originator)
             let subscribe = match &self.state {
                 Some(PutState::AwaitingResponse(data)) => data.subscribe,
-                _ => false,
+                Some(PutState::Finished(_)) | None => false,
             };
             let blocking_subscribe = match &self.state {
                 Some(PutState::AwaitingResponse(data)) => data.blocking_subscribe,
-                _ => false,
+                Some(PutState::Finished(_)) | None => false,
             };
 
             match input {

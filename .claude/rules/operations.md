@@ -50,7 +50,7 @@ paths:
 > downstream piping via `NetworkBridge::pipe_stream`, assembles
 > locally via the shared `relay_put_store_locally` helper, and
 > bubbles a non-streaming `PutMsg::Response` upstream (mirrors the
-> legacy downgrade at `put.rs:1506`). The dispatch site passes a
+> legacy downgrade at `put.rs:1517`). The dispatch site passes a
 > cloned `NetworkBridge` into the spawn so the driver can call
 > `pipe_stream` without a detour through `OpCtx`. The upgrade-only
 > case — `PutMsg::Request` whose serialized payload would exceed
