@@ -433,7 +433,12 @@ jobs:
           cp artifacts/x86_64-windows-freenet/freenet.exe freenet.exe
 
           # macOS universal installer (signed + notarized)
+          # Upload both the versioned name (Freenet-X.Y.Z.dmg) and a
+          # stable alias (Freenet.dmg) so the quickstart page can link
+          # to /releases/latest/download/Freenet.dmg without hardcoding
+          # a version.
           cp artifacts/macos-dmg/Freenet-*.dmg .
+          cp artifacts/macos-dmg/Freenet-*.dmg Freenet.dmg
 
           # Display the created files
           ls -lh *.tar.gz *.zip *.exe *.dmg
