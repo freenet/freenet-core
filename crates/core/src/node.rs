@@ -3962,6 +3962,38 @@ mod tests {
             );
         }
 
+        /// Pin: the slice C streaming dispatch arms MUST be guarded by
+        /// `has_update_op`. Without the guard, pre-registered UpdateOps
+        /// (GC / originator-loopback) would be stolen from the legacy
+        /// state machine mid-flight, losing `load_or_init`/`push`
+        /// bookkeeping that those paths still depend on.
+        #[test]
+        fn update_streaming_arms_gate_on_has_update_op() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            for arm_anchor in [
+                "update::UpdateMsg::RequestUpdateStreaming {",
+                "update::UpdateMsg::BroadcastToStreaming {",
+            ] {
+                let arm_start = SOURCE
+                    .find(arm_anchor)
+                    .unwrap_or_else(|| panic!("{arm_anchor} arm not found in UPDATE dispatch"));
+                // Scope: from arm header to its closing `return Ok(None);`
+                // — covers the match-guard clause + body.
+                let after = &SOURCE[arm_start..];
+                let arm_end = after
+                    .find("return Ok(None);")
+                    .expect("streaming arm must return Ok(None) after driver spawn");
+                let arm_src = &SOURCE[arm_start..arm_start + arm_end];
+                assert!(
+                    arm_src.contains("!op_manager.has_update_op(id)"),
+                    "streaming arm {arm_anchor} must be gated on \
+                     !op_manager.has_update_op(id); pre-registered UpdateOps \
+                     must fall through to legacy."
+                );
+            }
+        }
+
         // ── Relay PUT dispatch structural pin tests (#1454 phase 5
         // follow-up slice A). Mirror of the UPDATE tests above.
 

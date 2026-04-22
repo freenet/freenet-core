@@ -1079,6 +1079,23 @@ async fn drive_relay_broadcast_to(
 // `claim_or_wait`; tx-level dedup is handled by `active_relay_update_txs`.
 // These are complementary — fragment metadata may arrive on a new tx
 // while tx dedup catches wire-level retries of the metadata message.
+//
+// # Why tx dedup is held across `claim_or_wait`'s timeout window
+//
+// The driver inserts into `active_relay_update_txs` BEFORE calling
+// `claim_or_wait`. Worst case (attacker sends a bogus
+// `RequestUpdateStreaming` with a fabricated `stream_id` whose
+// fragments never arrive), the tx entry is held for up to
+// `STREAM_CLAIM_TIMEOUT` (60s) before the RAII guard drops and frees
+// it. This is deliberate: releasing the tx entry before
+// `claim_or_wait` returns would let a duplicate metadata message
+// spawn a parallel driver that would also block on `claim_or_wait` —
+// amplifying work and producing duplicate telemetry on eventual
+// fragment arrival. The 60s hold is bounded, per-tx (not per-peer),
+// and the stream-level dedup inside `orphan_stream_registry` still
+// short-circuits real duplicates. Operators monitoring
+// `RELAY_UPDATE_STREAMING_INFLIGHT` will see anomalous growth if a
+// peer floods bogus stream_ids — that's the intended signal.
 
 /// Spawn a relay driver for a fresh inbound
 /// `UpdateMsg::RequestUpdateStreaming`.
@@ -2240,6 +2257,22 @@ mod tests {
             drop_body.contains("RELAY_UPDATE_STREAMING_COMPLETED_TOTAL.fetch_add"),
             "streaming guard Drop must increment \
              RELAY_UPDATE_STREAMING_COMPLETED_TOTAL"
+        );
+    }
+
+    /// Pin: `log_broadcast_to_streaming_failure` must stay `pub(crate)`
+    /// so the slice C driver can reuse the shared classifier. If Phase 6
+    /// cleanup re-privatises it, the driver's failure branch breaks
+    /// silently — this pin trips at compile-ish time (source-level scan)
+    /// instead.
+    #[test]
+    fn log_broadcast_to_streaming_failure_is_pub_crate() {
+        let src = include_str!("../update.rs");
+        assert!(
+            src.contains("pub(crate) fn log_broadcast_to_streaming_failure("),
+            "log_broadcast_to_streaming_failure must remain pub(crate) — \
+             slice C driver reuses it for failure classification; \
+             re-privatising breaks drive_relay_broadcast_to_streaming"
         );
     }
 
