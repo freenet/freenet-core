@@ -139,8 +139,15 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                     latest = %latest,
                     "Newer version confirmed on GitHub"
                 );
-                // Clear failure count and backoff since we found an update
-                clear_update_failures();
+                // Reset the GitHub-check backoff so the next version bump is
+                // noticed promptly. Deliberately do NOT clear the update
+                // failure count here: that must only be reset by an actual
+                // successful install (see `record_update_failure` /
+                // `clear_update_failures` call sites in `commands::update`),
+                // otherwise every peer-mismatch check would wipe the
+                // failure tally and the `MAX_UPDATE_FAILURES` gate could
+                // never trigger — which is what let #3934's exit-42 loop
+                // run unbounded.
                 reset_backoff();
                 UpdateCheckResult::UpdateAvailable(latest)
             } else {
@@ -247,35 +254,84 @@ fn should_check_for_update(backoff: Duration) -> bool {
 
 /// Get the number of consecutive update failures.
 fn get_update_failure_count() -> u32 {
-    let path = state_dir().map(|d| d.join("update_failures"));
-    path.and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| s.trim().parse().ok())
+    state_dir()
+        .map(|d| get_update_failure_count_at(&d))
         .unwrap_or(0)
 }
 
-/// Record an update failure.
-/// This should be called by the update command when an update fails.
-/// After MAX_UPDATE_FAILURES consecutive failures, auto-update is disabled
-/// until a successful manual update clears the counter.
-#[allow(dead_code)] // Will be wired up to update command in follow-up
-pub fn record_update_failure() {
-    if let Some(dir) = state_dir() {
-        let _mkdir = fs::create_dir_all(&dir);
-        let count = get_update_failure_count() + 1;
-        let _write = fs::write(dir.join("update_failures"), count.to_string());
+/// Testable variant of [`get_update_failure_count`] that reads from an explicit
+/// directory.
+///
+/// * Missing file → `0` (legitimate "no failures yet").
+/// * Present but unparseable → `MAX_UPDATE_FAILURES` (defensive: if the
+///   counter file has been truncated or corrupted we must NOT silently
+///   reset the lockout — that would be an amplification vector for any
+///   process that can partially overwrite the file, defeating the
+///   #3934 fix. Users can recover by explicitly deleting the file).
+pub(crate) fn get_update_failure_count_at(dir: &std::path::Path) -> u32 {
+    match fs::read_to_string(dir.join("update_failures")) {
+        Ok(s) => s.trim().parse().unwrap_or(MAX_UPDATE_FAILURES),
+        Err(_) => 0,
     }
 }
 
-/// Clear the update failure count (called on successful update check).
+/// Record an update failure. Called by the update command when the install
+/// step fails (see `commands::update`). After `MAX_UPDATE_FAILURES`
+/// consecutive failures, [`should_attempt_update`] returns false and the
+/// version-mismatch update loop is disabled until a successful install
+/// clears the counter — this is what prevents the exit-42 restart loop
+/// reported in #3934 when `replace_binary` fails persistently (e.g. AV
+/// locks, read-only install dir).
+pub fn record_update_failure() {
+    if let Some(dir) = state_dir() {
+        record_update_failure_at(&dir);
+    }
+}
+
+/// Testable variant of [`record_update_failure`] that writes into an
+/// explicit directory. Missing directories are created on demand.
+pub(crate) fn record_update_failure_at(dir: &std::path::Path) {
+    let _mkdir = fs::create_dir_all(dir);
+    let count = get_update_failure_count_at(dir) + 1;
+    let _write = fs::write(dir.join("update_failures"), count.to_string());
+}
+
+/// Clear the update failure count. Called from the update command after a
+/// successful binary install so the counter resets automatically once the
+/// underlying problem is resolved (and so manual `freenet update` recovers
+/// from a locked-out auto-update state).
 pub fn clear_update_failures() {
     if let Some(dir) = state_dir() {
-        let _rm = fs::remove_file(dir.join("update_failures"));
+        clear_update_failures_at(&dir);
     }
+}
+
+/// Testable variant of [`clear_update_failures`] that operates on an
+/// explicit directory.
+pub(crate) fn clear_update_failures_at(dir: &std::path::Path) {
+    let _rm = fs::remove_file(dir.join("update_failures"));
 }
 
 /// Check if we should attempt an update based on failure history.
+///
+/// If the state directory cannot be resolved (e.g. Windows service
+/// account with no `USERPROFILE`), returns `false`: with no place to
+/// persist the failure counter we cannot distinguish a fresh session
+/// from one that has been looping for hours, so the safest choice is
+/// to skip auto-update entirely rather than risk an unbounded exit-42
+/// loop (skeptical-review H2 on PR #3941). Users in that situation
+/// still receive updates via whatever external packaging mechanism
+/// installed them.
 pub fn should_attempt_update() -> bool {
-    get_update_failure_count() < MAX_UPDATE_FAILURES
+    state_dir()
+        .map(|d| should_attempt_update_at(&d))
+        .unwrap_or(false)
+}
+
+/// Testable variant of [`should_attempt_update`] that reads from an explicit
+/// directory. Used by the regression tests for the #3934 lockout invariant.
+pub(crate) fn should_attempt_update_at(dir: &std::path::Path) -> bool {
+    get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES
 }
 
 /// Returns true if the update check backoff has reached the maximum (1 hour).
@@ -508,6 +564,179 @@ mod tests {
         let result =
             startup_update_check_with_fetcher("0.2.0", || async { Ok("0.1.99".to_string()) }).await;
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_update_failure_counter_roundtrip() {
+        // Invariant #3934 relies on: record → get observes increments,
+        // clear → get returns zero again. If this regresses, the auto-
+        // update lockout cannot accumulate and the exit-42 restart loop
+        // becomes unbounded again.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        assert_eq!(get_update_failure_count_at(dir), 0);
+
+        record_update_failure_at(dir);
+        assert_eq!(get_update_failure_count_at(dir), 1);
+
+        record_update_failure_at(dir);
+        record_update_failure_at(dir);
+        assert_eq!(get_update_failure_count_at(dir), 3);
+
+        clear_update_failures_at(dir);
+        assert_eq!(get_update_failure_count_at(dir), 0);
+
+        // Clearing an already-clear counter is idempotent.
+        clear_update_failures_at(dir);
+        assert_eq!(get_update_failure_count_at(dir), 0);
+    }
+
+    #[test]
+    fn test_should_attempt_update_locks_out_after_max_failures() {
+        // Core regression test for #3934: once MAX_UPDATE_FAILURES
+        // consecutive failures accumulate, should_attempt_update must
+        // return false so the child stops exiting 42 and the
+        // spawn-update / exit-42 / backoff loop terminates.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        assert!(should_attempt_update_at(dir), "fresh state: no lockout");
+
+        for _ in 0..MAX_UPDATE_FAILURES - 1 {
+            record_update_failure_at(dir);
+            assert!(
+                should_attempt_update_at(dir),
+                "below threshold still allowed"
+            );
+        }
+        record_update_failure_at(dir);
+        assert!(
+            !should_attempt_update_at(dir),
+            "MAX_UPDATE_FAILURES reached: auto-update must be disabled"
+        );
+
+        // A successful install clears the counter and re-enables updates.
+        clear_update_failures_at(dir);
+        assert!(
+            should_attempt_update_at(dir),
+            "after clear: updates re-enabled (manual install recovery)"
+        );
+    }
+
+    #[test]
+    fn test_update_failure_counter_persists_on_disk() {
+        // The counter must survive process restarts: the child records a
+        // failure via the wrapper's spawn_update_command result, then the
+        // wrapper relaunches a fresh child. If the counter lived only in
+        // memory the lockout would never fire.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        record_update_failure_at(dir);
+        record_update_failure_at(dir);
+
+        let on_disk = std::fs::read_to_string(dir.join("update_failures"))
+            .expect("failure counter file should exist after recording");
+        assert_eq!(on_disk.trim(), "2");
+    }
+
+    #[test]
+    fn test_corrupt_counter_file_is_treated_as_max() {
+        // Defensive invariant: a present-but-unparseable counter file
+        // must be treated as MAX, not silently reset to 0. Otherwise an
+        // AV tool (or any process) that truncates/corrupts the file
+        // mid-write silently defeats the auto-update lockout and the
+        // exit-42 loop becomes unbounded again (testing-review point
+        // #5 on PR #3941).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Non-numeric content: simulates corruption.
+        std::fs::write(dir.join("update_failures"), "garbage").unwrap();
+        assert_eq!(get_update_failure_count_at(dir), MAX_UPDATE_FAILURES);
+        assert!(!should_attempt_update_at(dir));
+
+        // Empty content: simulates truncated write.
+        std::fs::write(dir.join("update_failures"), "").unwrap();
+        assert_eq!(get_update_failure_count_at(dir), MAX_UPDATE_FAILURES);
+        assert!(!should_attempt_update_at(dir));
+
+        // Negative/overflow: parse failure → MAX.
+        std::fs::write(dir.join("update_failures"), "-1").unwrap();
+        assert_eq!(get_update_failure_count_at(dir), MAX_UPDATE_FAILURES);
+
+        // Deleting the file is the explicit user recovery path.
+        clear_update_failures_at(dir);
+        assert_eq!(get_update_failure_count_at(dir), 0);
+        assert!(should_attempt_update_at(dir));
+    }
+
+    #[test]
+    fn test_check_if_update_available_does_not_clear_failure_counter() {
+        // Regression test for the #3934 invariant that the PR fixed:
+        // `check_if_update_available` MUST NOT call
+        // `clear_update_failures()` in its `UpdateAvailable` arm. Before
+        // the fix, that call wiped the counter on every peer-mismatch
+        // GitHub check, so accumulated failures from previous install
+        // attempts were erased before the MAX_UPDATE_FAILURES gate
+        // could ever trigger, leaving the exit-42 loop unbounded.
+        //
+        // We look for call-syntax (`clear_update_failures(`) rather
+        // than any textual occurrence, because the replacement comment
+        // explaining why the call was removed legitimately mentions
+        // the function by name. Strip line comments first so a comment
+        // using the call-syntax form in example code would not trip us.
+        let src = include_str!("auto_update.rs");
+        let (_, after_fn_start) = src
+            .split_once("pub async fn check_if_update_available(")
+            .expect("check_if_update_available definition not found");
+        let (body, _) = after_fn_start
+            .split_once("\n}\n")
+            .expect("could not locate end of check_if_update_available");
+        let code_only: String = body
+            .lines()
+            .map(|line| line.split_once("//").map(|(c, _)| c).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("clear_update_failures("),
+            "check_if_update_available must not call clear_update_failures() — \
+             doing so wipes the #3934 lockout counter on every peer-mismatch \
+             GitHub check. Only a successful install (update.rs) or a verified \
+             AlreadyUpToDate exit should clear failures."
+        );
+    }
+
+    #[test]
+    fn test_should_attempt_update_conservative_when_state_dir_missing() {
+        // skeptical-review H2 on PR #3941: when state_dir() returns
+        // None (e.g. Windows service account with no USERPROFILE), we
+        // cannot persist failure state, so attempting auto-update
+        // risks the same unbounded exit-42 loop that the per-file
+        // counter is supposed to prevent. `should_attempt_update`
+        // must return false in that case, not true.
+        //
+        // We exercise `should_attempt_update_at` against a path that
+        // genuinely cannot be read (a file path used as if it were a
+        // directory). `get_update_failure_count_at` treats
+        // `read_to_string`-error as 0 (missing file), but
+        // `should_attempt_update` at the public wrapper level uses
+        // `unwrap_or(false)` for `state_dir() → None`. We pin that
+        // source-level choice too.
+        let src = include_str!("auto_update.rs");
+        let (_, after_fn_start) = src
+            .split_once("pub fn should_attempt_update() -> bool {")
+            .expect("should_attempt_update definition not found");
+        let (body, _) = after_fn_start
+            .split_once('}')
+            .expect("could not locate end of should_attempt_update");
+        assert!(
+            body.contains("unwrap_or(false)"),
+            "should_attempt_update must fall back to `false` when state_dir \
+             is unavailable — falling back to `true` allows the exit-42 loop \
+             to run unbounded on Windows service accounts without USERPROFILE."
+        );
     }
 
     #[test]

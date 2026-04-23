@@ -1085,6 +1085,21 @@ fn sleep_with_jitter_interruptible(
 fn run_wrapper(version: &str) -> Result<()> {
     // On Windows, detach from the console so no terminal window is visible.
     // The wrapper runs as a background service — all output goes to log files.
+    //
+    // CRITICAL: after `FreeConsole()` (and in particular when this process
+    // was launched by Windows autostart and never had a console at all),
+    // the inherited standard handles are invalid. ANY `Command::spawn()`
+    // reachable from this function MUST explicitly set
+    // `.stdin/.stdout/.stderr(Stdio::null())` — otherwise `spawn()` fails
+    // with "The handle is invalid" (os error 6) and the child silently
+    // never starts. Known spawn sites downstream of here:
+    //   - `spawn_update_command`                   (this file)
+    //   - network child in `run_wrapper_loop`      (this file, ~line 1452)
+    //   - `spawn_new_wrapper`                      (this file)
+    //   - `open_log_file` notepad/open/xdg-open    (tray.rs)
+    // Add any new child spawn in this module with null stdio by default.
+    // See #3933 / #3934 and
+    // `/home/ian/code/freenet/.claude/rules/bug-prevention-patterns.md`.
     #[cfg(target_os = "windows")]
     unsafe {
         winapi::um::wincon::FreeConsole();
@@ -1221,9 +1236,23 @@ fn run_wrapper(version: &str) -> Result<()> {
 /// Spawn `freenet update --quiet` and wait for it to complete.
 /// On Windows, uses `CREATE_NO_WINDOW` to avoid flashing a console window
 /// (the wrapper has already detached from the console via `FreeConsole`).
+///
+/// stdin/stdout/stderr are nulled on every platform. On Windows this is
+/// load-bearing: the wrapper has already called `FreeConsole()` (and may
+/// never have had a console at all when launched by autostart), so
+/// inheriting the parent's invalid standard handles makes `spawn()` fail
+/// with "The handle is invalid" (os error 6). Without these nulls, the
+/// update subprocess silently fails to start and the wrapper falls into
+/// the exit-42 / update-failed / backoff-relaunch loop documented in
+/// #3934 (which was also the root cause of "Check for Updates" being
+/// broken in #3933). Null stdio is harmless on macOS/Linux because
+/// `--quiet` already suppresses all output.
 fn spawn_update_command(exe_path: &Path) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(exe_path);
-    cmd.args(["update", "--quiet"]);
+    cmd.args(["update", "--quiet"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     #[cfg(target_os = "windows")]
     {
@@ -1672,26 +1701,46 @@ fn run_wrapper_loop(
             }
 
             let result = spawn_update_command(&exe_path);
+            let outcome = super::update::classify_update_subprocess(&result);
+
+            // Drive the persistent auto-update failure counter used by
+            // `check_if_update_available` to break the exit-42 restart loop
+            // (#3934). The split between `SpawnFailed` (records) and
+            // `OtherFailure` (no change) is deliberate: transient GitHub/
+            // network errors must NOT accumulate toward the lockout
+            // (Codex P1 review on PR #3941), only environmental failures
+            // (exe missing/locked) should. Install-stage failures (AV
+            // holding freenet.exe) are recorded inside the subprocess
+            // itself at `update.rs` on `replace_binary` error, so those
+            // still lock out after MAX_UPDATE_FAILURES.
+            match super::update::update_counter_action(outcome) {
+                super::update::UpdateCounterAction::Clear => {
+                    super::auto_update::clear_update_failures();
+                }
+                super::update::UpdateCounterAction::Record => {
+                    super::auto_update::record_update_failure();
+                }
+                super::update::UpdateCounterAction::NoChange => {}
+            }
+
             // macOS DMG-swap: if the update subprocess exits with the
             // bundle-staged code, the detached updater takes over after
             // this process exits. We must not re-exec or retry; just
             // return Ok so the wrapper exits cleanly and the updater can
             // swap /Applications/Freenet.app.
-            if let Ok(ref s) = result {
-                if s.code() == Some(super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED) {
-                    log_wrapper_event(
-                        log_dir,
-                        "Bundle update staged during auto-update; exiting for updater",
-                    );
-                    #[cfg(any(target_os = "windows", target_os = "macos"))]
-                    if let Some((_, status_tx)) = tray {
-                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                    }
-                    return Ok(());
+            if outcome == super::update::UpdateSubprocessOutcome::BundleUpdateStaged {
+                log_wrapper_event(
+                    log_dir,
+                    "Bundle update staged during auto-update; exiting for updater",
+                );
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                if let Some((_, status_tx)) = tray {
+                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
                 }
+                return Ok(());
             }
-            let ok = result.map(|s| s.success()).unwrap_or(false);
 
+            let ok = outcome == super::update::UpdateSubprocessOutcome::BinaryReplaced;
             if ok {
                 log_wrapper_event(log_dir, "Update successful, restarting...");
             } else {
@@ -1787,8 +1836,25 @@ fn run_wrapper_loop(
                             if let Some((_, status_tx)) = tray {
                                 status_tx.send(WrapperStatus::Updating).ok();
                                 let result = spawn_update_command(&exe_path);
-                                match result {
-                                    Ok(s) if s.success() => {
+                                let outcome = super::update::classify_update_subprocess(&result);
+
+                                // Drive the persistent failure counter for
+                                // the user-initiated check path identically
+                                // to the auto-update path above — see the
+                                // long comment there for the SpawnFailed vs.
+                                // OtherFailure rationale (#3934 / Codex P1).
+                                match super::update::update_counter_action(outcome) {
+                                    super::update::UpdateCounterAction::Clear => {
+                                        super::auto_update::clear_update_failures();
+                                    }
+                                    super::update::UpdateCounterAction::Record => {
+                                        super::auto_update::record_update_failure();
+                                    }
+                                    super::update::UpdateCounterAction::NoChange => {}
+                                }
+
+                                match outcome {
+                                    super::update::UpdateSubprocessOutcome::BinaryReplaced => {
                                         log_wrapper_event(
                                             log_dir,
                                             "Update installed during backoff, restarting wrapper...",
@@ -1801,12 +1867,7 @@ fn run_wrapper_loop(
                                         state.consecutive_failures = 0;
                                         break;
                                     }
-                                    Ok(s)
-                                        if s.code()
-                                            == Some(
-                                                super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED,
-                                            ) =>
-                                    {
+                                    super::update::UpdateSubprocessOutcome::BundleUpdateStaged => {
                                         log_wrapper_event(
                                             log_dir,
                                             "Bundle update staged during backoff; exiting for updater",
@@ -1814,15 +1875,36 @@ fn run_wrapper_loop(
                                         status_tx.send(WrapperStatus::UpdatedRestarting).ok();
                                         return Ok(());
                                     }
-                                    Ok(_) => {
+                                    super::update::UpdateSubprocessOutcome::AlreadyUpToDate => {
                                         log_wrapper_event(log_dir, "No update available");
                                         status_tx.send(WrapperStatus::UpToDate).ok();
                                     }
-                                    Err(e) => {
-                                        log_wrapper_event(
-                                            log_dir,
-                                            &format!("Update check failed: {e}"),
-                                        );
+                                    super::update::UpdateSubprocessOutcome::SpawnFailed => {
+                                        let msg = match &result {
+                                            Err(e) => {
+                                                format!("Update subprocess failed to spawn: {e}")
+                                            }
+                                            Ok(_) => {
+                                                // Unreachable: classify only returns
+                                                // SpawnFailed for Err results.
+                                                "Update subprocess failed to spawn".to_string()
+                                            }
+                                        };
+                                        log_wrapper_event(log_dir, &msg);
+                                        status_tx.send(WrapperStatus::Stopped).ok();
+                                    }
+                                    super::update::UpdateSubprocessOutcome::OtherFailure => {
+                                        let msg = if let Ok(s) = &result {
+                                            format!(
+                                                "Update check failed with exit code {:?}",
+                                                s.code()
+                                            )
+                                        } else {
+                                            // Unreachable: classify returns
+                                            // SpawnFailed for Err results.
+                                            "Update check failed".to_string()
+                                        };
+                                        log_wrapper_event(log_dir, &msg);
                                         status_tx.send(WrapperStatus::Stopped).ok();
                                     }
                                 }
@@ -4445,5 +4527,45 @@ mod tests {
         // Now finds hour 15 — this is the rotation detection mechanism
         let result = find_latest_log_file(tmp.path(), "freenet");
         assert_eq!(result, Some(hour15));
+    }
+
+    /// Source-level regression pin for #3933 / #3934.
+    ///
+    /// The Windows-only failure mode — `Command::spawn()` returning
+    /// "The handle is invalid" (os error 6) when the parent has called
+    /// `FreeConsole()` and no explicit `Stdio::null()` is set — cannot
+    /// be exercised in a portable unit test. This pin instead enforces
+    /// that the guard remains present in the source: if a future
+    /// refactor removes the `.stdin/.stdout/.stderr(Stdio::null())`
+    /// lines from `spawn_update_command`, the test fails with a
+    /// specific error message pointing at the relevant issues rather
+    /// than silently shipping the regression to Windows users.
+    #[test]
+    fn spawn_update_command_must_null_all_three_standard_handles() {
+        let src = include_str!("service.rs");
+        let (_, after_fn_start) = src
+            .split_once("fn spawn_update_command(")
+            .expect("spawn_update_command definition not found");
+        // Limit to the function body — stop at the next top-level fn
+        // so trailing source doesn't accidentally pass the check.
+        let (body, _) = after_fn_start
+            .split_once("\nfn ")
+            .expect("could not locate end of spawn_update_command");
+        let code_only: String = body
+            .lines()
+            .map(|line| line.split_once("//").map(|(c, _)| c).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for handle in ["stdin", "stdout", "stderr"] {
+            let pattern = format!(".{handle}(std::process::Stdio::null())");
+            assert!(
+                code_only.contains(&pattern),
+                "spawn_update_command must call `{}` — without it, Windows \
+                 autostart fires a silent spawn failure with os error 6 \
+                 (#3933 / #3934). The fix pattern matches the network-child \
+                 spawn in run_wrapper_loop.",
+                pattern
+            );
+        }
     }
 }

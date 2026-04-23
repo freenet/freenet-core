@@ -245,6 +245,47 @@ mod tests {
             "each WrapperStatus should map to a distinct status_text"
         );
     }
+
+    /// Source-level regression pin for #3933.
+    ///
+    /// The null-stdio fix for the notepad / open / xdg-open spawn in
+    /// `open_log_file` cannot be directly exercised in a portable unit
+    /// test (the failure mode — `spawn()` returning "The handle is
+    /// invalid" (os error 6) after `FreeConsole()` — is Windows-only
+    /// and requires a detached parent console). This test pins the
+    /// source-level invariant so a future revert of the `.stdin/.stdout/
+    /// .stderr(Stdio::null())` lines fails CI with a specific message
+    /// pointing at #3933, rather than shipping the regression silently.
+    #[test]
+    fn open_log_file_spawn_must_null_all_three_standard_handles() {
+        // Anchor on the function signature + opening brace, not the
+        // bare name, because the test body itself mentions
+        // `open_log_file` in its assertions and `include_str!` would
+        // otherwise pick up the first textual match inside this test.
+        let src = include_str!("tray.rs");
+        let (_, after_fn_start) = src
+            .split_once("pub fn open_log_file() {")
+            .expect("open_log_file definition not found");
+        // Body ends at the next blank line followed by a `#[cfg(test)]`
+        // attribute — the module-level tests block. Restricting the
+        // search window avoids double-counting nulls from unrelated
+        // helpers elsewhere in the file.
+        let body = after_fn_start
+            .split_once("\n#[cfg(test)]")
+            .map(|(b, _)| b)
+            .unwrap_or(after_fn_start);
+        for handle in ["stdin", "stdout", "stderr"] {
+            let pattern = format!(".{handle}(std::process::Stdio::null())");
+            assert!(
+                body.contains(&pattern),
+                "open_log_file must call `{}` — without it, Windows \
+                 autostart fails `Command::spawn()` with os error 6 \
+                 (handle invalid after FreeConsole), and View Logs \
+                 silently does nothing. See #3933.",
+                pattern
+            );
+        }
+    }
 }
 
 // ── Windows + macOS implementation ──────────────────────────────────
@@ -654,21 +695,25 @@ pub fn open_log_file() {
 
     match latest {
         Some(path) => {
+            // Null stdio on all three handles. On Windows this is required
+            // because the tray wrapper calls `FreeConsole()` at startup (and
+            // has no console at all when launched by Windows autostart),
+            // which invalidates the inherited standard handles. Without
+            // explicit nulling, `spawn()` fails with "The handle is invalid"
+            // (os error 6) and View Logs silently does nothing — see #3933.
+            // Null stdio is harmless on macOS/Linux: the GUI viewers don't
+            // use stdin/stdout/stderr.
             #[cfg(target_os = "windows")]
-            {
-                std::process::Command::new("notepad")
-                    .arg(&path)
-                    .spawn()
-                    .ok();
-            }
+            let mut cmd = std::process::Command::new("notepad");
             #[cfg(target_os = "macos")]
-            {
-                std::process::Command::new("open").arg(&path).spawn().ok();
-            }
+            let mut cmd = std::process::Command::new("open");
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                drop(std::process::Command::new("xdg-open").arg(&path).spawn());
-            }
+            let mut cmd = std::process::Command::new("xdg-open");
+            cmd.arg(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            drop(cmd.spawn());
         }
         None => {
             eprintln!("No log files found in {}", log_dir.display());
