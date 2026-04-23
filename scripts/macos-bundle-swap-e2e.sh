@@ -137,11 +137,22 @@ V2_MARKER="$WORKDIR/running-v2.txt"
 build_bundle "$INSTALL_APP" "v1" 4  "$V1_MARKER"
 build_bundle "$STAGED_APP"  "v2" 30 "$V2_MARKER"
 
-echo "Launching v1 via /usr/bin/open..."
-/usr/bin/open "$INSTALL_APP"
+echo "Launching v1 directly (background exec of CFBundleExecutable)..."
+# We deliberately bypass /usr/bin/open for spawning the "already-running
+# process" that the updater must wait for. LaunchServices on a headless
+# CI runner is flaky for unsigned bundles in $TMPDIR (origin of the
+# first-run failure: `open` returned success but no process was observed
+# within the 6s wait). The updater still uses /usr/bin/open for its
+# relaunch step at the end — we verify LaunchServices works there by
+# asserting the v2 process appears after the swap.
+"$INSTALL_APP/Contents/MacOS/Freenet" &
+V1_PID=$!
+echo "v1 backgrounded as pid $V1_PID"
 
 if ! wait_for_process "$INSTALL_APP"; then
-    echo "ERROR: v1 process never appeared; check that /usr/bin/open works on this runner" >&2
+    echo "ERROR: v1 process never appeared; diagnostic output:" >&2
+    echo "  ps -ef | grep Freenet:" >&2
+    ps -ef | grep -i freenet | grep -v grep >&2 || echo "  (no matches)" >&2
     exit 1
 fi
 echo "v1 process confirmed running."
@@ -178,15 +189,31 @@ fi
 # updater's final step is /usr/bin/open of the new bundle; this is the
 # relaunch step that most often fails silently in the wild, so we
 # explicitly verify it here.
-if ! wait_for_process "$INSTALL_APP"; then
-    echo "ERROR: no v2 process observed after updater relaunch" >&2
+#
+# Give LaunchServices a longer window on CI — the first open of an
+# unsigned bundle in $TMPDIR can take several seconds for lsregister to
+# scan the bundle and spawn the process.
+echo "Waiting for v2 process to appear (relaunch via /usr/bin/open)..."
+v2_seen=false
+for i in $(seq 1 150); do
+    if pgrep -f "^${INSTALL_APP}/Contents/MacOS/" > /dev/null 2>&1; then
+        v2_seen=true
+        break
+    fi
+    sleep 0.1
+done
+if ! $v2_seen; then
+    echo "ERROR: no v2 process observed after updater relaunch (15s wait)" >&2
+    echo "  ps output:" >&2
+    ps -ef | grep -i freenet | grep -v grep >&2 || echo "  (no matches)" >&2
+    echo "  updater log:" >&2
     cat "$LOG" >&2
     exit 1
 fi
 
 # Assertion 5: the running process is actually v2, not a lingering v1.
 # v2's freenet-bin writes its version to $V2_MARKER on startup.
-for i in $(seq 1 60); do
+for i in $(seq 1 150); do
     if [[ -s "$V2_MARKER" ]]; then
         break
     fi
