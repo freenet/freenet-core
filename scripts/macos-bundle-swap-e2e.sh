@@ -60,9 +60,12 @@ LOG="$WORKDIR/updater.log"
 mkdir -p "$INSTALL_ROOT"
 
 cleanup() {
-    # Kill any stray processes from our test bundles so the next run is
-    # not confused by leftover pgrep matches, then remove WORKDIR.
-    pkill -f "^${INSTALL_APP}/Contents/MacOS/" 2>/dev/null || true
+    # Kill any stray processes from our test bundles. No `^` anchor:
+    # /usr/bin/open canonicalizes the bundle path through /var->/private/var,
+    # so a post-swap relaunched process shows up as /private/var/... but
+    # INSTALL_APP is /var/...; an anchored pattern would miss it.
+    pkill -f "${INSTALL_APP}/Contents/MacOS/" 2>/dev/null || true
+    pkill -f "${PREFLIGHT_APP:-__unset__}/Contents/MacOS/" 2>/dev/null || true
     sleep 0.5
     rm -rf "$WORKDIR" 2>/dev/null || true
 }
@@ -190,8 +193,9 @@ else
     echo "Preflight SKIP: /usr/bin/open does not spawn unsigned bundles in this env."
     echo "  Swap-mechanics assertions will still run; post-swap relaunch assertion will be skipped."
 fi
-# Clean up preflight process if it's still around
-pkill -f "^${PREFLIGHT_APP}/Contents/MacOS/" 2>/dev/null || true
+# Clean up preflight process if it's still around. No `^` anchor for the
+# same reason as the cleanup trap — /usr/bin/open yields /private/var/...
+pkill -f "${PREFLIGHT_APP}/Contents/MacOS/" 2>/dev/null || true
 
 echo
 echo "== Test 1: happy-path swap =="
@@ -266,33 +270,32 @@ fi
 # under test, so we skip the assertion with a loud note rather than
 # pretend it ran.
 if $launchservices_works; then
-    echo "Waiting for v2 process to appear (relaunch via /usr/bin/open)..."
-    v2_seen=false
-    for i in $(seq 1 150); do
-        if pgrep -f "^${INSTALL_APP}/Contents/MacOS/" > /dev/null 2>&1; then
-            v2_seen=true
-            break
-        fi
-        sleep 0.1
-    done
-    if ! $v2_seen; then
-        echo "ERROR: no v2 process observed after updater relaunch" >&2
-        echo "  ps output:" >&2
-        ps -ef | grep -i freenet | grep -v grep >&2 || echo "  (no matches)" >&2
-        echo "  updater log:" >&2
-        cat "$LOG" >&2
-        exit 1
-    fi
-
-    # Assertion 5: the running process is actually v2, not a lingering v1.
-    # v2's freenet-bin writes its version to $V2_MARKER on startup.
+    # Verify relaunch via the marker file, not pgrep: when /usr/bin/open
+    # launches a bundle sitting under $TMPDIR, macOS canonicalizes the
+    # path through the /var -> /private/var symlink, so the running
+    # process's argv[0] looks like /private/var/... while INSTALL_APP is
+    # /var/... — the two forms don't compare equal under pgrep's ERE.
+    # In production that mismatch doesn't arise (/Applications is not a
+    # symlink) so the updater's own pgrep is fine; here we'd produce a
+    # false negative if we reused it. The marker file the stub writes
+    # on startup is the actual signal we care about: if it's present
+    # AND contains "v2", then the swapped bundle ran.
+    echo "Waiting for v2 startup marker (relaunch via /usr/bin/open)..."
     for i in $(seq 1 150); do
         if [[ -s "$V2_MARKER" ]]; then
             break
         fi
         sleep 0.1
     done
-    run_version="$(cat "$V2_MARKER" 2>/dev/null || echo missing)"
+    if [[ ! -s "$V2_MARKER" ]]; then
+        echo "ERROR: v2 startup marker never written after updater relaunch" >&2
+        echo "  ps output:" >&2
+        ps -ef | grep -i freenet | grep -v grep >&2 || echo "  (no matches)" >&2
+        echo "  updater log:" >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+    run_version="$(cat "$V2_MARKER")"
     if [[ "$run_version" != "v2" ]]; then
         echo "ERROR: relaunched process reported version '$run_version', expected 'v2'" >&2
         cat "$LOG" >&2
