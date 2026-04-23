@@ -48,9 +48,57 @@ pub enum UpdateSubprocessOutcome {
     BundleUpdateStaged,
     /// Update check ran; already on the latest version.
     AlreadyUpToDate,
-    /// Update attempted but failed (spawn error, network error, or non-
-    /// zero exit other than `ALREADY_UP_TO_DATE` / `BUNDLE_UPDATE_STAGED`).
-    Failed,
+    /// The update subprocess could not be launched at all (`Err` from
+    /// `Command::status`). This is an environmental failure that will
+    /// not resolve on its own (e.g. exe missing / locked, OS resource
+    /// exhaustion) — it DOES count toward the auto-update lockout so
+    /// the exit-42 loop terminates.
+    SpawnFailed,
+    /// The update subprocess ran but exited non-zero with a code we
+    /// don't specifically recognize. This bucket covers transient
+    /// failures like GitHub API errors, download aborts, and checksum
+    /// mismatches — those must NOT count toward the lockout (three
+    /// flaky GitHub calls should not permanently disable auto-update).
+    /// Install-stage failures (`replace_binary`) are recorded inside
+    /// the subprocess itself via `record_update_failure`, so they will
+    /// still lock out after MAX_UPDATE_FAILURES.
+    OtherFailure,
+}
+
+/// What the wrapper should do to the persistent auto-update failure
+/// counter for a given subprocess outcome. Pure so the glue between
+/// [`UpdateSubprocessOutcome`] and the `record`/`clear` calls in
+/// `service.rs` is directly unit-testable — a typo here reopens the
+/// #3934 exit-42 restart loop with no CI signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateCounterAction {
+    /// Clear the failure counter (install succeeded or detached
+    /// updater committed to completing the swap).
+    Clear,
+    /// Increment the failure counter toward `MAX_UPDATE_FAILURES`.
+    Record,
+    /// Leave the counter alone (transient failure or benign outcome).
+    NoChange,
+}
+
+/// Map a subprocess outcome to the correct counter action. The split
+/// between `SpawnFailed` (records) and `OtherFailure` (no change) is
+/// the anti-regression for Codex's P1 finding on PR #3941: lumping
+/// transient network errors into the lockout counter would
+/// permanently disable auto-update after a brief GitHub outage.
+/// Install-stage failures are still counted because
+/// `UpdateCommand::download_and_install` calls `record_update_failure`
+/// directly on `replace_binary` error before propagating.
+pub fn update_counter_action(outcome: UpdateSubprocessOutcome) -> UpdateCounterAction {
+    match outcome {
+        UpdateSubprocessOutcome::BinaryReplaced | UpdateSubprocessOutcome::BundleUpdateStaged => {
+            UpdateCounterAction::Clear
+        }
+        UpdateSubprocessOutcome::SpawnFailed => UpdateCounterAction::Record,
+        UpdateSubprocessOutcome::AlreadyUpToDate | UpdateSubprocessOutcome::OtherFailure => {
+            UpdateCounterAction::NoChange
+        }
+    }
 }
 
 /// Classify the exit status of a `freenet update` subprocess invocation.
@@ -67,8 +115,8 @@ pub fn classify_update_subprocess(
         Ok(s) if s.code() == Some(EXIT_CODE_ALREADY_UP_TO_DATE) => {
             UpdateSubprocessOutcome::AlreadyUpToDate
         }
-        Ok(_) => UpdateSubprocessOutcome::Failed,
-        Err(_) => UpdateSubprocessOutcome::Failed,
+        Ok(_) => UpdateSubprocessOutcome::OtherFailure,
+        Err(_) => UpdateSubprocessOutcome::SpawnFailed,
     }
 }
 
@@ -132,6 +180,16 @@ impl UpdateCommand {
             if !self.quiet {
                 println!("You are already running the latest version.");
             }
+            // Confirming the binary is already current is as strong a
+            // recovery signal as a successful install: any accumulated
+            // failure counter from prior doomed attempts should clear
+            // here, otherwise a user who hit the MAX_UPDATE_FAILURES
+            // lockout and then updated via an external channel (apt,
+            // homebrew, Windows installer) would stay permanently
+            // locked out, since subsequent `freenet update` invocations
+            // take this `AlreadyUpToDate` branch without ever touching
+            // the counter (skeptical-review H1 on PR #3941).
+            super::auto_update::clear_update_failures();
             // Exit with a distinct code so the service wrapper knows no update
             // was performed and can skip the unnecessary restart.
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
@@ -303,16 +361,24 @@ impl UpdateCommand {
             extract_binary(&freenet_archive_path, &freenet_extract_dir, "freenet")?;
 
         let current_exe = std::env::current_exe().context("Failed to get current executable")?;
-        replace_binary(&extracted_freenet, &current_exe)?;
-
-        // A successful in-place install clears the persistent failure
-        // counter that gates `check_if_update_available` (#3934). This
-        // matters for manual `freenet update` from a terminal: without it,
-        // once a user hit the MAX_UPDATE_FAILURES lockout (e.g. prior
-        // replace_binary failures on Windows), even a successful manual
-        // install would leave the counter stuck and auto-update would
-        // stay disabled.
-        super::auto_update::clear_update_failures();
+        // The failure-counter record/clear is scoped to the install step
+        // specifically, NOT to any earlier download / checksum / extract
+        // failure. Those are transient (transient GitHub outage, flaky
+        // connection, bad mirror) and are already retried under
+        // `check_if_update_available`'s own exponential backoff. Counting
+        // them toward the MAX_UPDATE_FAILURES lockout would permanently
+        // disable auto-update after a brief network hiccup (Codex P1 on
+        // PR #3941). Only genuine install-stage failures (AV lock,
+        // read-only install dir, permission-denied) should accumulate.
+        match replace_binary(&extracted_freenet, &current_exe) {
+            Ok(()) => {
+                super::auto_update::clear_update_failures();
+            }
+            Err(e) => {
+                super::auto_update::record_update_failure();
+                return Err(e);
+            }
+        }
 
         if !self.quiet {
             println!(
@@ -1600,26 +1666,75 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn classify_update_subprocess_arbitrary_failure() {
+    fn classify_update_subprocess_other_failure() {
+        // Arbitrary non-zero exit codes that aren't one of the specific
+        // known codes fall into `OtherFailure`. This variant covers
+        // transient network / GitHub / checksum errors that must NOT
+        // count toward the lockout — that's the Codex P1 anti-regression
+        // (see the split from a single `Failed` variant on PR #3941).
         let result = Ok(exit_with(1));
         assert_eq!(
             classify_update_subprocess(&result),
-            UpdateSubprocessOutcome::Failed
+            UpdateSubprocessOutcome::OtherFailure
         );
         let result = Ok(exit_with(42));
         assert_eq!(
             classify_update_subprocess(&result),
-            UpdateSubprocessOutcome::Failed
+            UpdateSubprocessOutcome::OtherFailure
         );
     }
 
     #[test]
     fn classify_update_subprocess_spawn_error() {
+        // Spawn failure is distinct from runtime failure: the subprocess
+        // never started (exe missing, AV-locked binary, OS resource
+        // exhaustion). These are environmental and persistent, so they
+        // MUST count toward the lockout — the #3934 null-stdio fix
+        // addresses one major cause of spawn failures, but any future
+        // cause should still lock out rather than loop forever.
         let result: std::io::Result<std::process::ExitStatus> =
             Err(std::io::Error::new(std::io::ErrorKind::NotFound, "boom"));
         assert_eq!(
             classify_update_subprocess(&result),
-            UpdateSubprocessOutcome::Failed
+            UpdateSubprocessOutcome::SpawnFailed
+        );
+    }
+
+    #[test]
+    fn update_counter_action_matches_outcome_semantics() {
+        // Pin the glue between subprocess outcomes and the persistent
+        // failure counter. A typo flipping any of these arms reopens
+        // #3934 (exit-42 loop unbounded) or Codex's P1 regression
+        // (transient network errors permanently disabling auto-update).
+        //
+        // This is the testing-reviewer-requested "glue test" that
+        // directly exercises the action the wrapper takes. Both call
+        // sites of `update_counter_action` in `service.rs` must agree
+        // with this mapping.
+        assert_eq!(
+            update_counter_action(UpdateSubprocessOutcome::BinaryReplaced),
+            UpdateCounterAction::Clear,
+            "successful install must clear accumulated failures"
+        );
+        assert_eq!(
+            update_counter_action(UpdateSubprocessOutcome::BundleUpdateStaged),
+            UpdateCounterAction::Clear,
+            "macOS DMG-swap commits to the update — clear failures"
+        );
+        assert_eq!(
+            update_counter_action(UpdateSubprocessOutcome::AlreadyUpToDate),
+            UpdateCounterAction::NoChange,
+            "already-up-to-date is not an install attempt — don't touch counter"
+        );
+        assert_eq!(
+            update_counter_action(UpdateSubprocessOutcome::SpawnFailed),
+            UpdateCounterAction::Record,
+            "spawn failure is environmental and persistent — must lock out"
+        );
+        assert_eq!(
+            update_counter_action(UpdateSubprocessOutcome::OtherFailure),
+            UpdateCounterAction::NoChange,
+            "transient network/checksum errors must NOT accumulate (Codex P1)"
         );
     }
 
