@@ -22,23 +22,16 @@ name: macOS DMG-swap E2E
 # the actual configuration.
 
 on:
+  # No path filter — this is a required status check, and skipped-by-
+  # path-filter workflows do not reliably produce a "check context" that
+  # branch protection sees as passing. Running unconditionally for ~15s
+  # per PR is much cheaper than debugging a PR stuck waiting for a
+  # never-fired required check. If cost ever becomes an issue, the right
+  # fix is to split into a tiny "always-green gate" job + a conditional
+  # real job — not to re-introduce a top-level path filter.
   pull_request:
-    paths:
-      - 'crates/core/src/bin/commands/update.rs'
-      - 'crates/core/src/bin/commands/service.rs'
-      - 'scripts/macos-bundle-updater.sh'
-      - 'scripts/macos-bundle-swap-e2e.sh'
-      - 'scripts/package-macos.sh'
-      - '.github/workflows/macos-dmg-swap-e2e.yml'
   push:
     branches: [main]
-    paths:
-      - 'crates/core/src/bin/commands/update.rs'
-      - 'crates/core/src/bin/commands/service.rs'
-      - 'scripts/macos-bundle-updater.sh'
-      - 'scripts/macos-bundle-swap-e2e.sh'
-      - 'scripts/package-macos.sh'
-      - '.github/workflows/macos-dmg-swap-e2e.yml'
   merge_group:
 
 concurrency:
