@@ -27,6 +27,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 UPDATER="$REPO_ROOT/scripts/macos-bundle-updater.sh"
+STUB_SRC="$REPO_ROOT/scripts/macos-bundle-swap-e2e-stub.c"
 
 if [[ ! -x "$UPDATER" ]]; then
     echo "ERROR: updater script not found or not executable at $UPDATER" >&2
@@ -38,9 +39,19 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
+if [[ ! -f "$STUB_SRC" ]]; then
+    echo "ERROR: stub source not found at $STUB_SRC" >&2
+    exit 1
+fi
+
 WORKDIR="$(mktemp -d -t freenet-swap-e2e.XXXXXX)"
 INSTALL_ROOT="$WORKDIR/install"
 INSTALL_APP="$INSTALL_ROOT/Freenet.app"
+STUB_BIN="$WORKDIR/freenet-bin-stub"
+
+echo "Compiling stub binary..."
+clang -O0 -o "$STUB_BIN" "$STUB_SRC"
+chmod +x "$STUB_BIN"
 # Sibling of INSTALL_APP so the kernel-atomic rename stays on one APFS
 # volume (same contract the updater expects in production).
 STAGED_APP="$INSTALL_ROOT/.Freenet.app.staging.$$"
@@ -89,21 +100,22 @@ build_bundle() {
 PLIST
 
     # Outer wrapper matches the production package-macos.sh convention:
-    # CFBundleExecutable execs the inner binary. Must be exec (not just
-    # call) so the running process's argv[0] is the inner binary — that
-    # is what pgrep -f matches against.
-    cat > "$dest/Contents/MacOS/Freenet" <<'SH'
+    # CFBundleExecutable execs the inner binary with args. Using `exec`
+    # (not a plain call) is required so the running process's argv[0]
+    # is the Mach-O stub at the bundle path — that is what pgrep -f in
+    # the updater script matches against. A shell-script freenet-bin
+    # would appear as `/bin/bash /path/...` under ps and silently break
+    # the match.
+    cat > "$dest/Contents/MacOS/Freenet" <<SH
 #!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/freenet-bin"
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+exec "\$DIR/freenet-bin" "$marker" "$version" "$lifetime"
 SH
     chmod +x "$dest/Contents/MacOS/Freenet"
 
-    cat > "$dest/Contents/MacOS/freenet-bin" <<SH
-#!/bin/bash
-echo "$version" > "$marker"
-sleep $lifetime
-SH
+    # Copy the compiled stub in place (not a shell script — see comment
+    # above and scripts/macos-bundle-swap-e2e-stub.c for the rationale).
+    cp "$STUB_BIN" "$dest/Contents/MacOS/freenet-bin"
     chmod +x "$dest/Contents/MacOS/freenet-bin"
 
     echo "$version" > "$dest/Contents/Resources/version.txt"
