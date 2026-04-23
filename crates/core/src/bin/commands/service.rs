@@ -1098,8 +1098,8 @@ fn run_wrapper(version: &str) -> Result<()> {
     //   - `spawn_new_wrapper`                      (this file)
     //   - `open_log_file` notepad/open/xdg-open    (tray.rs)
     // Add any new child spawn in this module with null stdio by default.
-    // See #3933 / #3934 and
-    // `/home/ian/code/freenet/.claude/rules/bug-prevention-patterns.md`.
+    // See #3933 / #3934 and `.claude/rules/bug-prevention-patterns.md`
+    // at the repo root for the rule + audit grep.
     #[cfg(target_os = "windows")]
     unsafe {
         winapi::um::wincon::FreeConsole();
