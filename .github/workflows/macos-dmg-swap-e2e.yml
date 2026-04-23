@@ -1,0 +1,58 @@
+name: macOS DMG-swap E2E
+
+# End-to-end test for the macOS bundle-swap updater (scripts/macos-bundle-
+# updater.sh + surrounding logic in crates/core/src/bin/commands/update.rs).
+#
+# Why a separate workflow: the DMG-swap path is invisible to every other
+# CI job — the mechanics (process-wait + atomic mv + LaunchServices
+# relaunch via /usr/bin/open) can only fail on real macOS. Previously
+# this path was only exercised in production by users downloading a new
+# DMG release; regressions silently shipped. This workflow runs on every
+# PR that touches the relevant files, and on main, so we catch breakage
+# before it reaches an alpha user's machine.
+#
+# Scope: the swap script itself is signing-independent, so no Apple
+# Developer ID secrets are needed and the job runs on fork PRs. The
+# signed-DMG build path is covered separately by macos-dmg-test.yml
+# (workflow_dispatch) and cross-compile.yml (release tags).
+#
+# Required check: the job name below ("macOS bundle-swap E2E") is wired
+# into branch protection / merge queue as required. See
+# .github/branch-protection (or the repo's Settings → Branches page) for
+# the actual configuration.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/core/src/bin/commands/update.rs'
+      - 'crates/core/src/bin/commands/service.rs'
+      - 'scripts/macos-bundle-updater.sh'
+      - 'scripts/macos-bundle-swap-e2e.sh'
+      - 'scripts/package-macos.sh'
+      - '.github/workflows/macos-dmg-swap-e2e.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/src/bin/commands/update.rs'
+      - 'crates/core/src/bin/commands/service.rs'
+      - 'scripts/macos-bundle-updater.sh'
+      - 'scripts/macos-bundle-swap-e2e.sh'
+      - 'scripts/package-macos.sh'
+      - '.github/workflows/macos-dmg-swap-e2e.yml'
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  swap-e2e:
+    name: macOS bundle-swap E2E
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run bundle-swap E2E test
+        run: bash scripts/macos-bundle-swap-e2e.sh
