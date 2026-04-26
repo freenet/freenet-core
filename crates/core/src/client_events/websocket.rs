@@ -172,34 +172,52 @@ fn is_allowed_host(headers: &axum::http::HeaderMap, allowed_hosts: &HashSet<Stri
     allowed_hosts.contains(&host_header.to_lowercase())
 }
 
-/// Returns `true` if the request's `Host` header IP is inside an operator-allowed
-/// source CIDR **and** the `Origin` is compatible with it.
+/// Returns `true` if the request's `Host` header IP is acceptable for a
+/// privileged WS upgrade **and** the `Origin` is compatible with it.
 ///
-/// "Compatible" means one of:
-/// - `Origin: null` — sandboxed iframe served from the same node (Freenet's
-///   default dApp sandbox intentionally strips origin).
-/// - `Origin` is an IP literal matching the same Host IP (direct browser
-///   access from a user-typed URL).
+/// Two acceptance branches with **different Origin policies**:
 ///
-/// This is strict on purpose: returning `true` here grants full WS access
-/// to the fully-privileged client API, so we require that the Origin
-/// genuinely corresponds to the Host. An attacker at `https://evil.com`
-/// whose JS targets `ws://<victim-tailnet-ip>:7509/...` sends
-/// `Origin: https://evil.com`, which parses to the hostname `evil.com` —
-/// not an IP, not matching the Host IP — so we refuse. This closes the
-/// cross-site WebSocket hijacking (CSWSH) vector flagged during review of
-/// this PR's earlier iteration.
+/// 1. **Operator-configured CIDR** (`--allowed-source-cidrs` / config
+///    `allowed-source-cidrs`): accepts the upgrade when the Host IP is in
+///    the CIDR and the Origin is **either** `null` (sandboxed iframe
+///    served from the same node) **or** a same-IP literal (direct browser
+///    access). The operator has explicitly opted into the null-origin
+///    risk surface — see `origin_compatible_with_host_ip`.
 ///
-/// Only string-parseable IP literals are considered for Host/Origin; DNS
-/// is never resolved, which preserves the DNS-rebinding defence.
+/// 2. **Default LAN/private** (no operator config required): accepts the
+///    upgrade when the Host IP is private (RFC 1918 / loopback /
+///    link-local / IPv6 ULA, but **not** the unspecified `0.0.0.0` / `::`)
+///    and the Origin is a **same-IP literal** matching the Host IP.
+///    `Origin: null` is **rejected** on this branch because any site can
+///    serve a `<iframe sandbox>` whose origin is null and use it to probe
+///    LAN-bound nodes — a default-on CSWSH would expose every desktop
+///    install on a LAN. Operators who genuinely need null-origin
+///    sandboxed access from non-localhost contexts must opt in via
+///    `--allowed-source-cidrs`.
+///
+/// This dual policy closes #3957 (LAN access works out of the box)
+/// without widening CSWSH exposure beyond what an explicit operator
+/// opt-in already accepts. The default-LAN branch matches what
+/// [`is_private_ip`](crate::server::is_private_ip) and the
+/// `private_network_filter` accept for **source** IPs, modulo the
+/// unspecified-address exclusion, so the HTTP and WS layers agree on
+/// what counts as a trusted network position.
+///
+/// **Not covered by the default-LAN branch:** CGNAT (100.64/10),
+/// public-unicast IPv4/IPv6, IPv6 GUA, and `0.0.0.0` / `::`. Tailnet,
+/// CGNAT, and other non-private but operator-controlled ranges still
+/// require `--allowed-source-cidrs` (see `host_header_ip_in_tailscale_cidr_allowed`).
+///
+/// CSWSH defence (both branches): `https://evil.com`'s JS opening
+/// `ws://<victim-lan-ip>:7509/...` sends `Origin: https://evil.com`, which
+/// parses to a hostname — not an IP, not matching the Host IP — so it's
+/// refused. DNS rebinding is defeated because no DNS resolution happens
+/// at this layer; only string-parseable IP literals are compared.
 fn host_header_ip_in_cidrs(
     headers: &axum::http::HeaderMap,
     origin_str: &str,
     allowed_cidrs: &crate::server::AllowedSourceCidrs,
 ) -> bool {
-    if allowed_cidrs.is_empty() {
-        return false;
-    }
     let Some(host_header) = headers
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -210,10 +228,49 @@ fn host_header_ip_in_cidrs(
         return false;
     };
     let host_ip = normalize_mapped_v6(ip);
-    if !allowed_cidrs.contains_ip(&host_ip) {
+
+    // Operator-configured CIDR: permissive Origin policy (null OK).
+    if allowed_cidrs.contains_ip(&host_ip) {
+        return origin_compatible_with_host_ip(origin_str, host_ip);
+    }
+
+    // Default LAN/private: stricter Origin policy (same-IP literal only,
+    // no null) to prevent default-on CSWSH from sandboxed iframes hosted
+    // on arbitrary sites.
+    if is_default_lan_host_ip(&host_ip) {
+        return origin_is_same_ip_literal(origin_str, host_ip);
+    }
+
+    false
+}
+
+/// Whether a `Host` header IP qualifies for the default LAN/private path.
+///
+/// Stricter than [`is_private_ip`](crate::server::is_private_ip): rejects
+/// the unspecified addresses (`0.0.0.0` / `::`). `is_private_ip` accepts
+/// them for source-IP filter purposes (legitimate kernel-source values),
+/// but no real browser legitimately sends `Host: 0.0.0.0` or `Host: [::]`,
+/// and accepting them would widen the matchable-Host surface for no use
+/// case.
+fn is_default_lan_host_ip(ip: &std::net::IpAddr) -> bool {
+    if ip.is_unspecified() {
         return false;
     }
-    origin_compatible_with_host_ip(origin_str, host_ip)
+    crate::server::is_private_ip(ip)
+}
+
+/// Strict Origin gate used by the default LAN/private branch: requires
+/// the Origin to parse to an IP literal that matches the Host IP after
+/// IPv4-mapped-v6 normalization. `Origin: null` and hostname Origins are
+/// rejected.
+fn origin_is_same_ip_literal(origin_str: &str, host_ip: std::net::IpAddr) -> bool {
+    let Some(origin_host) = parse_origin_host(origin_str) else {
+        return false;
+    };
+    let Ok(origin_ip) = origin_host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    normalize_mapped_v6(origin_ip) == host_ip
 }
 
 /// Decides whether an `Origin` header value is compatible with a `Host` IP
@@ -655,8 +712,9 @@ async fn connection_info(
             if let Ok(origin_str) = origin.to_str() {
                 // Accept the upgrade when the origin is localhost, the Host
                 // header matches an explicit `allowed-host` entry, or the
-                // Host is an IP in `allowed-source-cidrs` *and* the Origin
-                // is compatible with it (null sandboxed iframe or same-IP).
+                // Host is an acceptable IP (private/LAN by default, or
+                // inside `allowed-source-cidrs`) *and* the Origin is
+                // compatible with it (null sandboxed iframe or same-IP).
                 // See `host_header_ip_in_cidrs` for the CSWSH rationale.
                 if !is_localhost_origin(origin_str)
                     && !is_allowed_host(req.headers(), &allowed_hosts)
@@ -2003,25 +2061,141 @@ mod tests {
         ));
     }
 
-    /// Default-deny: with no `--allowed-source-cidrs` configured, no Host IP
-    /// may match. Users who never opt in get zero behaviour change.
+    /// Default-allow for private/LAN IPs only when the Origin is a
+    /// same-IP literal; default-deny for public IPs and for `Origin: null`
+    /// on the default-private branch. The `null` rejection is the CSWSH
+    /// guard against a malicious `<iframe sandbox>` on `evil.com` probing
+    /// LAN-bound nodes — operators who need null-origin sandboxed access
+    /// from non-localhost contexts must opt in via `--allowed-source-cidrs`.
     #[test]
-    fn host_header_empty_cidrs_matches_nothing() {
+    fn host_header_empty_cidrs_accepts_private_with_ip_literal_origin() {
         let empty = crate::server::AllowedSourceCidrs::default();
-        assert!(!host_header_ip_in_cidrs(
-            &headers_with_host("100.64.1.5:7509"),
-            "null",
+        // Private (loopback, RFC 1918) + same-IP literal Origin: accepted.
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("127.0.0.1:7509"),
+            "http://127.0.0.1:7509",
             &empty,
         ));
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("192.168.1.5:7509"),
+            "http://192.168.1.5:7509",
+            &empty,
+        ));
+        // Private Host + Origin: null: REJECTED on the default branch
+        // (CSWSH guard against sandboxed iframes on arbitrary sites).
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("127.0.0.1:7509"),
             "null",
             &empty,
         ));
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("192.168.1.5:7509"),
+            "null",
+            &empty,
+        ));
+        // CGNAT (100.64/10) is NOT private — still requires explicit
+        // CIDR even with a same-IP literal Origin (Tailnet users opt in
+        // via `--allowed-source-cidrs`).
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("100.64.1.5:7509"),
+            "http://100.64.1.5:7509",
+            &empty,
+        ));
+        // Public IPs always rejected even with a same-IP literal Origin.
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("8.8.8.8:7509"),
+            "http://8.8.8.8:7509",
+            &empty,
+        ));
+    }
+
+    /// Regression for #3957: a node bound to `0.0.0.0` and accessed from
+    /// the LAN at its RFC 1918 IP must accept the WS upgrade out of the
+    /// box. Reproduces fluffomat's report (Win11 host browsing into an
+    /// Alpine VM at `192.168.178.192:7509`, bridged networking) where
+    /// `private_network_filter` accepted the connection but the WS
+    /// upgrade rejected it because the LAN IP wasn't in `allowed_hosts`
+    /// and no `--allowed-source-cidrs` was configured.
+    ///
+    /// The accepting case is the actual production flow: the shell page
+    /// (loaded at `http://<lan-ip>:7509/`) opens a real WebSocket on
+    /// behalf of the sandboxed iframe via its postMessage bridge, so the
+    /// browser sends `Origin: http://<lan-ip>:7509` — a same-IP literal,
+    /// which passes the CSWSH guard. River and Delta both use this
+    /// shell-mediated path, so neither relies on the now-rejected
+    /// `Origin: null` shortcut on the default-private branch.
+    #[test]
+    fn lan_ip_accepted_without_explicit_allowlist_3957() {
+        let empty = crate::server::AllowedSourceCidrs::default();
+        // Production scenario: shell page opens a real WebSocket whose
+        // Origin is the gateway's own LAN URL.
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("192.168.178.192:7509"),
+            "http://192.168.178.192:7509",
+            &empty,
+        ));
+        // CSWSH guards still hold:
+
+        // - Sandboxed iframe on a 3rd-party site (Origin: null) probing
+        //   the LAN-bound gateway: REJECTED by the default-private branch.
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("192.168.178.192:7509"),
+            "null",
+            &empty,
+        ));
+        // - Cross-origin attacker hostname: REJECTED.
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("192.168.178.192:7509"),
+            "https://evil.com",
+            &empty,
+        ));
+        // - Origin spelling a different LAN IP must not hijack via the
+        //   same-host check.
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("192.168.178.192:7509"),
+            "http://192.168.178.50:7509",
+            &empty,
+        ));
+    }
+
+    /// Pin: `0.0.0.0` and `::` (unspecified addresses) are NOT acceptable
+    /// Host headers on the default-private branch even though
+    /// `is_private_ip` returns true for them. No legitimate browser sends
+    /// `Host: 0.0.0.0` or `Host: [::]`, so we narrow the default-LAN
+    /// surface to actual host IPs.
+    #[test]
+    fn host_header_unspecified_rejected_on_default_branch() {
+        let empty = crate::server::AllowedSourceCidrs::default();
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("0.0.0.0:7509"),
+            "http://0.0.0.0:7509",
+            &empty,
+        ));
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("[::]:7509"),
+            "http://[::]:7509",
+            &empty,
+        ));
+        // Even with operator CIDR explicitly covering 0.0.0.0/0 — wait,
+        // the CIDR validator rejects /0, so the operator path can't
+        // actually permit unspecified. This case is reachable only via a
+        // crafted CIDR like "0.0.0.0/8", which IS accepted by the
+        // validator. Pin the resulting behaviour: unspecified Host inside
+        // an explicit operator CIDR remains accepted (operator opt-in).
+        let permissive = cidrs(&["0.0.0.0/8"]);
+        assert!(host_header_ip_in_cidrs(
+            &headers_with_host("0.0.0.0:7509"),
+            "null",
+            &permissive,
+        ));
     }
 
     /// IPv6 CIDRs must work end-to-end, including the bracketed `[v6]:port`
-    /// form browsers send in the Host header.
+    /// form browsers send in the Host header. To exercise CIDR membership
+    /// specifically (not the default-private path) the "outside" case uses
+    /// a global-unicast IPv6 (2001:db8::/32 documentation prefix) which is
+    /// neither ULA nor link-local nor loopback, so it has no default-allow
+    /// path and must be rejected when not in the CIDR.
     #[test]
     fn host_header_ipv6_in_cidr_allowed() {
         let allowed = cidrs(&["fd7a:115c:a1e0::/48"]);
@@ -2035,9 +2209,10 @@ mod tests {
             "null",
             &allowed,
         ));
-        // Outside the /48.
+        // Public IPv6 (documentation prefix) outside the /48 — rejected
+        // because it isn't ULA/loopback/link-local AND isn't in the CIDR.
         assert!(!host_header_ip_in_cidrs(
-            &headers_with_host("[fd7a:115c:a1e1::1]:7509"),
+            &headers_with_host("[2001:db8::1]:7509"),
             "null",
             &allowed,
         ));
