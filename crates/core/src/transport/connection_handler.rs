@@ -32,7 +32,6 @@ use super::{
     Socket, TransportError,
     congestion_control::{CongestionControl, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
-    fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
     packet_data::{
         MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
@@ -70,7 +69,7 @@ const RECENTLY_CLOSED_DURATION: Duration = Duration::from_secs(2);
 ///
 /// When a gateway restarts, all connected peers detect their connections are dead
 /// and attempt to reconnect simultaneously ("thundering herd"). This overwhelms
-/// the fast_channel buffers for inter-gateway links, triggering packet drops
+/// the inbound channel buffers for inter-gateway links, triggering packet drops
 /// that can cascade into a non-recovering overflow loop.
 ///
 /// The rate limiter gradually increases the connection acceptance rate:
@@ -675,16 +674,16 @@ type GwOngoingConnectionResult<S, T> = Option<
 enum ConnectionState<S, T: TimeSource> {
     /// Gateway is performing asymmetric handshake with a connecting peer.
     GatewayHandshake {
-        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     },
     /// Outbound NAT traversal handshake in progress.
     NatTraversal {
-        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
         result_sender: oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>,
     },
     /// Connection fully established with symmetric encryption.
     Established {
-        inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     },
     /// Connection recently closed - drains in-flight packets.
     /// Allows new intro packets for reconnection.
@@ -750,8 +749,8 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         {
             match inbound_packet_sender.try_send(packet) {
                 Ok(()) => Ok(true),
-                Err(fast_channel::TrySendError::Full(_)) => Ok(false),
-                Err(fast_channel::TrySendError::Disconnected(_)) => {
+                Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.mark_closed(addr);
                     Err(())
                 }
@@ -772,8 +771,8 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         {
             match packet_sender.try_send(packet) {
                 Ok(()) => Ok(true),
-                Err(fast_channel::TrySendError::Full(_)) => Ok(false),
-                Err(fast_channel::TrySendError::Disconnected(_)) => Ok(false), // Handshake completing
+                Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+                Err(mpsc::error::TrySendError::Closed(_)) => Ok(false), // Handshake completing
             }
         } else {
             Err(())
@@ -788,7 +787,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         packet: PacketData<UnknownEncryption>,
     ) -> Result<bool, ()> {
         if let Some(ConnectionState::NatTraversal { packet_sender, .. }) = self.states.get(addr) {
-            match packet_sender.send_async(packet).await {
+            match packet_sender.send(packet).await {
                 Ok(()) => Ok(true),
                 Err(_) => Ok(false),
             }
@@ -801,7 +800,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn start_gateway_handshake(
         &mut self,
         addr: SocketAddr,
-        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     ) -> bool {
         use std::collections::btree_map::Entry;
         let now = self.time_source.now_nanos();
@@ -835,7 +834,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn complete_gateway_handshake(
         &mut self,
         addr: SocketAddr,
-        inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     ) -> bool {
         use std::collections::btree_map::Entry;
 
@@ -868,7 +867,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn start_nat_traversal(
         &mut self,
         addr: SocketAddr,
-        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
         result_sender: oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>,
     ) -> bool {
         use std::collections::btree_map::Entry;
@@ -937,7 +936,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn complete_nat_traversal(
         &mut self,
         addr: SocketAddr,
-        inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     ) -> Option<oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>> {
         use std::collections::btree_map::Entry;
 
@@ -1003,7 +1002,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn remove_established(
         &mut self,
         addr: &SocketAddr,
-    ) -> Option<FastSender<PacketData<UnknownEncryption>>> {
+    ) -> Option<mpsc::Sender<PacketData<UnknownEncryption>>> {
         if matches!(
             self.states.get(addr),
             Some(ConnectionState::Established { .. })
@@ -1660,7 +1659,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         inbound_key_bytes: [u8; 16],
     ) -> (
         GatewayConnectionFuture<S, T>,
-        FastSender<PacketData<UnknownEncryption>>,
+        mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
@@ -1670,8 +1669,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let time_source = self.time_source.clone();
         let congestion_config = self.congestion_config.clone();
 
-        let (inbound_from_remote, next_inbound) =
-            fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
+        let (inbound_from_remote, mut next_inbound) =
+            mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let f = async move {
             let decrypted_intro_packet =
                 secret
@@ -1749,11 +1748,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
             // wait until the remote sends the ack packet
             let timeout_result = crate::deterministic_select! {
-                result = next_inbound.recv_async() => Some(result),
+                result = next_inbound.recv() => Some(result),
                 _ = time_source.sleep(Duration::from_secs(5)) => None,
             };
             match timeout_result {
-                Some(Ok(packet)) => {
+                Some(Some(packet)) => {
                     let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
                         tracing::debug!(
                             peer_addr = %remote_addr,
@@ -1766,7 +1765,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         }
                     })?;
                 }
-                Some(Err(_)) => {
+                Some(None) => {
                     return Err(TransportError::ConnectionEstablishmentFailure {
                         cause: "connection closed".into(),
                     });
@@ -1811,8 +1810,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 time_source.clone(),
             ));
 
-            let (inbound_packet_tx, inbound_packet_rx) =
-                fast_channel::bounded(INBOUND_CHANNEL_CAPACITY);
+            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
             // Issue #2395: Drain any packets that arrived during the handshake.
             // The peer may send application-level messages (like ConnectRequest) immediately
@@ -1876,7 +1874,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         remote_public_key: TransportPublicKey,
     ) -> (
         TraverseNatFuture<S, T>,
-        FastSender<PacketData<UnknownEncryption>>,
+        mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         tracing::debug!(
             peer_addr = %remote_addr,
@@ -1963,8 +1961,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let socket = self.socket_listener.clone();
         let time_source = self.time_source.clone();
         let congestion_config = self.congestion_config.clone();
-        let (inbound_from_remote, next_inbound) =
-            fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
+        let (inbound_from_remote, mut next_inbound) =
+            mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
         let f = async move {
             tracing::info!(
@@ -2037,11 +2035,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     }
                 }
                 let next_inbound_result = crate::deterministic_select! {
-                    result = next_inbound.recv_async() => Some(result),
+                    result = next_inbound.recv() => Some(result),
                     _ = time_source.sleep(Duration::from_millis(200)) => None,
                 };
                 match next_inbound_result {
-                    Some(Ok(packet)) => {
+                    Some(Some(packet)) => {
                         tracing::trace!(
                             peer_addr = %remote_addr,
                             direction = "outbound",
@@ -2109,7 +2107,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) =
-                                                fast_channel::bounded(INBOUND_CHANNEL_CAPACITY);
+                                                mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
                                             // Initialize congestion controller (BBR by default, configurable for benchmarks)
                                             let congestion_controller = congestion_config
@@ -2222,7 +2220,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
                                 let (inbound_sender, inbound_recv) =
-                                    fast_channel::bounded(INBOUND_CHANNEL_CAPACITY);
+                                    mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
                                 // Initialize congestion controller (BBR by default, configurable for benchmarks)
                                 let congestion_controller = congestion_config
@@ -2282,7 +2280,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             }
                         }
                     }
-                    Some(Err(_)) => {
+                    Some(None) => {
                         tracing::debug!(
                             bind_addr = %this_addr,
                             peer_addr = %remote_addr,
@@ -2388,7 +2386,7 @@ pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
 }
 
 struct InboundRemoteConnection {
-    inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+    inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
 }
 
 mod version_cmp {
@@ -2840,11 +2838,12 @@ mod version_cmp {
     /// from GatewayHandshake to Established with no intermediate None state.
     #[test]
     fn test_atomic_handshake_completion_no_packet_loss() {
-        use super::{ConnectionStateManager, fast_channel};
+        use super::ConnectionStateManager;
         use crate::simulation::VirtualTime;
         use crate::transport::packet_data::{PacketData, UnknownEncryption};
         use std::net::SocketAddr;
         use tokio::net::UdpSocket;
+        use tokio::sync::mpsc;
 
         let time = VirtualTime::new();
         let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
@@ -2852,7 +2851,7 @@ mod version_cmp {
         let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
         // Create a channel for the handshake
-        let (tx, _rx) = fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
 
         // Start gateway handshake
         let started = manager.start_gateway_handshake(addr, tx);
@@ -2863,8 +2862,7 @@ mod version_cmp {
         );
 
         // Create channel for established connection
-        let (established_tx, _established_rx) =
-            fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        let (established_tx, _established_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
 
         // Complete the handshake atomically
         let completed = manager.complete_gateway_handshake(addr, established_tx);
@@ -2887,14 +2885,13 @@ mod version_cmp {
     /// to the asymmetric decryption handler (expensive and wrong).
     #[test]
     fn test_recently_closed_prevents_asymmetric_decryption() {
-        use super::{
-            ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION, fast_channel,
-        };
+        use super::{ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION};
         use crate::simulation::VirtualTime;
         use crate::transport::packet_data::{PacketData, UnknownEncryption};
         use std::net::SocketAddr;
         use std::time::Duration;
         use tokio::net::UdpSocket;
+        use tokio::sync::mpsc;
 
         let time = VirtualTime::new();
         let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
@@ -2902,10 +2899,9 @@ mod version_cmp {
         let addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
 
         // Create an established connection
-        let (tx, _rx) = fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
         manager.start_gateway_handshake(addr, tx);
-        let (established_tx, _established_rx) =
-            fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        let (established_tx, _established_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
         manager.complete_gateway_handshake(addr, established_tx);
         assert!(manager.is_established(&addr));
 
@@ -2938,6 +2934,77 @@ mod version_cmp {
         assert!(
             manager.get_state(&addr).is_none(),
             "State should be cleaned up after expiration"
+        );
+    }
+
+    /// Regression for #3959 — the UDP listener must never block in
+    /// `try_send_established` when a single per-peer inbound channel is full.
+    ///
+    /// Before the switch from `crossbeam::channel` to `tokio::sync::mpsc`,
+    /// a wedged crossbeam slot could send `try_send` into an indefinite
+    /// `sched_yield` spin (`Backoff::snooze`), freezing the entire listener
+    /// task and starving every other peer plus the HTTP API. With `tokio::sync::mpsc`
+    /// the slot-stamp protocol is gone, so `try_send` always returns
+    /// `Full` / `Closed` immediately when it cannot enqueue.
+    ///
+    /// This test fills a per-peer channel past capacity without any consumer
+    /// and asserts each call returns within a tight wall-clock budget.
+    #[test]
+    fn test_try_send_established_never_blocks_when_full() {
+        use super::ConnectionStateManager;
+        use crate::simulation::VirtualTime;
+        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+        use std::net::SocketAddr;
+        use std::time::{Duration, Instant};
+        use tokio::net::UdpSocket;
+        use tokio::sync::mpsc;
+
+        const CAPACITY: usize = 4;
+        const ATTEMPTS: usize = 1_000;
+        // Generous budget — even on a heavily loaded CI runner, 1k non-blocking
+        // try_sends should be done in <100 ms. The spin-deadlock burned 4 hours.
+        const BUDGET: Duration = Duration::from_secs(1);
+
+        let time = VirtualTime::new();
+        let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
+            ConnectionStateManager::new(time);
+        let addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+
+        // Establish a connection with a tiny channel and no consumer ever reading from it.
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
+        let started = manager.start_gateway_handshake(addr, tx.clone());
+        assert!(started, "Should start gateway handshake");
+        let completed = manager.complete_gateway_handshake(addr, tx);
+        assert!(completed, "Should complete gateway handshake");
+
+        // Build a dummy packet to forward repeatedly.
+        let make_packet = || PacketData::<UnknownEncryption>::from_buf([0u8; 32]);
+
+        let started_at = Instant::now();
+        let mut sent_count = 0;
+        let mut full_count = 0;
+        for _ in 0..ATTEMPTS {
+            match manager.try_send_established(&addr, make_packet()) {
+                Ok(true) => sent_count += 1,
+                Ok(false) => full_count += 1,
+                Err(()) => panic!("connection unexpectedly disconnected"),
+            }
+        }
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < BUDGET,
+            "{ATTEMPTS} try_send_established calls took {elapsed:?} (budget {BUDGET:?}) — \
+             the listener forwarding path must not block, regardless of receiver state"
+        );
+        assert!(
+            sent_count <= CAPACITY,
+            "Bounded channel (capacity {CAPACITY}) accepted {sent_count} messages with no consumer"
+        );
+        assert!(
+            full_count >= ATTEMPTS - CAPACITY,
+            "Expected at least {} Full results, got {full_count}",
+            ATTEMPTS - CAPACITY
         );
     }
 

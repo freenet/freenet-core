@@ -39,7 +39,6 @@ chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 clap = { features = ["derive", "env"], workspace = true }
 cookie = "0.18"
-crossbeam = { workspace = true }
 ctrlc = { features = ["termination"], workspace = true }
 dashmap = { workspace = true }
 delegate = { workspace = true }

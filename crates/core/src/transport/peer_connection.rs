@@ -13,13 +13,13 @@ use crate::config::GlobalExecutor;
 use crate::simulation::{RealTime, TimeSource, TimeSourceInterval};
 use crate::transport::connection_handler::NAT_TRAVERSAL_MAX_ATTEMPTS;
 use crate::transport::crypto::TransportSecretKey;
-use crate::transport::fast_channel::{self, FastReceiver, FastSender};
 use crate::transport::packet_data::UnknownEncryption;
 use crate::transport::sent_packet_tracker::MESSAGE_CONFIRMATION_TIMEOUT;
 use aes_gcm::Aes128Gcm;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, instrument, span};
 
@@ -100,7 +100,7 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     pub(super) remote_addr: SocketAddr,
     pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
     pub(super) last_packet_id: Arc<AtomicU32>,
-    pub(super) inbound_packet_recv: FastReceiver<PacketData<UnknownEncryption>>,
+    pub(super) inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
     pub(super) inbound_symmetric_key: Aes128Gcm,
     pub(super) inbound_symmetric_key_bytes: [u8; 16],
     #[allow(dead_code)]
@@ -230,7 +230,7 @@ type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     remote_conn: RemoteConnection<S, T>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
-    inbound_streams: HashMap<StreamId, FastSender<(u32, bytes::Bytes)>>,
+    inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, bytes::Bytes)>>,
     inbound_stream_futures: FuturesUnordered<JoinHandle<InboundStreamResult>>,
     outbound_stream_futures: FuturesUnordered<JoinHandle<OutboundStreamResult>>,
     failure_count: usize,
@@ -636,8 +636,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
             // DST: Use deterministic_select! for fair but deterministic branch ordering
             crate::deterministic_select! {
-                inbound = self.remote_conn.inbound_packet_recv.recv_async() => {
-                    let packet_data = inbound.map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
+                inbound = self.remote_conn.inbound_packet_recv.recv() => {
+                    let packet_data = inbound.ok_or_else(|| TransportError::ConnectionClosed(self.remote_addr()))?;
                     self.last_received_nanos = self.time_source.now_nanos();
 
                     // Debug logging for intro packets
@@ -1477,10 +1477,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     return Ok(None);
                 }
 
-                // Legacy path: push to fast_channel for existing recv() behavior
+                // Legacy path: push to mpsc channel for existing recv() behavior
                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
                     sender
-                        .send_async((fragment_number, payload))
+                        .send((fragment_number, payload))
                         .await
                         .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                     tracing::trace!(
@@ -1490,7 +1490,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         "Fragment pushed to existing stream"
                     );
                 } else {
-                    let (sender, receiver) = fast_channel::bounded(64);
+                    let (sender, receiver) = mpsc::channel(64);
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -2021,11 +2021,11 @@ mod tests {
 
     /// Simple test socket that writes to a channel
     struct TestSocket {
-        sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>,
+        sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     }
 
     impl TestSocket {
-        fn new(sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>) -> Self {
+        fn new(sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>) -> Self {
             Self { sender }
         }
     }
@@ -2041,7 +2041,7 @@ mod tests {
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
             self.sender
-                .send_async((target, buf.into()))
+                .send((target, buf.into()))
                 .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             Ok(buf.len())
@@ -2049,7 +2049,7 @@ mod tests {
 
         fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
             self.sender
-                .send((target, buf.into()))
+                .blocking_send((target, buf.into()))
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             Ok(buf.len())
         }
@@ -2057,13 +2057,13 @@ mod tests {
 
     /// Test socket with configurable send failures for testing transient error resilience.
     struct FailableTestSocket {
-        sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>,
+        sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
         fail_sends: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FailableTestSocket {
         fn new(
-            sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>,
+            sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
             fail_sends: Arc<std::sync::atomic::AtomicBool>,
         ) -> Self {
             Self { sender, fail_sends }
@@ -2087,7 +2087,7 @@ mod tests {
                 ));
             }
             self.sender
-                .send_async((target, buf.into()))
+                .send((target, buf.into()))
                 .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             Ok(buf.len())
@@ -2101,7 +2101,7 @@ mod tests {
                 ));
             }
             self.sender
-                .send((target, buf.into()))
+                .blocking_send((target, buf.into()))
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             Ok(buf.len())
         }
@@ -2112,7 +2112,7 @@ mod tests {
     #[test]
     fn send_failure_returns_transient_error() {
         let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let (tx, _rx) = fast_channel::bounded(16);
+        let (tx, _rx) = mpsc::channel(16);
         let socket = Arc::new(FailableTestSocket::new(tx, fail_flag));
         let remote_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
@@ -2205,7 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn test_inbound_outbound_interaction() -> Result<(), Box<dyn std::error::Error>> {
         const MSG_LEN: usize = 1000;
-        let (sender, receiver) = fast_channel::bounded(1);
+        let (sender, mut receiver) = mpsc::channel(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let mut message = vec![0u8; MSG_LEN];
         crate::config::GlobalRng::fill_bytes(&mut message);
@@ -2251,10 +2251,10 @@ mod tests {
 
         let inbound = async {
             // need to take care of decrypting and deserializing the inbound data before collecting into the message
-            let (tx, rx) = fast_channel::bounded(1);
+            let (tx, rx) = mpsc::channel(1);
             let stream = InboundStream::new(MSG_LEN as u64);
             let inbound_msg = GlobalExecutor::spawn(recv_stream(stream_id, rx, stream));
-            while let Ok((_, network_packet)) = receiver.recv_async().await {
+            while let Some((_, network_packet)) = receiver.recv().await {
                 let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
                     .try_decrypt_sym(&cipher)
                     .map_err(|e| e.to_string())?;
@@ -2270,7 +2270,7 @@ mod tests {
                 else {
                     return Err("unexpected message".into());
                 };
-                tx.send_async((fragment_number, payload)).await?;
+                tx.send((fragment_number, payload)).await?;
             }
             let (_, msg) = inbound_msg
                 .await?
@@ -2611,7 +2611,7 @@ mod tests {
         use crate::util::time_source::SharedMockTimeSource;
 
         let time_source = SharedMockTimeSource::new();
-        let (_inbound_tx, inbound_rx) = fast_channel::bounded(16);
+        let (_inbound_tx, inbound_rx) = mpsc::channel(16);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9999);
 
         let mut key = [0u8; 16];
@@ -2633,7 +2633,7 @@ mod tests {
         ));
 
         let socket = Arc::new(TestSocket::new(
-            fast_channel::bounded::<(SocketAddr, Arc<[u8]>)>(16).0,
+            mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
         ));
 
         let remote_conn = RemoteConnection {
