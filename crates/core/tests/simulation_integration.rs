@@ -6241,9 +6241,10 @@ async fn let_network_run(sim: &mut SimNetwork, duration: Duration) {
 ///
 /// **Background (Issue #3207):**
 /// When a gateway restarts, all peers reconnect simultaneously, generating a
-/// burst of CONNECT operations that can overwhelm per-connection fast_channel
-/// (see `INBOUND_CHANNEL_CAPACITY`), causing a non-recovering drop→retransmit feedback loop.
-/// PR #3208 fixed the underlying inbound starvation bug.
+/// burst of CONNECT operations that can overwhelm per-connection inbound
+/// channels (see `INBOUND_CHANNEL_CAPACITY`), causing a non-recovering
+/// drop→retransmit feedback loop. PR #3208 fixed the underlying inbound
+/// starvation bug.
 ///
 /// **Test scenario:**
 /// 1. Create a 1-gateway + 20-node network, let it stabilize
