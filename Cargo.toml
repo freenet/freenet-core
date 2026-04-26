@@ -146,7 +146,7 @@ tao = { version = "0.35", default-features = false, features = ["rwh_06"] }
 wry = { version = "0.55", default-features = false, features = ["os-webview"] }
 winreg = "0.56"
 tray-icon = "0.22"
-muda = "0.17"
+muda = "0.18"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
