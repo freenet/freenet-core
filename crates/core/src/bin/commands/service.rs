@@ -3478,6 +3478,7 @@ mod tests {
             .write(true)
             .open(path)
             .unwrap();
+        // SAFETY: file is a valid open fd owned by `file`; flock is safe to call on any fd.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 { Some(file) } else { None }
     }

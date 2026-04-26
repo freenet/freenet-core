@@ -191,8 +191,6 @@ pub mod in_memory_socket;
 /// without real network I/O.
 #[cfg(any(test, feature = "bench"))]
 pub use connection_handler::mock_transport;
-/// High-performance channels for transport layer.
-pub mod fast_channel;
 mod packet_data;
 pub mod peer_connection;
 // todo: optimize trackers
