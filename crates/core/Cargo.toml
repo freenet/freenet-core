@@ -120,14 +120,12 @@ winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "wi
 serde = { workspace = true }
 zip = { workspace = true }
 tray-icon = { workspace = true }
-muda = { workspace = true }
 tao = { workspace = true }
 wry = { workspace = true }
 winreg = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = { workspace = true }
-muda = { workspace = true }
 tao = { workspace = true }
 
 [dev-dependencies]
