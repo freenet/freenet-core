@@ -2937,20 +2937,29 @@ mod version_cmp {
         );
     }
 
-    /// Regression for #3959 — the UDP listener must never block in
-    /// `try_send_established` when a single per-peer inbound channel is full.
+    /// Regression invariant for #3959 — the UDP listener forwarding path must
+    /// never block, regardless of receiver state.
     ///
-    /// Before the switch from `crossbeam::channel` to `tokio::sync::mpsc`,
-    /// a wedged crossbeam slot could send `try_send` into an indefinite
-    /// `sched_yield` spin (`Backoff::snooze`), freezing the entire listener
-    /// task and starving every other peer plus the HTTP API. With `tokio::sync::mpsc`
-    /// the slot-stamp protocol is gone, so `try_send` always returns
-    /// `Full` / `Closed` immediately when it cannot enqueue.
+    /// Under the deleted `fast_channel` (built on `crossbeam::channel`), a
+    /// wedged crossbeam slot could send `try_send` into an indefinite
+    /// `sched_yield` spin (`Backoff::snooze`). The reproduction in production
+    /// required cross-thread interleaving inside crossbeam internals and is
+    /// not synthetically reproducible from a unit test, so this test does
+    /// NOT reproduce the original wedge — instead it pins the structural
+    /// contract that the fix establishes: the per-peer inbound `Sender`
+    /// returns immediately on capacity exhaustion (`Full`), without
+    /// blocking the listener task. The two methods exercised
+    /// (`try_send_established` and `try_send_gateway_handshake`) are
+    /// invoked from `UdpPacketsListener::listen` for every inbound packet,
+    /// so any future regression that reintroduces a blocking `try_send`
+    /// here would refreeze the node the same way.
     ///
-    /// This test fills a per-peer channel past capacity without any consumer
-    /// and asserts each call returns within a tight wall-clock budget.
-    #[test]
-    fn test_try_send_established_never_blocks_when_full() {
+    /// Run as `#[tokio::test]` so the channel construction lives inside a
+    /// runtime context — `mpsc::channel` itself does not require one, but
+    /// keeping the test in a runtime keeps it forward-compatible if anyone
+    /// extends `ConnectionStateManager` to use async primitives later.
+    #[tokio::test]
+    async fn test_try_send_established_never_blocks_when_full() {
         use super::ConnectionStateManager;
         use crate::simulation::VirtualTime;
         use crate::transport::packet_data::{PacketData, UnknownEncryption};
@@ -2961,8 +2970,8 @@ mod version_cmp {
 
         const CAPACITY: usize = 4;
         const ATTEMPTS: usize = 1_000;
-        // Generous budget — even on a heavily loaded CI runner, 1k non-blocking
-        // try_sends should be done in <100 ms. The spin-deadlock burned 4 hours.
+        // Generous budget — 1k non-blocking try_sends should complete in
+        // microseconds. Compare to the production wedge that spun 4 hours.
         const BUDGET: Duration = Duration::from_secs(1);
 
         let time = VirtualTime::new();
@@ -3000,6 +3009,58 @@ mod version_cmp {
         assert!(
             sent_count <= CAPACITY,
             "Bounded channel (capacity {CAPACITY}) accepted {sent_count} messages with no consumer"
+        );
+        assert!(
+            full_count >= ATTEMPTS - CAPACITY,
+            "Expected at least {} Full results, got {full_count}",
+            ATTEMPTS - CAPACITY
+        );
+    }
+
+    /// Companion to `test_try_send_established_never_blocks_when_full` —
+    /// the gateway-handshake forwarding path is also invoked synchronously
+    /// from the listener loop (`connection_handler.rs:1352`) and was
+    /// equally vulnerable to the crossbeam wedge before #3959. This test
+    /// pins the same non-blocking invariant for that path.
+    #[tokio::test]
+    async fn test_try_send_gateway_handshake_never_blocks_when_full() {
+        use super::ConnectionStateManager;
+        use crate::simulation::VirtualTime;
+        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+        use std::net::SocketAddr;
+        use std::time::{Duration, Instant};
+        use tokio::net::UdpSocket;
+        use tokio::sync::mpsc;
+
+        const CAPACITY: usize = 4;
+        const ATTEMPTS: usize = 1_000;
+        const BUDGET: Duration = Duration::from_secs(1);
+
+        let time = VirtualTime::new();
+        let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
+            ConnectionStateManager::new(time);
+        let addr: SocketAddr = "127.0.0.1:8003".parse().unwrap();
+
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
+        let started = manager.start_gateway_handshake(addr, tx);
+        assert!(started, "Should start gateway handshake");
+
+        let make_packet = || PacketData::<UnknownEncryption>::from_buf([0u8; 32]);
+
+        let started_at = Instant::now();
+        let mut full_count = 0;
+        for _ in 0..ATTEMPTS {
+            match manager.try_send_gateway_handshake(&addr, make_packet()) {
+                Ok(true) => {}
+                Ok(false) => full_count += 1,
+                Err(()) => panic!("handshake state unexpectedly missing"),
+            }
+        }
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < BUDGET,
+            "{ATTEMPTS} try_send_gateway_handshake calls took {elapsed:?} (budget {BUDGET:?})"
         );
         assert!(
             full_count >= ATTEMPTS - CAPACITY,
