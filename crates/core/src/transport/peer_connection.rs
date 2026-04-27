@@ -1477,12 +1477,27 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     return Ok(None);
                 }
 
-                // Legacy path: push to mpsc channel for existing recv() behavior
+                // Legacy path: push to mpsc channel for existing recv() behavior.
+                // Use try_send (not send().await): this code runs inside
+                // PeerConnection::recv, which is the connection's only event
+                // loop. A blocking await here would stall ACKs, keepalives,
+                // and every other stream on the same connection if a single
+                // stream's consumer task gets slow. On Full or Closed we
+                // treat the stream as broken and surface it as
+                // ConnectionClosed — matching the behaviour the prior
+                // .send().await already had on Closed, just without the
+                // node-wide hang risk on Full. (See #3961 / #3959.)
                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
-                    sender
-                        .send((fragment_number, payload))
-                        .await
-                        .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
+                    sender.try_send((fragment_number, payload)).map_err(|err| {
+                        tracing::debug!(
+                            peer_addr = %self.remote_conn.remote_addr,
+                            stream_id = %stream_id,
+                            fragment_number,
+                            ?err,
+                            "Inbound stream consumer cannot keep up; closing connection"
+                        );
+                        TransportError::ConnectionClosed(self.remote_addr())
+                    })?;
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
