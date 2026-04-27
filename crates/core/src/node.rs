@@ -1328,8 +1328,6 @@ where
                 // streaming variants (RequestUpdateStreaming /
                 // BroadcastToStreaming) through task-per-tx drivers
                 // under the same source_addr + !has_update_op gates.
-                // The deprecated Broadcasting wire variant stays on
-                // the legacy path (no-op handler).
                 if let Some(sender_addr) = source_addr {
                     #[allow(clippy::wildcard_enum_match_arm)]
                     match op {
@@ -1439,11 +1437,9 @@ where
                             }
                             return Ok(None);
                         }
-                        // Deprecated `Broadcasting` variant stays legacy
-                        // (no-op handler). Pre-registered UpdateOps
-                        // (has_update_op == true) also fall through to
-                        // legacy for GC / originator-loopback paths.
-                        // Wildcard arm exists ONLY to satisfy
+                        // Pre-registered UpdateOps (has_update_op == true)
+                        // fall through to legacy for GC / originator-loopback
+                        // paths. Wildcard arm exists ONLY to satisfy
                         // non-exhaustive matches; do not expand.
                         _ => {}
                     }
@@ -3930,11 +3926,9 @@ mod tests {
         }
 
         /// Slice C (#1454 phase 5): streaming relay UPDATE variants
-        /// are now dispatched through task-per-tx drivers. The
-        /// deprecated `Broadcasting` wire variant stays on the legacy
-        /// no-op path.
+        /// are dispatched through task-per-tx drivers.
         #[test]
-        fn update_branch_dispatches_streaming_drivers_but_not_broadcasting() {
+        fn update_branch_dispatches_streaming_drivers() {
             const SOURCE: &str = include_str!("node.rs");
 
             let anchor = "NetMessageV1::Update(ref op) => {";
@@ -3954,11 +3948,6 @@ mod tests {
                 window.contains("start_relay_broadcast_to_streaming("),
                 "UPDATE branch must call start_relay_broadcast_to_streaming \
                  for streaming relay dispatch (slice C)."
-            );
-            assert!(
-                !window.contains("UpdateMsg::Broadcasting {"),
-                "UPDATE branch must not dispatch the deprecated Broadcasting \
-                 variant — it stays on the legacy no-op handler."
             );
         }
 

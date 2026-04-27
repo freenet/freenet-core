@@ -1393,26 +1393,6 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Update(UpdateMsg::Broadcasting {
-                new_value,
-                broadcast_to,
-                broadcasted_to,
-                key,
-                id,
-            }) => {
-                let this_peer = op_manager.ring.connection_manager.own_location();
-                EventKind::Update(UpdateEvent::BroadcastEmitted {
-                    id: *id,
-                    upstream: this_peer.clone(), // We are the broadcaster
-                    broadcast_to: broadcast_to.clone(),
-                    broadcasted_to: *broadcasted_to,
-                    key: *key,
-                    value: new_value.clone(),
-                    sender: this_peer, // We are the sender
-                    timestamp: chrono::Utc::now().timestamp() as u64,
-                    state_hash: None, // Hash not available from message
-                })
-            }
             NetMessageV1::Update(UpdateMsg::BroadcastTo {
                 payload, key, id, ..
             }) => {

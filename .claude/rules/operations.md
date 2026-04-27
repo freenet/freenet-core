@@ -24,8 +24,7 @@ paths:
 > state-machine path**, which still serves: GC-spawned GET retries and
 > `start_targeted_op` UPDATE-triggered auto-fetch (streaming relay and
 > originator loopback also remain on legacy per #3883 port plan §7),
-> PUT GC / streaming / originator-loopback paths, the deprecated
-> UPDATE `Broadcasting` wire variant (no-op handler), CONNECT, and
+> PUT GC / streaming / originator-loopback paths, CONNECT, and
 > SUBSCRIBE's renewal / PUT-sub-op / executor / intermediate-peer
 > entry points. Phase 5 follow-up slice A (PR #3910) migrated fresh
 > inbound non-streaming relay `UpdateMsg::RequestUpdate` and
@@ -83,9 +82,9 @@ paths:
 > reuses the shared `log_broadcast_to_streaming_failure` classifier
 > and triggers `try_auto_fetch_contract` / `send_summary_back_on_rejection`
 > on the same branches as the legacy handler. The deprecated
-> `UpdateMsg::Broadcasting` wire variant remains on the legacy no-op
-> handler; Phase 6 wire cleanup will delete both the legacy streaming
-> arms in `update.rs:871-1366` and the `Broadcasting` variant.
+> `UpdateMsg::Broadcasting` wire variant has been removed; the
+> `min-compatible-version` floor was bumped to 0.2.50 to gate the
+> incompatible bincode discriminant shift.
 >
 > Task-per-tx drivers have their own invariants documented in the
 > `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.

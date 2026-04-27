@@ -410,8 +410,6 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 //      `update.rs::process_message`, lines 595–825).
 //
 // NOT migrated (stays on legacy path; see port plan §3 / §9):
-//   - `UpdateMsg::Broadcasting` (deprecated wire variant — legacy
-//      handler is a no-op).
 //   - `UpdateMsg::RequestUpdateStreaming` /
 //     `UpdateMsg::BroadcastToStreaming` (slice B follow-up — orphan
 //      stream claim + assembly).
@@ -2276,27 +2274,19 @@ mod tests {
         );
     }
 
-    /// Pin: `Broadcasting` (deprecated) must not be migrated. Legacy
-    /// handler treats it as a no-op; driver should never reference it.
+    /// Pin: the deprecated `UpdateMsg::Broadcasting` variant has been
+    /// removed. Re-introducing it would shift bincode discriminant
+    /// tags and silently break wire compatibility with peers gated by
+    /// the bumped `min-compatible-version`. If a future change needs
+    /// a new variant, append it at the end of the enum to preserve
+    /// existing tags.
     #[test]
-    fn deprecated_broadcasting_variant_stays_legacy() {
-        let src = include_str!("op_ctx_task.rs");
-        // Skip past the section header / module-level scope doc comment
-        // (which references variant names by design) by anchoring on the
-        // first relay entry-point fn.
-        let relay_start = src
-            .find("pub(crate) async fn start_relay_request_update(")
-            .expect("start_relay_request_update not found");
-        let relay_end = src
-            .find("#[cfg(test)]")
-            .expect("test module marker not found");
-        let relay_src = &src[relay_start..relay_end];
-        // Match the variant constructor (UpdateMsg::Broadcasting), not
-        // arbitrary substrings (e.g. "Broadcasting" in a doc comment).
+    fn deprecated_broadcasting_variant_must_not_return() {
+        let src = include_str!("../update.rs");
         assert!(
-            !relay_src.contains("UpdateMsg::Broadcasting"),
-            "Driver must not handle UpdateMsg::Broadcasting — deprecated wire \
-             variant; legacy no-op handler stays in place."
+            !src.contains("Broadcasting {"),
+            "UpdateMsg::Broadcasting must remain deleted; appending new variants \
+             at the end of UpdateMsg preserves bincode discriminant tags."
         );
     }
 }

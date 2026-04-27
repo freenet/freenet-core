@@ -232,27 +232,19 @@ where
             } else {
                 let id = *msg.id();
                 tracing::debug!(%id, "operation in progress");
-                if let Some(target) = next_hop {
-                    tracing::debug!(%id, ?target, "sending updated op state");
-                    // IMPORTANT: Push state BEFORE sending message to avoid race condition.
-                    // If we send first, a fast response might arrive before the state is saved,
-                    // causing load_or_init to fail to find the operation.
-                    op_manager.push(id, updated_state).await?;
-                    send_with_stream(network_bridge, target, msg, stream_data).await?;
-                } else {
-                    tracing::debug!(%id, "queueing op state for local processing");
-                    debug_assert!(
-                        matches!(
-                            msg,
-                            NetMessage::V1(NetMessageV1::Update(
-                                crate::operations::update::UpdateMsg::Broadcasting { .. }
-                            ))
-                        ),
-                        "Only Update::Broadcasting messages should be re-queued locally"
-                    );
-                    op_manager.notify_op_change(msg, updated_state).await?;
-                    return Err(OpError::StatePushed);
-                }
+                let target = next_hop.ok_or_else(|| {
+                    // Only UPDATE's deprecated `Broadcasting` variant produced
+                    // SendAndContinue without a next_hop, and it has been
+                    // removed. Reaching this branch indicates a bug in an
+                    // operation's process_message implementation.
+                    OpError::UnexpectedOpState
+                })?;
+                tracing::debug!(%id, ?target, "sending updated op state");
+                // IMPORTANT: Push state BEFORE sending message to avoid race condition.
+                // If we send first, a fast response might arrive before the state is saved,
+                // causing load_or_init to fail to find the operation.
+                op_manager.push(id, updated_state).await?;
+                send_with_stream(network_bridge, target, msg, stream_data).await?;
             }
         }
 
