@@ -38,9 +38,11 @@ paths:
 > relay `PutMsg::Request` to
 > `operations/put/op_ctx_task.rs::start_relay_put` (gated on
 > `source_addr.is_some()` AND `!has_put_op(id)` AND the payload size
-> would not upgrade to streaming on forward); GC speculative retries and
-> client-initiated loopback (`source_addr.is_none()`) still go through
-> legacy. Phase 5 follow-up slice B migrated fresh inbound streaming
+> would not upgrade to streaming on forward). PUT GC speculative
+> retries and the per-op `ack_received` / `speculative_paths` fields
+> have since been retired (PR #3964) along with `PutMsg::ForwardingAck`
+> consumer + senders; only the upgrade-on-forward without inbound
+> `StreamId` and a no-op `ForwardingAck` receiver remain on legacy. Phase 5 follow-up slice B migrated fresh inbound streaming
 > relay `PutMsg::RequestStreaming` to
 > `operations/put/op_ctx_task.rs::start_relay_put_streaming` (same
 > `source_addr.is_some()` AND `!has_put_op(id)` gate). The streaming

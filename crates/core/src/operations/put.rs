@@ -2164,4 +2164,173 @@ mod tests {
             "PUT without stats should return Incomplete"
         );
     }
+
+    // === Pins for retired PUT GC speculative retry surface (PR #3964) ===
+    //
+    // These pins catch accidental re-introduction of the retired
+    // ack-aware speculative retry mechanism. The surface was retired
+    // because PutOp entries no longer leak into `OpManager.ops.put`
+    // for completed task-per-tx originators (the leak was fixed by
+    // extending `OpManager::completed` to remove the per-type
+    // DashMap entry).
+
+    /// Pin: `PutOp` MUST NOT regrow `speculative_paths` / `ack_received`
+    /// fields. The GC speculative retry block (deleted in PR #3964) was
+    /// the only consumer; reintroducing the fields silently brings back
+    /// the dead-code surface.
+    #[test]
+    fn put_op_must_not_regrow_speculative_or_ack_fields() {
+        let src = include_str!("put.rs");
+        let struct_start = src
+            .find("pub(crate) struct PutOp {")
+            .expect("PutOp struct declaration not found");
+        let struct_end = src[struct_start..]
+            .find("\n}\n")
+            .expect("PutOp struct closing brace not found")
+            + struct_start;
+        let struct_body = &src[struct_start..struct_end];
+        assert!(
+            !struct_body.contains("speculative_paths"),
+            "PutOp must not regrow `speculative_paths` — retired in PR #3964"
+        );
+        assert!(
+            !struct_body.contains("ack_received"),
+            "PutOp must not regrow `ack_received` — retired in PR #3964"
+        );
+    }
+
+    /// Pin: `AwaitingResponseData` MUST NOT regrow the retry-related
+    /// fields (alternatives, tried_peers, attempts_at_hop, visited,
+    /// retry_payload, contract_key). They existed only to feed
+    /// `retry_with_next_alternative`, which was deleted with the GC
+    /// speculative retry block.
+    #[test]
+    fn awaiting_response_data_must_not_regrow_retry_fields() {
+        let src = include_str!("put.rs");
+        let struct_start = src
+            .find("pub struct AwaitingResponseData {")
+            .expect("AwaitingResponseData struct declaration not found");
+        let struct_end = src[struct_start..]
+            .find("\n}\n")
+            .expect("AwaitingResponseData closing brace not found")
+            + struct_start;
+        let body = &src[struct_start..struct_end];
+        for retired in [
+            "alternatives",
+            "tried_peers",
+            "attempts_at_hop",
+            "visited",
+            "retry_payload",
+            "contract_key",
+        ] {
+            assert!(
+                !body.contains(retired),
+                "AwaitingResponseData must not regrow `{retired}` — retired in PR #3964"
+            );
+        }
+    }
+
+    /// Pin: the retired retry-with-next-alternative impl method MUST
+    /// stay deleted. Reintroducing it implies regrowing the
+    /// retry-related fields (which the previous pin guards) and
+    /// bringing back the GC speculative retry block.
+    #[test]
+    fn retry_method_signature_must_stay_deleted() {
+        let src = include_str!("put.rs");
+        // Compose the needle at runtime so the pin's own source line
+        // does not contain the literal we're searching for.
+        let needle = format!(
+            "{vis} fn retry_with_next_{kind}",
+            vis = "pub(crate)",
+            kind = "alternative",
+        );
+        assert!(
+            !src.contains(&needle),
+            "retry method retired in PR #3964 — see PutOp pins"
+        );
+    }
+
+    /// Pin: PUT GC speculative retry block MUST NOT come back.
+    /// `op_state_manager.rs` should no longer contain the
+    /// `put_retry_candidates` accumulator or the `put_retried` map.
+    #[test]
+    fn put_gc_speculative_retry_block_must_stay_deleted() {
+        let src = include_str!("../node/op_state_manager.rs");
+        assert!(
+            !src.contains("put_retry_candidates"),
+            "PUT GC speculative retry block was retired in PR #3964 — \
+             reintroduction risks the Phase 3a DashMap leak interaction"
+        );
+        assert!(
+            !src.contains("put_retried"),
+            "PUT GC retry-count map was retired in PR #3964"
+        );
+    }
+
+    /// Pin: `OpManager::completed` MUST keep removing the per-type
+    /// DashMap entry. Without this the Phase 3a leak comes back: a
+    /// task-per-tx PUT's loopback Request pushes a PutOp into
+    /// `ops.put` during multi-hop forward, the bypass routes the
+    /// terminal Response directly to the driver task, and the entry
+    /// never gets popped.
+    #[test]
+    fn completed_must_remove_per_type_dashmap_entry() {
+        let src = include_str!("../node/op_state_manager.rs");
+        let fn_start = src
+            .find("pub fn completed(&self, id: Transaction)")
+            .expect("OpManager::completed not found");
+        let fn_end = src[fn_start..]
+            .find("\n    }\n")
+            .expect("OpManager::completed closing brace not found")
+            + fn_start;
+        let body = &src[fn_start..fn_end];
+        for op in ["self.ops.put", "self.ops.get", "self.ops.subscribe"] {
+            assert!(
+                body.contains(&format!("{op}.remove")),
+                "OpManager::completed must call `{op}.remove(&id)` to \
+                 prevent the Phase 3a-style task-per-tx DashMap leak"
+            );
+        }
+    }
+
+    /// Pin: legacy ForwardingAck senders MUST NOT come back at the
+    /// legacy relay forward sites. Slice A/B drivers omit them
+    /// (would race the capacity-1 task-per-tx waiter), and PR #3964
+    /// removed the legacy senders since the consumer is now a no-op.
+    #[test]
+    fn put_forwarding_ack_senders_must_stay_deleted() {
+        let src = include_str!("put.rs");
+        // Compose the needle at runtime so the pin's own assert line
+        // does not contain the literal we're searching for.
+        let needle = format!("NetMessage::from({}::ForwardingAck", "PutMsg",);
+        assert!(
+            !src.contains(&needle),
+            "ForwardingAck senders retired in PR #3964 — slice A/B drivers omit them"
+        );
+    }
+
+    /// Pin: the no-op `PutMsg::ForwardingAck` handler stays in place
+    /// so older peers that still emit ForwardingAck do not produce
+    /// per-message error noise. Wire variant retained for backward
+    /// compat with peers running pre-PR #3964 builds.
+    #[test]
+    fn put_forwarding_ack_handler_must_be_no_op() {
+        let src = include_str!("put.rs");
+        let arm_start = src
+            .find("PutMsg::ForwardingAck { id, contract_key } => {")
+            .expect("ForwardingAck handler arm not found");
+        let arm_end = src[arm_start..]
+            .find("\n                }")
+            .expect("ForwardingAck handler arm closing not found")
+            + arm_start;
+        let arm = &src[arm_start..arm_end];
+        assert!(
+            arm.contains("OperationResult::Completed"),
+            "ForwardingAck handler must stay a no-op (returns OperationResult::Completed)"
+        );
+        assert!(
+            !arm.contains("ack_received: true"),
+            "ForwardingAck handler must NOT touch ack_received — field retired in PR #3964"
+        );
+    }
 }
