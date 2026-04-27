@@ -1478,26 +1478,35 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 }
 
                 // Legacy path: push to mpsc channel for existing recv() behavior.
-                // Use try_send (not send().await): this code runs inside
-                // PeerConnection::recv, which is the connection's only event
-                // loop. A blocking await here would stall ACKs, keepalives,
-                // and every other stream on the same connection if a single
-                // stream's consumer task gets slow. On Full or Closed we
-                // treat the stream as broken and surface it as
-                // ConnectionClosed — matching the behaviour the prior
-                // .send().await already had on Closed, just without the
-                // node-wide hang risk on Full. (See #3961 / #3959.)
+                //
+                // This is one of the rare in-tree exceptions to the
+                // `.send().await`-in-recv-loop ban from
+                // `.claude/rules/channel-safety.md`. The receiver here is
+                // the freenet-spawned `recv_stream` reassembly task in
+                // `inbound_stream_futures` — it is NOT an external client
+                // consumer, and it has no upstream dependency on this
+                // recv loop. The cascading-backpressure deadlock pattern
+                // the rule prevents (slow external consumer stalls our
+                // event loop, which feeds another channel the consumer
+                // is waiting on) cannot form here because:
+                //   - the consumer is internal and same-runtime, with
+                //     bounded per-fragment work (BTreeMap insert + Vec extend),
+                //   - blocking is scoped per-connection (each peer has
+                //     its own recv loop), so it cannot starve other peers,
+                //   - the only effect of transient backpressure is brief
+                //     ACK/keepalive delay for THIS peer until `recv_stream`
+                //     drains.
+                //
+                // Switching to `try_send` was attempted in #3961 and reverted
+                // on review (Codex P1, skeptical reviewer M2): turning
+                // transient executor pressure into `ConnectionClosed` would
+                // abort otherwise-healthy large transfers whenever more than
+                // 64 fragments back up before `recv_stream` is scheduled.
                 if let Some(sender) = self.inbound_streams.get(&stream_id) {
-                    sender.try_send((fragment_number, payload)).map_err(|err| {
-                        tracing::debug!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            stream_id = %stream_id,
-                            fragment_number,
-                            ?err,
-                            "Inbound stream consumer cannot keep up; closing connection"
-                        );
-                        TransportError::ConnectionClosed(self.remote_addr())
-                    })?;
+                    sender
+                        .send((fragment_number, payload))
+                        .await
+                        .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,

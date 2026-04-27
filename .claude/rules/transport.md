@@ -89,7 +89,7 @@ BEFORE changing LEDBAT++ parameters:
 
 ```
 NAT traversal:
-  1. Send multiple intro packets (up to 10 over ~3s)
+  1. Send multiple intro packets — `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds, 10 under `cfg(test)`) at a 200 ms cadence, capped by a 3 s `overall_deadline` (so ~15 attempts at production settings)
   2. Use exponential backoff: 50ms → 300ms → 1s → 5s
   3. First relay observes external address (ObservedAddress msg)
   4. Rate limit: 1 intro packet/second per source IP
