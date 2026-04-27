@@ -236,10 +236,9 @@ impl ContractInterface for WebsiteContainerContract {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::rngs::OsRng;
 
     fn create_test_keypair() -> (SigningKey, VerifyingKey) {
-        let signing_key = SigningKey::from_bytes(&SigningKey::generate(&mut OsRng).to_bytes());
+        let signing_key = SigningKey::from_bytes(&rand::random());
         let verifying_key = signing_key.verifying_key();
         (signing_key, verifying_key)
     }
