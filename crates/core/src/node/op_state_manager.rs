@@ -1085,6 +1085,39 @@ impl OpManager {
         self.ops.under_progress.remove(&id);
         self.ops.completed.insert(id);
 
+        // Remove the per-type DashMap entry for this transaction.
+        //
+        // Legacy state-machine paths reach `completed` after `pop` already
+        // removed the entry, so the remove below is a no-op for them.
+        //
+        // Task-per-tx drivers use `OpCtx::send_and_await`, which loops the
+        // outbound message back through the event loop as an InboundMessage
+        // with `source_addr=None`. The originator's multi-hop branch in
+        // `process_message` (e.g. put.rs SendAndContinue when forwarding)
+        // returns a non-finalized state that `handle_op_result` pushes into
+        // `ops.<type>`. The bypass in `handle_pure_network_message_v1` then
+        // routes the terminal Response directly to the driver task, so the
+        // entry never re-enters `handle_op_request` and never gets popped.
+        // Without this remove, the entry leaks for OPERATION_TTL (60s) and
+        // pollutes `has_<type>_op` checks until the GC sweep clears it.
+        match id.transaction_type() {
+            TransactionType::Connect => {
+                self.ops.connect.remove(&id);
+            }
+            TransactionType::Put => {
+                self.ops.put.remove(&id);
+            }
+            TransactionType::Get => {
+                self.ops.get.remove(&id);
+            }
+            TransactionType::Subscribe => {
+                self.ops.subscribe.remove(&id);
+            }
+            TransactionType::Update => {
+                self.ops.update.remove(&id);
+            }
+        }
+
         // Clean up request router to prevent stale entries from blocking subsequent requests
         if let Some(router) = self.request_router.get() {
             router.complete_operation(id);
@@ -1741,8 +1774,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
         std::collections::HashMap::new();
     let mut subscribe_retried: std::collections::HashMap<Transaction, usize> =
         std::collections::HashMap::new();
-    let mut put_retried: std::collections::HashMap<Transaction, usize> =
-        std::collections::HashMap::new();
     loop {
         crate::deterministic_select! {
             tx = new_transactions.recv() => {
@@ -2186,128 +2217,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     }
                 }
 
-                // ACK-aware speculative retry for PUT operations.
-                // Same logic as GET/SUBSCRIBE: 3s ACK timeout, max 2 speculative paths.
-                // Only the originator retries — relays just forward and ACK.
-                {
-                    // Clean up entries for completed operations
-                    put_retried.retain(|tx, _| ops.put.contains_key(tx));
-
-                    let mut put_retry_candidates: Vec<Transaction> = Vec::new();
-                    for entry in ops.put.iter() {
-                        let tx = *entry.key();
-                        let put_op = entry.value();
-
-                        // Phase 3a (#1454): the task-per-tx PUT driver calls
-                        // `op_manager.completed(client_tx)` on terminal reply
-                        // but does not remove the DashMap entry that
-                        // `process_message` created (legacy `report_result`
-                        // removal path is bypassed). Without this guard the
-                        // GC re-dispatches the completed PUT ~9-15s later,
-                        // which replays `finalize_put_at_originator` side
-                        // effects — in particular it resurrects upstream
-                        // subscriptions on other nodes, breaking
-                        // `test_client_disconnect_triggers_upstream_unsubscribe`.
-                        if ops.completed.contains(&tx) {
-                            continue;
-                        }
-
-                        if !put_op.is_client_initiated() {
-                            continue;
-                        }
-                        if put_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
-                            continue;
-                        }
-
-                        let elapsed = tx.elapsed();
-
-                        if put_op.ack_received {
-                            if elapsed <= PROGRESS_TIMEOUT {
-                                continue;
-                            }
-                            tracing::info!(
-                                %tx,
-                                elapsed_ms = elapsed.as_millis(),
-                                "PUT chain stalled after ForwardingAck — re-enabling speculative retry"
-                            );
-                        }
-
-                        let retry_count = put_retried.get(&tx).copied().unwrap_or(0);
-                        let base = if put_op.ack_received {
-                            PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32)
-                        } else {
-                            ACK_TIMEOUT * (retry_count as u32 + 1)
-                        };
-                        let min_jittered = base.mul_f64(0.8);
-                        if elapsed > min_jittered {
-                            let jitter_factor: f64 =
-                                crate::config::GlobalRng::random_range(0.8..=1.2);
-                            let jitter = base.mul_f64(jitter_factor);
-                            if elapsed > jitter {
-                                put_retry_candidates.push(tx);
-                            }
-                        }
-                    }
-
-                    if !put_retry_candidates.is_empty() {
-                        let all_connected: Vec<_> = ring
-                            .connection_manager
-                            .get_connections_by_location()
-                            .values()
-                            .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
-                            .collect();
-
-                        for tx in put_retry_candidates {
-                            if let Some((_, put_op)) = ops.put.remove(&tx) {
-                                let stalled_peer_info = put_op.failure_routing_info();
-                                let max_htl = ring.max_hops_to_live;
-                                match put_op
-                                    .retry_with_next_alternative(max_htl, &all_connected)
-                                {
-                                    Ok((mut new_op, msg)) => {
-                                        // Only report failure when alternative found (see GET comment).
-                                        if let Some((peer, contract_location)) = stalled_peer_info
-                                        {
-                                            ring.routing_finished(crate::router::RouteEvent {
-                                                peer,
-                                                contract_location,
-                                                outcome: crate::router::RouteOutcome::Failure,
-                                                op_type: Some(crate::node::network_status::OpType::Put),
-                                            });
-                                        }
-                                        let msg = crate::message::NetMessage::from(msg);
-                                        new_op.speculative_paths += 1;
-                                        new_op.ack_received = false;
-                                        ops.put.insert(tx, new_op);
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(1),
-                                            event_loop_notifier
-                                                .notifications_sender
-                                                .send(Either::Left(msg)),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {
-                                                *put_retried.entry(tx).or_insert(0) += 1;
-                                            }
-                                            Ok(Err(_)) | Err(_) => {
-                                                tracing::warn!(
-                                                    %tx,
-                                                    "Failed to send PUT retry message, \
-                                                     will retry next tick"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(put_op) => {
-                                        // No alternatives — put it back for normal timeout
-                                        ops.put.insert(tx, *put_op);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
 
                 let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing.drain(..) {
@@ -2345,7 +2254,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     } else {
                         get_retried.remove(&tx);
                         subscribe_retried.remove(&tx);
-                        put_retried.remove(&tx);
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
                         tracing::info!(

@@ -385,9 +385,12 @@ pub(super) fn acquire_wrapper_single_instance_lock() -> AcquireWrapperLockOutcom
             return AcquireWrapperLockOutcome::UnavailableSoProceed;
         }
     };
-    // LOCK_EX | LOCK_NB: exclusive lock, fail fast if held by another
-    // process. Released automatically when the fd closes on process
-    // exit (kernel-managed); we never need to unlock explicitly.
+    // SAFETY: `file.as_raw_fd()` returns a valid fd owned by `file`,
+    // and `libc::flock` only operates on that fd. LOCK_EX | LOCK_NB
+    // is an exclusive non-blocking lock that fails fast if held by
+    // another process. The lock is released automatically when the
+    // fd closes on process exit (kernel-managed); we never need to
+    // unlock explicitly.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         AcquireWrapperLockOutcome::AnotherWrapperRunning
