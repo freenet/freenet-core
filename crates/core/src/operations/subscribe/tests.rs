@@ -2208,3 +2208,37 @@ fn subscribe_forwarding_ack_serde_roundtrip() {
         }
     }
 }
+
+// === Pin tests: sub-op GET migration (#1454 phase 5 follow-up) ===
+
+/// fetch_contract_if_missing MUST use the task-per-tx sub-op GET driver.
+/// Regression: legacy `get::start_op + request_get` used to push a
+/// `GetOp` into `OpManager.ops.get`, keeping the GC speculative-retry
+/// block alive for sub-op GETs. Migration retired both.
+#[test]
+fn fetch_contract_if_missing_uses_sub_op_driver() {
+    let src = include_str!("../subscribe.rs");
+    let body = src
+        .split("async fn fetch_contract_if_missing(")
+        .nth(1)
+        .expect("fetch_contract_if_missing must exist")
+        .split(
+            "
+}",
+        )
+        .next()
+        .expect("closing brace");
+    assert!(
+        body.contains("start_sub_op_get"),
+        "fetch_contract_if_missing must call start_sub_op_get — sub-op \
+         GET migration in #1454 phase 5 follow-up"
+    );
+    // Compose the needle at runtime so the assertion source itself
+    // doesn't trip the pin (matches the pattern used in put.rs).
+    let needle = ["get::", "start_op"].concat();
+    assert!(
+        !body.contains(&needle),
+        "fetch_contract_if_missing must NOT call legacy `get::start_op` — \
+         retired in #1454 sub-op GET migration"
+    );
+}

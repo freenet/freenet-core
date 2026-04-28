@@ -3497,13 +3497,38 @@ impl Executor<Runtime> {
                 return Ok(Either::Left(state));
             }
         }
-        // Fetch from network
-        let request: GetContract = GetContract {
-            instance_id: *id,
-            return_contract_code,
-        };
-        let get_result: operations::get::GetResult = self.op_request(request).await?;
-        Ok(Either::Right(get_result))
+        // Fetch from network via the task-per-tx sub-op GET driver.
+        // Bypasses the legacy `op_request` mediator path entirely
+        // (issue #1454 phase 5 follow-up): driver delivers the
+        // resolved `GetResult` directly through a oneshot.
+        let op_manager = self
+            .op_manager
+            .as_ref()
+            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("missing op_manager")))?;
+        let (_tx, rx) =
+            operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, return_contract_code);
+        const OP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+        let outcome = tokio::time::timeout(OP_REQUEST_TIMEOUT, rx)
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    contract = %id,
+                    "sub-op GET timed out at executor"
+                );
+                ExecutorError::other(anyhow::anyhow!("sub-op GET timed out"))
+            })?
+            .map_err(|_| ExecutorError::other(anyhow::anyhow!("sub-op GET task dropped")))?;
+        match outcome {
+            operations::get::op_ctx_task::SubOpGetOutcome::Found(get_result) => {
+                Ok(Either::Right(get_result))
+            }
+            operations::get::op_ctx_task::SubOpGetOutcome::NotFound(cause) => {
+                Err(ExecutorError::other(anyhow::anyhow!(cause)))
+            }
+            operations::get::op_ctx_task::SubOpGetOutcome::Infra(err) => {
+                Err(ExecutorError::other(err))
+            }
+        }
     }
 }
 
@@ -3623,5 +3648,48 @@ mod resolve_message_origin_tests {
             Some(MessageOrigin::Delegate(k)) => assert_eq!(k, caller),
             other => panic!("Expected Delegate(caller), got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod sub_op_get_migration_pin_tests {
+    /// Pin: `local_state_or_from_network` MUST use the task-per-tx
+    /// sub-op GET driver, not the legacy `op_request(GetContract)`
+    /// path. Regression: legacy path went through the executor
+    /// mediator + `request_get`, pushing GetOp into ops.get and
+    /// keeping the GC speculative-retry block alive for sub-op GETs.
+    /// Migrated in #1454 phase 5 follow-up.
+    #[test]
+    fn local_state_or_from_network_uses_sub_op_driver() {
+        let src = include_str!("runtime.rs");
+        let body = src
+            .split("async fn local_state_or_from_network(")
+            .nth(1)
+            .expect("local_state_or_from_network must exist")
+            .split(
+                "
+    }",
+            )
+            .next()
+            .expect("closing brace");
+        assert!(
+            body.contains("start_sub_op_get"),
+            "local_state_or_from_network must call start_sub_op_get — \
+             sub-op GET migration in #1454 phase 5 follow-up"
+        );
+        // Compose the needles at runtime so the assertion source itself
+        // doesn't trip the pin (matches the pattern used in put.rs).
+        let get_contract_needle = ["Get", "Contract", " {"].concat();
+        assert!(
+            !body.contains(&get_contract_needle),
+            "local_state_or_from_network must NOT construct legacy \
+             GetContract — retired in #1454 sub-op GET migration"
+        );
+        let op_request_needle = ["self.", "op_request"].concat();
+        assert!(
+            !body.contains(&op_request_needle),
+            "local_state_or_from_network must NOT call self.op_request — \
+             sub-op GET migration bypasses the legacy mediator path"
+        );
     }
 }

@@ -89,10 +89,15 @@ async fn fetch_contract_if_missing(
         return Ok(Some(key));
     }
 
-    // Start a GET operation to fetch the contract
-    let get_op = get::start_op(instance_id, true, false, false);
-    let visited = super::VisitedPeers::new(&get_op.id);
-    get::request_get(op_manager, get_op, visited).await?;
+    // Start a GET operation to fetch the contract via the task-per-tx
+    // sub-op driver. The receiver is dropped — caller relies on
+    // `wait_for_contract_with_timeout` (storage poll + timeout) to
+    // detect arrival, mirroring the legacy fire-and-forget shape.
+    let (_tx, _rx) = get::op_ctx_task::start_sub_op_get(
+        op_manager,
+        instance_id,
+        /* return_contract_code */ true,
+    );
 
     // Wait for contract to arrive
     wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await

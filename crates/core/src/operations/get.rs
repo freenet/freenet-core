@@ -15,7 +15,7 @@ use crate::{
     message::{InnerMessage, NetMessage, Transaction},
     node::{NetworkBridge, OpManager},
     operations::{OpInitialization, Operation},
-    ring::{Location, PeerKeyLocation, RingError},
+    ring::{Location, PeerKeyLocation},
     tracing::{NetEventLog, OperationFailure, state_hash_full},
 };
 use either::Either;
@@ -39,47 +39,13 @@ const DEFAULT_MAX_BREADTH: usize = 3;
 /// away, which is the minimum useful search depth in any topology.
 const MIN_RETRY_HTL: usize = 3;
 
-pub(crate) fn start_op(
-    instance_id: ContractInstanceId,
-    fetch_contract: bool,
-    subscribe: bool,
-    blocking_subscribe: bool,
-) -> GetOp {
-    let contract_location = Location::from(&instance_id);
-    let id = Transaction::new::<GetMsg>();
-    tracing::debug!(tx = %id, "Requesting get contract {instance_id} @ loc({contract_location})");
-    // Always fetch contract code from the network so the node can cache WASM
-    // for validation, subscription, and hosting. The client's return_contract_code
-    // preference only controls whether WASM is included in the client response.
-    // See issue #3757.
-    let state = Some(GetState::PrepareRequest(PrepareRequestData {
-        instance_id,
-        id,
-        fetch_contract: true,
-        subscribe,
-        blocking_subscribe,
-    }));
-    GetOp {
-        id,
-        state,
-        result: None,
-        stats: Some(Box::new(GetStats {
-            contract_location,
-            next_peer: None,
-            transfer_time: None,
-            first_response_time: None,
-        })),
-        upstream_addr: None, // Local operation, no upstream peer
-        local_fallback: None,
-        auto_fetch: false,
-        ack_received: false,
-        speculative_paths: 0,
-        client_return_code: fetch_contract,
-    }
-}
-
-/// Create a GET operation with a specific transaction ID (for operation deduplication)
-#[allow(dead_code)] // Phase 6 cleanup: client-initiated GET now uses op_ctx_task::start_client_get
+/// Create a GET operation with a specific transaction ID (for operation deduplication).
+///
+/// Retained for unit tests. Client-initiated GETs use
+/// `op_ctx_task::start_client_get`; sub-op GETs use
+/// `op_ctx_task::start_sub_op_get`. Phase 6 may delete this entry
+/// alongside the legacy `PrepareRequest` state.
+#[allow(dead_code)]
 pub(crate) fn start_op_with_id(
     instance_id: ContractInstanceId,
     fetch_contract: bool,
@@ -182,220 +148,12 @@ pub(crate) fn start_targeted_op(
     (op, msg)
 }
 
-/// Request to get the current value from a contract.
-pub(crate) async fn request_get(
-    op_manager: &OpManager,
-    get_op: GetOp,
-    visited: super::VisitedPeers,
-) -> Result<(), OpError> {
-    let (mut candidates, id, instance_id_val, _fetch_contract, local_fallback) = if let Some(
-        GetState::PrepareRequest(data),
-    ) =
-        &get_op.state
-    {
-        let instance_id = &data.instance_id;
-        let id = &data.id;
-        let fetch_contract = &data.fetch_contract;
-        // Check local storage to have a fallback, but prefer network for freshness.
-        // This implements "network first, local fallback" to ensure we get the latest
-        // version of contracts rather than serving potentially stale cached data.
-        tracing::debug!(
-            tx = %id,
-            %instance_id,
-            "GET: Checking local storage for fallback before network query"
-        );
-
-        let get_result = op_manager
-            .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                instance_id: *instance_id,
-                return_contract_code: *fetch_contract,
-            })
-            .await;
-
-        let local_value = match get_result {
-            Ok(ContractHandlerEvent::GetResponse {
-                key: Some(key),
-                response:
-                    Ok(StoreResponse {
-                        state: Some(state),
-                        contract,
-                    }),
-            }) => {
-                if *fetch_contract && contract.is_none() {
-                    tracing::info!(
-                        tx = %id,
-                        %instance_id,
-                        "GET: state available locally but contract code missing; will query peers"
-                    );
-                    None
-                } else {
-                    Some((key, state, contract))
-                }
-            }
-            _ => None,
-        };
-
-        // Find peers to query - we prefer network over local cache for freshness
-        let candidates = op_manager.ring.k_closest_potentially_hosting(
-            instance_id,
-            &visited,
-            DEFAULT_MAX_BREADTH,
-        );
-
-        if candidates.is_empty() {
-            // No peers available - use local cache if we have it
-            if let Some((key, state, contract)) = local_value {
-                tracing::info!(
-                    tx = %id,
-                    contract = %key,
-                    phase = "complete",
-                    "GET: No peers available, returning local cache"
-                );
-
-                let completed_op = GetOp {
-                    id: *id,
-                    state: Some(GetState::Finished(FinishedData { key })),
-                    result: Some(GetResult {
-                        key,
-                        state,
-                        contract,
-                    }),
-                    stats: get_op.stats,
-                    upstream_addr: get_op.upstream_addr,
-                    local_fallback: None,
-                    auto_fetch: false,
-                    ack_received: false,
-                    speculative_paths: 0,
-                    client_return_code: get_op.client_return_code,
-                };
-
-                op_manager.push(*id, OpEnum::Get(completed_op)).await?;
-                return Ok(());
-            }
-
-            // No peers AND no local cache - error
-            tracing::warn!(
-                tx = %id,
-                contract = %instance_id,
-                phase = "error",
-                "GET: Contract not found locally and no peers available"
-            );
-
-            // Emit failure telemetry so this case is visible in production metrics
-            if let Some(event) = NetEventLog::get_failure(
-                id,
-                &op_manager.ring,
-                *instance_id,
-                OperationFailure::NoPeersAvailable,
-                None,
-            ) {
-                op_manager.ring.register_events(Either::Left(event)).await;
-            }
-
-            return Err(RingError::EmptyRing.into());
-        }
-
-        // Peers available - query network, keep local as fallback
-        if local_value.is_some() {
-            tracing::debug!(
-                tx = %id,
-                %instance_id,
-                peer_count = candidates.len(),
-                "GET: Have local cache, querying {} peer(s) for fresh version",
-                candidates.len()
-            );
-        } else {
-            tracing::debug!(
-                tx = %id,
-                %instance_id,
-                peer_count = candidates.len(),
-                "GET: No local cache, querying {} peer(s)",
-                candidates.len()
-            );
-        }
-
-        (candidates, *id, *instance_id, *fetch_contract, local_value)
-    } else {
-        return Err(OpError::UnexpectedOpState);
-    };
-
-    // Take the first candidate as the target
-    let target = candidates.remove(0);
-    tracing::debug!(
-        tx = %id,
-        target = %target,
-        "Preparing get contract request",
-    );
-
-    match get_op.state {
-        Some(GetState::PrepareRequest(data)) => {
-            let (fetch_contract, subscribe, blocking_subscribe) =
-                (data.fetch_contract, data.subscribe, data.blocking_subscribe);
-            let mut tried_peers = HashSet::new();
-            if let Some(addr) = target.socket_addr() {
-                tried_peers.insert(addr);
-            }
-
-            let new_state = Some(GetState::AwaitingResponse(AwaitingResponseData {
-                instance_id: instance_id_val,
-                retries: 0,
-                fetch_contract,
-                requester: None,
-                current_hop: op_manager.ring.max_hops_to_live,
-                subscribe,
-                blocking_subscribe,
-                next_hop: target.clone(),
-                tried_peers,
-                alternatives: candidates,
-                attempts_at_hop: 1,
-                visited: visited.clone(),
-            }));
-
-            let msg = GetMsg::Request {
-                id,
-                instance_id: instance_id_val,
-                fetch_contract,
-                htl: op_manager.ring.max_hops_to_live,
-                visited,
-                subscribe,
-            };
-
-            let op = GetOp {
-                id,
-                state: new_state,
-                result: None,
-                stats: get_op.stats.map(|mut s| {
-                    s.next_peer = Some(target.clone());
-                    s.start_timers();
-                    s
-                }),
-                upstream_addr: get_op.upstream_addr,
-                local_fallback, // Store local cache for fallback if network returns NotFound
-                auto_fetch: get_op.auto_fetch,
-                ack_received: false,
-                speculative_paths: 0,
-                client_return_code: get_op.client_return_code,
-            };
-
-            // Emit get_request telemetry when initiating a GET operation
-            if let Some(event) = NetEventLog::get_request(
-                &id,
-                &op_manager.ring,
-                instance_id_val,
-                target,
-                op_manager.ring.max_hops_to_live,
-            ) {
-                op_manager.ring.register_events(Either::Left(event)).await;
-            }
-
-            op_manager
-                .notify_op_change(NetMessage::from(msg), OpEnum::Get(op))
-                .await?;
-        }
-        _ => return Err(OpError::invalid_transition(get_op.id)),
-    }
-    Ok(())
-}
+// Note: `request_get` (legacy client-initiated GET driver) was retired
+// in the #1454 sub-op GET migration. Client-initiated GETs route via
+// `op_ctx_task::start_client_get`; sub-op GETs (executor and
+// SUBSCRIBE-spawned fetches) route via `op_ctx_task::start_sub_op_get`.
+// Legacy auto-fetch (`start_targeted_op`) keeps its parallel
+// state-machine path.
 
 // ── Type-state data structs ──────────────────────────────────────────────
 //
@@ -572,11 +330,29 @@ impl GetStats {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct GetResult {
     key: ContractKey,
     pub state: WrappedState,
     pub contract: Option<ContractContainer>,
+}
+
+impl GetResult {
+    /// Construct a `GetResult` directly from its fields. Used by the
+    /// task-per-tx sub-op GET driver, which assembles the result from
+    /// the wire-level terminal reply rather than a fully populated
+    /// `GetOp`.
+    pub(crate) fn new(
+        key: ContractKey,
+        state: WrappedState,
+        contract: Option<ContractContainer>,
+    ) -> Self {
+        Self {
+            key,
+            state,
+            contract,
+        }
+    }
 }
 
 impl TryFrom<GetOp> for GetResult {
@@ -3989,12 +3765,20 @@ mod tests {
             assert_eq!(op.client_return_code, expected_client_return);
         }
 
-        // start_op with fetch_contract=false
-        assert_fetch_state(&start_op(instance_id, false, false, false), false);
-        // start_op with fetch_contract=true
-        assert_fetch_state(&start_op(instance_id, true, false, false), true);
+        // start_op_with_id with fetch_contract=false
+        let tx_a = Transaction::new::<GetMsg>();
+        assert_fetch_state(
+            &start_op_with_id(instance_id, false, false, false, tx_a),
+            false,
+        );
+        // start_op_with_id with fetch_contract=true
+        let tx_b = Transaction::new::<GetMsg>();
+        assert_fetch_state(
+            &start_op_with_id(instance_id, true, false, false, tx_b),
+            true,
+        );
 
-        // start_op_with_id should behave identically
+        // start_op_with_id explicit transaction
         let tx = Transaction::new::<GetMsg>();
         assert_fetch_state(
             &start_op_with_id(instance_id, false, false, false, tx),
@@ -4204,7 +3988,8 @@ mod tests {
     #[test]
     fn start_op_propagates_blocking_subscribe_true() {
         let instance_id = ContractInstanceId::new([1u8; 32]);
-        let op = start_op(instance_id, true, true, true);
+        let tx = Transaction::new::<GetMsg>();
+        let op = start_op_with_id(instance_id, true, true, true, tx);
         match op.state {
             Some(GetState::PrepareRequest(data)) => {
                 let blocking_subscribe = data.blocking_subscribe;
@@ -4237,7 +4022,8 @@ mod tests {
     #[test]
     fn start_op_defaults_blocking_subscribe_false() {
         let instance_id = ContractInstanceId::new([1u8; 32]);
-        let op = start_op(instance_id, true, true, false);
+        let tx = Transaction::new::<GetMsg>();
+        let op = start_op_with_id(instance_id, true, true, false, tx);
         match op.state {
             Some(GetState::PrepareRequest(data)) => {
                 let blocking_subscribe = data.blocking_subscribe;

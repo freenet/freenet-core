@@ -94,6 +94,21 @@ paths:
 > state before calling `send_and_await`), but the mechanical
 > `op_manager.push(...)` call is absent. Phase 6 of #1454 will rewrite
 > this rules file in full once all ops have migrated.
+>
+> Sub-operation GETs (subscribe's `fetch_contract_if_missing` and
+> executor's `local_state_or_from_network`) now route through
+> `operations/get/op_ctx_task.rs::start_sub_op_get` — same retry
+> driver as `start_client_get` but skips auto-subscribe,
+> explicit-subscribe hand-off, telemetry route-events, and
+> `result_router_tx` publication; outcome delivered through a
+> oneshot (`SubOpGetOutcome`). The legacy `request_get` driver and
+> `get::start_op` constructor were retired in this migration; the
+> executor's `GetContract` / `ComposeNetworkMessage<GetOp>` impl is
+> deleted. Legacy `start_targeted_op` (UPDATE-triggered auto-fetch)
+> remains on legacy. After this migration, no caller pushes a
+> client-initiated `GetOp` into `ops.get`, so the GC speculative-
+> retry block at `op_state_manager.rs:1912` is provably dead for
+> GET — retirement deferred to a follow-up slice.
 
 ## Critical Invariant: Push-Before-Send (legacy path)
 

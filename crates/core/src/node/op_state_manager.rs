@@ -3482,8 +3482,8 @@ mod tests {
 
         let ops = Ops::default();
         let instance_id = ContractInstanceId::new([0u8; 32]);
-        let get_op = crate::operations::get::start_op(instance_id, false, false, false);
-        let tx = get_op.id;
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let get_op = crate::operations::get::start_op_with_id(instance_id, false, false, false, tx);
 
         // Before insert: absent
         assert!(

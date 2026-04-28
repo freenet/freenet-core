@@ -696,23 +696,6 @@ where
 }
 
 #[allow(unused)]
-struct GetContract {
-    instance_id: ContractInstanceId,
-    return_contract_code: bool,
-}
-
-impl ComposeNetworkMessage<operations::get::GetOp> for GetContract {
-    fn initiate_op(self, _op_manager: &OpManager) -> operations::get::GetOp {
-        operations::get::start_op(self.instance_id, self.return_contract_code, false, false)
-    }
-
-    async fn resume_op(op: operations::get::GetOp, op_manager: &OpManager) -> Result<(), OpError> {
-        let visited = operations::VisitedPeers::new(&op.id);
-        operations::get::request_get(op_manager, op, visited).await
-    }
-}
-
-#[allow(unused)]
 struct SubscribeContract {
     instance_id: ContractInstanceId,
 }

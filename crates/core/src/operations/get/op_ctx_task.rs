@@ -1023,6 +1023,207 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
     }
 }
 
+// ── Sub-operation GET task-per-tx driver ────────────────────────────────────
+//
+// Entry point for node-internal GETs that have no client (executor's
+// `local_state_or_from_network` and subscribe's `fetch_contract_if_missing`).
+// Reuses the `GetRetryDriver` retry loop but skips auto-subscribe,
+// explicit-subscribe hand-off, telemetry route-event emission, and
+// result-router publication. The terminal `(GetResult)` (or error) is
+// delivered through a oneshot receiver returned to the caller — fire-and-
+// forget callers drop the receiver, awaiting callers (executor) await it.
+
+/// Test-only counter incremented every time `start_sub_op_get` is invoked.
+#[cfg(any(test, feature = "testing"))]
+pub static SUB_OP_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Outcome of a sub-op GET task. `Found` carries the wire-level reply
+/// payload assembled into a `GetResult`; `NotFound` indicates retry
+/// exhaustion or driver classification miss; `Infra` carries an
+/// infrastructure failure (channel closed, OpCtx bug, etc.).
+#[derive(Debug)]
+pub(crate) enum SubOpGetOutcome {
+    Found(crate::operations::get::GetResult),
+    NotFound(String),
+    Infra(OpError),
+}
+
+/// Spawn a sub-operation GET. Returns the transaction id and a
+/// oneshot receiver carrying the [`SubOpGetOutcome`]. Callers that
+/// just want the side effect of caching the contract locally (e.g.,
+/// `subscribe::fetch_contract_if_missing`) may drop the receiver
+/// immediately. Callers that need the resolved `GetResult` (e.g.,
+/// `executor::local_state_or_from_network`) await the receiver.
+pub(crate) fn start_sub_op_get(
+    op_manager: &OpManager,
+    instance_id: ContractInstanceId,
+    return_contract_code: bool,
+) -> (Transaction, tokio::sync::oneshot::Receiver<SubOpGetOutcome>) {
+    let op_manager = Arc::new(op_manager.clone());
+    #[cfg(any(test, feature = "testing"))]
+    SUB_OP_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let tx = Transaction::new::<GetMsg>();
+    let (out_tx, out_rx) = tokio::sync::oneshot::channel();
+
+    tracing::debug!(
+        %tx,
+        contract = %instance_id,
+        "get (task-per-tx): spawning sub-op task"
+    );
+
+    GlobalExecutor::spawn(run_sub_op_get(
+        op_manager,
+        tx,
+        instance_id,
+        return_contract_code,
+        out_tx,
+    ));
+
+    (tx, out_rx)
+}
+
+async fn run_sub_op_get(
+    op_manager: Arc<OpManager>,
+    tx: Transaction,
+    instance_id: ContractInstanceId,
+    return_contract_code: bool,
+    out_tx: tokio::sync::oneshot::Sender<SubOpGetOutcome>,
+) {
+    let outcome = drive_sub_op_get(&op_manager, tx, instance_id, return_contract_code).await;
+    // Receiver drop is acceptable — fire-and-forget callers expect this.
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = out_tx.send(outcome);
+}
+
+async fn drive_sub_op_get(
+    op_manager: &Arc<OpManager>,
+    tx: Transaction,
+    instance_id: ContractInstanceId,
+    return_contract_code: bool,
+) -> SubOpGetOutcome {
+    let htl = op_manager.ring.max_hops_to_live;
+
+    let mut tried: Vec<std::net::SocketAddr> = Vec::new();
+    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+        tried.push(own_addr);
+    }
+    let initial_target = op_manager
+        .ring
+        .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
+        .into_iter()
+        .next();
+    let current_target = match initial_target {
+        Some(peer) => {
+            if let Some(addr) = peer.socket_addr() {
+                tried.push(addr);
+            }
+            peer
+        }
+        None => op_manager.ring.connection_manager.own_location(),
+    };
+
+    let mut driver = GetRetryDriver {
+        op_manager,
+        instance_id,
+        htl,
+        tried,
+        retries: 0,
+        current_target,
+        attempt_visited: VisitedPeers::new(&tx),
+    };
+
+    let loop_result = drive_retry_loop(op_manager, tx, "get-subop", &mut driver).await;
+
+    match loop_result {
+        RetryLoopOutcome::Done(terminal) => {
+            op_manager.completed(tx);
+
+            let reply_key = match &terminal {
+                Terminal::InlineFound {
+                    key,
+                    state,
+                    contract,
+                } => {
+                    cache_contract_locally(
+                        op_manager,
+                        *key,
+                        state.clone(),
+                        contract.clone(),
+                        false, // sub-op: not a client-originating GET
+                    )
+                    .await;
+                    *key
+                }
+                Terminal::Streaming {
+                    key,
+                    stream_id,
+                    includes_contract,
+                } => {
+                    if let Some(peer_addr) = driver.current_target.socket_addr() {
+                        if let Err(e) = assemble_and_cache_stream(
+                            op_manager,
+                            peer_addr,
+                            *stream_id,
+                            *key,
+                            *includes_contract,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                %key,
+                                error = %e,
+                                "get (task-per-tx sub-op): stream assembly failed"
+                            );
+                        }
+                    }
+                    *key
+                }
+                Terminal::LocalCompletion => {
+                    match lookup_stored_key(op_manager, &instance_id).await {
+                        Some(k) => k,
+                        None => synthetic_key(&instance_id),
+                    }
+                }
+            };
+
+            // Resolve a GetResult by re-querying the local store. Mirrors
+            // `build_host_response` but returns the raw `GetResult` shape
+            // instead of a HostResponse.
+            let lookup = op_manager
+                .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                    instance_id,
+                    return_contract_code,
+                })
+                .await;
+            match lookup {
+                Ok(ContractHandlerEvent::GetResponse {
+                    key: Some(_),
+                    response:
+                        Ok(StoreResponse {
+                            state: Some(state),
+                            contract,
+                        }),
+                }) => {
+                    let client_contract = if return_contract_code { contract } else { None };
+                    SubOpGetOutcome::Found(crate::operations::get::GetResult::new(
+                        reply_key,
+                        state,
+                        client_contract,
+                    ))
+                }
+                _ => SubOpGetOutcome::NotFound(format!(
+                    "sub-op GET wire-level success but local store lookup returned no state for {instance_id}"
+                )),
+            }
+        }
+        RetryLoopOutcome::Exhausted(cause) => SubOpGetOutcome::NotFound(cause),
+        RetryLoopOutcome::Unexpected => SubOpGetOutcome::Infra(OpError::UnexpectedOpState),
+        RetryLoopOutcome::InfraError(err) => SubOpGetOutcome::Infra(err),
+    }
+}
+
 // ── Relay GET task-per-tx driver (#3883) ────────────────────────────────────
 //
 // `start_relay_get` is the entry point for the relay (non-originator) GET
@@ -3214,6 +3415,53 @@ mod tests {
             "`RELAY_DRIVER_CALL_COUNT` increment must be gated behind \
              `#[cfg(any(test, feature = \"testing\"))]` so it doesn't ship \
              in release builds."
+        );
+    }
+
+    /// Pin: `start_sub_op_get` MUST exist as the sub-op GET entry
+    /// point. Removing it would force legacy `get::start_op` +
+    /// `request_get` revival and re-leak GetOp into `ops.get` for
+    /// sub-op GETs. (#1454 phase 5 follow-up.)
+    #[test]
+    fn start_sub_op_get_entry_must_exist() {
+        let src = include_str!("op_ctx_task.rs");
+        let needle = "pub(crate) fn start_sub_op_get(";
+        assert!(
+            src.contains(needle),
+            "start_sub_op_get fn must remain — sub-op GET migration entry point"
+        );
+    }
+
+    /// Pin: sub-op driver MUST NOT auto-subscribe or hand off to a
+    /// child SUBSCRIBE. The caller (executor's
+    /// `local_state_or_from_network` or subscribe's
+    /// `fetch_contract_if_missing`) drives those side effects when
+    /// appropriate. Doubling them up risks duplicate SUBSCRIBE op
+    /// dispatch.
+    #[test]
+    fn sub_op_driver_skips_auto_subscribe_and_maybe_subscribe_child() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = src
+            .split("async fn drive_sub_op_get(")
+            .nth(1)
+            .expect("drive_sub_op_get must exist")
+            .split("\nasync fn ")
+            .next()
+            .expect("next fn boundary");
+        assert!(
+            !body.contains("auto_subscribe_on_get_response"),
+            "drive_sub_op_get must NOT call auto_subscribe_on_get_response — \
+             sub-op caller owns subscribe semantics"
+        );
+        assert!(
+            !body.contains("maybe_subscribe_child"),
+            "drive_sub_op_get must NOT call maybe_subscribe_child — \
+             sub-op caller owns subscribe semantics"
+        );
+        assert!(
+            !body.contains("send_client_result"),
+            "drive_sub_op_get must NOT publish to result_router via \
+             send_client_result — sub-op tx has no client waiter"
         );
     }
 }

@@ -3265,7 +3265,12 @@ mod deferred_swap_drop_tests {
 pub(crate) enum RingError {
     #[error(transparent)]
     ConnError(#[from] Box<node::ConnectionError>),
+    /// Retained for completeness; client_events maps it to a stable
+    /// `ClientError::EmptyRing`. Currently unconstructed since the
+    /// `request_get` legacy path that produced it was retired in the
+    /// #1454 sub-op GET migration.
     #[error("No ring connections found")]
+    #[allow(dead_code)]
     EmptyRing,
     #[error("Ran out of, or haven't found any, hosting peers for contract {0}")]
     NoHostingPeers(ContractInstanceId),
