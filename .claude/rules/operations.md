@@ -99,16 +99,23 @@ paths:
 > executor's `local_state_or_from_network`) now route through
 > `operations/get/op_ctx_task.rs::start_sub_op_get` — same retry
 > driver as `start_client_get` but skips auto-subscribe,
-> explicit-subscribe hand-off, telemetry route-events, and
+> explicit-subscribe hand-off, telemetry route-events
+> (`NetEventLog::get_request` is intentionally not emitted on any
+> task-per-tx originator path — matches `start_client_get`), and
 > `result_router_tx` publication; outcome delivered through a
 > oneshot (`SubOpGetOutcome`). The legacy `request_get` driver and
 > `get::start_op` constructor were retired in this migration; the
 > executor's `GetContract` / `ComposeNetworkMessage<GetOp>` impl is
 > deleted. Legacy `start_targeted_op` (UPDATE-triggered auto-fetch)
-> remains on legacy. After this migration, no caller pushes a
-> client-initiated `GetOp` into `ops.get`, so the GC speculative-
-> retry block at `op_state_manager.rs:1912` is provably dead for
-> GET — retirement deferred to a follow-up slice.
+> remains on legacy. The executor's `op_request` mediator path is
+> bypassed for GET; the spawned sub-op task can outlive its caller's
+> outer timeout (e.g., `RELATED_FETCH_TIMEOUT = 10s` wrapping
+> `local_state_or_from_network`'s 120 s receiver timeout) — receiver
+> drop is silent so no leak, just a longer-lived background task.
+> After this migration, no caller pushes a client-initiated `GetOp`
+> into `ops.get`, so the GC speculative-retry block at
+> `op_state_manager.rs:1912` is provably dead for GET — retirement
+> deferred to a follow-up slice.
 
 ## Critical Invariant: Push-Before-Send (legacy path)
 

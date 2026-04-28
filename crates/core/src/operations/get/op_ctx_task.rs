@@ -1033,11 +1033,6 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 // delivered through a oneshot receiver returned to the caller — fire-and-
 // forget callers drop the receiver, awaiting callers (executor) await it.
 
-/// Test-only counter incremented every time `start_sub_op_get` is invoked.
-#[cfg(any(test, feature = "testing"))]
-pub static SUB_OP_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Outcome of a sub-op GET task. `Found` carries the wire-level reply
 /// payload assembled into a `GetResult`; `NotFound` indicates retry
 /// exhaustion or driver classification miss; `Infra` carries an
@@ -1061,8 +1056,6 @@ pub(crate) fn start_sub_op_get(
     return_contract_code: bool,
 ) -> (Transaction, tokio::sync::oneshot::Receiver<SubOpGetOutcome>) {
     let op_manager = Arc::new(op_manager.clone());
-    #[cfg(any(test, feature = "testing"))]
-    SUB_OP_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let tx = Transaction::new::<GetMsg>();
     let (out_tx, out_rx) = tokio::sync::oneshot::channel();
@@ -1177,6 +1170,16 @@ async fn drive_sub_op_get(
                                 "get (task-per-tx sub-op): stream assembly failed"
                             );
                         }
+                    } else {
+                        // Mirrors the client driver's branch at op_ctx_task.rs:341-347:
+                        // without a socket_addr we cannot claim the orphan stream, so
+                        // the local-store re-query below will return NotFound. Surface
+                        // the breadcrumb so operators can correlate to the failure.
+                        tracing::warn!(
+                            %key,
+                            "get (task-per-tx sub-op): current_target has no socket_addr; \
+                             cannot claim orphan stream"
+                        );
                     }
                     *key
                 }
@@ -3449,13 +3452,18 @@ mod tests {
     #[test]
     fn sub_op_driver_skips_auto_subscribe_and_maybe_subscribe_child() {
         let src = include_str!("op_ctx_task.rs");
+        // Boundary `\n}\n\n/// Cause` matches the literal closing brace
+        // of `drive_sub_op_get` followed by the docstring of the
+        // immediately-following `missing_state_cause` helper. This
+        // anchors the pin to the function body proper, not the helpers
+        // and comment blocks that follow.
         let body = src
             .split("async fn drive_sub_op_get(")
             .nth(1)
             .expect("drive_sub_op_get must exist")
-            .split("\nasync fn ")
+            .split("\n}\n\n/// Cause")
             .next()
-            .expect("next fn boundary");
+            .expect("end of drive_sub_op_get body");
         assert!(
             !body.contains("auto_subscribe_on_get_response"),
             "drive_sub_op_get must NOT call auto_subscribe_on_get_response — \

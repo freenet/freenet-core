@@ -3507,6 +3507,14 @@ impl Executor<Runtime> {
             .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("missing op_manager")))?;
         let (_tx, rx) =
             operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, return_contract_code);
+        // Matches the legacy `op_request` envelope. Outer callers may
+        // wrap this with a tighter budget (e.g.,
+        // `fetch_related_for_validation_network` uses
+        // `RELATED_FETCH_TIMEOUT = 10s`); when that fires first the
+        // receiver is dropped silently and the spawned sub-op task
+        // continues until OPERATION_TTL exhausts the retry loop. No
+        // leak (oneshot send-after-drop is graceful) — just a
+        // longer-lived background task.
         const OP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
         let outcome = tokio::time::timeout(OP_REQUEST_TIMEOUT, rx)
             .await
