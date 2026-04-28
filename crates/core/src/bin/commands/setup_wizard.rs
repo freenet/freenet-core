@@ -10,20 +10,12 @@
 pub mod detection;
 #[cfg(target_os = "windows")]
 pub mod installer;
-#[cfg(target_os = "windows")]
+// `ui` compiles on every platform — its `platform` module is the one that
+// is OS-gated (Windows uses tao/wry, non-Windows is a stub). Compiling
+// `ui` everywhere lets the embedded HTML's content tests (countdown
+// wiring, success-screen elements) run on the Linux CI matrix instead
+// of only on Windows where this project's `cargo test` doesn't run.
 pub mod ui;
-
-// Re-export stubs on non-Windows so the entry point compiles everywhere.
-#[cfg(not(target_os = "windows"))]
-pub mod ui {
-    #[derive(Debug, Clone, PartialEq)]
-    #[allow(dead_code)]
-    pub enum SetupResult {
-        Installed,
-        RunWithout,
-        Cancelled,
-    }
-}
 
 /// Check if Freenet needs to be installed and show the setup wizard if so.
 ///

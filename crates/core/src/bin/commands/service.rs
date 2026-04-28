@@ -2186,9 +2186,12 @@ struct DataLeaves {
     /// `config_dir` (Roaming on Windows, e.g.
     /// `%APPDATA%\...\Freenet\config`). Only populated when it differs
     /// from both data paths (matches the macOS case where
-    /// `config_dir == data_dir`). May be stale on Windows where the
-    /// running node actually writes to `config_local` (see #3979),
-    /// but is still cleaned up in case an old install left it behind.
+    /// `config_dir == data_dir`). On Windows the running node does
+    /// not write here — it writes to `config_local` — but several
+    /// other call sites (`config.rs:1661` id-set fallback, `report.rs`
+    /// config-file scan) still resolve through `config_dir()`, and an
+    /// older install may have written to it before the live node
+    /// switched to Local AppData. Cleaning both is correct.
     config: Option<PathBuf>,
     /// `config_local_dir` (Local on Windows, e.g.
     /// `%LOCALAPPDATA%\...\Freenet\config`). This is what the running
@@ -2196,8 +2199,10 @@ struct DataLeaves {
     /// `defaults.config_local_dir()`), which is *not* the same as
     /// `config_dir` on Windows. Without this, `freenet uninstall
     /// --purge` left the live config folder behind. Only populated
-    /// when distinct from `data_local` and `config` to avoid double
-    /// removal.
+    /// when distinct from `data_local`, `data_roaming`, and `config`
+    /// to avoid double removal — on Linux/macOS the `directories`
+    /// crate aliases `config_local_dir` to `config_dir`, so this
+    /// stays `None` and the existing leaves cover those platforms.
     config_local: Option<PathBuf>,
     /// `cache_dir` for the uppercase project bundle.
     cache: Option<PathBuf>,
@@ -4276,13 +4281,15 @@ mod tests {
 
     #[test]
     fn test_purge_leaves_removes_config_in_local_app_data() {
-        // Regression for #3979: on Windows the running node writes config
-        // to `config_local_dir()` (Local AppData), not `config_dir()`
-        // (Roaming) — see `Config::build` in config.rs which uses
-        // `defaults.config_local_dir()`. The pre-fix `purge_leaves_and_collapse`
-        // only knew about the Roaming `config` leaf, so it left
-        // `%LOCALAPPDATA%\The Freenet Project Inc\Freenet\config\` behind
-        // on every Windows uninstall.
+        // Regression for the Windows-uninstall config-leftover bug
+        // (#3904 follow-up, addressed in PR #3969): on Windows the
+        // running node writes config to `config_local_dir()` (Local
+        // AppData), not `config_dir()` (Roaming) — see `Config::build`
+        // in config.rs which uses `defaults.config_local_dir()`. The
+        // pre-fix `purge_leaves_and_collapse` only knew about the
+        // Roaming `config` leaf, so it left
+        // `%LOCALAPPDATA%\The Freenet Project Inc\Freenet\config\`
+        // behind on every Windows uninstall.
         let tmp = tempfile::tempdir().unwrap();
         let freenet_local = tmp
             .path()
@@ -4308,11 +4315,34 @@ mod tests {
 
         assert!(
             !config_local.exists(),
-            "config_local leaf must be removed (the #3979 regression)",
+            "config_local leaf must be removed (the #3904 follow-up regression)",
         );
         assert!(
             !freenet_local.exists(),
             "the now-empty Freenet parent should also collapse",
+        );
+    }
+
+    /// On Linux/macOS the `directories` crate aliases `config_local_dir`
+    /// to `config_dir`, so `DataLeaves::from_project_dirs()` must leave
+    /// `config_local` empty after the dedup branches at
+    /// `from_project_dirs` reject it. If a future refactor reorders the
+    /// dedup conditions and lets `config_local` be `Some` on Linux, the
+    /// purge code path would attempt to remove `~/.config/Freenet` a
+    /// second time (harmless via `remove_if_exists`, but masks a real
+    /// regression). This test pins the invariant.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_from_project_dirs_leaves_config_local_empty_on_unix() {
+        let leaves = DataLeaves::from_project_dirs();
+        assert!(
+            leaves.config_local.is_none(),
+            "config_local must alias config on Linux/macOS to avoid double removal; got {:?}",
+            leaves.config_local,
+        );
+        assert!(
+            !leaves.collapse_parents,
+            "collapse_parents must stay false off Windows so shared XDG roots are never collapsed",
         );
     }
 
