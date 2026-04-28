@@ -720,6 +720,13 @@ pub(super) fn start_subscription_request(
         "spawning child subscription operation (task-per-tx driver)"
     );
 
+    // `run_client_subscribe` requires `Arc<OpManager>`. Callers on
+    // legacy `process_message` paths only have `&OpManager`, so we
+    // wrap a single clone here. PUT/GET task drivers that already
+    // hold `&Arc<OpManager>` route through their own
+    // `maybe_subscribe_child` helper (see
+    // `put/op_ctx_task.rs::maybe_subscribe_child` and the GET
+    // counterpart) and don't pay this cost.
     let op_manager_arc = std::sync::Arc::new(op_manager.clone());
     let instance_id = *key.id();
     GlobalExecutor::spawn(async move {
@@ -942,15 +949,32 @@ mod sub_op_subscribe_migration_pin_tests {
         let start = src
             .find(&head)
             .expect("`fn start_subscription_request(` must exist in operations.rs");
-        // Find the end of the function: a balanced `}` at column 0
-        // following an `Transaction {` body close. Easiest approximation
-        // is to slice up to the next top-level `\nasync fn ` /
-        // `\nfn ` boundary.
-        let tail_anchor = "\nasync fn has_contract(";
-        let end = src[start..]
-            .find(tail_anchor)
+        // Walk forward from the function signature to the first `{`,
+        // then track brace depth until we find the matching close.
+        // This is robust against renaming/moving the next function.
+        let body_open = src[start..]
+            .find('{')
             .map(|off| start + off)
-            .expect("expected `async fn has_contract` to follow");
+            .expect("expected `{` after function signature");
+        let mut depth: i32 = 0;
+        let mut end = body_open;
+        for (i, ch) in src[body_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            end > body_open,
+            "failed to find matching `}}` for start_subscription_request"
+        );
         &src[start..end]
     }
 

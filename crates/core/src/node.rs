@@ -2448,11 +2448,13 @@ pub async fn subscribe(
 /// [`crate::operations::subscribe::start_client_subscribe`] rather than going
 /// through the legacy `request_subscribe` + `handle_op_result` re-entry loop.
 ///
-/// The renewal-initiated path (`ring::connection_maintenance`), the PUT
-/// sub-op path (`operations::start_subscription_request_internal`), and the
+/// The renewal-initiated path (`ring::connection_maintenance`) and the
 /// executor/WASM-initiated path (`contract::executor::SubscribeContract::resume_op`)
-/// all call `subscribe::request_subscribe` directly and bypass this function,
-/// so they continue on the legacy path unchanged.
+/// call `subscribe::request_subscribe` directly and bypass this function,
+/// so they continue on the legacy path unchanged. The PUT/GET sub-op
+/// fallback paths (`operations::start_subscription_request`,
+/// `maybe_subscribe_child`) now route through
+/// `subscribe::run_client_subscribe` directly.
 ///
 /// The legacy `is_renewal` parameter has been removed in Phase 2b: no live
 /// caller passes `true`, and the task-per-tx path does not carry renewal

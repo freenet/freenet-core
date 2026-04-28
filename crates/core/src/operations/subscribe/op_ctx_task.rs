@@ -14,8 +14,13 @@
 //!
 //! - **Renewals** (`ring.rs::connection_maintenance` loop) — their jitter
 //!   and spam-prevention in `can_request_subscription()` are load-bearing.
-//! - **PUT sub-ops** (`start_subscription_request_internal`) — blocking
-//!   semantics with `SubOperationTracker`; migrated in Phase 2.5.
+//! - **PUT/GET sub-ops** (`start_subscription_request` and
+//!   `maybe_subscribe_child` in `put/op_ctx_task.rs` /
+//!   `get/op_ctx_task.rs`) — historically used `SubOperationTracker`
+//!   for blocking semantics; migrated to `run_client_subscribe` (PUT
+//!   in Phase 3a, GET in Phase 3b, the legacy
+//!   `auto_subscribe_on_get_response` fallback in the sub-op
+//!   SUBSCRIBE migration follow-up).
 //! - **Intermediate-peer forwarding** (`SubscribeOp::load_or_init` on
 //!   incoming `Request`) — server-side response role; migrated in Phase 5.
 //!
