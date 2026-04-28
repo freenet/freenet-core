@@ -2183,9 +2183,22 @@ struct DataLeaves {
     /// Pre-#3739 Roaming data path, only populated on Windows where it
     /// differs from `data_local`.
     data_roaming: Option<PathBuf>,
-    /// Config dir, only populated when it differs from both data paths
-    /// (matches the macOS case where `config_dir == data_dir`).
+    /// `config_dir` (Roaming on Windows, e.g.
+    /// `%APPDATA%\...\Freenet\config`). Only populated when it differs
+    /// from both data paths (matches the macOS case where
+    /// `config_dir == data_dir`). May be stale on Windows where the
+    /// running node actually writes to `config_local` (see #3979),
+    /// but is still cleaned up in case an old install left it behind.
     config: Option<PathBuf>,
+    /// `config_local_dir` (Local on Windows, e.g.
+    /// `%LOCALAPPDATA%\...\Freenet\config`). This is what the running
+    /// node actually writes to (`Config::build` in config.rs uses
+    /// `defaults.config_local_dir()`), which is *not* the same as
+    /// `config_dir` on Windows. Without this, `freenet uninstall
+    /// --purge` left the live config folder behind. Only populated
+    /// when distinct from `data_local` and `config` to avoid double
+    /// removal.
+    config_local: Option<PathBuf>,
     /// `cache_dir` for the uppercase project bundle.
     cache: Option<PathBuf>,
     /// Lowercase-variant cache used by the webapp cache on case-sensitive
@@ -2227,6 +2240,14 @@ impl DataLeaves {
             let config_dir = dirs.config_dir().to_path_buf();
             if config_dir != data_dir && Some(&config_dir) != leaves.data_roaming.as_ref() {
                 leaves.config = Some(config_dir);
+            }
+
+            let config_local_dir = dirs.config_local_dir().to_path_buf();
+            if config_local_dir != data_dir
+                && Some(&config_local_dir) != leaves.data_roaming.as_ref()
+                && Some(&config_local_dir) != leaves.config.as_ref()
+            {
+                leaves.config_local = Some(config_local_dir);
             }
 
             leaves.cache = Some(dirs.cache_dir().to_path_buf());
@@ -2273,8 +2294,12 @@ fn purge_leaves_and_collapse(leaves: &DataLeaves) -> Result<()> {
         collect(roaming, &mut parents);
     }
     if let Some(ref config) = leaves.config {
-        remove_if_exists("config", config)?;
+        remove_if_exists("config (legacy roaming)", config)?;
         collect(config, &mut parents);
+    }
+    if let Some(ref config_local) = leaves.config_local {
+        remove_if_exists("config", config_local)?;
+        collect(config_local, &mut parents);
     }
     if let Some(ref cache) = leaves.cache {
         remove_if_exists("cache", cache)?;
@@ -4051,10 +4076,18 @@ mod tests {
         let data_local = freenet_local.join("data");
         let data_roaming = freenet_roaming.join("data");
         let config = freenet_roaming.join("config");
+        let config_local = freenet_local.join("config");
         let cache = freenet_local.join("cache");
         let log = base.join("Local").join("freenet").join("logs");
 
-        for d in [&data_local, &data_roaming, &config, &cache, &log] {
+        for d in [
+            &data_local,
+            &data_roaming,
+            &config,
+            &config_local,
+            &cache,
+            &log,
+        ] {
             std::fs::create_dir_all(d).unwrap();
             std::fs::write(d.join("placeholder.bin"), b"x").unwrap();
         }
@@ -4063,6 +4096,7 @@ mod tests {
             data_local: Some(data_local),
             data_roaming: Some(data_roaming),
             config: Some(config),
+            config_local: Some(config_local),
             cache: Some(cache),
             cache_lowercase: None,
             log: Some(log),
@@ -4102,6 +4136,7 @@ mod tests {
             leaves.data_local.as_ref(),
             leaves.data_roaming.as_ref(),
             leaves.config.as_ref(),
+            leaves.config_local.as_ref(),
             leaves.cache.as_ref(),
             leaves.log.as_ref(),
         ]
@@ -4187,6 +4222,7 @@ mod tests {
             data_local: Some(data.clone()),
             data_roaming: None,
             config: Some(config.clone()),
+            config_local: None,
             cache: Some(cache.clone()),
             cache_lowercase: None,
             log: Some(log.clone()),
@@ -4226,6 +4262,7 @@ mod tests {
             data_local: Some(data_local.clone()),
             data_roaming: None,
             config: None,
+            config_local: None,
             cache: None,
             cache_lowercase: None,
             log: None,
@@ -4235,6 +4272,48 @@ mod tests {
         purge_leaves_and_collapse(&leaves).unwrap();
 
         assert!(!data_local.exists(), "leaf should be removed");
+    }
+
+    #[test]
+    fn test_purge_leaves_removes_config_in_local_app_data() {
+        // Regression for #3979: on Windows the running node writes config
+        // to `config_local_dir()` (Local AppData), not `config_dir()`
+        // (Roaming) — see `Config::build` in config.rs which uses
+        // `defaults.config_local_dir()`. The pre-fix `purge_leaves_and_collapse`
+        // only knew about the Roaming `config` leaf, so it left
+        // `%LOCALAPPDATA%\The Freenet Project Inc\Freenet\config\` behind
+        // on every Windows uninstall.
+        let tmp = tempfile::tempdir().unwrap();
+        let freenet_local = tmp
+            .path()
+            .join("Local")
+            .join("The Freenet Project Inc")
+            .join("Freenet");
+        let config_local = freenet_local.join("config");
+        std::fs::create_dir_all(&config_local).unwrap();
+        std::fs::write(config_local.join("config.toml"), b"x").unwrap();
+
+        let leaves = DataLeaves {
+            data_local: None,
+            data_roaming: None,
+            config: None,
+            config_local: Some(config_local.clone()),
+            cache: None,
+            cache_lowercase: None,
+            log: None,
+            collapse_parents: true,
+        };
+
+        purge_leaves_and_collapse(&leaves).unwrap();
+
+        assert!(
+            !config_local.exists(),
+            "config_local leaf must be removed (the #3979 regression)",
+        );
+        assert!(
+            !freenet_local.exists(),
+            "the now-empty Freenet parent should also collapse",
+        );
     }
 
     // ── Wrapper backoff state machine tests ──
