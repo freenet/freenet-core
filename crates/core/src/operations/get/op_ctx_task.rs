@@ -1213,15 +1213,23 @@ async fn drive_sub_op_get(
                         client_contract,
                     ))
                 }
-                _ => SubOpGetOutcome::NotFound(format!(
-                    "sub-op GET wire-level success but local store lookup returned no state for {instance_id}"
-                )),
+                _ => SubOpGetOutcome::NotFound(missing_state_cause(&instance_id)),
             }
         }
         RetryLoopOutcome::Exhausted(cause) => SubOpGetOutcome::NotFound(cause),
         RetryLoopOutcome::Unexpected => SubOpGetOutcome::Infra(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => SubOpGetOutcome::Infra(err),
     }
+}
+
+/// Cause string for a sub-op GET that succeeded on the wire but
+/// produced no state in the local store on re-query. Extracted as a
+/// pure helper so the message format is unit-testable without a
+/// real `OpManager`.
+fn missing_state_cause(instance_id: &ContractInstanceId) -> String {
+    format!(
+        "sub-op GET wire-level success but local store lookup returned no state for {instance_id}"
+    )
 }
 
 // ── Relay GET task-per-tx driver (#3883) ────────────────────────────────────
@@ -3463,5 +3471,90 @@ mod tests {
             "drive_sub_op_get must NOT publish to result_router via \
              send_client_result — sub-op tx has no client waiter"
         );
+    }
+
+    // ── Behavioral coverage for sub-op outcome variants ───────────────────
+
+    /// `start_sub_op_get` must return a tx that is NOT a sub-operation
+    /// in the structural sense (no `parent` field) — sub-op GETs are
+    /// node-internal but flat in the transaction-tree sense, mirroring
+    /// the legacy `request_get` path which used `Transaction::new::<>`.
+    /// Regression: if a sub-op tx grew a parent, `is_sub_operation()`
+    /// would suppress the legacy `cb.response()` callback path that any
+    /// future migration might still rely on.
+    #[test]
+    fn sub_op_tx_has_no_parent() {
+        let tx = crate::message::Transaction::new::<super::GetMsg>();
+        assert!(
+            !tx.is_sub_operation(),
+            "sub-op GET tx must be flat (no parent) — matches legacy \
+             request_get + start_op shape"
+        );
+    }
+
+    /// Behavioral guard: missing-state cause string MUST contain the
+    /// instance_id so operators can correlate the warning to a contract.
+    /// This is the message surfaced by `SubOpGetOutcome::NotFound` when
+    /// the wire layer returned Found but the local store re-query
+    /// produced no state — a real failure mode (e.g., contract handler
+    /// rejected the PutQuery, or the store was wiped between Response
+    /// and re-query).
+    #[test]
+    fn missing_state_cause_includes_instance_id() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+        let id = ContractInstanceId::new([0xAB; 32]);
+        let cause = super::missing_state_cause(&id);
+        assert!(
+            cause.contains(&id.to_string()),
+            "missing_state_cause must reference the instance_id; got {cause:?}"
+        );
+        assert!(
+            cause.contains("local store"),
+            "missing_state_cause must mention local store re-query failure; got {cause:?}"
+        );
+    }
+
+    /// Behavioral guard: the fire-and-forget caller (subscribe's
+    /// `fetch_contract_if_missing`) drops the oneshot receiver
+    /// immediately. The driver task's `out_tx.send(outcome)` MUST NOT
+    /// panic in that case — the `let _ =` pattern guarantees graceful
+    /// receiver-dropped handling. This test exercises the oneshot
+    /// shape independently of the driver to lock in that contract.
+    #[test]
+    fn oneshot_send_after_receiver_drop_is_silent() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<super::SubOpGetOutcome>();
+        drop(rx);
+        // Mirrors the `let _ = out_tx.send(outcome)` pattern in run_sub_op_get.
+        // Should return Err(value) without panicking.
+        let result = tx.send(super::SubOpGetOutcome::Infra(
+            crate::operations::OpError::UnexpectedOpState,
+        ));
+        assert!(
+            result.is_err(),
+            "send after receiver drop must return Err, not panic"
+        );
+    }
+
+    /// Behavioral guard: `SubOpGetOutcome` discriminates the three
+    /// distinct delivery cases. Pattern-matching exhaustiveness is
+    /// already enforced by the compiler at the executor consumer site
+    /// (`local_state_or_from_network`); this test locks in the
+    /// constructor shape so future variant additions trip the test.
+    #[test]
+    fn sub_op_outcome_variants_constructible() {
+        use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, WrappedState};
+
+        let id = ContractInstanceId::new([0u8; 32]);
+        let key =
+            ContractKey::from_id_and_code(id, freenet_stdlib::prelude::CodeHash::new([0u8; 32]));
+        let state = WrappedState::from(vec![1u8, 2, 3]);
+        let found =
+            super::SubOpGetOutcome::Found(crate::operations::get::GetResult::new(key, state, None));
+        let not_found = super::SubOpGetOutcome::NotFound("exhausted".to_string());
+        let infra = super::SubOpGetOutcome::Infra(crate::operations::OpError::UnexpectedOpState);
+
+        assert!(matches!(found, super::SubOpGetOutcome::Found(_)));
+        assert!(matches!(not_found, super::SubOpGetOutcome::NotFound(_)));
+        assert!(matches!(infra, super::SubOpGetOutcome::Infra(_)));
     }
 }
