@@ -693,125 +693,37 @@ pub(crate) async fn broadcast_change_interests(
     }
 }
 
-/// Initiates a subscription after a PUT or GET completes without blocking the parent.
+/// Initiates a subscription after a PUT or GET, routing through the
+/// task-per-tx subscribe driver.
 ///
-/// This does NOT register a parent-child relationship for atomicity tracking,
-/// so the PUT/GET response is sent immediately rather than waiting for the
-/// subscription to complete.
-///
-/// This is appropriate for PUT/GET with subscribe=true, where:
-/// - The client needs immediate confirmation that the contract was stored/fetched
-/// - The subscription can complete asynchronously in the background
-/// - Subscription success/failure doesn't affect the PUT/GET result
-fn start_subscription_request_async(
-    op_manager: &OpManager,
-    parent_tx: Transaction,
-    key: ContractKey,
-) -> Transaction {
-    start_subscription_request_internal(op_manager, parent_tx, key, false)
-}
-
-/// Initiates a subscription after a PUT or GET completes, blocking the parent operation.
-///
-/// This DOES register a parent-child relationship for atomicity tracking,
-/// so the PUT/GET response waits for the subscription to complete before being sent.
-///
-/// This provides stronger atomicity guarantees but may cause timeouts under
-/// poor network conditions.
-fn start_subscription_request_blocking(
-    op_manager: &OpManager,
-    parent_tx: Transaction,
-    key: ContractKey,
-) -> Transaction {
-    start_subscription_request_internal(op_manager, parent_tx, key, true)
-}
-
-/// Initiates a subscription after a PUT or GET, with configurable blocking behavior.
-///
-/// The `blocking` parameter determines whether to block the parent operation on
-/// subscription completion:
-/// - When false (default): subscription completes asynchronously, PUT/GET responds immediately
-/// - When true: PUT/GET waits for subscription to complete before responding
-///
-/// This flag is intended to be passed from the client request (e.g., ContractRequest::Put)
-/// to allow per-operation control over subscription semantics.
+/// `blocking` is accepted for API stability (callers may inspect it for
+/// telemetry), but post-#1454 sub-op SUBSCRIBE migration it has no
+/// behavioral effect: the subscribe runs as a fire-and-forget background
+/// task in either case. The legacy `SubOperationTracker`-based blocking
+/// semantics (parent waits for child via tracker DashMap) are retired —
+/// task-per-tx PUT/GET drivers handle blocking by `await`ing
+/// `subscribe::run_client_subscribe` inline (see `maybe_subscribe_child`
+/// in `put/op_ctx_task.rs` and `get/op_ctx_task.rs`).
 pub(super) fn start_subscription_request(
     op_manager: &OpManager,
     parent_tx: Transaction,
     key: ContractKey,
     blocking: bool,
 ) -> Transaction {
-    if blocking {
-        start_subscription_request_blocking(op_manager, parent_tx, key)
-    } else {
-        start_subscription_request_async(op_manager, parent_tx, key)
-    }
-}
-
-/// Starts a subscription request while allowing callers to opt out of parent tracking.
-fn start_subscription_request_internal(
-    op_manager: &OpManager,
-    parent_tx: Transaction,
-    key: ContractKey,
-    track_parent: bool,
-) -> Transaction {
     let child_tx = Transaction::new_child_of::<subscribe::SubscribeMsg>(&parent_tx);
-    if track_parent {
-        op_manager.expect_and_register_sub_operation(parent_tx, child_tx);
-    }
 
     tracing::debug!(
         %parent_tx,
         %child_tx,
         %key,
-        "created child subscription operation"
+        blocking,
+        "spawning child subscription operation (task-per-tx driver)"
     );
 
-    let op_manager_cloned = op_manager.clone();
-
+    let op_manager_arc = std::sync::Arc::new(op_manager.clone());
+    let instance_id = *key.id();
     GlobalExecutor::spawn(async move {
-        tokio::task::yield_now().await;
-
-        // is_renewal: false - GET-triggered subscription is a new subscription
-        let sub_op = subscribe::start_op_with_id(*key.id(), child_tx, false);
-
-        match subscribe::request_subscribe(&op_manager_cloned, sub_op).await {
-            Ok(_) => {
-                tracing::debug!(%child_tx, %parent_tx, "child subscription completed");
-            }
-            Err(error) => {
-                let error_msg = format!("{}", error);
-                tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = error_msg, phase = "error", "child subscription failed");
-
-                if let Err(e) = op_manager_cloned
-                    .sub_operation_failed(child_tx, &error_msg)
-                    .await
-                {
-                    tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = %e, phase = "error", "failed to propagate failure");
-                }
-
-                // Without parent tracking, sub_operation_failed has no parent link
-                // to propagate through, so notify clients via the subscription channel.
-                if !track_parent {
-                    let instance_id = *key.id();
-                    if let Err(e) = op_manager_cloned
-                        .notify_contract_handler(
-                            crate::contract::ContractHandlerEvent::NotifySubscriptionError {
-                                key: instance_id,
-                                reason: format!("Subscription failed: {}", error_msg),
-                            },
-                        )
-                        .await
-                    {
-                        tracing::debug!(
-                            contract = %instance_id,
-                            error = %e,
-                            "Failed to send subscription error to notification channels"
-                        );
-                    }
-                }
-            }
-        }
+        subscribe::run_client_subscribe(op_manager_arc, instance_id, child_tx).await;
     });
 
     child_tx
@@ -1003,5 +915,85 @@ mod streaming_tests {
         assert!(!should_use_streaming(0, 0));
         assert!(should_use_streaming(0, 1));
         assert!(should_use_streaming(0, 100));
+    }
+}
+
+#[cfg(test)]
+mod sub_op_subscribe_migration_pin_tests {
+    //! Pin tests for the #1454 sub-op SUBSCRIBE migration.
+    //!
+    //! These tests scrape the source of `start_subscription_request` to
+    //! prove that:
+    //! 1. The legacy `subscribe::request_subscribe` driver and the legacy
+    //!    `expect_and_register_sub_operation` registration call are gone
+    //!    from the production sub-op SUBSCRIBE entry point.
+    //! 2. The function spawns the task-per-tx
+    //!    `subscribe::run_client_subscribe` driver instead.
+    //!
+    //! If a future refactor reintroduces the legacy paths, these tests
+    //! will fail loudly and force a re-evaluation against the rationale
+    //! recorded in `.claude/rules/operations.md`.
+
+    fn extract_start_subscription_request_body() -> &'static str {
+        let src = include_str!("operations.rs");
+        // Compose runtime-needle to avoid self-trigger (the test file
+        // itself contains the literal "fn start_subscription_request").
+        let head = ["fn ", "start_subscription_request("].concat();
+        let start = src
+            .find(&head)
+            .expect("`fn start_subscription_request(` must exist in operations.rs");
+        // Find the end of the function: a balanced `}` at column 0
+        // following an `Transaction {` body close. Easiest approximation
+        // is to slice up to the next top-level `\nasync fn ` /
+        // `\nfn ` boundary.
+        let tail_anchor = "\nasync fn has_contract(";
+        let end = src[start..]
+            .find(tail_anchor)
+            .map(|off| start + off)
+            .expect("expected `async fn has_contract` to follow");
+        &src[start..end]
+    }
+
+    #[test]
+    fn start_subscription_request_does_not_call_legacy_request_subscribe() {
+        let body = extract_start_subscription_request_body();
+        assert!(
+            !body.contains("subscribe::request_subscribe"),
+            "`start_subscription_request` must NOT route through the \
+             legacy `subscribe::request_subscribe` driver — sub-op \
+             SUBSCRIBE migrated to `subscribe::run_client_subscribe` \
+             (see #1454 follow-up)."
+        );
+    }
+
+    #[test]
+    fn start_subscription_request_does_not_register_with_sub_op_tracker() {
+        let body = extract_start_subscription_request_body();
+        assert!(
+            !body.contains("expect_and_register_sub_operation"),
+            "`start_subscription_request` must NOT call \
+             `expect_and_register_sub_operation` — `SubOperationTracker` \
+             registration was retired alongside the sub-op SUBSCRIBE \
+             migration. The tracker itself is scheduled for deletion in \
+             Phase 3c of #1454."
+        );
+        assert!(
+            !body.contains("sub_operation_failed"),
+            "`start_subscription_request` must NOT propagate failures \
+             via `sub_operation_failed` — the task-per-tx subscribe \
+             driver publishes its own `HostResult::Err`."
+        );
+    }
+
+    #[test]
+    fn start_subscription_request_spawns_task_per_tx_driver() {
+        let body = extract_start_subscription_request_body();
+        assert!(
+            body.contains("subscribe::run_client_subscribe"),
+            "`start_subscription_request` must spawn the task-per-tx \
+             subscribe driver `subscribe::run_client_subscribe` — \
+             matches the `maybe_subscribe_child` pattern in \
+             `put/op_ctx_task.rs` and `get/op_ctx_task.rs`."
+        );
     }
 }

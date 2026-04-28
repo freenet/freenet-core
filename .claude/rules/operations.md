@@ -116,6 +116,28 @@ paths:
 > into `ops.get`, so the GC speculative-retry block at
 > `op_state_manager.rs:1912` is provably dead for GET — retirement
 > deferred to a follow-up slice.
+>
+> Sub-operation SUBSCRIBE callers (legacy GET-originator
+> `auto_subscribe_on_get_response` fallback path; PUT/GET task-per-tx
+> drivers already routed via `maybe_subscribe_child`) now spawn
+> `subscribe::run_client_subscribe` directly — the legacy
+> `subscribe::request_subscribe` driver and the
+> `expect_and_register_sub_operation` /
+> `SubOperationTracker`-registration step are gone from the production
+> sub-op SUBSCRIBE entry point. `start_subscription_request` keeps
+> the `blocking` parameter for API stability but it is no longer
+> behaviorally distinct: blocking semantics in the task-per-tx world
+> are obtained by `await`ing `run_client_subscribe` inline (see
+> `maybe_subscribe_child` in `put/op_ctx_task.rs` and
+> `get/op_ctx_task.rs`); `start_subscription_request` is a
+> fire-and-forget spawner. The tracker (`SubOperationTracker`,
+> `expect_and_register_sub_operation`, `sub_operation_failed`,
+> `all_sub_operations_completed`, `count_pending_sub_operations`,
+> `failed_parents`, `root_ops_awaiting_sub_ops`,
+> `parent_of`) and the finalized-parent-parking branch in
+> `operations.rs::handle_op_result` are still referenced by the
+> legacy state-machine path but have no production caller after this
+> slice — Phase 3c of #1454 will delete them mechanically.
 
 ## Critical Invariant: Push-Before-Send (legacy path)
 

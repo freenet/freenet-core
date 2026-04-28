@@ -243,6 +243,11 @@ pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> Sub
 }
 
 /// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
+///
+/// Used only by unit tests after the #1454 sub-op SUBSCRIBE migration; the
+/// production sub-op caller (`auto_subscribe_on_get_response`) now spawns
+/// the task-per-tx driver directly via `subscribe::run_client_subscribe`.
+#[allow(dead_code)]
 pub(crate) fn start_op_with_id(
     instance_id: ContractInstanceId,
     id: Transaction,

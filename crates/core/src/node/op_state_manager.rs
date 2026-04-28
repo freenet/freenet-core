@@ -164,6 +164,14 @@ impl SubOperationTracker {
 
     /// Atomically registers both expected count and parent-child relationship.
     /// This prevents race conditions where children complete before registration.
+    ///
+    /// Retained alongside the rest of `SubOperationTracker` until Phase 3c
+    /// of #1454 deletes the tracker. After the sub-op SUBSCRIBE migration
+    /// (#1454 follow-up to PR #3968) no production caller registers a
+    /// child here — the legacy `handle_op_result` consumers still
+    /// reference the tracker fields, so the unit tests below keep
+    /// exercising this method until Phase 3c removes both.
+    #[allow(dead_code)]
     fn expect_and_register_sub_operation(&self, parent: Transaction, child: Transaction) {
         // Increment expected count
         self.expected_sub_operations
@@ -1164,6 +1172,11 @@ impl OpManager {
 
     /// Atomically registers both expected count and parent-child relationship.
     /// This prevents race conditions where children complete before registration.
+    ///
+    /// No production caller after the #1454 sub-op SUBSCRIBE migration;
+    /// kept alive for the unit tests in `SubOperationTracker` until
+    /// Phase 3c retires the whole tracker.
+    #[allow(dead_code)]
     pub fn expect_and_register_sub_operation(&self, parent: Transaction, child: Transaction) {
         self.sub_op_tracker
             .expect_and_register_sub_operation(parent, child);
@@ -1182,6 +1195,12 @@ impl OpManager {
     }
 
     /// Handle sub-operation failure - propagate error to parent.
+    ///
+    /// No production caller after the #1454 sub-op SUBSCRIBE migration —
+    /// the task-per-tx subscribe driver publishes its own
+    /// `HostResult::Err` on failure. Kept alive until Phase 3c retires
+    /// the whole tracker.
+    #[allow(dead_code)]
     pub async fn sub_operation_failed(
         &self,
         child: Transaction,
