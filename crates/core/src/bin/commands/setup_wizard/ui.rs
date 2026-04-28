@@ -352,7 +352,14 @@ mod platform {
   .complete-hint {
     color: #5a7089;
     font-size: 12px;
-    margin-bottom: 28px;
+    margin-bottom: 14px;
+  }
+
+  .complete-countdown {
+    color: #5a7089;
+    font-size: 11.5px;
+    margin-bottom: 18px;
+    font-variant-numeric: tabular-nums;
   }
 
   #error {
@@ -423,7 +430,8 @@ mod platform {
   </div>
   <p class="complete-text">Freenet is running</p>
   <p class="complete-hint">Look for the icon in your system tray</p>
-  <button class="btn-close" onclick="doClose()">Close</button>
+  <p class="complete-countdown" id="countdown">Closing in 5s...</p>
+  <button class="btn-close" onclick="doClose()">Close now</button>
 </div>
 
 <div id="error">
@@ -450,8 +458,21 @@ mod platform {
     document.getElementById('heading').textContent = 'Installation complete';
     document.getElementById('subtitle').style.display = 'none';
     document.getElementById('complete').style.display = 'block';
-    // Auto-close after 5 seconds so the user doesn't have to click Close
-    setTimeout(function() { window.ipc.postMessage('close'); }, 5000);
+    // Auto-close after 5 seconds so the user doesn't have to click Close,
+    // but show a visible countdown so the dialog never disappears without
+    // warning. Without this the window appeared to vanish on its own.
+    var remaining = 5;
+    var label = document.getElementById('countdown');
+    label.textContent = 'Closing in ' + remaining + 's...';
+    var tick = setInterval(function() {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(tick);
+        window.ipc.postMessage('close');
+      } else {
+        label.textContent = 'Closing in ' + remaining + 's...';
+      }
+    }, 1000);
   }
 
   function showError(msg) {
