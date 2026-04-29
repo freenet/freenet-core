@@ -177,21 +177,28 @@ jobs:
           REMOVED=$(git diff "$BASE"..."$HEAD" -- 'crates/core/src/**/*.rs' 'crates/core/tests/**/*.rs' \
             | grep '^-' | grep -v '^---' || true)
           REMOVED_STRIPPED=$(echo "$REMOVED" | sed 's|//.*||' || true)
-          if echo "$REMOVED_STRIPPED" | grep -qE "$TEST_ATTR_RE"; then
+          # The test-exempt label allows mechanical refactors (e.g., retiring a
+          # data structure whose unit tests can't be #[ignore]d because the
+          # type itself is gone) to bypass both rule #4 (deleted tests) and
+          # rule #5 (missing fix-PR test). Justification must be in PR comments.
+          HAS_EXEMPT_LABEL=$(echo "${{ join(github.event.pull_request.labels.*.name, ',') }}" | grep -c 'test-exempt' || true)
+          if [ "$HAS_EXEMPT_LABEL" -eq 0 ] && echo "$REMOVED_STRIPPED" | grep -qE "$TEST_ATTR_RE"; then
             # Check it wasn't just moved (also present in added lines across all files)
             REMOVED_TESTS=$(echo "$REMOVED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
             ADDED_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
             if [ "$REMOVED_TESTS" -gt "$ADDED_TESTS" ]; then
               ERRORS="$ERRORS
           ERROR: Test function(s) removed — tests must not be deleted (use #[ignore] with a tracking issue if broken)
-          Removed $REMOVED_TESTS test(s), added $ADDED_TESTS test(s)"
+          Removed $REMOVED_TESTS test(s), added $ADDED_TESTS test(s)
+          If the deletion is intentional (e.g., retiring a data structure whose
+          tests can't be #[ignore]d because the type is gone), add the
+          'test-exempt' label with a justification comment."
             fi
           fi
 
           # 5. fix: PRs must add at least one new test (check all Rust files, not just src/)
           # PR_TITLE is set via env: above to avoid shell injection from backticks in titles
           IS_FIX=$(echo "$PR_TITLE" | grep -ciE '^fix(\(.*\))?:' || true)
-          HAS_EXEMPT_LABEL=$(echo "${{ join(github.event.pull_request.labels.*.name, ',') }}" | grep -c 'test-exempt' || true)
 
           if [ "$IS_FIX" -gt 0 ] && [ "$HAS_EXEMPT_LABEL" -eq 0 ]; then
             NEW_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
