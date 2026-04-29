@@ -119,25 +119,27 @@ paths:
 >
 > Sub-operation SUBSCRIBE callers (legacy GET-originator
 > `auto_subscribe_on_get_response` fallback path; PUT/GET task-per-tx
-> drivers already routed via `maybe_subscribe_child`) now spawn
-> `subscribe::run_client_subscribe` directly — the legacy
-> `subscribe::request_subscribe` driver and the
-> `expect_and_register_sub_operation` /
-> `SubOperationTracker`-registration step are gone from the production
-> sub-op SUBSCRIBE entry point. `start_subscription_request` keeps
-> the `blocking` parameter for API stability but it is no longer
-> behaviorally distinct: blocking semantics in the task-per-tx world
-> are obtained by `await`ing `run_client_subscribe` inline (see
-> `maybe_subscribe_child` in `put/op_ctx_task.rs` and
-> `get/op_ctx_task.rs`); `start_subscription_request` is a
-> fire-and-forget spawner. The tracker (`SubOperationTracker`,
-> `expect_and_register_sub_operation`, `sub_operation_failed`,
-> `all_sub_operations_completed`, `count_pending_sub_operations`,
-> `failed_parents`, `root_ops_awaiting_sub_ops`,
-> `parent_of`) and the finalized-parent-parking branch in
-> `operations.rs::handle_op_result` are still referenced by the
-> legacy state-machine path but have no production caller after this
-> slice — Phase 3c of #1454 will delete them mechanically.
+> drivers already routed via `maybe_subscribe_child`) spawn
+> `subscribe::run_client_subscribe` directly.
+> `start_subscription_request` keeps the `blocking` parameter for API
+> stability but it is no longer behaviorally distinct: blocking
+> semantics in the task-per-tx world are obtained by `await`ing
+> `run_client_subscribe` inline (see `maybe_subscribe_child` in
+> `put/op_ctx_task.rs` and `get/op_ctx_task.rs`);
+> `start_subscription_request` is a fire-and-forget spawner.
+>
+> Phase 3c of #1454 has retired the `SubOperationTracker` entirely:
+> the struct, the OpManager methods (`expect_and_register_sub_operation`,
+> `sub_operation_failed`, `all_sub_operations_completed`,
+> `count_pending_sub_operations`, `root_ops_awaiting_sub_ops`,
+> `failed_parents`), the `parent_of` index, the GC parent-propagation
+> blocks, and the finalized-parent-parking branch in
+> `operations.rs::handle_op_result` are all gone. `OperationResult::ContinueOp`
+> with a finalized state now completes the op directly. Sub-operation
+> identity is structural (`Transaction::is_sub_operation()` via the
+> parent field set by `Transaction::new_child_of`); failure
+> propagation is via the task-per-tx driver's own `HostResult::Err`
+> publication, never through a tracker.
 
 ## Critical Invariant: Push-Before-Send (legacy path)
 
@@ -221,45 +223,20 @@ WRONG:
 
 ## Sub-Operation Rules
 
-### WHEN spawning a sub-operation (legacy state-machine path)
+### WHEN spawning a sub-operation
 
 ```
-1. FIRST: Register with expect_and_register_sub_operation()
-2. THEN: Create and push the child operation
-3. WHY: Prevents race where child completes before parent knows about it
+Sub-operations are identified structurally — create them via
+Transaction::new_child_of::<MsgType>(&parent_tx). The parent field is
+set at construction; Transaction::is_sub_operation() returns true
+without any DashMap registration.
 
-CORRECT:
-  op_manager.expect_and_register_sub_operation(parent_tx, child_tx);
-  let child_op = SubscribeOp::new(...);
-  op_manager.push(child_tx, child_op).await?;
-
-WRONG:
-  let child_op = SubscribeOp::new(...);
-  op_manager.push(child_tx, child_op).await?;  // Child might complete here!
-  op_manager.expect_and_register_sub_operation(parent_tx, child_tx);  // Too late
-```
-
-### WHEN spawning a sub-operation (task-per-tx path)
-
-```
-Task-per-tx drivers (PUT, GET) do NOT register children with
-SubOperationTracker. They create children via Transaction::new_child_of
-and either await them inline (blocking) or fire-and-forget (async).
+Either await the child inline (blocking) or fire-and-forget (async).
+There is no central tracker; failure propagation is the child driver's
+responsibility (publish HostResult::Err on its own task).
 
 The is_sub_operation guards at p2p_protoc.rs, node.rs, and subscribe.rs
-use the structural Transaction::is_sub_operation() check (parent field
-set by new_child_of), not the tracker DashMap. No registration needed.
-
-SubOperationTracker is only used by legacy relay paths that go through
-the finalized-parent-parking branch in operations.rs:182–208.
-```
-
-### WHEN a sub-operation fails
-
-```
-→ Call sub_operation_failed(child_tx, error_msg)
-→ This propagates failure to parent
-→ Parent should handle gracefully (may still complete partially)
+all use the structural check.
 ```
 
 ## Streaming Rules

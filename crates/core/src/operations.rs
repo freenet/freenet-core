@@ -181,31 +181,9 @@ where
         // ── No message, has state → keep processing ────────────────────
         Ok(OperationResult::ContinueOp(state)) => {
             if state.finalized() {
-                // Finalized with no outgoing message — check sub-ops.
-                if op_manager.failed_parents().remove(&tx_id).is_some() {
-                    tracing::warn!(
-                        tx = %tx_id,
-                        phase = "error",
-                        "Operation reached finalized state after a sub-operation failure; dropping client response"
-                    );
-                    op_manager.completed(tx_id);
-                    return Ok(None);
-                }
-                if op_manager.all_sub_operations_completed(tx_id) {
-                    tracing::debug!(%tx_id, "operation complete");
-                    op_manager.completed(tx_id);
-                    return Ok(Some(state));
-                } else {
-                    let pending_count = op_manager.count_pending_sub_operations(tx_id);
-                    tracing::debug!(
-                        %tx_id,
-                        pending_count,
-                        "root operation awaiting child completion"
-                    );
-                    op_manager.root_ops_awaiting_sub_ops().insert(tx_id, state);
-                    tracing::info!(tx = %tx_id, phase = "wait_sub_ops", "root operation registered as awaiting sub-ops");
-                    return Ok(None);
-                }
+                tracing::debug!(%tx_id, "operation complete");
+                op_manager.completed(tx_id);
+                return Ok(Some(state));
             } else {
                 // Non-finalized: push state for later processing.
                 let id = *state.id();
@@ -997,9 +975,8 @@ mod sub_op_subscribe_migration_pin_tests {
             !body.contains("expect_and_register_sub_operation"),
             "`start_subscription_request` must NOT call \
              `expect_and_register_sub_operation` — `SubOperationTracker` \
-             registration was retired alongside the sub-op SUBSCRIBE \
-             migration. The tracker itself is scheduled for deletion in \
-             Phase 3c of #1454."
+             was deleted in #1454 Phase 3c. Reintroducing it would be a \
+             regression."
         );
         assert!(
             !body.contains("sub_operation_failed"),

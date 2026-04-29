@@ -48,18 +48,6 @@ pub(crate) struct PutOp {
 }
 
 impl PutOp {
-    /// Minimal PutOp constructor for tests outside this module
-    /// (state=None, stats=None — enough for DashMap insert/remove tests).
-    #[cfg(test)]
-    pub(crate) fn new_empty_for_test(id: Transaction) -> Self {
-        PutOp {
-            id,
-            state: None,
-            upstream_addr: None,
-            stats: None,
-        }
-    }
-
     pub(super) fn outcome(&self) -> OpOutcome<'_> {
         if self.finalized() {
             if let Some(ref stats) = self.stats {
@@ -1344,28 +1332,16 @@ async fn start_subscription_after_put(
     key: ContractKey,
     blocking_subscription: bool,
 ) {
-    // Note: This failed_parents check may be unnecessary since we only spawn the subscription
-    // at PUT completion, so there's no earlier child operation that could have failed.
-    // Keeping it as defensive check in case of race conditions not currently understood.
-    if !op_manager.failed_parents().contains(&parent_tx) {
-        let child_tx =
-            super::start_subscription_request(op_manager, parent_tx, key, blocking_subscription);
-        tracing::debug!(
-            tx = %parent_tx,
-            child_tx = %child_tx,
-            contract = %key,
-            blocking = blocking_subscription,
-            phase = "subscribe",
-            "Started subscription after PUT"
-        );
-    } else {
-        tracing::warn!(
-            tx = %parent_tx,
-            contract = %key,
-            phase = "subscribe",
-            "Not starting subscription for failed parent PUT operation"
-        );
-    }
+    let child_tx =
+        super::start_subscription_request(op_manager, parent_tx, key, blocking_subscription);
+    tracing::debug!(
+        tx = %parent_tx,
+        child_tx = %child_tx,
+        contract = %key,
+        blocking = blocking_subscription,
+        phase = "subscribe",
+        "Started subscription after PUT"
+    );
 }
 
 // State machine for PUT operations.
