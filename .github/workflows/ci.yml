@@ -98,6 +98,40 @@ jobs:
       - name: Check code formatting
         run: cargo fmt -- --check
 
+      # Locks the bash predicate that the merge_group release-gate keys off
+      # (#3973). The actual release path is only exercised on a real release
+      # merge_group entry, so a regression in the matching logic would
+      # silently skip the pre-publish gate. This self-test catches predicate
+      # quoting, anchoring, and case-sensitivity bugs on every CI run.
+      - name: Self-test merge_group release detector
+        run: |
+          set -eu
+          check() {
+            local msg="$1"
+            local expected="$2"  # "release" or "non-release"
+            local actual
+            if [[ "$msg" == build:\ release* ]]; then
+              actual="release"
+            else
+              actual="non-release"
+            fi
+            if [[ "$actual" != "$expected" ]]; then
+              echo "FAIL: '$msg' -> expected '$expected', got '$actual'"
+              return 1
+            fi
+            echo "OK:   '$msg' -> $actual"
+          }
+          # Positive cases (release-gate must fire)
+          check "build: release 0.2.49 (#3947)"                "release"
+          check "build: release 1.0.0"                         "release"
+          check "build: release 0.2.49"                        "release"
+          # Negative cases (release-gate must NOT fire)
+          check "chore: bump versions to 0.2.49"               "non-release"
+          check "refactor(ops): retire SubOperationTracker"    "non-release"
+          check "build(deps): bump rand from 0.8.5 to 0.9.2"   "non-release"
+          check "build: replace local release build"           "non-release"
+          check ""                                             "non-release"
+
       - name: Check for old-style mod.rs files
         run: |
           # New modules must use foo.rs + foo/ style, not foo/mod.rs
