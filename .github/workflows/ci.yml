@@ -286,6 +286,10 @@ jobs:
 
   test_unit:
     name: Unit & Integration
+    # Always runs on the heavy runner. Unlike test_simulation and nat_validation,
+    # this job has no runner-conditional and no skip_check: Unit & Integration is
+    # the one heavy gate kept on every merge_group entry (release or not), so the
+    # tiered model (#3973) doesn't apply here.
     runs-on: ubicloud-standard-16
     timeout-minutes: 30
     needs: fmt_check

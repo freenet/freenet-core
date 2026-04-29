@@ -127,6 +127,11 @@ jobs:
         id: create_pr
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        # NOTE: The PR title MUST start with "build: release " — squash-merge
+        # propagates the title to the merge_group head_commit.message, where
+        # ci.yml's `skip_check` keys off it to decide whether the merge_group
+        # entry is the pre-publish gate. Renaming this prefix without
+        # updating ci.yml will silently disable the full-suite release gate.
         run: |
           PR_URL=$(gh pr create \
             --title "build: release ${{ needs.validate.outputs.version }}" \
@@ -154,7 +159,11 @@ jobs:
   wait_for_pr:
     name: Wait for PR to merge
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 75 min covers: merge-queue scheduling + full-suite release gate (test_unit
+    # + Simulation + NAT Validation in parallel, ~10-15 min each on a busy
+    # ubicloud-standard-16) + branch-protection check propagation. Bumped from
+    # 60 min when the release merge_group started running the full suite (#3973).
+    timeout-minutes: 75
     needs: [validate, update_versions]
 
     steps:
@@ -166,7 +175,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PR_NUMBER="${{ needs.update_versions.outputs.pr_number }}"
-          MAX_WAIT=1800  # 30 minutes
+          # 60 min budget. Was 30 min when the release merge_group skipped
+          # heavy tests; the new full-suite release gate (#3973) needs longer.
+          # Stays under the 75-min job timeout to leave headroom for shutdown.
+          MAX_WAIT=3600  # 60 minutes
           WAIT_INTERVAL=30
           ELAPSED=0
 
