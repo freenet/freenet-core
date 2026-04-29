@@ -76,8 +76,6 @@ pub(crate) fn start_op_with_id(
         upstream_addr: None, // Local operation, no upstream peer
         local_fallback: None,
         auto_fetch: false,
-        ack_received: false,
-        speculative_paths: 0,
         client_return_code: fetch_contract,
     }
 }
@@ -139,9 +137,7 @@ pub(crate) fn start_targeted_op(
         })),
         upstream_addr: None,
         local_fallback: None,
-        auto_fetch: true, // System-initiated, not a client request
-        ack_received: false,
-        speculative_paths: 0,
+        auto_fetch: true,         // System-initiated, not a client request
         client_return_code: true, // Internal fetch, always include code
     };
 
@@ -383,19 +379,6 @@ pub(crate) struct GetOp {
     /// not by a client request. Used to avoid sending spurious timeout errors
     /// to a non-existent client.
     auto_fetch: bool,
-    /// True when a downstream relay has acknowledged forwarding this request.
-    /// Historically used by the GC task to distinguish "peer is dead" from
-    /// "peer is working on it" — that retry block was retired in #1454
-    /// Phase 5-final. The field is still maintained on the legacy state
-    /// machine path and exercised by the `gc_would_retry` helper tests
-    /// (see end of this file) so the bookkeeping is captured if a future
-    /// retry mechanism reuses it. Allow `dead_code` until those tests +
-    /// fields are deleted in a follow-up slice.
-    #[allow(dead_code)]
-    pub(crate) ack_received: bool,
-    /// Number of speculative parallel paths launched by the originator's
-    /// GC task. Same lineage as `ack_received` above.
-    pub(crate) speculative_paths: u8,
     /// Whether the client wants contract code in the response.
     /// The node always fetches WASM from the network for internal caching,
     /// but strips it from the client response when this is false.
@@ -570,8 +553,6 @@ impl GetOp {
                     upstream_addr: self.upstream_addr,
                     local_fallback: self.local_fallback,
                     auto_fetch: self.auto_fetch,
-                    ack_received: false,
-                    speculative_paths: 0,
                     client_return_code: self.client_return_code,
                 };
 
@@ -641,8 +622,6 @@ impl GetOp {
                         upstream_addr: self.upstream_addr,
                         local_fallback: self.local_fallback,
                         auto_fetch: self.auto_fetch,
-                        ack_received: false,
-                        speculative_paths: 0,
                         client_return_code: self.client_return_code,
                     };
 
@@ -675,8 +654,6 @@ impl GetOp {
                     upstream_addr: self.upstream_addr,
                     local_fallback: None,
                     auto_fetch: false,
-                    ack_received: false,
-                    speculative_paths: 0,
                     client_return_code: self.client_return_code,
                 };
 
@@ -710,8 +687,6 @@ impl GetOp {
                     upstream_addr: self.upstream_addr,
                     local_fallback: None,
                     auto_fetch: false,
-                    ack_received: false,
-                    speculative_paths: 0,
                     client_return_code: self.client_return_code,
                 };
 
@@ -755,8 +730,6 @@ impl GetOp {
                     upstream_addr: self.upstream_addr,
                     local_fallback: None,
                     auto_fetch: false,
-                    ack_received: false,
-                    speculative_paths: 0,
                     client_return_code: self.client_return_code,
                 };
                 op_manager.push(self.id, OpEnum::Get(failed_op)).await?;
@@ -977,8 +950,6 @@ impl Operation for GetOp {
                         upstream_addr: source_addr, // Connection-based routing: store who sent us this request
                         local_fallback: None,       // Remote requests don't have local fallback
                         auto_fetch: false,
-                        ack_received: false,
-                        speculative_paths: 0,
                         client_return_code: true,
                     },
                     source_addr,
@@ -1963,8 +1934,6 @@ impl Operation for GetOp {
                                         upstream_addr: self.upstream_addr,
                                         local_fallback: None,
                                         auto_fetch: false,
-                                        ack_received: false,
-                                        speculative_paths: 0,
                                         client_return_code: self.client_return_code,
                                     }),
                                 )
@@ -2528,8 +2497,6 @@ impl Operation for GetOp {
                                             upstream_addr: self.upstream_addr,
                                             local_fallback,
                                             auto_fetch: false,
-                                            ack_received: false,
-                                            speculative_paths: 0,
                                             client_return_code: self.client_return_code,
                                         }),
                                     )
@@ -2560,8 +2527,6 @@ impl Operation for GetOp {
                                             upstream_addr: self.upstream_addr,
                                             local_fallback,
                                             auto_fetch: false,
-                                            ack_received: false,
-                                            speculative_paths: 0,
                                             client_return_code: self.client_return_code,
                                         }),
                                     )
@@ -2707,8 +2672,6 @@ impl Operation for GetOp {
                                 upstream_addr: self.upstream_addr,
                                 local_fallback,
                                 auto_fetch,
-                                ack_received: false,
-                                speculative_paths: self.speculative_paths,
                                 client_return_code: self.client_return_code,
                             };
 
@@ -2717,7 +2680,7 @@ impl Operation for GetOp {
                             let stalled_peer_info = retry_op.failure_routing_info();
 
                             match retry_op.retry_with_next_alternative(max_htl, &all_connected) {
-                                Ok((mut new_op, msg)) => {
+                                Ok((new_op, msg)) => {
                                     if let Some((peer, contract_location)) = stalled_peer_info {
                                         op_manager.ring.routing_finished(
                                             crate::router::RouteEvent {
@@ -2730,9 +2693,6 @@ impl Operation for GetOp {
                                             },
                                         );
                                     }
-                                    // Track speculative path to respect MAX_SPECULATIVE_PATHS
-                                    // cap, matching the GC task behavior.
-                                    new_op.speculative_paths += 1;
                                     let target = match new_op.get_next_hop_addr() {
                                         Some(addr) => addr,
                                         None => {
@@ -3072,15 +3032,17 @@ impl Operation for GetOp {
                     return_msg = None;
                 }
                 GetMsg::ForwardingAck { id, instance_id } => {
-                    // A downstream relay has acknowledged forwarding our request.
-                    // Mark the op so the GC task knows the chain is alive.
+                    // A downstream relay has acknowledged forwarding our
+                    // request. The GC speculative-retry block that consumed
+                    // this signal was retired in #1454 Phase 5-final, but the
+                    // telemetry emission stays for #3570 diagnostics. The
+                    // operation's runtime state is unchanged by this message.
                     tracing::debug!(
                         tx = %id,
                         %instance_id,
                         "Received forwarding ACK from downstream relay"
                     );
 
-                    // Emit telemetry for ForwardingAck received (#3570 diagnostics)
                     if let Some(event) = NetEventLog::get_forwarding_ack_received(
                         &self.id,
                         &op_manager.ring,
@@ -3097,8 +3059,6 @@ impl Operation for GetOp {
                         upstream_addr: self.upstream_addr,
                         local_fallback,
                         auto_fetch,
-                        ack_received: true,
-                        speculative_paths: self.speculative_paths,
                         client_return_code: self.client_return_code,
                     })));
                 }
@@ -3188,8 +3148,6 @@ fn build_op_result(params: GetOpResult) -> Result<OperationResult, OpError> {
         upstream_addr,
         local_fallback,
         auto_fetch,
-        ack_received: false,
-        speculative_paths: 0,
         client_return_code,
     });
     let return_msg = msg.map(NetMessage::from);
@@ -3623,8 +3581,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         }
     }
@@ -4065,8 +4021,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         };
 
@@ -4093,8 +4047,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         };
         assert!(
@@ -4122,8 +4074,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         };
         assert!(
@@ -4164,8 +4114,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         };
 
@@ -4213,8 +4161,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         };
 
@@ -4257,8 +4203,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         };
 
@@ -4290,8 +4234,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         };
 
@@ -4378,8 +4320,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         }
     }
@@ -4761,8 +4701,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         };
         assert!(!op.is_client_initiated());
@@ -4793,254 +4731,14 @@ mod tests {
         assert!(!op.is_client_initiated());
     }
 
-    // === Tests for GC task retry flow ===
-    //
-    // These tests reproduce the exact scenario from the garbage_cleanup_task in
-    // op_state_manager.rs: a GET op has been stuck for >20s with no response,
-    // and the GC task selects it for retry.
-    //
-    // The GC task uses:
-    //   1. tx.elapsed() > GET_RETRY_THRESHOLD (20s ± 20% jitter)
-    //   2. retry_with_next_alternative(max_htl, &all_connected)
-    //
-    // Without the fix (no GC retry logic), stuck GETs would sit until the 60s
-    // OPERATION_TTL expires and then be silently removed — no retry, no client
-    // notification.
+    // ── ForwardingAck wire-format pin (#3570 telemetry hook survives) ──────
 
-    use crate::config::{GlobalRng, GlobalSimulationTime};
-
-    /// Verify that a transaction created 25s ago would be selected as a
-    /// retry candidate by the GC task's threshold check.
-    ///
-    /// Removing the GC retry logic from op_state_manager.rs would make this
-    /// test's scenario moot — the elapsed check would never be performed
-    /// and stuck GETs would silently expire.
-    #[test]
-    fn gc_retry_candidate_selected_after_threshold() {
-        // Set deterministic simulation time
-        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
-        GlobalRng::set_seed(0x6C01);
-
-        // Create a transaction (records creation timestamp via current_time_ms)
-        let tx = Transaction::new::<GetMsg>();
-        // Advance simulation time by 25 seconds (past the 20s threshold).
-        // Creation timestamp is ~1_700_000_000_000 (base + small counter offset).
-        GlobalSimulationTime::set_time_ms(1_700_000_000_000 + 25_000);
-
-        let elapsed = tx.elapsed();
-        assert!(
-            elapsed > std::time::Duration::from_secs(20),
-            "Transaction should show >20s elapsed after time advancement, got {:?}",
-            elapsed
-        );
-
-        // This is what the GC task checks: elapsed > threshold * (retry_count + 1)
-        let threshold = std::time::Duration::from_secs(20);
-        let retry_count = 0u32;
-        let base = threshold * (retry_count + 1);
-        // With jitter factor 0.8-1.2, the threshold ranges from 16s to 24s
-        // At 25s elapsed, we're past even the worst-case jitter
-        assert!(
-            elapsed > base.mul_f64(1.2),
-            "Should exceed even worst-case jittered threshold"
-        );
-    }
-
-    /// Verify that a transaction created only 10s ago would NOT be selected
-    /// as a retry candidate.
-    #[test]
-    fn gc_retry_candidate_not_selected_before_threshold() {
-        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
-        GlobalRng::set_seed(0x6C02);
-
-        let tx = Transaction::new::<GetMsg>();
-        // Only 10 seconds — below the 20s threshold
-        GlobalSimulationTime::set_time_ms(1_700_000_000_000 + 10_000);
-
-        let elapsed = tx.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(20),
-            "Transaction should show <20s elapsed, got {:?}",
-            elapsed
-        );
-    }
-
-    /// Full GC retry flow: stuck GET → time passes → retry with alternative.
-    ///
-    /// Reproduces the exact flow from garbage_cleanup_task:
-    ///   1. GET op created, sent to peer, waiting for response
-    ///   2. 25 seconds pass with no response
-    ///   3. GC task selects it as retry candidate
-    ///   4. retry_with_next_alternative produces a new Request message
-    ///   5. Op is re-inserted with updated state
-    ///
-    /// Without the fix: step 4 doesn't exist — the op sits until TTL expiry.
-    /// Removing retry_with_next_alternative → this test fails to compile.
-    /// Removing the GC retry logic → step 3-5 never happen in production.
-    #[test]
-    fn gc_retry_full_flow_stuck_get_retries_with_alternative() {
-        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
-        GlobalRng::set_seed(0x6C03);
-
-        // Create a GET op with 2 alternative peers
-        let alt1 = make_peer(4001);
-        let alt2 = make_peer(4002);
-        let op = make_awaiting_op(vec![alt1.clone(), alt2], &[]);
-        let tx = op.id;
-
-        // Simulate the op being stuck: advance time by 25 seconds
-        GlobalSimulationTime::set_time_ms(1_700_000_000_000 + 25_000);
-
-        // Verify the GC task would select this as a retry candidate
-        assert!(
-            tx.elapsed() > std::time::Duration::from_secs(20),
-            "Op should be eligible for retry"
-        );
-
-        // GC task calls retry_with_next_alternative (this IS the fix)
-        let max_htl = 7;
-        let all_connected: Vec<PeerKeyLocation> = vec![]; // no DBF needed, has alternatives
-        let result = op.retry_with_next_alternative(max_htl, &all_connected);
-
-        // With the fix: produces a retry message targeting alt1
-        let (new_op, msg) = result.unwrap_or_else(|_| {
-            panic!("GC retry should produce a message when alternatives exist")
-        });
-
-        // Verify the retry message uses reduced HTL (not full max_htl).
-        // make_awaiting_op sets attempts_at_hop=1, retry increments to 2 → 7/2=3.
-        match &msg {
-            GetMsg::Request { htl, .. } => {
-                assert!(
-                    *htl <= max_htl,
-                    "Retry HTL ({}) should not exceed max_htl ({})",
-                    htl,
-                    max_htl
-                );
-                assert!(
-                    *htl >= MIN_RETRY_HTL,
-                    "Retry HTL ({}) should be at least MIN_RETRY_HTL ({})",
-                    htl,
-                    MIN_RETRY_HTL
-                );
-            }
-            GetMsg::Response { .. }
-            | GetMsg::ResponseStreaming { .. }
-            | GetMsg::ResponseStreamingAck { .. }
-            | GetMsg::ForwardingAck { .. } => panic!("Expected Request"),
-        }
-
-        // Verify the op state was updated: alt1 is now the next_hop, alt2 remains
-        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
-            assert_eq!(
-                data.next_hop, alt1,
-                "Should be targeting the first alternative"
-            );
-            assert_eq!(data.alternatives.len(), 1, "One alternative remaining");
-            assert!(
-                data.tried_peers.contains(&alt1.socket_addr().unwrap()),
-                "alt1 should be in tried_peers"
-            );
-        } else {
-            panic!("Expected AwaitingResponse state after retry");
-        }
-    }
-
-    /// GC retry with DBF fallback: stuck GET, all alternatives exhausted,
-    /// broadens search to all connected peers.
-    ///
-    /// Without the DBF fallback fix: when alternatives are empty, the retry
-    /// returns Err and the op stays stuck until TTL expiry.
-    /// With the fix: fallback_peers (from ring.get_connections_by_location)
-    /// are injected as new alternatives.
-    #[test]
-    fn gc_retry_dbf_fallback_broadens_to_connected_peers() {
-        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
-        GlobalRng::set_seed(0x6C04);
-
-        // Create a GET op with NO alternatives (all exhausted)
-        let op = make_awaiting_op(vec![], &[]);
-
-        // Without DBF fallback: retry fails (no alternatives)
-        let fallback_peers: Vec<PeerKeyLocation> = vec![];
-        let op_clone_for_no_fallback = make_awaiting_op(vec![], &[]);
-        let result = op_clone_for_no_fallback.retry_with_next_alternative(7, &fallback_peers);
-        assert!(result.is_err(), "Without fallback peers, retry should fail");
-
-        // WITH DBF fallback: provide connected peers that haven't been tried
-        let fallback1 = make_peer(5001);
-        let fallback2 = make_peer(5002);
-        let fallback_peers = vec![fallback1.clone(), fallback2];
-
-        let result = op.retry_with_next_alternative(7, &fallback_peers);
-        let (new_op, msg) =
-            result.unwrap_or_else(|_| panic!("DBF fallback should inject new peers and retry"));
-
-        // Verify the retry targets a fallback peer
-        assert!(matches!(msg, GetMsg::Request { .. }));
-
-        if let Some(GetState::AwaitingResponse(data)) = &new_op.state {
-            assert!(
-                data.tried_peers.contains(&fallback1.socket_addr().unwrap()),
-                "Fallback peer should be in tried_peers"
-            );
-            // One fallback was used, one remains as alternative
-            assert_eq!(
-                data.alternatives.len(),
-                1,
-                "Second fallback should remain as alternative"
-            );
-        } else {
-            panic!("Expected AwaitingResponse state");
-        }
-    }
-
-    /// Verify that successive GC retries advance the threshold multiplicatively.
-    ///
-    /// The GC task uses: threshold = GET_RETRY_THRESHOLD * (retry_count + 1)
-    ///   retry 0: fires at ~20s
-    ///   retry 1: fires at ~40s
-    ///   retry 2: fires at ~60s (near TTL expiry)
-    ///
-    /// This prevents rapid-fire retries from overwhelming the network.
-    #[test]
-    fn gc_retry_threshold_scales_with_retry_count() {
-        GlobalSimulationTime::set_time_ms(1_700_000_000_000);
-        GlobalRng::set_seed(0x6C05);
-
-        let tx = Transaction::new::<GetMsg>();
-        // Transaction was created at ~1_700_000_000_000 (base + tiny counter offset)
-        let base_ms = 1_700_000_000_000u64;
-
-        // ACK_TIMEOUT is 3s (matches op_state_manager.rs GC task)
-        let threshold = std::time::Duration::from_secs(3);
-
-        // At 4s: retry_count=0 threshold=3s → eligible
-        GlobalSimulationTime::set_time_ms(base_ms + 4_000);
-        let base_0 = threshold * 1;
-        assert!(tx.elapsed() > base_0, "First retry should fire at ~3s");
-
-        // At 4s: retry_count=1 threshold=6s → NOT eligible
-        let base_1 = threshold * 2;
-        assert!(
-            tx.elapsed() < base_1,
-            "Second retry should NOT fire at 4s (needs ~6s)"
-        );
-
-        // At 7s: retry_count=1 threshold=6s → eligible
-        GlobalSimulationTime::set_time_ms(base_ms + 7_000);
-        assert!(tx.elapsed() > base_1, "Second retry should fire at ~6s");
-
-        // At 7s: retry_count=2 threshold=9s → NOT eligible
-        let base_2 = threshold * 3;
-        assert!(
-            tx.elapsed() < base_2,
-            "Third retry should NOT fire at 7s (needs ~9s)"
-        );
-    }
-
-    // === Tests for ForwardingAck serde round-trip ===
-
+    /// Pin test: `GetMsg::ForwardingAck` survives Phase 5-final as a wire
+    /// variant + telemetry-only handler (no production reader after the
+    /// retry block was retired). This serde round-trip guards against
+    /// accidental bincode-discriminant shifts that would break
+    /// cross-version compatibility for any deployed peer still emitting
+    /// the variant.
     #[test]
     fn forwarding_ack_serde_roundtrip() {
         let id = Transaction::new::<GetMsg>();
@@ -5065,160 +4763,6 @@ mod tests {
                 panic!("Expected ForwardingAck, got {other}")
             }
         }
-    }
-
-    // === Tests for ACK-aware GC retry logic ===
-    //
-    // These tests replicate the GC task's decision logic from op_state_manager.rs
-    // to verify the retry/skip conditions at the unit level.
-
-    /// Helper that replicates the GC task's retry eligibility check for a GET op.
-    /// Returns true if the op would be selected as a retry candidate.
-    fn gc_would_retry(op: &GetOp, retry_count: usize) -> bool {
-        const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-        const PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
-        const MAX_SPECULATIVE_PATHS: u8 = 2;
-
-        // Must be originator
-        if !op.is_client_initiated() {
-            return false;
-        }
-        // Capped speculative paths
-        if op.speculative_paths >= MAX_SPECULATIVE_PATHS {
-            return false;
-        }
-        let elapsed = op.id.elapsed();
-
-        if op.ack_received {
-            // ACK received — trust chain for PROGRESS_TIMEOUT, then re-enable (#3570)
-            if elapsed <= PROGRESS_TIMEOUT {
-                return false;
-            }
-            // Chain stalled past PROGRESS_TIMEOUT — eligible for retry
-            let base = PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32);
-            return elapsed > base;
-        }
-
-        // No ACK — check against ACK_TIMEOUT (without jitter for deterministic testing)
-        let base = ACK_TIMEOUT * (retry_count as u32 + 1);
-        elapsed > base
-    }
-
-    #[test]
-    fn ack_received_prevents_gc_retry_within_progress_timeout() {
-        use crate::config::GlobalSimulationTime;
-
-        let base_ms = 1_700_000_000_000;
-        GlobalSimulationTime::set_time_ms(base_ms);
-
-        let mut op = make_awaiting_op(vec![make_peer(5001)], &[]);
-        op.ack_received = true;
-
-        // Advance time past ACK_TIMEOUT (3s) but within PROGRESS_TIMEOUT (7s)
-        GlobalSimulationTime::set_time_ms(base_ms + 5_000);
-
-        assert!(
-            !gc_would_retry(&op, 0),
-            "Op with ack_received should NOT be retried within PROGRESS_TIMEOUT"
-        );
-    }
-
-    #[test]
-    fn ack_received_allows_retry_after_progress_timeout() {
-        use crate::config::GlobalSimulationTime;
-
-        let base_ms = 1_700_000_000_000;
-        GlobalSimulationTime::set_time_ms(base_ms);
-
-        let mut op = make_awaiting_op(vec![make_peer(5001)], &[]);
-        op.ack_received = true;
-
-        // Advance time past PROGRESS_TIMEOUT (7s) + ACK_TIMEOUT (3s) for jitter headroom
-        GlobalSimulationTime::set_time_ms(base_ms + 12_000);
-
-        assert!(
-            gc_would_retry(&op, 0),
-            "Op with ack_received SHOULD be retried after PROGRESS_TIMEOUT (#3570)"
-        );
-    }
-
-    #[test]
-    fn speculative_paths_caps_at_max() {
-        use crate::config::GlobalSimulationTime;
-
-        let base_ms = 1_700_000_000_000;
-        GlobalSimulationTime::set_time_ms(base_ms);
-
-        let mut op = make_awaiting_op(vec![make_peer(5001), make_peer(5002)], &[]);
-        op.speculative_paths = 2; // MAX_SPECULATIVE_PATHS
-
-        GlobalSimulationTime::set_time_ms(base_ms + 10_000);
-
-        assert!(
-            !gc_would_retry(&op, 0),
-            "Op at MAX_SPECULATIVE_PATHS should NOT be retried by GC"
-        );
-    }
-
-    #[test]
-    fn no_ack_allows_gc_retry_after_timeout() {
-        use crate::config::GlobalSimulationTime;
-
-        let base_ms = 1_700_000_000_000;
-        GlobalSimulationTime::set_time_ms(base_ms);
-
-        let op = make_awaiting_op(vec![make_peer(5001)], &[]);
-        assert!(!op.ack_received);
-        assert_eq!(op.speculative_paths, 0);
-
-        // Before ACK_TIMEOUT — should NOT retry
-        GlobalSimulationTime::set_time_ms(base_ms + 2_000);
-        assert!(
-            !gc_would_retry(&op, 0),
-            "Op should NOT be retried before ACK_TIMEOUT (3s)"
-        );
-
-        // After ACK_TIMEOUT — SHOULD retry
-        GlobalSimulationTime::set_time_ms(base_ms + 4_000);
-        assert!(
-            gc_would_retry(&op, 0),
-            "Op without ACK should be retried after 3s"
-        );
-
-        // And retry should succeed since alternatives exist
-        let result = op.retry_with_next_alternative(7, &[]);
-        assert!(result.is_ok(), "Should retry with available alternative");
-    }
-
-    #[test]
-    fn gc_retry_increments_speculative_paths_and_resets_ack() {
-        use crate::config::GlobalSimulationTime;
-
-        let base_ms = 1_700_000_000_000;
-        GlobalSimulationTime::set_time_ms(base_ms);
-
-        let op = make_awaiting_op(vec![make_peer(5001), make_peer(5002)], &[]);
-        assert_eq!(op.speculative_paths, 0);
-        assert!(!op.ack_received);
-
-        // Simulate first retry (as GC task does)
-        GlobalSimulationTime::set_time_ms(base_ms + 4_000);
-        let (mut new_op, _msg) = op
-            .retry_with_next_alternative(7, &[])
-            .map_err(|_| "retry_with_next_alternative failed")
-            .unwrap();
-        new_op.speculative_paths += 1;
-        new_op.ack_received = false;
-
-        assert_eq!(new_op.speculative_paths, 1);
-        assert!(!new_op.ack_received);
-
-        // After ACK arrives on the new path
-        new_op.ack_received = true;
-        assert!(
-            !gc_would_retry(&new_op, 1),
-            "Op with ACK on new path should NOT be retried"
-        );
     }
 
     // ── Stream failure retry tests (#3756) ──────────────────────────────────
@@ -5246,8 +4790,6 @@ mod tests {
             upstream_addr: op.upstream_addr,
             local_fallback: op.local_fallback,
             auto_fetch: op.auto_fetch,
-            ack_received: false,
-            speculative_paths: op.speculative_paths,
             client_return_code: true,
         };
 
@@ -5293,8 +4835,6 @@ mod tests {
             upstream_addr: op.upstream_addr,
             local_fallback: op.local_fallback,
             auto_fetch: op.auto_fetch,
-            ack_received: false,
-            speculative_paths: op.speculative_paths,
             client_return_code: true,
         };
 
@@ -5336,8 +4876,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         }
     }
@@ -5489,8 +5027,6 @@ mod tests {
             upstream_addr: None,
             local_fallback: None,
             auto_fetch: false,
-            ack_received: false,
-            speculative_paths: 0,
             client_return_code: true,
         };
 
