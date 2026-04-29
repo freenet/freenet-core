@@ -113,9 +113,16 @@ paths:
 > `local_state_or_from_network`'s 120 s receiver timeout) — receiver
 > drop is silent so no leak, just a longer-lived background task.
 > After this migration, no caller pushes a client-initiated `GetOp`
-> into `ops.get`, so the GC speculative-retry block at
-> `op_state_manager.rs:1912` is provably dead for GET — retirement
-> deferred to a follow-up slice.
+> into `ops.get`, so the GC speculative-retry block was provably dead
+> for GET. Phase 5-final (this slice) retired that block and the
+> `get_retried` per-tick HashMap. The shared retry constants
+> (`ACK_TIMEOUT`, `MAX_SPECULATIVE_PATHS`, `PROGRESS_TIMEOUT`) and the
+> SUBSCRIBE retry block stay because SUBSCRIBE renewals (which run on
+> the legacy state machine — see #3763) still rely on them. The
+> `GetOp::ack_received` and `GetOp::speculative_paths` fields are
+> still maintained by legacy state-machine bookkeeping and exercised
+> by `gc_would_retry`-style unit tests; deleting those is a separate
+> follow-up slice.
 >
 > Sub-operation SUBSCRIBE callers (legacy GET-originator
 > `auto_subscribe_on_get_response` fallback path; PUT/GET task-per-tx

@@ -1482,8 +1482,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     let mut ttl_set = BTreeSet::new();
 
     let mut delayed = vec![];
-    let mut get_retried: std::collections::HashMap<Transaction, usize> =
-        std::collections::HashMap::new();
     let mut subscribe_retried: std::collections::HashMap<Transaction, usize> =
         std::collections::HashMap::new();
     loop {
@@ -1615,21 +1613,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     }
                 }
 
-                // ACK-aware speculative retry for GET operations.
-                //
-                // When a relay forwards a GET request, it sends a ForwardingAck back
-                // to its upstream within milliseconds. If no ACK arrives within 3s,
-                // the downstream peer is likely dead — launch a speculative retry on
-                // a different path (same tx ID).
-                //
-                // If an ACK has been received, the chain is alive — trust it for
-                // PROGRESS_TIMEOUT (7s). If no response arrives within that window,
-                // the chain has stalled and we re-enable speculative retry (#3570).
-                // Without this, a single ACK permanently disables retry, causing
-                // the originator to wait the full OPERATION_TTL (60s) with no recovery.
-                //
-                // Only the originator speculates (max 2 parallel paths). Relay peers
-                // just forward once, so network overhead is bounded.
+                // Shared retry constants for SUBSCRIBE speculative retry below.
+                // (GET speculative retry was retired in #1454 Phase 5-final:
+                // client-initiated GETs now drive on a task-per-tx loop, and
+                // the only legacy writer to `ops.get` is `start_targeted_op`
+                // which sets `auto_fetch=true` so `is_client_initiated()` is
+                // false — no entry in `ops.get` could ever satisfy the GET
+                // retry filter.)
                 const ACK_TIMEOUT: Duration = Duration::from_secs(3);
                 const MAX_SPECULATIVE_PATHS: u8 = 2;
                 /// Time to wait after ForwardingAck before re-enabling retry.
@@ -1638,147 +1628,15 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 /// at 500ms/hop completes in ~2.5s; 7s gives ~3x headroom while
                 /// keeping worst-case stall detection under 10s.
                 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(7);
-                {
-                    // Clean up entries for completed operations
-                    get_retried.retain(|tx, _| ops.get.contains_key(tx));
 
-                    let mut retry_candidates: Vec<Transaction> = Vec::new();
-                    for entry in ops.get.iter() {
-                        let tx = *entry.key();
-                        let get_op = entry.value();
-
-                        // Only the originator speculates — relays just forward and ACK.
-                        if !get_op.is_client_initiated() {
-                            continue;
-                        }
-
-                        // Cap speculative paths to bound network overhead
-                        if get_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
-                            continue;
-                        }
-
-                        let elapsed = tx.elapsed();
-
-                        if get_op.ack_received {
-                            // ACK received — the chain was alive when the relay forwarded.
-                            // Trust it for PROGRESS_TIMEOUT, then re-enable retry if no
-                            // response has arrived (#3570: ForwardingAck retry-disable fix).
-                            if elapsed <= PROGRESS_TIMEOUT {
-                                continue;
-                            }
-                            // Chain has stalled past PROGRESS_TIMEOUT — fall through to retry.
-                            tracing::info!(
-                                %tx,
-                                elapsed_ms = elapsed.as_millis(),
-                                "GET chain stalled after ForwardingAck — re-enabling speculative retry"
-                            );
-                        }
-
-                        // No ACK after ACK_TIMEOUT, or ACK received but chain stalled
-                        // past PROGRESS_TIMEOUT — speculative retry with ±20% jitter
-                        let retry_count = get_retried.get(&tx).copied().unwrap_or(0);
-                        let base = if get_op.ack_received {
-                            // For stalled-after-ACK, use PROGRESS_TIMEOUT as the base
-                            // instead of ACK_TIMEOUT to avoid immediate rapid retries
-                            PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32)
-                        } else {
-                            ACK_TIMEOUT * (retry_count as u32 + 1)
-                        };
-                        // Only consume GlobalRng when elapsed exceeds 80% of base
-                        // (minimum possible jittered threshold). This avoids shifting
-                        // the global RNG state on every GC tick for ops that are
-                        // nowhere near retry time.
-                        let min_jittered = base.mul_f64(0.8);
-                        if elapsed > min_jittered {
-                            let jitter_factor: f64 =
-                                crate::config::GlobalRng::random_range(0.8..=1.2);
-                            let jitter = base.mul_f64(jitter_factor);
-                            if elapsed > jitter {
-                                retry_candidates.push(tx);
-                            }
-                        }
-                    }
-
-                    if !retry_candidates.is_empty() {
-                        // Collect all connected peers for DBF fallback (only when needed)
-                        let all_connected: Vec<_> = ring
-                            .connection_manager
-                            .get_connections_by_location()
-                            .values()
-                            .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
-                            .collect();
-
-                        for tx in retry_candidates {
-                            if let Some((_, get_op)) = ops.get.remove(&tx) {
-                                // Capture the stalled peer's routing info BEFORE retry
-                                // overwrites stats.next_peer (get.rs:1039).
-                                let stalled_peer_info = get_op.failure_routing_info();
-                                let max_htl = ring.max_hops_to_live;
-                                match get_op.retry_with_next_alternative(max_htl, &all_connected)
-                                {
-                                    Ok((mut new_op, msg)) => {
-                                        // Only report routing failure when we found an
-                                        // alternative. In small topologies (e.g., 3 nodes)
-                                        // the "stalled" peer may be the only relay — poisoning
-                                        // its routing score would make all future ops fail.
-                                        if let Some((peer, contract_location)) = stalled_peer_info
-                                        {
-                                            ring.routing_finished(crate::router::RouteEvent {
-                                                peer,
-                                                contract_location,
-                                                outcome: crate::router::RouteOutcome::Failure,
-                                                op_type: Some(crate::node::network_status::OpType::Get),
-                                            });
-                                        }
-                                        let msg = crate::message::NetMessage::from(msg);
-                                        // Track speculative path for ACK-aware retry bounds
-                                        new_op.speculative_paths += 1;
-                                        // Reset ack_received for the new path
-                                        new_op.ack_received = false;
-                                        // Insert op BEFORE sending message to avoid race
-                                        // where the response arrives before the op is stored.
-                                        ops.get.insert(tx, new_op);
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(1),
-                                            event_loop_notifier
-                                                .notifications_sender
-                                                .send(Either::Left(msg)),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {
-                                                // Count the retry now that message was sent
-                                                *get_retried.entry(tx).or_insert(0) += 1;
-                                            }
-                                            Ok(Err(_)) | Err(_) => {
-                                                // Channel closed or timeout — op is already
-                                                // stored, will be retried next tick.
-                                                tracing::warn!(
-                                                    %tx,
-                                                    "Failed to send GET retry message, \
-                                                     will retry next tick"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(get_op) => {
-                                        // No alternatives — put it back for normal timeout
-                                        ops.get.insert(tx, *get_op);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Periodically clean up stale pending_contract_fetches entries.
-                    // Entries older than 2x cooldown are removed to prevent unbounded growth.
-                    if tick_count % 12 == 0 {
-                        let cooldown_ms = crate::operations::update::CONTRACT_FETCH_COOLDOWN_MS;
-                        let now_ms = crate::config::GlobalSimulationTime::read_time_ms();
-                        pending_contract_fetches.retain(|_, ts| {
-                            now_ms.saturating_sub(*ts) < cooldown_ms * 2
-                        });
-                    }
+                // Periodically clean up stale pending_contract_fetches entries.
+                // Entries older than 2x cooldown are removed to prevent unbounded growth.
+                if tick_count % 12 == 0 {
+                    let cooldown_ms = crate::operations::update::CONTRACT_FETCH_COOLDOWN_MS;
+                    let now_ms = crate::config::GlobalSimulationTime::read_time_ms();
+                    pending_contract_fetches.retain(|_, ts| {
+                        now_ms.saturating_sub(*ts) < cooldown_ms * 2
+                    });
                 }
 
                 // ACK-aware speculative retry for SUBSCRIBE operations.
@@ -1958,7 +1816,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     if still_waiting {
                         delayed.push(tx);
                     } else {
-                        get_retried.remove(&tx);
                         subscribe_retried.remove(&tx);
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);

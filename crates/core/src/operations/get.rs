@@ -384,10 +384,17 @@ pub(crate) struct GetOp {
     /// to a non-existent client.
     auto_fetch: bool,
     /// True when a downstream relay has acknowledged forwarding this request.
-    /// Used by the GC task to distinguish "peer is dead" from "peer is working on it".
+    /// Historically used by the GC task to distinguish "peer is dead" from
+    /// "peer is working on it" — that retry block was retired in #1454
+    /// Phase 5-final. The field is still maintained on the legacy state
+    /// machine path and exercised by the `gc_would_retry` helper tests
+    /// (see end of this file) so the bookkeeping is captured if a future
+    /// retry mechanism reuses it. Allow `dead_code` until those tests +
+    /// fields are deleted in a follow-up slice.
+    #[allow(dead_code)]
     pub(crate) ack_received: bool,
-    /// Number of speculative parallel paths launched by the originator's GC task.
-    /// Capped at MAX_SPECULATIVE_PATHS to bound network overhead.
+    /// Number of speculative parallel paths launched by the originator's
+    /// GC task. Same lineage as `ack_received` above.
     pub(crate) speculative_paths: u8,
     /// Whether the client wants contract code in the response.
     /// The node always fetches WASM from the network for internal caching,
