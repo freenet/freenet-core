@@ -24,7 +24,6 @@ flowchart TB
             Update["UpdateOp"]
             Subscribe["SubscribeOp"]
         end
-        SubTracker["SubOperationTracker<br/>(atomicity)"]
         Cleanup["GarbageCleanup<br/>(timeout handling)"]
     end
 
@@ -40,7 +39,6 @@ flowchart TB
     StateMachines -->|"routing"| Ring
     StateMachines -->|"contract ops"| Contracts
     StateMachines -->|"send/recv"| Network
-    OpMgr --> SubTracker
     OpMgr --> Cleanup
 
     style Operations fill:#fdebd0,stroke:#d35400
@@ -305,27 +303,34 @@ Created → Pushed → Under Progress → Completed
 
 ## Sub-Operation Tracking
 
-Composite operations (e.g., PUT with SUBSCRIBE) use parent-child tracking:
+Composite operations (e.g., PUT spawning SUBSCRIBE) identify children
+**structurally**, not via a central tracker. A child transaction is
+created with `Transaction::new_child_of::<MsgType>(&parent_tx)`, which
+sets the parent field at construction. `Transaction::is_sub_operation()`
+returns `true` for any transaction with a parent set, with no DashMap
+lookup required.
 
 ```mermaid
 flowchart TB
     Parent["PUT Operation<br/>(parent)"]
-    Child["SUBSCRIBE Operation<br/>(child)"]
+    Child["SUBSCRIBE Operation<br/>(child via new_child_of)"]
 
     Parent -->|"spawns"| Child
-    Child -->|"notifies completion"| Parent
-    Parent -->|"waits for all children"| Complete["Complete to client"]
+    Child -->|"awaited inline OR fire-and-forget"| Done["Driver publishes<br/>HostResult on its own task"]
 
     style Parent fill:#d4edda,stroke:#28a745
     style Child fill:#cce5ff,stroke:#004085
 ```
 
-**SubOperationTracker methods:**
-- `expect_and_register_sub_operation(parent, child)` - Pre-register child
-- `all_sub_operations_completed(parent)` - Check if ready
-- `sub_operation_failed(child, error)` - Propagate failure
+Each task-per-tx driver owns its own outcome publication
+(`HostResult::Ok` on success, `HostResult::Err` on timeout/error).
+There is no central registry of pending children, no parent-parking
+branch, and no GC parent-propagation block. Failure isolation is the
+driver's responsibility.
 
-**Code reference:** `crates/core/src/node/op_state_manager.rs:61-192`
+**Code reference:** `Transaction::new_child_of` and
+`Transaction::is_sub_operation` in `crates/core/src/message.rs`;
+task-per-tx drivers in `crates/core/src/operations/{put,get,subscribe,update}/op_ctx_task.rs`.
 
 ## Error Handling
 
