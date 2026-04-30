@@ -14,8 +14,9 @@
 # freenet/web (served from https://freenet.org/install.sh). Keep the
 # two in sync. In particular, the service-install prompt below MUST
 # keep its $0 + /dev/tty handling so that `curl | sh` users can
-# answer the prompt - see freenet/web PR #42 for context. A previous
-# fix was already lost once via a bulk resync.
+# answer the prompt - see https://github.com/freenet/web/pull/42 and
+# its companion PR in this repo for context. A previous fix was
+# already lost once via a bulk resync.
 
 set -eu
 
@@ -428,8 +429,9 @@ main() {
     # stdin, $0 is the shell name itself (e.g. "sh", "bash"). In the
     # script-file case we read from stdin as before, so existing
     # automation patterns like `printf 'y\n' | sh install.sh` still work.
-    # The robust way to bypass the prompt in any invocation form is
-    # FREENET_NO_SERVICE=1.
+    # The shell-name allowlist covers shells likely to appear as
+    # `curl ... | <shell>`; users piping to a more exotic shell can fall
+    # back to FREENET_NO_SERVICE=1 to bypass the prompt.
     #
     # `{ true </dev/tty; } 2>/dev/null` is used instead of `[ -r /dev/tty ]`:
     # the access check can succeed even when the process has no
@@ -442,7 +444,7 @@ main() {
         echo ""
         response=""
         case "${0##*/}" in
-            sh|bash|dash|ash|busybox|-sh|-bash|-dash|-ash)
+            sh|bash|dash|ash|zsh|ksh|mksh|pdksh|yash|busybox|-sh|-bash|-dash|-ash|-zsh|-ksh|-mksh|-yash)
                 # Script source is on stdin (`curl | sh` form).
                 if { true </dev/tty; } 2>/dev/null; then
                     printf "Would you like to install Freenet as a system service? [y/N] "
