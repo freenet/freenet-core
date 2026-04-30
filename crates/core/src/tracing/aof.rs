@@ -26,7 +26,14 @@ const EVENT_LOG_HEADER_SIZE: usize = RECORD_LENGTH + EVENT_KIND_LENGTH; // len +
 // surviving record into a new file. This bounds per-pass disk I/O to one
 // segment size rather than full-log size — a busy gateway used to spend
 // ~9 MB/s rewriting the entire surviving log to drop ~1% of records.
-const SEGMENT_INDEX_DIGITS: usize = 6;
+//
+// `SEGMENT_INDEX_DIGITS` is wide enough to represent every `u32` index
+// (`u32::MAX = 4_294_967_295`, 10 digits). The scan filter requires the
+// suffix to be exactly this many ASCII digits, so a narrower width would
+// silently drop newly-created segments once the index passed the boundary
+// — a long-running gateway would lose data. Pad to the full u32 width and
+// the scanner stays consistent across the whole index range.
+const SEGMENT_INDEX_DIGITS: usize = 10;
 
 #[cfg(not(test))]
 pub(super) const MAX_RECORDS_PER_SEGMENT: usize = 5_000;
@@ -255,9 +262,19 @@ impl LogFile {
     }
 
     /// If a legacy single-file event log exists at `base_path`, migrate it
-    /// into a segment file so the segment-aware open path can ingest it.
-    /// Empty stubs (e.g. created by `config.rs` on first-time setup) are
-    /// silently removed instead of taking up a segment slot.
+    /// into segment 0 so the segment-aware open path can ingest it. Empty
+    /// stubs (e.g. created by `config.rs` on first-time setup) are silently
+    /// removed instead of taking up a segment slot.
+    ///
+    /// If `base_path` exists *and* one or more `<base>.NNNNNN` segments are
+    /// already present we refuse with an error instead of guessing the
+    /// chronological ordering. The new code never writes to `base_path`, so
+    /// the only realistic way to land in this state is a partial migration
+    /// from a prior crash, where the legacy data is older than the
+    /// segments. Renaming the legacy file to a fresh index would surface
+    /// it as the newest segment, corrupting downstream tooling that
+    /// assumes filename order matches chronological order. Refusing gives
+    /// the operator a chance to inspect and merge by hand.
     async fn migrate_legacy(base_path: &Path) -> io::Result<()> {
         let metadata = match tokio::fs::metadata(base_path).await {
             Ok(m) => m,
@@ -271,12 +288,16 @@ impl LogFile {
             tokio::fs::remove_file(base_path).await.ok();
             return Ok(());
         }
-        // Place the migrated content after any pre-existing segments so its
-        // records are treated as the most recent. This only matters in the
-        // unusual case where a partial migration left both formats in place.
         let existing = Self::scan_segment_indices(base_path)?;
-        let next_index = existing.last().map(|i| i + 1).unwrap_or(0);
-        let target = Self::segment_path(base_path, next_index);
+        if !existing.is_empty() {
+            return Err(io::Error::other(format!(
+                "legacy event log {} exists alongside segment files {:?}; refusing to \
+                 guess chronological order — please archive or remove one before restart",
+                base_path.display(),
+                existing,
+            )));
+        }
+        let target = Self::segment_path(base_path, 0);
         tokio::fs::rename(base_path, &target).await?;
         tracing::info!(
             from = %base_path.display(),
@@ -384,10 +405,30 @@ impl LogFile {
 
     /// Close the active segment, open the next one, and drop the oldest
     /// segments while the on-disk record count exceeds the configured cap.
-    /// Holding `FILE_LOCK` here prevents readers (`read_all_events`,
-    /// `get_router_events`) from observing a half-rotated state.
-    pub(super) async fn rotate_segment(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Holding `FILE_LOCK` here serializes rotation against
+    /// `read_all_events` and `get_router_events` (which both take the same
+    /// lock), so reader paths never observe a half-rotated state. The lock
+    /// is *not* held across the unlocked `update_recs` call in
+    /// `persist_log` — readers inspect the filesystem rather than in-memory
+    /// state, so the brief gap between the locked `write_all` and the
+    /// locked `rotate_segment` is benign. The `NotFound` arms in the read
+    /// paths are defensive (they cover externally-deleted segments, e.g.
+    /// an operator pruning files) rather than a guard against a real
+    /// rotation race.
+    pub(super) async fn rotate_segment(&mut self) -> io::Result<()> {
         let _guard = FILE_LOCK.lock().await;
+
+        // Compute the next index BEFORE closing the active file so an
+        // overflow returns Err with `self.file` still wired up — otherwise
+        // a subsequent `persist_log` would unwrap a `None` and crash.
+        let next_index = match self.segments.back().map(|s| s.index.checked_add(1)) {
+            Some(Some(next)) => next,
+            Some(None) => {
+                return Err(io::Error::other("event log segment index overflowed u32"));
+            }
+            None => 0,
+        };
+
         if let Some(reader) = self.file.take() {
             let file = reader.into_inner();
             if let Err(e) = file.sync_all().await {
@@ -396,13 +437,6 @@ impl LogFile {
             // Drop closes the file.
         }
 
-        let next_index = match self.segments.back().map(|s| s.index.checked_add(1)) {
-            Some(Some(next)) => next,
-            Some(None) => {
-                return Err(io::Error::other("event log segment index overflowed u32").into());
-            }
-            None => 0,
-        };
         let next_path = Self::segment_path(&self.base_path, next_index);
         let new_file = OpenOptions::new()
             .create(true)
@@ -416,6 +450,9 @@ impl LogFile {
             record_count: 0,
         });
 
+        // The drop loop preserves `segments.len() > 1` so we never unlink
+        // the active segment — even if the cap is configured below
+        // `max_records_per_segment`, the active segment survives.
         while self.num_recs > self.max_log_records && self.segments.len() > 1 {
             let dropped = self.segments.pop_front().expect("checked non-empty");
             let dropped_path = Self::segment_path(&self.base_path, dropped.index);
@@ -430,7 +467,7 @@ impl LogFile {
                     // Re-add the segment to keep accounting consistent and
                     // surface the error to the caller.
                     self.segments.push_front(dropped);
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         }
@@ -438,6 +475,9 @@ impl LogFile {
     }
 
     /// Read all events from the segment-based AOF (for event aggregation).
+    /// Reads any pre-migration legacy single-file log first (so offline
+    /// tooling like `analyze_event_logs` keeps working against an
+    /// untouched legacy log) followed by every segment in age order.
     pub async fn read_all_events(event_log_path: &Path) -> anyhow::Result<Vec<NetLogMessage>> {
         let _guard = FILE_LOCK.lock().await;
         let new_records_ts = NEW_RECORDS_TS
@@ -449,8 +489,21 @@ impl LogFile {
             })
             .unwrap_or(0);
 
-        let indices = Self::scan_segment_indices(event_log_path).unwrap_or_default();
+        let indices = Self::scan_segment_indices(event_log_path)?;
         let mut buffers: Vec<Vec<u8>> = Vec::new();
+
+        // Read the pre-migration legacy log first if present. Once
+        // `LogFile::open` runs against the path the legacy file is
+        // renamed to segment 0, but standalone consumers of this API
+        // (offline aggregator, ad-hoc analysis scripts) may invoke it
+        // before any writer has had a chance to migrate.
+        if indices.is_empty() {
+            if let Ok(file) = OpenOptions::new().read(true).open(event_log_path).await {
+                let mut reader = BufReader::new(file);
+                Self::read_record_buffers(&mut reader, &mut buffers, None).await?;
+            }
+        }
+
         for idx in indices {
             let path = Self::segment_path(event_log_path, idx);
             match OpenOptions::new().read(true).open(&path).await {
@@ -459,7 +512,9 @@ impl LogFile {
                     Self::read_record_buffers(&mut reader, &mut buffers, None).await?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    // Segment was rotated out concurrently — skip it.
+                    // Segment was unlinked between the directory scan and
+                    // open (operator pruning, external tool). Defensive —
+                    // FILE_LOCK already serializes our own rotation.
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -538,7 +593,7 @@ impl LogFile {
             .expect("should be older than unix epoch")
             .as_secs() as i64;
 
-        let indices = Self::scan_segment_indices(event_log_path).unwrap_or_default();
+        let indices = Self::scan_segment_indices(event_log_path)?;
         let mut route_buffers: Vec<Vec<u8>> = Vec::new();
         let mut visited: usize = 0;
         'segments: for idx in indices {
@@ -1074,6 +1129,278 @@ mod tests {
             segment_zero.exists(),
             "fresh segment 0 should be created after stub removal",
         );
+        Ok(())
+    }
+
+    /// `read_all_events` must concatenate records across segments in age
+    /// order — the offline aggregator and `state_verifier` both rely on
+    /// this. Push enough records to span multiple segments without
+    /// triggering a drop, then assert the count and ordering survive a
+    /// round-trip.
+    ///
+    /// `EventKind`'s arbitrary derive can occasionally generate values
+    /// that don't bincode-roundtrip cleanly (a pre-existing quirk that
+    /// also affects existing route-only tests, but those only count
+    /// `EventKind::Route` so non-route deserialization failures are
+    /// invisible). We pre-validate each generated message here so the
+    /// test asserts a precise count against what's actually round-trippable
+    /// without papering over real read-path bugs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_all_events_spans_segments() -> anyhow::Result<()> {
+        ensure_records_ts();
+        let temp_dir = tempfile::tempdir()?;
+        let log_path = temp_dir.path().join("event_log");
+
+        // Two and a half segments' worth, well below MAX_LOG_RECORDS so no
+        // drops happen and we can assert the exact event count.
+        const TEST_LOGS: usize = MAX_RECORDS_PER_SEGMENT * 2 + BATCH_SIZE * 10;
+        let bytes = crate::util::test::random_bytes_2mb();
+        let mut unstructured = arbitrary::Unstructured::new(&bytes);
+        let mut transactions = Vec::with_capacity(TEST_LOGS);
+        let mut peers = Vec::with_capacity(TEST_LOGS);
+        for _ in 0..TEST_LOGS {
+            transactions.push(unstructured.arbitrary::<Transaction>()?);
+            peers.push(PeerId::random());
+        }
+        let mut events = Vec::with_capacity(TEST_LOGS);
+        for i in 0..TEST_LOGS {
+            let kind: EventKind = unstructured.arbitrary()?;
+            events.push(NetEventLog {
+                tx: &transactions[i],
+                peer_id: peers[i].clone(),
+                kind,
+            });
+        }
+        let messages: Vec<NetLogMessage> =
+            NetLogMessage::to_log_message(either::Either::Right(events)).collect();
+        let roundtrippable: Vec<NetLogMessage> = messages
+            .iter()
+            .filter(|m| {
+                bincode::serialize(m)
+                    .ok()
+                    .and_then(|bytes| bincode::deserialize::<NetLogMessage>(&bytes).ok())
+                    .is_some()
+            })
+            .cloned()
+            .collect();
+        let expected = roundtrippable.len();
+        assert!(
+            expected >= TEST_LOGS - 100,
+            "lost too many records to bincode roundtrip ({}/{TEST_LOGS}) — \
+             pre-existing arbitrary-EventKind quirk has gotten worse",
+            expected
+        );
+
+        {
+            let mut log = LogFile::open(&log_path).await?;
+            for msg in messages {
+                log.persist_log(msg).await;
+            }
+        }
+
+        let read = LogFile::read_all_events(&log_path).await?;
+        assert_eq!(read.len(), expected);
+        // Ordering: records must come out in the same order they were
+        // appended, segment by segment.
+        for (i, msg) in read.iter().enumerate() {
+            assert_eq!(
+                msg.tx, roundtrippable[i].tx,
+                "record {i} surfaced out of segment-append order",
+            );
+        }
+        Ok(())
+    }
+
+    /// `read_all_events` against an untouched legacy single-file log
+    /// (no `LogFile::open` has migrated it yet, e.g. an offline
+    /// aggregator running before any node restart) must still surface
+    /// every record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_all_events_reads_legacy_without_migration() -> anyhow::Result<()> {
+        ensure_records_ts();
+        let temp_dir = tempfile::tempdir()?;
+        let log_path = temp_dir.path().join("event_log");
+
+        const LEGACY_LOGS: usize = BATCH_SIZE * 4;
+        let bytes = crate::util::test::random_bytes_2mb();
+        let mut unstructured = arbitrary::Unstructured::new(&bytes);
+        let mut transactions = Vec::with_capacity(LEGACY_LOGS);
+        let mut peers = Vec::with_capacity(LEGACY_LOGS);
+        for _ in 0..LEGACY_LOGS {
+            transactions.push(unstructured.arbitrary::<Transaction>()?);
+            peers.push(PeerId::random());
+        }
+        let mut events = Vec::with_capacity(LEGACY_LOGS);
+        for i in 0..LEGACY_LOGS {
+            let kind: EventKind = unstructured.arbitrary()?;
+            events.push(NetEventLog {
+                tx: &transactions[i],
+                peer_id: peers[i].clone(),
+                kind,
+            });
+        }
+        let log_messages: Vec<_> =
+            NetLogMessage::to_log_message(either::Either::Right(events)).collect();
+        let roundtrippable_count = log_messages
+            .iter()
+            .filter(|m| {
+                bincode::serialize(m)
+                    .ok()
+                    .and_then(|b| bincode::deserialize::<NetLogMessage>(&b).ok())
+                    .is_some()
+            })
+            .count();
+        let mut payload = Vec::new();
+        for msg in &log_messages {
+            let (header, mut serialized) = LogFile::encode_log(msg).expect("encode");
+            payload.extend_from_slice(&header);
+            payload.append(&mut serialized);
+        }
+        std::fs::write(&log_path, &payload)?;
+        // Deliberately do NOT call LogFile::open — exercise the
+        // standalone-reader path.
+
+        let read = LogFile::read_all_events(&log_path).await?;
+        assert_eq!(read.len(), roundtrippable_count);
+        Ok(())
+    }
+
+    /// A torn record may stop in the middle of the header, not just after
+    /// it. The repair pass must handle both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn partial_header_is_truncated_on_open() -> anyhow::Result<()> {
+        ensure_records_ts();
+        let temp_dir = tempfile::tempdir()?;
+        let log_path = temp_dir.path().join("event_log");
+
+        const CLEAN_LOGS: usize = BATCH_SIZE * 2;
+        let bytes = crate::util::test::random_bytes_2mb();
+        let mut unstructured = arbitrary::Unstructured::new(&bytes);
+        let (transactions, peers, kinds) = build_events(&mut unstructured, CLEAN_LOGS)?;
+        {
+            let mut log = LogFile::open(&log_path).await?;
+            let mut events = Vec::with_capacity(CLEAN_LOGS);
+            for i in 0..CLEAN_LOGS {
+                events.push(NetEventLog {
+                    tx: &transactions[i],
+                    peer_id: peers[i].clone(),
+                    kind: kinds[i].clone(),
+                });
+            }
+            for msg in NetLogMessage::to_log_message(either::Either::Right(events)) {
+                log.persist_log(msg).await;
+            }
+        }
+
+        let active = LogFile::segment_path(&log_path, 0);
+        let pre_size = std::fs::metadata(&active)?.len();
+
+        // Append only 3 of the 5 header bytes — a power-loss in the
+        // middle of the header itself.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&active)?;
+            f.write_all(&[0u8, 0u8, 0u8])?;
+            f.sync_all()?;
+        }
+        assert_eq!(std::fs::metadata(&active)?.len(), pre_size + 3);
+
+        let log = LogFile::open(&log_path).await?;
+        assert_eq!(log.num_recs, CLEAN_LOGS);
+        assert_eq!(
+            std::fs::metadata(&active)?.len(),
+            pre_size,
+            "partial header bytes should be truncated back to the last good record",
+        );
+        Ok(())
+    }
+
+    /// A zero-byte segment file (e.g. a crash between
+    /// `OpenOptions::create` and the first append during rotation) must
+    /// be tolerated on reopen — count it as zero records, treat it as the
+    /// active segment, and let the next append land there normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zero_byte_stray_segment_is_recovered() -> anyhow::Result<()> {
+        ensure_records_ts();
+        let temp_dir = tempfile::tempdir()?;
+        let log_path = temp_dir.path().join("event_log");
+
+        // Populate segment 0 with a couple of clean batches.
+        const FIRST_BATCH: usize = BATCH_SIZE * 2;
+        let bytes = crate::util::test::random_bytes_2mb();
+        let mut unstructured = arbitrary::Unstructured::new(&bytes);
+        let (transactions, peers, kinds) = build_events(&mut unstructured, FIRST_BATCH)?;
+        {
+            let mut log = LogFile::open(&log_path).await?;
+            let mut events = Vec::with_capacity(FIRST_BATCH);
+            for i in 0..FIRST_BATCH {
+                events.push(NetEventLog {
+                    tx: &transactions[i],
+                    peer_id: peers[i].clone(),
+                    kind: kinds[i].clone(),
+                });
+            }
+            for msg in NetLogMessage::to_log_message(either::Either::Right(events)) {
+                log.persist_log(msg).await;
+            }
+        }
+
+        // Simulate a mid-rotation crash: a fresh empty `<base>.000001`
+        // exists alongside the populated `<base>.000000`.
+        let stray = LogFile::segment_path(&log_path, 1);
+        std::fs::write(&stray, [])?;
+
+        let mut log = LogFile::open(&log_path).await?;
+        assert_eq!(log.num_recs, FIRST_BATCH);
+        assert_eq!(log.segments.len(), 2);
+        assert_eq!(log.segments.back().unwrap().index, 1);
+        assert_eq!(log.segments.back().unwrap().record_count, 0);
+
+        // Subsequent writes should land in the stray (now-active) segment.
+        let (more_tx, more_peers, more_kinds) = build_events(&mut unstructured, BATCH_SIZE)?;
+        let mut events = Vec::with_capacity(BATCH_SIZE);
+        for i in 0..BATCH_SIZE {
+            events.push(NetEventLog {
+                tx: &more_tx[i],
+                peer_id: more_peers[i].clone(),
+                kind: more_kinds[i].clone(),
+            });
+        }
+        for msg in NetLogMessage::to_log_message(either::Either::Right(events)) {
+            log.persist_log(msg).await;
+        }
+        assert!(std::fs::metadata(&stray)?.len() > 0);
+        assert_eq!(log.num_recs, FIRST_BATCH + BATCH_SIZE);
+        Ok(())
+    }
+
+    /// `migrate_legacy` must refuse — not silently corrupt — when both a
+    /// legacy single-file log and segment files exist at the same base
+    /// path. The realistic cause is a partial migration crash; we choose
+    /// to surface the conflict to the operator instead of guessing the
+    /// chronological ordering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn migrate_refuses_when_legacy_and_segments_coexist() -> anyhow::Result<()> {
+        ensure_records_ts();
+        let temp_dir = tempfile::tempdir()?;
+        let log_path = temp_dir.path().join("event_log");
+
+        // Create a non-empty legacy file and a sibling segment.
+        std::fs::write(&log_path, b"not really a record but enough to be non-empty")?;
+        let segment = LogFile::segment_path(&log_path, 0);
+        std::fs::write(&segment, [])?;
+
+        let result = LogFile::open(&log_path).await;
+        assert!(
+            result.is_err(),
+            "expected open to refuse with both legacy and segment files present",
+        );
+        // Both files must be untouched so the operator can resolve.
+        assert!(
+            log_path.exists(),
+            "legacy file should not be renamed on refusal"
+        );
+        assert!(segment.exists(), "existing segment must be left in place");
         Ok(())
     }
 }
