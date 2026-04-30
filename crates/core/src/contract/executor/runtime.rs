@@ -3478,11 +3478,35 @@ impl Executor<Runtime> {
         if self.mode == OperationMode::Local {
             return Ok(());
         }
-        let request = SubscribeContract {
-            instance_id: *key.id(),
-        };
-        let _sub: operations::subscribe::SubscribeResult = self.op_request(request).await?;
-        Ok(())
+        // Bypass the legacy `op_request` mediator path entirely (#1454
+        // SUBSCRIBE executor migration): driver delivers the resolved
+        // outcome directly through its return value. The executor was
+        // the last legacy writer into `ops.subscribe` for client-style
+        // SUBSCRIBE — once this migrates, the SUBSCRIBE GC retry block
+        // becomes provably dead (mirrors GET phase 5-final pattern).
+        let op_manager = self
+            .op_manager
+            .as_ref()
+            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("missing op_manager")))?;
+        let executor_tx = crate::message::Transaction::new::<operations::subscribe::SubscribeMsg>();
+        const SUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        match tokio::time::timeout(
+            SUBSCRIBE_TIMEOUT,
+            operations::subscribe::run_executor_subscribe(
+                op_manager.clone(),
+                *key.id(),
+                executor_tx,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(ExecutorError::other(err)),
+            Err(_) => Err(ExecutorError::other(anyhow::anyhow!(
+                "executor subscribe timed out after {}s",
+                SUBSCRIBE_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     #[inline]

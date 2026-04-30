@@ -2433,10 +2433,14 @@ pub async fn subscribe(
 /// [`crate::operations::subscribe::start_client_subscribe`] rather than going
 /// through the legacy `request_subscribe` + `handle_op_result` re-entry loop.
 ///
-/// The executor/WASM-initiated path
-/// (`contract::executor::SubscribeContract::resume_op`) still calls
-/// `subscribe::request_subscribe` directly and bypasses this function,
-/// so it continues on the legacy path unchanged.
+/// The executor/WASM-initiated path (`executor::subscribe`) now goes
+/// through the task-per-tx executor driver
+/// (`subscribe::run_executor_subscribe`) — same retry loop as
+/// client-initiated subscribe, with the outcome returned to the
+/// executor as `Result<(), OpError>` rather than published via
+/// `result_router_tx` (the executor is an internal caller with no
+/// client waiter). Bypasses the `op_request` mediator entirely
+/// (mirrors `local_state_or_from_network` for GET).
 ///
 /// The renewal-initiated path (`ring::connection_maintenance`) now goes
 /// through the task-per-tx renewal driver (`subscribe::run_renewal_subscribe`)

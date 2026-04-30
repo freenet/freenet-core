@@ -306,6 +306,63 @@ fn classify_renewal_result(result: Result<DriverOutcome, OpError>) -> RenewalOut
     }
 }
 
+/// Drive an executor-initiated SUBSCRIBE (`SubscribeContract` /
+/// `executor::subscribe`) to completion and return the outcome directly
+/// to the caller via the function return value.
+///
+/// The executor's `subscribe()` (in `contract::executor::runtime`) calls
+/// this in place of the legacy `op_request(SubscribeContract)` →
+/// `notify_op_change` mediator path. Like
+/// [`run_renewal_subscribe`], delivery happens through the return type
+/// instead of through `result_router_tx` / `SessionActor`: the executor
+/// is an internal caller with no client waiter to publish to.
+///
+/// Reuses [`drive_client_subscribe_inner`] with `is_renewal=false` so
+/// the wire request, retry loop, and local-completion path are
+/// identical to the client-initiated driver. The responder sends full
+/// state because executor auto-subscribes are NOT renewals — the
+/// executor invokes them when a contract is first being put / updated
+/// and needs the responder to acknowledge with state.
+///
+/// # Returns
+///
+/// `Ok(())` on a successful subscribe (network or local-completion).
+/// `Err(OpError)` on exhaustion / infrastructure failure. The executor
+/// wraps all errors into `ExecutorError::other(...)`.
+pub(crate) async fn run_executor_subscribe(
+    op_manager: Arc<OpManager>,
+    instance_id: ContractInstanceId,
+    executor_tx: Transaction,
+) -> Result<(), OpError> {
+    let result = drive_client_subscribe_inner(
+        &op_manager,
+        instance_id,
+        executor_tx,
+        /* is_renewal */ false,
+    )
+    .await;
+    classify_executor_subscribe_result(result)
+}
+
+/// Pure classifier mapping `drive_client_subscribe_inner`'s result into
+/// `Result<(), OpError>` for executor-side delivery. Factored out so
+/// the conversion has direct unit-test coverage.
+fn classify_executor_subscribe_result(
+    result: Result<DriverOutcome, OpError>,
+) -> Result<(), OpError> {
+    match result {
+        Ok(DriverOutcome::Publish(Ok(_))) | Ok(DriverOutcome::SkipAlreadyDelivered) => Ok(()),
+        Ok(DriverOutcome::Publish(Err(host_err))) => {
+            // Wire-level failure (NotFound / driver gave up). Surface as
+            // a `NotificationChannelError` shape so the existing
+            // `ExecutorError::other` wrapping at the call site
+            // preserves the error text.
+            Err(OpError::NotificationChannelError(host_err.to_string()))
+        }
+        Ok(DriverOutcome::InfrastructureError(err)) | Err(err) => Err(err),
+    }
+}
+
 /// Outcome of the driver, carrying an explicit signal for "local completion
 /// already published to the router, no follow-up `result_router_tx` send
 /// needed". Using an enum here instead of piggybacking on `OpManager::is_completed`
@@ -2146,6 +2203,76 @@ mod tests {
         assert!(matches!(
             classify_renewal_result(result),
             RenewalOutcome::Failed { .. }
+        ));
+    }
+
+    // ── classify_executor_subscribe_result tests (#1454 SUBSCRIBE
+    //    executor migration) ───────────────────────────────────────────
+    //
+    // Executor auto-subscribe delivers Result<(), OpError> directly.
+    // These pin the mapping so a future `OpError` / `DriverOutcome`
+    // shape change can't silently shift the executor's success
+    // criterion.
+
+    #[test]
+    fn classify_executor_subscribe_publish_ok_is_ok() {
+        use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([8u8; 32]),
+            CodeHash::new([9u8; 32]),
+        );
+        let result = Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+            ContractResponse::SubscribeResponse {
+                key,
+                subscribed: true,
+            },
+        ))));
+        assert!(classify_executor_subscribe_result(result).is_ok());
+    }
+
+    #[test]
+    fn classify_executor_subscribe_skip_already_delivered_is_ok() {
+        let result = Ok(DriverOutcome::SkipAlreadyDelivered);
+        assert!(classify_executor_subscribe_result(result).is_ok());
+    }
+
+    #[test]
+    fn classify_executor_subscribe_publish_err_is_err() {
+        let host_err: freenet_stdlib::client_api::ClientError =
+            freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: "downstream peer rejected".into(),
+            }
+            .into();
+        let result = Ok(DriverOutcome::Publish(Err(host_err)));
+        match classify_executor_subscribe_result(result) {
+            Err(OpError::NotificationChannelError(reason)) => {
+                assert!(
+                    reason.contains("downstream peer rejected"),
+                    "reason should include host-error cause; got: {reason}"
+                );
+            }
+            other => panic!("expected NotificationChannelError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_executor_subscribe_infrastructure_error_is_err() {
+        let result = Ok(DriverOutcome::InfrastructureError(
+            OpError::NotificationError,
+        ));
+        assert!(matches!(
+            classify_executor_subscribe_result(result),
+            Err(OpError::NotificationError)
+        ));
+    }
+
+    #[test]
+    fn classify_executor_subscribe_outer_err_propagates() {
+        let result: Result<DriverOutcome, OpError> = Err(OpError::UnexpectedOpState);
+        assert!(matches!(
+            classify_executor_subscribe_result(result),
+            Err(OpError::UnexpectedOpState)
         ));
     }
 }

@@ -60,9 +60,15 @@ paths:
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
 > `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`
 > (gated on `source_addr.is_some()` AND `!has_subscribe_op(id)`);
-> executor auto-subscribe, GC-spawned retries that pre-register a
-> `SubscribeOp`, `SubscribeMsg::Unsubscribe`, and
-> `SubscribeMsg::ForwardingAck` all stay on legacy. Renewals were
+> GC-spawned retries that pre-register a `SubscribeOp`,
+> `SubscribeMsg::Unsubscribe`, and `SubscribeMsg::ForwardingAck` all
+> stay on legacy. Executor auto-subscribe (the executor's
+> `SubscribeContract::resume_op` adapter) was the last legacy
+> originator-side writer into `ops.subscribe`; it has been migrated to
+> `subscribe::run_executor_subscribe` (reuses
+> `drive_client_subscribe_inner` with `is_renewal=false`, returns
+> `Result<(), OpError>` to the executor, bypasses the `op_request`
+> mediator path entirely). Renewals were
 > previously routed to legacy at this dispatch site so the relay
 > would emit `ForwardingAck` back to the renewal originator (the
 > originator's GC retry timer used `ack_received` for retry-base
@@ -129,13 +135,16 @@ paths:
 > `GetOp::speculative_paths` fields, and the 11 unit tests that
 > simulated the GC retry decision. The shared retry constants
 > (`ACK_TIMEOUT`, `MAX_SPECULATIVE_PATHS`, `PROGRESS_TIMEOUT`) and the
-> SUBSCRIBE retry block stay because the executor auto-subscribe
-> path and other legacy intermediate-peer SUBSCRIBE writers still
-> push `SubscribeOp`s into `ops.subscribe` that need GC retry
-> coverage. Renewals previously also wrote here, but the SUBSCRIBE
-> renewal migration moved them onto the task-per-tx driver — that
-> writer can be retired once the executor auto-subscribe path
-> follows.
+> SUBSCRIBE retry block stay because legacy intermediate-peer
+> SUBSCRIBE writers (state pushed by `subscribe::process_message` on
+> relay hops) still produce `SubscribeOp`s in `ops.subscribe` that
+> need GC retry coverage. Renewals and executor auto-subscribe were
+> previously also originator-side writers; both have now been
+> migrated to the task-per-tx driver. Retiring the GC retry block
+> requires either migrating the relay-side push-into-`ops.subscribe`
+> to task-per-tx local state OR proving the legacy state-machine
+> entries are short-lived enough that the GC block is dead in
+> practice.
 > `GetMsg::ForwardingAck` survives as a wire variant + telemetry hook
 > (#3570 diagnostics) but its handler now returns the operation
 > unchanged.

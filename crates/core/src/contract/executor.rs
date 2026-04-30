@@ -695,24 +695,11 @@ where
     ) -> impl Future<Output = Result<(), OpError>> + Send;
 }
 
-#[allow(unused)]
-struct SubscribeContract {
-    instance_id: ContractInstanceId,
-}
-
-impl ComposeNetworkMessage<operations::subscribe::SubscribeOp> for SubscribeContract {
-    fn initiate_op(self, _op_manager: &OpManager) -> operations::subscribe::SubscribeOp {
-        // is_renewal: false - client-initiated subscriptions are always new
-        operations::subscribe::start_op(self.instance_id, false)
-    }
-
-    async fn resume_op(
-        op: operations::subscribe::SubscribeOp,
-        op_manager: &OpManager,
-    ) -> Result<(), OpError> {
-        operations::subscribe::request_subscribe(op_manager, op).await
-    }
-}
+// `SubscribeContract` was the legacy `ComposeNetworkMessage` adapter
+// for executor auto-subscribe. Retired by #1454: `executor::subscribe`
+// now bypasses the `op_request` mediator path and calls
+// `subscribe::run_executor_subscribe` directly (mirrors
+// `local_state_or_from_network` for GET).
 
 struct UpdateContract {
     key: ContractKey,

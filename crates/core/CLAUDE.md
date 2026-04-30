@@ -90,8 +90,10 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
     driver with `is_renewal=true`, returns the outcome to the renewal
     task instead of through `result_router_tx`). PUT sub-op subscribes
     are dispatched via `subscribe::run_client_subscribe`. Executor
-    auto-subscribe paths, `Unsubscribe`, and `ForwardingAck` still run
-    on the legacy state machine.
+    auto-subscribe migrated to `subscribe::run_executor_subscribe`
+    (returns `Result<(), OpError>` directly; bypasses the `op_request`
+    mediator). `Unsubscribe` and `ForwardingAck` still run on the
+    legacy state machine.
 ```
 
 ## Module Map
