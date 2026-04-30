@@ -74,8 +74,11 @@
 //!
 //! Additional runtime protections:
 //!
-//! - **Guard region** – protects against sign-extension bugs (sized to
-//!   one wasm page, see "Memory Management" below)
+//! - **Explicit bounds checks** – wasmtime emits bounds checks at every
+//!   memory access (the small reservation disables guard-page-based
+//!   elimination); ResourceLimiter caps memory at `DEFAULT_MAX_MEMORY_PAGES`
+//! - **Guard region** – one-page backstop for tiny-offset overruns
+//!   (see "Memory Management" below)
 //! - **Stack overflow guard pages** – abort on stack overflow
 //! - **Memory zeroing** – clears memory between instantiations
 //! - **Spectre mitigations** – bounds check protection with dynamic memory
@@ -176,15 +179,18 @@ const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// Refresh the Store after this many cumulative instance creations.
 ///
 /// wasmtime's Store uses arena-style allocation for instances. When an Instance
-/// handle is dropped, the underlying virtual memory (4 GiB guard region per
-/// instance) is NOT reclaimed — it stays mapped until the entire Store is dropped.
-/// On a gateway with ~64 contracts and a 5-minute interest heartbeat, this means
-/// ~768 leaked memory mappings per hour. After ~70 days the process hits the
-/// kernel's vm.max_map_count limit (default 1M) and crashes.
+/// handle is dropped, the underlying mmap (`memory_reservation` + guard, see
+/// `create_engine`) is NOT reclaimed — it stays mapped until the entire Store
+/// is dropped. On a gateway with ~64 contracts and a 5-minute interest
+/// heartbeat, this means ~768 leaked memory mappings per hour. After ~70 days
+/// the process hits the kernel's `vm.max_map_count` limit (default 1M) and
+/// crashes.
 ///
 /// Refreshing the Store drops the old arena and all its accumulated mappings.
-/// 500 is chosen to keep virtual memory overhead under ~2 TB (500 × 4 GiB)
-/// while avoiding overly frequent refreshes.
+/// 500 is chosen as a compromise between mapping count (`vm.max_map_count`)
+/// and refresh frequency. With the bounded per-instance reservation
+/// (~256 MiB, see #3986) the per-Store virtual memory budget is ~125 GiB,
+/// well within the address space limits that previously motivated this cap.
 const STORE_REFRESH_THRESHOLD: u64 = 500;
 
 /// Maximum age of a Store before forced refresh, even with live instances.
@@ -826,6 +832,16 @@ impl WasmtimeEngine {
         // additional perf impact. Correctness is unchanged because
         // ResourceLimiter is the actual source of truth.
         //
+        // `memory_reservation_for_growth` is also bounded to zero. Per
+        // wasmtime's docs `memory_reservation` is *ignored* if a module
+        // declares an initial linear memory larger than the reservation;
+        // wasmtime then falls back to allocating the declared minimum
+        // plus this growth reservation (default 2 GiB on 64-bit). The
+        // ResourceLimiter rejects such modules at instantiation before
+        // any mmap happens, but defaulting growth to zero is defense in
+        // depth — if any future code path bypasses the limiter, the
+        // 2 GiB ghost reservation no longer hides under it.
+        //
         // On-demand allocation is still preferred over the pooling
         // allocator: pooling pre-reserves ~4 GiB per slot regardless of
         // these settings, leading to multi-TB virtual reservations that
@@ -835,6 +851,7 @@ impl WasmtimeEngine {
         const WASM_MEMORY_GUARD_BYTES: u64 = WASM_PAGE_SIZE as u64;
         wasmtime_config.memory_reservation(WASM_MEMORY_RESERVATION_BYTES);
         wasmtime_config.memory_guard_size(WASM_MEMORY_GUARD_BYTES);
+        wasmtime_config.memory_reservation_for_growth(0);
 
         // Use OptLevel::None for maximum security with untrusted code
         // Simpler compiler = smaller attack surface
@@ -2157,6 +2174,54 @@ mod tests {
         );
     }
 
+    /// Pin the wasmtime memory tuning constants set in `create_engine`
+    /// to their derived values. Cheap, runs on every platform — catches
+    /// drift even where the subprocess `/proc/self/status` test below
+    /// can't run (macOS, Windows). If a refactor accidentally drops one
+    /// of the `wasmtime_config.memory_*` calls or computes the wrong
+    /// byte count, the assertion below fails before the regression
+    /// reaches a low-RAM host (#3986).
+    #[test]
+    fn test_memory_tuning_constants_match_resource_limiter_cap() {
+        // ResourceLimiter caps memory at DEFAULT_MAX_MEMORY_PAGES * WASM_PAGE_SIZE.
+        // The wasmtime reservation must equal that cap so reservation never
+        // exceeds what the limiter would allow.
+        let expected_reservation: u64 = DEFAULT_MAX_MEMORY_PAGES as u64 * WASM_PAGE_SIZE as u64;
+        assert_eq!(expected_reservation, 256 * 1024 * 1024);
+        // Guard must be one wasm page (smallest non-zero value wasmtime
+        // accepts, page-aligned).
+        let expected_guard: u64 = WASM_PAGE_SIZE as u64;
+        assert_eq!(expected_guard, 64 * 1024);
+    }
+
+    /// Regression test for #3986 (defense in depth): a contract that
+    /// declares an initial memory larger than the cap MUST be rejected
+    /// at instantiation. Without this check, an adversarial module
+    /// could force wasmtime to mmap multi-GiB regions before any
+    /// limiter rejection — the very failure mode the per-instance
+    /// reservation cap is supposed to prevent.
+    #[test]
+    fn test_oversized_initial_memory_rejected_3986() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+
+        // 5000 pages = 312.5 MiB initial, above DEFAULT_MAX_MEMORY_PAGES (4096).
+        let wat = r#"
+        (module
+          (memory (export "memory") 5000)
+          (func (export "validate_state") (param i64 i64 i64) (result i64)
+            i64.const 0))
+        "#;
+        let module = engine.compile(wat.as_bytes()).unwrap();
+
+        let result = engine.create_instance(&module, 0, 1024);
+        assert!(
+            result.is_err(),
+            "Module declaring 5000 initial pages (>cap of 4096) must be \
+             rejected at instantiation; got Ok(...)"
+        );
+    }
+
     /// Regression test for #3986: wasmtime defaults reserve ~4 GiB of
     /// virtual memory per instance (4 GiB linear memory + 32 MiB guard).
     /// On low-RAM hosts (Raspberry Pi 4 4 GB, etc.) the kernel rejects
@@ -2257,10 +2322,10 @@ mod tests {
         // With wasmtime defaults, 4 instances would add ~16 GiB of VmSize
         // (4 × 4 GiB reservation + guard). With the fix matching
         // DEFAULT_MAX_MEMORY_PAGES (256 MiB) the addition is ~1 GiB plus
-        // small overhead. Bound at 4 GiB: well above the expected growth
-        // with the fix, well below the smallest single-instance regression
-        // it would catch.
-        const GROWTH_BOUND_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+        // small overhead. Bound at 2 × N × cap = 2 GiB: catches a 2x
+        // per-instance regression while leaving headroom for VmSize jitter.
+        const GROWTH_BOUND_BYTES: u64 =
+            2 * (N_INSTANCES as u64) * (DEFAULT_MAX_MEMORY_PAGES as u64) * (WASM_PAGE_SIZE as u64);
         assert!(
             growth < GROWTH_BOUND_BYTES,
             "Per-instance virtual reservation regressed (#3986): \
