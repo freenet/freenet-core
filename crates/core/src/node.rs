@@ -2446,12 +2446,11 @@ pub async fn subscribe(
 /// remain owned by `ring::connection_maintenance` (above this layer).
 ///
 /// PUT/GET sub-op fallback paths (`operations::start_subscription_request`,
-/// `maybe_subscribe_child`) route through `subscribe::run_client_subscribe`
-/// directly with `is_renewal=false`.
-///
-/// `subscribe_with_id` itself only handles client-initiated requests — it
-/// does not accept an `is_renewal` parameter so a misrouted renewal-by-
-/// `subscribe_with_id` is a compile error rather than a runtime footgun.
+/// `maybe_subscribe_child`) route through `subscribe::run_client_subscribe`,
+/// which is hard-wired to `is_renewal=false`. Misrouting a renewal through
+/// any of those is a compile error: `start_client_subscribe` /
+/// `run_client_subscribe` no longer accept `is_renewal` — only
+/// `subscribe::run_renewal_subscribe` does.
 ///
 /// # Parameters
 ///
@@ -2493,17 +2492,13 @@ pub async fn subscribe_with_id(
     // immediately. The spawned task owns retries, peer selection, local
     // completion, and result delivery via `result_router_tx`.
     //
-    // `is_renewal=false`: client-initiated SUBSCRIBE always asks the
-    // responder for state. Renewals come from
-    // `ring::connection_maintenance` and use this same driver via
-    // `start_client_subscribe(..., is_renewal=true)`.
-    subscribe::start_client_subscribe(
-        op_manager,
-        instance_id,
-        client_tx,
-        /* is_renewal */ false,
-    )
-    .await
+    // Renewals do NOT come through here. `ring::connection_maintenance`
+    // calls `subscribe::run_renewal_subscribe` directly — same task-per-tx
+    // machinery (`drive_client_subscribe_inner`) with `is_renewal=true`
+    // and a custom delivery path that returns `RenewalOutcome` to the
+    // renewal task instead of publishing through `result_router_tx`
+    // (renewals have no client waiter to publish to).
+    subscribe::start_client_subscribe(op_manager, instance_id, client_tx).await
 }
 
 async fn handle_aborted_op(
@@ -4165,19 +4160,53 @@ mod tests {
                 .expect("SUBSCRIBE branch no longer calls handle_op_request")
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
+            // Strip line comments so doc strings that mention the absent
+            // `if !*is_renewal` text as a negative constraint do not
+            // trip the substring scan.
+            let stripped: String = window
+                .lines()
+                .map(|line| match line.find("//") {
+                    Some(idx) => &line[..idx],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
             // After SUBSCRIBE renewal migration, renewals MUST flow through
             // `start_relay_subscribe` like non-renewal Requests. The
             // `is_renewal` flag is propagated to the responder (so it
             // skips sending state) but the dispatch gate no longer
-            // discriminates on it. Reintroducing `if !*is_renewal {` here
-            // would silently route renewals back through the legacy
-            // state machine and reopen the asymmetry the migration
-            // resolved.
+            // discriminates on it. Reintroducing `if !*is_renewal {` (or
+            // any equivalent shape — `match is_renewal { true => ... }`,
+            // `if *is_renewal { return ...; }`, etc.) would silently
+            // route renewals back through the legacy state machine and
+            // reopen the asymmetry the migration resolved.
             assert!(
-                !window.contains("if !*is_renewal"),
-                "SUBSCRIBE relay dispatch must NOT special-case `is_renewal=true` — \
+                !stripped.contains("if !*is_renewal"),
+                "SUBSCRIBE relay dispatch must NOT special-case `is_renewal` — \
                  renewals run on the same task-per-tx driver as client-initiated \
                  SUBSCRIBE after the renewal migration."
+            );
+            assert!(
+                !stripped.contains("if *is_renewal"),
+                "SUBSCRIBE relay dispatch must NOT special-case `is_renewal` — \
+                 (inverted-form check)."
+            );
+            assert!(
+                !stripped.contains("match is_renewal"),
+                "SUBSCRIBE relay dispatch must NOT match on `is_renewal` to \
+                 fork dispatch — every Request goes through start_relay_subscribe."
+            );
+
+            // Positive assertion: the dispatch site MUST contain the
+            // start_relay_subscribe call. Without this, a refactor that
+            // removes the call and falls through to legacy for ALL
+            // requests would still pass the negative assertions above.
+            assert!(
+                stripped.contains("subscribe::op_ctx_task::start_relay_subscribe("),
+                "SUBSCRIBE relay dispatch must call \
+                 `subscribe::op_ctx_task::start_relay_subscribe` for fresh \
+                 inbound Requests (renewal and non-renewal alike)."
             );
         }
 

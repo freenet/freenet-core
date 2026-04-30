@@ -991,19 +991,12 @@ async fn maybe_subscribe_child(
     // set by `new_child_of`), not the tracker DashMap.
 
     if blocking_subscribe {
-        subscribe::run_client_subscribe(
-            op_manager.clone(),
-            *key.id(),
-            child_tx,
-            /* is_renewal */ false,
-        )
-        .await;
+        subscribe::run_client_subscribe(op_manager.clone(), *key.id(), child_tx).await;
     } else {
         GlobalExecutor::spawn(subscribe::run_client_subscribe(
             op_manager.clone(),
             *key.id(),
             child_tx,
-            /* is_renewal */ false,
         ));
     }
 }

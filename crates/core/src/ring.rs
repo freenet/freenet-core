@@ -1054,15 +1054,41 @@ impl Ring {
                         // client-initiated SUBSCRIBE, with delivery returned to
                         // this task instead of routed via `result_router_tx`.
                         // `is_renewal=true` so the responder skips sending state.
+                        //
+                        // Outer renewal-cycle timeout: cap each renewal task at
+                        // a fraction of the renewal interval so a stuck driver
+                        // (slow peer, blocked op_execution_sender) self-cancels
+                        // within one cycle instead of leaking past
+                        // `mark_subscription_pending` semantics. The driver's
+                        // per-attempt `OPERATION_TTL` (60 s) bounds individual
+                        // peer waits; this outer timeout bounds total task
+                        // lifetime. Without it, sustained slow-peer load could
+                        // accumulate background renewal tasks faster than they
+                        // complete (90+ contracts × multi-attempt ×
+                        // OPERATION_TTL on a gateway).
                         let renewal_tx = crate::message::Transaction::new::<
                             crate::operations::subscribe::SubscribeMsg,
                         >();
-                        let outcome_enum = crate::operations::subscribe::run_renewal_subscribe(
-                            op_manager_clone.clone(),
-                            instance_id,
-                            renewal_tx,
+                        let renewal_deadline = Self::SUBSCRIPTION_RECOVERY_INTERVAL
+                            .saturating_sub(Duration::from_secs(5));
+                        let outcome_enum = match tokio::time::timeout(
+                            renewal_deadline,
+                            crate::operations::subscribe::run_renewal_subscribe(
+                                op_manager_clone.clone(),
+                                instance_id,
+                                renewal_tx,
+                            ),
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(_) => crate::operations::subscribe::RenewalOutcome::Failed {
+                                reason: format!(
+                                    "renewal task exceeded {}s cycle deadline",
+                                    renewal_deadline.as_secs()
+                                ),
+                            },
+                        };
 
                         let (outcome, error_msg) = match outcome_enum {
                             crate::operations::subscribe::RenewalOutcome::Success => {

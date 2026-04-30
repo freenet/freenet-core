@@ -104,12 +104,10 @@ pub(crate) async fn start_client_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_tx: Transaction,
-    is_renewal: bool,
 ) -> Result<Transaction, OpError> {
     tracing::debug!(
         tx = %client_tx,
         contract = %instance_id,
-        is_renewal,
         "subscribe (task-per-tx): spawning client-initiated task"
     );
 
@@ -152,12 +150,7 @@ pub(crate) async fn start_client_subscribe(
     // `send_and_await` attempt both inserts (via `handle_op_execution`)
     // and removes (via `release_pending_op_slot`) a `pending_op_results`
     // slot, a stuck task would show up as a widening insert/remove gap.
-    GlobalExecutor::spawn(run_client_subscribe(
-        op_manager,
-        instance_id,
-        client_tx,
-        is_renewal,
-    ));
+    GlobalExecutor::spawn(run_client_subscribe(op_manager, instance_id, client_tx));
 
     Ok(client_tx)
 }
@@ -174,10 +167,21 @@ pub(crate) async fn run_client_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_tx: Transaction,
-    is_renewal: bool,
 ) {
-    let outcome =
-        drive_client_subscribe(op_manager.clone(), instance_id, client_tx, is_renewal).await;
+    // `is_renewal=false` here is hard-wired: every caller of this entry
+    // point is a fresh client-style subscribe (WS, sub-op fallback) that
+    // needs the responder to send state. Renewals call
+    // [`run_renewal_subscribe`] directly, which goes through
+    // [`drive_client_subscribe_inner`] with `is_renewal=true` AND a
+    // different delivery path (returned outcome instead of
+    // `result_router_tx`).
+    let outcome = drive_client_subscribe(
+        op_manager.clone(),
+        instance_id,
+        client_tx,
+        /* is_renewal */ false,
+    )
+    .await;
     deliver_outcome(&op_manager, client_tx, instance_id, outcome);
 }
 
@@ -192,12 +196,23 @@ pub(crate) async fn run_client_subscribe(
 /// - [`Self::Success`]: a `Subscribed` reply was received (or local
 ///   completion) — record success, clear backoff.
 /// - [`Self::Failed`]: subscribe could not complete (no peers, exhausted
-///   retries, downstream errors) — record failure, apply backoff.
+///   retries, downstream errors) — record failure, apply backoff. The
+///   `reason` field is opaque telemetry text — DO NOT parse it.
 /// - [`Self::ChannelCongestion`]: a notification-channel error was
-///   raised (`OpError::NotificationError` /
-///   `OpError::NotificationChannelError`). Treated as a local resource
-///   issue, NOT a protocol failure — clear pending mark without
-///   penalising the contract on backoff.
+///   raised. Both [`OpError::NotificationError`] and
+///   [`OpError::NotificationChannelError`] route here. Treated as a
+///   local resource issue, NOT a protocol failure — clear pending mark
+///   without penalising the contract on backoff.
+///
+/// Note on the channel-congestion bucket: the legacy `ring.rs` renewal
+/// site only matched [`OpError::NotificationChannelError`] for the
+/// no-penalty arm. The task-per-tx renewal driver also routes
+/// [`OpError::NotificationError`] (returned from
+/// [`mpsc::Sender::send`]'s `Err(SendError(_))` via [`OpError::from`])
+/// into [`Self::ChannelCongestion`] because both indicate the same
+/// underlying condition (a bounded notification channel could not
+/// accept the operation). Treating them differently was a legacy
+/// asymmetry, not a load-bearing distinction.
 #[derive(Debug)]
 pub(crate) enum RenewalOutcome {
     Success,
@@ -213,6 +228,34 @@ pub(crate) enum RenewalOutcome {
 /// the client-initiated driver. The only divergence is delivery: results
 /// are returned to the caller for backoff bookkeeping and renewal-cycle
 /// telemetry rather than published via `send_client_result`.
+///
+/// # Congestion semantics
+///
+/// The legacy renewal site at `ring.rs::connection_maintenance` used
+/// `notify_op_change_nonblocking` to fail-fast under congestion of the
+/// 2048-cap event-loop notification channel. The task-per-tx renewal
+/// driver dispatches each attempt through `OpCtx::send_to_and_await`,
+/// which uses the separate `op_execution_sender` channel; that channel
+/// has its own bound and behaviour, so the legacy fail-fast contract no
+/// longer applies at this layer.
+///
+/// Two safeguards bound the blast radius:
+///
+/// 1. Each renewal runs in its own spawned task — a blocked
+///    `op_execution_sender.send().await` only stalls that one renewal
+///    task, not the renewal-spawning loop in `connection_maintenance`.
+///    The spawn loop continues to honour the per-tick channel-capacity
+///    backpressure check on `notifications_sender` (see
+///    `RENEWAL_DEFER_CAPACITY_FRACTION` / `RENEWAL_STOP_CAPACITY_FRACTION`).
+///
+/// 2. The renewal-spawn site wraps this future in a
+///    `tokio::time::timeout` matching the renewal cycle interval, so a
+///    stuck driver can't outlive its `mark_subscription_pending` mark
+///    and accumulate behind successive cycles.
+///
+/// `op_execution_sender` failures surface as `OpError::NotificationError`
+/// (from `From<SendError<_>>`) and route into
+/// [`RenewalOutcome::ChannelCongestion`] — see [`classify_renewal_result`].
 pub(crate) async fn run_renewal_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
@@ -225,7 +268,16 @@ pub(crate) async fn run_renewal_subscribe(
         /* is_renewal */ true,
     )
     .await;
+    classify_renewal_result(result)
+}
 
+/// Pure classifier mapping `drive_client_subscribe_inner`'s result into
+/// [`RenewalOutcome`]. Factored out so the wildcard `OpError` arm has
+/// direct unit-test coverage — without this a future `OpError` variant
+/// representing local resource pressure could silently land in
+/// [`RenewalOutcome::Failed`] (penalising the contract on backoff and
+/// reopening the #3763 storm regression vector).
+fn classify_renewal_result(result: Result<DriverOutcome, OpError>) -> RenewalOutcome {
     let infra_err = match result {
         Ok(DriverOutcome::Publish(Ok(_))) | Ok(DriverOutcome::SkipAlreadyDelivered) => {
             return RenewalOutcome::Success;
@@ -241,7 +293,8 @@ pub(crate) async fn run_renewal_subscribe(
     // Wildcard intentional: every other OpError variant maps to the
     // same renewal-failure bucket. Future variants should default to
     // `Failed` unless they represent local resource pressure (in
-    // which case extend the channel-congestion arm explicitly).
+    // which case extend the channel-congestion arm explicitly AND add
+    // a unit test in `classify_renewal_result_*` below).
     #[allow(clippy::wildcard_enum_match_arm)]
     match infra_err {
         OpError::NotificationError | OpError::NotificationChannelError(_) => {
@@ -1975,5 +2028,124 @@ mod tests {
             !stripped.contains("announce_contract_hosted"),
             "relay driver must NOT call announce_contract_hosted on relayed response"
         );
+    }
+
+    // ── classify_renewal_result tests (#1454 SUBSCRIBE renewal slice) ────
+    //
+    // The renewal classifier is the load-bearing decision point for
+    // backoff bookkeeping. Misclassification of a transient channel error
+    // as `Failed` would penalise the contract on backoff and reopen the
+    // #3763 storm regression vector. These tests pin the mapping so a
+    // future `OpError` variant can't silently land in the wrong bucket.
+
+    #[test]
+    fn classify_renewal_result_publish_ok_is_success() {
+        use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([1u8; 32]),
+            CodeHash::new([2u8; 32]),
+        );
+        let result = Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+            ContractResponse::SubscribeResponse {
+                key,
+                subscribed: true,
+            },
+        ))));
+        assert!(matches!(
+            classify_renewal_result(result),
+            RenewalOutcome::Success
+        ));
+    }
+
+    #[test]
+    fn classify_renewal_result_skip_already_delivered_is_success() {
+        let result = Ok(DriverOutcome::SkipAlreadyDelivered);
+        assert!(matches!(
+            classify_renewal_result(result),
+            RenewalOutcome::Success
+        ));
+    }
+
+    #[test]
+    fn classify_renewal_result_publish_err_is_failed() {
+        let host_err: freenet_stdlib::client_api::ClientError =
+            freenet_stdlib::client_api::ErrorKind::OperationError {
+                cause: "downstream peer rejected".into(),
+            }
+            .into();
+        let result = Ok(DriverOutcome::Publish(Err(host_err)));
+        match classify_renewal_result(result) {
+            RenewalOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("downstream peer rejected"),
+                    "reason should include the host-error cause; got: {reason}"
+                );
+            }
+            RenewalOutcome::Success | RenewalOutcome::ChannelCongestion => {
+                panic!("expected Failed, got non-Failed variant")
+            }
+        }
+    }
+
+    #[test]
+    fn classify_renewal_result_notification_error_is_channel_congestion() {
+        let result = Ok(DriverOutcome::InfrastructureError(
+            OpError::NotificationError,
+        ));
+        assert!(matches!(
+            classify_renewal_result(result),
+            RenewalOutcome::ChannelCongestion
+        ));
+    }
+
+    #[test]
+    fn classify_renewal_result_notification_channel_error_is_channel_congestion() {
+        let result = Ok(DriverOutcome::InfrastructureError(
+            OpError::NotificationChannelError("channel full".into()),
+        ));
+        assert!(matches!(
+            classify_renewal_result(result),
+            RenewalOutcome::ChannelCongestion
+        ));
+    }
+
+    #[test]
+    fn classify_renewal_result_outer_err_notification_is_channel_congestion() {
+        // `drive_client_subscribe_inner` propagates `OpError` via `?` from
+        // `prepare_initial_request` / `complete_local_subscription`. A
+        // NotificationError surfaced through the outer Err path must also
+        // bucket into ChannelCongestion (not Failed) — otherwise renewals
+        // racing the ring-update channel get an unwarranted backoff.
+        let result: Result<DriverOutcome, OpError> = Err(OpError::NotificationError);
+        assert!(matches!(
+            classify_renewal_result(result),
+            RenewalOutcome::ChannelCongestion
+        ));
+    }
+
+    #[test]
+    fn classify_renewal_result_unexpected_op_state_is_failed() {
+        // Any OpError that is NOT a notification-channel error maps to
+        // Failed. Picking UnexpectedOpState as a representative.
+        let result: Result<DriverOutcome, OpError> = Err(OpError::UnexpectedOpState);
+        assert!(matches!(
+            classify_renewal_result(result),
+            RenewalOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_renewal_result_ring_error_no_hosting_peers_is_failed() {
+        // Mirrors the "no remote peers available" exhaustion path in
+        // `drive_client_subscribe_inner`. Must apply backoff (Failed),
+        // not the no-penalty congestion bucket.
+        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([7u8; 32]);
+        let result: Result<DriverOutcome, OpError> =
+            Err(OpError::RingError(RingError::NoHostingPeers(instance_id)));
+        assert!(matches!(
+            classify_renewal_result(result),
+            RenewalOutcome::Failed { .. }
+        ));
     }
 }
