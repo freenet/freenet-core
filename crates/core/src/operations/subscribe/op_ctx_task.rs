@@ -425,30 +425,19 @@ pub(crate) async fn run_executor_subscribe(
 /// Modelled as a separate enum (rather than reusing
 /// `OpError::NotificationChannelError`) so the wire-level exhaustion
 /// case has a meaningful name in the taxonomy.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum ExecutorSubscribeError {
     /// Wire-level exhaustion (driver retried + gave up, or remote peer
     /// rejected with NotFound). Carries the underlying client-error
     /// text for telemetry / logging.
+    #[error("executor subscribe: network exhausted: {0}")]
     NetworkExhausted(String),
     /// Local infrastructure failure surfaced by
     /// [`drive_client_subscribe_inner`] (e.g.,
     /// [`OpError::NotificationError`], peer-not-joined, ring error).
-    Infra(OpError),
+    #[error("executor subscribe: {0}")]
+    Infra(#[source] OpError),
 }
-
-impl std::fmt::Display for ExecutorSubscribeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NetworkExhausted(reason) => {
-                write!(f, "executor subscribe: network exhausted: {reason}")
-            }
-            Self::Infra(err) => write!(f, "executor subscribe: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for ExecutorSubscribeError {}
 
 /// Pure classifier mapping `drive_client_subscribe_inner`'s result into
 /// `Result<(), ExecutorSubscribeError>` for executor-side delivery.
@@ -2380,5 +2369,103 @@ mod tests {
             Err(ExecutorSubscribeError::Infra(OpError::UnexpectedOpState)) => {}
             other => panic!("expected Infra(UnexpectedOpState), got {other:?}"),
         }
+    }
+
+    // ── run_executor_subscribe body pin tests (#1454) ────────────────
+    //
+    // Behavioral end-to-end tests of `run_executor_subscribe` would
+    // require spinning a full `OpManager` (no shared test fixture
+    // exists), which is non-trivial for a unit-test layer. Pin tests
+    // below substitute by asserting the load-bearing source-level
+    // invariants — most importantly that the `LocallyComplete` arm
+    // does NOT call `complete_local_subscription` (which would emit
+    // `NodeEvent::LocalSubscribeComplete` and trip the
+    // standalone-parent branch in `p2p_protoc.rs` that publishes a
+    // result keyed on `executor_tx` to `result_router_tx` with no
+    // client waiter).
+
+    #[test]
+    fn run_executor_subscribe_locally_complete_skips_local_subscribe_complete_event() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = src
+            .split("pub(crate) async fn run_executor_subscribe(")
+            .nth(1)
+            .expect("run_executor_subscribe must exist")
+            .split(
+                "
+}",
+            )
+            .next()
+            .expect("closing brace of run_executor_subscribe");
+        // Strip line comments so doc strings that mention the absent
+        // helper as a negative constraint do not trip the substring
+        // scan.
+        let stripped: String = body
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Locally-complete branch must NOT delegate to the helper that
+        // emits the local-completion event. Compose the needle at
+        // runtime so the test itself doesn't trip the scan.
+        let helper = ["complete_local_", "subscription"].concat();
+        assert!(
+            !stripped.contains(&helper),
+            "run_executor_subscribe must NOT call the local-completion \
+             helper on the LocallyComplete branch — would publish a \
+             result for executor_tx that has no client waiter. Handle \
+             interest registration + op_manager.completed inline."
+        );
+        // Locally-complete branch must still register local interest
+        // and complete the op (replaces the side effects of
+        // complete_local_subscription).
+        assert!(
+            body.contains("interest_manager.add_local_client"),
+            "run_executor_subscribe LocallyComplete arm must register \
+             local interest (mirrors complete_local_subscription side \
+             effect)"
+        );
+        assert!(
+            body.contains("op_manager.completed("),
+            "run_executor_subscribe LocallyComplete arm must call \
+             op_manager.completed() to drop the under_progress slot"
+        );
+    }
+
+    #[test]
+    fn run_executor_subscribe_no_hosting_peers_maps_to_infra_ring_error() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = src
+            .split("pub(crate) async fn run_executor_subscribe(")
+            .nth(1)
+            .expect("run_executor_subscribe must exist")
+            .split(
+                "
+}",
+            )
+            .next()
+            .expect("closing brace of run_executor_subscribe");
+        // Both PeerNotJoined and NoHostingPeers must wrap as
+        // `ExecutorSubscribeError::Infra(...)` so the executor's
+        // `subscribe()` sees a structured failure cause rather than
+        // an opaque string.
+        assert!(
+            body.contains("RingError::NoHostingPeers"),
+            "run_executor_subscribe must surface NoHostingPeers via \
+             RingError::NoHostingPeers"
+        );
+        assert!(
+            body.contains("RingError::PeerNotJoined"),
+            "run_executor_subscribe must surface PeerNotJoined via \
+             RingError::PeerNotJoined"
+        );
+        assert!(
+            body.contains("ExecutorSubscribeError::Infra"),
+            "run_executor_subscribe early-return error branches must \
+             wrap as ExecutorSubscribeError::Infra(...)"
+        );
     }
 }
