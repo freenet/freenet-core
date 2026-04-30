@@ -26,20 +26,49 @@ pub(super) const MAX_LOG_RECORDS: usize = 10_000;
 // surviving record to disk, so a small REMOVE_RECS forces the entire file to
 // be copied on every ~REMOVE_RECS-record append cycle. With a flat 1005
 // against the 100_000-record cap this produced ~99x write amplification,
-// observed as ~9 MB/s of sustained disk writes from compaction churn alone
-// on a busy gateway. Scaling with MAX_LOG_RECORDS keeps the trim fraction
-// constant across cfg(test) and cfg(not(test)); the +BATCH_SIZE buffer
-// preserves the original "headroom for one fresh batch" intent.
+// observed via /proc/$pid/io as ~9 MB/s of sustained disk writes from
+// compaction churn alone on a busy gateway. Scaling with MAX_LOG_RECORDS
+// keeps the trim fraction constant across cfg(test) and cfg(not(test)); the
+// +BATCH_SIZE buffer preserves the original "headroom for one fresh batch"
+// intent.
+//
+// 25% (rather than e.g. 50%) is a tradeoff between write amplification and
+// the size of the trailing window of router-training events on disk. At 25%,
+// amortized rewrite cost is ~3x records-per-record-shed and the file
+// oscillates between ~75% and ~100% of the cap; at 50% it would be ~1.5x
+// but the on-disk window would shrink toward 50% of the cap, halving the
+// router-training history available after each compaction. 25% sits at a
+// sane point in that tradeoff without losing meaningful history.
 pub(super) const REMOVE_RECS: usize = MAX_LOG_RECORDS / 4 + EVENT_REGISTER_BATCH_SIZE;
-// Compile-time guard: each truncate_records pass rewrites every surviving
-// record to disk, so REMOVE_RECS must be a meaningful fraction of the cap
-// (>=20%) to keep amortized write amplification bounded.
+// Compile-time guards. truncate_records rewrites every surviving record on
+// each pass, so REMOVE_RECS must be a meaningful fraction of the cap
+// (lower-bound ensures bounded write amplification) but never more than half
+// the cap (upper-bound prevents a future REMOVE_RECS = MAX_LOG_RECORDS misuse
+// from clearing the entire log and leaving the steady-state band's lower
+// edge at zero or underflowed).
 const _: () = assert!(
     REMOVE_RECS * 5 >= MAX_LOG_RECORDS,
     "REMOVE_RECS must drop at least 20% of MAX_LOG_RECORDS per compaction; \
      truncate_records rewrites the entire surviving log on every pass, so a \
      smaller fraction makes every ~REMOVE_RECS appends rewrite ~MAX_LOG_RECORDS \
      bytes (the gateway-write-amplification bug fixed by this guard)"
+);
+const _: () = assert!(
+    REMOVE_RECS * 2 <= MAX_LOG_RECORDS,
+    "REMOVE_RECS must drop at most 50% of MAX_LOG_RECORDS per compaction; \
+     a larger fraction shrinks the post-compaction record window below half \
+     the cap and risks clearing the log entirely if REMOVE_RECS approaches \
+     MAX_LOG_RECORDS"
+);
+// The truncation tests assume one full BATCH_SIZE batch flush carries
+// num_recs from MAX_LOG_RECORDS to MAX_LOG_RECORDS + BATCH_SIZE; that only
+// holds when MAX_LOG_RECORDS is a multiple of BATCH_SIZE. Pin the relation
+// at compile time so changing either constant doesn't silently shift the
+// trigger point and invalidate the regression tests.
+const _: () = assert!(
+    MAX_LOG_RECORDS % EVENT_REGISTER_BATCH_SIZE == 0,
+    "MAX_LOG_RECORDS must be a multiple of EVENT_REGISTER_BATCH_SIZE so \
+     compaction triggers exactly at MAX_LOG_RECORDS + BATCH_SIZE"
 );
 // Reduced from 100 to 5 to ensure events are written more frequently,
 // especially important for integration tests which generate few events
@@ -697,6 +726,57 @@ mod tests {
              to drop a sliver",
             log.num_recs,
             MAX_LOG_RECORDS,
+        );
+        Ok(())
+    }
+
+    /// Steady-state regression: push enough records for multiple compactions
+    /// and confirm the on-disk record count stays within the
+    /// `[MAX_LOG_RECORDS - REMOVE_RECS, MAX_LOG_RECORDS + BATCH_SIZE]` band.
+    /// Without the fix the band shrinks to `[MAX - 1005, MAX + BATCH_SIZE]`,
+    /// i.e. compaction fires after every ~1005 appends and the file
+    /// oscillates between 90% and 100% full instead of 75% and 100%.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sustained_load_keeps_log_bounded() -> anyhow::Result<()> {
+        NEW_RECORDS_TS.get_or_init(SystemTime::now);
+        let temp_dir = tempfile::tempdir()?;
+        let log_path = temp_dir.path().join("event_log");
+
+        // Push enough records to force at least three compactions so the
+        // assertion captures steady-state behaviour, not a single-pass
+        // post-trim count.
+        const TEST_LOGS: usize = 3 * MAX_LOG_RECORDS;
+
+        let mut log = LogFile::open(&log_path).await?;
+        let bytes = crate::util::test::random_bytes_2mb();
+
+        // arbitrary::Unstructured returns default values once its buffer is
+        // exhausted, so re-prime per record to keep the EventKind mix
+        // varied enough that compaction logic exercises route-event paths.
+        for i in 0..TEST_LOGS {
+            // Cycle through the buffer to keep entropy across many records.
+            let offset = (i * 31) % bytes.len();
+            let mut unstructured = arbitrary::Unstructured::new(&bytes[offset..]);
+            let tx: Transaction = unstructured.arbitrary()?;
+            let peer = PeerId::random();
+            let kind: EventKind = unstructured.arbitrary()?;
+            let event = NetEventLog {
+                tx: &tx,
+                peer_id: peer,
+                kind,
+            };
+            for msg in NetLogMessage::to_log_message(either::Either::Left(event)) {
+                log.persist_log(msg).await;
+            }
+        }
+
+        let upper_bound = MAX_LOG_RECORDS + BATCH_SIZE;
+        let lower_bound = MAX_LOG_RECORDS.saturating_sub(REMOVE_RECS);
+        assert!(
+            log.num_recs >= lower_bound && log.num_recs <= upper_bound,
+            "num_recs={} outside steady-state band [{lower_bound}, {upper_bound}] \
+             after pushing {TEST_LOGS} records",
+            log.num_recs,
         );
         Ok(())
     }

@@ -205,11 +205,17 @@ jobs:
           # Check ALL Rust files for test additions/removals (not just crates/core/src/)
           # TEST_ATTR_RE matches the set of attributes this repo uses to mark
           # a function as a test:
-          #   #[test]                  — plain libtest
-          #   #[tokio::test]           — async tests
-          #   #[test_log::test]        — tracing-subscriber-enabled tests
-          #   #[freenet_test(...)]     — Freenet integration-test macro
-          TEST_ATTR_RE='#\[((tokio|test_log)::)?test\]|#\[freenet_test'
+          #   #[test]                                          - plain libtest
+          #   #[tokio::test]                                   - async tests
+          #   #[tokio::test(flavor = ..., worker_threads = N)] - parameterized async tests
+          #   #[test_log::test]                                - tracing-subscriber-enabled tests
+          #   #[test_log::test(tokio::test)]                   - parameterized tracing-subscriber-enabled
+          #   #[freenet_test(...)]                             - Freenet integration-test macro
+          # The character class [(\]] after `test` matches either `]` (plain
+          # form) or `(` (parameterized form). Without that, parameterized
+          # tokio::test attributes weren't counted as new tests and fix: PRs
+          # using only such tests were incorrectly rejected.
+          TEST_ATTR_RE='#\[((tokio|test_log)::)?test(\]|\()|#\[freenet_test'
           ALL_ADDED=$(git diff "$BASE"..."$HEAD" -- '**/*.rs' \
             | grep '^+' | grep -v '^+++' || true)
           ALL_ADDED_STRIPPED=$(echo "$ALL_ADDED" | sed 's|//.*||' || true)
