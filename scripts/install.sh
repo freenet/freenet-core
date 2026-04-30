@@ -9,6 +9,13 @@
 #   FREENET_INSTALL_DIR  - Installation directory (default: ~/.local/bin)
 #   FREENET_NO_SERVICE   - Set to 1 to skip service installation prompt
 #   FREENET_VERSION      - Specific version to install (default: latest)
+#
+# NOTE: This file is mirrored at hugo-site/static/install.sh in
+# freenet/web (served from https://freenet.org/install.sh). Keep the
+# two in sync. In particular, the service-install prompt below MUST
+# keep its $0 + /dev/tty handling so that `curl | sh` users can
+# answer the prompt - see freenet/web PR #42 for context. A previous
+# fix was already lost once via a bulk resync.
 
 set -eu
 
@@ -409,11 +416,45 @@ main() {
         print_path_instructions "$install_dir"
     fi
 
-    # Ask about service installation (unless FREENET_NO_SERVICE is set)
+    # Ask about service installation (unless FREENET_NO_SERVICE is set).
+    #
+    # When the script is piped via `curl ... | sh`, sh reads its own script
+    # source from stdin. A plain `read` at this point would consume bytes
+    # of script source instead of capturing the user's answer, so we
+    # redirect from /dev/tty in that case.
+    #
+    # We detect "sh is reading the script from stdin" via $0: when sh runs
+    # a script file, $0 is the script path; when sh reads its source from
+    # stdin, $0 is the shell name itself (e.g. "sh", "bash"). In the
+    # script-file case we read from stdin as before, so existing
+    # automation patterns like `printf 'y\n' | sh install.sh` still work.
+    # The robust way to bypass the prompt in any invocation form is
+    # FREENET_NO_SERVICE=1.
+    #
+    # `{ true </dev/tty; } 2>/dev/null` is used instead of `[ -r /dev/tty ]`:
+    # the access check can succeed even when the process has no
+    # controlling terminal and the subsequent open(2) fails with ENXIO.
+    # Probe by actually opening /dev/tty.
+    #
+    # `read -r response || response=""` keeps EOF (e.g. Ctrl-D, closed
+    # stdin) from aborting the script under `set -eu`.
     if [ "${FREENET_NO_SERVICE:-0}" != "1" ]; then
         echo ""
-        printf "Would you like to install Freenet as a system service? [y/N] "
-        read -r response
+        response=""
+        case "${0##*/}" in
+            sh|bash|dash|ash|busybox|-sh|-bash|-dash|-ash)
+                # Script source is on stdin (`curl | sh` form).
+                if { true </dev/tty; } 2>/dev/null; then
+                    printf "Would you like to install Freenet as a system service? [y/N] "
+                    read -r response </dev/tty || response=""
+                fi
+                ;;
+            *)
+                # Script ran as a file; stdin carries the user's answer.
+                printf "Would you like to install Freenet as a system service? [y/N] "
+                read -r response || response=""
+                ;;
+        esac
         case "$response" in
             [yY]|[yY][eE][sS])
                 info "Installing service..."
@@ -427,6 +468,8 @@ main() {
                 echo ""
                 echo "You can install the service later with:"
                 echo "  freenet service install"
+                echo ""
+                echo "To skip this prompt entirely in scripted installs, set FREENET_NO_SERVICE=1."
                 ;;
         esac
     fi
