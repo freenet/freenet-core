@@ -104,10 +104,12 @@ pub(crate) async fn start_client_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_tx: Transaction,
+    is_renewal: bool,
 ) -> Result<Transaction, OpError> {
     tracing::debug!(
         tx = %client_tx,
         contract = %instance_id,
+        is_renewal,
         "subscribe (task-per-tx): spawning client-initiated task"
     );
 
@@ -150,7 +152,12 @@ pub(crate) async fn start_client_subscribe(
     // `send_and_await` attempt both inserts (via `handle_op_execution`)
     // and removes (via `release_pending_op_slot`) a `pending_op_results`
     // slot, a stuck task would show up as a widening insert/remove gap.
-    GlobalExecutor::spawn(run_client_subscribe(op_manager, instance_id, client_tx));
+    GlobalExecutor::spawn(run_client_subscribe(
+        op_manager,
+        instance_id,
+        client_tx,
+        is_renewal,
+    ));
 
     Ok(client_tx)
 }
@@ -167,9 +174,83 @@ pub(crate) async fn run_client_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_tx: Transaction,
+    is_renewal: bool,
 ) {
-    let outcome = drive_client_subscribe(op_manager.clone(), instance_id, client_tx).await;
+    let outcome =
+        drive_client_subscribe(op_manager.clone(), instance_id, client_tx, is_renewal).await;
     deliver_outcome(&op_manager, client_tx, instance_id, outcome);
+}
+
+/// Outcome of a renewal subscribe (`ring::connection_maintenance`).
+///
+/// Renewals do not deliver through `result_router_tx`; the renewal task
+/// owns its own outcome observation for backoff bookkeeping
+/// (`SubscriptionRecoveryGuard`) and `subscription_renewal_outcome`
+/// telemetry. This enum carries the three semantic buckets the renewal
+/// site needs to distinguish:
+///
+/// - [`Self::Success`]: a `Subscribed` reply was received (or local
+///   completion) — record success, clear backoff.
+/// - [`Self::Failed`]: subscribe could not complete (no peers, exhausted
+///   retries, downstream errors) — record failure, apply backoff.
+/// - [`Self::ChannelCongestion`]: a notification-channel error was
+///   raised (`OpError::NotificationError` /
+///   `OpError::NotificationChannelError`). Treated as a local resource
+///   issue, NOT a protocol failure — clear pending mark without
+///   penalising the contract on backoff.
+#[derive(Debug)]
+pub(crate) enum RenewalOutcome {
+    Success,
+    Failed { reason: String },
+    ChannelCongestion,
+}
+
+/// Drive a renewal subscribe to completion and return the outcome directly
+/// instead of routing through `result_router_tx` / `SessionActor`.
+///
+/// Reuses [`drive_client_subscribe_inner`] with `is_renewal=true` so the
+/// wire request, retry loop, and local-completion path are identical to
+/// the client-initiated driver. The only divergence is delivery: results
+/// are returned to the caller for backoff bookkeeping and renewal-cycle
+/// telemetry rather than published via `send_client_result`.
+pub(crate) async fn run_renewal_subscribe(
+    op_manager: Arc<OpManager>,
+    instance_id: ContractInstanceId,
+    renewal_tx: Transaction,
+) -> RenewalOutcome {
+    let result = drive_client_subscribe_inner(
+        &op_manager,
+        instance_id,
+        renewal_tx,
+        /* is_renewal */ true,
+    )
+    .await;
+
+    let infra_err = match result {
+        Ok(DriverOutcome::Publish(Ok(_))) | Ok(DriverOutcome::SkipAlreadyDelivered) => {
+            return RenewalOutcome::Success;
+        }
+        Ok(DriverOutcome::Publish(Err(host_err))) => {
+            return RenewalOutcome::Failed {
+                reason: host_err.to_string(),
+            };
+        }
+        Ok(DriverOutcome::InfrastructureError(err)) | Err(err) => err,
+    };
+
+    // Wildcard intentional: every other OpError variant maps to the
+    // same renewal-failure bucket. Future variants should default to
+    // `Failed` unless they represent local resource pressure (in
+    // which case extend the channel-congestion arm explicitly).
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match infra_err {
+        OpError::NotificationError | OpError::NotificationChannelError(_) => {
+            RenewalOutcome::ChannelCongestion
+        }
+        other => RenewalOutcome::Failed {
+            reason: other.to_string(),
+        },
+    }
 }
 
 /// Outcome of the driver, carrying an explicit signal for "local completion
@@ -202,8 +283,9 @@ async fn drive_client_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_tx: Transaction,
+    is_renewal: bool,
 ) -> DriverOutcome {
-    match drive_client_subscribe_inner(&op_manager, instance_id, client_tx).await {
+    match drive_client_subscribe_inner(&op_manager, instance_id, client_tx, is_renewal).await {
         Ok(outcome) => outcome,
         Err(err) => DriverOutcome::InfrastructureError(err),
     }
@@ -213,6 +295,7 @@ async fn drive_client_subscribe_inner(
     op_manager: &Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_tx: Transaction,
+    is_renewal: bool,
 ) -> Result<DriverOutcome, OpError> {
     // Decide: local-completion, give up, or send to the network.
     // `prepare_initial_request` uses `client_tx` for its visited-peers
@@ -220,13 +303,7 @@ async fn drive_client_subscribe_inner(
     // filter is per-attempt-first-peer only and telemetry correlates on
     // the client-visible tx (matching legacy behaviour for the first
     // attempt).
-    let initial = prepare_initial_request(
-        op_manager,
-        client_tx,
-        instance_id,
-        /* is_renewal */ false,
-    )
-    .await?;
+    let initial = prepare_initial_request(op_manager, client_tx, instance_id, is_renewal).await?;
 
     let (target_peer, target_addr, mut visited, mut alternatives, htl) = match initial {
         InitialRequest::LocallyComplete { key } => {
@@ -235,7 +312,7 @@ async fn drive_client_subscribe_inner(
             // so the driver MUST NOT deliver a second time — return
             // `SkipAlreadyDelivered` to explicitly signal that to
             // `deliver_outcome`.
-            complete_local_subscription(op_manager, client_tx, key, /* is_renewal */ false).await?;
+            complete_local_subscription(op_manager, client_tx, key, is_renewal).await?;
             return Ok(DriverOutcome::SkipAlreadyDelivered);
         }
         InitialRequest::NoHostingPeers => {
@@ -319,7 +396,7 @@ async fn drive_client_subscribe_inner(
             instance_id,
             htl,
             visited: visited.clone(),
-            is_renewal: false,
+            is_renewal,
         };
 
         // Dispatch via `send_to_and_await` so the Request reaches `current_target_addr`

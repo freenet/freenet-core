@@ -25,8 +25,9 @@ paths:
 > `start_targeted_op` UPDATE-triggered auto-fetch (streaming relay and
 > originator loopback also remain on legacy per #3883 port plan §7),
 > PUT GC / streaming / originator-loopback paths, CONNECT, and
-> SUBSCRIBE's renewal / PUT-sub-op / executor / intermediate-peer
-> entry points. Phase 5 follow-up slice A (PR #3910) migrated fresh
+> SUBSCRIBE's executor / intermediate-peer entry points (PUT-sub-op
+> SUBSCRIBE migrated in Phase 3a/3b; renewal migrated in the SUBSCRIBE
+> renewal slice — see below). Phase 5 follow-up slice A (PR #3910) migrated fresh
 > inbound non-streaming relay `UpdateMsg::RequestUpdate` and
 > `UpdateMsg::BroadcastTo` to
 > `operations/update/op_ctx_task.rs::start_relay_request_update` /
@@ -59,10 +60,19 @@ paths:
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
 > `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`
 > (gated on `source_addr.is_some()` AND `!has_subscribe_op(id)`);
-> renewals, PUT sub-op subscribes, executor auto-subscribe,
-> GC-spawned retries that pre-register a `SubscribeOp`,
-> `SubscribeMsg::Unsubscribe`, and `SubscribeMsg::ForwardingAck` all
-> stay on legacy. The driver caps relay-hop retries at 1 (originator
+> executor auto-subscribe, GC-spawned retries that pre-register a
+> `SubscribeOp`, `SubscribeMsg::Unsubscribe`, and
+> `SubscribeMsg::ForwardingAck` all stay on legacy. Renewals were
+> previously routed to legacy at this dispatch site so the relay
+> would emit `ForwardingAck` back to the renewal originator (the
+> originator's GC retry timer used `ack_received` for retry-base
+> selection); the SUBSCRIBE renewal migration moved the renewal
+> originator to the same task-per-tx driver as client-initiated
+> subscribe (`subscribe::run_renewal_subscribe` reuses
+> `drive_client_subscribe_inner` with `is_renewal=true`, returning
+> the outcome to the renewal task instead of through
+> `result_router_tx`), so renewals now flow through
+> `start_relay_subscribe` like any other Request. The driver caps relay-hop retries at 1 (originator
 > owns cross-peer retry), reuses `incoming_tx` end-to-end, omits
 > `ForwardingAck` emission, and calls `register_downstream_subscriber`
 > on BOTH local-hit and relayed-Subscribed paths — but DELIBERATELY
@@ -119,8 +129,13 @@ paths:
 > `GetOp::speculative_paths` fields, and the 11 unit tests that
 > simulated the GC retry decision. The shared retry constants
 > (`ACK_TIMEOUT`, `MAX_SPECULATIVE_PATHS`, `PROGRESS_TIMEOUT`) and the
-> SUBSCRIBE retry block stay because SUBSCRIBE renewals (which run on
-> the legacy state machine — see #3763) still rely on them.
+> SUBSCRIBE retry block stay because the executor auto-subscribe
+> path and other legacy intermediate-peer SUBSCRIBE writers still
+> push `SubscribeOp`s into `ops.subscribe` that need GC retry
+> coverage. Renewals previously also wrote here, but the SUBSCRIBE
+> renewal migration moved them onto the task-per-tx driver — that
+> writer can be retired once the executor auto-subscribe path
+> follows.
 > `GetMsg::ForwardingAck` survives as a wire variant + telemetry hook
 > (#3570 diagnostics) but its handler now returns the operation
 > unchanged.

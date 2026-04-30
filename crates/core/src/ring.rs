@@ -1050,16 +1050,22 @@ impl Ring {
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
 
                         let instance_id = *contract_key.id();
-                        // is_renewal: true - this is a subscription renewal, skip sending state
-                        let sub_op = crate::operations::subscribe::start_op(instance_id, true);
-                        let result = crate::operations::subscribe::request_subscribe(
-                            &op_manager_clone,
-                            sub_op,
+                        // Renewal driver (#1454): same task-per-tx machinery as
+                        // client-initiated SUBSCRIBE, with delivery returned to
+                        // this task instead of routed via `result_router_tx`.
+                        // `is_renewal=true` so the responder skips sending state.
+                        let renewal_tx = crate::message::Transaction::new::<
+                            crate::operations::subscribe::SubscribeMsg,
+                        >();
+                        let outcome_enum = crate::operations::subscribe::run_renewal_subscribe(
+                            op_manager_clone.clone(),
+                            instance_id,
+                            renewal_tx,
                         )
                         .await;
 
-                        let (outcome, error_msg) = match &result {
-                            Ok(()) => {
+                        let (outcome, error_msg) = match outcome_enum {
+                            crate::operations::subscribe::RenewalOutcome::Success => {
                                 tracing::info!(
                                     %contract_key,
                                     "Subscription renewal succeeded"
@@ -1067,7 +1073,7 @@ impl Ring {
                                 guard.complete(true);
                                 ("success", None)
                             }
-                            Err(crate::operations::OpError::NotificationChannelError(_)) => {
+                            crate::operations::subscribe::RenewalOutcome::ChannelCongestion => {
                                 // Channel congestion is a local resource issue, not a
                                 // protocol failure. Don't penalize with backoff — just
                                 // clear the pending mark so the contract is eligible on
@@ -1079,15 +1085,14 @@ impl Ring {
                                 guard.complete(true);
                                 ("dropped_channel_full", None)
                             }
-                            Err(e) => {
+                            crate::operations::subscribe::RenewalOutcome::Failed { reason } => {
                                 tracing::debug!(
                                     %contract_key,
-                                    error = %e,
+                                    error = %reason,
                                     "Subscription renewal failed (will retry with backoff)"
                                 );
-                                let err_str = e.to_string();
                                 guard.complete(false);
-                                ("failed", Some(err_str))
+                                ("failed", Some(reason))
                             }
                         };
 

@@ -463,13 +463,20 @@ async fn maybe_subscribe_child(
 
     if blocking_subscribe {
         // Inline await — PUT response waits for subscribe completion.
-        subscribe::run_client_subscribe(op_manager.clone(), *key.id(), child_tx).await;
+        subscribe::run_client_subscribe(
+            op_manager.clone(),
+            *key.id(),
+            child_tx,
+            /* is_renewal */ false,
+        )
+        .await;
     } else {
         // Fire-and-forget — PUT response returns immediately.
         GlobalExecutor::spawn(subscribe::run_client_subscribe(
             op_manager.clone(),
             *key.id(),
             child_tx,
+            /* is_renewal */ false,
         ));
     }
 }

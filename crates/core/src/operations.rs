@@ -708,7 +708,16 @@ pub(super) fn start_subscription_request(
     let op_manager_arc = std::sync::Arc::new(op_manager.clone());
     let instance_id = *key.id();
     GlobalExecutor::spawn(async move {
-        subscribe::run_client_subscribe(op_manager_arc, instance_id, child_tx).await;
+        // Sub-op subscribes are never renewals: the parent op (PUT/GET)
+        // is establishing a fresh subscription on a contract it just
+        // produced/fetched, so the responder must send full state.
+        subscribe::run_client_subscribe(
+            op_manager_arc,
+            instance_id,
+            child_tx,
+            /* is_renewal */ false,
+        )
+        .await;
     });
 
     child_tx
