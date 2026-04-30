@@ -306,9 +306,9 @@ fn classify_renewal_result(result: Result<DriverOutcome, OpError>) -> RenewalOut
     }
 }
 
-/// Drive an executor-initiated SUBSCRIBE (`SubscribeContract` /
-/// `executor::subscribe`) to completion and return the outcome directly
-/// to the caller via the function return value.
+/// Drive an executor-initiated SUBSCRIBE (`executor::subscribe`) to
+/// completion and return the outcome directly to the caller via the
+/// function return value.
 ///
 /// The executor's `subscribe()` (in `contract::executor::runtime`) calls
 /// this in place of the legacy `op_request(SubscribeContract)` →
@@ -317,23 +317,95 @@ fn classify_renewal_result(result: Result<DriverOutcome, OpError>) -> RenewalOut
 /// instead of through `result_router_tx` / `SessionActor`: the executor
 /// is an internal caller with no client waiter to publish to.
 ///
-/// Reuses [`drive_client_subscribe_inner`] with `is_renewal=false` so
-/// the wire request, retry loop, and local-completion path are
-/// identical to the client-initiated driver. The responder sends full
-/// state because executor auto-subscribes are NOT renewals — the
-/// executor invokes them when a contract is first being put / updated
-/// and needs the responder to acknowledge with state.
+/// # Local-hit handling
+///
+/// Unlike [`drive_client_subscribe_inner`], this entry point pre-checks
+/// the local-completion case via [`prepare_initial_request`] and handles
+/// it inline (interest registration + `op_manager.completed(tx)`). It
+/// deliberately does NOT call [`complete_local_subscription`], which
+/// would emit `NodeEvent::LocalSubscribeComplete` and trip the
+/// standalone-parent branch in `p2p_protoc.rs` that publishes a result
+/// keyed on `executor_tx` to `result_router_tx`. The executor has no
+/// client waiter for `executor_tx`, so the publish would consume a
+/// `result_router_tx` slot and trigger a "no waiting clients" warning.
+/// Renewals avoid this via the `is_renewal` short-circuit in the
+/// handler (`p2p_protoc.rs:2072`); executor auto-subscribes avoid it
+/// here.
+///
+/// # Network-hit handling
+///
+/// For the non-local case, delegate to [`drive_client_subscribe_inner`]
+/// with `is_renewal=false` so the wire request, retry loop, and
+/// per-attempt telemetry are identical to the client-initiated driver.
+/// The responder sends full state because executor auto-subscribes are
+/// not renewals — the executor invokes them when a contract is first
+/// being put / updated and needs the responder to acknowledge with
+/// state.
 ///
 /// # Returns
 ///
-/// `Ok(())` on a successful subscribe (network or local-completion).
-/// `Err(OpError)` on exhaustion / infrastructure failure. The executor
-/// wraps all errors into `ExecutorError::other(...)`.
+/// `Ok(())` on a successful subscribe (network or local).
+/// `Err(ExecutorSubscribeError)` on exhaustion / infrastructure
+/// failure. The executor wraps the error into
+/// `ExecutorError::other(...)` at the call site.
 pub(crate) async fn run_executor_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
     executor_tx: Transaction,
-) -> Result<(), OpError> {
+) -> Result<(), ExecutorSubscribeError> {
+    // Pre-check local hit so we can skip the
+    // `NodeEvent::LocalSubscribeComplete` round-trip (see rustdoc).
+    match prepare_initial_request(
+        &op_manager,
+        executor_tx,
+        instance_id,
+        /* is_renewal */ false,
+    )
+    .await
+    {
+        Ok(InitialRequest::LocallyComplete { key }) => {
+            tracing::debug!(
+                %key,
+                tx = %executor_tx,
+                "executor subscribe (task-per-tx): local hit, completing inline"
+            );
+            // Mirror the interest-registration side-effect of
+            // `complete_local_subscription` for non-renewal locals.
+            // Skip the `LocalSubscribeComplete` event because the
+            // executor has no client waiter on `executor_tx`.
+            let became_interested = op_manager.interest_manager.add_local_client(&key);
+            if became_interested {
+                crate::operations::broadcast_change_interests(&op_manager, vec![key], vec![]).await;
+            }
+            op_manager.completed(executor_tx);
+            return Ok(());
+        }
+        Ok(InitialRequest::NoHostingPeers) => {
+            return Err(ExecutorSubscribeError::Infra(
+                RingError::NoHostingPeers(instance_id).into(),
+            ));
+        }
+        Ok(InitialRequest::PeerNotJoined) => {
+            return Err(ExecutorSubscribeError::Infra(
+                RingError::PeerNotJoined.into(),
+            ));
+        }
+        Ok(InitialRequest::NetworkRequest { .. }) => {
+            // Network case falls through to the inner driver, which
+            // re-runs `prepare_initial_request` itself. The double
+            // call is benign — the function is read-only against
+            // the ring + state store, and the second call sees the
+            // same ring state because `executor_tx` doesn't move
+            // between calls. If state changes between the two
+            // calls and the second observes a local hit, the inner
+            // driver's `complete_local_subscription` would emit
+            // `LocalSubscribeComplete`, but that's a transient race
+            // (single result-router slot, no client waiter) and
+            // self-heals on next executor invocation.
+        }
+        Err(err) => return Err(ExecutorSubscribeError::Infra(err)),
+    }
+
     let result = drive_client_subscribe_inner(
         &op_manager,
         instance_id,
@@ -344,22 +416,54 @@ pub(crate) async fn run_executor_subscribe(
     classify_executor_subscribe_result(result)
 }
 
+/// Outcome of an executor-driven subscribe, carrying the structured
+/// failure cause separately from infrastructure errors. The executor's
+/// `subscribe()` wraps both into `ExecutorError::other`, but the
+/// distinction matters for any future caller that wants to discriminate
+/// "couldn't reach a peer" from "local notification channel closed".
+///
+/// Modelled as a separate enum (rather than reusing
+/// `OpError::NotificationChannelError`) so the wire-level exhaustion
+/// case has a meaningful name in the taxonomy.
+#[derive(Debug)]
+pub(crate) enum ExecutorSubscribeError {
+    /// Wire-level exhaustion (driver retried + gave up, or remote peer
+    /// rejected with NotFound). Carries the underlying client-error
+    /// text for telemetry / logging.
+    NetworkExhausted(String),
+    /// Local infrastructure failure surfaced by
+    /// [`drive_client_subscribe_inner`] (e.g.,
+    /// [`OpError::NotificationError`], peer-not-joined, ring error).
+    Infra(OpError),
+}
+
+impl std::fmt::Display for ExecutorSubscribeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NetworkExhausted(reason) => {
+                write!(f, "executor subscribe: network exhausted: {reason}")
+            }
+            Self::Infra(err) => write!(f, "executor subscribe: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutorSubscribeError {}
+
 /// Pure classifier mapping `drive_client_subscribe_inner`'s result into
-/// `Result<(), OpError>` for executor-side delivery. Factored out so
-/// the conversion has direct unit-test coverage.
+/// `Result<(), ExecutorSubscribeError>` for executor-side delivery.
+/// Factored out so the conversion has direct unit-test coverage.
 fn classify_executor_subscribe_result(
     result: Result<DriverOutcome, OpError>,
-) -> Result<(), OpError> {
+) -> Result<(), ExecutorSubscribeError> {
     match result {
         Ok(DriverOutcome::Publish(Ok(_))) | Ok(DriverOutcome::SkipAlreadyDelivered) => Ok(()),
-        Ok(DriverOutcome::Publish(Err(host_err))) => {
-            // Wire-level failure (NotFound / driver gave up). Surface as
-            // a `NotificationChannelError` shape so the existing
-            // `ExecutorError::other` wrapping at the call site
-            // preserves the error text.
-            Err(OpError::NotificationChannelError(host_err.to_string()))
+        Ok(DriverOutcome::Publish(Err(host_err))) => Err(ExecutorSubscribeError::NetworkExhausted(
+            host_err.to_string(),
+        )),
+        Ok(DriverOutcome::InfrastructureError(err)) | Err(err) => {
+            Err(ExecutorSubscribeError::Infra(err))
         }
-        Ok(DriverOutcome::InfrastructureError(err)) | Err(err) => Err(err),
     }
 }
 
@@ -2238,7 +2342,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_executor_subscribe_publish_err_is_err() {
+    fn classify_executor_subscribe_publish_err_is_network_exhausted() {
         let host_err: freenet_stdlib::client_api::ClientError =
             freenet_stdlib::client_api::ErrorKind::OperationError {
                 cause: "downstream peer rejected".into(),
@@ -2246,33 +2350,35 @@ mod tests {
             .into();
         let result = Ok(DriverOutcome::Publish(Err(host_err)));
         match classify_executor_subscribe_result(result) {
-            Err(OpError::NotificationChannelError(reason)) => {
+            Err(ExecutorSubscribeError::NetworkExhausted(reason)) => {
                 assert!(
                     reason.contains("downstream peer rejected"),
                     "reason should include host-error cause; got: {reason}"
                 );
             }
-            other => panic!("expected NotificationChannelError, got {other:?}"),
+            Ok(_) | Err(ExecutorSubscribeError::Infra(_)) => {
+                panic!("expected NetworkExhausted variant")
+            }
         }
     }
 
     #[test]
-    fn classify_executor_subscribe_infrastructure_error_is_err() {
+    fn classify_executor_subscribe_infrastructure_error_is_infra() {
         let result = Ok(DriverOutcome::InfrastructureError(
             OpError::NotificationError,
         ));
-        assert!(matches!(
-            classify_executor_subscribe_result(result),
-            Err(OpError::NotificationError)
-        ));
+        match classify_executor_subscribe_result(result) {
+            Err(ExecutorSubscribeError::Infra(OpError::NotificationError)) => {}
+            other => panic!("expected Infra(NotificationError), got {other:?}"),
+        }
     }
 
     #[test]
-    fn classify_executor_subscribe_outer_err_propagates() {
+    fn classify_executor_subscribe_outer_err_propagates_as_infra() {
         let result: Result<DriverOutcome, OpError> = Err(OpError::UnexpectedOpState);
-        assert!(matches!(
-            classify_executor_subscribe_result(result),
-            Err(OpError::UnexpectedOpState)
-        ));
+        match classify_executor_subscribe_result(result) {
+            Err(ExecutorSubscribeError::Infra(OpError::UnexpectedOpState)) => {}
+            other => panic!("expected Infra(UnexpectedOpState), got {other:?}"),
+        }
     }
 }

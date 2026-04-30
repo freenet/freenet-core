@@ -569,7 +569,6 @@ fn test_subscribe_op_state_lifecycle() {
         state: SubscribeState::PrepareRequest(super::PrepareRequestData {
             id: tx_id,
             instance_id,
-            is_renewal: false,
         }),
         requester_addr: None,
         requester_pub_key: None,
@@ -1565,7 +1564,6 @@ fn test_non_awaiting_response_states_skip_retry() {
         state: SubscribeState::PrepareRequest(PrepareRequestData {
             id: tx,
             instance_id,
-            is_renewal: false,
         }),
         requester_addr: None,
         requester_pub_key: None,
@@ -2144,7 +2142,6 @@ fn test_retry_fails_on_wrong_state() {
         state: SubscribeState::PrepareRequest(super::PrepareRequestData {
             id: tx_id,
             instance_id,
-            is_renewal: false,
         }),
         requester_addr: None,
         requester_pub_key: None,

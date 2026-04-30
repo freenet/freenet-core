@@ -3489,6 +3489,13 @@ impl Executor<Runtime> {
             .as_ref()
             .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("missing op_manager")))?;
         let executor_tx = crate::message::Transaction::new::<operations::subscribe::SubscribeMsg>();
+        // 120 s mirrors the legacy `op_request` `OP_REQUEST_TIMEOUT`
+        // (`crates/core/src/contract/executor.rs`, deleted in this
+        // migration). Caps total task lifetime — the inner driver's
+        // per-attempt `OPERATION_TTL = 60 s` would otherwise allow
+        // multi-attempt waits to compound. Any change here should be
+        // checked against the per-attempt budget so `MAX_RETRIES`
+        // attempts can complete within the deadline.
         const SUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         match tokio::time::timeout(
             SUBSCRIBE_TIMEOUT,
@@ -3501,7 +3508,7 @@ impl Executor<Runtime> {
         .await
         {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(ExecutorError::other(err)),
+            Ok(Err(err)) => Err(ExecutorError::other(anyhow::anyhow!("{err}"))),
             Err(_) => Err(ExecutorError::other(anyhow::anyhow!(
                 "executor subscribe timed out after {}s",
                 SUBSCRIBE_TIMEOUT.as_secs()
@@ -3722,6 +3729,53 @@ mod sub_op_get_migration_pin_tests {
             !body.contains(&op_request_needle),
             "local_state_or_from_network must NOT call self.op_request — \
              sub-op GET migration bypasses the legacy mediator path"
+        );
+    }
+
+    /// Pin: `executor::subscribe` MUST use the task-per-tx executor
+    /// SUBSCRIBE driver, not the legacy `op_request(SubscribeContract)`
+    /// path. Regression: legacy path went through the executor mediator
+    /// and called `request_subscribe`, pushing `SubscribeOp` into
+    /// `ops.subscribe` and keeping the SUBSCRIBE GC retry block alive
+    /// for the executor auto-subscribe writer.
+    ///
+    /// Migrated in #1454 SUBSCRIBE executor migration (mirrors the
+    /// GET phase 5-final pattern). The next slice retires the
+    /// SUBSCRIBE GC retry block once relay-side intermediate-peer
+    /// writers are also migrated.
+    #[test]
+    fn executor_subscribe_uses_run_executor_subscribe() {
+        let src = include_str!("runtime.rs");
+        let body = src
+            .split("async fn subscribe(&mut self, key: ContractKey)")
+            .nth(1)
+            .expect("executor::subscribe must exist")
+            .split(
+                "
+    }",
+            )
+            .next()
+            .expect("closing brace");
+        assert!(
+            body.contains("run_executor_subscribe"),
+            "executor::subscribe must call run_executor_subscribe — \
+             SUBSCRIBE executor migration (#1454)"
+        );
+        // Compose the needle at runtime so the assertion source itself
+        // doesn't trip the pin.
+        let sub_contract_needle = ["Subscribe", "Contract", " {"].concat();
+        assert!(
+            !body.contains(&sub_contract_needle),
+            "executor::subscribe must NOT construct legacy \
+             SubscribeContract — retired in #1454 SUBSCRIBE executor \
+             migration"
+        );
+        let op_request_needle = ["self.", "op_request"].concat();
+        assert!(
+            !body.contains(&op_request_needle),
+            "executor::subscribe must NOT call self.op_request — \
+             SUBSCRIBE executor migration bypasses the legacy mediator \
+             path"
         );
     }
 }

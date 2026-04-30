@@ -120,12 +120,6 @@ async fn fetch_contract_if_missing(
 struct PrepareRequestData {
     id: Transaction,
     instance_id: ContractInstanceId,
-    /// Read only by test fixtures via match-binding on
-    /// `SubscribeState::PrepareRequest(ref data)`. Production callers
-    /// drive through the task-per-tx machinery in `op_ctx_task.rs` and
-    /// never construct this state.
-    #[allow(dead_code)]
-    is_renewal: bool,
 }
 
 impl PrepareRequestData {
@@ -244,11 +238,7 @@ pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> Sub
     let id = Transaction::new::<SubscribeMsg>();
     SubscribeOp {
         id,
-        state: SubscribeState::PrepareRequest(PrepareRequestData {
-            id,
-            instance_id,
-            is_renewal,
-        }),
+        state: SubscribeState::PrepareRequest(PrepareRequestData { id, instance_id }),
         requester_addr: None, // Local operation, we are the originator
         requester_pub_key: None,
         is_renewal,
@@ -269,11 +259,7 @@ pub(crate) fn start_op_with_id(
 ) -> SubscribeOp {
     SubscribeOp {
         id,
-        state: SubscribeState::PrepareRequest(PrepareRequestData {
-            id,
-            instance_id,
-            is_renewal,
-        }),
+        state: SubscribeState::PrepareRequest(PrepareRequestData { id, instance_id }),
         requester_addr: None, // Local operation, we are the originator
         requester_pub_key: None,
         is_renewal,
@@ -333,11 +319,14 @@ pub(crate) fn create_unsubscribe_op(
 /// a subscribe request based on the node's current ring state and contract
 /// availability.
 ///
-/// This type exists so both the legacy state-machine path (`request_subscribe`)
-/// and the task-per-tx path (`op_ctx_task::run_client_subscribe`, #1454 Phase
-/// 2b) can share the "which peer, or local-complete, or give up?" decision
-/// logic without duplicating `k_closest_potentially_hosting` + fallback +
-/// local-completion handling.
+/// This type exists so all task-per-tx subscribe entry points
+/// (`op_ctx_task::run_client_subscribe`,
+/// `op_ctx_task::run_renewal_subscribe`,
+/// `op_ctx_task::run_executor_subscribe`) share the "which peer, or
+/// local-complete, or give up?" decision logic without duplicating
+/// `k_closest_potentially_hosting` + fallback + local-completion
+/// handling. The legacy state-machine path (`request_subscribe`) used
+/// the same helper before #1454 and is now retired.
 ///
 /// The returned values describe what the caller should do; the helper does
 /// NOT mutate `op_manager` or push state. Any side-effects (emitting
@@ -378,16 +367,16 @@ pub(super) enum InitialRequest {
 /// Compute the initial "where do we send this subscribe, or do we complete
 /// locally?" decision for a subscribe request.
 ///
-/// Factored out of [`request_subscribe`] so the task-per-tx client-initiated
-/// path (`op_ctx_task::run_client_subscribe`, #1454 Phase 2b) can reuse the
-/// exact same ring lookup / fallback / local-completion logic without
-/// duplicating it. The helper is pure modulo telemetry emission: it calls
-/// `NetEventLog::subscribe_request` on the `NetworkRequest` branch so both
-/// callers get identical event logs, but it does not mutate `op_manager`
-/// state and does not push any `SubscribeOp` into the per-op DashMap.
+/// All task-per-tx subscribe entry points
+/// (`op_ctx_task::run_client_subscribe`, `run_renewal_subscribe`,
+/// `run_executor_subscribe`) reuse the same ring lookup / fallback /
+/// local-completion logic via this helper. The helper is pure modulo
+/// telemetry emission: it calls `NetEventLog::subscribe_request` on
+/// the `NetworkRequest` branch so all callers get identical event
+/// logs, but it does not mutate `op_manager` state and does not push
+/// any `SubscribeOp` into the per-op DashMap.
 ///
-/// The decision branches exactly mirror the pre-extraction body of
-/// `request_subscribe`:
+/// The decision branches:
 ///
 /// 1. If the peer has no ring location (hasn't joined), check local contract
 ///    availability and either complete locally or return `PeerNotJoined`.
