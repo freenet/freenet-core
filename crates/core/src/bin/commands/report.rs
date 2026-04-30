@@ -11,7 +11,8 @@ use flate2::write::GzEncoder;
 use freenet::config::ConfigPaths;
 use freenet::tracing::tracer::get_log_dir;
 use freenet_stdlib::client_api::{
-    ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeQuery, QueryResponse, WebApi,
+    ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeDiagnosticsResponse, NodeQuery,
+    QueryResponse, WebApi,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -758,8 +759,7 @@ async fn query_node_diagnostics(host: &str, port: u16) -> Result<String> {
 
     match response {
         HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)) => {
-            // Serialize the diagnostics to JSON for the report
-            serde_json::to_string_pretty(&diag).context("Failed to serialize diagnostics")
+            diagnostics_to_json(&diag)
         }
         HostResponse::ContractResponse(_)
         | HostResponse::DelegateResponse { .. }
@@ -767,6 +767,64 @@ async fn query_node_diagnostics(host: &str, port: u16) -> Result<String> {
         | HostResponse::Ok
         | _ => anyhow::bail!("Unexpected response from node"),
     }
+}
+
+/// Serialize `NodeDiagnosticsResponse` to JSON for the report payload.
+///
+/// `contract_states` is keyed by `ContractKey`, whose derived `Serialize`
+/// impl emits a struct (`{instance, code}`). `serde_json` rejects non-string
+/// JSON map keys, so a direct `serde_json::to_string(&diag)` fails with
+/// "key must be a string" as soon as the node hosts at least one contract.
+/// We rebuild the field with stringified keys before serializing. The
+/// rest of the struct serializes natively. See freenet/freenet-core#3987.
+///
+/// The destructure-bind on the input forces a compile error if a field is
+/// added to `NodeDiagnosticsResponse` upstream — without it, the helper
+/// would silently drop the new field from the JSON payload.
+fn diagnostics_to_json(diag: &NodeDiagnosticsResponse) -> Result<String> {
+    use serde_json::{Map, Value};
+
+    let NodeDiagnosticsResponse {
+        node_info,
+        network_info,
+        subscriptions,
+        contract_states,
+        system_metrics,
+        connected_peers_detailed,
+    } = diag;
+
+    let mut states = Map::with_capacity(contract_states.len());
+    for (key, state) in contract_states {
+        let value =
+            serde_json::to_value(state).context("Failed to serialize contract state value")?;
+        states.insert(key.to_string(), value);
+    }
+
+    let mut value = Map::new();
+    value.insert(
+        "node_info".to_string(),
+        serde_json::to_value(node_info).context("Failed to serialize node_info")?,
+    );
+    value.insert(
+        "network_info".to_string(),
+        serde_json::to_value(network_info).context("Failed to serialize network_info")?,
+    );
+    value.insert(
+        "subscriptions".to_string(),
+        serde_json::to_value(subscriptions).context("Failed to serialize subscriptions")?,
+    );
+    value.insert("contract_states".to_string(), Value::Object(states));
+    value.insert(
+        "system_metrics".to_string(),
+        serde_json::to_value(system_metrics).context("Failed to serialize system_metrics")?,
+    );
+    value.insert(
+        "connected_peers_detailed".to_string(),
+        serde_json::to_value(connected_peers_detailed)
+            .context("Failed to serialize connected_peers_detailed")?,
+    );
+
+    serde_json::to_string_pretty(&Value::Object(value)).context("Failed to serialize diagnostics")
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -839,6 +897,213 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("linux"));
         assert!(json.contains("test log"));
+    }
+
+    #[test]
+    fn test_diagnostics_to_json_with_populated_contract_states() {
+        // Regression for #3987: serde_json::to_string_pretty(&NodeDiagnosticsResponse)
+        // panicked with "key must be a string" when contract_states had any entries,
+        // because ContractKey derives Serialize as a struct (not a string) and
+        // serde_json forbids non-string JSON object keys. Every report from a node
+        // hosting at least one contract was silently uploaded with empty
+        // network_status. The fix builds JSON manually with stringified keys.
+        use freenet_stdlib::client_api::ContractState;
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        use std::collections::HashMap;
+
+        let key1 = ContractKey::from_id_and_code(
+            ContractInstanceId::new([1u8; 32]),
+            CodeHash::new([2u8; 32]),
+        );
+        let key2 = ContractKey::from_id_and_code(
+            ContractInstanceId::new([3u8; 32]),
+            CodeHash::new([4u8; 32]),
+        );
+        let mut contract_states = HashMap::new();
+        contract_states.insert(
+            key1,
+            ContractState {
+                subscribers: 2,
+                subscriber_peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
+                size_bytes: 1234,
+            },
+        );
+        contract_states.insert(
+            key2,
+            ContractState {
+                subscribers: 0,
+                subscriber_peer_ids: vec![],
+                size_bytes: 0,
+            },
+        );
+
+        let diag = NodeDiagnosticsResponse {
+            node_info: None,
+            network_info: None,
+            subscriptions: vec![],
+            contract_states,
+            system_metrics: None,
+            connected_peers_detailed: vec![],
+        };
+
+        let json = diagnostics_to_json(&diag).expect("serialization must not fail");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("output must be valid JSON");
+
+        // Field is preserved.
+        let states = parsed["contract_states"]
+            .as_object()
+            .expect("contract_states must be a JSON object");
+        assert_eq!(states.len(), 2);
+
+        // Keys are the Base58 contract id (matches ContractKey's Display impl,
+        // which is what the report viewer expects), not the struct form
+        // {"instance":..., "code":...} that the broken derive produced.
+        assert!(states.contains_key(&key1.to_string()));
+        assert!(states.contains_key(&key2.to_string()));
+
+        // Values round-trip.
+        assert_eq!(states[&key1.to_string()]["subscribers"], 2);
+        assert_eq!(states[&key1.to_string()]["size_bytes"], 1234);
+    }
+
+    #[test]
+    fn test_native_serde_json_on_contract_states_fails_documents_root_cause() {
+        // Pin the failure mode so a stdlib-side fix that switches the key type
+        // surfaces here as a tightening, not a silent change. If this test
+        // starts passing, NodeDiagnosticsResponse.contract_states no longer
+        // requires the diagnostics_to_json workaround above and the helper can
+        // be removed in favour of a direct serde_json::to_string call.
+        use freenet_stdlib::client_api::ContractState;
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        use std::collections::HashMap;
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([1u8; 32]),
+            CodeHash::new([2u8; 32]),
+        );
+        let mut contract_states = HashMap::new();
+        contract_states.insert(
+            key,
+            ContractState {
+                subscribers: 0,
+                subscriber_peer_ids: vec![],
+                size_bytes: 0,
+            },
+        );
+        let diag = NodeDiagnosticsResponse {
+            node_info: None,
+            network_info: None,
+            subscriptions: vec![],
+            contract_states,
+            system_metrics: None,
+            connected_peers_detailed: vec![],
+        };
+
+        let err = serde_json::to_string(&diag)
+            .expect_err("native serde_json must reject ContractKey-keyed map");
+        assert!(
+            err.to_string().contains("key must be a string"),
+            "expected serde_json key-must-be-string error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_to_json_with_empty_contract_states() {
+        // The bug only triggered when contract_states had >=1 entry, but the
+        // empty case is the path users with no hosted contracts hit. Asserting
+        // both keeps either case from regressing.
+        let diag = NodeDiagnosticsResponse {
+            node_info: None,
+            network_info: None,
+            subscriptions: vec![],
+            contract_states: std::collections::HashMap::new(),
+            system_metrics: None,
+            connected_peers_detailed: vec![],
+        };
+
+        let json = diagnostics_to_json(&diag).expect("serialization must not fail");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("output must be valid JSON");
+        assert!(parsed["contract_states"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_diagnostics_to_json_all_fields_populated_round_trip() {
+        // Guard against typos in the manual field-by-field assembly inside
+        // diagnostics_to_json: every Option must be Some, every Vec must be
+        // non-empty, and every top-level key must round-trip with a
+        // distinguishable value. If anyone accidentally inserts the same
+        // key twice, drops a field, or mis-types a key (e.g. "nodeinfo"),
+        // the missing/duplicate field surfaces here instead of in production
+        // reports. The destructure-bind already catches *new* fields at
+        // compile time; this test catches typos in the *existing* fields
+        // that the compiler cannot.
+        use freenet_stdlib::client_api::{
+            ConnectedPeerInfo, ContractState, NetworkInfo, NodeInfo, SubscriptionInfo,
+            SystemMetrics,
+        };
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        use std::collections::HashMap;
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let mut contract_states = HashMap::new();
+        contract_states.insert(
+            key,
+            ContractState {
+                subscribers: 5,
+                subscriber_peer_ids: vec!["peer-z".to_string()],
+                size_bytes: 9999,
+            },
+        );
+
+        let diag = NodeDiagnosticsResponse {
+            node_info: Some(NodeInfo {
+                peer_id: "peer-self".to_string(),
+                is_gateway: true,
+                location: Some("0.5".to_string()),
+                listening_address: Some("0.0.0.0:31337".to_string()),
+                uptime_seconds: 3600,
+            }),
+            network_info: Some(NetworkInfo {
+                connected_peers: vec![("peer-x".to_string(), "10.0.0.1:31337".to_string())],
+                active_connections: 1,
+            }),
+            subscriptions: vec![SubscriptionInfo {
+                contract_key: ContractInstanceId::new([7u8; 32]),
+                client_id: 42,
+            }],
+            contract_states,
+            system_metrics: Some(SystemMetrics {
+                active_connections: 1,
+                hosting_contracts: 1,
+            }),
+            connected_peers_detailed: vec![ConnectedPeerInfo {
+                peer_id: "peer-x".to_string(),
+                address: "10.0.0.1:31337".to_string(),
+            }],
+        };
+
+        let json = diagnostics_to_json(&diag).expect("serialization must not fail");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("output must be valid JSON");
+
+        // All six top-level keys present and distinguishable.
+        let obj = parsed.as_object().expect("top-level must be object");
+        assert_eq!(obj.len(), 6, "expected six top-level fields, got {obj:?}");
+        assert_eq!(parsed["node_info"]["peer_id"], "peer-self");
+        assert_eq!(parsed["network_info"]["active_connections"], 1);
+        assert_eq!(parsed["subscriptions"][0]["client_id"], 42);
+        assert_eq!(parsed["system_metrics"]["hosting_contracts"], 1);
+        assert_eq!(parsed["connected_peers_detailed"][0]["peer_id"], "peer-x");
+        let states = parsed["contract_states"]
+            .as_object()
+            .expect("contract_states must be a JSON object");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[&key.to_string()]["size_bytes"], 9999);
     }
 
     #[test]
