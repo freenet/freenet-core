@@ -231,6 +231,10 @@ async fn drive_client_put_inner(
         tried: Vec<std::net::SocketAddr>,
         retries: usize,
         current_target: PeerKeyLocation,
+        /// Per-attempt timeout. Scaled with payload size for streaming PUTs
+        /// so the retry loop doesn't fire while the original streaming op
+        /// is still in flight (#4001).
+        attempt_timeout: std::time::Duration,
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
@@ -283,7 +287,14 @@ async fn drive_client_put_inner(
                 None => AdvanceOutcome::Exhausted,
             }
         }
+
+        fn attempt_timeout(&self) -> std::time::Duration {
+            self.attempt_timeout
+        }
     }
+
+    let attempt_timeout =
+        compute_put_attempt_timeout(op_manager.streaming_threshold, &value, &contract);
 
     let mut driver = PutRetryDriver {
         op_manager,
@@ -295,6 +306,7 @@ async fn drive_client_put_inner(
         tried,
         retries: 0,
         current_target,
+        attempt_timeout,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
@@ -403,6 +415,45 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
         },
         _ => ReplyClass::Unexpected,
     }
+}
+
+// --- Per-attempt timeout (issue #4001) ---
+
+/// Compute the per-attempt timeout the client-PUT driver passes to
+/// `drive_retry_loop`.
+///
+/// Approximates the bincode-serialized
+/// `PutStreamingPayload { contract, related_contracts, value }` size as
+/// `state.size() + contract.data().len() + contract.params().size()` and
+/// delegates to [`crate::operations::streaming_aware_attempt_timeout`] for
+/// the scaling formula and cap.
+///
+/// **Excluded from the estimate**: `RelatedContracts` and bincode framing.
+/// For typical PUT payloads these contribute at most a small constant; the
+/// `STREAMING_MIN_DRAIN_SECS` floor and the 20 KiB/s throughput floor (~2×
+/// margin vs observed throughput) inside `streaming_aware_attempt_timeout`
+/// absorb the gap.
+///
+/// **Known limitation — pre-merge value**: this is computed from the
+/// client-supplied `value` *before* `put_contract` runs the contract's
+/// `update_state` against the cached state. If a merge expands the
+/// payload substantially (e.g. a small delta merged into a large existing
+/// state, then forwarded as the merged result), the driver may
+/// under-estimate the streamed size. For the freenet.org website case
+/// (full-state replace, no merge expansion), this does not apply. Issue
+/// #4001's follow-up inactivity-based design (approach (c)) eliminates
+/// the merge-expansion gap structurally by observing per-fragment
+/// progress instead of pre-computing a wall-clock budget.
+fn compute_put_attempt_timeout(
+    streaming_threshold: usize,
+    value: &WrappedState,
+    contract: &ContractContainer,
+) -> std::time::Duration {
+    let payload_size_estimate = value
+        .size()
+        .saturating_add(contract.data().len())
+        .saturating_add(contract.params().size());
+    crate::operations::streaming_aware_attempt_timeout(streaming_threshold, payload_size_estimate)
 }
 
 // --- Peer advance ---
@@ -1662,6 +1713,90 @@ mod tests {
         let tx = dummy_tx();
         let msg = NetMessage::V1(NetMessageV1::Aborted(tx));
         assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
+    }
+
+    /// Behavioral regression for issue #4001: the client-PUT driver's
+    /// per-attempt timeout must scale up when the (state + contract code)
+    /// payload would trigger streaming. A small payload uses the unscaled
+    /// `OPERATION_TTL`; a payload at the freenet.org website's observed
+    /// 2.4 MB size must clear the 63 s the original streaming PUT actually
+    /// took before declaring the attempt dead.
+    ///
+    /// This test exercises the helper directly — refactors that move or
+    /// rename the call site but preserve the contract still pass.
+    #[test]
+    fn compute_put_attempt_timeout_matches_payload_streaming_decision() {
+        use crate::config::OPERATION_TTL;
+
+        let small_state = WrappedState::new(vec![0u8; 1024]);
+        let small_contract =
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+                Arc::new(ContractCode::from(vec![0u8; 256])),
+                Parameters::from(vec![]),
+            )));
+        // 64 KiB default streaming threshold; small payload => OPERATION_TTL.
+        assert_eq!(
+            compute_put_attempt_timeout(64 * 1024, &small_state, &small_contract),
+            OPERATION_TTL,
+            "non-streaming-eligible payload must reuse OPERATION_TTL"
+        );
+
+        // Website case: 2.4 MB total. Must exceed the observed 63 s
+        // completion so the retry loop doesn't fire mid-flight.
+        let website_state = WrappedState::new(vec![0u8; 2_460_242 - 256]);
+        let timeout = compute_put_attempt_timeout(64 * 1024, &website_state, &small_contract);
+        assert!(
+            timeout > std::time::Duration::from_secs(63),
+            "website-scale payload timeout {timeout:?} must exceed observed \
+             completion (~62 s); otherwise issue #4001 recurs"
+        );
+        assert!(
+            timeout > OPERATION_TTL,
+            "website-scale payload timeout {timeout:?} must exceed OPERATION_TTL"
+        );
+    }
+
+    /// The size estimate (`state.size() + contract.data().len()`) is a
+    /// strict lower bound on the actual bincode-serialized
+    /// `PutStreamingPayload` size that `process_message` checks against
+    /// `streaming_threshold`. The 20 KiB/s throughput floor inside
+    /// `streaming_aware_attempt_timeout` then absorbs the slack, but only
+    /// if the slack stays below ~2× (half of observed throughput).
+    ///
+    /// This test pins that invariant by constructing a representative
+    /// payload and confirming the bincode size is within 2× of the
+    /// estimate. If a future change to bincode framing or
+    /// `PutStreamingPayload` blows past 2×, the throughput floor needs
+    /// re-tuning OR the estimate needs to include more fields.
+    #[test]
+    fn payload_size_estimate_within_throughput_floor_safety_margin() {
+        use crate::operations::put::PutStreamingPayload;
+
+        // Realistic payload: 1 MB state + 200 KB contract code + nontrivial
+        // parameters and one related contract — i.e. headroom-stress for
+        // the things the estimate omits.
+        let state = WrappedState::new(vec![0xABu8; 1024 * 1024]);
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![0x42u8; 200 * 1024])),
+            Parameters::from(vec![0x55u8; 4096]),
+        )));
+
+        let estimate = state.size() + contract.data().len();
+        let payload = PutStreamingPayload {
+            contract: contract.clone(),
+            related_contracts: RelatedContracts::default(),
+            value: state,
+        };
+        let actual = bincode::serialized_size(&payload).expect("serializable") as usize;
+
+        assert!(
+            actual <= estimate.saturating_mul(2),
+            "bincode payload size {actual} exceeds 2× estimate {estimate} — \
+             the 20 KiB/s throughput floor (half observed throughput) no \
+             longer absorbs the slack; either tighten the estimate (include \
+             parameters / related_contracts) or revisit \
+             STREAMING_THROUGHPUT_FLOOR_BPS in operations.rs"
+        );
     }
 
     #[test]

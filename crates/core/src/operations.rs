@@ -768,6 +768,66 @@ pub(crate) fn should_use_streaming(streaming_threshold: usize, payload_size: usi
     payload_size > streaming_threshold
 }
 
+/// Conservative effective throughput floor for streaming transfers (bytes/sec).
+///
+/// Used to scale the per-attempt timeout for streaming PUTs. Set to 20 KiB/s
+/// so that even a slow link (or congested gateway) has time to drain a large
+/// payload before the retry loop fires. Real-world end-to-end throughput
+/// observed for the freenet.org website upload (2.4 MB in ~62 s) is ~40 KiB/s,
+/// so 20 KiB/s gives ~2x safety margin.
+const STREAMING_THROUGHPUT_FLOOR_BPS: usize = 20 * 1024;
+
+/// Minimum drain budget added to streaming timeouts on top of `OPERATION_TTL`.
+///
+/// Without this floor, payloads just above `streaming_threshold` (where
+/// `payload_size / STREAMING_THROUGHPUT_FLOOR_BPS` rounds down to 0) would
+/// fall back to the unscaled `OPERATION_TTL` even though `process_message`
+/// chose to stream them. That's exactly the #4001 bug — so guarantee at
+/// least an extra 30 s of headroom for *every* streaming-eligible payload.
+/// 30 s covers stream handshake + first chunk RTT + brief congestion.
+const STREAMING_MIN_DRAIN_SECS: u64 = 30;
+
+/// Hard ceiling on the per-attempt timeout for streaming PUTs.
+///
+/// Even at the throughput floor, a 25 MB payload would only need ~21 minutes,
+/// but capping at 10 minutes prevents pathological cases (a wedged remote that
+/// never errors) from holding the driver hostage indefinitely. The retry loop
+/// can still recover by advancing to a different peer when this fires.
+const STREAMING_ATTEMPT_TIMEOUT_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Compute the per-attempt timeout for an operation whose payload may use
+/// streaming transport.
+///
+/// For non-streaming payloads (size <= `streaming_threshold`), returns
+/// [`crate::config::OPERATION_TTL`] (60 s) — there is no per-fragment progress
+/// to wait on, so the standard timeout applies.
+///
+/// For streaming payloads, returns `OPERATION_TTL` (handshake / k-closest /
+/// downstream relays) plus `max(STREAMING_MIN_DRAIN_SECS, payload_size /
+/// STREAMING_THROUGHPUT_FLOOR_BPS)` seconds to give the streaming layer time
+/// to drain the bytes, capped at [`STREAMING_ATTEMPT_TIMEOUT_CAP`] (10 min).
+/// The `STREAMING_MIN_DRAIN_SECS` floor ensures payloads just above the
+/// threshold still escape the unscaled `OPERATION_TTL` (integer truncation
+/// would otherwise reduce the drain term to zero — re-introducing the
+/// #4001 bug for payloads of size `(threshold, threshold + floor_bps)`).
+///
+/// This is a heuristic: it relocates the cliff at which `drive_retry_loop`
+/// fires retries while the original streaming op is still in flight, but does
+/// not eliminate it. Issue #4001 has a follow-up design to replace this with
+/// a true stream-inactivity timeout that observes per-fragment progress.
+pub(crate) fn streaming_aware_attempt_timeout(
+    streaming_threshold: usize,
+    payload_size: usize,
+) -> std::time::Duration {
+    if !should_use_streaming(streaming_threshold, payload_size) {
+        return crate::config::OPERATION_TTL;
+    }
+    let drain_secs =
+        ((payload_size / STREAMING_THROUGHPUT_FLOOR_BPS) as u64).max(STREAMING_MIN_DRAIN_SECS);
+    let total = crate::config::OPERATION_TTL + std::time::Duration::from_secs(drain_secs);
+    total.min(STREAMING_ATTEMPT_TIMEOUT_CAP)
+}
+
 #[cfg(test)]
 mod ordering_invariant_tests {
     //! Tests documenting critical ordering invariants in the operations module.
@@ -870,7 +930,11 @@ mod ordering_invariant_tests {
 
 #[cfg(test)]
 mod streaming_tests {
-    use super::should_use_streaming;
+    use super::{
+        STREAMING_ATTEMPT_TIMEOUT_CAP, should_use_streaming, streaming_aware_attempt_timeout,
+    };
+    use crate::config::OPERATION_TTL;
+    use std::time::Duration;
 
     const DEFAULT_THRESHOLD: usize = 64 * 1024; // 64KB
 
@@ -900,6 +964,143 @@ mod streaming_tests {
         assert!(!should_use_streaming(0, 0));
         assert!(should_use_streaming(0, 1));
         assert!(should_use_streaming(0, 100));
+    }
+
+    /// Non-streaming payloads (at or below the threshold) get the standard
+    /// `OPERATION_TTL`. Crossing the threshold is what triggers scaling.
+    #[test]
+    fn non_streaming_payload_uses_operation_ttl() {
+        assert_eq!(
+            streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 0),
+            OPERATION_TTL
+        );
+        assert_eq!(
+            streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 1024),
+            OPERATION_TTL
+        );
+        assert_eq!(
+            streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD),
+            OPERATION_TTL
+        );
+    }
+
+    /// Regression test for #4001: a 2.4 MB payload (the freenet.org website
+    /// case) MUST get a per-attempt timeout that exceeds the observed
+    /// end-to-end completion time of ~62 s. With the old hard-coded 60 s
+    /// `OPERATION_TTL`, the retry loop fired three retries while the
+    /// original streaming PUT was still in flight, causing version-conflict
+    /// failures on every push to `freenet/web`.
+    #[test]
+    fn website_payload_attempt_timeout_exceeds_observed_completion() {
+        let website_payload_size = 2_460_242; // bytes, from freenet/web 2026-05-01 logs
+        let timeout = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, website_payload_size);
+        let observed_completion = Duration::from_secs(63); // log: elapsed_ms=62335
+
+        assert!(
+            timeout > observed_completion,
+            "streaming-aware timeout ({timeout:?}) must exceed observed \
+             completion time ({observed_completion:?}) so the retry loop \
+             does not fire while the original streaming PUT is still in \
+             flight (issue #4001)"
+        );
+        assert!(
+            timeout > OPERATION_TTL,
+            "streaming-aware timeout ({timeout:?}) must exceed OPERATION_TTL \
+             ({OPERATION_TTL:?}); otherwise the fix is a no-op for the bug \
+             reported in #4001"
+        );
+    }
+
+    /// Streaming timeouts grow with payload size — a 10 MB payload gets a
+    /// strictly larger timeout than a 1 MB payload, so the cliff scales.
+    #[test]
+    fn streaming_timeout_scales_with_payload_size() {
+        let small_streaming = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 1_000_000);
+        let medium_streaming = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 10_000_000);
+
+        assert!(
+            small_streaming < medium_streaming,
+            "1 MB timeout ({small_streaming:?}) must be smaller than \
+             10 MB timeout ({medium_streaming:?})"
+        );
+        assert!(small_streaming > OPERATION_TTL);
+        assert!(medium_streaming > OPERATION_TTL);
+    }
+
+    /// Pathological payloads cannot push the per-attempt timeout above the
+    /// hard ceiling. Without this, a wedged remote could hold the driver
+    /// hostage indefinitely.
+    #[test]
+    fn streaming_timeout_capped_at_ceiling() {
+        // 1 GB — far beyond the per-attempt ceiling at 20 KB/s floor.
+        let huge = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 1024 * 1024 * 1024);
+        assert_eq!(
+            huge, STREAMING_ATTEMPT_TIMEOUT_CAP,
+            "huge payloads must clamp to the cap"
+        );
+    }
+
+    /// Boundary: the threshold itself is non-streaming, but `threshold + 1`
+    /// crosses into streaming territory. The timeout MUST jump *strictly*
+    /// above `OPERATION_TTL` at the crossing — otherwise streaming PUTs
+    /// just over the threshold inherit the unscaled 60 s timeout that this
+    /// fix is trying to escape.
+    ///
+    /// Without [`super::STREAMING_MIN_DRAIN_SECS`], integer division
+    /// would truncate `1 / 20 KiB` to 0 s of drain budget for any payload
+    /// of size `(threshold, threshold + STREAMING_THROUGHPUT_FLOOR_BPS)`,
+    /// silently re-introducing the #4001 bug. Pin both ends of that gap.
+    #[test]
+    fn streaming_timeout_jumps_above_threshold_boundary() {
+        let at_threshold = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD);
+        let just_above = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD + 1);
+        // 19 KiB above threshold — would be `0 s drain` under naive
+        // truncation, but the floor saves us.
+        let in_truncation_gap =
+            streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD + 19 * 1024);
+        assert_eq!(at_threshold, OPERATION_TTL);
+        assert!(
+            just_above > OPERATION_TTL,
+            "just-above-threshold timeout {just_above:?} must STRICTLY \
+             exceed OPERATION_TTL ({OPERATION_TTL:?}); a fix that lets \
+             this equal OPERATION_TTL is a no-op for the size range \
+             (threshold, threshold + 20 KiB) — exactly the truncation \
+             gap STREAMING_MIN_DRAIN_SECS exists to close (#4001 \
+             skeptical review)"
+        );
+        assert!(
+            in_truncation_gap > OPERATION_TTL,
+            "payload in the truncation gap (threshold + 19 KiB) must \
+             exceed OPERATION_TTL — STREAMING_MIN_DRAIN_SECS guarantees it"
+        );
+    }
+
+    /// The minimum-drain floor applies to every streaming-eligible payload.
+    /// Pin the exact value so a future tightening of the floor can't
+    /// silently reintroduce the truncation gap.
+    #[test]
+    fn streaming_timeout_min_drain_floor() {
+        let just_above = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD + 1);
+        assert_eq!(
+            just_above,
+            OPERATION_TTL + Duration::from_secs(super::STREAMING_MIN_DRAIN_SECS),
+            "streaming-eligible payloads must get at least \
+             OPERATION_TTL + STREAMING_MIN_DRAIN_SECS"
+        );
+    }
+
+    /// Pin the exact payload size where the timeout stops scaling and
+    /// clamps to the 10-min ceiling. With a 60 s base + 20 KiB/s floor +
+    /// 600 s cap, scaling stops at exactly `(600 - 60) * 20 KiB`.
+    #[test]
+    fn streaming_timeout_cap_boundary() {
+        const FLOOR_BPS: usize = 20 * 1024;
+        let scaling_max_bytes =
+            (STREAMING_ATTEMPT_TIMEOUT_CAP - OPERATION_TTL).as_secs() as usize * FLOOR_BPS;
+        let just_below_cap = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, scaling_max_bytes);
+        let at_cap = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, scaling_max_bytes + 1);
+        assert_eq!(just_below_cap, STREAMING_ATTEMPT_TIMEOUT_CAP);
+        assert_eq!(at_cap, STREAMING_ATTEMPT_TIMEOUT_CAP);
     }
 }
 
