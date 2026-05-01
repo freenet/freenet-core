@@ -647,7 +647,11 @@ update_versions() {
     # binstall pkg-url embeds `vX.Y.Z` (the freenet version) literally rather
     # than `v{ version }`. Re-point it to the current release each bump so
     # that `cargo binstall fdev` resolves to the actual GitHub release assets
-    # (issue #3995).
+    # (issue #3995). The `/g` flag is load-bearing — there are two pkg-url
+    # lines (default + Windows override) that both need the rewrite. Mirror
+    # in `.github/workflows/release.yml`; tests in
+    # `crates/fdev/tests/binstall_metadata.rs::release_sed_rewrite` keep both
+    # copies of the regex in lockstep.
     sed_inplace "s|releases/download/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/fdev-|releases/download/v${VERSION}/fdev-|g" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
     echo "✓"
 
