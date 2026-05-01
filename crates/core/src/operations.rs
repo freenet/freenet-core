@@ -777,6 +777,16 @@ pub(crate) fn should_use_streaming(streaming_threshold: usize, payload_size: usi
 /// so 20 KiB/s gives ~2x safety margin.
 const STREAMING_THROUGHPUT_FLOOR_BPS: usize = 20 * 1024;
 
+/// Minimum drain budget added to streaming timeouts on top of `OPERATION_TTL`.
+///
+/// Without this floor, payloads just above `streaming_threshold` (where
+/// `payload_size / STREAMING_THROUGHPUT_FLOOR_BPS` rounds down to 0) would
+/// fall back to the unscaled `OPERATION_TTL` even though `process_message`
+/// chose to stream them. That's exactly the #4001 bug — so guarantee at
+/// least an extra 30 s of headroom for *every* streaming-eligible payload.
+/// 30 s covers stream handshake + first chunk RTT + brief congestion.
+const STREAMING_MIN_DRAIN_SECS: u64 = 30;
+
 /// Hard ceiling on the per-attempt timeout for streaming PUTs.
 ///
 /// Even at the throughput floor, a 25 MB payload would only need ~21 minutes,
@@ -793,9 +803,13 @@ const STREAMING_ATTEMPT_TIMEOUT_CAP: std::time::Duration = std::time::Duration::
 /// to wait on, so the standard timeout applies.
 ///
 /// For streaming payloads, returns `OPERATION_TTL` (handshake / k-closest /
-/// downstream relays) plus `payload_size / STREAMING_THROUGHPUT_FLOOR_BPS`
-/// seconds to give the streaming layer time to drain the bytes, capped at
-/// [`STREAMING_ATTEMPT_TIMEOUT_CAP`] (10 min).
+/// downstream relays) plus `max(STREAMING_MIN_DRAIN_SECS, payload_size /
+/// STREAMING_THROUGHPUT_FLOOR_BPS)` seconds to give the streaming layer time
+/// to drain the bytes, capped at [`STREAMING_ATTEMPT_TIMEOUT_CAP`] (10 min).
+/// The `STREAMING_MIN_DRAIN_SECS` floor ensures payloads just above the
+/// threshold still escape the unscaled `OPERATION_TTL` (integer truncation
+/// would otherwise reduce the drain term to zero — re-introducing the
+/// #4001 bug for payloads of size `(threshold, threshold + floor_bps)`).
 ///
 /// This is a heuristic: it relocates the cliff at which `drive_retry_loop`
 /// fires retries while the original streaming op is still in flight, but does
@@ -808,7 +822,8 @@ pub(crate) fn streaming_aware_attempt_timeout(
     if !should_use_streaming(streaming_threshold, payload_size) {
         return crate::config::OPERATION_TTL;
     }
-    let drain_secs = (payload_size / STREAMING_THROUGHPUT_FLOOR_BPS) as u64;
+    let drain_secs =
+        ((payload_size / STREAMING_THROUGHPUT_FLOOR_BPS) as u64).max(STREAMING_MIN_DRAIN_SECS);
     let total = crate::config::OPERATION_TTL + std::time::Duration::from_secs(drain_secs);
     total.min(STREAMING_ATTEMPT_TIMEOUT_CAP)
 }
@@ -1026,19 +1041,66 @@ mod streaming_tests {
     }
 
     /// Boundary: the threshold itself is non-streaming, but `threshold + 1`
-    /// crosses into streaming territory. The timeout MUST jump strictly
+    /// crosses into streaming territory. The timeout MUST jump *strictly*
     /// above `OPERATION_TTL` at the crossing — otherwise streaming PUTs
     /// just over the threshold inherit the unscaled 60 s timeout that this
     /// fix is trying to escape.
+    ///
+    /// Without [`super::STREAMING_MIN_DRAIN_SECS`], integer division
+    /// would truncate `1 / 20 KiB` to 0 s of drain budget for any payload
+    /// of size `(threshold, threshold + STREAMING_THROUGHPUT_FLOOR_BPS)`,
+    /// silently re-introducing the #4001 bug. Pin both ends of that gap.
     #[test]
     fn streaming_timeout_jumps_above_threshold_boundary() {
         let at_threshold = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD);
         let just_above = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD + 1);
+        // 19 KiB above threshold — would be `0 s drain` under naive
+        // truncation, but the floor saves us.
+        let in_truncation_gap =
+            streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD + 19 * 1024);
         assert_eq!(at_threshold, OPERATION_TTL);
         assert!(
-            just_above >= OPERATION_TTL,
-            "just-above-threshold timeout must be at least OPERATION_TTL"
+            just_above > OPERATION_TTL,
+            "just-above-threshold timeout {just_above:?} must STRICTLY \
+             exceed OPERATION_TTL ({OPERATION_TTL:?}); a fix that lets \
+             this equal OPERATION_TTL is a no-op for the size range \
+             (threshold, threshold + 20 KiB) — exactly the truncation \
+             gap STREAMING_MIN_DRAIN_SECS exists to close (#4001 \
+             skeptical review)"
         );
+        assert!(
+            in_truncation_gap > OPERATION_TTL,
+            "payload in the truncation gap (threshold + 19 KiB) must \
+             exceed OPERATION_TTL — STREAMING_MIN_DRAIN_SECS guarantees it"
+        );
+    }
+
+    /// The minimum-drain floor applies to every streaming-eligible payload.
+    /// Pin the exact value so a future tightening of the floor can't
+    /// silently reintroduce the truncation gap.
+    #[test]
+    fn streaming_timeout_min_drain_floor() {
+        let just_above = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD + 1);
+        assert_eq!(
+            just_above,
+            OPERATION_TTL + Duration::from_secs(super::STREAMING_MIN_DRAIN_SECS),
+            "streaming-eligible payloads must get at least \
+             OPERATION_TTL + STREAMING_MIN_DRAIN_SECS"
+        );
+    }
+
+    /// Pin the exact payload size where the timeout stops scaling and
+    /// clamps to the 10-min ceiling. With a 60 s base + 20 KiB/s floor +
+    /// 600 s cap, scaling stops at exactly `(600 - 60) * 20 KiB`.
+    #[test]
+    fn streaming_timeout_cap_boundary() {
+        const FLOOR_BPS: usize = 20 * 1024;
+        let scaling_max_bytes =
+            (STREAMING_ATTEMPT_TIMEOUT_CAP - OPERATION_TTL).as_secs() as usize * FLOOR_BPS;
+        let just_below_cap = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, scaling_max_bytes);
+        let at_cap = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, scaling_max_bytes + 1);
+        assert_eq!(just_below_cap, STREAMING_ATTEMPT_TIMEOUT_CAP);
+        assert_eq!(at_cap, STREAMING_ATTEMPT_TIMEOUT_CAP);
     }
 }
 
