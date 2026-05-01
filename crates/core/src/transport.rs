@@ -438,15 +438,23 @@ impl Socket for UdpSocket {
         let (len, addr) = self.recv_from(buf).await?;
         // Normalize ::ffff:x.x.x.x → plain IPv4 so the rest of the system
         // sees a consistent address regardless of socket type.
-        Ok((len, normalize_mapped_addr(addr)))
+        let addr = normalize_mapped_addr(addr);
+        metrics::TRANSPORT_METRICS.record_packet_received(addr, len as u64);
+        Ok((len, addr))
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         // Convert plain IPv4 targets to mapped form when sending on an IPv6 socket,
         // since AF_INET6 sockets reject AF_INET addresses with EINVAL.
         let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
-        let target = map_addr_for_send(local_is_ipv6, target);
-        self.send_to(buf, target).await
+        let mapped_target = map_addr_for_send(local_is_ipv6, target);
+        let result = self.send_to(buf, mapped_target).await;
+        if let Ok(bytes) = result {
+            // Record against the un-mapped target so per-peer keys match the
+            // normalized form used everywhere else in the system.
+            metrics::TRANSPORT_METRICS.record_packet_sent(target, bytes as u64);
+        }
+        result
     }
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
@@ -454,13 +462,16 @@ impl Socket for UdpSocket {
         // However, under high load the kernel buffer might be full, returning WouldBlock.
         // In that case, we retry with exponential backoff since we're in a blocking context.
         let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
-        let target = map_addr_for_send(local_is_ipv6, target);
+        let mapped_target = map_addr_for_send(local_is_ipv6, target);
         let mut backoff_us = 1u64; // Start at 1μs
         const MAX_BACKOFF_US: u64 = 1000; // Cap at 1ms
 
         loop {
-            match self.try_send_to(buf, target) {
-                Ok(n) => return Ok(n),
+            match self.try_send_to(buf, mapped_target) {
+                Ok(n) => {
+                    metrics::TRANSPORT_METRICS.record_packet_sent(target, n as u64);
+                    return Ok(n);
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // Kernel buffer full - exponential backoff
                     std::thread::sleep(std::time::Duration::from_micros(backoff_us));
@@ -794,5 +805,71 @@ mod dual_stack_tests {
             .await
             .unwrap();
         assert_eq!(&buf[..len], b"pong");
+    }
+
+    /// Regression: every successful send_to / recv_from on the production
+    /// `UdpSocket` must update both the cumulative wire-byte counters and the
+    /// per-peer counters used by the local dashboard. Before this fix, those
+    /// counters only moved on stream-transfer completion, so a node connected
+    /// for hours could legitimately show "—" for SENT/RECV despite real
+    /// keep-alive traffic flowing.
+    #[tokio::test]
+    async fn udp_socket_records_packet_metrics() {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        let sender = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let receiver = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+
+        let cumulative_sent_before = TRANSPORT_METRICS.cumulative_bytes_sent();
+        let cumulative_recv_before = TRANSPORT_METRICS.cumulative_bytes_received();
+
+        let payload = b"keep-alive-sized-control-packet";
+        <UdpSocket as Socket>::send_to(&sender, payload, receiver_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let (len, _) = <UdpSocket as Socket>::recv_from(&receiver, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(len, payload.len());
+
+        // Cumulative counters must move at least by the payload size each way.
+        // Other tests running in parallel may push them higher, hence the >=.
+        assert!(
+            TRANSPORT_METRICS.cumulative_bytes_sent()
+                >= cumulative_sent_before + payload.len() as u64,
+            "cumulative_bytes_sent must include the payload"
+        );
+        assert!(
+            TRANSPORT_METRICS.cumulative_bytes_received()
+                >= cumulative_recv_before + payload.len() as u64,
+            "cumulative_bytes_received must include the payload"
+        );
+
+        // Per-peer counters keyed by the un-mapped target / normalized source
+        // (both plain IPv4 here) must include the payload.
+        let peers = TRANSPORT_METRICS.per_peer_snapshot();
+        let receiver_entry = peers
+            .iter()
+            .find(|(a, _, _)| *a == receiver_addr)
+            .expect("per-peer entry for send target must exist");
+        assert!(
+            receiver_entry.1 >= payload.len() as u64,
+            "per-peer bytes_sent must include the payload (got {})",
+            receiver_entry.1
+        );
+        let sender_entry = peers
+            .iter()
+            .find(|(a, _, _)| *a == sender_addr)
+            .expect("per-peer entry for recv source must exist");
+        assert!(
+            sender_entry.2 >= payload.len() as u64,
+            "per-peer bytes_received must include the payload (got {})",
+            sender_entry.2
+        );
     }
 }
