@@ -266,20 +266,27 @@ impl TransportMetrics {
 
     /// Record a completed inbound stream transfer.
     ///
-    /// Updates the per-snapshot `bytes_received` counter (which pairs with
-    /// `transfers_completed` for telemetry). Wire-byte counters
-    /// (`cumulative_bytes_received`, per-peer `bytes_received`) are updated at
-    /// the socket layer in `record_packet_received`.
-    pub fn record_inbound_completed(&self, _remote_addr: SocketAddr, bytes: u64) {
+    /// Aggregates stream-payload bytes into the per-snapshot `bytes_received`
+    /// counter, which pairs with `transfers_completed` for periodic telemetry.
+    /// Wire-byte counters (`cumulative_bytes_received`, per-peer
+    /// `bytes_received`) are owned by [`Self::record_packet_received`] at the
+    /// socket layer.
+    pub fn record_inbound_completed(&self, bytes: u64) {
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Record an outbound UDP packet at the socket layer.
     ///
-    /// Updates the cumulative dashboard counter and the per-peer counter.
-    /// Counts every packet, including keep-alives, ACKs, and small control
-    /// messages, so the local dashboard reflects real wire activity rather
-    /// than only large stream transfers.
+    /// Updates the cumulative dashboard counter and the per-peer counter so
+    /// keep-alives, ACKs, and other small control messages all show up on the
+    /// local dashboard, not just large stream transfers.
+    ///
+    /// `remote_addr` MUST be the canonical (un-mapped) form used elsewhere in
+    /// the system — the same form `recv_from` returns after
+    /// `normalize_mapped_addr`. Mismatched callers (e.g. passing a
+    /// `::ffff:x.x.x.x` mapped target on a dual-stack socket) would create a
+    /// duplicate per-peer entry that the dashboard cannot join against
+    /// `connected_peers[].address`.
     pub fn record_packet_sent(&self, remote_addr: SocketAddr, bytes: u64) {
         self.cumulative_bytes_sent
             .fetch_add(bytes, Ordering::Relaxed);
@@ -288,7 +295,8 @@ impl TransportMetrics {
 
     /// Record an inbound UDP packet at the socket layer.
     ///
-    /// See [`Self::record_packet_sent`] for the counter semantics.
+    /// See [`Self::record_packet_sent`] for the counter semantics and the
+    /// canonical-address contract on `remote_addr`.
     pub fn record_packet_received(&self, remote_addr: SocketAddr, bytes: u64) {
         self.cumulative_bytes_received
             .fetch_add(bytes, Ordering::Relaxed);
@@ -300,7 +308,17 @@ impl TransportMetrics {
         self.cumulative_bytes_received.load(Ordering::Relaxed)
     }
 
-    /// Record per-peer bytes for the given direction (bounded to MAX_TRACKED_PEERS).
+    /// Record per-peer bytes for the given direction.
+    ///
+    /// Bounded to [`MAX_TRACKED_PEERS`] entries: once full, new peers' bytes
+    /// are silently dropped (existing entries continue to update). There is no
+    /// LRU eviction. Combined with the fact that `record_packet_received`
+    /// runs at the raw socket before authentication, an attacker that
+    /// fabricates packets from many spoofed source IPs can fill the table
+    /// with abandoned entries and crowd out legitimate new peers from the
+    /// dashboard's per-peer view. Memory damage is still bounded (256 entries
+    /// × ~16 bytes), and authenticated traffic on the existing connections
+    /// continues to be metered correctly. Follow-up tracked in #3999.
     fn record_per_peer(
         &self,
         addr: SocketAddr,
@@ -671,10 +689,9 @@ mod tests {
         // double-counting bug (counted both at socket layer and at stream
         // completion) cannot regress.
         let metrics = TransportMetrics::new();
-        let addr: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
 
-        metrics.record_inbound_completed(addr, 2048);
-        metrics.record_inbound_completed(addr, 1024);
+        metrics.record_inbound_completed(2048);
+        metrics.record_inbound_completed(1024);
 
         assert_eq!(
             metrics.cumulative_bytes_received(),
@@ -690,7 +707,7 @@ mod tests {
         // alongside transfers_completed for telemetry.
         let stats = crate::transport::TransferStats {
             stream_id: 1,
-            remote_addr: addr,
+            remote_addr: "10.0.0.1:5000".parse().unwrap(),
             bytes_transferred: 100,
             elapsed: Duration::from_millis(10),
             peak_cwnd_bytes: 1000,

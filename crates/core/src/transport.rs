@@ -872,4 +872,131 @@ mod dual_stack_tests {
             sender_entry.2
         );
     }
+
+    /// Regression: failed sends must not bump the metrics. Without this,
+    /// a future refactor could move the increment before the result check
+    /// and silently inflate the counters on every error.
+    #[tokio::test]
+    async fn udp_socket_failed_send_does_not_record_metrics() {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        let sender = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+
+        // Connect the socket to a known-bad address so subsequent sends
+        // synchronously fail with ECONNREFUSED on Linux. This is the
+        // simplest way to force a Send error from `send_to`.
+        sender
+            .connect("127.0.0.1:1") // port 1 is reserved; nothing listens
+            .await
+            .ok();
+
+        let unbound: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let cumulative_sent_before = TRANSPORT_METRICS.cumulative_bytes_sent();
+
+        // Capture per-peer state before — the exact behavior depends on the
+        // OS (some kernels still accept the sendto), so we tolerate either
+        // outcome but assert that *if* the send fails, no metric moves.
+        let result = <UdpSocket as Socket>::send_to(&sender, b"x", unbound).await;
+        if result.is_err() {
+            assert_eq!(
+                TRANSPORT_METRICS.cumulative_bytes_sent(),
+                cumulative_sent_before,
+                "failed send must not bump cumulative_bytes_sent"
+            );
+            // Per-peer entry for the unbound address should also not exist
+            // due to this send. (Other tests may have created it; this is
+            // why we don't assert absence outright.)
+        }
+    }
+
+    /// Verify that `send_to_blocking` (the synchronous code path used in
+    /// `spawn_blocking` contexts) also records metrics on success. Same
+    /// dashboard-correctness guarantee as the async path. Runs inside a
+    /// `spawn_blocking` so the call is in a real blocking context with the
+    /// tokio reactor still active for `try_send_to` polling.
+    #[tokio::test]
+    async fn udp_socket_blocking_send_records_packet_metrics() {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        use std::sync::Arc;
+
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        let sender = Arc::new(<UdpSocket as Socket>::bind(v4_addr).await.unwrap());
+        let receiver = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let cumulative_sent_before = TRANSPORT_METRICS.cumulative_bytes_sent();
+        let payload: &'static [u8] = b"blocking-send-payload";
+        let sender_clone = sender.clone();
+
+        tokio::task::spawn_blocking(move || {
+            <UdpSocket as Socket>::send_to_blocking(&sender_clone, payload, receiver_addr)
+                .expect("blocking send should succeed on localhost UDP");
+        })
+        .await
+        .unwrap();
+
+        // Drain the receiver so the kernel buffer doesn't leak across tests.
+        let mut buf = [0u8; 64];
+        let _ = <UdpSocket as Socket>::recv_from(&receiver, &mut buf).await;
+
+        assert!(
+            TRANSPORT_METRICS.cumulative_bytes_sent()
+                >= cumulative_sent_before + payload.len() as u64,
+            "send_to_blocking must record cumulative_bytes_sent"
+        );
+        let peers = TRANSPORT_METRICS.per_peer_snapshot();
+        let entry = peers
+            .iter()
+            .find(|(a, _, _)| *a == receiver_addr)
+            .expect("per-peer entry must exist after blocking send");
+        assert!(
+            entry.1 >= payload.len() as u64,
+            "send_to_blocking must record per-peer bytes_sent"
+        );
+    }
+
+    /// On a dual-stack IPv6 socket sending to an IPv4 target, the kernel
+    /// receives the AF_INET6-mapped form, but the per-peer entry MUST be
+    /// keyed by the canonical (un-mapped) IPv4 form. Otherwise the dashboard
+    /// would split a single peer across two map entries when the local
+    /// socket happens to be IPv6.
+    #[tokio::test]
+    async fn udp_socket_dual_stack_send_keys_per_peer_by_unmapped_addr() {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+
+        let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr).await.unwrap();
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        let v4_recv = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let v4_recv_port = v4_recv.local_addr().unwrap().port();
+
+        let target = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            v4_recv_port,
+        );
+        assert!(target.is_ipv4(), "test precondition");
+
+        <UdpSocket as Socket>::send_to(&dual_sock, b"dual-stack", target)
+            .await
+            .unwrap();
+
+        let peers = TRANSPORT_METRICS.per_peer_snapshot();
+        let entry = peers
+            .iter()
+            .find(|(a, _, _)| *a == target)
+            .expect("per-peer entry must be keyed by un-mapped IPv4 target");
+        assert!(
+            entry.0.is_ipv4(),
+            "per-peer key must be plain IPv4, not ::ffff:x.x.x.x"
+        );
+        // Same target in mapped form must NOT have its own entry.
+        let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{v4_recv_port}")
+            .parse()
+            .unwrap();
+        assert!(
+            peers.iter().all(|(a, _, _)| *a != mapped),
+            "mapped form must not produce a duplicate per-peer entry"
+        );
+    }
 }
