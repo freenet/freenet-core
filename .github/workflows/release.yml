@@ -101,6 +101,19 @@ jobs:
           sed "s/freenet = { path = \"..\/core\", version = \".*\" }/freenet = { path = \"..\/core\", version = \"$VERSION\" }/" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp2
           mv crates/fdev/Cargo.toml.tmp2 crates/fdev/Cargo.toml
 
+          # The fdev crate version diverged from the freenet release tag, so
+          # `[package.metadata.binstall].pkg-url` embeds the freenet version
+          # literally (`v0.2.X`) rather than `v{ version }`. Re-point both the
+          # default and the Windows override to the new release tag so that
+          # `cargo binstall fdev` resolves to the actual GitHub release assets
+          # (issue #3995). The `/g` flag is load-bearing — there are two
+          # pkg-url lines that both need the rewrite. Mirror in
+          # `scripts/release.sh`; tests in
+          # `crates/fdev/tests/binstall_metadata.rs::release_sed_rewrite`
+          # keep both copies of the regex in lockstep.
+          sed -E "s|releases/download/v[0-9]+\.[0-9]+\.[0-9]+/fdev-|releases/download/v${VERSION}/fdev-|g" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp3
+          mv crates/fdev/Cargo.toml.tmp3 crates/fdev/Cargo.toml
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

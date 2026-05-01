@@ -20,6 +20,11 @@ pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
 pkg-fmt = "tgz"
 bin-dir = "freenet"
 
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.zip"
+pkg-fmt = "zip"
+bin-dir = "freenet.exe"
+
 [[bin]]
 name = "freenet"
 path = "src/bin/freenet.rs"
