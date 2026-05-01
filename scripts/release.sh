@@ -643,6 +643,12 @@ update_versions() {
     echo -n "  Updating fdev to $FDEV_VERSION... "
     sed_inplace "s/^version = \".*\"/version = \"$FDEV_VERSION\"/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
     sed_inplace "s/\(freenet = { path = \"..\/core\", version = \)\"[^\"]*\"/\1\"$VERSION\"/" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
+    # fdev's crate version is independent of the freenet release tag, so the
+    # binstall pkg-url embeds `vX.Y.Z` (the freenet version) literally rather
+    # than `v{ version }`. Re-point it to the current release each bump so
+    # that `cargo binstall fdev` resolves to the actual GitHub release assets
+    # (issue #3995).
+    sed_inplace "s|releases/download/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/fdev-|releases/download/v${VERSION}/fdev-|g" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
     echo "✓"
 
     # Update Cargo.lock to match new versions
