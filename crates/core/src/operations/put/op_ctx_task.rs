@@ -231,6 +231,10 @@ async fn drive_client_put_inner(
         tried: Vec<std::net::SocketAddr>,
         retries: usize,
         current_target: PeerKeyLocation,
+        /// Per-attempt timeout. Scaled with payload size for streaming PUTs
+        /// so the retry loop doesn't fire while the original streaming op
+        /// is still in flight (#4001).
+        attempt_timeout: std::time::Duration,
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
@@ -283,7 +287,27 @@ async fn drive_client_put_inner(
                 None => AdvanceOutcome::Exhausted,
             }
         }
+
+        fn attempt_timeout(&self) -> std::time::Duration {
+            self.attempt_timeout
+        }
     }
+
+    // Approximate payload size as `state bytes + contract code bytes`. The
+    // bincode-serialized payload `process_message` actually checks against
+    // `streaming_threshold` is `PutStreamingPayload { contract,
+    // related_contracts, value }`; the two large components are the state
+    // and the WASM bytes, with related_contracts and bincode framing
+    // contributing a small constant. This may slightly under-estimate
+    // (parameters, framing, related contracts), so the
+    // `STREAMING_THROUGHPUT_FLOOR_BPS` constant in `streaming_aware_attempt_timeout`
+    // is set conservatively (20 KB/s, ~half of observed throughput) to
+    // absorb the gap.
+    let payload_size_estimate = value.size().saturating_add(contract.data().len());
+    let attempt_timeout = crate::operations::streaming_aware_attempt_timeout(
+        op_manager.streaming_threshold,
+        payload_size_estimate,
+    );
 
     let mut driver = PutRetryDriver {
         op_manager,
@@ -295,6 +319,7 @@ async fn drive_client_put_inner(
         tried,
         retries: 0,
         current_target,
+        attempt_timeout,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
@@ -1662,6 +1687,45 @@ mod tests {
         let tx = dummy_tx();
         let msg = NetMessage::V1(NetMessageV1::Aborted(tx));
         assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
+    }
+
+    /// Pin test for issue #4001: verifies the client-PUT driver wires its
+    /// per-attempt timeout through `streaming_aware_attempt_timeout` rather
+    /// than the unscaled `OPERATION_TTL`.
+    ///
+    /// If a refactor accidentally drops this scaling, large streaming PUTs
+    /// will once again fire retries while the original is still in flight,
+    /// re-introducing the freenet/web `Publish to Freenet` workflow failure
+    /// described in the issue. Source-level scrape so the test fails loudly
+    /// at compile-time-adjacent feedback rather than only in production.
+    #[test]
+    fn drive_client_put_uses_streaming_aware_timeout() {
+        let src = include_str!("op_ctx_task.rs");
+
+        // Find the function body. The `drive_client_put_inner` body must
+        // contain the call site that computes `attempt_timeout`.
+        let fn_marker = "async fn drive_client_put_inner(";
+        let fn_pos = src
+            .find(fn_marker)
+            .expect("drive_client_put_inner not found");
+        // Take everything until the next top-level `async fn ` after that.
+        let rest = &src[fn_pos + fn_marker.len()..];
+        let body_end = rest.find("\nasync fn ").unwrap_or(rest.len());
+        let body = &rest[..body_end];
+
+        assert!(
+            body.contains("streaming_aware_attempt_timeout"),
+            "drive_client_put_inner must compute its per-attempt timeout via \
+             crate::operations::streaming_aware_attempt_timeout — without this, \
+             large streaming PUTs hit the unscaled OPERATION_TTL and fire \
+             retries while the original is still in flight (issue #4001)."
+        );
+        assert!(
+            body.contains("op_manager.streaming_threshold"),
+            "drive_client_put_inner must pass `op_manager.streaming_threshold` \
+             into streaming_aware_attempt_timeout so the scaling matches the \
+             threshold process_message actually uses to decide streaming."
+        );
     }
 
     #[test]

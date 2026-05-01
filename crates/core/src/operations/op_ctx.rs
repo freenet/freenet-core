@@ -381,6 +381,16 @@ pub(crate) trait RetryDriver {
 
     /// Pick the next peer or signal exhaustion.
     fn advance(&mut self) -> AdvanceOutcome;
+
+    /// Per-attempt wall-clock timeout. Defaults to [`OPERATION_TTL`].
+    ///
+    /// PUT overrides this to scale with payload size: large streaming
+    /// payloads need significantly longer than `OPERATION_TTL` to
+    /// complete a single attempt, otherwise the retry loop fires
+    /// while the original streaming op is still in flight (#4001).
+    fn attempt_timeout(&self) -> std::time::Duration {
+        OPERATION_TTL
+    }
 }
 
 /// Drive a task-per-tx retry loop against the network.
@@ -390,7 +400,7 @@ pub(crate) trait RetryDriver {
 /// [`RetryDriver::new_attempt_tx`].
 ///
 /// The loop handles:
-/// - `tokio::time::timeout(OPERATION_TTL, ...)` wrapping
+/// - `tokio::time::timeout(driver.attempt_timeout(), ...)` wrapping
 /// - `release_pending_op_slot` cleanup on every exit path
 /// - Structured `outcome=wire_error|timeout` logging
 pub(crate) async fn drive_retry_loop<D: RetryDriver>(
@@ -413,8 +423,9 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         let request = driver.build_request(attempt_tx);
 
+        let attempt_timeout = driver.attempt_timeout();
         let mut ctx = op_manager.op_ctx(attempt_tx);
-        let round_trip = tokio::time::timeout(OPERATION_TTL, ctx.send_and_await(request)).await;
+        let round_trip = tokio::time::timeout(attempt_timeout, ctx.send_and_await(request)).await;
 
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
@@ -447,7 +458,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     attempt_tx = %attempt_tx,
                     attempt = attempt_count,
                     outcome = "timeout",
-                    timeout_secs = OPERATION_TTL.as_secs(),
+                    timeout_secs = attempt_timeout.as_secs(),
                     "{op_label} (task-per-tx): attempt timed out; advancing"
                 );
                 match driver.advance() {
@@ -898,5 +909,34 @@ mod tests {
         executor
             .await
             .expect("executor task should complete without panicking");
+    }
+
+    /// `RetryDriver::attempt_timeout`'s default value is the unscaled
+    /// [`OPERATION_TTL`] that non-streaming and pre-#4001 op drivers
+    /// (GET / SUBSCRIBE) rely on. Drivers that need a different
+    /// per-attempt timeout — currently only PUT, for streaming-payload
+    /// scaling per #4001 — must override explicitly. Pin the default so
+    /// a refactor that changes the trait can't silently shift behaviour
+    /// for the drivers that don't override it.
+    #[test]
+    fn retry_driver_default_attempt_timeout_is_operation_ttl() {
+        struct DefaultDriver;
+        impl RetryDriver for DefaultDriver {
+            type Terminal = ();
+            fn new_attempt_tx(&mut self) -> Transaction {
+                unreachable!()
+            }
+            fn build_request(&mut self, _attempt_tx: Transaction) -> NetMessage {
+                unreachable!()
+            }
+            fn classify(&mut self, _reply: NetMessage) -> AttemptOutcome<()> {
+                unreachable!()
+            }
+            fn advance(&mut self) -> AdvanceOutcome {
+                unreachable!()
+            }
+        }
+        let d = DefaultDriver;
+        assert_eq!(d.attempt_timeout(), OPERATION_TTL);
     }
 }
