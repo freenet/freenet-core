@@ -9,12 +9,13 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use crate::ring::PeerKeyLocation;
+use crate::ring::{PeerKeyLocation, Ring};
 use crate::router::Router;
 use crate::transport::metrics::TRANSPORT_METRICS;
 
 static NETWORK_STATUS: OnceLock<Arc<RwLock<NetworkStatus>>> = OnceLock::new();
 static ROUTER: OnceLock<Arc<parking_lot::RwLock<Router>>> = OnceLock::new();
+static RING: OnceLock<Arc<Ring>> = OnceLock::new();
 
 /// Store a reference to the Router for the dashboard.
 pub fn set_router(router: Arc<parking_lot::RwLock<Router>>) {
@@ -28,6 +29,14 @@ pub(crate) fn get_router() -> Option<Arc<parking_lot::RwLock<Router>>> {
     ROUTER.get().cloned()
 }
 
+/// Store a reference to the Ring so the dashboard can read canonical
+/// subscription / hosting state directly instead of mirroring it.
+pub fn set_ring(ring: Arc<Ring>) {
+    // OnceLock::set returns Err if already initialized; this is expected on repeated calls
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = RING.set(ring);
+}
+
 /// Tracked network connection status for diagnostic display.
 pub struct NetworkStatus {
     pub gateway_failures: Vec<GatewayFailure>,
@@ -38,8 +47,6 @@ pub struct NetworkStatus {
     pub gateway_addresses: HashSet<SocketAddr>,
     /// Active peer connections.
     pub connected_peers: Vec<ConnectedPeer>,
-    /// Subscribed contracts keyed by encoded contract key.
-    pub subscribed_contracts: HashMap<String, ContractInfo>,
     /// Freenet version string.
     pub version: String,
     /// This node's ring location.
@@ -59,13 +66,6 @@ pub struct ConnectedPeer {
     pub location: Option<f64>,
     pub connected_since: Instant,
     pub peer_key_location: Option<PeerKeyLocation>,
-}
-
-/// Info about a subscribed contract.
-pub struct ContractInfo {
-    pub key_encoded: String,
-    pub subscribed_since: Instant,
-    pub last_updated: Option<Instant>,
 }
 
 /// Counters for each operation type: (success, failure).
@@ -171,7 +171,6 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         started_at: Instant::now(),
         gateway_addresses: gateway_addrs,
         connected_peers: Vec::new(),
-        subscribed_contracts: HashMap::new(),
         version,
         own_location: None,
         external_address: None,
@@ -237,41 +236,6 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.connected_peers.retain(|p| p.address != addr);
-        }
-    }
-}
-
-/// Record a new subscription.
-pub fn record_subscription(key_encoded: String) {
-    if let Some(status) = NETWORK_STATUS.get() {
-        if let Ok(mut s) = status.write() {
-            s.subscribed_contracts
-                .entry(key_encoded.clone())
-                .or_insert_with(|| ContractInfo {
-                    key_encoded,
-                    subscribed_since: Instant::now(),
-                    last_updated: None,
-                });
-        }
-    }
-}
-
-/// Record that a contract was updated.
-pub fn record_contract_updated(key_encoded: &str) {
-    if let Some(status) = NETWORK_STATUS.get() {
-        if let Ok(mut s) = status.write() {
-            if let Some(info) = s.subscribed_contracts.get_mut(key_encoded) {
-                info.last_updated = Some(Instant::now());
-            }
-        }
-    }
-}
-
-/// Record a subscription removal.
-pub fn record_subscription_removed(key_encoded: &str) {
-    if let Some(status) = NETWORK_STATUS.get() {
-        if let Ok(mut s) = status.write() {
-            s.subscribed_contracts.remove(key_encoded);
         }
     }
 }
@@ -504,32 +468,35 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
     let open_connections = peers.len() as u32;
     let gateway_only = open_connections > 0 && peers.iter().all(|p| p.is_gateway);
 
-    let mut contracts: Vec<ContractSnapshot> = s
-        .subscribed_contracts
-        .values()
-        .map(|c| {
-            // Use char boundary for safe truncation (contract keys are base58/ASCII,
-            // but be defensive against future encoding changes).
-            let key_short = if c.key_encoded.chars().count() > 12 {
-                let trunc: String = c.key_encoded.chars().take(12).collect();
-                format!("{trunc}...")
-            } else {
-                c.key_encoded.clone()
-            };
-            ContractSnapshot {
-                key_short,
-                key_full: c.key_encoded.clone(),
-                subscribed_secs: now.duration_since(c.subscribed_since).as_secs(),
-                last_updated_secs: c.last_updated.map(|t| now.duration_since(t).as_secs()),
-            }
+    // Read subscribed contracts directly from the canonical lease map in
+    // `HostingManager`. Sort order is set inside the snapshot helper
+    // (most recently updated first; never-updated entries fall to the end).
+    let contracts: Vec<ContractSnapshot> = RING
+        .get()
+        .map(|ring| {
+            ring.dashboard_subscription_snapshot()
+                .into_iter()
+                .map(|c| {
+                    let key_full = c.key.to_string();
+                    // Use char boundary for safe truncation (contract keys
+                    // are base58/ASCII, but be defensive against future
+                    // encoding changes).
+                    let key_short = if key_full.chars().count() > 12 {
+                        let trunc: String = key_full.chars().take(12).collect();
+                        format!("{trunc}...")
+                    } else {
+                        key_full.clone()
+                    };
+                    ContractSnapshot {
+                        key_short,
+                        key_full,
+                        subscribed_secs: c.subscribed_secs,
+                        last_updated_secs: c.last_updated_secs,
+                    }
+                })
+                .collect()
         })
-        .collect();
-    // Sort by most recently updated first
-    contracts.sort_by(|a, b| {
-        let a_time = a.last_updated_secs.unwrap_or(u64::MAX);
-        let b_time = b.last_updated_secs.unwrap_or(u64::MAX);
-        a_time.cmp(&b_time)
-    });
+        .unwrap_or_default();
 
     let elapsed_secs = s.started_at.elapsed().as_secs();
     let has_version_mismatch = s
@@ -812,20 +779,14 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription_tracking() {
+    fn test_subscription_tracking_no_ring_wired() {
+        // Without a Ring registered (the default in unit tests),
+        // `get_snapshot()` reports zero subscribed contracts. Subscription
+        // state lives in `HostingManager.active_subscriptions`; see
+        // hosting.rs::dashboard_snapshot_reflects_active_subscriptions for
+        // the regression test that pins the contracts-list pipeline.
         let _lock = TEST_MUTEX.lock().unwrap();
         init(31341, HashSet::new(), "0.1.148".to_string());
-
-        record_subscription("ABC123DEF456".to_string());
-        let snap = get_snapshot().unwrap();
-        assert_eq!(snap.contracts.len(), 1);
-        assert_eq!(snap.contracts[0].key_full, "ABC123DEF456");
-
-        record_contract_updated("ABC123DEF456");
-        let snap = get_snapshot().unwrap();
-        assert!(snap.contracts[0].last_updated_secs.is_some());
-
-        record_subscription_removed("ABC123DEF456");
         let snap = get_snapshot().unwrap();
         assert!(snap.contracts.is_empty());
     }

@@ -1510,10 +1510,10 @@ async fn drive_relay_subscribe(
         })) => {
             // Relay-side Subscribed registration — mirror legacy
             // subscribe.rs:1690 arm. DO NOT call ring.subscribe /
-            // record_subscription / announce_contract_hosted here; a
-            // relay is not itself a subscriber. See subscribe.rs:1655–1688
-            // for the full reasoning (prevents the #3763 subscription
-            // storm feedback loop).
+            // announce_contract_hosted here; a relay is not itself a
+            // subscriber. See subscribe.rs:1655–1688 for the full
+            // reasoning (prevents the #3763 subscription storm feedback
+            // loop).
             register_downstream_subscriber(
                 op_manager,
                 &key,
@@ -2140,8 +2140,8 @@ mod tests {
         );
     }
 
-    /// Pin: relay driver MUST NOT call `ring.subscribe`, `record_subscription`,
-    /// or `announce_contract_hosted` on behalf of the relayed Subscribed
+    /// Pin: relay driver MUST NOT call `ring.subscribe` or
+    /// `announce_contract_hosted` on behalf of the relayed Subscribed
     /// response. A relay is not itself a subscriber; doing so would
     /// install a lease and trigger #3763 subscription-storm feedback
     /// loops via the renewal cycle.

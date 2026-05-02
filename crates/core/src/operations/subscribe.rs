@@ -1592,8 +1592,8 @@ impl Operation for SubscribeOp {
                                 // an upstream fulfilling peer back to a downstream requester.
                                 //
                                 // Critically, we do NOT call `ring.subscribe()`,
-                                // `record_subscription()`, `announce_contract_hosted()`, or
-                                // register ourselves as having an upstream. Relays are not
+                                // `announce_contract_hosted()`, or register ourselves as
+                                // having an upstream. Relays are not
                                 // subscribers in their own right; they only mediate updates
                                 // between the upstream fulfilling node and the downstream
                                 // requester. Doing any of the above on a relay would:
@@ -1669,7 +1669,9 @@ impl Operation for SubscribeOp {
                                 contract = %format!("{:.8}", key),
                                 "SUBSCRIPTION_ACCEPTED: registered lease-based subscription"
                             );
-                            crate::node::network_status::record_subscription(format!("{key}"));
+                            // Dashboard "Subscribed Contracts" reads from the canonical lease
+                            // map via `Ring::dashboard_subscription_snapshot`; the prior
+                            // `network_status::record_subscription` mirror has been removed.
 
                             // Fetch contract if we don't have it.
                             // This is non-fatal - if it fails, we still complete the

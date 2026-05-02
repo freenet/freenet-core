@@ -1249,7 +1249,11 @@ where
                                 event = "initial_state_installed",
                                 "Contract initial state installed"
                             );
-                            crate::node::network_status::record_contract_updated(&format!("{key}"));
+                            // Dashboard "last updated" telemetry; no-op if
+                            // we're not subscribed to this contract.
+                            if let Some(op_manager) = &self.op_manager {
+                                op_manager.ring.record_contract_update(&key);
+                            }
                             if let Err(err) = self
                                 .send_update_notification(&key, &params, &incoming_state)
                                 .await
@@ -1916,8 +1920,12 @@ where
             "Contract state updated"
         );
 
-        // Record update timestamp for dashboard display
-        crate::node::network_status::record_contract_updated(&format!("{key}"));
+        // Record update timestamp for dashboard display. No-op if we're
+        // not subscribed (e.g., a relay forwarding an UPDATE for a
+        // contract this peer doesn't track).
+        if let Some(op_manager) = &self.op_manager {
+            op_manager.ring.record_contract_update(key);
+        }
 
         if let Err(err) = self
             .send_update_notification(key, parameters, new_state)

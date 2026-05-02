@@ -139,6 +139,10 @@ impl NodeP2P {
             gateway_addrs,
             crate::config::PCK_VERSION.to_string(),
         );
+        // Wire the ring so the dashboard can read canonical subscription /
+        // hosting state directly instead of mirroring it through
+        // `record_subscription` callbacks.
+        super::network_status::set_ring(self.op_manager.ring.clone());
 
         // Emit peer startup event
         if let Some(event) = crate::tracing::NetEventLog::peer_startup(

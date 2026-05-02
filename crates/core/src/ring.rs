@@ -23,7 +23,10 @@ use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::{Mutex, RwLock};
 
-pub use hosting::{AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult};
+pub use hosting::{
+    AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult,
+    SubscribedContractSnapshot,
+};
 
 use crate::message::TransactionType;
 use crate::topology::TopologyAdjustment;
@@ -1701,6 +1704,18 @@ impl Ring {
     /// Returns: (contract, has_client_subscription, is_active_subscription, expires_at)
     pub fn get_subscription_states(&self) -> Vec<(ContractKey, bool, bool, Option<Instant>)> {
         self.hosting_manager.get_subscription_states()
+    }
+
+    /// Snapshot of every active subscription for the local-peer dashboard.
+    /// Reads directly from the canonical lease map.
+    pub fn dashboard_subscription_snapshot(&self) -> Vec<SubscribedContractSnapshot> {
+        self.hosting_manager.dashboard_subscription_snapshot()
+    }
+
+    /// Record that a state update was observed for `contract`.
+    /// No-op if the contract is not currently subscribed.
+    pub fn record_contract_update(&self, contract: &ContractKey) {
+        self.hosting_manager.record_contract_update(contract)
     }
 
     // ==================== Subscription Retry Spam Prevention ====================
