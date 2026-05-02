@@ -1229,6 +1229,39 @@ where
 
                             self.broadcast_state_change(key, incoming_state.clone())
                                 .await;
+
+                            // Notify locally-subscribed WS clients of the
+                            // new state. Without this, the very first state
+                            // install for a contract on this node never
+                            // reaches `register_contract_notifier` consumers
+                            // — only the merge path at the end of this
+                            // function calls `commit_state_update`, which
+                            // is the only other site that fans out to the
+                            // local notifier map. ResyncResponse-driven
+                            // applies hit this branch when the state_store
+                            // entry is missing, so subscribers would miss
+                            // every cross-node delivery that recovers via
+                            // resync.
+                            tracing::info!(
+                                contract = %key,
+                                new_size_bytes = incoming_state.as_ref().len(),
+                                phase = "update_complete",
+                                event = "initial_state_installed",
+                                "Contract initial state installed"
+                            );
+                            crate::node::network_status::record_contract_updated(&format!("{key}"));
+                            if let Err(err) = self
+                                .send_update_notification(&key, &params, &incoming_state)
+                                .await
+                            {
+                                tracing::error!(
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "notification_failed",
+                                    "Failed to send initial-state notification"
+                                );
+                            }
+
                             return Ok(UpsertResult::Updated(incoming_state));
                         }
                     }

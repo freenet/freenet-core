@@ -634,3 +634,80 @@ async fn test_per_client_churn_with_limit() {
         receivers.push(rx);
     }
 }
+
+// ==========================================================================
+// Initial-state install notification (PR #4004 regression coverage)
+// ==========================================================================
+
+/// Regression for the runtime.rs new-contract install path: prior to PR
+/// #4004 the `is_new_contract` branch in `bridged_upsert_contract_state`
+/// returned `UpsertResult::Updated` after `broadcast_state_change` *without*
+/// calling `send_update_notification`, so any client that subscribed before
+/// the contract's first state install (e.g. a Dioxus WS client that
+/// registers a notifier during PUT planning, then the state arrives via
+/// ResyncResponse recovery) silently never received its `UpdateNotification`.
+///
+/// Setup mirrors the production race: register the notifier first against
+/// an `instance_id` whose `state_store` slot is still empty, then perform
+/// the very first `upsert_contract_state` for that contract with both the
+/// `ContractContainer` (forces the new-contract path) and a fresh
+/// `WrappedState`. The notifier MUST receive an `UpdateNotification` carrying
+/// the just-installed state.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::wildcard_enum_match_arm)]
+async fn initial_state_install_notifies_pre_registered_subscriber() {
+    use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+
+    let mut executor = create_executor().await;
+    let contract = test_contract(b"initial_install_notify");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    // Register notifier BEFORE the contract's first state install. This is
+    // the production race: WS subscribe lands first, contract state arrives
+    // later. The state_store has no entry for `instance_id` at this point.
+    let client_id = ClientId::next();
+    let (tx, mut rx) = mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    executor
+        .register_contract_notifier(instance_id, client_id, tx, None)
+        .expect("registration must succeed before any upsert");
+
+    // First upsert for this contract — provides the container so the
+    // `is_new_contract` branch fires (state_store.get(key) is Err).
+    let initial_state_bytes = b"initial-install-payload".to_vec();
+    let initial_state = WrappedState::new(initial_state_bytes.clone());
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(initial_state),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("first upsert must succeed");
+
+    // The fix is the `send_update_notification` call added on the
+    // new-contract branch: assert the notifier saw the install. Without
+    // PR #4004 this `try_recv` returns `Err(Empty)` because the branch
+    // skipped notification entirely.
+    let received = rx
+        .try_recv()
+        .expect("subscriber must receive UpdateNotification on initial state install");
+    match received {
+        Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+            key: notified_key,
+            update,
+        })) => {
+            assert_eq!(notified_key.id(), &instance_id);
+            // The notification carries the just-installed state (deltas
+            // are only computed for subscribers that supplied a summary).
+            match update {
+                freenet_stdlib::prelude::UpdateData::State(state) => {
+                    assert_eq!(state.as_ref(), initial_state_bytes.as_slice());
+                }
+                other => panic!("expected UpdateData::State, got {other:?}"),
+            }
+        }
+        other => panic!("expected ContractResponse::UpdateNotification, got {other:?}"),
+    }
+}
