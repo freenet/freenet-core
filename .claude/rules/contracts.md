@@ -219,11 +219,19 @@ MUST:
   Empty RequestRelated is rejected.
 
 - Network inbound upsert: Related contracts are fetched locally
-  during validation. If the related contract isn't already stored
-  locally, it will fail with MissingRelated. The sending node
-  already validated at depth=1, so this is acceptable. Network
-  fetch during broadcast processing is deferred to avoid
-  cascading backpressure (documented anti-pattern).
+  first; on a local miss the bridged path now escalates to a
+  network GET via `start_sub_op_get` when `op_manager` is wired
+  (production `Executor<Runtime>`). Mock executors and local-only
+  test harnesses still surface MissingRelated synchronously
+  because they have `op_manager == None`. The previous version
+  was local-only with the rationale that "the sending node
+  already validated at depth=1, so this is acceptable" — but in
+  practice the receiving node was often a *first-time* observer of
+  the related contract (e.g. a fresh cross-node UPDATE delivery
+  where the recipient has never seen the sender's AFT record),
+  and the local-only path forced wasted ResyncRequest round trips
+  on every send. The escalation is bounded by RELATED_FETCH_TIMEOUT.
+  See PR #4006 / freenet/mail#80.
 ```
 
 ### WHEN a contract's validate_state returns RequestRelated
@@ -232,7 +240,11 @@ MUST:
 The fetch_related_for_validation helper handles this:
   1. Reject empty request, self-reference, >10 contracts
   2. Dedup requested IDs
-  3. Look up each locally (lookup_key + state_store.get)
+  3. Try local lookup first (lookup_key + state_store.get); on
+     miss, escalate via fetch_related_via_network → start_sub_op_get
+     when op_manager is wired (production Executor<Runtime>).
+     op_manager == None paths (mock executors, local-only test
+     harnesses) surface MissingRelated synchronously as before.
   4. Re-call validate_state with populated RelatedContracts
   5. If second call returns RequestRelated → error (depth>1)
 

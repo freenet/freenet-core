@@ -1986,23 +1986,30 @@ where
             "Fetching related contracts for validation"
         );
 
-        // Fetch each related contract locally with overall timeout.
-        // Local lookup via lookup_key + state_store.get() is available on all executor
-        // types (Runtime, MockWasmRuntime). Network fetch is only available on
-        // Executor<Runtime> and happens automatically via GET auto-subscribe when
-        // the contract isn't found locally.
+        // Fetch each related contract: try local state_store first, escalate
+        // to network GET when the executor has an `op_manager` attached. The
+        // previous version was local-only, which silently failed cross-node
+        // UPDATE flows where the validating node was a fresh receiver that
+        // hadn't yet cached the related contract (see freenet/mail#80 — the
+        // recipient's inbox UPDATE always carried `RequestRelated` for the
+        // sender's AFT record, which the receiver hadn't seen before).
         let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
             HashMap::with_capacity(unique_ids.len());
 
         let fetch_all = async {
             for id in &unique_ids {
-                let full_key = self.bridged_lookup_key(id).ok_or_else(|| {
-                    ExecutorError::request(StdContractError::MissingRelated { key: *id })
-                })?;
-                let state = self.state_store.get(&full_key).await.map_err(|_| {
-                    ExecutorError::request(StdContractError::MissingRelated { key: *id })
-                })?;
-                related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                if let Some(full_key) = self.bridged_lookup_key(id) {
+                    if let Ok(state) = self.state_store.get(&full_key).await {
+                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                        continue;
+                    }
+                }
+                // Local lookup miss → escalate via the network-fallback
+                // helper (factored out so the per-id branch logic is
+                // testable with a stubbed fetcher). Mock executors that
+                // lack an `op_manager` get the legacy MissingRelated.
+                let fetched = fetch_related_via_network(self.op_manager.as_ref(), id).await?;
+                related_map.insert(*id, Some(State::from(fetched.as_ref().to_vec())));
             }
             Ok::<(), ExecutorError>(())
         };
@@ -3396,12 +3403,15 @@ impl Executor<Runtime> {
 }
 
 impl Executor<Runtime> {
-    /// Network-aware version of `fetch_related_for_validation`.
+    /// Network-aware variant retained for the PUT path.
     ///
-    /// Uses `local_state_or_from_network` to fetch related contracts, allowing
-    /// first-time publishes that depend on contracts not yet stored locally.
-    /// The base `fetch_related_for_validation` on the bridged impl only does
-    /// local lookups.
+    /// The base `fetch_related_for_validation` on the bridged impl now also
+    /// escalates to network GET via `op_manager` when the local state_store
+    /// lookup misses, so the two implementations are functionally equivalent
+    /// for `Executor<Runtime>`. This variant is kept because it exposes the
+    /// `local_state_or_from_network` helper directly and several PUT call
+    /// sites already wire through it; collapsing the two would touch more
+    /// surface area than the bug fix needs.
     async fn fetch_related_for_validation_network(
         &mut self,
         key: &ContractKey,
@@ -3602,6 +3612,73 @@ impl Executor<Runtime> {
             }
         }
     }
+}
+
+/// Network-escalation half of the bridged `fetch_related_for_validation`
+/// loop, factored out so the dispatch logic is unit-testable with a
+/// stubbed fetcher. Production callers pass the executor's own
+/// `op_manager`; tests in this module override [`TEST_NETWORK_FETCH_OVERRIDE`]
+/// (a thread-local) to redirect the network call to a stub instead of
+/// driving a real network sub-op.
+///
+/// Behavior:
+/// - `op_manager.is_none()` → return `MissingRelated`. This preserves the
+///   legacy local-only outcome for mock executors and unit tests that
+///   never wire up a real op_manager.
+/// - `op_manager.is_some()` → drive a sub-op GET via
+///   `start_sub_op_get`. `Found` resolves to the fetched state;
+///   `NotFound`/`Infra` map back to `MissingRelated`.
+async fn fetch_related_via_network(
+    op_manager: Option<&Arc<crate::node::OpManager>>,
+    id: &ContractInstanceId,
+) -> Result<WrappedState, ExecutorError> {
+    #[cfg(test)]
+    {
+        if let Some(stub) = TEST_NETWORK_FETCH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+            return stub(*id);
+        }
+    }
+    let Some(op_manager) = op_manager else {
+        return Err(ExecutorError::request(StdContractError::MissingRelated {
+            key: *id,
+        }));
+    };
+    // `_tx` is named for clarity; not a drop guard. `Transaction` is
+    // `Copy` so the binding has no lifetime effect today.
+    let (_tx, rx) = crate::operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, false);
+    let outcome = rx
+        .await
+        .map_err(|_| ExecutorError::other(anyhow::anyhow!("sub-op GET task dropped")))?;
+    match outcome {
+        crate::operations::get::op_ctx_task::SubOpGetOutcome::Found(get_result) => {
+            Ok(WrappedState::from(get_result.state.as_ref().to_vec()))
+        }
+        crate::operations::get::op_ctx_task::SubOpGetOutcome::NotFound(_)
+        | crate::operations::get::op_ctx_task::SubOpGetOutcome::Infra(_) => {
+            Err(ExecutorError::request(StdContractError::MissingRelated {
+                key: *id,
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) type NetworkFetchStub =
+    std::rc::Rc<dyn Fn(ContractInstanceId) -> Result<WrappedState, ExecutorError>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook used by `fetch_related_via_network` to bypass the real
+    /// network sub-op driver. Set with [`set_test_network_fetch_override`]
+    /// inside a `#[tokio::test(flavor = "current_thread")]` so the
+    /// thread-local lookup hits the same task that ran the test setup.
+    static TEST_NETWORK_FETCH_OVERRIDE: std::cell::RefCell<Option<NetworkFetchStub>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_network_fetch_override(stub: Option<NetworkFetchStub>) {
+    TEST_NETWORK_FETCH_OVERRIDE.with(|cell| *cell.borrow_mut() = stub);
 }
 
 /// Resolve a [`MessageOrigin`] for a delegate `ApplicationMessages` request,
