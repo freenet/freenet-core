@@ -938,7 +938,7 @@ mod dual_stack_tests {
 
         // Drain the receiver so the kernel buffer doesn't leak across tests.
         let mut buf = [0u8; 64];
-        let _ = <UdpSocket as Socket>::recv_from(&receiver, &mut buf).await;
+        let _drain = <UdpSocket as Socket>::recv_from(&receiver, &mut buf).await;
 
         assert!(
             TRANSPORT_METRICS.cumulative_bytes_sent()

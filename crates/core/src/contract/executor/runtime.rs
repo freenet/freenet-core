@@ -1986,23 +1986,55 @@ where
             "Fetching related contracts for validation"
         );
 
-        // Fetch each related contract locally with overall timeout.
-        // Local lookup via lookup_key + state_store.get() is available on all executor
-        // types (Runtime, MockWasmRuntime). Network fetch is only available on
-        // Executor<Runtime> and happens automatically via GET auto-subscribe when
-        // the contract isn't found locally.
+        // Fetch each related contract: try local state_store first, escalate
+        // to network GET when the executor has an `op_manager` attached. The
+        // previous version was local-only, which silently failed cross-node
+        // UPDATE flows where the validating node was a fresh receiver that
+        // hadn't yet cached the related contract (see freenet/mail#80 — the
+        // recipient's inbox UPDATE always carried `RequestRelated` for the
+        // sender's AFT record, which the receiver hadn't seen before).
         let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
             HashMap::with_capacity(unique_ids.len());
 
         let fetch_all = async {
             for id in &unique_ids {
-                let full_key = self.bridged_lookup_key(id).ok_or_else(|| {
-                    ExecutorError::request(StdContractError::MissingRelated { key: *id })
+                if let Some(full_key) = self.bridged_lookup_key(id) {
+                    if let Ok(state) = self.state_store.get(&full_key).await {
+                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                        continue;
+                    }
+                }
+                // Local lookup miss → escalate to a network GET if the
+                // executor has the op_manager wired up. Mock executors and
+                // local-only test harnesses have `op_manager == None`; for
+                // those the legacy MissingRelated error stays.
+                let Some(op_manager) = self.op_manager.as_ref() else {
+                    return Err(ExecutorError::request(StdContractError::MissingRelated {
+                        key: *id,
+                    }));
+                };
+                // The driver returns `(Transaction, oneshot::Receiver)`. We
+                // only need the receiver to carry the outcome; the
+                // transaction is a `Copy` id used for tracing in the
+                // sibling network helper. Bind it as `_tx` (clippy is happy
+                // with non-must_use Copy types under that pattern).
+                let (_tx, rx) =
+                    crate::operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, false);
+                let outcome = rx.await.map_err(|_| {
+                    ExecutorError::other(anyhow::anyhow!("sub-op GET task dropped"))
                 })?;
-                let state = self.state_store.get(&full_key).await.map_err(|_| {
-                    ExecutorError::request(StdContractError::MissingRelated { key: *id })
-                })?;
-                related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                match outcome {
+                    crate::operations::get::op_ctx_task::SubOpGetOutcome::Found(get_result) => {
+                        related_map
+                            .insert(*id, Some(State::from(get_result.state.as_ref().to_vec())));
+                    }
+                    crate::operations::get::op_ctx_task::SubOpGetOutcome::NotFound(_)
+                    | crate::operations::get::op_ctx_task::SubOpGetOutcome::Infra(_) => {
+                        return Err(ExecutorError::request(StdContractError::MissingRelated {
+                            key: *id,
+                        }));
+                    }
+                }
             }
             Ok::<(), ExecutorError>(())
         };
@@ -3396,12 +3428,15 @@ impl Executor<Runtime> {
 }
 
 impl Executor<Runtime> {
-    /// Network-aware version of `fetch_related_for_validation`.
+    /// Network-aware variant retained for the PUT path.
     ///
-    /// Uses `local_state_or_from_network` to fetch related contracts, allowing
-    /// first-time publishes that depend on contracts not yet stored locally.
-    /// The base `fetch_related_for_validation` on the bridged impl only does
-    /// local lookups.
+    /// The base `fetch_related_for_validation` on the bridged impl now also
+    /// escalates to network GET via `op_manager` when the local state_store
+    /// lookup misses, so the two implementations are functionally equivalent
+    /// for `Executor<Runtime>`. This variant is kept because it exposes the
+    /// `local_state_or_from_network` helper directly and several PUT call
+    /// sites already wire through it; collapsing the two would touch more
+    /// surface area than the bug fix needs.
     async fn fetch_related_for_validation_network(
         &mut self,
         key: &ContractKey,

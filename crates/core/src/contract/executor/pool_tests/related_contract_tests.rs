@@ -591,3 +591,63 @@ async fn test_multiple_related_contracts() {
         "multiple related contracts should succeed: {result:?}"
     );
 }
+
+// =========================================================================
+// Test: UPDATE that triggers RequestRelated for a missing contract errors
+// (no network in mock executor, MissingRelated returned synchronously).
+//
+// Regression for the bridged-path network-fetch fix: the bridged
+// `fetch_related_for_validation` previously returned MissingRelated
+// without ever consulting `op_manager`. The fix escalates to a network
+// GET when `op_manager` is `Some`. The mock executor has
+// `op_manager == None`, so the legacy MissingRelated outcome must be
+// preserved here — production-side network behavior is exercised by
+// the live-node E2E harness (freenet/mail) rather than this unit test.
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_update_missing_related_local_only_errors() {
+    let mut executor = create_executor().await;
+
+    // PUT the contract being updated, with no override at first so the PUT
+    // succeeds without fetching related state.
+    let target_contract = make_contract(b"update_missing_related_target");
+    let target_key = target_contract.key();
+    let initial_state = WrappedState::new(br#"{"v":0}"#.to_vec());
+    executor
+        .upsert_contract_state(
+            target_key,
+            Either::Left(initial_state),
+            RelatedContracts::default(),
+            Some(target_contract),
+        )
+        .await
+        .expect("initial PUT");
+
+    // Now configure the validator to demand a related contract that doesn't
+    // exist anywhere — local lookup must miss, network path must be skipped
+    // because mock executor has no `op_manager`, and `upsert` must surface
+    // a MissingRelated error.
+    let nonexistent_contract = make_contract(b"update_missing_related_target_missing");
+    let nonexistent_id = *nonexistent_contract.key().id();
+    executor.runtime.validate_overrides.insert(
+        *target_key.id(),
+        ValidateOverride::RequestRelated(vec![nonexistent_id]),
+    );
+
+    let delta = StateDelta::from(br#"{"v":1}"#.to_vec());
+    let result = executor
+        .upsert_contract_state(
+            target_key,
+            Either::Right(delta),
+            RelatedContracts::default(),
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "UPDATE that triggers RequestRelated for a missing contract \
+         must error in local-only mode (mock executor has no op_manager); \
+         got {result:?}"
+    );
+}
