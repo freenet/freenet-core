@@ -238,6 +238,9 @@ impl HostingManager {
         let expires_at = now + SUBSCRIPTION_LEASE_DURATION;
         let is_new = match self.active_subscriptions.entry(contract) {
             Entry::Occupied(mut e) => {
+                // Renewal: advance the lease but DELIBERATELY preserve
+                // `subscribed_since` (continuous duration) and
+                // `last_updated` (most-recent UPDATE timestamp).
                 e.get_mut().expires_at = expires_at;
                 false
             }
@@ -335,12 +338,19 @@ impl HostingManager {
                 }
             })
             .collect();
-        // Most recently updated first; never-updated entries fall to the end.
-        snapshot.sort_by(|a, b| match (a.last_updated_secs, b.last_updated_secs) {
-            (Some(a_secs), Some(b_secs)) => a_secs.cmp(&b_secs),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.key.id().as_bytes().cmp(b.key.id().as_bytes()),
+        // Most recently updated first; never-updated entries fall to the
+        // end. Ties on `last_updated_secs` (including the (None, None)
+        // case) break by key bytes so the dashboard renders a stable
+        // order across refreshes — DashMap iteration order would
+        // otherwise leak through and reshuffle rows on every poll.
+        snapshot.sort_by(|a, b| {
+            let primary = match (a.last_updated_secs, b.last_updated_secs) {
+                (Some(a_secs), Some(b_secs)) => a_secs.cmp(&b_secs),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            primary.then_with(|| a.key.id().as_bytes().cmp(b.key.id().as_bytes()))
         });
         snapshot
     }
@@ -1534,6 +1544,54 @@ mod tests {
         let snap = manager.dashboard_subscription_snapshot();
         assert_eq!(snap.len(), 1);
         assert!(snap.iter().all(|s| s.key != c1));
+    }
+
+    /// Sort order of `dashboard_subscription_snapshot()` must be
+    /// deterministic — DashMap iteration order would otherwise leak
+    /// through to the rendered dashboard, reshuffling rows on every
+    /// 5-second poll. Ties (including `None`/`None` for never-updated
+    /// entries) must break by contract-key bytes.
+    #[tokio::test]
+    async fn dashboard_snapshot_sort_is_deterministic_on_ties() {
+        let manager = HostingManager::new();
+        // Three contracts with distinct, ordered key-byte prefixes
+        // (`make_contract_key(seed)` writes `[seed; 32]` into the
+        // ContractInstanceId, so seeds 0x10/0x40/0xF0 sort low/mid/high).
+        let low = make_contract_key(0x10);
+        let mid = make_contract_key(0x40);
+        let high = make_contract_key(0xF0);
+
+        // Subscribe all three, then drive `last_updated` to the same
+        // wall-clock timestamp for `low` and `high`. `mid` stays
+        // never-updated, so it must sort to the end.
+        manager.subscribe(low);
+        manager.subscribe(mid);
+        manager.subscribe(high);
+        manager.record_contract_update(&high);
+        manager.record_contract_update(&low);
+
+        let snap = manager.dashboard_subscription_snapshot();
+        assert_eq!(snap.len(), 3);
+        // `low` and `high` share `last_updated_secs` (both 0 immediately
+        // after `record_contract_update`); the byte-key tie-break must
+        // place `low` before `high`. `mid` (never updated) goes last.
+        assert_eq!(
+            snap.iter().map(|s| s.key).collect::<Vec<_>>(),
+            vec![low, high, mid],
+            "snapshot must be ordered (low, high, mid); got {:?}",
+            snap.iter().map(|s| s.key).collect::<Vec<_>>()
+        );
+
+        // Re-poll: the order MUST be the same. (Pre-fix: DashMap
+        // iteration order would shuffle on every call.)
+        for _ in 0..5 {
+            let again = manager.dashboard_subscription_snapshot();
+            assert_eq!(
+                again.iter().map(|s| s.key).collect::<Vec<_>>(),
+                vec![low, high, mid],
+                "repeated snapshots must be byte-stable"
+            );
+        }
     }
 
     /// Subscription renewal must not reset `subscribed_since`, otherwise
