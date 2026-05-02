@@ -240,7 +240,11 @@ MUST:
 The fetch_related_for_validation helper handles this:
   1. Reject empty request, self-reference, >10 contracts
   2. Dedup requested IDs
-  3. Look up each locally (lookup_key + state_store.get)
+  3. Try local lookup first (lookup_key + state_store.get); on
+     miss, escalate via fetch_related_via_network → start_sub_op_get
+     when op_manager is wired (production Executor<Runtime>).
+     op_manager == None paths (mock executors, local-only test
+     harnesses) surface MissingRelated synchronously as before.
   4. Re-call validate_state with populated RelatedContracts
   5. If second call returns RequestRelated → error (depth>1)
 
