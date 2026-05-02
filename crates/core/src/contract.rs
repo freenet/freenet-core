@@ -616,6 +616,43 @@ fn caller_identity_from_origin(origin: Option<&ContractInstanceId>) -> CallerIde
     }
 }
 
+/// Inject a related contract's full state into `related_contracts` for
+/// downstream propagation to the contract WASM as a `RelatedState` entry.
+///
+/// `RelatedContracts` exposes no public `insert`, so we use the documented
+/// `missing()` + `update()` pattern: `missing()` registers the id with a
+/// `None` slot, and `update()` returns a mutable iterator we can use to set
+/// the slot. The slot is guaranteed to exist after `missing()`; if a caller
+/// previously supplied a state for the same id via the bare
+/// `related_contracts` argument on `UpdateQuery`, we overwrite it — the
+/// inline `RelatedStateAndDelta` payload is the atomic package the sender
+/// committed to and is preferred over any out-of-band hint.
+///
+/// Extracted as a free function so the conversion can be unit-tested in
+/// isolation. Without that, regressions in `RelatedContracts::missing()` or
+/// `update()` semantics — for instance if `missing()` ever stopped
+/// guaranteeing the slot exists — would silently drop the inline state and
+/// surface only as missing-message bugs in higher-level integration tests.
+fn inject_related_state(
+    related_contracts: &mut RelatedContracts<'static>,
+    related_to: ContractInstanceId,
+    state: freenet_stdlib::prelude::State<'static>,
+) {
+    related_contracts.missing(vec![related_to]);
+    let mut state_holder = Some(state);
+    for (id, slot) in related_contracts.update() {
+        if id == &related_to {
+            *slot = state_holder.take();
+            break;
+        }
+    }
+    debug_assert!(
+        state_holder.is_none(),
+        "RelatedContracts::missing() must register the slot it just declared, \
+         so update() should always have a slot for the requested id"
+    );
+}
+
 pub(crate) async fn contract_handling<CH, P>(
     mut contract_handler: CH,
     prompter: P,
@@ -1060,7 +1097,13 @@ where
                     // Prefer the full state — it's authoritative and avoids
                     // an extra delta-merge round trip in the executor. The
                     // delta is dropped because `upsert_contract_state` only
-                    // accepts one of the two via the `Either` argument.
+                    // accepts one of the two via the `Either` argument; the
+                    // full state is a strict superset of the delta's effect,
+                    // so callers cannot observe a stale result. If a caller
+                    // ever needs strict delta-only semantics (e.g. a write
+                    // that intentionally relies on merge-time validation
+                    // rejecting a full-state replacement), they should send
+                    // `Delta` directly.
                     Either::Left(WrappedState::from(state.into_bytes()))
                 }
                 freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta {
@@ -1078,14 +1121,7 @@ where
                     // also supplied a state for the same id via the bare
                     // `related_contracts` field, prefer the inline one —
                     // it arrived with the delta as an atomic package.
-                    related_contracts.missing(vec![related_to]);
-                    let mut state_holder = Some(state);
-                    for (id, slot) in related_contracts.update() {
-                        if id == &related_to {
-                            *slot = state_holder.take();
-                            break;
-                        }
-                    }
+                    inject_related_state(&mut related_contracts, related_to, state);
                     Either::Right(delta)
                 }
                 freenet_stdlib::prelude::UpdateData::RelatedState { .. }
@@ -1462,6 +1498,63 @@ mod tests {
             CallerIdentity::WebApp(s) => assert!(!s.is_empty()),
             other => panic!("expected WebApp, got {other:?}"),
         }
+    }
+
+    // Regression tests for the `UpdateQuery` arm rewrite that landed in
+    // PR #4004: previously every variant other than `State` and `Delta`
+    // hit `unreachable!()` and panicked the executor task. The conversion
+    // now decomposes `RelatedStateAndDelta` and `StateAndDelta` instead;
+    // these tests exercise the `inject_related_state` helper directly so
+    // a regression in the conversion (silent state drop, wrong slot, lost
+    // related id) fails fast without needing the full runtime stack.
+
+    #[test]
+    fn inject_related_state_writes_inline_state_to_slot() {
+        // When `RelatedStateAndDelta` arrives with an inline `state` for
+        // `related_to`, the inline state must end up in the
+        // `RelatedContracts` slot for that id so the executor's
+        // related-state-injection bridge surfaces it as a
+        // `UpdateData::RelatedState` entry to the contract WASM.
+        let related_id = *make_contract_key().id();
+        let inline_state = freenet_stdlib::prelude::State::from(vec![1, 2, 3, 4]);
+
+        let mut related = RelatedContracts::default();
+        inject_related_state(&mut related, related_id, inline_state.clone());
+
+        let states: Vec<_> = related.states().collect();
+        assert_eq!(states.len(), 1, "expected exactly one related entry");
+        let (id, slot) = states[0];
+        assert_eq!(id, &related_id);
+        let stored = slot.as_ref().expect("slot must hold the inline state");
+        assert_eq!(stored.as_ref(), inline_state.as_ref());
+    }
+
+    #[test]
+    fn inject_related_state_overrides_existing_slot() {
+        // If the caller already populated `related_contracts` with a state
+        // for the same id (e.g. via a separate `related_contracts` arg on
+        // `UpdateQuery`), the inline state from `RelatedStateAndDelta`
+        // wins. The inline payload arrived alongside the delta as an
+        // atomic package and is the sender's authoritative intent.
+        let related_id = *make_contract_key().id();
+
+        let prior = freenet_stdlib::prelude::State::from(vec![9, 9]);
+        let inline = freenet_stdlib::prelude::State::from(vec![1, 2, 3]);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(related_id, Some(prior));
+        let mut related = RelatedContracts::from(map);
+
+        inject_related_state(&mut related, related_id, inline.clone());
+
+        let states: Vec<_> = related.states().collect();
+        assert_eq!(states.len(), 1);
+        let stored = states[0].1.as_ref().expect("slot must be Some");
+        assert_eq!(
+            stored.as_ref(),
+            inline.as_ref(),
+            "inline state must override pre-existing slot"
+        );
     }
 
     /// Helper: send an event through the sender halve and receive it on the handler side,
