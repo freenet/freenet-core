@@ -3,7 +3,7 @@
 //! Contract web apps are served inside sandboxed iframes to provide origin isolation.
 //! The local API server returns a "shell" page that holds the auth token and
 //! proxies WebSocket connections via postMessage, while the contract runs in an
-//! `<iframe sandbox="allow-scripts allow-forms allow-popups">`
+//! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-downloads">`
 //! with an opaque origin that cannot access other contracts' data.
 //! Popups inherit the sandbox (no `allow-popups-to-escape-sandbox`); external links
 //! are opened via the `open_url` shell bridge message to avoid CORS issues. Sandbox content
@@ -470,7 +470,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" data-src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -1867,6 +1867,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_page_iframe_sandbox_allows_downloads() {
+        // Regression for freenet/mail#TBD: webapps that emit blob/object-URL
+        // downloads via `<a download>` were silently dropped by Chromium
+        // and Safari because the iframe sandbox omitted `allow-downloads`.
+        // Lock the token in so a future refactor does not regress the fix.
+        let token = AuthToken::generate();
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+        assert!(
+            html.contains("allow-downloads"),
+            "iframe sandbox missing `allow-downloads` — user-initiated \
+             file downloads from sandboxed webapps will be silently blocked \
+             by the browser. Got HTML:\n{html}"
+        );
+    }
+
+    #[tokio::test]
     async fn shell_page_contains_iframe_and_bridge() {
         let token = AuthToken::generate();
         let html =
@@ -1874,7 +1891,7 @@ mod tests {
 
         // Shell page must contain sandboxed iframe
         assert!(
-            html.contains(r#"sandbox="allow-scripts allow-forms allow-popups"#),
+            html.contains(r#"sandbox="allow-scripts allow-forms allow-popups allow-downloads"#),
             "iframe sandbox attribute missing"
         );
         // Iframe src must include __sandbox=1
@@ -2088,7 +2105,7 @@ mod tests {
         // immediate load before JS can append the hash fragment).
         assert!(
             !html.contains(
-                r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" src="#
+                r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads" src="#
             ),
             "iframe must use data-src, not src, to avoid loading before JS appends the hash"
         );
