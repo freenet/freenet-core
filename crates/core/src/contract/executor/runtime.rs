@@ -1334,13 +1334,67 @@ where
             .await
         {
             Ok(Either::Left(s)) => s,
-            Ok(Either::Right(mut r)) => {
-                let Some(c) = r.pop() else {
-                    return Err(ExecutorError::internal_error());
-                };
-                return Err(ExecutorError::request(StdContractError::MissingRelated {
-                    key: c.contract_instance_id,
-                }));
+            Ok(Either::Right(missing_related)) => {
+                // Contract's `update_state` returned `UpdateModification::requires(...)`,
+                // listing related contracts it needs to apply the delta. Try to
+                // fetch each one (local first, then network when op_manager is
+                // wired) and re-attempt the update with the fetched states
+                // surfaced as `UpdateData::RelatedState` entries — the same
+                // pattern the validate-side `fetch_related_for_validation`
+                // helper uses. Without this, every cross-node UPDATE that
+                // references a related contract not yet cached locally would
+                // fail with `MissingRelated` even though we could resolve it.
+                let mut fetched_updates = updates.clone();
+                let mut all_resolved = true;
+                for related in &missing_related {
+                    let id = related.contract_instance_id;
+                    let mut got: Option<State<'static>> = None;
+                    if let Some(full_key) = self.bridged_lookup_key(&id) {
+                        if let Ok(state) = self.state_store.get(&full_key).await {
+                            got = Some(State::from(state.as_ref().to_vec()));
+                        }
+                    }
+                    if got.is_none() {
+                        match fetch_related_via_network(self.op_manager.as_ref(), &id).await {
+                            Ok(state) => got = Some(State::from(state.as_ref().to_vec())),
+                            Err(_) => {
+                                all_resolved = false;
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(state) = got {
+                        fetched_updates.push(UpdateData::RelatedState {
+                            related_to: id,
+                            state,
+                        });
+                    }
+                }
+                if !all_resolved {
+                    let Some(c) = missing_related.into_iter().next() else {
+                        return Err(ExecutorError::internal_error());
+                    };
+                    return Err(ExecutorError::request(StdContractError::MissingRelated {
+                        key: c.contract_instance_id,
+                    }));
+                }
+                match self
+                    .attempt_state_update(&params, &current_state, &key, &fetched_updates)
+                    .await
+                {
+                    Ok(Either::Left(s)) => s,
+                    Ok(Either::Right(mut r)) => {
+                        // Contract still demanding more after one round → reject
+                        // (depth limit, matching the validate-side behavior).
+                        let Some(c) = r.pop() else {
+                            return Err(ExecutorError::internal_error());
+                        };
+                        return Err(ExecutorError::request(StdContractError::MissingRelated {
+                            key: c.contract_instance_id,
+                        }));
+                    }
+                    Err(retry_err) => return Err(retry_err),
+                }
             }
             Err(merge_err) => {
                 // Merge failed. If we have a validated full incoming state, try to recover

@@ -78,6 +78,7 @@ fn setup_mock() -> MockWasmRuntime {
     MockWasmRuntime {
         contract_store: InMemoryContractStore::new(),
         validate_overrides: std::collections::HashMap::new(),
+        update_overrides: std::collections::HashMap::new(),
     }
 }
 

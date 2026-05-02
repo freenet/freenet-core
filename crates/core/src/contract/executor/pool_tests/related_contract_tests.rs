@@ -800,3 +800,80 @@ async fn test_update_missing_related_network_fetch_fails() {
         "UPDATE must surface the network fetch failure as an error: {result:?}"
     );
 }
+
+// =========================================================================
+// Test: UPDATE where the contract's update_state returns
+// `requires(missing)` falls through to the network fetch + retry path
+// (the production cross-node UPDATE flow that #80 surfaced — inbox's
+// `update_state` returns requires(AFT-record) on the receiver because
+// the receiver hasn't seen the sender's AFT yet).
+//
+// Regression for the bridged_upsert_contract_state branch that used to
+// MissingRelated immediately on `Either::Right`. With the fix the
+// missing related contracts are fetched via the same local-then-network
+// path used by validate-side RequestRelated, then update_state is
+// re-invoked with `RelatedState` entries surfaced; the second call
+// completes the merge and the upsert succeeds.
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_update_state_requires_related_fetches_and_retries() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mut executor = create_executor().await;
+
+    let target_contract = make_contract(b"update_requires_target");
+    let target_key = target_contract.key();
+    let initial_state = WrappedState::new(br#"{"v":0}"#.to_vec());
+    executor
+        .upsert_contract_state(
+            target_key,
+            Either::Left(initial_state),
+            RelatedContracts::default(),
+            Some(target_contract),
+        )
+        .await
+        .expect("initial PUT");
+
+    let related_contract = make_contract(b"update_requires_related");
+    let related_id = *related_contract.key().id();
+    executor.runtime.update_overrides.insert(
+        *target_key.id(),
+        crate::contract::executor::mock_wasm_runtime::UpdateOverride::RequiresRelated(vec![
+            related_id,
+        ]),
+    );
+
+    let calls: Rc<RefCell<Vec<ContractInstanceId>>> = Rc::new(RefCell::new(Vec::new()));
+    let calls_inner = calls.clone();
+    crate::contract::executor::runtime::set_test_network_fetch_override(Some(Rc::new(move |id| {
+        calls_inner.borrow_mut().push(id);
+        Ok(freenet_stdlib::prelude::WrappedState::new(
+            br#"{"network_supplied_related":true}"#.to_vec(),
+        ))
+    })));
+
+    let delta = StateDelta::from(br#"{"v":1}"#.to_vec());
+    let result = executor
+        .upsert_contract_state(
+            target_key,
+            Either::Right(delta),
+            RelatedContracts::default(),
+            None,
+        )
+        .await;
+
+    crate::contract::executor::runtime::set_test_network_fetch_override(None);
+
+    assert!(
+        result.is_ok(),
+        "UPDATE must succeed once network supplies the related state: {result:?}"
+    );
+    let observed_calls = calls.borrow().clone();
+    assert!(
+        observed_calls.contains(&related_id),
+        "fetch_related_via_network must have been invoked for the requires(missing) path; \
+         observed calls: {observed_calls:?}"
+    );
+}
