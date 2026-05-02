@@ -3617,7 +3617,7 @@ impl Executor<Runtime> {
 /// Network-escalation half of the bridged `fetch_related_for_validation`
 /// loop, factored out so the dispatch logic is unit-testable with a
 /// stubbed fetcher. Production callers pass the executor's own
-/// `op_manager`; tests in this module override [`NETWORK_FETCH_OVERRIDE`]
+/// `op_manager`; tests in this module override [`TEST_NETWORK_FETCH_OVERRIDE`]
 /// (a thread-local) to redirect the network call to a stub instead of
 /// driving a real network sub-op.
 ///
@@ -3643,14 +3643,8 @@ async fn fetch_related_via_network(
             key: *id,
         }));
     };
-    // `_tx` is load-bearing: `start_sub_op_get` returns a
-    // `(Transaction, oneshot::Receiver)` pair. The Transaction is `Copy`
-    // and only used for tracing in the sibling network helper, but the
-    // binding must stay until `rx.await` completes — replacing it with
-    // `let (_, rx) = …` would not in this case (Copy types) drop the
-    // sender, but a future refactor that returns a non-Copy guard here
-    // would silently break the receiver. Keep the named bind so a reader
-    // sees the dependency.
+    // `_tx` is named for clarity; not a drop guard. `Transaction` is
+    // `Copy` so the binding has no lifetime effect today.
     let (_tx, rx) = crate::operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, false);
     let outcome = rx
         .await

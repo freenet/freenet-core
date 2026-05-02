@@ -730,3 +730,73 @@ async fn test_update_missing_related_escalates_to_network_when_stubbed() {
          observed calls: {observed_calls:?}"
     );
 }
+
+// =========================================================================
+// Test: UPDATE that triggers RequestRelated returns MissingRelated when
+// the network branch is reached but the fetch itself fails.
+//
+// Pairs with `test_update_missing_related_escalates_to_network_when_stubbed`
+// (happy path) — this test covers the failure path where the stub
+// returns `Err(...)`. Without this, `SubOpGetOutcome::NotFound` /
+// `SubOpGetOutcome::Infra` mapping in `fetch_related_via_network` would
+// have no automated coverage.
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_update_missing_related_network_fetch_fails() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mut executor = create_executor().await;
+
+    let target_contract = make_contract(b"update_network_fail_target");
+    let target_key = target_contract.key();
+    let initial_state = WrappedState::new(br#"{"v":0}"#.to_vec());
+    executor
+        .upsert_contract_state(
+            target_key,
+            Either::Left(initial_state),
+            RelatedContracts::default(),
+            Some(target_contract),
+        )
+        .await
+        .expect("initial PUT");
+
+    let related_contract = make_contract(b"update_network_fail_related");
+    let related_id = *related_contract.key().id();
+    executor.runtime.validate_overrides.insert(
+        *target_key.id(),
+        ValidateOverride::RequestRelated(vec![related_id]),
+    );
+
+    let calls: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let calls_inner = calls.clone();
+    crate::contract::executor::runtime::set_test_network_fetch_override(Some(Rc::new(move |id| {
+        *calls_inner.borrow_mut() += 1;
+        Err(crate::contract::ExecutorError::request(
+            freenet_stdlib::client_api::ContractError::MissingRelated { key: id },
+        ))
+    })));
+
+    let delta = StateDelta::from(br#"{"v":1}"#.to_vec());
+    let result = executor
+        .upsert_contract_state(
+            target_key,
+            Either::Right(delta),
+            RelatedContracts::default(),
+            None,
+        )
+        .await;
+
+    crate::contract::executor::runtime::set_test_network_fetch_override(None);
+
+    assert_eq!(
+        *calls.borrow(),
+        1,
+        "stub must be called exactly once (one related id requested)"
+    );
+    assert!(
+        result.is_err(),
+        "UPDATE must surface the network fetch failure as an error: {result:?}"
+    );
+}
