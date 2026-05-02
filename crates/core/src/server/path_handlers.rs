@@ -1867,6 +1867,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_page_iframe_sandbox_allows_downloads() {
+        // Regression for freenet/mail#TBD: webapps that emit blob/object-URL
+        // downloads via `<a download>` were silently dropped by Chromium
+        // and Safari because the iframe sandbox omitted `allow-downloads`.
+        // Lock the token in so a future refactor does not regress the fix.
+        let token = AuthToken::generate();
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+        assert!(
+            html.contains("allow-downloads"),
+            "iframe sandbox missing `allow-downloads` — user-initiated \
+             file downloads from sandboxed webapps will be silently blocked \
+             by the browser. Got HTML:\n{html}"
+        );
+    }
+
+    #[tokio::test]
     async fn shell_page_contains_iframe_and_bridge() {
         let token = AuthToken::generate();
         let html =
