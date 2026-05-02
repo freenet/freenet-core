@@ -2222,8 +2222,10 @@ async fn deliver_update_result(
     };
 
     let host_result = op.to_host_result();
-    // Note: record_contract_updated is called in commit_state_update (the single
-    // chokepoint for all state updates), so we don't call it here to avoid double-counting.
+    // Note: dashboard "last updated" telemetry is recorded via
+    // `Ring::record_contract_update` from `commit_state_update` (the single
+    // chokepoint for all state updates); we don't call it here to avoid
+    // double-counting.
 
     // Use try_send to avoid blocking spawned executor tasks (see channel-safety.md).
     op_manager

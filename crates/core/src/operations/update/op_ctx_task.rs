@@ -1736,7 +1736,8 @@ mod tests {
 
     /// Guard: the driver must call `update_contract` to preserve all side
     /// effects (WASM merge, state persistence, BroadcastStateChange emission,
-    /// delegate notifications, record_contract_updated telemetry).
+    /// delegate notifications, dashboard last-updated telemetry via
+    /// `Ring::record_contract_update`).
     #[test]
     fn driver_calls_update_contract() {
         let src = include_str!("op_ctx_task.rs");

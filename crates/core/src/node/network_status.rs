@@ -9,12 +9,29 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use crate::ring::PeerKeyLocation;
+use crate::ring::{PeerKeyLocation, SubscribedContractSnapshot};
 use crate::router::Router;
 use crate::transport::metrics::TRANSPORT_METRICS;
 
 static NETWORK_STATUS: OnceLock<Arc<RwLock<NetworkStatus>>> = OnceLock::new();
 static ROUTER: OnceLock<Arc<parking_lot::RwLock<Router>>> = OnceLock::new();
+
+/// Provider returning the current dashboard view of subscribed contracts.
+///
+/// In production this closure captures the node's `Arc<Ring>` and calls
+/// `Ring::dashboard_subscription_snapshot()`; tests can register an
+/// arbitrary closure to pin the wiring without constructing a Ring.
+pub type SubscriptionProvider =
+    Arc<dyn Fn() -> Vec<SubscribedContractSnapshot> + Send + Sync + 'static>;
+
+/// Replaceable storage for the subscription provider. Wrapped in a
+/// `RwLock<Option<…>>` rather than `OnceLock` so multi-node in-process
+/// harnesses can re-wire the dashboard to the live node — and so a
+/// repeated wiring is loud (replaces the previous provider) rather than
+/// silently retaining the first one set, which is precisely the
+/// silent-mirror failure mode this refactor exists to remove.
+static SUBSCRIPTION_PROVIDER: parking_lot::RwLock<Option<SubscriptionProvider>> =
+    parking_lot::RwLock::new(None);
 
 /// Store a reference to the Router for the dashboard.
 pub fn set_router(router: Arc<parking_lot::RwLock<Router>>) {
@@ -28,6 +45,20 @@ pub(crate) fn get_router() -> Option<Arc<parking_lot::RwLock<Router>>> {
     ROUTER.get().cloned()
 }
 
+/// Register the dashboard's subscription data source. Replaces any
+/// previously-registered provider so multi-node in-process harnesses
+/// can re-wire to the current node.
+pub fn set_subscription_provider(provider: SubscriptionProvider) {
+    *SUBSCRIPTION_PROVIDER.write() = Some(provider);
+}
+
+/// Clear the subscription provider. Used by tests; not called from
+/// production.
+#[cfg(test)]
+pub(crate) fn clear_subscription_provider() {
+    *SUBSCRIPTION_PROVIDER.write() = None;
+}
+
 /// Tracked network connection status for diagnostic display.
 pub struct NetworkStatus {
     pub gateway_failures: Vec<GatewayFailure>,
@@ -38,8 +69,6 @@ pub struct NetworkStatus {
     pub gateway_addresses: HashSet<SocketAddr>,
     /// Active peer connections.
     pub connected_peers: Vec<ConnectedPeer>,
-    /// Subscribed contracts keyed by encoded contract key.
-    pub subscribed_contracts: HashMap<String, ContractInfo>,
     /// Freenet version string.
     pub version: String,
     /// This node's ring location.
@@ -59,13 +88,6 @@ pub struct ConnectedPeer {
     pub location: Option<f64>,
     pub connected_since: Instant,
     pub peer_key_location: Option<PeerKeyLocation>,
-}
-
-/// Info about a subscribed contract.
-pub struct ContractInfo {
-    pub key_encoded: String,
-    pub subscribed_since: Instant,
-    pub last_updated: Option<Instant>,
 }
 
 /// Counters for each operation type: (success, failure).
@@ -171,7 +193,6 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         started_at: Instant::now(),
         gateway_addresses: gateway_addrs,
         connected_peers: Vec::new(),
-        subscribed_contracts: HashMap::new(),
         version,
         own_location: None,
         external_address: None,
@@ -237,41 +258,6 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.connected_peers.retain(|p| p.address != addr);
-        }
-    }
-}
-
-/// Record a new subscription.
-pub fn record_subscription(key_encoded: String) {
-    if let Some(status) = NETWORK_STATUS.get() {
-        if let Ok(mut s) = status.write() {
-            s.subscribed_contracts
-                .entry(key_encoded.clone())
-                .or_insert_with(|| ContractInfo {
-                    key_encoded,
-                    subscribed_since: Instant::now(),
-                    last_updated: None,
-                });
-        }
-    }
-}
-
-/// Record that a contract was updated.
-pub fn record_contract_updated(key_encoded: &str) {
-    if let Some(status) = NETWORK_STATUS.get() {
-        if let Ok(mut s) = status.write() {
-            if let Some(info) = s.subscribed_contracts.get_mut(key_encoded) {
-                info.last_updated = Some(Instant::now());
-            }
-        }
-    }
-}
-
-/// Record a subscription removal.
-pub fn record_subscription_removed(key_encoded: &str) {
-    if let Some(status) = NETWORK_STATUS.get() {
-        if let Ok(mut s) = status.write() {
-            s.subscribed_contracts.remove(key_encoded);
         }
     }
 }
@@ -504,32 +490,38 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
     let open_connections = peers.len() as u32;
     let gateway_only = open_connections > 0 && peers.iter().all(|p| p.is_gateway);
 
-    let mut contracts: Vec<ContractSnapshot> = s
-        .subscribed_contracts
-        .values()
-        .map(|c| {
-            // Use char boundary for safe truncation (contract keys are base58/ASCII,
-            // but be defensive against future encoding changes).
-            let key_short = if c.key_encoded.chars().count() > 12 {
-                let trunc: String = c.key_encoded.chars().take(12).collect();
-                format!("{trunc}...")
-            } else {
-                c.key_encoded.clone()
-            };
-            ContractSnapshot {
-                key_short,
-                key_full: c.key_encoded.clone(),
-                subscribed_secs: now.duration_since(c.subscribed_since).as_secs(),
-                last_updated_secs: c.last_updated.map(|t| now.duration_since(t).as_secs()),
-            }
+    // Read subscribed contracts from the registered provider, which in
+    // production points at the canonical lease map in `HostingManager`.
+    // Sort order is set inside the provider (most recently updated first;
+    // never-updated entries fall to the end with a deterministic key
+    // tie-break).
+    let contracts: Vec<ContractSnapshot> = SUBSCRIPTION_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| {
+            provider()
+                .into_iter()
+                .map(|c| {
+                    let key_full = c.key.to_string();
+                    // Use char boundary for safe truncation (contract keys
+                    // are base58/ASCII, but be defensive against future
+                    // encoding changes).
+                    let key_short = if key_full.chars().count() > 12 {
+                        let trunc: String = key_full.chars().take(12).collect();
+                        format!("{trunc}...")
+                    } else {
+                        key_full.clone()
+                    };
+                    ContractSnapshot {
+                        key_short,
+                        key_full,
+                        subscribed_secs: c.subscribed_secs,
+                        last_updated_secs: c.last_updated_secs,
+                    }
+                })
+                .collect()
         })
-        .collect();
-    // Sort by most recently updated first
-    contracts.sort_by(|a, b| {
-        let a_time = a.last_updated_secs.unwrap_or(u64::MAX);
-        let b_time = b.last_updated_secs.unwrap_or(u64::MAX);
-        a_time.cmp(&b_time)
-    });
+        .unwrap_or_default();
 
     let elapsed_secs = s.started_at.elapsed().as_secs();
     let has_version_mismatch = s
@@ -812,22 +804,73 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription_tracking() {
+    fn test_subscription_tracking_no_provider_wired() {
+        // With no provider registered, `get_snapshot()` reports zero
+        // subscribed contracts (rather than panicking).
         let _lock = TEST_MUTEX.lock().unwrap();
         init(31341, HashSet::new(), "0.1.148".to_string());
-
-        record_subscription("ABC123DEF456".to_string());
-        let snap = get_snapshot().unwrap();
-        assert_eq!(snap.contracts.len(), 1);
-        assert_eq!(snap.contracts[0].key_full, "ABC123DEF456");
-
-        record_contract_updated("ABC123DEF456");
-        let snap = get_snapshot().unwrap();
-        assert!(snap.contracts[0].last_updated_secs.is_some());
-
-        record_subscription_removed("ABC123DEF456");
+        clear_subscription_provider();
         let snap = get_snapshot().unwrap();
         assert!(snap.contracts.is_empty());
+    }
+
+    /// Regression test for the dashboard "Subscribed Contracts" panel.
+    ///
+    /// Pins the production wiring: when the subscription provider is
+    /// registered and yields contracts, `get_snapshot().contracts`
+    /// renders them with the same field shape (`key_short`, `key_full`,
+    /// `subscribed_secs`, `last_updated_secs`) the dashboard template
+    /// expects. The bug this PR fixes was a silent break in this path
+    /// after SUBSCRIBE migrated to the task-per-tx driver and stopped
+    /// invoking the legacy mirror — without a test that exercises the
+    /// provider end-to-end, the same break could happen at the
+    /// `set_subscription_provider` seam in a future refactor.
+    #[test]
+    fn test_subscription_provider_wired_renders_contracts() {
+        use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey};
+
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31350, HashSet::new(), "0.1.148".to_string());
+
+        // Two contracts with deterministic keys; the base58 encoding is
+        // long enough to exercise the >12-char truncation path.
+        let code_hash = ContractCode::from(vec![0u8; 32]).hash().clone();
+        let key_a =
+            ContractKey::from_id_and_code(ContractInstanceId::new([0xAA; 32]), code_hash.clone());
+        let key_b = ContractKey::from_id_and_code(ContractInstanceId::new([0xBB; 32]), code_hash);
+        let snapshot = vec![
+            crate::ring::SubscribedContractSnapshot {
+                key: key_a,
+                subscribed_secs: 30,
+                last_updated_secs: Some(5),
+            },
+            crate::ring::SubscribedContractSnapshot {
+                key: key_b,
+                subscribed_secs: 30,
+                last_updated_secs: None,
+            },
+        ];
+        set_subscription_provider(Arc::new(move || snapshot.clone()));
+
+        let snap = get_snapshot().unwrap();
+        assert_eq!(snap.contracts.len(), 2);
+        assert_eq!(snap.contracts[0].key_full, key_a.to_string());
+        assert_eq!(snap.contracts[0].subscribed_secs, 30);
+        assert_eq!(snap.contracts[0].last_updated_secs, Some(5));
+        // key_short should be truncated to the first 12 chars + ellipsis
+        // for any base58-encoded ContractKey.
+        assert!(snap.contracts[0].key_short.ends_with("..."));
+        assert_eq!(snap.contracts[0].key_short.chars().count(), 15);
+
+        // Replacing the provider must take effect immediately — the
+        // OnceLock-style "first set wins" pattern would silently fail
+        // multi-node test harnesses, exactly the failure mode this
+        // refactor exists to remove.
+        set_subscription_provider(Arc::new(Vec::new));
+        let snap = get_snapshot().unwrap();
+        assert!(snap.contracts.is_empty());
+
+        clear_subscription_provider();
     }
 
     #[test]
