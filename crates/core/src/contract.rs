@@ -1049,28 +1049,100 @@ where
         ContractHandlerEvent::UpdateQuery {
             key,
             data,
-            related_contracts,
+            mut related_contracts,
         } => {
             let update_value: Either<WrappedState, StateDelta<'static>> = match data {
                 freenet_stdlib::prelude::UpdateData::State(state) => {
                     Either::Left(WrappedState::from(state.into_bytes()))
                 }
                 freenet_stdlib::prelude::UpdateData::Delta(delta) => Either::Right(delta),
-                freenet_stdlib::prelude::UpdateData::StateAndDelta { .. }
-                | freenet_stdlib::prelude::UpdateData::RelatedState { .. }
-                | freenet_stdlib::prelude::UpdateData::RelatedDelta { .. }
-                | freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta { .. } => {
-                    unreachable!()
+                freenet_stdlib::prelude::UpdateData::StateAndDelta { state, .. } => {
+                    // Prefer the full state — it's authoritative and avoids
+                    // an extra delta-merge round trip in the executor. The
+                    // delta is dropped because `upsert_contract_state` only
+                    // accepts one of the two via the `Either` argument.
+                    Either::Left(WrappedState::from(state.into_bytes()))
+                }
+                freenet_stdlib::prelude::UpdateData::RelatedStateAndDelta {
+                    related_to,
+                    state,
+                    delta,
+                } => {
+                    // Bundle the related contract's state into
+                    // `related_contracts` so the executor's
+                    // related-state-injection bridge surfaces it to the
+                    // contract WASM as a `UpdateData::RelatedState` entry.
+                    // The delta on this variant targets `key` itself.
+                    // `RelatedContracts` exposes no public `insert`, so use
+                    // `update()` to mutate the inner slot. If the caller
+                    // also supplied a state for the same id via the bare
+                    // `related_contracts` field, prefer the inline one —
+                    // it arrived with the delta as an atomic package.
+                    related_contracts.missing(vec![related_to]);
+                    let mut state_holder = Some(state);
+                    for (id, slot) in related_contracts.update() {
+                        if id == &related_to {
+                            *slot = state_holder.take();
+                            break;
+                        }
+                    }
+                    Either::Right(delta)
+                }
+                freenet_stdlib::prelude::UpdateData::RelatedState { .. }
+                | freenet_stdlib::prelude::UpdateData::RelatedDelta { .. } => {
+                    // These variants carry a payload only for a related
+                    // contract, with no main-contract state or delta. The
+                    // runtime's `RequestRelated → GET → re-update` flow
+                    // populates `related_contracts` itself rather than
+                    // routing these variants through `UpdateQuery`, so
+                    // hitting this branch indicates a misuse from a
+                    // client-facing surface. Reject explicitly instead of
+                    // panicking — see freenet/freenet-core#4003.
+                    let err = ExecutorError::other(anyhow::anyhow!(
+                        "RelatedState / RelatedDelta UpdateData variants are not \
+                         accepted directly via ContractRequest::Update — they are \
+                         reserved for the runtime's request-related orchestration"
+                    ));
+                    if let Err(send_err) = contract_handler
+                        .channel()
+                        .send_to_sender(
+                            id,
+                            ContractHandlerEvent::UpdateResponse {
+                                new_value: Err(err),
+                                state_changed: false,
+                            },
+                        )
+                        .await
+                    {
+                        tracing::debug!(error = %send_err, contract = %key, "Failed to send rejection");
+                    }
+                    return Ok(());
                 }
                 // `UpdateData` is `#[non_exhaustive]` since stdlib 0.6.0.
-                // Future variants must be explicitly handled before they
-                // flow through `UpdateQuery`; the producer at the edge
-                // should reject unknown variants rather than routing them
-                // here.
-                _ => unreachable!(
-                    "Unknown UpdateData variant reached ContractHandlerEvent::UpdateQuery; \
-                     add explicit handling before landing the new variant upstream"
-                ),
+                // Reject unknown future variants explicitly instead of
+                // panicking the executor task; the producer at the edge
+                // should validate variants before routing them here.
+                _ => {
+                    let err = ExecutorError::other(anyhow::anyhow!(
+                        "Unknown UpdateData variant reached \
+                         ContractHandlerEvent::UpdateQuery; add explicit \
+                         handling before landing the new variant"
+                    ));
+                    if let Err(send_err) = contract_handler
+                        .channel()
+                        .send_to_sender(
+                            id,
+                            ContractHandlerEvent::UpdateResponse {
+                                new_value: Err(err),
+                                state_changed: false,
+                            },
+                        )
+                        .await
+                    {
+                        tracing::debug!(error = %send_err, contract = %key, "Failed to send rejection");
+                    }
+                    return Ok(());
+                }
             };
             let update_result = contract_handler
                 .executor()
