@@ -30,6 +30,10 @@ pub(crate) enum UpdateOverride {
     /// bridged-upsert retry path). Mirrors `ValidateOverride::RequestRelated`
     /// but at the update-side of the fetch loop.
     RequiresRelated(Vec<ContractInstanceId>),
+    /// Always return `UpdateModification::requires(...)` regardless of
+    /// whether RelatedState entries are already populated. Drives the
+    /// depth-limit branch in `bridged_upsert_contract_state`.
+    AlwaysRequiresRelated(Vec<ContractInstanceId>),
 }
 
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
@@ -94,23 +98,35 @@ impl ContractRuntimeInterface for MockWasmRuntime {
         // update_data slice) returns `requires`; once the bridged path
         // re-attempts with `RelatedState` entries appended, fall through
         // to the default merge.
-        if let Some(UpdateOverride::RequiresRelated(ref ids)) =
-            self.update_overrides.get(_key.id()).cloned()
-        {
-            let has_related = update_data
-                .iter()
-                .any(|u| matches!(u, UpdateData::RelatedState { .. }));
-            if !has_related {
-                let related: Vec<RelatedContract> = ids
-                    .iter()
-                    .map(|id| RelatedContract {
-                        contract_instance_id: *id,
-                        mode: RelatedMode::StateOnce,
-                    })
-                    .collect();
-                return Ok(
-                    UpdateModification::requires(related).map_err(|e| anyhow::anyhow!("{e}"))?
-                );
+        if let Some(override_) = self.update_overrides.get(_key.id()).cloned() {
+            match override_ {
+                UpdateOverride::RequiresRelated(ids) => {
+                    let has_related = update_data
+                        .iter()
+                        .any(|u| matches!(u, UpdateData::RelatedState { .. }));
+                    if !has_related {
+                        let related: Vec<RelatedContract> = ids
+                            .iter()
+                            .map(|id| RelatedContract {
+                                contract_instance_id: *id,
+                                mode: RelatedMode::StateOnce,
+                            })
+                            .collect();
+                        return Ok(UpdateModification::requires(related)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?);
+                    }
+                }
+                UpdateOverride::AlwaysRequiresRelated(ids) => {
+                    let related: Vec<RelatedContract> = ids
+                        .iter()
+                        .map(|id| RelatedContract {
+                            contract_instance_id: *id,
+                            mode: RelatedMode::StateOnce,
+                        })
+                        .collect();
+                    return Ok(UpdateModification::requires(related)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?);
+                }
             }
         }
         // Accept the last full state or delta from update_data as the new state

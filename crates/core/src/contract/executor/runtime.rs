@@ -1344,38 +1344,98 @@ where
                 // helper uses. Without this, every cross-node UPDATE that
                 // references a related contract not yet cached locally would
                 // fail with `MissingRelated` even though we could resolve it.
+                //
+                // Apply the same abuse-prevention guards the validate-side
+                // path enforces (see `contracts.md` Abuse prevention):
+                //   * Reject empty list (a contract MUST signal Valid via
+                //     a populated state, not an empty `requires`).
+                //   * Reject self-reference (no contract may ask for its
+                //     own state through this path).
+                //   * Cap at MAX_RELATED_CONTRACTS_PER_REQUEST so a
+                //     misbehaving contract can't fan out 50 network GETs.
+                //   * Dedup IDs so repeated declarations don't multiply
+                //     the fetch count.
+                if missing_related.is_empty() {
+                    tracing::warn!(
+                        contract = %key,
+                        "update_state returned requires() with empty list"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Update {
+                        key,
+                        cause: "contract requested related contracts but provided empty list"
+                            .into(),
+                    }));
+                }
+                let self_id = key.id();
+                if missing_related
+                    .iter()
+                    .any(|c| &c.contract_instance_id == self_id)
+                {
+                    tracing::warn!(
+                        contract = %key,
+                        "update_state requires() included self-reference"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Update {
+                        key,
+                        cause: "contract cannot request itself as a related contract".into(),
+                    }));
+                }
+                let unique_ids: HashSet<ContractInstanceId> = missing_related
+                    .iter()
+                    .map(|c| c.contract_instance_id)
+                    .collect();
+                if unique_ids.len() > MAX_RELATED_CONTRACTS_PER_REQUEST {
+                    tracing::warn!(
+                        contract = %key,
+                        requested = unique_ids.len(),
+                        limit = MAX_RELATED_CONTRACTS_PER_REQUEST,
+                        "update_state requires() exceeded MAX_RELATED_CONTRACTS_PER_REQUEST"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Update {
+                        key,
+                        cause: format!(
+                            "contract requested {} related contracts, limit is {}",
+                            unique_ids.len(),
+                            MAX_RELATED_CONTRACTS_PER_REQUEST
+                        )
+                        .into(),
+                    }));
+                }
+
                 let mut fetched_updates = updates.clone();
-                let mut all_resolved = true;
-                for related in &missing_related {
-                    let id = related.contract_instance_id;
+                let mut failed_id: Option<ContractInstanceId> = None;
+                for id in &unique_ids {
                     let mut got: Option<State<'static>> = None;
-                    if let Some(full_key) = self.bridged_lookup_key(&id) {
+                    if let Some(full_key) = self.bridged_lookup_key(id) {
                         if let Ok(state) = self.state_store.get(&full_key).await {
                             got = Some(State::from(state.as_ref().to_vec()));
                         }
                     }
                     if got.is_none() {
-                        match fetch_related_via_network(self.op_manager.as_ref(), &id).await {
+                        match fetch_related_via_network(self.op_manager.as_ref(), id).await {
                             Ok(state) => got = Some(State::from(state.as_ref().to_vec())),
-                            Err(_) => {
-                                all_resolved = false;
+                            Err(err) => {
+                                tracing::warn!(
+                                    contract = %key,
+                                    related_id = %id,
+                                    error = %err,
+                                    "Failed to fetch related contract for update_state requires()"
+                                );
+                                failed_id = Some(*id);
                                 break;
                             }
                         }
                     }
                     if let Some(state) = got {
                         fetched_updates.push(UpdateData::RelatedState {
-                            related_to: id,
+                            related_to: *id,
                             state,
                         });
                     }
                 }
-                if !all_resolved {
-                    let Some(c) = missing_related.into_iter().next() else {
-                        return Err(ExecutorError::internal_error());
-                    };
+                if let Some(id) = failed_id {
                     return Err(ExecutorError::request(StdContractError::MissingRelated {
-                        key: c.contract_instance_id,
+                        key: id,
                     }));
                 }
                 match self
@@ -1389,6 +1449,11 @@ where
                         let Some(c) = r.pop() else {
                             return Err(ExecutorError::internal_error());
                         };
+                        tracing::warn!(
+                            contract = %key,
+                            related_id = %c.contract_instance_id,
+                            "update_state still requires() after first fetch round (depth>1 not supported)"
+                        );
                         return Err(ExecutorError::request(StdContractError::MissingRelated {
                             key: c.contract_instance_id,
                         }));

@@ -877,3 +877,231 @@ async fn test_update_state_requires_related_fetches_and_retries() {
          observed calls: {observed_calls:?}"
     );
 }
+
+// =========================================================================
+// Test: update_state requires(missing) + network fetch FAILS → MissingRelated.
+//
+// Pairs with `test_update_state_requires_related_fetches_and_retries`
+// (happy path). Ensures the failure mapping in the new branch returns
+// MissingRelated cleanly when the network can't service the related id.
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_update_state_requires_related_network_fail_returns_missing() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mut executor = create_executor().await;
+
+    let target_contract = make_contract(b"update_requires_fail_target");
+    let target_key = target_contract.key();
+    executor
+        .upsert_contract_state(
+            target_key,
+            Either::Left(WrappedState::new(br#"{"v":0}"#.to_vec())),
+            RelatedContracts::default(),
+            Some(target_contract),
+        )
+        .await
+        .expect("initial PUT");
+
+    let related_contract = make_contract(b"update_requires_fail_related");
+    let related_id = *related_contract.key().id();
+    executor.runtime.update_overrides.insert(
+        *target_key.id(),
+        crate::contract::executor::mock_wasm_runtime::UpdateOverride::RequiresRelated(vec![
+            related_id,
+        ]),
+    );
+
+    let calls: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let calls_inner = calls.clone();
+    crate::contract::executor::runtime::set_test_network_fetch_override(Some(Rc::new(move |id| {
+        *calls_inner.borrow_mut() += 1;
+        Err(crate::contract::ExecutorError::request(
+            freenet_stdlib::client_api::ContractError::MissingRelated { key: id },
+        ))
+    })));
+
+    let result = executor
+        .upsert_contract_state(
+            target_key,
+            Either::Right(StateDelta::from(br#"{"v":1}"#.to_vec())),
+            RelatedContracts::default(),
+            None,
+        )
+        .await;
+
+    crate::contract::executor::runtime::set_test_network_fetch_override(None);
+
+    assert_eq!(*calls.borrow(), 1, "stub must be called once");
+    assert!(
+        result.is_err(),
+        "UPDATE must surface network fetch failure: {result:?}"
+    );
+}
+
+// =========================================================================
+// Test: update_state still requires(missing) after the fetch round →
+// rejected (depth>1 limit, mirroring the validate-side behavior).
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_update_state_requires_related_depth_exceeded_rejected() {
+    use std::rc::Rc;
+
+    let mut executor = create_executor().await;
+
+    let target_contract = make_contract(b"update_requires_depth_target");
+    let target_key = target_contract.key();
+    executor
+        .upsert_contract_state(
+            target_key,
+            Either::Left(WrappedState::new(br#"{"v":0}"#.to_vec())),
+            RelatedContracts::default(),
+            Some(target_contract),
+        )
+        .await
+        .expect("initial PUT");
+
+    let related_contract = make_contract(b"update_requires_depth_related");
+    let related_id = *related_contract.key().id();
+    executor.runtime.update_overrides.insert(
+        *target_key.id(),
+        crate::contract::executor::mock_wasm_runtime::UpdateOverride::AlwaysRequiresRelated(vec![
+            related_id,
+        ]),
+    );
+
+    crate::contract::executor::runtime::set_test_network_fetch_override(Some(Rc::new(|_id| {
+        Ok(freenet_stdlib::prelude::WrappedState::new(
+            br#"{"network_supplied_related":true}"#.to_vec(),
+        ))
+    })));
+
+    let result = executor
+        .upsert_contract_state(
+            target_key,
+            Either::Right(StateDelta::from(br#"{"v":1}"#.to_vec())),
+            RelatedContracts::default(),
+            None,
+        )
+        .await;
+
+    crate::contract::executor::runtime::set_test_network_fetch_override(None);
+
+    assert!(
+        result.is_err(),
+        "depth>1 UPDATE requires() must be rejected: {result:?}"
+    );
+}
+
+// =========================================================================
+// Test: update_state requires(missing) with > MAX_RELATED_CONTRACTS_PER_REQUEST
+// IDs is rejected outright without fanning out network fetches.
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_update_state_requires_related_too_many_rejected() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mut executor = create_executor().await;
+
+    let target_contract = make_contract(b"update_requires_toomany_target");
+    let target_key = target_contract.key();
+    executor
+        .upsert_contract_state(
+            target_key,
+            Either::Left(WrappedState::new(br#"{"v":0}"#.to_vec())),
+            RelatedContracts::default(),
+            Some(target_contract),
+        )
+        .await
+        .expect("initial PUT");
+
+    // 11 ids — one over the cap. Use Always so the override fires
+    // regardless of RelatedState entries (fetches must NOT happen at all).
+    let too_many: Vec<ContractInstanceId> = (0..11)
+        .map(|i| *make_contract(&[0xFF, i, 0xAA]).key().id())
+        .collect();
+    executor.runtime.update_overrides.insert(
+        *target_key.id(),
+        crate::contract::executor::mock_wasm_runtime::UpdateOverride::AlwaysRequiresRelated(
+            too_many,
+        ),
+    );
+
+    let calls: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let calls_inner = calls.clone();
+    crate::contract::executor::runtime::set_test_network_fetch_override(Some(Rc::new(
+        move |_id| {
+            *calls_inner.borrow_mut() += 1;
+            Ok(freenet_stdlib::prelude::WrappedState::new(b"x".to_vec()))
+        },
+    )));
+
+    let result = executor
+        .upsert_contract_state(
+            target_key,
+            Either::Right(StateDelta::from(br#"{"v":1}"#.to_vec())),
+            RelatedContracts::default(),
+            None,
+        )
+        .await;
+
+    crate::contract::executor::runtime::set_test_network_fetch_override(None);
+
+    assert_eq!(
+        *calls.borrow(),
+        0,
+        "guard must reject before any fetch fires; stub was called {} times",
+        *calls.borrow()
+    );
+    assert!(
+        result.is_err(),
+        "UPDATE requires() with >MAX must be rejected: {result:?}"
+    );
+}
+
+// =========================================================================
+// Test: update_state requires(self) is rejected.
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_update_state_requires_related_self_reference_rejected() {
+    let mut executor = create_executor().await;
+
+    let target_contract = make_contract(b"update_requires_self_target");
+    let target_key = target_contract.key();
+    executor
+        .upsert_contract_state(
+            target_key,
+            Either::Left(WrappedState::new(br#"{"v":0}"#.to_vec())),
+            RelatedContracts::default(),
+            Some(target_contract),
+        )
+        .await
+        .expect("initial PUT");
+
+    executor.runtime.update_overrides.insert(
+        *target_key.id(),
+        crate::contract::executor::mock_wasm_runtime::UpdateOverride::AlwaysRequiresRelated(vec![
+            *target_key.id(),
+        ]),
+    );
+
+    let result = executor
+        .upsert_contract_state(
+            target_key,
+            Either::Right(StateDelta::from(br#"{"v":1}"#.to_vec())),
+            RelatedContracts::default(),
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "self-reference in update_state requires() must be rejected: {result:?}"
+    );
+}
