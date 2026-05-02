@@ -2004,37 +2004,12 @@ where
                         continue;
                     }
                 }
-                // Local lookup miss → escalate to a network GET if the
-                // executor has the op_manager wired up. Mock executors and
-                // local-only test harnesses have `op_manager == None`; for
-                // those the legacy MissingRelated error stays.
-                let Some(op_manager) = self.op_manager.as_ref() else {
-                    return Err(ExecutorError::request(StdContractError::MissingRelated {
-                        key: *id,
-                    }));
-                };
-                // The driver returns `(Transaction, oneshot::Receiver)`. We
-                // only need the receiver to carry the outcome; the
-                // transaction is a `Copy` id used for tracing in the
-                // sibling network helper. Bind it as `_tx` (clippy is happy
-                // with non-must_use Copy types under that pattern).
-                let (_tx, rx) =
-                    crate::operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, false);
-                let outcome = rx.await.map_err(|_| {
-                    ExecutorError::other(anyhow::anyhow!("sub-op GET task dropped"))
-                })?;
-                match outcome {
-                    crate::operations::get::op_ctx_task::SubOpGetOutcome::Found(get_result) => {
-                        related_map
-                            .insert(*id, Some(State::from(get_result.state.as_ref().to_vec())));
-                    }
-                    crate::operations::get::op_ctx_task::SubOpGetOutcome::NotFound(_)
-                    | crate::operations::get::op_ctx_task::SubOpGetOutcome::Infra(_) => {
-                        return Err(ExecutorError::request(StdContractError::MissingRelated {
-                            key: *id,
-                        }));
-                    }
-                }
+                // Local lookup miss → escalate via the network-fallback
+                // helper (factored out so the per-id branch logic is
+                // testable with a stubbed fetcher). Mock executors that
+                // lack an `op_manager` get the legacy MissingRelated.
+                let fetched = fetch_related_via_network(self.op_manager.as_ref(), id).await?;
+                related_map.insert(*id, Some(State::from(fetched.as_ref().to_vec())));
             }
             Ok::<(), ExecutorError>(())
         };
@@ -3637,6 +3612,71 @@ impl Executor<Runtime> {
             }
         }
     }
+}
+
+/// Network-escalation half of the bridged `fetch_related_for_validation`
+/// loop, factored out so the dispatch logic is unit-testable with a
+/// stubbed fetcher. Production callers pass the executor's own
+/// `op_manager`; tests in this module override [`NETWORK_FETCH_OVERRIDE`]
+/// (a thread-local) to redirect the network call to a stub instead of
+/// driving a real network sub-op.
+///
+/// Behavior:
+/// - `op_manager.is_none()` → return `MissingRelated`. This preserves the
+///   legacy local-only outcome for mock executors and unit tests that
+///   never wire up a real op_manager.
+/// - `op_manager.is_some()` → drive a sub-op GET via
+///   `start_sub_op_get`. `Found` resolves to the fetched state;
+///   `NotFound`/`Infra` map back to `MissingRelated`.
+async fn fetch_related_via_network(
+    op_manager: Option<&Arc<crate::node::OpManager>>,
+    id: &ContractInstanceId,
+) -> Result<WrappedState, ExecutorError> {
+    #[cfg(test)]
+    {
+        if let Some(stub) = TEST_NETWORK_FETCH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+            return stub(*id);
+        }
+    }
+    let Some(op_manager) = op_manager else {
+        return Err(ExecutorError::request(StdContractError::MissingRelated {
+            key: *id,
+        }));
+    };
+    let (_tx, rx) = crate::operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, false);
+    let outcome = rx
+        .await
+        .map_err(|_| ExecutorError::other(anyhow::anyhow!("sub-op GET task dropped")))?;
+    match outcome {
+        crate::operations::get::op_ctx_task::SubOpGetOutcome::Found(get_result) => {
+            Ok(WrappedState::from(get_result.state.as_ref().to_vec()))
+        }
+        crate::operations::get::op_ctx_task::SubOpGetOutcome::NotFound(_)
+        | crate::operations::get::op_ctx_task::SubOpGetOutcome::Infra(_) => {
+            Err(ExecutorError::request(StdContractError::MissingRelated {
+                key: *id,
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) type NetworkFetchStub =
+    std::rc::Rc<dyn Fn(ContractInstanceId) -> Result<WrappedState, ExecutorError>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook used by `fetch_related_via_network` to bypass the real
+    /// network sub-op driver. Set with [`set_test_network_fetch_override`]
+    /// inside a `#[tokio::test(flavor = "current_thread")]` so the
+    /// thread-local lookup hits the same task that ran the test setup.
+    static TEST_NETWORK_FETCH_OVERRIDE: std::cell::RefCell<Option<NetworkFetchStub>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_network_fetch_override(stub: Option<NetworkFetchStub>) {
+    TEST_NETWORK_FETCH_OVERRIDE.with(|cell| *cell.borrow_mut() = stub);
 }
 
 /// Resolve a [`MessageOrigin`] for a delegate `ApplicationMessages` request,

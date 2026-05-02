@@ -651,3 +651,82 @@ async fn test_update_missing_related_local_only_errors() {
          got {result:?}"
     );
 }
+
+// =========================================================================
+// Test: UPDATE that triggers RequestRelated for a contract not in
+// state_store DOES escalate to network when the override stub is wired.
+//
+// This is the regression for the actual fix in PR #4006: previously the
+// bridged path returned MissingRelated immediately on local miss with no
+// network attempt. The fix calls into `fetch_related_via_network`, which
+// in production uses `op_manager` + `start_sub_op_get` and in tests
+// honors the `TEST_NETWORK_FETCH_OVERRIDE` thread-local stub. If the
+// fix were reverted (back to local-only), this test fails because the
+// stub never gets called.
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_update_missing_related_escalates_to_network_when_stubbed() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mut executor = create_executor().await;
+
+    let target_contract = make_contract(b"update_network_escalate_target");
+    let target_key = target_contract.key();
+    let initial_state = WrappedState::new(br#"{"v":0}"#.to_vec());
+    executor
+        .upsert_contract_state(
+            target_key,
+            Either::Left(initial_state),
+            RelatedContracts::default(),
+            Some(target_contract),
+        )
+        .await
+        .expect("initial PUT");
+
+    let related_contract = make_contract(b"update_network_escalate_related");
+    let related_id = *related_contract.key().id();
+    executor.runtime.validate_overrides.insert(
+        *target_key.id(),
+        ValidateOverride::RequestRelated(vec![related_id]),
+    );
+
+    // Pre-fix: bridged_upsert hit local state_store, missed, returned
+    // MissingRelated synchronously and never asked the network. Post-fix:
+    // local miss falls through to `fetch_related_via_network`, which the
+    // stub services with a synthetic "fetched from network" state. The
+    // call counter proves the network branch fired at least once for the
+    // requested id; if the fix were reverted the counter stays at 0.
+    let calls: Rc<RefCell<Vec<ContractInstanceId>>> = Rc::new(RefCell::new(Vec::new()));
+    let calls_inner = calls.clone();
+    crate::contract::executor::runtime::set_test_network_fetch_override(Some(Rc::new(move |id| {
+        calls_inner.borrow_mut().push(id);
+        Ok(freenet_stdlib::prelude::WrappedState::new(
+            br#"{"network_fetched":true}"#.to_vec(),
+        ))
+    })));
+
+    let delta = StateDelta::from(br#"{"v":1}"#.to_vec());
+    let result = executor
+        .upsert_contract_state(
+            target_key,
+            Either::Right(delta),
+            RelatedContracts::default(),
+            None,
+        )
+        .await;
+
+    crate::contract::executor::runtime::set_test_network_fetch_override(None);
+
+    assert!(
+        result.is_ok(),
+        "UPDATE must succeed once the network stub services the missing related contract: {result:?}"
+    );
+    let observed_calls = calls.borrow().clone();
+    assert!(
+        observed_calls.contains(&related_id),
+        "fetch_related_via_network must have been invoked for related_id={related_id}; \
+         observed calls: {observed_calls:?}"
+    );
+}
