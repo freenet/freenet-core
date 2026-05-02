@@ -254,6 +254,15 @@ This helper is used in:
   - perform_contract_put (existing contract merge validation)
   - get_updated_state (post-update validation)
   - verify_and_store_contract (depth=1 simplified)
+
+The same local-then-network fetch is also performed when
+`update_state` (not validate_state) returns
+`UpdateModification::requires(missing)`. The bridged-upsert path
+walks each id, fetches local-or-network via fetch_related_via_network,
+appends RelatedState entries to the update slice, and re-attempts
+the merge. Depth-1 limit applies to both branches (a second
+RequestRelated/requires after the retry is rejected). See
+PR #4006 / #4008 / freenet/mail#80.
 ```
 
 ### Abuse prevention
