@@ -1004,12 +1004,43 @@ where
 ///   user-visible error shape (e.g., `OpError::NotificationError` from
 ///   `send_and_await`) — everything else the driver builds an explicit
 ///   `DriverOutcome::Publish(Err(...))` for.
+///
+/// Dashboard op_stats success classifier (issue #4010). Extracted so the
+/// success/failure mapping per `DriverOutcome` variant has direct unit
+/// coverage; `deliver_outcome` itself takes an `OpManager` which is
+/// expensive to construct in tests.
+fn classify_subscribe_outcome_for_op_stats(outcome: &DriverOutcome) -> bool {
+    matches!(
+        outcome,
+        DriverOutcome::Publish(Ok(_)) | DriverOutcome::SkipAlreadyDelivered
+    )
+}
+
 fn deliver_outcome(
     op_manager: &OpManager,
     client_tx: Transaction,
     instance_id: ContractInstanceId,
     outcome: DriverOutcome,
 ) {
+    // Dashboard op_stats SUBSCRIBE counter (issue #4010). The legacy
+    // `report_result` recording path is bypassed for task-per-tx
+    // terminal replies (see `node::record_op_result` rustdoc), so
+    // every terminal outcome must be recorded here.
+    //
+    // Sub-operation gate: `run_client_subscribe` is also the entry point
+    // for sub-op SUBSCRIBE spawned by PUT/GET (`maybe_subscribe_child`)
+    // and `start_subscription_request`, both of which create a child tx
+    // via `Transaction::new_child_of`. Those are background plumbing,
+    // not user-initiated SUBSCRIBE attempts; counting them would inflate
+    // the user-facing dashboard counter every time a PUT/GET completes.
+    if !client_tx.is_sub_operation() {
+        let success = classify_subscribe_outcome_for_op_stats(&outcome);
+        crate::node::network_status::record_op_result(
+            crate::node::network_status::OpType::Subscribe,
+            success,
+        );
+    }
+
     match outcome {
         DriverOutcome::Publish(result) => {
             op_manager.send_client_result(client_tx, result);
@@ -2467,5 +2498,159 @@ mod tests {
             "run_executor_subscribe early-return error branches must \
              wrap as ExecutorSubscribeError::Infra(...)"
         );
+    }
+
+    /// Issue #4010: `deliver_outcome` must record the SUBSCRIBE outcome
+    /// to the dashboard `op_stats.subscribes` counter (the task-per-tx
+    /// bypass at `handle_pure_network_message_v1` skips the legacy
+    /// `report_result` recording path), and it must NOT record sub-op
+    /// SUBSCRIBE attempts (those are background plumbing spawned by
+    /// PUT/GET, not user-initiated subscribes).
+    ///
+    /// Source-level regression pin: `deliver_outcome` must call
+    /// `record_op_result(OpType::Subscribe, ...)` and gate the call on
+    /// `!client_tx.is_sub_operation()`. Walks brace depth from the
+    /// opening `{` so the test does not depend on any nearby section
+    /// comments staying named the same.
+    #[test]
+    fn deliver_outcome_records_subscribe_op_result() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "fn deliver_outcome(");
+
+        assert!(
+            body.contains("record_op_result"),
+            "deliver_outcome must call record_op_result so the dashboard \
+             SUBSCRIBE counter advances on task-per-tx terminal replies. \
+             Issue #4010."
+        );
+        assert!(
+            body.contains("OpType::Subscribe"),
+            "record_op_result inside deliver_outcome must be passed \
+             OpType::Subscribe (not Get/Put/Update)."
+        );
+        assert!(
+            body.contains("!client_tx.is_sub_operation()"),
+            "deliver_outcome must gate record_op_result on \
+             `!client_tx.is_sub_operation()` (note the leading `!`) so \
+             sub-op SUBSCRIBE spawned by PUT/GET \
+             (`maybe_subscribe_child`, `start_subscription_request`) \
+             does not inflate the user-facing dashboard counter. \
+             A flipped guard would silently re-introduce the inflation \
+             reported by Codex review. Issue #4010."
+        );
+    }
+
+    /// Issue #4010 negative-path pin: renewal subscribes
+    /// (`run_renewal_subscribe`) and executor auto-subscribes
+    /// (`run_executor_subscribe`) MUST NOT call `deliver_outcome` or
+    /// `record_op_result` directly. They have their own return-value
+    /// delivery paths and are background traffic that would inflate the
+    /// user-facing dashboard counter (renewals fire every 2 minutes per
+    /// active subscription).
+    #[test]
+    fn renewal_and_executor_subscribe_do_not_record_op_stats() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+
+        let renewal_body = extract_fn_body(prod, "pub(crate) async fn run_renewal_subscribe(");
+        assert!(
+            !renewal_body.contains("deliver_outcome"),
+            "run_renewal_subscribe must NOT route through deliver_outcome \
+             — that would record renewals against the dashboard SUBSCRIBE \
+             counter. Issue #4010."
+        );
+        assert!(
+            !renewal_body.contains("record_op_result"),
+            "run_renewal_subscribe must NOT call record_op_result. \
+             Issue #4010."
+        );
+
+        let executor_body = extract_fn_body(prod, "pub(crate) async fn run_executor_subscribe(");
+        assert!(
+            !executor_body.contains("deliver_outcome"),
+            "run_executor_subscribe must NOT route through deliver_outcome \
+             — that would record executor auto-subscribes against the \
+             dashboard SUBSCRIBE counter. Issue #4010."
+        );
+        assert!(
+            !executor_body.contains("record_op_result"),
+            "run_executor_subscribe must NOT call record_op_result. \
+             Issue #4010."
+        );
+    }
+
+    /// Pure-function unit test: `classify_subscribe_outcome_for_op_stats`
+    /// covers every `DriverOutcome` variant. Pins the success/failure
+    /// mapping against accidental `success: !success` flips and against
+    /// dropping `SkipAlreadyDelivered` from the success arm (which would
+    /// silently undercount local-hit subscribes). Issue #4010.
+    #[test]
+    fn classify_subscribe_outcome_covers_all_variants() {
+        use freenet_stdlib::client_api::{ContractResponse, ErrorKind, HostResponse};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let publish_ok = DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+            ContractResponse::SubscribeResponse {
+                key,
+                subscribed: true,
+            },
+        )));
+        let publish_err = DriverOutcome::Publish(Err(ErrorKind::OperationError {
+            cause: "synthetic".into(),
+        }
+        .into()));
+        let skip = DriverOutcome::SkipAlreadyDelivered;
+        let infra = DriverOutcome::InfrastructureError(OpError::UnexpectedOpState);
+
+        assert!(classify_subscribe_outcome_for_op_stats(&publish_ok));
+        assert!(!classify_subscribe_outcome_for_op_stats(&publish_err));
+        assert!(classify_subscribe_outcome_for_op_stats(&skip));
+        assert!(!classify_subscribe_outcome_for_op_stats(&infra));
+    }
+
+    /// Truncate the source string at the `#[cfg(test)]` marker so the
+    /// pin tests never see code or comments inside the test module
+    /// (avoids false positives where a test asserts a substring that
+    /// also appears in a sibling test).
+    fn production_source(full: &str) -> &str {
+        let cutoff = full
+            .find("#[cfg(test)]")
+            .expect("file must have a #[cfg(test)] section");
+        &full[..cutoff]
+    }
+
+    /// Walk brace depth from the opening `{` of the named fn to the
+    /// matching `}`. Returns the body slice (excluding the braces).
+    /// Robust to nearby section comments being renamed.
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..]
+            .find('{')
+            .expect("fn signature must have a body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unterminated fn body for {signature_prefix}");
     }
 }

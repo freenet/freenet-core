@@ -262,7 +262,45 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
     }
 }
 
-/// Record an operation result.
+/// Record an operation result for the dashboard "Operations" panel.
+///
+/// # Required call sites
+///
+/// This is a manually-mirrored counter: every code path that delivers a
+/// terminal client-visible op result MUST call this exactly once with
+/// the matching outcome. Forgetting a call site silently rots the
+/// counter (issue #4009 / #4010 prior incidents). Current writers:
+///
+/// - `node.rs::report_result` for legacy state-machine ops (PUT/GET/
+///   UPDATE/SUBSCRIBE that still flow through `OpManager.ops.*`).
+/// - `operations/get/op_ctx_task.rs` `Done` arm (client-initiated GET).
+/// - `operations/put/op_ctx_task.rs` `Done` arm (client-initiated PUT).
+/// - `operations/subscribe/op_ctx_task.rs::deliver_outcome` (client-
+///   initiated SUBSCRIBE; covers all `DriverOutcome` variants).
+/// - `operations/update/op_ctx_task.rs::deliver_outcome` (client-
+///   initiated UPDATE; covers all `DriverOutcome` variants).
+///
+/// Internal-only operations are intentionally NOT recorded; counting
+/// them would inflate the user-facing counter with background traffic
+/// (renewals fire every 2 minutes per active subscription, sub-op
+/// SUBSCRIBE fires once per PUT/GET completion). Specifically:
+///
+/// - `operations/subscribe/op_ctx_task.rs::run_renewal_subscribe`
+///   (subscription renewal driver, called from
+///   `ring::connection_maintenance`).
+/// - `operations/subscribe/op_ctx_task.rs::run_executor_subscribe`
+///   (executor auto-subscribe, called from
+///   `contract::executor::runtime`).
+/// - Sub-operation SUBSCRIBE spawned by PUT/GET via
+///   `Transaction::new_child_of` (gated in
+///   `subscribe::op_ctx_task::deliver_outcome` by
+///   `!client_tx.is_sub_operation()`).
+/// - Sub-operation GET spawned by subscribe / executor
+///   (`get::op_ctx_task::start_sub_op_get` returns through a oneshot
+///   and never publishes via `result_router_tx`).
+///
+/// Audit: `grep -rn "record_op_result" crates/core/src/operations/`
+/// must show coverage for every op type that has a task-per-tx driver.
 pub fn record_op_result(op_type: OpType, success: bool) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
@@ -797,10 +835,24 @@ mod tests {
         record_op_result(OpType::Get, true);
         record_op_result(OpType::Get, false);
         record_op_result(OpType::Put, true);
+        // Issue #4010: SUBSCRIBE / UPDATE counters were stuck at zero
+        // because the task-per-tx drivers stopped recording outcomes.
+        // Cover both op types and both outcomes (success + failure) so
+        // the per-op tabulation is pinned end to end. The two
+        // `OpType::Update, true` calls are intentional, not a copy
+        // paste: we want the success counter to assert `2`, paired
+        // with one failure for `1`.
+        record_op_result(OpType::Subscribe, true);
+        record_op_result(OpType::Subscribe, false);
+        record_op_result(OpType::Update, true);
+        record_op_result(OpType::Update, true);
+        record_op_result(OpType::Update, false);
 
         let snap = get_snapshot().unwrap();
         assert_eq!(snap.op_stats.gets, (2, 1));
         assert_eq!(snap.op_stats.puts, (1, 0));
+        assert_eq!(snap.op_stats.subscribes, (1, 1));
+        assert_eq!(snap.op_stats.updates, (2, 1));
     }
 
     #[test]
