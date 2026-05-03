@@ -1010,6 +1010,24 @@ fn deliver_outcome(
     instance_id: ContractInstanceId,
     outcome: DriverOutcome,
 ) {
+    // Record dashboard op_stats counter (issue #4010). Mirrors what
+    // `report_result` does for legacy state-machine ops via
+    // `node.rs::record_op_result`. The task-per-tx bypass at
+    // `handle_pure_network_message_v1` returns Ok(None) for forwarded
+    // replies, so `report_result` never sees the terminal classification
+    // for client-initiated SUBSCRIBE; the recording must happen here.
+    // Without it the dashboard "Operations" panel SUBSCRIBE counter
+    // sticks on whatever the legacy path produces (rarely hit on the
+    // originator side after the migrations in #3806 / #3981).
+    let success = matches!(
+        outcome,
+        DriverOutcome::Publish(Ok(_)) | DriverOutcome::SkipAlreadyDelivered
+    );
+    crate::node::network_status::record_op_result(
+        crate::node::network_status::OpType::Subscribe,
+        success,
+    );
+
     match outcome {
         DriverOutcome::Publish(result) => {
             op_manager.send_client_result(client_tx, result);
@@ -2466,6 +2484,56 @@ mod tests {
             body.contains("ExecutorSubscribeError::Infra"),
             "run_executor_subscribe early-return error branches must \
              wrap as ExecutorSubscribeError::Infra(...)"
+        );
+    }
+
+    /// Issue #4010 regression (source-level): client-initiated SUBSCRIBE
+    /// must record its outcome to the dashboard `op_stats.subscribes`
+    /// counter. The legacy `report_result` recording path does not run
+    /// for task-per-tx terminal replies (the bypass at
+    /// `handle_pure_network_message_v1` returns Ok(None)), so
+    /// `deliver_outcome` MUST call `record_op_result(OpType::Subscribe, _)`
+    /// itself. Without this the dashboard "Operations" panel SUBSCRIBE
+    /// counter is silently stuck at zero.
+    #[test]
+    fn deliver_outcome_records_subscribe_op_result() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let cutoff = SOURCE
+            .find("#[cfg(test)]")
+            .expect("file must have a #[cfg(test)] section");
+        let prod = &SOURCE[..cutoff];
+
+        let fn_start = prod
+            .find("fn deliver_outcome(")
+            .expect("deliver_outcome must exist");
+        // Walk to the matching closing brace.
+        let body_start = fn_start
+            + prod[fn_start..]
+                .find('{')
+                .expect("deliver_outcome must have a body");
+        let bytes = prod.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start + 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let body = &prod[body_start..i];
+
+        assert!(
+            body.contains("record_op_result"),
+            "deliver_outcome must call record_op_result so the dashboard \
+             SUBSCRIBE counter advances on task-per-tx terminal replies. \
+             Issue #4010."
+        );
+        assert!(
+            body.contains("OpType::Subscribe"),
+            "record_op_result inside deliver_outcome must be passed \
+             OpType::Subscribe (not Get/Put/Update)."
         );
     }
 }

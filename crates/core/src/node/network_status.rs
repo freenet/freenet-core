@@ -262,7 +262,31 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
     }
 }
 
-/// Record an operation result.
+/// Record an operation result for the dashboard "Operations" panel.
+///
+/// # Required call sites
+///
+/// This is a manually-mirrored counter: every code path that delivers a
+/// terminal client-visible op result MUST call this exactly once with
+/// the matching outcome. Forgetting a call site silently rots the
+/// counter (issue #4009 / #4010 prior incidents). Current writers:
+///
+/// - `node.rs::report_result` for legacy state-machine ops (PUT/GET/
+///   UPDATE/SUBSCRIBE that still flow through `OpManager.ops.*`).
+/// - `operations/get/op_ctx_task.rs` `Done` arm (client-initiated GET).
+/// - `operations/put/op_ctx_task.rs` `Done` arm (client-initiated PUT).
+/// - `operations/subscribe/op_ctx_task.rs::deliver_outcome` (client-
+///   initiated SUBSCRIBE; covers all `DriverOutcome` variants).
+/// - `operations/update/op_ctx_task.rs::deliver_outcome` (client-
+///   initiated UPDATE; covers all `DriverOutcome` variants).
+///
+/// Internal-only operations (subscription renewals, sub-operation
+/// SUBSCRIBE/GET spawned by PUT/GET, executor auto-subscribe) are
+/// intentionally NOT recorded: they would inflate the user-facing
+/// counter with background traffic.
+///
+/// Audit: `grep -rn "record_op_result" crates/core/src/operations/`
+/// must show coverage for every op type that has a task-per-tx driver.
 pub fn record_op_result(op_type: OpType, success: bool) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
@@ -797,10 +821,24 @@ mod tests {
         record_op_result(OpType::Get, true);
         record_op_result(OpType::Get, false);
         record_op_result(OpType::Put, true);
+        // SUBSCRIBE / UPDATE counters were silently stuck at zero before
+        // issue #4010 (the task-per-tx drivers stopped invoking the
+        // recording hook after the #1454 migrations). Cover both op
+        // types and both outcomes here so any regression in the
+        // counter wiring fails this test alongside the source-grep
+        // pin tests in `subscribe/op_ctx_task.rs` and
+        // `update/op_ctx_task.rs`.
+        record_op_result(OpType::Subscribe, true);
+        record_op_result(OpType::Subscribe, false);
+        record_op_result(OpType::Update, true);
+        record_op_result(OpType::Update, true);
+        record_op_result(OpType::Update, false);
 
         let snap = get_snapshot().unwrap();
         assert_eq!(snap.op_stats.gets, (2, 1));
         assert_eq!(snap.op_stats.puts, (1, 0));
+        assert_eq!(snap.op_stats.subscribes, (1, 1));
+        assert_eq!(snap.op_stats.updates, (2, 1));
     }
 
     #[test]

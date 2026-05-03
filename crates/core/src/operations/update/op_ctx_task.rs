@@ -361,6 +361,21 @@ async fn drive_client_update(
 // --- Outcome delivery ---
 
 fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: DriverOutcome) {
+    // Record dashboard op_stats counter (issue #4010). Mirrors what
+    // `report_result` does for legacy state-machine ops via
+    // `node.rs::record_op_result`. The task-per-tx bypass at
+    // `handle_pure_network_message_v1` returns Ok(None) for forwarded
+    // replies, so `report_result` never sees the terminal classification
+    // for client-initiated UPDATE; the recording must happen here.
+    // Without it the dashboard "Operations" panel UPDATE counter sticks
+    // on whatever the legacy path produces (rarely hit on the originator
+    // side after the #1454 Phase 4 migration).
+    let success = matches!(outcome, DriverOutcome::Publish(Ok(_)));
+    crate::node::network_status::record_op_result(
+        crate::node::network_status::OpType::Update,
+        success,
+    );
+
     match outcome {
         DriverOutcome::Publish(result) => {
             // send_client_result handles both result_router_tx.try_send AND
@@ -2288,6 +2303,55 @@ mod tests {
             !src.contains("Broadcasting {"),
             "UpdateMsg::Broadcasting must remain deleted; appending new variants \
              at the end of UpdateMsg preserves bincode discriminant tags."
+        );
+    }
+
+    /// Issue #4010 regression (source-level): client-initiated UPDATE
+    /// must record its outcome to the dashboard `op_stats.updates`
+    /// counter. The legacy `report_result` recording path does not run
+    /// for task-per-tx terminal replies (the bypass at
+    /// `handle_pure_network_message_v1` returns Ok(None)), so
+    /// `deliver_outcome` MUST call `record_op_result(OpType::Update, _)`
+    /// itself. Without this the dashboard "Operations" panel UPDATE
+    /// counter is silently stuck at zero.
+    #[test]
+    fn deliver_outcome_records_update_op_result() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let cutoff = SOURCE
+            .find("#[cfg(test)]")
+            .expect("file must have a #[cfg(test)] section");
+        let prod = &SOURCE[..cutoff];
+
+        let fn_start = prod
+            .find("fn deliver_outcome(")
+            .expect("deliver_outcome must exist");
+        let body_start = fn_start
+            + prod[fn_start..]
+                .find('{')
+                .expect("deliver_outcome must have a body");
+        let bytes = prod.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start + 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let body = &prod[body_start..i];
+
+        assert!(
+            body.contains("record_op_result"),
+            "deliver_outcome must call record_op_result so the dashboard \
+             UPDATE counter advances on task-per-tx terminal replies. \
+             Issue #4010."
+        );
+        assert!(
+            body.contains("OpType::Update"),
+            "record_op_result inside deliver_outcome must be passed \
+             OpType::Update (not Get/Put/Subscribe)."
         );
     }
 }
