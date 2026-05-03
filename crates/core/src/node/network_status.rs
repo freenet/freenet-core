@@ -821,13 +821,10 @@ mod tests {
         record_op_result(OpType::Get, true);
         record_op_result(OpType::Get, false);
         record_op_result(OpType::Put, true);
-        // SUBSCRIBE / UPDATE counters were silently stuck at zero before
-        // issue #4010 (the task-per-tx drivers stopped invoking the
-        // recording hook after the #1454 migrations). Cover both op
-        // types and both outcomes here so any regression in the
-        // counter wiring fails this test alongside the source-grep
-        // pin tests in `subscribe/op_ctx_task.rs` and
-        // `update/op_ctx_task.rs`.
+        // Issue #4010: SUBSCRIBE / UPDATE counters were stuck at zero
+        // because the task-per-tx drivers stopped recording outcomes.
+        // Pin both op types and both outcomes so the wiring regression
+        // is caught here in addition to the source-grep pin tests.
         record_op_result(OpType::Subscribe, true);
         record_op_result(OpType::Subscribe, false);
         record_op_result(OpType::Update, true);

@@ -1010,15 +1010,10 @@ fn deliver_outcome(
     instance_id: ContractInstanceId,
     outcome: DriverOutcome,
 ) {
-    // Record dashboard op_stats counter (issue #4010). Mirrors what
-    // `report_result` does for legacy state-machine ops via
-    // `node.rs::record_op_result`. The task-per-tx bypass at
-    // `handle_pure_network_message_v1` returns Ok(None) for forwarded
-    // replies, so `report_result` never sees the terminal classification
-    // for client-initiated SUBSCRIBE; the recording must happen here.
-    // Without it the dashboard "Operations" panel SUBSCRIBE counter
-    // sticks on whatever the legacy path produces (rarely hit on the
-    // originator side after the migrations in #3806 / #3981).
+    // Dashboard op_stats SUBSCRIBE counter (issue #4010). The legacy
+    // `report_result` recording path is bypassed for task-per-tx
+    // terminal replies (see `node::record_op_result` rustdoc), so
+    // every terminal outcome must be recorded here.
     let success = matches!(
         outcome,
         DriverOutcome::Publish(Ok(_)) | DriverOutcome::SkipAlreadyDelivered
@@ -2487,42 +2482,20 @@ mod tests {
         );
     }
 
-    /// Issue #4010 regression (source-level): client-initiated SUBSCRIBE
-    /// must record its outcome to the dashboard `op_stats.subscribes`
-    /// counter. The legacy `report_result` recording path does not run
-    /// for task-per-tx terminal replies (the bypass at
-    /// `handle_pure_network_message_v1` returns Ok(None)), so
-    /// `deliver_outcome` MUST call `record_op_result(OpType::Subscribe, _)`
-    /// itself. Without this the dashboard "Operations" panel SUBSCRIBE
-    /// counter is silently stuck at zero.
+    /// Issue #4010 regression (source-level): `deliver_outcome` must
+    /// record the SUBSCRIBE outcome to the dashboard `op_stats.subscribes`
+    /// counter. Without this the counter is silently stuck at zero
+    /// because the task-per-tx bypass at
+    /// `handle_pure_network_message_v1` skips the legacy `report_result`
+    /// recording path.
     #[test]
     fn deliver_outcome_records_subscribe_op_result() {
         const SOURCE: &str = include_str!("op_ctx_task.rs");
-        let cutoff = SOURCE
-            .find("#[cfg(test)]")
-            .expect("file must have a #[cfg(test)] section");
-        let prod = &SOURCE[..cutoff];
-
-        let fn_start = prod
-            .find("fn deliver_outcome(")
-            .expect("deliver_outcome must exist");
-        // Walk to the matching closing brace.
-        let body_start = fn_start
-            + prod[fn_start..]
-                .find('{')
-                .expect("deliver_outcome must have a body");
-        let bytes = prod.as_bytes();
-        let mut depth: i32 = 1;
-        let mut i = body_start + 1;
-        while i < bytes.len() && depth > 0 {
-            match bytes[i] {
-                b'{' => depth += 1,
-                b'}' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        let body = &prod[body_start..i];
+        let body = SOURCE
+            .split_once("fn deliver_outcome(")
+            .and_then(|(_, after)| after.split_once("// ── Relay SUBSCRIBE driver"))
+            .map(|(body, _)| body)
+            .expect("deliver_outcome body must precede the relay SUBSCRIBE driver section");
 
         assert!(
             body.contains("record_op_result"),
