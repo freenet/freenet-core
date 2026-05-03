@@ -280,10 +280,24 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
 /// - `operations/update/op_ctx_task.rs::deliver_outcome` (client-
 ///   initiated UPDATE; covers all `DriverOutcome` variants).
 ///
-/// Internal-only operations (subscription renewals, sub-operation
-/// SUBSCRIBE/GET spawned by PUT/GET, executor auto-subscribe) are
-/// intentionally NOT recorded: they would inflate the user-facing
-/// counter with background traffic.
+/// Internal-only operations are intentionally NOT recorded; counting
+/// them would inflate the user-facing counter with background traffic
+/// (renewals fire every 2 minutes per active subscription, sub-op
+/// SUBSCRIBE fires once per PUT/GET completion). Specifically:
+///
+/// - `operations/subscribe/op_ctx_task.rs::run_renewal_subscribe`
+///   (subscription renewal driver, called from
+///   `ring::connection_maintenance`).
+/// - `operations/subscribe/op_ctx_task.rs::run_executor_subscribe`
+///   (executor auto-subscribe, called from
+///   `contract::executor::runtime`).
+/// - Sub-operation SUBSCRIBE spawned by PUT/GET via
+///   `Transaction::new_child_of` (gated in
+///   `subscribe::op_ctx_task::deliver_outcome` by
+///   `!client_tx.is_sub_operation()`).
+/// - Sub-operation GET spawned by subscribe / executor
+///   (`get::op_ctx_task::start_sub_op_get` returns through a oneshot
+///   and never publishes via `result_router_tx`).
 ///
 /// Audit: `grep -rn "record_op_result" crates/core/src/operations/`
 /// must show coverage for every op type that has a task-per-tx driver.
@@ -823,8 +837,11 @@ mod tests {
         record_op_result(OpType::Put, true);
         // Issue #4010: SUBSCRIBE / UPDATE counters were stuck at zero
         // because the task-per-tx drivers stopped recording outcomes.
-        // Pin both op types and both outcomes so the wiring regression
-        // is caught here in addition to the source-grep pin tests.
+        // Cover both op types and both outcomes (success + failure) so
+        // the per-op tabulation is pinned end to end. The two
+        // `OpType::Update, true` calls are intentional, not a copy
+        // paste: we want the success counter to assert `2`, paired
+        // with one failure for `1`.
         record_op_result(OpType::Subscribe, true);
         record_op_result(OpType::Subscribe, false);
         record_op_result(OpType::Update, true);

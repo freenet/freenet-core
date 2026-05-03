@@ -360,16 +360,33 @@ async fn drive_client_update(
 
 // --- Outcome delivery ---
 
+/// Dashboard op_stats success classifier (issue #4010). Extracted so the
+/// success/failure mapping per `DriverOutcome` variant has direct unit
+/// coverage; `deliver_outcome` itself takes an `OpManager` which is
+/// expensive to construct in tests.
+fn classify_update_outcome_for_op_stats(outcome: &DriverOutcome) -> bool {
+    matches!(outcome, DriverOutcome::Publish(Ok(_)))
+}
+
 fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: DriverOutcome) {
     // Dashboard op_stats UPDATE counter (issue #4010). The legacy
     // `report_result` recording path is bypassed for task-per-tx
     // terminal replies (see `node::record_op_result` rustdoc), so
     // every terminal outcome must be recorded here.
-    let success = matches!(outcome, DriverOutcome::Publish(Ok(_)));
-    crate::node::network_status::record_op_result(
-        crate::node::network_status::OpType::Update,
-        success,
-    );
+    //
+    // Sub-operation gate: defensive. Today UPDATE has no sub-operation
+    // entry points (it's fire-and-forget at the originator), so
+    // `client_tx.is_sub_operation()` is always false on this path. The
+    // explicit gate matches SUBSCRIBE's pattern so a future change that
+    // routes a sub-op tx through `run_client_update` doesn't silently
+    // start inflating the user-facing dashboard counter.
+    if !client_tx.is_sub_operation() {
+        let success = classify_update_outcome_for_op_stats(&outcome);
+        crate::node::network_status::record_op_result(
+            crate::node::network_status::OpType::Update,
+            success,
+        );
+    }
 
     match outcome {
         DriverOutcome::Publish(result) => {
@@ -1676,6 +1693,8 @@ async fn drive_relay_broadcast_to_streaming(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Guard: `client_events.rs` must call `start_client_update` for both the
     /// routed and legacy UPDATE paths, not the legacy `request_update`.
     #[test]
@@ -2301,20 +2320,18 @@ mod tests {
         );
     }
 
-    /// Issue #4010 regression (source-level): `deliver_outcome` must
-    /// record the UPDATE outcome to the dashboard `op_stats.updates`
-    /// counter. Without this the counter is silently stuck at zero
-    /// because the task-per-tx bypass at
-    /// `handle_pure_network_message_v1` skips the legacy `report_result`
-    /// recording path.
+    /// Issue #4010: `deliver_outcome` must record the UPDATE outcome to
+    /// the dashboard `op_stats.updates` counter (the task-per-tx bypass
+    /// at `handle_pure_network_message_v1` skips the legacy
+    /// `report_result` recording path) and gate the call on
+    /// `!client_tx.is_sub_operation()` for parity with SUBSCRIBE.
+    /// Walks brace depth so the test does not depend on any nearby
+    /// section comments staying named the same.
     #[test]
     fn deliver_outcome_records_update_op_result() {
         const SOURCE: &str = include_str!("op_ctx_task.rs");
-        let body = SOURCE
-            .split_once("fn deliver_outcome(")
-            .and_then(|(_, after)| after.split_once("// ── Relay UPDATE drivers"))
-            .map(|(body, _)| body)
-            .expect("deliver_outcome body must precede the relay UPDATE drivers section");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "fn deliver_outcome(");
 
         assert!(
             body.contains("record_op_result"),
@@ -2327,5 +2344,84 @@ mod tests {
             "record_op_result inside deliver_outcome must be passed \
              OpType::Update (not Get/Put/Subscribe)."
         );
+        assert!(
+            body.contains("!client_tx.is_sub_operation()"),
+            "deliver_outcome must gate record_op_result on \
+             `!client_tx.is_sub_operation()` (note the leading `!`) for \
+             parity with SUBSCRIBE; defensive against a future change \
+             that routes a sub-op tx through run_client_update and \
+             silently inflates the user-facing dashboard counter. \
+             Issue #4010."
+        );
+    }
+
+    /// Pure-function unit test: `classify_update_outcome_for_op_stats`
+    /// covers every `DriverOutcome` variant. Pins the success/failure
+    /// mapping against accidental `success: !success` flips. Issue #4010.
+    #[test]
+    fn classify_update_outcome_covers_all_variants() {
+        use freenet_stdlib::client_api::{ContractResponse, ErrorKind, HostResponse};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey, StateSummary};
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let publish_ok = DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+            ContractResponse::UpdateResponse {
+                key,
+                summary: StateSummary::from(Vec::<u8>::new()),
+            },
+        )));
+        let publish_err = DriverOutcome::Publish(Err(ErrorKind::OperationError {
+            cause: "synthetic".into(),
+        }
+        .into()));
+        let infra = DriverOutcome::InfrastructureError(OpError::UnexpectedOpState);
+
+        assert!(classify_update_outcome_for_op_stats(&publish_ok));
+        assert!(!classify_update_outcome_for_op_stats(&publish_err));
+        assert!(!classify_update_outcome_for_op_stats(&infra));
+    }
+
+    /// Truncate the source at the `#[cfg(test)]` marker so the pin
+    /// tests don't see test-module code or comments (avoids false
+    /// positives where a test asserts a substring that also appears in
+    /// a sibling test).
+    fn production_source(full: &str) -> &str {
+        let cutoff = full
+            .find("#[cfg(test)]")
+            .expect("file must have a #[cfg(test)] section");
+        &full[..cutoff]
+    }
+
+    /// Walk brace depth from the opening `{` of the named fn to the
+    /// matching `}`. Returns the body slice. Robust to nearby section
+    /// comments being renamed.
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..]
+            .find('{')
+            .expect("fn signature must have a body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unterminated fn body for {signature_prefix}");
     }
 }
