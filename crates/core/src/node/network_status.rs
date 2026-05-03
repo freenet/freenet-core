@@ -886,9 +886,8 @@ mod tests {
 
         // Two contracts with deterministic keys; the base58 encoding is
         // long enough to exercise the >12-char truncation path.
-        let code_hash = ContractCode::from(vec![0u8; 32]).hash().clone();
-        let key_a =
-            ContractKey::from_id_and_code(ContractInstanceId::new([0xAA; 32]), code_hash.clone());
+        let code_hash = *ContractCode::from(vec![0u8; 32]).hash();
+        let key_a = ContractKey::from_id_and_code(ContractInstanceId::new([0xAA; 32]), code_hash);
         let key_b = ContractKey::from_id_and_code(ContractInstanceId::new([0xBB; 32]), code_hash);
         let snapshot = vec![
             crate::ring::SubscribedContractSnapshot {

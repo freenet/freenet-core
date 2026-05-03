@@ -3,7 +3,8 @@
 //! Contract web apps are served inside sandboxed iframes to provide origin isolation.
 //! The local API server returns a "shell" page that holds the auth token and
 //! proxies WebSocket connections via postMessage, while the contract runs in an
-//! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-downloads">`
+//! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals"
+//!         allow="clipboard-read; clipboard-write">`
 //! with an opaque origin that cannot access other contracts' data.
 //! Popups inherit the sandbox (no `allow-popups-to-escape-sandbox`); external links
 //! are opened via the `open_url` shell bridge message to avoid CORS issues. Sandbox content
@@ -470,7 +471,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -1891,8 +1892,15 @@ mod tests {
 
         // Shell page must contain sandboxed iframe
         assert!(
-            html.contains(r#"sandbox="allow-scripts allow-forms allow-popups allow-downloads"#),
-            "iframe sandbox attribute missing"
+            html.contains(
+                r#"sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals""#
+            ),
+            "iframe sandbox attribute missing or wrong allowlist"
+        );
+        // Iframe must grant clipboard via permissions-policy
+        assert!(
+            html.contains(r#"allow="clipboard-read; clipboard-write""#),
+            "iframe permissions-policy missing clipboard grants"
         );
         // Iframe src must include __sandbox=1
         assert!(
