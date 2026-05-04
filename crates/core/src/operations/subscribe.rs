@@ -32,18 +32,6 @@ const MAX_BREADTH: usize = 3;
 /// Matches GET operation's MAX_RETRIES; change both together.
 const MAX_RETRIES: usize = 10;
 
-/// Minimum HTL for speculative retries.
-///
-/// Retries use a reduced HTL (capped at current_hop) to avoid full-depth
-/// traversal storms. This floor ensures retries still reach peers 2-3 hops
-/// away, which is the minimum useful search depth in any topology.
-/// Matches GET operation's MIN_RETRY_HTL; change both together.
-/// Used only by `retry_with_next_alternative`, which itself survives
-/// the slice-1 GC retirement only as a test-exercised helper. Allow
-/// `dead_code` until the helper + tests are removed in slice 2.
-#[allow(dead_code)]
-const MIN_RETRY_HTL: usize = 3;
-
 /// Timeout for waiting on contract storage notification.
 /// Used when a subscription arrives before the contract has been propagated via PUT.
 pub(super) const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
@@ -247,8 +235,6 @@ pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> Sub
         requester_pub_key: None,
         is_renewal,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     }
 }
 
@@ -268,8 +254,6 @@ pub(crate) fn start_op_with_id(
         requester_pub_key: None,
         is_renewal,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     }
 }
 
@@ -299,8 +283,6 @@ pub(crate) fn create_unsubscribe_op(
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     }
 }
 
@@ -607,20 +589,6 @@ pub(crate) struct SubscribeOp {
     is_renewal: bool,
     /// Routing stats for failure reporting.
     stats: Option<SubscribeStats>,
-    /// Historically: true when a downstream relay has acknowledged
-    /// forwarding this request. The GC speculative-retry block that
-    /// consumed this signal was retired in #1454 Phase 5-final slice 1
-    /// (mirroring the GET retirement in PR #3974). The field is still
-    /// maintained on the legacy state-machine path and exercised by
-    /// helper tests so the bookkeeping is captured if a future retry
-    /// mechanism reuses it. Allow `dead_code` until the field + tests
-    /// are deleted in slice 2.
-    #[allow(dead_code)]
-    pub(crate) ack_received: bool,
-    /// Historically: number of speculative parallel paths launched by
-    /// the originator's GC task. Same lineage as `ack_received` above.
-    #[allow(dead_code)]
-    pub(crate) speculative_paths: u8,
 }
 
 impl SubscribeOp {
@@ -715,119 +683,6 @@ impl SubscribeOp {
     /// The originator has no `requester_addr` (no upstream peer to respond to).
     pub(crate) fn is_originator(&self) -> bool {
         self.requester_addr.is_none()
-    }
-
-    /// Retry the subscribe operation with the next alternative peer.
-    ///
-    /// Similar to GET's `retry_with_next_alternative`: picks the next untried peer
-    /// from local alternatives, or injects fallback peers if alternatives are exhausted.
-    /// Returns `Ok((op, msg))` with the updated op and new Request message,
-    /// or `Err(op)` if no alternatives remain.
-    ///
-    /// Historically called by the GC speculative-retry block; that block
-    /// was retired in #1454 Phase 5-final slice 1. Helper retained for
-    /// the existing unit tests until the field + tests are deleted in
-    /// slice 2.
-    #[allow(dead_code)]
-    pub(crate) fn retry_with_next_alternative(
-        mut self,
-        max_hops_to_live: usize,
-        fallback_peers: &[PeerKeyLocation],
-    ) -> Result<(SubscribeOp, SubscribeMsg), Box<SubscribeOp>> {
-        match self.state {
-            SubscribeState::AwaitingResponse(ref mut data) => {
-                // If local alternatives exhausted, inject fallback peers we haven't tried.
-                // Filter through both tried_peers and visited bloom filter (#3570).
-                if data.alternatives.is_empty() && !fallback_peers.is_empty() {
-                    for peer in fallback_peers {
-                        if let Some(addr) = peer.socket_addr() {
-                            if !data.tried_peers.contains(&addr)
-                                && !data.visited.probably_visited(addr)
-                            {
-                                data.alternatives.push(peer.clone());
-                            }
-                        }
-                    }
-                    if !data.alternatives.is_empty() {
-                        tracing::info!(
-                            tx = %self.id,
-                            contract = %data.instance_id,
-                            new_candidates = data.alternatives.len(),
-                            "Subscribe broadening search to all connected peers (fallback)"
-                        );
-                    }
-                }
-
-                if data.alternatives.is_empty() {
-                    return Err(Box::new(self));
-                }
-
-                // Take ownership of state to modify it
-                let SubscribeState::AwaitingResponse(mut data) =
-                    std::mem::replace(&mut self.state, SubscribeState::Failed)
-                else {
-                    unreachable!();
-                };
-
-                let instance_id = data.instance_id;
-                let is_renewal = self.is_renewal;
-
-                // Find next alternative with a known socket address.
-                // Skip peers without addresses — they can't be contacted.
-                let (next_target, addr) = loop {
-                    if data.alternatives.is_empty() {
-                        // All remaining alternatives lack addresses
-                        self.state = SubscribeState::AwaitingResponse(data);
-                        return Err(Box::new(self));
-                    }
-                    let candidate = data.alternatives.remove(0);
-                    if let Some(addr) = candidate.socket_addr() {
-                        break (candidate, addr);
-                    }
-                };
-                data.tried_peers.insert(addr);
-                // Mark in bloom filter so future retries skip this peer (#3570).
-                data.visited.mark_visited(addr);
-                data.next_hop = Some(addr);
-                data.attempts_at_hop += 1;
-                let visited = data.visited.clone();
-
-                tracing::info!(
-                    tx = %self.id,
-                    contract = %instance_id,
-                    target = ?next_target.socket_addr(),
-                    remaining_alternatives = data.alternatives.len(),
-                    "Subscribe retrying with alternative peer after timeout"
-                );
-
-                // Update stats for the new target (reset timing for new attempt)
-                self.stats = Some(SubscribeStats {
-                    target_peer: next_target,
-                    contract_location: Location::from(&instance_id),
-                    request_sent_at: Instant::now(),
-                });
-
-                // Reduce HTL on each retry, floored at MIN_RETRY_HTL (#3570).
-                let retry_htl = (max_hops_to_live / (data.attempts_at_hop.max(1)))
-                    .max(MIN_RETRY_HTL)
-                    .min(max_hops_to_live);
-
-                self.state = SubscribeState::AwaitingResponse(data);
-
-                let msg = SubscribeMsg::Request {
-                    id: self.id,
-                    instance_id,
-                    htl: retry_htl,
-                    visited,
-                    is_renewal,
-                };
-
-                Ok((self, msg))
-            }
-            SubscribeState::PrepareRequest(_)
-            | SubscribeState::Completed(_)
-            | SubscribeState::Failed => Err(Box::new(self)),
-        }
     }
 
     /// Build a NotFound result to send back to the requester, or fail locally if we're the originator.
@@ -952,8 +807,6 @@ impl SubscribeOp {
                             s.target_peer = next_target.clone();
                             s
                         }),
-                        ack_received: false,
-                        speculative_paths: 0,
                     };
 
                     op_manager
@@ -1017,8 +870,6 @@ impl SubscribeOp {
                                 s.target_peer = next_target.clone();
                                 s
                             }),
-                            ack_received: false,
-                            speculative_paths: 0,
                         };
 
                         op_manager
@@ -1054,8 +905,6 @@ impl SubscribeOp {
                     requester_pub_key,
                     is_renewal,
                     stats,
-                    ack_received: false,
-                    speculative_paths: 0,
                 };
 
                 op_manager
@@ -1298,8 +1147,6 @@ impl Operation for SubscribeOp {
                         requester_pub_key,
                         is_renewal,
                         stats: None,
-                        ack_received: false,
-                        speculative_paths: 0,
                     },
                     source_addr,
                 })
@@ -1380,8 +1227,6 @@ impl Operation for SubscribeOp {
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
-                                    ack_received: false,
-                                    speculative_paths: 0,
                                 },
                             )));
                         }
@@ -1430,8 +1275,6 @@ impl Operation for SubscribeOp {
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
-                                    ack_received: false,
-                                    speculative_paths: 0,
                                 },
                             )));
                         }
@@ -1576,8 +1419,6 @@ impl Operation for SubscribeOp {
                                 contract_location: Location::from(instance_id),
                                 request_sent_at: Instant::now(),
                             }),
-                            ack_received: false,
-                            speculative_paths: 0,
                         }),
                         stream_data: None,
                     })
@@ -1767,8 +1608,6 @@ impl Operation for SubscribeOp {
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
-                                    ack_received: false,
-                                    speculative_paths: 0,
                                 },
                             )))
                         }
@@ -1862,8 +1701,6 @@ impl Operation for SubscribeOp {
                                                 s.target_peer = next_target.clone();
                                                 s
                                             }),
-                                            ack_received: false,
-                                            speculative_paths: 0,
                                         }),
                                         stream_data: None,
                                     });
@@ -1931,8 +1768,6 @@ impl Operation for SubscribeOp {
                                                     s.target_peer = next_target.clone();
                                                     s
                                                 }),
-                                                ack_received: false,
-                                                speculative_paths: 0,
                                             }),
                                             stream_data: None,
                                         });
@@ -2030,8 +1865,6 @@ impl Operation for SubscribeOp {
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                             stats: self.stats,
-                                            ack_received: false,
-                                            speculative_paths: 0,
                                         },
                                     )))
                                 } else {
@@ -2083,8 +1916,6 @@ impl Operation for SubscribeOp {
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                             stats: self.stats,
-                                            ack_received: false,
-                                            speculative_paths: 0,
                                         },
                                     )))
                                 }
@@ -2177,19 +2008,16 @@ impl Operation for SubscribeOp {
                 }
 
                 SubscribeMsg::ForwardingAck { id, instance_id } => {
-                    // A downstream relay has acknowledged forwarding our request.
-                    // Mark the op so the GC task knows the chain is alive.
+                    // Wire variant survives as a telemetry hook (#3570 diagnostics)
+                    // after the SUBSCRIBE GC speculative-retry block was retired in
+                    // #1454 Phase 5-final. No state mutation; mirrors GET's
+                    // ForwardingAck no-op handler.
                     tracing::debug!(
                         tx = %id,
                         %instance_id,
                         "Received forwarding ACK from downstream relay"
                     );
-                    Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
-                        SubscribeOp {
-                            ack_received: true,
-                            ..self
-                        },
-                    )))
+                    Ok(OperationResult::ContinueOp(OpEnum::Subscribe(self)))
                 }
             }
         })
