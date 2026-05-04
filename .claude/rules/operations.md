@@ -152,10 +152,15 @@ paths:
 > `failure_routing_info().is_some()`. Slice 1 deletes the block, the
 > `subscribe_retried` per-tick HashMap, and the shared `ACK_TIMEOUT` /
 > `MAX_SPECULATIVE_PATHS` / `PROGRESS_TIMEOUT` constants (also
-> previously used by GET, now fully unreferenced). Slice 2 will delete
+> previously used by GET, now fully unreferenced). Slice 2 deleted
 > the `SubscribeOp::ack_received` / `speculative_paths` fields, the
-> `retry_with_next_alternative` helper, and the unit tests that
-> exercised the GC retry decision.
+> `retry_with_next_alternative` helper, the `MIN_RETRY_HTL` constant,
+> and the unit tests that exercised the GC retry decision (the 11
+> `test_retry_*` cases in `subscribe/tests.rs` and the
+> `subscribe_retry_candidates_sorted_oldest_first` test in
+> `op_state_manager.rs`). The `SubscribeMsg::ForwardingAck` handler
+> on the legacy state-machine path was simplified to a no-op (mirrors
+> the GET treatment).
 > `GetMsg::ForwardingAck` and `SubscribeMsg::ForwardingAck` survive as
 > wire variants + telemetry hooks (#3570 diagnostics) but their
 > handlers return the operation unchanged.
