@@ -1445,11 +1445,24 @@ mod tests {
     async fn open_sse_with_origin(
         origin: Option<&str>,
     ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = bytes::Bytes> + Send>> {
+        open_sse_with_headers(origin, None).await
+    }
+
+    /// Open SSE with both `Origin` and `Sec-Fetch-Site` controlled by the
+    /// caller. Either signal alone is enough to reject the request, so the
+    /// helper exposes both for the rejection-path tests.
+    async fn open_sse_with_headers(
+        origin: Option<&str>,
+        sec_fetch_site: Option<&str>,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = bytes::Bytes> + Send>> {
         use axum::response::IntoResponse;
         let pending = crate::contract::user_input::pending_prompts();
         let mut headers = HeaderMap::new();
         if let Some(o) = origin {
             headers.insert("origin", o.parse().unwrap());
+        }
+        if let Some(s) = sec_fetch_site {
+            headers.insert("sec-fetch-site", s.parse().unwrap());
         }
         let resp = permission_events(headers, Extension(pending))
             .await
@@ -1611,6 +1624,60 @@ mod tests {
             frame.is_none(),
             "untrusted origin must not receive any data events, got: {frame:?}"
         );
+    }
+
+    /// Cross-site `Sec-Fetch-Site` must independently reject the request,
+    /// even if `Origin` is absent (which is the common case for an
+    /// EventSource opened from an attacker page: browsers do not include
+    /// `Origin` on most cross-origin GETs). This is the second of the two
+    /// independent rejection signals in `is_caller_trusted`. Without this
+    /// branch, an evil page could open EventSources to `/permission/events`
+    /// and consume slots against `MAX_SSE_CONNECTIONS = 64`.
+    #[tokio::test]
+    async fn test_sse_rejects_cross_site_sec_fetch() {
+        for site in ["cross-site", "cross-origin", "Cross-Site"] {
+            let mut body = open_sse_with_headers(None, Some(site)).await;
+            let frame = next_event_frame(&mut body, 200).await;
+            assert!(
+                frame.is_none(),
+                "Sec-Fetch-Site={site} must reject (no data events), got: {frame:?}"
+            );
+        }
+    }
+
+    /// `Sec-Fetch-Site` values that indicate same-origin or no-initiator
+    /// requests must be allowed. Positive control for the rejection branch
+    /// above; prevents an over-eager future tightening from breaking
+    /// same-origin shell pages. Uses the bootstrap-replay path (insert a
+    /// pending prompt with a per-iteration unique nonce; assert the SSE
+    /// handler emits `prompt_added` for it) instead of the live broadcast,
+    /// to keep the test deterministic under parallel execution.
+    #[tokio::test]
+    async fn test_sse_allows_same_origin_and_none_sec_fetch() {
+        let pending = crate::contract::user_input::pending_prompts();
+        for site in ["same-origin", "same-site", "none"] {
+            let nonce = format!("ssetest_secfetch_allow_{site}");
+            let _rx = insert_prompt(
+                &pending,
+                &nonce,
+                "secfetch-test",
+                vec!["OK"],
+                "dkey-secfetch",
+                webapp_caller("cid-secfetch"),
+            );
+            let _cleanup = cleanup_on_drop(pending.clone(), nonce.clone());
+
+            let mut body = open_sse_with_headers(None, Some(site)).await;
+            let frame = frame_matching(
+                &mut body,
+                |f| f.contains("event: prompt_added") && f.contains(&nonce),
+                32,
+                500,
+            )
+            .await
+            .unwrap_or_else(|| panic!("Sec-Fetch-Site={site} must accept; did not see {nonce}"));
+            assert!(frame.contains(&nonce));
+        }
     }
 
     /// Initial-state bootstrap: a fresh subscriber must receive
