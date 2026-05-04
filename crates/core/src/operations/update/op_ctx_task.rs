@@ -360,7 +360,34 @@ async fn drive_client_update(
 
 // --- Outcome delivery ---
 
+/// Dashboard op_stats success classifier (issue #4010). Extracted so the
+/// success/failure mapping per `DriverOutcome` variant has direct unit
+/// coverage; `deliver_outcome` itself takes an `OpManager` which is
+/// expensive to construct in tests.
+fn classify_update_outcome_for_op_stats(outcome: &DriverOutcome) -> bool {
+    matches!(outcome, DriverOutcome::Publish(Ok(_)))
+}
+
 fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: DriverOutcome) {
+    // Dashboard op_stats UPDATE counter (issue #4010). The legacy
+    // `report_result` recording path is bypassed for task-per-tx
+    // terminal replies (see `node::record_op_result` rustdoc), so
+    // every terminal outcome must be recorded here.
+    //
+    // Sub-operation gate: defensive. Today UPDATE has no sub-operation
+    // entry points (it's fire-and-forget at the originator), so
+    // `client_tx.is_sub_operation()` is always false on this path. The
+    // explicit gate matches SUBSCRIBE's pattern so a future change that
+    // routes a sub-op tx through `run_client_update` doesn't silently
+    // start inflating the user-facing dashboard counter.
+    if !client_tx.is_sub_operation() {
+        let success = classify_update_outcome_for_op_stats(&outcome);
+        crate::node::network_status::record_op_result(
+            crate::node::network_status::OpType::Update,
+            success,
+        );
+    }
+
     match outcome {
         DriverOutcome::Publish(result) => {
             // send_client_result handles both result_router_tx.try_send AND
@@ -410,8 +437,6 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 //      `update.rs::process_message`, lines 595–825).
 //
 // NOT migrated (stays on legacy path; see port plan §3 / §9):
-//   - `UpdateMsg::Broadcasting` (deprecated wire variant — legacy
-//      handler is a no-op).
 //   - `UpdateMsg::RequestUpdateStreaming` /
 //     `UpdateMsg::BroadcastToStreaming` (slice B follow-up — orphan
 //      stream claim + assembly).
@@ -1668,6 +1693,8 @@ async fn drive_relay_broadcast_to_streaming(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Guard: `client_events.rs` must call `start_client_update` for both the
     /// routed and legacy UPDATE paths, not the legacy `request_update`.
     #[test]
@@ -1738,7 +1765,8 @@ mod tests {
 
     /// Guard: the driver must call `update_contract` to preserve all side
     /// effects (WASM merge, state persistence, BroadcastStateChange emission,
-    /// delegate notifications, record_contract_updated telemetry).
+    /// delegate notifications, dashboard last-updated telemetry via
+    /// `Ring::record_contract_update`).
     #[test]
     fn driver_calls_update_contract() {
         let src = include_str!("op_ctx_task.rs");
@@ -2276,27 +2304,124 @@ mod tests {
         );
     }
 
-    /// Pin: `Broadcasting` (deprecated) must not be migrated. Legacy
-    /// handler treats it as a no-op; driver should never reference it.
+    /// Pin: the deprecated `UpdateMsg::Broadcasting` variant has been
+    /// removed. Re-introducing it would shift bincode discriminant
+    /// tags and silently break wire compatibility with peers gated by
+    /// the bumped `min-compatible-version`. If a future change needs
+    /// a new variant, append it at the end of the enum to preserve
+    /// existing tags.
     #[test]
-    fn deprecated_broadcasting_variant_stays_legacy() {
-        let src = include_str!("op_ctx_task.rs");
-        // Skip past the section header / module-level scope doc comment
-        // (which references variant names by design) by anchoring on the
-        // first relay entry-point fn.
-        let relay_start = src
-            .find("pub(crate) async fn start_relay_request_update(")
-            .expect("start_relay_request_update not found");
-        let relay_end = src
-            .find("#[cfg(test)]")
-            .expect("test module marker not found");
-        let relay_src = &src[relay_start..relay_end];
-        // Match the variant constructor (UpdateMsg::Broadcasting), not
-        // arbitrary substrings (e.g. "Broadcasting" in a doc comment).
+    fn deprecated_broadcasting_variant_must_not_return() {
+        let src = include_str!("../update.rs");
         assert!(
-            !relay_src.contains("UpdateMsg::Broadcasting"),
-            "Driver must not handle UpdateMsg::Broadcasting — deprecated wire \
-             variant; legacy no-op handler stays in place."
+            !src.contains("Broadcasting {"),
+            "UpdateMsg::Broadcasting must remain deleted; appending new variants \
+             at the end of UpdateMsg preserves bincode discriminant tags."
         );
+    }
+
+    /// Issue #4010: `deliver_outcome` must record the UPDATE outcome to
+    /// the dashboard `op_stats.updates` counter (the task-per-tx bypass
+    /// at `handle_pure_network_message_v1` skips the legacy
+    /// `report_result` recording path) and gate the call on
+    /// `!client_tx.is_sub_operation()` for parity with SUBSCRIBE.
+    /// Walks brace depth so the test does not depend on any nearby
+    /// section comments staying named the same.
+    #[test]
+    fn deliver_outcome_records_update_op_result() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "fn deliver_outcome(");
+
+        assert!(
+            body.contains("record_op_result"),
+            "deliver_outcome must call record_op_result so the dashboard \
+             UPDATE counter advances on task-per-tx terminal replies. \
+             Issue #4010."
+        );
+        assert!(
+            body.contains("OpType::Update"),
+            "record_op_result inside deliver_outcome must be passed \
+             OpType::Update (not Get/Put/Subscribe)."
+        );
+        assert!(
+            body.contains("!client_tx.is_sub_operation()"),
+            "deliver_outcome must gate record_op_result on \
+             `!client_tx.is_sub_operation()` (note the leading `!`) for \
+             parity with SUBSCRIBE; defensive against a future change \
+             that routes a sub-op tx through run_client_update and \
+             silently inflates the user-facing dashboard counter. \
+             Issue #4010."
+        );
+    }
+
+    /// Pure-function unit test: `classify_update_outcome_for_op_stats`
+    /// covers every `DriverOutcome` variant. Pins the success/failure
+    /// mapping against accidental `success: !success` flips. Issue #4010.
+    #[test]
+    fn classify_update_outcome_covers_all_variants() {
+        use freenet_stdlib::client_api::{ContractResponse, ErrorKind, HostResponse};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey, StateSummary};
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let publish_ok = DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+            ContractResponse::UpdateResponse {
+                key,
+                summary: StateSummary::from(Vec::<u8>::new()),
+            },
+        )));
+        let publish_err = DriverOutcome::Publish(Err(ErrorKind::OperationError {
+            cause: "synthetic".into(),
+        }
+        .into()));
+        let infra = DriverOutcome::InfrastructureError(OpError::UnexpectedOpState);
+
+        assert!(classify_update_outcome_for_op_stats(&publish_ok));
+        assert!(!classify_update_outcome_for_op_stats(&publish_err));
+        assert!(!classify_update_outcome_for_op_stats(&infra));
+    }
+
+    /// Truncate the source at the `#[cfg(test)]` marker so the pin
+    /// tests don't see test-module code or comments (avoids false
+    /// positives where a test asserts a substring that also appears in
+    /// a sibling test).
+    fn production_source(full: &str) -> &str {
+        let cutoff = full
+            .find("#[cfg(test)]")
+            .expect("file must have a #[cfg(test)] section");
+        &full[..cutoff]
+    }
+
+    /// Walk brace depth from the opening `{` of the named fn to the
+    /// matching `}`. Returns the body slice. Robust to nearby section
+    /// comments being renamed.
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..]
+            .find('{')
+            .expect("fn signature must have a body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unterminated fn body for {signature_prefix}");
     }
 }

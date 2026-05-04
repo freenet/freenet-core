@@ -20,6 +20,22 @@ pub(crate) enum ValidateOverride {
     EmptyRequestRelated,
 }
 
+/// Configurable `update_state` behavior for testing related contract flows.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Variants constructed in test code only
+pub(crate) enum UpdateOverride {
+    /// Return `UpdateModification::requires(...)` on first call (no
+    /// `RelatedState` entry present in the updates yet) and accept the
+    /// merge on second call (RelatedState entries populated by the
+    /// bridged-upsert retry path). Mirrors `ValidateOverride::RequestRelated`
+    /// but at the update-side of the fetch loop.
+    RequiresRelated(Vec<ContractInstanceId>),
+    /// Always return `UpdateModification::requires(...)` regardless of
+    /// whether RelatedState entries are already populated. Drives the
+    /// depth-limit branch in `bridged_upsert_contract_state`.
+    AlwaysRequiresRelated(Vec<ContractInstanceId>),
+}
+
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
 /// simulation tests exercise the **production** `ContractExecutor` code path
 /// without requiring real WASM binaries.
@@ -32,6 +48,9 @@ pub(crate) struct MockWasmRuntime {
     pub(crate) contract_store: InMemoryContractStore,
     /// Per-contract validation overrides for testing related contract flows.
     pub(crate) validate_overrides: HashMap<ContractInstanceId, ValidateOverride>,
+    /// Per-contract update_state overrides for testing the
+    /// `requires(missing)` fetch-and-retry path.
+    pub(crate) update_overrides: HashMap<ContractInstanceId, UpdateOverride>,
 }
 
 impl ContractRuntimeInterface for MockWasmRuntime {
@@ -74,6 +93,42 @@ impl ContractRuntimeInterface for MockWasmRuntime {
         _state: &WrappedState,
         update_data: &[UpdateData<'_>],
     ) -> crate::wasm_runtime::RuntimeResult<UpdateModification<'static>> {
+        // If a per-contract override is wired, replay the production
+        // require-then-merge flow: first call (no RelatedState in the
+        // update_data slice) returns `requires`; once the bridged path
+        // re-attempts with `RelatedState` entries appended, fall through
+        // to the default merge.
+        if let Some(override_) = self.update_overrides.get(_key.id()).cloned() {
+            match override_ {
+                UpdateOverride::RequiresRelated(ids) => {
+                    let has_related = update_data
+                        .iter()
+                        .any(|u| matches!(u, UpdateData::RelatedState { .. }));
+                    if !has_related {
+                        let related: Vec<RelatedContract> = ids
+                            .iter()
+                            .map(|id| RelatedContract {
+                                contract_instance_id: *id,
+                                mode: RelatedMode::StateOnce,
+                            })
+                            .collect();
+                        return Ok(UpdateModification::requires(related)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?);
+                    }
+                }
+                UpdateOverride::AlwaysRequiresRelated(ids) => {
+                    let related: Vec<RelatedContract> = ids
+                        .iter()
+                        .map(|id| RelatedContract {
+                            contract_instance_id: *id,
+                            mode: RelatedMode::StateOnce,
+                        })
+                        .collect();
+                    return Ok(UpdateModification::requires(related)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?);
+                }
+            }
+        }
         // Accept the last full state or delta from update_data as the new state
         let mut new_state = None;
         for ud in update_data {
@@ -238,6 +293,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
         let runtime = MockWasmRuntime {
             contract_store: contract_store.unwrap_or_default(),
             validate_overrides: HashMap::new(),
+            update_overrides: HashMap::new(),
         };
 
         Executor::new(

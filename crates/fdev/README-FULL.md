@@ -247,16 +247,16 @@ Older Freenet docs mention `build_state` as a separate script, but in practice y
 # Build a web-based front end
 fdev build \
     --input-metadata-path /optional/metadata \
-    --input-state-path contracts/freenet-microblogging/view/web \
-    --output-file contracts/freenet-microblogging-web/freenet_microblogging_view \
+    --input-state-path contracts/my-app/view/web \
+    --output-file contracts/my-app-web/my_app_view \
     --package-type contract  # or 'webapp' if your config demands
 ```
 
 Similarly, you can specify `--state` for a model-only contract:
 ```bash
 fdev build \
-    --input-state-path contracts/freenet-microblogging/model/ \
-    --output-file contracts/freenet-microblogging-data/freenet_microblogging_model
+    --input-state-path contracts/my-app/model/ \
+    --output-file contracts/my-app-data/my_app_model
 ```
 
 *(Adjust paths, actual flags, and config to match your usage.)*
@@ -652,16 +652,16 @@ Older Freenet docs mention `build_state` as a separate script, but in practice y
 # Build a web-based front end
 fdev build \
     --input-metadata-path /optional/metadata \
-    --input-state-path contracts/freenet-microblogging/view/web \
-    --output-file contracts/freenet-microblogging-web/freenet_microblogging_view \
+    --input-state-path contracts/my-app/view/web \
+    --output-file contracts/my-app-web/my_app_view \
     --package-type contract  # or 'webapp' if your config demands
 ```
 
 Similarly, you can specify `--state` for a model-only contract:
 ```bash
 fdev build \
-    --input-state-path contracts/freenet-microblogging/model/ \
-    --output-file contracts/freenet-microblogging-data/freenet_microblogging_model
+    --input-state-path contracts/my-app/model/ \
+    --output-file contracts/my-app-data/my_app_model
 ```
 
 *(Adjust paths, actual flags, and config to match your usage.)*

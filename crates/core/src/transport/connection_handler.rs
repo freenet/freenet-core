@@ -32,7 +32,6 @@ use super::{
     Socket, TransportError,
     congestion_control::{CongestionControl, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
-    fast_channel::{self, FastSender},
     global_bandwidth::GlobalBandwidthManager,
     packet_data::{
         MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
@@ -70,7 +69,7 @@ const RECENTLY_CLOSED_DURATION: Duration = Duration::from_secs(2);
 ///
 /// When a gateway restarts, all connected peers detect their connections are dead
 /// and attempt to reconnect simultaneously ("thundering herd"). This overwhelms
-/// the fast_channel buffers for inter-gateway links, triggering packet drops
+/// the inbound channel buffers for inter-gateway links, triggering packet drops
 /// that can cascade into a non-recovering overflow loop.
 ///
 /// The rate limiter gradually increases the connection acceptance rate:
@@ -675,20 +674,29 @@ type GwOngoingConnectionResult<S, T> = Option<
 enum ConnectionState<S, T: TimeSource> {
     /// Gateway is performing asymmetric handshake with a connecting peer.
     GatewayHandshake {
-        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     },
     /// Outbound NAT traversal handshake in progress.
     NatTraversal {
-        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
         result_sender: oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>,
     },
     /// Connection fully established with symmetric encryption.
     Established {
-        inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     },
     /// Connection recently closed - drains in-flight packets.
     /// Allows new intro packets for reconnection.
     RecentlyClosed { closed_at_nanos: u64 },
+}
+
+/// Result of `ConnectionStateManager::try_send_nat_traversal` —
+/// distinguishes a slow consumer from a vanished one so the listener
+/// can log them differently.
+enum TrySendNatTraversalOutcome {
+    Sent,
+    Full,
+    Closed,
 }
 
 /// Manages connection state with atomic transitions.
@@ -750,8 +758,8 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         {
             match inbound_packet_sender.try_send(packet) {
                 Ok(()) => Ok(true),
-                Err(fast_channel::TrySendError::Full(_)) => Ok(false),
-                Err(fast_channel::TrySendError::Disconnected(_)) => {
+                Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.mark_closed(addr);
                     Err(())
                 }
@@ -772,25 +780,41 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         {
             match packet_sender.try_send(packet) {
                 Ok(()) => Ok(true),
-                Err(fast_channel::TrySendError::Full(_)) => Ok(false),
-                Err(fast_channel::TrySendError::Disconnected(_)) => Ok(false), // Handshake completing
+                Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+                Err(mpsc::error::TrySendError::Closed(_)) => Ok(false), // Handshake completing
             }
         } else {
             Err(())
         }
     }
 
-    /// Try to send a packet to an ongoing NAT traversal.
-    /// Returns Ok(true) if sent, Ok(false) if channel closed.
-    async fn send_nat_traversal(
+    /// Try to send a packet to an ongoing NAT traversal, without blocking.
+    ///
+    /// Returns the outcome distinguishing `Sent` (delivered), `Full`
+    /// (consumer not draining fast enough — usually transient), `Closed`
+    /// (handshake task already exited — state about to be removed).
+    /// Returns `Err(())` if no NAT traversal state exists for `addr`.
+    ///
+    /// Crucially this is non-blocking: the listener task calls this
+    /// synchronously for every inbound packet, so a slow or wedged
+    /// per-handshake consumer cannot stall the listener for other peers.
+    /// Dropped intro packets are recoverable — `connect_outbound_inner`
+    /// retries up to `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds,
+    /// 10 under `cfg(test)`) at a 200 ms cadence, capped by the 3 s
+    /// `overall_deadline`. So at production settings the remote peer
+    /// fires roughly 15 intro packets during the deadline window — a
+    /// transient channel-full event degrades latency but does not break
+    /// the handshake.
+    fn try_send_nat_traversal(
         &self,
         addr: &SocketAddr,
         packet: PacketData<UnknownEncryption>,
-    ) -> Result<bool, ()> {
+    ) -> Result<TrySendNatTraversalOutcome, ()> {
         if let Some(ConnectionState::NatTraversal { packet_sender, .. }) = self.states.get(addr) {
-            match packet_sender.send_async(packet).await {
-                Ok(()) => Ok(true),
-                Err(_) => Ok(false),
+            match packet_sender.try_send(packet) {
+                Ok(()) => Ok(TrySendNatTraversalOutcome::Sent),
+                Err(mpsc::error::TrySendError::Full(_)) => Ok(TrySendNatTraversalOutcome::Full),
+                Err(mpsc::error::TrySendError::Closed(_)) => Ok(TrySendNatTraversalOutcome::Closed),
             }
         } else {
             Err(())
@@ -801,7 +825,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn start_gateway_handshake(
         &mut self,
         addr: SocketAddr,
-        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     ) -> bool {
         use std::collections::btree_map::Entry;
         let now = self.time_source.now_nanos();
@@ -835,7 +859,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn complete_gateway_handshake(
         &mut self,
         addr: SocketAddr,
-        inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     ) -> bool {
         use std::collections::btree_map::Entry;
 
@@ -868,7 +892,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn start_nat_traversal(
         &mut self,
         addr: SocketAddr,
-        packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
         result_sender: oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>,
     ) -> bool {
         use std::collections::btree_map::Entry;
@@ -937,7 +961,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn complete_nat_traversal(
         &mut self,
         addr: SocketAddr,
-        inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+        inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
     ) -> Option<oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>> {
         use std::collections::btree_map::Entry;
 
@@ -1003,7 +1027,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn remove_established(
         &mut self,
         addr: &SocketAddr,
-    ) -> Option<FastSender<PacketData<UnknownEncryption>>> {
+    ) -> Option<mpsc::Sender<PacketData<UnknownEncryption>>> {
         if matches!(
             self.states.get(addr),
             Some(ConnectionState::Established { .. })
@@ -1369,10 +1393,21 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             }
                                             self.connections.record_asym_attempt(remote_addr);
                                         }
-                                        if let Err(()) = self.connections.send_nat_traversal(&remote_addr, packet_data).await {
-                                            tracing::debug!(peer_addr = %remote_addr, "failed to send NAT traversal packet");
+                                        match self.connections.try_send_nat_traversal(&remote_addr, packet_data) {
+                                            Ok(TrySendNatTraversalOutcome::Sent) => continue,
+                                            Ok(TrySendNatTraversalOutcome::Full) => {
+                                                tracing::debug!(peer_addr = %remote_addr, "NAT traversal channel full, dropping packet (peer will retry)");
+                                                continue;
+                                            }
+                                            Ok(TrySendNatTraversalOutcome::Closed) => {
+                                                tracing::debug!(peer_addr = %remote_addr, "NAT traversal handshake task exited; dropping packet");
+                                                continue;
+                                            }
+                                            Err(()) => {
+                                                tracing::debug!(peer_addr = %remote_addr, "NAT traversal state missing");
+                                                continue;
+                                            }
                                         }
-                                        continue;
                                     }
 
                                     ConnectionState::RecentlyClosed { .. } => {
@@ -1660,7 +1695,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         inbound_key_bytes: [u8; 16],
     ) -> (
         GatewayConnectionFuture<S, T>,
-        FastSender<PacketData<UnknownEncryption>>,
+        mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         let secret = self.this_peer_keypair.secret.clone();
         let bandwidth_limit = self.bandwidth_limit;
@@ -1670,8 +1705,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let time_source = self.time_source.clone();
         let congestion_config = self.congestion_config.clone();
 
-        let (inbound_from_remote, next_inbound) =
-            fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
+        let (inbound_from_remote, mut next_inbound) =
+            mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let f = async move {
             let decrypted_intro_packet =
                 secret
@@ -1749,11 +1784,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
             // wait until the remote sends the ack packet
             let timeout_result = crate::deterministic_select! {
-                result = next_inbound.recv_async() => Some(result),
+                result = next_inbound.recv() => Some(result),
                 _ = time_source.sleep(Duration::from_secs(5)) => None,
             };
             match timeout_result {
-                Some(Ok(packet)) => {
+                Some(Some(packet)) => {
                     let _ = packet.try_decrypt_sym(&inbound_key).map_err(|_| {
                         tracing::debug!(
                             peer_addr = %remote_addr,
@@ -1766,7 +1801,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         }
                     })?;
                 }
-                Some(Err(_)) => {
+                Some(None) => {
                     return Err(TransportError::ConnectionEstablishmentFailure {
                         cause: "connection closed".into(),
                     });
@@ -1811,8 +1846,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 time_source.clone(),
             ));
 
-            let (inbound_packet_tx, inbound_packet_rx) =
-                fast_channel::bounded(INBOUND_CHANNEL_CAPACITY);
+            let (inbound_packet_tx, inbound_packet_rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
             // Issue #2395: Drain any packets that arrived during the handshake.
             // The peer may send application-level messages (like ConnectRequest) immediately
@@ -1876,7 +1910,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         remote_public_key: TransportPublicKey,
     ) -> (
         TraverseNatFuture<S, T>,
-        FastSender<PacketData<UnknownEncryption>>,
+        mpsc::Sender<PacketData<UnknownEncryption>>,
     ) {
         tracing::debug!(
             peer_addr = %remote_addr,
@@ -1963,8 +1997,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let socket = self.socket_listener.clone();
         let time_source = self.time_source.clone();
         let congestion_config = self.congestion_config.clone();
-        let (inbound_from_remote, next_inbound) =
-            fast_channel::bounded::<PacketData<UnknownEncryption>>(100);
+        let (inbound_from_remote, mut next_inbound) =
+            mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
         let f = async move {
             tracing::info!(
@@ -2037,11 +2071,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     }
                 }
                 let next_inbound_result = crate::deterministic_select! {
-                    result = next_inbound.recv_async() => Some(result),
+                    result = next_inbound.recv() => Some(result),
                     _ = time_source.sleep(Duration::from_millis(200)) => None,
                 };
                 match next_inbound_result {
-                    Some(Ok(packet)) => {
+                    Some(Some(packet)) => {
                         tracing::trace!(
                             peer_addr = %remote_addr,
                             direction = "outbound",
@@ -2109,7 +2143,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 .await
                                                 .map_err(|_| TransportError::ChannelClosed)?;
                                             let (inbound_sender, inbound_recv) =
-                                                fast_channel::bounded(INBOUND_CHANNEL_CAPACITY);
+                                                mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
                                             // Initialize congestion controller (BBR by default, configurable for benchmarks)
                                             let congestion_controller = congestion_config
@@ -2222,7 +2256,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 }
                                 // if is not an intro packet, the connection is successful and we can proceed
                                 let (inbound_sender, inbound_recv) =
-                                    fast_channel::bounded(INBOUND_CHANNEL_CAPACITY);
+                                    mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
                                 // Initialize congestion controller (BBR by default, configurable for benchmarks)
                                 let congestion_controller = congestion_config
@@ -2282,7 +2316,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             }
                         }
                     }
-                    Some(Err(_)) => {
+                    Some(None) => {
                         tracing::debug!(
                             bind_addr = %this_addr,
                             peer_addr = %remote_addr,
@@ -2388,7 +2422,7 @@ pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
 }
 
 struct InboundRemoteConnection {
-    inbound_packet_sender: FastSender<PacketData<UnknownEncryption>>,
+    inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
 }
 
 mod version_cmp {
@@ -2840,11 +2874,12 @@ mod version_cmp {
     /// from GatewayHandshake to Established with no intermediate None state.
     #[test]
     fn test_atomic_handshake_completion_no_packet_loss() {
-        use super::{ConnectionStateManager, fast_channel};
+        use super::ConnectionStateManager;
         use crate::simulation::VirtualTime;
         use crate::transport::packet_data::{PacketData, UnknownEncryption};
         use std::net::SocketAddr;
         use tokio::net::UdpSocket;
+        use tokio::sync::mpsc;
 
         let time = VirtualTime::new();
         let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
@@ -2852,7 +2887,7 @@ mod version_cmp {
         let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
         // Create a channel for the handshake
-        let (tx, _rx) = fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
 
         // Start gateway handshake
         let started = manager.start_gateway_handshake(addr, tx);
@@ -2863,8 +2898,7 @@ mod version_cmp {
         );
 
         // Create channel for established connection
-        let (established_tx, _established_rx) =
-            fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        let (established_tx, _established_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
 
         // Complete the handshake atomically
         let completed = manager.complete_gateway_handshake(addr, established_tx);
@@ -2887,14 +2921,13 @@ mod version_cmp {
     /// to the asymmetric decryption handler (expensive and wrong).
     #[test]
     fn test_recently_closed_prevents_asymmetric_decryption() {
-        use super::{
-            ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION, fast_channel,
-        };
+        use super::{ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION};
         use crate::simulation::VirtualTime;
         use crate::transport::packet_data::{PacketData, UnknownEncryption};
         use std::net::SocketAddr;
         use std::time::Duration;
         use tokio::net::UdpSocket;
+        use tokio::sync::mpsc;
 
         let time = VirtualTime::new();
         let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
@@ -2902,10 +2935,9 @@ mod version_cmp {
         let addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
 
         // Create an established connection
-        let (tx, _rx) = fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
         manager.start_gateway_handshake(addr, tx);
-        let (established_tx, _established_rx) =
-            fast_channel::bounded::<PacketData<UnknownEncryption>>(16);
+        let (established_tx, _established_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
         manager.complete_gateway_handshake(addr, established_tx);
         assert!(manager.is_established(&addr));
 
@@ -2938,6 +2970,197 @@ mod version_cmp {
         assert!(
             manager.get_state(&addr).is_none(),
             "State should be cleaned up after expiration"
+        );
+    }
+
+    /// Regression invariant for #3959 — the UDP listener forwarding path must
+    /// never block, regardless of receiver state.
+    ///
+    /// Under the deleted `fast_channel` (built on `crossbeam::channel`), a
+    /// wedged crossbeam slot could send `try_send` into an indefinite
+    /// `sched_yield` spin (`Backoff::snooze`). The reproduction in production
+    /// required cross-thread interleaving inside crossbeam internals and is
+    /// not synthetically reproducible from a unit test, so this test does
+    /// NOT reproduce the original wedge — instead it pins the structural
+    /// contract that the fix establishes: the per-peer inbound `Sender`
+    /// returns immediately on capacity exhaustion (`Full`), without
+    /// blocking the listener task. The two methods exercised
+    /// (`try_send_established` and `try_send_gateway_handshake`) are
+    /// invoked from `UdpPacketsListener::listen` for every inbound packet,
+    /// so any future regression that reintroduces a blocking `try_send`
+    /// here would refreeze the node the same way.
+    ///
+    /// Run as `#[tokio::test]` so the channel construction lives inside a
+    /// runtime context — `mpsc::channel` itself does not require one, but
+    /// keeping the test in a runtime keeps it forward-compatible if anyone
+    /// extends `ConnectionStateManager` to use async primitives later.
+    #[tokio::test]
+    async fn test_try_send_established_never_blocks_when_full() {
+        use super::ConnectionStateManager;
+        use super::mock_transport::MockSocket;
+        use crate::simulation::VirtualTime;
+        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+        use std::net::SocketAddr;
+        use std::time::{Duration, Instant};
+        use tokio::sync::mpsc;
+
+        const CAPACITY: usize = 4;
+        const ATTEMPTS: usize = 1_000;
+        // Generous budget — 1k non-blocking try_sends should complete in
+        // microseconds. Compare to the production wedge that spun 4 hours.
+        const BUDGET: Duration = Duration::from_secs(1);
+
+        let time = VirtualTime::new();
+        let mut manager: ConnectionStateManager<MockSocket, VirtualTime> =
+            ConnectionStateManager::new(time);
+        let addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+
+        // Establish a connection with a tiny channel and no consumer ever reading from it.
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
+        let started = manager.start_gateway_handshake(addr, tx.clone());
+        assert!(started, "Should start gateway handshake");
+        let completed = manager.complete_gateway_handshake(addr, tx);
+        assert!(completed, "Should complete gateway handshake");
+
+        // Build a dummy packet to forward repeatedly.
+        let make_packet = || PacketData::<UnknownEncryption>::from_buf([0u8; 32]);
+
+        let started_at = Instant::now();
+        let mut sent_count = 0;
+        let mut full_count = 0;
+        for _ in 0..ATTEMPTS {
+            match manager.try_send_established(&addr, make_packet()) {
+                Ok(true) => sent_count += 1,
+                Ok(false) => full_count += 1,
+                Err(()) => panic!("connection unexpectedly disconnected"),
+            }
+        }
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < BUDGET,
+            "{ATTEMPTS} try_send_established calls took {elapsed:?} (budget {BUDGET:?}) — \
+             the listener forwarding path must not block, regardless of receiver state"
+        );
+        assert!(
+            sent_count <= CAPACITY,
+            "Bounded channel (capacity {CAPACITY}) accepted {sent_count} messages with no consumer"
+        );
+        assert!(
+            full_count >= ATTEMPTS - CAPACITY,
+            "Expected at least {} Full results, got {full_count}",
+            ATTEMPTS - CAPACITY
+        );
+    }
+
+    /// Companion to `test_try_send_established_never_blocks_when_full` —
+    /// the gateway-handshake forwarding path is also invoked synchronously
+    /// from the listener loop (`connection_handler.rs:1352`) and was
+    /// equally vulnerable to the crossbeam wedge before #3959. This test
+    /// pins the same non-blocking invariant for that path.
+    #[tokio::test]
+    async fn test_try_send_gateway_handshake_never_blocks_when_full() {
+        use super::ConnectionStateManager;
+        use super::mock_transport::MockSocket;
+        use crate::simulation::VirtualTime;
+        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+        use std::net::SocketAddr;
+        use std::time::{Duration, Instant};
+        use tokio::sync::mpsc;
+
+        const CAPACITY: usize = 4;
+        const ATTEMPTS: usize = 1_000;
+        const BUDGET: Duration = Duration::from_secs(1);
+
+        let time = VirtualTime::new();
+        let mut manager: ConnectionStateManager<MockSocket, VirtualTime> =
+            ConnectionStateManager::new(time);
+        let addr: SocketAddr = "127.0.0.1:8003".parse().unwrap();
+
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
+        let started = manager.start_gateway_handshake(addr, tx);
+        assert!(started, "Should start gateway handshake");
+
+        let make_packet = || PacketData::<UnknownEncryption>::from_buf([0u8; 32]);
+
+        let started_at = Instant::now();
+        let mut full_count = 0;
+        for _ in 0..ATTEMPTS {
+            match manager.try_send_gateway_handshake(&addr, make_packet()) {
+                Ok(true) => {}
+                Ok(false) => full_count += 1,
+                Err(()) => panic!("handshake state unexpectedly missing"),
+            }
+        }
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < BUDGET,
+            "{ATTEMPTS} try_send_gateway_handshake calls took {elapsed:?} (budget {BUDGET:?})"
+        );
+        assert!(
+            full_count >= ATTEMPTS - CAPACITY,
+            "Expected at least {} Full results, got {full_count}",
+            ATTEMPTS - CAPACITY
+        );
+    }
+
+    /// Regression for #3961 — completes the trio of listener-forwarding
+    /// non-blocking tests with the NAT-traversal path. Like `try_send_established`
+    /// and `try_send_gateway_handshake`, `try_send_nat_traversal` is invoked
+    /// synchronously from `UdpPacketsListener::listen` for every inbound
+    /// packet that maps to an in-flight NAT-traversal handshake. The prior
+    /// implementation (`send_nat_traversal` with `.send().await`) could
+    /// stall the listener for every other peer if a single per-handshake
+    /// consumer was slow. This test pins the new non-blocking contract.
+    #[tokio::test]
+    async fn test_try_send_nat_traversal_never_blocks_when_full() {
+        use super::ConnectionStateManager;
+        use super::mock_transport::MockSocket;
+        use crate::simulation::VirtualTime;
+        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+        use std::net::SocketAddr;
+        use std::time::{Duration, Instant};
+        use tokio::sync::{mpsc, oneshot};
+
+        const CAPACITY: usize = 4;
+        const ATTEMPTS: usize = 1_000;
+        const BUDGET: Duration = Duration::from_secs(1);
+
+        let time = VirtualTime::new();
+        let mut manager: ConnectionStateManager<MockSocket, VirtualTime> =
+            ConnectionStateManager::new(time);
+        let addr: SocketAddr = "127.0.0.1:8004".parse().unwrap();
+
+        let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
+        let (result_tx, _result_rx) = oneshot::channel();
+        let started = manager.start_nat_traversal(addr, tx, result_tx);
+        assert!(started, "Should start NAT traversal");
+
+        let make_packet = || PacketData::<UnknownEncryption>::from_buf([0u8; 32]);
+
+        let started_at = Instant::now();
+        let mut full_count = 0;
+        for _ in 0..ATTEMPTS {
+            match manager.try_send_nat_traversal(&addr, make_packet()) {
+                Ok(super::TrySendNatTraversalOutcome::Sent) => {}
+                Ok(super::TrySendNatTraversalOutcome::Full) => full_count += 1,
+                Ok(super::TrySendNatTraversalOutcome::Closed) => {
+                    panic!("receiver still alive; should not be Closed");
+                }
+                Err(()) => panic!("NAT traversal state unexpectedly missing"),
+            }
+        }
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < BUDGET,
+            "{ATTEMPTS} try_send_nat_traversal calls took {elapsed:?} (budget {BUDGET:?})"
+        );
+        assert!(
+            full_count >= ATTEMPTS - CAPACITY,
+            "Expected at least {} Full results, got {full_count}",
+            ATTEMPTS - CAPACITY
         );
     }
 
@@ -3001,6 +3224,377 @@ mod version_cmp {
         for _ in 0..1000 {
             assert!(limiter.try_accept(), "Should accept unlimited in phase 3");
         }
+    }
+}
+
+/// Smoke tests pinning the contract the transport layer relies on from
+/// `tokio::sync::mpsc`. These tests replace the wrapper-level tests that
+/// were deleted along with `fast_channel.rs` in #3960 — they exercise the
+/// same scenarios (basic send/recv, backpressure, sender clone, disconnect
+/// detection, no-busy-loop wakeup, burst drain, multi-producer concurrency,
+/// stress under contention, sender drop while receiver parked) directly
+/// against the primitive the transport now uses, so any future regression
+/// (e.g. swapping back to a wrapper that wedges) trips a clear unit test.
+#[cfg(test)]
+mod mpsc_invariants {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn send_recv_roundtrip() {
+        let (tx, mut rx) = mpsc::channel::<i32>(10);
+        tx.send(42).await.unwrap();
+        tx.send(43).await.unwrap();
+        assert_eq!(rx.recv().await, Some(42));
+        assert_eq!(rx.recv().await, Some(43));
+    }
+
+    #[tokio::test]
+    async fn try_send_returns_full_at_capacity() {
+        let (tx, _rx) = mpsc::channel::<i32>(2);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        assert!(matches!(
+            tx.try_send(3),
+            Err(mpsc::error::TrySendError::Full(3))
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_recv_returns_empty_when_drained() {
+        let (tx, mut rx) = mpsc::channel::<i32>(10);
+        tx.send(1).await.unwrap();
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn backpressure_blocks_sender_until_drain() {
+        let (tx, mut rx) = mpsc::channel::<i32>(2);
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+        // Channel full — try_send fails immediately, send().await would park.
+        assert!(matches!(
+            tx.try_send(3),
+            Err(mpsc::error::TrySendError::Full(3))
+        ));
+        assert_eq!(rx.recv().await, Some(1));
+        // Space freed; can send again.
+        tx.try_send(3).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sender_clone_preserves_send_order_per_clone() {
+        let (tx, mut rx) = mpsc::channel::<i32>(10);
+        let tx2 = tx.clone();
+        tx.send(1).await.unwrap();
+        tx2.send(2).await.unwrap();
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn buffered_messages_drain_after_all_senders_drop() {
+        let (tx, mut rx) = mpsc::channel::<i32>(10);
+        tx.send(42).await.unwrap();
+        drop(tx);
+        assert_eq!(rx.recv().await, Some(42));
+        assert_eq!(rx.recv().await, None, "None signals all senders dropped");
+    }
+
+    #[tokio::test]
+    async fn is_closed_reflects_receiver_drop() {
+        let (tx, rx) = mpsc::channel::<i32>(10);
+        assert!(!tx.is_closed());
+        drop(rx);
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn concurrent_send_recv_one_thousand_messages() {
+        let (tx, mut rx) = mpsc::channel::<i32>(100);
+        let count = 1000;
+        let sender = tokio::spawn(async move {
+            for i in 0..count {
+                tx.send(i).await.unwrap();
+            }
+        });
+        let receiver = tokio::spawn(async move {
+            let mut received = 0;
+            while rx.recv().await.is_some() {
+                received += 1;
+                if received == count {
+                    break;
+                }
+            }
+            received
+        });
+        sender.await.unwrap();
+        assert_eq!(receiver.await.unwrap(), count);
+    }
+
+    #[tokio::test]
+    async fn recv_does_not_busy_loop_while_idle() {
+        // recv().await must park, not spin. With a 1s producer delay, the
+        // receiver must complete in a small bounded number of polls.
+        let (tx, mut rx) = mpsc::channel::<i32>(10);
+        let polls = Arc::new(AtomicU64::new(0));
+        let polls_inner = polls.clone();
+        let receiver = tokio::spawn(async move {
+            polls_inner.fetch_add(1, Ordering::Relaxed);
+            rx.recv().await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tx.send(7).await.unwrap();
+        assert_eq!(receiver.await.unwrap(), Some(7));
+        // Single recv() future; one poll to enter, parker wakes it once on
+        // delivery. Anything >>2 would mean the runtime was repolling
+        // (busy loop). Allow generous bound to avoid runtime-internal
+        // counting noise.
+        assert!(
+            polls.load(Ordering::Relaxed) < 10,
+            "recv() should park, not busy-loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn burst_send_before_recv_drains_all() {
+        // Multiple sends with no receiver waiting still result in all
+        // messages being delivered, in order, when recv() begins.
+        let (tx, mut rx) = mpsc::channel::<i32>(100);
+        for i in 0..50 {
+            tx.send(i).await.unwrap();
+        }
+        for i in 0..50 {
+            assert_eq!(rx.recv().await, Some(i));
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_sender_wakes_blocked_receiver() {
+        // A receiver parked on recv() must wake when the last sender drops,
+        // and observe None (channel closed).
+        let (tx, mut rx) = mpsc::channel::<i32>(10);
+        let receiver = tokio::spawn(async move { rx.recv().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(tx);
+        let result = receiver.await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn multiple_concurrent_senders_lose_no_messages() {
+        let (tx, mut rx) = mpsc::channel::<i32>(100);
+        let n_senders = 5;
+        let msgs_per_sender = 200;
+        let handles: Vec<_> = (0..n_senders)
+            .map(|_| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    for i in 0..msgs_per_sender {
+                        tx.send(i).await.unwrap();
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        let receiver = tokio::spawn(async move {
+            let mut count = 0;
+            while rx.recv().await.is_some() {
+                count += 1;
+            }
+            count
+        });
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(receiver.await.unwrap(), n_senders * msgs_per_sender);
+    }
+
+    #[tokio::test]
+    async fn high_concurrency_small_channel_drops_nothing() {
+        // 50 senders × 1000 msgs through a capacity-5 channel: forces heavy
+        // backpressure on every send. All messages must arrive.
+        let (tx, mut rx) = mpsc::channel::<u64>(5);
+        let n_senders = 50_u64;
+        let msgs_per_sender = 1000_u64;
+        let handles: Vec<_> = (0..n_senders)
+            .map(|sender_id| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    for i in 0..msgs_per_sender {
+                        tx.send(sender_id * msgs_per_sender + i).await.unwrap();
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        let receiver = tokio::spawn(async move {
+            let mut count = 0_u64;
+            while rx.recv().await.is_some() {
+                count += 1;
+            }
+            count
+        });
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(receiver.await.unwrap(), n_senders * msgs_per_sender);
+    }
+
+    #[tokio::test]
+    async fn rapid_sender_disconnect_loses_no_messages() {
+        // Spawn a wave of short-lived senders, each sending then dropping.
+        // Receiver must collect exactly the total sent.
+        let (tx, mut rx) = mpsc::channel::<u64>(100);
+        let sent = Arc::new(AtomicU64::new(0));
+        let handles: Vec<_> = (0..100)
+            .map(|wave| {
+                let tx = tx.clone();
+                let sent = sent.clone();
+                tokio::spawn(async move {
+                    for i in 0..10 {
+                        tx.send(wave * 10 + i).await.unwrap();
+                        sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        let receiver = tokio::spawn(async move {
+            let mut count = 0_u64;
+            while rx.recv().await.is_some() {
+                count += 1;
+            }
+            count
+        });
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(receiver.await.unwrap(), sent.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn many_independent_channels_in_parallel() {
+        // 200 channels running concurrently — exercises per-connection
+        // channel pattern without cross-channel interference.
+        let n_channels = 200;
+        let msgs_per_channel = 500_u64;
+        let handles: Vec<_> = (0..n_channels)
+            .map(|_| {
+                tokio::spawn(async move {
+                    let (tx, mut rx) = mpsc::channel::<u64>(50);
+                    let sender = tokio::spawn(async move {
+                        for i in 0..msgs_per_channel {
+                            tx.send(i).await.unwrap();
+                        }
+                    });
+                    let receiver = tokio::spawn(async move {
+                        let mut count = 0_u64;
+                        while count < msgs_per_channel {
+                            rx.recv().await.unwrap();
+                            count += 1;
+                        }
+                        count
+                    });
+                    sender.await.unwrap();
+                    assert_eq!(receiver.await.unwrap(), msgs_per_channel);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_receiver_with_capacity_one_completes() {
+        // capacity-1 channel: every send must wait for the receiver. With
+        // a deliberately slow receiver, all messages must still arrive.
+        let (tx, mut rx) = mpsc::channel::<u64>(1);
+        let n_msgs = 500_u64;
+        let sender = tokio::spawn(async move {
+            for i in 0..n_msgs {
+                tx.send(i).await.unwrap();
+            }
+        });
+        let receiver = tokio::spawn(async move {
+            let mut count = 0_u64;
+            for _ in 0..n_msgs {
+                let msg = rx.recv().await.unwrap();
+                assert_eq!(msg, count);
+                count += 1;
+                if count % 10 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            count
+        });
+        sender.await.unwrap();
+        assert_eq!(receiver.await.unwrap(), n_msgs);
+    }
+
+    #[tokio::test]
+    async fn sender_drop_during_backpressure_releases_blocked_senders() {
+        // Fill channel, start senders blocked on backpressure, then drop
+        // receiver — every blocked sender must observe SendError, none stuck.
+        let (tx, rx) = mpsc::channel::<u64>(2);
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let tx = tx.clone();
+                tokio::spawn(async move { tx.send(100 + i).await })
+            })
+            .collect();
+        drop(tx);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(rx);
+        for h in handles {
+            assert!(h.await.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_disconnect_observed_by_senders() {
+        let (tx, rx) = mpsc::channel::<u64>(10);
+        assert!(!tx.is_closed());
+        drop(rx);
+        assert!(tx.is_closed());
+        assert!(tx.send(1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_after_close_returns_error() {
+        let (tx, mut rx) = mpsc::channel::<u64>(10);
+        tx.send(1).await.unwrap();
+        rx.close();
+        // After receiver-side close, further sends must fail rather than
+        // succeed-but-be-discarded.
+        let result = tx.send(2).await;
+        assert!(result.is_err());
+        // Messages already buffered before close are still delivered.
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn capacity_is_exact() {
+        // mpsc::channel(N) accepts exactly N pending messages with no
+        // consumer; the (N+1)th try_send must return Full.
+        let (tx, _rx) = mpsc::channel::<u64>(5);
+        for i in 0..5 {
+            tx.try_send(i).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(5),
+            Err(mpsc::error::TrySendError::Full(5))
+        ));
     }
 }
 

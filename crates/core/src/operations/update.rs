@@ -847,25 +847,6 @@ impl Operation for UpdateOp {
                     new_state = None;
                     return_msg = None;
                 }
-                UpdateMsg::Broadcasting {
-                    id,
-                    broadcast_to,
-                    key,
-                    ..
-                } => {
-                    // DEPRECATED: Broadcasting messages are no longer generated.
-                    // Network peer propagation is now automatic via BroadcastStateChange event
-                    // emitted by the executor when state changes.
-                    // This handler is kept for backwards compatibility during rolling upgrades.
-                    tracing::debug!(
-                        tx = %id,
-                        %key,
-                        target_count = broadcast_to.len(),
-                        "Received deprecated Broadcasting message - ignoring (propagation is automatic)"
-                    );
-                    new_state = None;
-                    return_msg = None;
-                }
 
                 // ---- Streaming handlers ----
                 UpdateMsg::RequestUpdateStreaming {
@@ -1633,7 +1614,6 @@ fn build_op_result(
 ) -> Result<super::OperationResult, OpError> {
     // With hop-by-hop routing:
     // - forward_hop is set when forwarding RequestUpdate to the next peer
-    // - Broadcasting messages have next_hop = None (they're processed locally)
     // - BroadcastTo uses explicit addresses via conn_manager.send()
     let next_hop = forward_hop;
 
@@ -2242,8 +2222,10 @@ async fn deliver_update_result(
     };
 
     let host_result = op.to_host_result();
-    // Note: record_contract_updated is called in commit_state_update (the single
-    // chokepoint for all state updates), so we don't call it here to avoid double-counting.
+    // Note: dashboard "last updated" telemetry is recorded via
+    // `Ring::record_contract_update` from `commit_state_update` (the single
+    // chokepoint for all state updates); we don't call it here to avoid
+    // double-counting.
 
     // Use try_send to avoid blocking spawned executor tasks (see channel-safety.md).
     op_manager
@@ -2488,7 +2470,7 @@ mod messages {
 
     use crate::{
         message::{InnerMessage, Transaction},
-        ring::{Location, PeerKeyLocation},
+        ring::Location,
         transport::peer_connection::StreamId,
     };
 
@@ -2528,14 +2510,6 @@ mod messages {
             #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
             related_contracts: RelatedContracts<'static>,
             value: WrappedState,
-        },
-        /// Internal node instruction to track broadcasting progress.
-        Broadcasting {
-            id: Transaction,
-            broadcasted_to: usize,
-            broadcast_to: Vec<PeerKeyLocation>,
-            key: ContractKey,
-            new_value: WrappedState,
         },
         /// Broadcasting a change to a specific subscriber.
         ///
@@ -2585,7 +2559,6 @@ mod messages {
         fn id(&self) -> &Transaction {
             match self {
                 UpdateMsg::RequestUpdate { id, .. }
-                | UpdateMsg::Broadcasting { id, .. }
                 | UpdateMsg::BroadcastTo { id, .. }
                 | UpdateMsg::RequestUpdateStreaming { id, .. }
                 | UpdateMsg::BroadcastToStreaming { id, .. } => id,
@@ -2595,7 +2568,6 @@ mod messages {
         fn requested_location(&self) -> Option<crate::ring::Location> {
             match self {
                 UpdateMsg::RequestUpdate { key, .. }
-                | UpdateMsg::Broadcasting { key, .. }
                 | UpdateMsg::BroadcastTo { key, .. }
                 | UpdateMsg::RequestUpdateStreaming { key, .. }
                 | UpdateMsg::BroadcastToStreaming { key, .. } => Some(Location::from(key.id())),
@@ -2607,7 +2579,6 @@ mod messages {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 UpdateMsg::RequestUpdate { id, .. } => write!(f, "RequestUpdate(id: {id})"),
-                UpdateMsg::Broadcasting { id, .. } => write!(f, "Broadcasting(id: {id})"),
                 UpdateMsg::BroadcastTo { id, .. } => write!(f, "BroadcastTo(id: {id})"),
                 UpdateMsg::RequestUpdateStreaming { id, stream_id, .. } => {
                     write!(f, "RequestUpdateStreaming(id: {id}, stream: {stream_id})")

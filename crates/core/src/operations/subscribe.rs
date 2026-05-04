@@ -32,14 +32,6 @@ const MAX_BREADTH: usize = 3;
 /// Matches GET operation's MAX_RETRIES; change both together.
 const MAX_RETRIES: usize = 10;
 
-/// Minimum HTL for speculative retries.
-///
-/// Retries use a reduced HTL (capped at current_hop) to avoid full-depth
-/// traversal storms. This floor ensures retries still reach peers 2-3 hops
-/// away, which is the minimum useful search depth in any topology.
-/// Matches GET operation's MIN_RETRY_HTL; change both together.
-const MIN_RETRY_HTL: usize = 3;
-
 /// Timeout for waiting on contract storage notification.
 /// Used when a subscription arrives before the contract has been propagated via PUT.
 pub(super) const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
@@ -89,10 +81,15 @@ async fn fetch_contract_if_missing(
         return Ok(Some(key));
     }
 
-    // Start a GET operation to fetch the contract
-    let get_op = get::start_op(instance_id, true, false, false);
-    let visited = super::VisitedPeers::new(&get_op.id);
-    get::request_get(op_manager, get_op, visited).await?;
+    // Start a GET operation to fetch the contract via the task-per-tx
+    // sub-op driver. The receiver is dropped — caller relies on
+    // `wait_for_contract_with_timeout` (storage poll + timeout) to
+    // detect arrival, mirroring the legacy fire-and-forget shape.
+    let (_tx, _rx) = get::op_ctx_task::start_sub_op_get(
+        op_manager,
+        instance_id,
+        /* return_contract_code */ true,
+    );
 
     // Wait for contract to arrive
     wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
@@ -115,7 +112,6 @@ async fn fetch_contract_if_missing(
 struct PrepareRequestData {
     id: Transaction,
     instance_id: ContractInstanceId,
-    is_renewal: bool,
 }
 
 impl PrepareRequestData {
@@ -192,6 +188,14 @@ struct CompletedData {
 #[derive(Debug)]
 enum SubscribeState {
     /// Prepare the request to subscribe.
+    ///
+    /// Constructed only in test fixtures (`start_op` / `start_op_with_id`)
+    /// after #1454 SUBSCRIBE migrations: production callers (client,
+    /// renewal, executor, sub-op) drive subscribes through the
+    /// task-per-tx machinery in `op_ctx_task.rs` and never push a
+    /// `SubscribeOp` in the `PrepareRequest` state. Match arms in
+    /// `process_message` are retained as a structural safety net.
+    #[allow(dead_code)]
     PrepareRequest(PrepareRequestData),
     /// Awaiting response from downstream peer.
     AwaitingResponse(AwaitingResponseData),
@@ -217,27 +221,27 @@ impl TryFrom<SubscribeOp> for SubscribeResult {
 
 /// Start a new subscription operation.
 ///
-/// `is_renewal` indicates whether this is a renewal (requester already has the contract).
-/// If true, the responder will skip sending state to save bandwidth.
+/// Test fixture only after #1454 SUBSCRIBE migrations: production
+/// callers (client, renewal, executor, sub-op) all go through the
+/// task-per-tx drivers in `op_ctx_task.rs` which build `SubscribeOp`s
+/// inline.
+#[cfg(test)]
 pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> SubscribeOp {
     let id = Transaction::new::<SubscribeMsg>();
     SubscribeOp {
         id,
-        state: SubscribeState::PrepareRequest(PrepareRequestData {
-            id,
-            instance_id,
-            is_renewal,
-        }),
+        state: SubscribeState::PrepareRequest(PrepareRequestData { id, instance_id }),
         requester_addr: None, // Local operation, we are the originator
         requester_pub_key: None,
         is_renewal,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     }
 }
 
 /// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
+///
+/// Test fixture only after #1454 SUBSCRIBE migrations.
+#[cfg(test)]
 pub(crate) fn start_op_with_id(
     instance_id: ContractInstanceId,
     id: Transaction,
@@ -245,17 +249,11 @@ pub(crate) fn start_op_with_id(
 ) -> SubscribeOp {
     SubscribeOp {
         id,
-        state: SubscribeState::PrepareRequest(PrepareRequestData {
-            id,
-            instance_id,
-            is_renewal,
-        }),
+        state: SubscribeState::PrepareRequest(PrepareRequestData { id, instance_id }),
         requester_addr: None, // Local operation, we are the originator
         requester_pub_key: None,
         is_renewal,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     }
 }
 
@@ -285,109 +283,36 @@ pub(crate) fn create_unsubscribe_op(
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     }
 }
 
-/// Request to subscribe to value changes from a contract.
-///
-/// # Errors
-///
-/// Returns `RingError::PeerNotJoined` if the peer hasn't established its ring location
-/// (i.e., hasn't completed joining the network) AND the contract is not available locally.
-/// This allows callers to retry after the peer has completed joining.
-///
-/// If the contract exists locally and no network is needed, the subscription completes
-/// locally even without a ring location (standalone node case).
-pub(crate) async fn request_subscribe(
-    op_manager: &OpManager,
-    sub_op: SubscribeOp,
-) -> Result<(), OpError> {
-    let SubscribeState::PrepareRequest(ref data) = sub_op.state else {
-        return Err(OpError::UnexpectedOpState);
-    };
-    let id = data.id;
-    let instance_id = data.instance_id;
-    let is_renewal = data.is_renewal;
-
-    tracing::debug!(tx = %id, contract = %instance_id, is_renewal, "subscribe: request_subscribe invoked");
-
-    match prepare_initial_request(op_manager, id, instance_id, is_renewal).await? {
-        InitialRequest::LocallyComplete { key } => {
-            complete_local_subscription(op_manager, id, key, is_renewal).await
-        }
-        InitialRequest::NoHostingPeers => Err(RingError::NoHostingPeers(instance_id).into()),
-        InitialRequest::PeerNotJoined => Err(RingError::PeerNotJoined.into()),
-        InitialRequest::NetworkRequest {
-            target,
-            target_addr,
-            visited,
-            alternatives,
-            htl,
-        } => {
-            let msg = SubscribeMsg::Request {
-                id,
-                instance_id,
-                htl,
-                visited: visited.clone(),
-                is_renewal,
-            };
-
-            let mut tried_peers = HashSet::new();
-            tried_peers.insert(target_addr);
-
-            let op = SubscribeOp {
-                id,
-                state: SubscribeState::AwaitingResponse(AwaitingResponseData {
-                    next_hop: Some(target_addr),
-                    instance_id,
-                    retries: 0,
-                    current_hop: htl,
-                    tried_peers,
-                    alternatives, // remaining candidates after remove(0)
-                    attempts_at_hop: 1,
-                    visited,
-                }),
-                requester_addr: None, // We're the originator
-                requester_pub_key: None,
-                is_renewal,
-                stats: Some(SubscribeStats {
-                    target_peer: target,
-                    contract_location: Location::from(&instance_id),
-                    request_sent_at: Instant::now(),
-                }),
-                ack_received: false,
-                speculative_paths: 0,
-            };
-
-            // Renewals use non-blocking send to fail fast under congestion rather
-            // than blocking 30 s and compounding it. Client subscribes use the
-            // blocking path for a definitive success/failure response.
-            if is_renewal {
-                op_manager
-                    .notify_op_change_nonblocking(NetMessage::from(msg), OpEnum::Subscribe(op))
-                    .await?;
-            } else {
-                op_manager
-                    .notify_op_change(NetMessage::from(msg), OpEnum::Subscribe(op))
-                    .await?;
-            }
-
-            Ok(())
-        }
-    }
-}
+// `request_subscribe` was the legacy state-machine entry point that
+// pushed a `SubscribeOp` into `OpManager.ops.subscribe` via
+// `notify_op_change(_nonblocking)`. It was retired by #1454:
+// client-initiated callers go through
+// `op_ctx_task::run_client_subscribe`, renewals go through
+// `op_ctx_task::run_renewal_subscribe`, and executor auto-subscribe
+// goes through `op_ctx_task::run_executor_subscribe`. None of these
+// push state into `ops.subscribe`. Relay-side intermediate-peer
+// SUBSCRIBE state still flows through the legacy path via
+// `process_message`, but no caller constructs a fresh `SubscribeOp`
+// for it — the relay state arrives as a `SubscribeMsg::Request` from
+// the wire and is handled by `start_relay_subscribe`.
+//
+// `start_op` and `start_op_with_id` remain for test fixtures.
 
 /// Outcome of [`prepare_initial_request`]: the decision about how to originate
 /// a subscribe request based on the node's current ring state and contract
 /// availability.
 ///
-/// This type exists so both the legacy state-machine path (`request_subscribe`)
-/// and the task-per-tx path (`op_ctx_task::run_client_subscribe`, #1454 Phase
-/// 2b) can share the "which peer, or local-complete, or give up?" decision
-/// logic without duplicating `k_closest_potentially_hosting` + fallback +
-/// local-completion handling.
+/// This type exists so all task-per-tx subscribe entry points
+/// (`op_ctx_task::run_client_subscribe`,
+/// `op_ctx_task::run_renewal_subscribe`,
+/// `op_ctx_task::run_executor_subscribe`) share the "which peer, or
+/// local-complete, or give up?" decision logic without duplicating
+/// `k_closest_potentially_hosting` + fallback + local-completion
+/// handling. The legacy state-machine path (`request_subscribe`) used
+/// the same helper before #1454 and is now retired.
 ///
 /// The returned values describe what the caller should do; the helper does
 /// NOT mutate `op_manager` or push state. Any side-effects (emitting
@@ -428,16 +353,16 @@ pub(super) enum InitialRequest {
 /// Compute the initial "where do we send this subscribe, or do we complete
 /// locally?" decision for a subscribe request.
 ///
-/// Factored out of [`request_subscribe`] so the task-per-tx client-initiated
-/// path (`op_ctx_task::run_client_subscribe`, #1454 Phase 2b) can reuse the
-/// exact same ring lookup / fallback / local-completion logic without
-/// duplicating it. The helper is pure modulo telemetry emission: it calls
-/// `NetEventLog::subscribe_request` on the `NetworkRequest` branch so both
-/// callers get identical event logs, but it does not mutate `op_manager`
-/// state and does not push any `SubscribeOp` into the per-op DashMap.
+/// All task-per-tx subscribe entry points
+/// (`op_ctx_task::run_client_subscribe`, `run_renewal_subscribe`,
+/// `run_executor_subscribe`) reuse the same ring lookup / fallback /
+/// local-completion logic via this helper. The helper is pure modulo
+/// telemetry emission: it calls `NetEventLog::subscribe_request` on
+/// the `NetworkRequest` branch so all callers get identical event
+/// logs, but it does not mutate `op_manager` state and does not push
+/// any `SubscribeOp` into the per-op DashMap.
 ///
-/// The decision branches exactly mirror the pre-extraction body of
-/// `request_subscribe`:
+/// The decision branches:
 ///
 /// 1. If the peer has no ring location (hasn't joined), check local contract
 ///    availability and either complete locally or return `PeerNotJoined`.
@@ -664,12 +589,6 @@ pub(crate) struct SubscribeOp {
     is_renewal: bool,
     /// Routing stats for failure reporting.
     stats: Option<SubscribeStats>,
-    /// True when a downstream relay has acknowledged forwarding this request.
-    /// Used by the GC task to distinguish "peer is dead" from "peer is working on it".
-    pub(crate) ack_received: bool,
-    /// Number of speculative parallel paths launched by the originator's GC task.
-    /// Capped at MAX_SPECULATIVE_PATHS to bound network overhead.
-    pub(crate) speculative_paths: u8,
 }
 
 impl SubscribeOp {
@@ -764,113 +683,6 @@ impl SubscribeOp {
     /// The originator has no `requester_addr` (no upstream peer to respond to).
     pub(crate) fn is_originator(&self) -> bool {
         self.requester_addr.is_none()
-    }
-
-    /// Retry the subscribe operation with the next alternative peer.
-    ///
-    /// Similar to GET's `retry_with_next_alternative`: picks the next untried peer
-    /// from local alternatives, or injects fallback peers if alternatives are exhausted.
-    /// Returns `Ok((op, msg))` with the updated op and new Request message,
-    /// or `Err(op)` if no alternatives remain.
-    pub(crate) fn retry_with_next_alternative(
-        mut self,
-        max_hops_to_live: usize,
-        fallback_peers: &[PeerKeyLocation],
-    ) -> Result<(SubscribeOp, SubscribeMsg), Box<SubscribeOp>> {
-        match self.state {
-            SubscribeState::AwaitingResponse(ref mut data) => {
-                // If local alternatives exhausted, inject fallback peers we haven't tried.
-                // Filter through both tried_peers and visited bloom filter (#3570).
-                if data.alternatives.is_empty() && !fallback_peers.is_empty() {
-                    for peer in fallback_peers {
-                        if let Some(addr) = peer.socket_addr() {
-                            if !data.tried_peers.contains(&addr)
-                                && !data.visited.probably_visited(addr)
-                            {
-                                data.alternatives.push(peer.clone());
-                            }
-                        }
-                    }
-                    if !data.alternatives.is_empty() {
-                        tracing::info!(
-                            tx = %self.id,
-                            contract = %data.instance_id,
-                            new_candidates = data.alternatives.len(),
-                            "Subscribe broadening search to all connected peers (fallback)"
-                        );
-                    }
-                }
-
-                if data.alternatives.is_empty() {
-                    return Err(Box::new(self));
-                }
-
-                // Take ownership of state to modify it
-                let SubscribeState::AwaitingResponse(mut data) =
-                    std::mem::replace(&mut self.state, SubscribeState::Failed)
-                else {
-                    unreachable!();
-                };
-
-                let instance_id = data.instance_id;
-                let is_renewal = self.is_renewal;
-
-                // Find next alternative with a known socket address.
-                // Skip peers without addresses — they can't be contacted.
-                let (next_target, addr) = loop {
-                    if data.alternatives.is_empty() {
-                        // All remaining alternatives lack addresses
-                        self.state = SubscribeState::AwaitingResponse(data);
-                        return Err(Box::new(self));
-                    }
-                    let candidate = data.alternatives.remove(0);
-                    if let Some(addr) = candidate.socket_addr() {
-                        break (candidate, addr);
-                    }
-                };
-                data.tried_peers.insert(addr);
-                // Mark in bloom filter so future retries skip this peer (#3570).
-                data.visited.mark_visited(addr);
-                data.next_hop = Some(addr);
-                data.attempts_at_hop += 1;
-                let visited = data.visited.clone();
-
-                tracing::info!(
-                    tx = %self.id,
-                    contract = %instance_id,
-                    target = ?next_target.socket_addr(),
-                    remaining_alternatives = data.alternatives.len(),
-                    "Subscribe retrying with alternative peer after timeout"
-                );
-
-                // Update stats for the new target (reset timing for new attempt)
-                self.stats = Some(SubscribeStats {
-                    target_peer: next_target,
-                    contract_location: Location::from(&instance_id),
-                    request_sent_at: Instant::now(),
-                });
-
-                // Reduce HTL on each retry, floored at MIN_RETRY_HTL (#3570).
-                let retry_htl = (max_hops_to_live / (data.attempts_at_hop.max(1)))
-                    .max(MIN_RETRY_HTL)
-                    .min(max_hops_to_live);
-
-                self.state = SubscribeState::AwaitingResponse(data);
-
-                let msg = SubscribeMsg::Request {
-                    id: self.id,
-                    instance_id,
-                    htl: retry_htl,
-                    visited,
-                    is_renewal,
-                };
-
-                Ok((self, msg))
-            }
-            SubscribeState::PrepareRequest(_)
-            | SubscribeState::Completed(_)
-            | SubscribeState::Failed => Err(Box::new(self)),
-        }
     }
 
     /// Build a NotFound result to send back to the requester, or fail locally if we're the originator.
@@ -995,8 +807,6 @@ impl SubscribeOp {
                             s.target_peer = next_target.clone();
                             s
                         }),
-                        ack_received: false,
-                        speculative_paths: 0,
                     };
 
                     op_manager
@@ -1060,8 +870,6 @@ impl SubscribeOp {
                                 s.target_peer = next_target.clone();
                                 s
                             }),
-                            ack_received: false,
-                            speculative_paths: 0,
                         };
 
                         op_manager
@@ -1097,8 +905,6 @@ impl SubscribeOp {
                     requester_pub_key,
                     is_renewal,
                     stats,
-                    ack_received: false,
-                    speculative_paths: 0,
                 };
 
                 op_manager
@@ -1341,8 +1147,6 @@ impl Operation for SubscribeOp {
                         requester_pub_key,
                         is_renewal,
                         stats: None,
-                        ack_received: false,
-                        speculative_paths: 0,
                     },
                     source_addr,
                 })
@@ -1423,8 +1227,6 @@ impl Operation for SubscribeOp {
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
-                                    ack_received: false,
-                                    speculative_paths: 0,
                                 },
                             )));
                         }
@@ -1473,8 +1275,6 @@ impl Operation for SubscribeOp {
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
-                                    ack_received: false,
-                                    speculative_paths: 0,
                                 },
                             )));
                         }
@@ -1619,8 +1419,6 @@ impl Operation for SubscribeOp {
                                 contract_location: Location::from(instance_id),
                                 request_sent_at: Instant::now(),
                             }),
-                            ack_received: false,
-                            speculative_paths: 0,
                         }),
                         stream_data: None,
                     })
@@ -1653,8 +1451,8 @@ impl Operation for SubscribeOp {
                                 // an upstream fulfilling peer back to a downstream requester.
                                 //
                                 // Critically, we do NOT call `ring.subscribe()`,
-                                // `record_subscription()`, `announce_contract_hosted()`, or
-                                // register ourselves as having an upstream. Relays are not
+                                // `announce_contract_hosted()`, or register ourselves as
+                                // having an upstream. Relays are not
                                 // subscribers in their own right; they only mediate updates
                                 // between the upstream fulfilling node and the downstream
                                 // requester. Doing any of the above on a relay would:
@@ -1730,7 +1528,9 @@ impl Operation for SubscribeOp {
                                 contract = %format!("{:.8}", key),
                                 "SUBSCRIPTION_ACCEPTED: registered lease-based subscription"
                             );
-                            crate::node::network_status::record_subscription(format!("{key}"));
+                            // Dashboard "Subscribed Contracts" reads from the canonical lease
+                            // map via `Ring::dashboard_subscription_snapshot`; the prior
+                            // `network_status::record_subscription` mirror has been removed.
 
                             // Fetch contract if we don't have it.
                             // This is non-fatal - if it fails, we still complete the
@@ -1808,8 +1608,6 @@ impl Operation for SubscribeOp {
                                     requester_pub_key: None,
                                     is_renewal: self.is_renewal,
                                     stats: self.stats,
-                                    ack_received: false,
-                                    speculative_paths: 0,
                                 },
                             )))
                         }
@@ -1903,8 +1701,6 @@ impl Operation for SubscribeOp {
                                                 s.target_peer = next_target.clone();
                                                 s
                                             }),
-                                            ack_received: false,
-                                            speculative_paths: 0,
                                         }),
                                         stream_data: None,
                                     });
@@ -1972,8 +1768,6 @@ impl Operation for SubscribeOp {
                                                     s.target_peer = next_target.clone();
                                                     s
                                                 }),
-                                                ack_received: false,
-                                                speculative_paths: 0,
                                             }),
                                             stream_data: None,
                                         });
@@ -2071,8 +1865,6 @@ impl Operation for SubscribeOp {
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                             stats: self.stats,
-                                            ack_received: false,
-                                            speculative_paths: 0,
                                         },
                                     )))
                                 } else {
@@ -2124,8 +1916,6 @@ impl Operation for SubscribeOp {
                                             requester_pub_key: None,
                                             is_renewal: self.is_renewal,
                                             stats: self.stats,
-                                            ack_received: false,
-                                            speculative_paths: 0,
                                         },
                                     )))
                                 }
@@ -2218,19 +2008,16 @@ impl Operation for SubscribeOp {
                 }
 
                 SubscribeMsg::ForwardingAck { id, instance_id } => {
-                    // A downstream relay has acknowledged forwarding our request.
-                    // Mark the op so the GC task knows the chain is alive.
+                    // Wire variant survives as a telemetry hook (#3570 diagnostics)
+                    // after the SUBSCRIBE GC speculative-retry block was retired in
+                    // #1454 Phase 5-final. No state mutation; mirrors GET's
+                    // ForwardingAck no-op handler.
                     tracing::debug!(
                         tx = %id,
                         %instance_id,
                         "Received forwarding ACK from downstream relay"
                     );
-                    Ok(OperationResult::ContinueOp(OpEnum::Subscribe(
-                        SubscribeOp {
-                            ack_received: true,
-                            ..self
-                        },
-                    )))
+                    Ok(OperationResult::ContinueOp(OpEnum::Subscribe(self)))
                 }
             }
         })
@@ -2250,7 +2037,10 @@ mod tests;
 /// First production consumer of `OpCtx::send_and_await`.
 pub(crate) mod op_ctx_task;
 
-pub(crate) use op_ctx_task::{run_client_subscribe, start_client_subscribe};
+pub(crate) use op_ctx_task::{
+    RenewalOutcome, run_client_subscribe, run_executor_subscribe, run_renewal_subscribe,
+    start_client_subscribe,
+};
 
 mod messages {
     use std::fmt::Display;

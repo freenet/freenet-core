@@ -84,10 +84,16 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
     (`active_relay_{get,update,put,subscribe}_txs`) and the
     `Relay*InflightGuard` RAII. PUT and UPDATE streaming relays now run
     on the task-per-tx path. The deprecated UPDATE `Broadcasting` wire
-    variant remains on the legacy no-op handler (Phase 6 wire cleanup
-    removes it). SUBSCRIBE has no streaming variants but renewals, PUT
-    sub-op subscribes, executor auto-subscribe paths, `Unsubscribe`,
-    and `ForwardingAck` all stay on the legacy state machine.
+    variant has been removed (gated by a `min-compatible-version`
+    bump). SUBSCRIBE has no streaming variants. Renewals migrated to
+    `subscribe::run_renewal_subscribe` (reuses the client-initiated
+    driver with `is_renewal=true`, returns the outcome to the renewal
+    task instead of through `result_router_tx`). PUT sub-op subscribes
+    are dispatched via `subscribe::run_client_subscribe`. Executor
+    auto-subscribe migrated to `subscribe::run_executor_subscribe`
+    (returns `Result<(), OpError>` directly; bypasses the `op_request`
+    mediator). `Unsubscribe` and `ForwardingAck` still run on the
+    legacy state machine.
 ```
 
 ## Module Map

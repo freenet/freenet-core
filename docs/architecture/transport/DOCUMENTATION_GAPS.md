@@ -255,16 +255,7 @@ Max plaintext: 1463 bytes
 
 **Location:** `peer_connection.rs:243-384`
 
-### 9. Fast Channel Implementation
-
-**Implementation:**
-- 2x faster than tokio::mpsc (2.88 vs 1.33 Melem/s)
-- Hybrid crossbeam + tokio::Notify
-- Bounded channels for backpressure
-
-**Location:** `fast_channel.rs:1-314`
-
-### 10. Packet Tracking Details
+### 9. Packet Tracking Details
 
 **Implementation:**
 - SentPacketTracker with RFC 6298 RTT estimation
@@ -296,7 +287,7 @@ Max plaintext: 1463 bytes
 9. Expand README architecture diagram to show all components
 10. Add troubleshooting section with common issues
 11. Create tuning guide for different network profiles
-12. Document internal components (fast channel, packet tracking)
+12. Document internal components (packet tracking)
 
 ---
 
@@ -312,7 +303,6 @@ Max plaintext: 1463 bytes
 | BBR startup rate | 🟡 Not in docs | `config.rs:838-846` |
 | Reliability (TLP/RTO) | 🟡 Not explained | `sent_packet_tracker.rs:368-468` |
 | Keep-alive | 🟢 Minor | `peer_connection.rs:243-384` |
-| Fast channel | 🟢 Minor | `fast_channel.rs:1-314` |
 
 ---
 

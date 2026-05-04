@@ -23,7 +23,10 @@ use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::{Mutex, RwLock};
 
-pub use hosting::{AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult};
+pub use hosting::{
+    AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult,
+    SubscribedContractSnapshot,
+};
 
 use crate::message::TransactionType;
 use crate::topology::TopologyAdjustment;
@@ -1050,16 +1053,48 @@ impl Ring {
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
 
                         let instance_id = *contract_key.id();
-                        // is_renewal: true - this is a subscription renewal, skip sending state
-                        let sub_op = crate::operations::subscribe::start_op(instance_id, true);
-                        let result = crate::operations::subscribe::request_subscribe(
-                            &op_manager_clone,
-                            sub_op,
+                        // Renewal driver (#1454): same task-per-tx machinery as
+                        // client-initiated SUBSCRIBE, with delivery returned to
+                        // this task instead of routed via `result_router_tx`.
+                        // `is_renewal=true` so the responder skips sending state.
+                        //
+                        // Outer renewal-cycle timeout: cap each renewal task at
+                        // a fraction of the renewal interval so a stuck driver
+                        // (slow peer, blocked op_execution_sender) self-cancels
+                        // within one cycle instead of leaking past
+                        // `mark_subscription_pending` semantics. The driver's
+                        // per-attempt `OPERATION_TTL` (60 s) bounds individual
+                        // peer waits; this outer timeout bounds total task
+                        // lifetime. Without it, sustained slow-peer load could
+                        // accumulate background renewal tasks faster than they
+                        // complete (90+ contracts × multi-attempt ×
+                        // OPERATION_TTL on a gateway).
+                        let renewal_tx = crate::message::Transaction::new::<
+                            crate::operations::subscribe::SubscribeMsg,
+                        >();
+                        let renewal_deadline = Self::SUBSCRIPTION_RECOVERY_INTERVAL
+                            .saturating_sub(Duration::from_secs(5));
+                        let outcome_enum = match tokio::time::timeout(
+                            renewal_deadline,
+                            crate::operations::subscribe::run_renewal_subscribe(
+                                op_manager_clone.clone(),
+                                instance_id,
+                                renewal_tx,
+                            ),
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(_) => crate::operations::subscribe::RenewalOutcome::Failed {
+                                reason: format!(
+                                    "renewal task exceeded {}s cycle deadline",
+                                    renewal_deadline.as_secs()
+                                ),
+                            },
+                        };
 
-                        let (outcome, error_msg) = match &result {
-                            Ok(()) => {
+                        let (outcome, error_msg) = match outcome_enum {
+                            crate::operations::subscribe::RenewalOutcome::Success => {
                                 tracing::info!(
                                     %contract_key,
                                     "Subscription renewal succeeded"
@@ -1067,7 +1102,7 @@ impl Ring {
                                 guard.complete(true);
                                 ("success", None)
                             }
-                            Err(crate::operations::OpError::NotificationChannelError(_)) => {
+                            crate::operations::subscribe::RenewalOutcome::ChannelCongestion => {
                                 // Channel congestion is a local resource issue, not a
                                 // protocol failure. Don't penalize with backoff — just
                                 // clear the pending mark so the contract is eligible on
@@ -1079,15 +1114,14 @@ impl Ring {
                                 guard.complete(true);
                                 ("dropped_channel_full", None)
                             }
-                            Err(e) => {
+                            crate::operations::subscribe::RenewalOutcome::Failed { reason } => {
                                 tracing::debug!(
                                     %contract_key,
-                                    error = %e,
+                                    error = %reason,
                                     "Subscription renewal failed (will retry with backoff)"
                                 );
-                                let err_str = e.to_string();
                                 guard.complete(false);
-                                ("failed", Some(err_str))
+                                ("failed", Some(reason))
                             }
                         };
 
@@ -1670,6 +1704,18 @@ impl Ring {
     /// Returns: (contract, has_client_subscription, is_active_subscription, expires_at)
     pub fn get_subscription_states(&self) -> Vec<(ContractKey, bool, bool, Option<Instant>)> {
         self.hosting_manager.get_subscription_states()
+    }
+
+    /// Snapshot of every active subscription for the local-peer dashboard.
+    /// Reads directly from the canonical lease map.
+    pub fn dashboard_subscription_snapshot(&self) -> Vec<SubscribedContractSnapshot> {
+        self.hosting_manager.dashboard_subscription_snapshot()
+    }
+
+    /// Record that a state update was observed for `contract`.
+    /// No-op if the contract is not currently subscribed.
+    pub fn record_contract_update(&self, contract: &ContractKey) {
+        self.hosting_manager.record_contract_update(contract)
     }
 
     // ==================== Subscription Retry Spam Prevention ====================
@@ -3265,7 +3311,12 @@ mod deferred_swap_drop_tests {
 pub(crate) enum RingError {
     #[error(transparent)]
     ConnError(#[from] Box<node::ConnectionError>),
+    /// Retained for completeness; client_events maps it to a stable
+    /// `ClientError::EmptyRing`. Currently unconstructed since the
+    /// `request_get` legacy path that produced it was retired in the
+    /// #1454 sub-op GET migration.
     #[error("No ring connections found")]
+    #[allow(dead_code)]
     EmptyRing,
     #[error("Ran out of, or haven't found any, hosting peers for contract {0}")]
     NoHostingPeers(ContractInstanceId),

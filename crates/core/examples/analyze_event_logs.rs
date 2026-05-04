@@ -228,7 +228,20 @@ fn parse_args(args: &[String]) -> Result<Vec<(PathBuf, Option<String>)>> {
                     // Check if it's a directory containing event logs
                     if path.is_dir() {
                         let event_log = path.join("_EVENT_LOG_LOCAL");
-                        if event_log.exists() {
+                        // Accept either the legacy single-file log or any
+                        // segment-AOF file (`_EVENT_LOG_LOCAL.NNNNNN`) from
+                        // the segment-based format.
+                        let has_segments = std::fs::read_dir(&path)
+                            .map(|rd| {
+                                rd.filter_map(Result::ok).any(|entry| {
+                                    entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .starts_with("_EVENT_LOG_LOCAL.")
+                                })
+                            })
+                            .unwrap_or(false);
+                        if event_log.exists() || has_segments {
                             let label = path
                                 .file_name()
                                 .and_then(|n| n.to_str())

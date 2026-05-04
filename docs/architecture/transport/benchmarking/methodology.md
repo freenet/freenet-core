@@ -266,7 +266,6 @@ The `transport` benchmark group tests the **actual transport code** with mock so
 |-----------|-----------------|
 | `transport/connection/establish` | Full handshake: key exchange, encryption setup |
 | `transport/throughput/bytes/*` | End-to-end message throughput at different sizes |
-| `transport/fast_channel/*` | Our crossbeam-based channel vs tokio::sync::mpsc |
 
 **Using the Mock Transport Infrastructure:**
 
@@ -572,7 +571,7 @@ echo "=== Results in target/criterion/ ==="
 | Syscall overhead | `level2` | Linux bare metal | recv/send | Medium |
 | Full stack | `level3` | Controlled hardware | Everything | Low |
 
-**Key insight**: The `transport` benchmark group tests the **actual Freenet transport code** (PeerConnection, fast_channel, encryption) with mock I/O. This catches real regressions in the transport pipeline without kernel noise.
+**Key insight**: The `transport` benchmark group tests the **actual Freenet transport code** (PeerConnection, connection_handler, encryption) with mock I/O. This catches real regressions in the transport pipeline without kernel noise.
 
 To run all benchmark groups:
 ```bash

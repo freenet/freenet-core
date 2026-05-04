@@ -1,7 +1,7 @@
 //! Transport Layer Benchmarks (Blackbox) with VirtualTime
 //!
 //! These benchmarks test the actual Freenet transport code (PeerConnection,
-//! connection_handler, fast_channel, encryption) with mock sockets and VirtualTime.
+//! connection_handler, encryption) with mock sockets and VirtualTime.
 //!
 //! Uses VirtualTime for instant execution of network operations.
 //! Expected runtime: ~30 seconds (vs ~5-10 minutes with real time)

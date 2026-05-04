@@ -1229,6 +1229,43 @@ where
 
                             self.broadcast_state_change(key, incoming_state.clone())
                                 .await;
+
+                            // Notify locally-subscribed WS clients of the
+                            // new state. Without this, the very first state
+                            // install for a contract on this node never
+                            // reaches `register_contract_notifier` consumers
+                            // — only the merge path at the end of this
+                            // function calls `commit_state_update`, which
+                            // is the only other site that fans out to the
+                            // local notifier map. ResyncResponse-driven
+                            // applies hit this branch when the state_store
+                            // entry is missing, so subscribers would miss
+                            // every cross-node delivery that recovers via
+                            // resync.
+                            tracing::info!(
+                                contract = %key,
+                                new_size_bytes = incoming_state.as_ref().len(),
+                                phase = "update_complete",
+                                event = "initial_state_installed",
+                                "Contract initial state installed"
+                            );
+                            // Dashboard "last updated" telemetry; no-op if
+                            // we're not subscribed to this contract.
+                            if let Some(op_manager) = &self.op_manager {
+                                op_manager.ring.record_contract_update(&key);
+                            }
+                            if let Err(err) = self
+                                .send_update_notification(&key, &params, &incoming_state)
+                                .await
+                            {
+                                tracing::error!(
+                                    contract = %key,
+                                    error = %err,
+                                    phase = "notification_failed",
+                                    "Failed to send initial-state notification"
+                                );
+                            }
+
                             return Ok(UpsertResult::Updated(incoming_state));
                         }
                     }
@@ -1301,13 +1338,132 @@ where
             .await
         {
             Ok(Either::Left(s)) => s,
-            Ok(Either::Right(mut r)) => {
-                let Some(c) = r.pop() else {
-                    return Err(ExecutorError::internal_error());
-                };
-                return Err(ExecutorError::request(StdContractError::MissingRelated {
-                    key: c.contract_instance_id,
-                }));
+            Ok(Either::Right(missing_related)) => {
+                // Contract's `update_state` returned `UpdateModification::requires(...)`,
+                // listing related contracts it needs to apply the delta. Try to
+                // fetch each one (local first, then network when op_manager is
+                // wired) and re-attempt the update with the fetched states
+                // surfaced as `UpdateData::RelatedState` entries — the same
+                // pattern the validate-side `fetch_related_for_validation`
+                // helper uses. Without this, every cross-node UPDATE that
+                // references a related contract not yet cached locally would
+                // fail with `MissingRelated` even though we could resolve it.
+                //
+                // Apply the same abuse-prevention guards the validate-side
+                // path enforces (see `contracts.md` Abuse prevention):
+                //   * Reject empty list (a contract MUST signal Valid via
+                //     a populated state, not an empty `requires`).
+                //   * Reject self-reference (no contract may ask for its
+                //     own state through this path).
+                //   * Cap at MAX_RELATED_CONTRACTS_PER_REQUEST so a
+                //     misbehaving contract can't fan out 50 network GETs.
+                //   * Dedup IDs so repeated declarations don't multiply
+                //     the fetch count.
+                if missing_related.is_empty() {
+                    tracing::warn!(
+                        contract = %key,
+                        "update_state returned requires() with empty list"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Update {
+                        key,
+                        cause: "contract requested related contracts but provided empty list"
+                            .into(),
+                    }));
+                }
+                let self_id = key.id();
+                if missing_related
+                    .iter()
+                    .any(|c| &c.contract_instance_id == self_id)
+                {
+                    tracing::warn!(
+                        contract = %key,
+                        "update_state requires() included self-reference"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Update {
+                        key,
+                        cause: "contract cannot request itself as a related contract".into(),
+                    }));
+                }
+                let unique_ids: HashSet<ContractInstanceId> = missing_related
+                    .iter()
+                    .map(|c| c.contract_instance_id)
+                    .collect();
+                if unique_ids.len() > MAX_RELATED_CONTRACTS_PER_REQUEST {
+                    tracing::warn!(
+                        contract = %key,
+                        requested = unique_ids.len(),
+                        limit = MAX_RELATED_CONTRACTS_PER_REQUEST,
+                        "update_state requires() exceeded MAX_RELATED_CONTRACTS_PER_REQUEST"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Update {
+                        key,
+                        cause: format!(
+                            "contract requested {} related contracts, limit is {}",
+                            unique_ids.len(),
+                            MAX_RELATED_CONTRACTS_PER_REQUEST
+                        )
+                        .into(),
+                    }));
+                }
+
+                let mut fetched_updates = updates.clone();
+                let mut failed_id: Option<ContractInstanceId> = None;
+                for id in &unique_ids {
+                    let mut got: Option<State<'static>> = None;
+                    if let Some(full_key) = self.bridged_lookup_key(id) {
+                        if let Ok(state) = self.state_store.get(&full_key).await {
+                            got = Some(State::from(state.as_ref().to_vec()));
+                        }
+                    }
+                    if got.is_none() {
+                        match fetch_related_via_network(self.op_manager.as_ref(), id).await {
+                            Ok(state) => got = Some(State::from(state.as_ref().to_vec())),
+                            Err(err) => {
+                                tracing::warn!(
+                                    contract = %key,
+                                    related_id = %id,
+                                    error = %err,
+                                    "Failed to fetch related contract for update_state requires()"
+                                );
+                                failed_id = Some(*id);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(state) = got {
+                        fetched_updates.push(UpdateData::RelatedState {
+                            related_to: *id,
+                            state,
+                        });
+                    }
+                }
+                if let Some(id) = failed_id {
+                    return Err(ExecutorError::request(StdContractError::MissingRelated {
+                        key: id,
+                    }));
+                }
+                match self
+                    .attempt_state_update(&params, &current_state, &key, &fetched_updates)
+                    .await
+                {
+                    Ok(Either::Left(s)) => s,
+                    Ok(Either::Right(mut r)) => {
+                        // Contract still demanding more after one round → reject
+                        // (depth limit, matching the validate-side behavior).
+                        let Some(c) = r.pop() else {
+                            return Err(ExecutorError::internal_error());
+                        };
+                        tracing::warn!(
+                            contract = %key,
+                            related_id = %c.contract_instance_id,
+                            "update_state still requires() after first fetch round (depth>1 not supported)"
+                        );
+                        return Err(ExecutorError::request(StdContractError::MissingRelated {
+                            key: c.contract_instance_id,
+                        }));
+                    }
+                    Err(retry_err) => return Err(retry_err),
+                }
             }
             Err(merge_err) => {
                 // Merge failed. If we have a validated full incoming state, try to recover
@@ -1764,8 +1920,12 @@ where
             "Contract state updated"
         );
 
-        // Record update timestamp for dashboard display
-        crate::node::network_status::record_contract_updated(&format!("{key}"));
+        // Record update timestamp for dashboard display. No-op if we're
+        // not subscribed (e.g., a relay forwarding an UPDATE for a
+        // contract this peer doesn't track).
+        if let Some(op_manager) = &self.op_manager {
+            op_manager.ring.record_contract_update(key);
+        }
 
         if let Err(err) = self
             .send_update_notification(key, parameters, new_state)
@@ -1953,23 +2113,30 @@ where
             "Fetching related contracts for validation"
         );
 
-        // Fetch each related contract locally with overall timeout.
-        // Local lookup via lookup_key + state_store.get() is available on all executor
-        // types (Runtime, MockWasmRuntime). Network fetch is only available on
-        // Executor<Runtime> and happens automatically via GET auto-subscribe when
-        // the contract isn't found locally.
+        // Fetch each related contract: try local state_store first, escalate
+        // to network GET when the executor has an `op_manager` attached. The
+        // previous version was local-only, which silently failed cross-node
+        // UPDATE flows where the validating node was a fresh receiver that
+        // hadn't yet cached the related contract (see freenet/mail#80 — the
+        // recipient's inbox UPDATE always carried `RequestRelated` for the
+        // sender's AFT record, which the receiver hadn't seen before).
         let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
             HashMap::with_capacity(unique_ids.len());
 
         let fetch_all = async {
             for id in &unique_ids {
-                let full_key = self.bridged_lookup_key(id).ok_or_else(|| {
-                    ExecutorError::request(StdContractError::MissingRelated { key: *id })
-                })?;
-                let state = self.state_store.get(&full_key).await.map_err(|_| {
-                    ExecutorError::request(StdContractError::MissingRelated { key: *id })
-                })?;
-                related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                if let Some(full_key) = self.bridged_lookup_key(id) {
+                    if let Ok(state) = self.state_store.get(&full_key).await {
+                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                        continue;
+                    }
+                }
+                // Local lookup miss → escalate via the network-fallback
+                // helper (factored out so the per-id branch logic is
+                // testable with a stubbed fetcher). Mock executors that
+                // lack an `op_manager` get the legacy MissingRelated.
+                let fetched = fetch_related_via_network(self.op_manager.as_ref(), id).await?;
+                related_map.insert(*id, Some(State::from(fetched.as_ref().to_vec())));
             }
             Ok::<(), ExecutorError>(())
         };
@@ -3363,12 +3530,15 @@ impl Executor<Runtime> {
 }
 
 impl Executor<Runtime> {
-    /// Network-aware version of `fetch_related_for_validation`.
+    /// Network-aware variant retained for the PUT path.
     ///
-    /// Uses `local_state_or_from_network` to fetch related contracts, allowing
-    /// first-time publishes that depend on contracts not yet stored locally.
-    /// The base `fetch_related_for_validation` on the bridged impl only does
-    /// local lookups.
+    /// The base `fetch_related_for_validation` on the bridged impl now also
+    /// escalates to network GET via `op_manager` when the local state_store
+    /// lookup misses, so the two implementations are functionally equivalent
+    /// for `Executor<Runtime>`. This variant is kept because it exposes the
+    /// `local_state_or_from_network` helper directly and several PUT call
+    /// sites already wire through it; collapsing the two would touch more
+    /// surface area than the bug fix needs.
     async fn fetch_related_for_validation_network(
         &mut self,
         key: &ContractKey,
@@ -3478,11 +3648,42 @@ impl Executor<Runtime> {
         if self.mode == OperationMode::Local {
             return Ok(());
         }
-        let request = SubscribeContract {
-            instance_id: *key.id(),
-        };
-        let _sub: operations::subscribe::SubscribeResult = self.op_request(request).await?;
-        Ok(())
+        // Bypass the legacy `op_request` mediator path entirely (#1454
+        // SUBSCRIBE executor migration): driver delivers the resolved
+        // outcome directly through its return value. The executor was
+        // the last legacy writer into `ops.subscribe` for client-style
+        // SUBSCRIBE — once this migrates, the SUBSCRIBE GC retry block
+        // becomes provably dead (mirrors GET phase 5-final pattern).
+        let op_manager = self
+            .op_manager
+            .as_ref()
+            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("missing op_manager")))?;
+        let executor_tx = crate::message::Transaction::new::<operations::subscribe::SubscribeMsg>();
+        // 120 s mirrors the legacy `op_request` `OP_REQUEST_TIMEOUT`
+        // (`crates/core/src/contract/executor.rs`, deleted in this
+        // migration). Caps total task lifetime — the inner driver's
+        // per-attempt `OPERATION_TTL = 60 s` would otherwise allow
+        // multi-attempt waits to compound. Any change here should be
+        // checked against the per-attempt budget so `MAX_RETRIES`
+        // attempts can complete within the deadline.
+        const SUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        match tokio::time::timeout(
+            SUBSCRIBE_TIMEOUT,
+            operations::subscribe::run_executor_subscribe(
+                op_manager.clone(),
+                *key.id(),
+                executor_tx,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(ExecutorError::other(anyhow::anyhow!("{err}"))),
+            Err(_) => Err(ExecutorError::other(anyhow::anyhow!(
+                "executor subscribe timed out after {}s",
+                SUBSCRIBE_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     #[inline]
@@ -3497,14 +3698,114 @@ impl Executor<Runtime> {
                 return Ok(Either::Left(state));
             }
         }
-        // Fetch from network
-        let request: GetContract = GetContract {
-            instance_id: *id,
-            return_contract_code,
-        };
-        let get_result: operations::get::GetResult = self.op_request(request).await?;
-        Ok(Either::Right(get_result))
+        // Fetch from network via the task-per-tx sub-op GET driver.
+        // Bypasses the legacy `op_request` mediator path entirely
+        // (issue #1454 phase 5 follow-up): driver delivers the
+        // resolved `GetResult` directly through a oneshot.
+        let op_manager = self
+            .op_manager
+            .as_ref()
+            .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("missing op_manager")))?;
+        let (_tx, rx) =
+            operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, return_contract_code);
+        // Matches the legacy `op_request` envelope. Outer callers may
+        // wrap this with a tighter budget (e.g.,
+        // `fetch_related_for_validation_network` uses
+        // `RELATED_FETCH_TIMEOUT = 10s`); when that fires first the
+        // receiver is dropped silently and the spawned sub-op task
+        // continues until OPERATION_TTL exhausts the retry loop. No
+        // leak (oneshot send-after-drop is graceful) — just a
+        // longer-lived background task.
+        const OP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+        let outcome = tokio::time::timeout(OP_REQUEST_TIMEOUT, rx)
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    contract = %id,
+                    "sub-op GET timed out at executor"
+                );
+                ExecutorError::other(anyhow::anyhow!("sub-op GET timed out"))
+            })?
+            .map_err(|_| ExecutorError::other(anyhow::anyhow!("sub-op GET task dropped")))?;
+        match outcome {
+            operations::get::op_ctx_task::SubOpGetOutcome::Found(get_result) => {
+                Ok(Either::Right(get_result))
+            }
+            operations::get::op_ctx_task::SubOpGetOutcome::NotFound(cause) => {
+                Err(ExecutorError::other(anyhow::anyhow!(cause)))
+            }
+            operations::get::op_ctx_task::SubOpGetOutcome::Infra(err) => {
+                Err(ExecutorError::other(err))
+            }
+        }
     }
+}
+
+/// Network-escalation half of the bridged `fetch_related_for_validation`
+/// loop, factored out so the dispatch logic is unit-testable with a
+/// stubbed fetcher. Production callers pass the executor's own
+/// `op_manager`; tests in this module override [`TEST_NETWORK_FETCH_OVERRIDE`]
+/// (a thread-local) to redirect the network call to a stub instead of
+/// driving a real network sub-op.
+///
+/// Behavior:
+/// - `op_manager.is_none()` → return `MissingRelated`. This preserves the
+///   legacy local-only outcome for mock executors and unit tests that
+///   never wire up a real op_manager.
+/// - `op_manager.is_some()` → drive a sub-op GET via
+///   `start_sub_op_get`. `Found` resolves to the fetched state;
+///   `NotFound`/`Infra` map back to `MissingRelated`.
+async fn fetch_related_via_network(
+    op_manager: Option<&Arc<crate::node::OpManager>>,
+    id: &ContractInstanceId,
+) -> Result<WrappedState, ExecutorError> {
+    #[cfg(test)]
+    {
+        if let Some(stub) = TEST_NETWORK_FETCH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+            return stub(*id);
+        }
+    }
+    let Some(op_manager) = op_manager else {
+        return Err(ExecutorError::request(StdContractError::MissingRelated {
+            key: *id,
+        }));
+    };
+    // `_tx` is named for clarity; not a drop guard. `Transaction` is
+    // `Copy` so the binding has no lifetime effect today.
+    let (_tx, rx) = crate::operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, false);
+    let outcome = rx
+        .await
+        .map_err(|_| ExecutorError::other(anyhow::anyhow!("sub-op GET task dropped")))?;
+    match outcome {
+        crate::operations::get::op_ctx_task::SubOpGetOutcome::Found(get_result) => {
+            Ok(WrappedState::from(get_result.state.as_ref().to_vec()))
+        }
+        crate::operations::get::op_ctx_task::SubOpGetOutcome::NotFound(_)
+        | crate::operations::get::op_ctx_task::SubOpGetOutcome::Infra(_) => {
+            Err(ExecutorError::request(StdContractError::MissingRelated {
+                key: *id,
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) type NetworkFetchStub =
+    std::rc::Rc<dyn Fn(ContractInstanceId) -> Result<WrappedState, ExecutorError>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook used by `fetch_related_via_network` to bypass the real
+    /// network sub-op driver. Set with [`set_test_network_fetch_override`]
+    /// inside a `#[tokio::test(flavor = "current_thread")]` so the
+    /// thread-local lookup hits the same task that ran the test setup.
+    static TEST_NETWORK_FETCH_OVERRIDE: std::cell::RefCell<Option<NetworkFetchStub>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_network_fetch_override(stub: Option<NetworkFetchStub>) {
+    TEST_NETWORK_FETCH_OVERRIDE.with(|cell| *cell.borrow_mut() = stub);
 }
 
 /// Resolve a [`MessageOrigin`] for a delegate `ApplicationMessages` request,
@@ -3623,5 +3924,95 @@ mod resolve_message_origin_tests {
             Some(MessageOrigin::Delegate(k)) => assert_eq!(k, caller),
             other => panic!("Expected Delegate(caller), got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod sub_op_get_migration_pin_tests {
+    /// Pin: `local_state_or_from_network` MUST use the task-per-tx
+    /// sub-op GET driver, not the legacy `op_request(GetContract)`
+    /// path. Regression: legacy path went through the executor
+    /// mediator + `request_get`, pushing GetOp into ops.get and
+    /// keeping the GC speculative-retry block alive for sub-op GETs.
+    /// Migrated in #1454 phase 5 follow-up.
+    #[test]
+    fn local_state_or_from_network_uses_sub_op_driver() {
+        let src = include_str!("runtime.rs");
+        let body = src
+            .split("async fn local_state_or_from_network(")
+            .nth(1)
+            .expect("local_state_or_from_network must exist")
+            .split(
+                "
+    }",
+            )
+            .next()
+            .expect("closing brace");
+        assert!(
+            body.contains("start_sub_op_get"),
+            "local_state_or_from_network must call start_sub_op_get — \
+             sub-op GET migration in #1454 phase 5 follow-up"
+        );
+        // Compose the needles at runtime so the assertion source itself
+        // doesn't trip the pin (matches the pattern used in put.rs).
+        let get_contract_needle = ["Get", "Contract", " {"].concat();
+        assert!(
+            !body.contains(&get_contract_needle),
+            "local_state_or_from_network must NOT construct legacy \
+             GetContract — retired in #1454 sub-op GET migration"
+        );
+        let op_request_needle = ["self.", "op_request"].concat();
+        assert!(
+            !body.contains(&op_request_needle),
+            "local_state_or_from_network must NOT call self.op_request — \
+             sub-op GET migration bypasses the legacy mediator path"
+        );
+    }
+
+    /// Pin: `executor::subscribe` MUST use the task-per-tx executor
+    /// SUBSCRIBE driver, not the legacy `op_request(SubscribeContract)`
+    /// path. Regression: legacy path went through the executor mediator
+    /// and called `request_subscribe`, pushing `SubscribeOp` into
+    /// `ops.subscribe` and keeping the SUBSCRIBE GC retry block alive
+    /// for the executor auto-subscribe writer.
+    ///
+    /// Migrated in #1454 SUBSCRIBE executor migration (mirrors the
+    /// GET phase 5-final pattern). The next slice retires the
+    /// SUBSCRIBE GC retry block once relay-side intermediate-peer
+    /// writers are also migrated.
+    #[test]
+    fn executor_subscribe_uses_run_executor_subscribe() {
+        let src = include_str!("runtime.rs");
+        let body = src
+            .split("async fn subscribe(&mut self, key: ContractKey)")
+            .nth(1)
+            .expect("executor::subscribe must exist")
+            .split(
+                "
+    }",
+            )
+            .next()
+            .expect("closing brace");
+        assert!(
+            body.contains("run_executor_subscribe"),
+            "executor::subscribe must call run_executor_subscribe — \
+             SUBSCRIBE executor migration (#1454)"
+        );
+        // Compose the needle at runtime so the assertion source itself
+        // doesn't trip the pin.
+        let sub_contract_needle = ["Subscribe", "Contract", " {"].concat();
+        assert!(
+            !body.contains(&sub_contract_needle),
+            "executor::subscribe must NOT construct legacy \
+             SubscribeContract — retired in #1454 SUBSCRIBE executor \
+             migration"
+        );
+        let op_request_needle = ["self.", "op_request"].concat();
+        assert!(
+            !body.contains(&op_request_needle),
+            "executor::subscribe must NOT call self.op_request — \
+             SUBSCRIBE executor migration bypasses the legacy mediator \
+             path"
+        );
     }
 }

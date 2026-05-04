@@ -22,6 +22,38 @@ stalling the entire event loop. This has caused 4+ production deadlocks:
   the event loop exceeded bridge channel capacity, deadlocking the node.
 - **Result router chain**: `result_router_tx.send().await` in the event loop
   could cascade if `SessionActor` was slow → router blocked → event loop blocked.
+- **Listener forwarding family** (#3959 → #3960 → #3961, Apr 2026):
+  the UDP listener task in `transport::connection_handler` calls
+  `try_send_*` synchronously to route every inbound packet to the right
+  per-peer channel. The original `fast_channel` wrapper used
+  `crossbeam::channel`, whose internal `Backoff::snooze` could spin in
+  `sched_yield` indefinitely on a wedged slot — taking the entire node
+  offline (#3959). #3960 replaced it with `tokio::sync::mpsc` so
+  `try_send` is guaranteed non-blocking. #3961 closed the remaining
+  `.send().await` site on the listener path (`send_nat_traversal`).
+  The recv-loop forwarding from `PeerConnection::recv` into the
+  per-stream `inbound_streams` channel was investigated and *kept* as
+  `.send().await`: the receiver there is the freenet-spawned
+  `recv_stream` reassembly task, internal and same-runtime, so the
+  cascading-backpressure pattern this rule prevents cannot form.
+
+## Exception: same-runtime internal consumers
+
+`.send().await` on a bounded channel is acceptable when **all** of the
+following hold:
+
+1. The receiver task is freenet-internal (we spawned it; it is not an
+   external client or peer).
+2. The consumer has no upstream dependency on the producer (no cycle
+   through which a stalled producer could starve its own consumer).
+3. Blocking is scoped to a single per-peer or per-connection event loop
+   (so it cannot starve other peers).
+4. Per-message consumer work is bounded and small (microseconds, not
+   "I might call into a slow external API").
+
+Document the exception inline at the call site, citing this section.
+Existing exception: `peer_connection.rs::process_inbound` legacy stream
+fragment forwarding into `inbound_streams[stream_id]`.
 
 ## Rules
 

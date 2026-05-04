@@ -1328,8 +1328,6 @@ where
                 // streaming variants (RequestUpdateStreaming /
                 // BroadcastToStreaming) through task-per-tx drivers
                 // under the same source_addr + !has_update_op gates.
-                // The deprecated Broadcasting wire variant stays on
-                // the legacy path (no-op handler).
                 if let Some(sender_addr) = source_addr {
                     #[allow(clippy::wildcard_enum_match_arm)]
                     match op {
@@ -1439,11 +1437,9 @@ where
                             }
                             return Ok(None);
                         }
-                        // Deprecated `Broadcasting` variant stays legacy
-                        // (no-op handler). Pre-registered UpdateOps
-                        // (has_update_op == true) also fall through to
-                        // legacy for GC / originator-loopback paths.
-                        // Wildcard arm exists ONLY to satisfy
+                        // Pre-registered UpdateOps (has_update_op == true)
+                        // fall through to legacy for GC / originator-loopback
+                        // paths. Wildcard arm exists ONLY to satisfy
                         // non-exhaustive matches; do not expand.
                         _ => {}
                     }
@@ -1541,12 +1537,23 @@ where
                 // `SubscribeMsg::Response` bypass above handles the
                 // originator reply.
                 //
-                // Existing SubscribeOp means a renewal, PUT sub-op, or
-                // GC-spawned retry already registered state in the
-                // DashMap — those paths must stay on legacy.
+                // Existing SubscribeOp means a PUT sub-op, executor
+                // auto-subscribe, or GC-spawned retry already registered
+                // state in the DashMap — those paths must stay on legacy.
                 //
                 // ForwardingAck / Unsubscribe never match the Request
                 // arm so they flow to legacy naturally.
+                //
+                // Renewals were previously routed to legacy here so the
+                // relay would emit `SubscribeMsg::ForwardingAck` back to
+                // the renewal originator (the originator's GC retry
+                // selector relied on `ack_received` for retry-base
+                // selection). The renewal originator now runs on the
+                // same task-per-tx driver as client-initiated subscribe
+                // (#1454 SUBSCRIBE renewal migration), so the relay no
+                // longer needs to emit `ForwardingAck`. The `is_renewal`
+                // flag is still propagated so the responder knows
+                // whether to skip sending state.
                 if let subscribe::SubscribeMsg::Request {
                     id,
                     instance_id,
@@ -1555,53 +1562,27 @@ where
                     is_renewal,
                 } = op
                 {
-                    // Renewals (`is_renewal=true`) fall through to legacy
-                    // so the relay still emits `SubscribeMsg::ForwardingAck`
-                    // back to the renewal originator. The
-                    // `ring.rs::connection_maintenance` renewal loop
-                    // registers a `SubscribeOp` locally, and its GC retry
-                    // selector at `op_state_manager.rs:2094` uses
-                    // `ack_received` to pick the retry base — without the
-                    // ack the originator retries on `ACK_TIMEOUT*(n+1)`
-                    // instead of `PROGRESS_TIMEOUT + ACK_TIMEOUT*n`,
-                    // which over the ~2 min renewal cycle compounds into
-                    // the #3763 subscription-storm feedback loop.
-                    // Driver-side ack emission would race the reply on
-                    // the upstream's capacity-1 `pending_op_results` slot
-                    // for task-per-tx originators, so slice A keeps
-                    // renewals on legacy.
-                    //
-                    // Non-renewal SUBSCRIBEs come from: (a) the Phase 2b
-                    // client-init driver, which uses `pending_op_results`
-                    // and would classify a `ForwardingAck` as
-                    // `ReplyClass::Unexpected` anyway; (b) PUT sub-op
-                    // subscribes and parent-op child subscribes —
-                    // one-shot paths with bounded `MAX_RETRIES` so the
-                    // ACK-timer shortening is an accepted slice-A
-                    // amplification ceiling.
-                    if !*is_renewal {
-                        if let Some(upstream_addr) = source_addr {
-                            if !op_manager.has_subscribe_op(id) {
-                                if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
-                                    op_manager.clone(),
-                                    *id,
-                                    *instance_id,
-                                    *htl,
-                                    visited.clone(),
-                                    *is_renewal,
-                                    upstream_addr,
-                                )
-                                .await
-                                {
-                                    tracing::error!(
-                                        tx = %id,
-                                        %instance_id,
-                                        error = %err,
-                                        "SUBSCRIBE relay dispatch: start_relay_subscribe failed"
-                                    );
-                                }
-                                return Ok(None);
+                    if let Some(upstream_addr) = source_addr {
+                        if !op_manager.has_subscribe_op(id) {
+                            if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
+                                op_manager.clone(),
+                                *id,
+                                *instance_id,
+                                *htl,
+                                visited.clone(),
+                                *is_renewal,
+                                upstream_addr,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    %instance_id,
+                                    error = %err,
+                                    "SUBSCRIBE relay dispatch: start_relay_subscribe failed"
+                                );
                             }
+                            return Ok(None);
                         }
                     }
                 }
@@ -2452,19 +2433,28 @@ pub async fn subscribe(
 /// [`crate::operations::subscribe::start_client_subscribe`] rather than going
 /// through the legacy `request_subscribe` + `handle_op_result` re-entry loop.
 ///
-/// The renewal-initiated path (`ring::connection_maintenance`), the PUT
-/// sub-op path (`operations::start_subscription_request_internal`), and the
-/// executor/WASM-initiated path (`contract::executor::SubscribeContract::resume_op`)
-/// all call `subscribe::request_subscribe` directly and bypass this function,
-/// so they continue on the legacy path unchanged.
+/// The executor/WASM-initiated path (`executor::subscribe`) now goes
+/// through the task-per-tx executor driver
+/// (`subscribe::run_executor_subscribe`) — same retry loop as
+/// client-initiated subscribe, with the outcome returned to the
+/// executor as `Result<(), OpError>` rather than published via
+/// `result_router_tx` (the executor is an internal caller with no
+/// client waiter). Bypasses the `op_request` mediator entirely
+/// (mirrors `local_state_or_from_network` for GET).
 ///
-/// The legacy `is_renewal` parameter has been removed in Phase 2b: no live
-/// caller passes `true`, and the task-per-tx path does not carry renewal
-/// jitter / spam-prevention semantics (those are owned by
-/// `ring::connection_maintenance` and are load-bearing there). Accepting
-/// `is_renewal=true` here would silently route a renewal through the wrong
-/// code path — removing the parameter makes the misuse a compile error
-/// instead of a runtime footgun (review finding L1).
+/// The renewal-initiated path (`ring::connection_maintenance`) now goes
+/// through the task-per-tx renewal driver (`subscribe::run_renewal_subscribe`)
+/// — same retry loop as client-initiated subscribe, with the outcome
+/// returned to the renewal task for backoff bookkeeping rather than
+/// published via `result_router_tx`. Renewal jitter and spam-prevention
+/// remain owned by `ring::connection_maintenance` (above this layer).
+///
+/// PUT/GET sub-op fallback paths (`operations::start_subscription_request`,
+/// `maybe_subscribe_child`) route through `subscribe::run_client_subscribe`,
+/// which is hard-wired to `is_renewal=false`. Misrouting a renewal through
+/// any of those is a compile error: `start_client_subscribe` /
+/// `run_client_subscribe` no longer accept `is_renewal` — only
+/// `subscribe::run_renewal_subscribe` does.
 ///
 /// # Parameters
 ///
@@ -2505,6 +2495,13 @@ pub async fn subscribe_with_id(
     // Task-per-tx: spawn the driver and return the client-visible tx
     // immediately. The spawned task owns retries, peer selection, local
     // completion, and result delivery via `result_router_tx`.
+    //
+    // Renewals do NOT come through here. `ring::connection_maintenance`
+    // calls `subscribe::run_renewal_subscribe` directly — same task-per-tx
+    // machinery (`drive_client_subscribe_inner`) with `is_renewal=true`
+    // and a custom delivery path that returns `RenewalOutcome` to the
+    // renewal task instead of publishing through `result_router_tx`
+    // (renewals have no client waiter to publish to).
     subscribe::start_client_subscribe(op_manager, instance_id, client_tx).await
 }
 
@@ -3930,11 +3927,9 @@ mod tests {
         }
 
         /// Slice C (#1454 phase 5): streaming relay UPDATE variants
-        /// are now dispatched through task-per-tx drivers. The
-        /// deprecated `Broadcasting` wire variant stays on the legacy
-        /// no-op path.
+        /// are dispatched through task-per-tx drivers.
         #[test]
-        fn update_branch_dispatches_streaming_drivers_but_not_broadcasting() {
+        fn update_branch_dispatches_streaming_drivers() {
             const SOURCE: &str = include_str!("node.rs");
 
             let anchor = "NetMessageV1::Update(ref op) => {";
@@ -3954,11 +3949,6 @@ mod tests {
                 window.contains("start_relay_broadcast_to_streaming("),
                 "UPDATE branch must call start_relay_broadcast_to_streaming \
                  for streaming relay dispatch (slice C)."
-            );
-            assert!(
-                !window.contains("UpdateMsg::Broadcasting {"),
-                "UPDATE branch must not dispatch the deprecated Broadcasting \
-                 variant — it stays on the legacy no-op handler."
             );
         }
 
@@ -4165,7 +4155,7 @@ mod tests {
         }
 
         #[test]
-        fn subscribe_branch_falls_through_on_renewal() {
+        fn subscribe_branch_dispatches_renewals_through_driver() {
             const SOURCE: &str = include_str!("node.rs");
             let anchor = "NetMessageV1::Subscribe(ref op) => {";
             let branch_start = SOURCE.find(anchor).expect("SUBSCRIBE branch not found");
@@ -4174,16 +4164,53 @@ mod tests {
                 .expect("SUBSCRIBE branch no longer calls handle_op_request")
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
-            // Renewals MUST stay on legacy — the renewal originator's GC
-            // retry selector uses `ack_received` and the driver does not
-            // emit `SubscribeMsg::ForwardingAck`. Falling through to
-            // legacy keeps the ack emission alive for renewals.
+            // Strip line comments so doc strings that mention the absent
+            // `if !*is_renewal` text as a negative constraint do not
+            // trip the substring scan.
+            let stripped: String = window
+                .lines()
+                .map(|line| match line.find("//") {
+                    Some(idx) => &line[..idx],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // After SUBSCRIBE renewal migration, renewals MUST flow through
+            // `start_relay_subscribe` like non-renewal Requests. The
+            // `is_renewal` flag is propagated to the responder (so it
+            // skips sending state) but the dispatch gate no longer
+            // discriminates on it. Reintroducing `if !*is_renewal {` (or
+            // any equivalent shape — `match is_renewal { true => ... }`,
+            // `if *is_renewal { return ...; }`, etc.) would silently
+            // route renewals back through the legacy state machine and
+            // reopen the asymmetry the migration resolved.
             assert!(
-                window.contains("if !*is_renewal"),
-                "SUBSCRIBE relay dispatch must skip `is_renewal=true` \
-                 requests so renewals still receive `ForwardingAck` from \
-                 the relay. Dropping the ack on the ~2 min renewal cycle \
-                 reopens the #3763 subscription-storm feedback loop."
+                !stripped.contains("if !*is_renewal"),
+                "SUBSCRIBE relay dispatch must NOT special-case `is_renewal` — \
+                 renewals run on the same task-per-tx driver as client-initiated \
+                 SUBSCRIBE after the renewal migration."
+            );
+            assert!(
+                !stripped.contains("if *is_renewal"),
+                "SUBSCRIBE relay dispatch must NOT special-case `is_renewal` — \
+                 (inverted-form check)."
+            );
+            assert!(
+                !stripped.contains("match is_renewal"),
+                "SUBSCRIBE relay dispatch must NOT match on `is_renewal` to \
+                 fork dispatch — every Request goes through start_relay_subscribe."
+            );
+
+            // Positive assertion: the dispatch site MUST contain the
+            // start_relay_subscribe call. Without this, a refactor that
+            // removes the call and falls through to legacy for ALL
+            // requests would still pass the negative assertions above.
+            assert!(
+                stripped.contains("subscribe::op_ctx_task::start_relay_subscribe("),
+                "SUBSCRIBE relay dispatch must call \
+                 `subscribe::op_ctx_task::start_relay_subscribe` for fresh \
+                 inbound Requests (renewal and non-renewal alike)."
             );
         }
 

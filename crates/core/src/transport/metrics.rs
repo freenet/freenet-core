@@ -58,7 +58,10 @@ pub struct TransportMetrics {
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
 
-    // Cumulative counters (never reset — used by the local dashboard)
+    // Cumulative wire-byte counters (never reset, used by the local dashboard).
+    // Updated at the UDP socket layer for every packet, so they reflect all
+    // traffic including keep-alives, ACKs, NAT-traversal, and small control
+    // messages — not just stream transfer payloads.
     cumulative_bytes_sent: AtomicU64,
     cumulative_bytes_received: AtomicU64,
 
@@ -77,7 +80,8 @@ pub struct TransportMetrics {
     // Slowdowns during period
     slowdowns_triggered: AtomicU32,
 
-    // Per-peer transfer stats (bounded to MAX_TRACKED_PEERS entries)
+    // Per-peer wire-byte stats (bounded to MAX_TRACKED_PEERS entries).
+    // Updated at the UDP socket layer alongside the cumulative counters above.
     per_peer_stats: DashMap<SocketAddr, PeerTransferStats>,
 
     // RTT tracking (in microseconds for precision)
@@ -146,12 +150,12 @@ impl TransportMetrics {
                 Some(v.saturating_add(1))
             })
             .ok();
+        // Note: `bytes_sent` here aggregates stream-transfer payload sizes for
+        // the periodic telemetry snapshot. Wire-byte counters
+        // (`cumulative_bytes_sent`, per-peer `bytes_sent`) are updated at the
+        // socket layer in `record_packet_sent` and intentionally not touched
+        // here.
         self.bytes_sent
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_add(stats.bytes_transferred))
-            })
-            .ok();
-        self.cumulative_bytes_sent
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_add(stats.bytes_transferred))
             })
@@ -197,11 +201,6 @@ impl TransportMetrics {
         if rtt_us > 0 {
             self.record_rtt_sample(rtt_us);
         }
-
-        // Per-peer tracking (skip if at capacity and peer is new)
-        self.record_per_peer(stats.remote_addr, stats.bytes_transferred, |s| {
-            &s.bytes_sent
-        });
     }
 
     /// Record a cwnd sample (called periodically or on transfer completion).
@@ -266,8 +265,39 @@ impl TransportMetrics {
     }
 
     /// Record a completed inbound stream transfer.
-    pub fn record_inbound_completed(&self, remote_addr: SocketAddr, bytes: u64) {
+    ///
+    /// Aggregates stream-payload bytes into the per-snapshot `bytes_received`
+    /// counter, which pairs with `transfers_completed` for periodic telemetry.
+    /// Wire-byte counters (`cumulative_bytes_received`, per-peer
+    /// `bytes_received`) are owned by [`Self::record_packet_received`] at the
+    /// socket layer.
+    pub fn record_inbound_completed(&self, bytes: u64) {
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record an outbound UDP packet at the socket layer.
+    ///
+    /// Updates the cumulative dashboard counter and the per-peer counter so
+    /// keep-alives, ACKs, and other small control messages all show up on the
+    /// local dashboard, not just large stream transfers.
+    ///
+    /// `remote_addr` MUST be the canonical (un-mapped) form used elsewhere in
+    /// the system — the same form `recv_from` returns after
+    /// `normalize_mapped_addr`. Mismatched callers (e.g. passing a
+    /// `::ffff:x.x.x.x` mapped target on a dual-stack socket) would create a
+    /// duplicate per-peer entry that the dashboard cannot join against
+    /// `connected_peers[].address`.
+    pub fn record_packet_sent(&self, remote_addr: SocketAddr, bytes: u64) {
+        self.cumulative_bytes_sent
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.record_per_peer(remote_addr, bytes, |s| &s.bytes_sent);
+    }
+
+    /// Record an inbound UDP packet at the socket layer.
+    ///
+    /// See [`Self::record_packet_sent`] for the counter semantics and the
+    /// canonical-address contract on `remote_addr`.
+    pub fn record_packet_received(&self, remote_addr: SocketAddr, bytes: u64) {
         self.cumulative_bytes_received
             .fetch_add(bytes, Ordering::Relaxed);
         self.record_per_peer(remote_addr, bytes, |s| &s.bytes_received);
@@ -278,7 +308,17 @@ impl TransportMetrics {
         self.cumulative_bytes_received.load(Ordering::Relaxed)
     }
 
-    /// Record per-peer bytes for the given direction (bounded to MAX_TRACKED_PEERS).
+    /// Record per-peer bytes for the given direction.
+    ///
+    /// Bounded to [`MAX_TRACKED_PEERS`] entries: once full, new peers' bytes
+    /// are silently dropped (existing entries continue to update). There is no
+    /// LRU eviction. Combined with the fact that `record_packet_received`
+    /// runs at the raw socket before authentication, an attacker that
+    /// fabricates packets from many spoofed source IPs can fill the table
+    /// with abandoned entries and crowd out legitimate new peers from the
+    /// dashboard's per-peer view. Memory damage is still bounded (256 entries
+    /// × ~16 bytes), and authenticated traffic on the existing connections
+    /// continues to be metered correctly. Follow-up tracked in #3999.
     fn record_per_peer(
         &self,
         addr: SocketAddr,
@@ -642,26 +682,93 @@ mod tests {
     }
 
     #[test]
-    fn test_inbound_completed_tracking() {
+    fn test_inbound_completed_updates_only_snapshot_bytes() {
+        // record_inbound_completed must NOT touch the cumulative or per-peer
+        // wire-byte counters — those are owned by record_packet_received and
+        // updated at the socket layer. This test pins that contract so the
+        // double-counting bug (counted both at socket layer and at stream
+        // completion) cannot regress.
+        let metrics = TransportMetrics::new();
+
+        metrics.record_inbound_completed(2048);
+        metrics.record_inbound_completed(1024);
+
+        assert_eq!(
+            metrics.cumulative_bytes_received(),
+            0,
+            "cumulative is wire-byte only; stream completion must not touch it"
+        );
+        assert!(
+            metrics.per_peer_snapshot().is_empty(),
+            "per-peer is wire-byte only; stream completion must not touch it"
+        );
+
+        // The snapshot bytes_received field still aggregates transfer payloads
+        // alongside transfers_completed for telemetry.
+        let stats = crate::transport::TransferStats {
+            stream_id: 1,
+            remote_addr: "10.0.0.1:5000".parse().unwrap(),
+            bytes_transferred: 100,
+            elapsed: Duration::from_millis(10),
+            peak_cwnd_bytes: 1000,
+            final_cwnd_bytes: 1000,
+            slowdowns_triggered: 0,
+            base_delay: Duration::from_millis(5),
+            final_ssthresh_bytes: 100000,
+            min_ssthresh_floor_bytes: 5696,
+            total_timeouts: 0,
+            final_flightsize: 0,
+            configured_rate: 0,
+        };
+        metrics.record_transfer_completed(&stats);
+        let snapshot = metrics.take_snapshot().unwrap();
+        assert_eq!(snapshot.bytes_received, 3072);
+    }
+
+    #[test]
+    fn test_packet_sent_updates_cumulative_and_per_peer() {
         let metrics = TransportMetrics::new();
         let addr: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
 
-        metrics.record_inbound_completed(addr, 2048);
-        metrics.record_inbound_completed(addr, 1024);
+        // Simulate small control packets that never trigger streaming —
+        // historically these were invisible to the dashboard. After the fix
+        // they must show up.
+        metrics.record_packet_sent(addr, 64);
+        metrics.record_packet_sent(addr, 200);
 
-        // Cumulative counter
-        assert_eq!(metrics.cumulative_bytes_received(), 3072);
+        assert_eq!(metrics.cumulative_bytes_sent(), 264);
 
-        // Per-peer snapshot
         let peers = metrics.per_peer_snapshot();
-        let peer = peers.iter().find(|(a, _, _)| *a == addr);
-        assert!(peer.is_some(), "peer should be tracked");
-        let (_, sent, recv) = peer.unwrap();
-        assert_eq!(*sent, 0);
-        assert_eq!(*recv, 3072);
+        let peer = peers.iter().find(|(a, _, _)| *a == addr).expect("tracked");
+        assert_eq!(peer.1, 264, "per-peer sent must reflect packet bytes");
+        assert_eq!(peer.2, 0);
+    }
 
-        // Periodic snapshot reflects bytes_received
-        // Need a transfer to make take_snapshot return Some
+    #[test]
+    fn test_packet_received_updates_cumulative_and_per_peer() {
+        let metrics = TransportMetrics::new();
+        let addr: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+
+        metrics.record_packet_received(addr, 128);
+        metrics.record_packet_received(addr, 256);
+
+        assert_eq!(metrics.cumulative_bytes_received(), 384);
+
+        let peers = metrics.per_peer_snapshot();
+        let peer = peers.iter().find(|(a, _, _)| *a == addr).expect("tracked");
+        assert_eq!(peer.1, 0);
+        assert_eq!(peer.2, 384);
+    }
+
+    #[test]
+    fn test_packet_metrics_survive_snapshot_reset() {
+        let metrics = TransportMetrics::new();
+        let addr: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+
+        metrics.record_packet_sent(addr, 500);
+        metrics.record_packet_received(addr, 700);
+
+        // Force a snapshot via a transfer completion.
         let stats = crate::transport::TransferStats {
             stream_id: 1,
             remote_addr: addr,
@@ -678,11 +785,15 @@ mod tests {
             configured_rate: 0,
         };
         metrics.record_transfer_completed(&stats);
-        let snapshot = metrics.take_snapshot().unwrap();
-        assert_eq!(snapshot.bytes_received, 3072);
+        let _ = metrics.take_snapshot();
 
-        // Cumulative survives snapshot reset
-        assert_eq!(metrics.cumulative_bytes_received(), 3072);
+        // Cumulative + per-peer wire bytes survive the snapshot reset.
+        assert_eq!(metrics.cumulative_bytes_sent(), 500);
+        assert_eq!(metrics.cumulative_bytes_received(), 700);
+        let peers = metrics.per_peer_snapshot();
+        let peer = peers.iter().find(|(a, _, _)| *a == addr).expect("tracked");
+        assert_eq!(peer.1, 500);
+        assert_eq!(peer.2, 700);
     }
 
     #[test]
@@ -694,22 +805,22 @@ mod tests {
             let addr: std::net::SocketAddr = format!("10.0.{}.{}:{}", i / 256, i % 256, 5000 + i)
                 .parse()
                 .unwrap();
-            metrics.record_inbound_completed(addr, 100);
+            metrics.record_packet_received(addr, 100);
         }
 
         assert_eq!(metrics.per_peer_snapshot().len(), MAX_TRACKED_PEERS);
 
-        // 257th peer should not be tracked in per-peer stats
+        // Beyond capacity: new peer not tracked, but cumulative still counts.
         let extra: std::net::SocketAddr = "192.168.1.1:9999".parse().unwrap();
-        metrics.record_inbound_completed(extra, 500);
+        metrics.record_packet_received(extra, 500);
 
-        // Per-peer map should not grow
         assert_eq!(metrics.per_peer_snapshot().len(), MAX_TRACKED_PEERS);
         let snapshot = metrics.per_peer_snapshot();
-        let extra_entry = snapshot.iter().find(|(a, _, _)| *a == extra);
-        assert!(extra_entry.is_none(), "257th peer should not be tracked");
+        assert!(
+            snapshot.iter().all(|(a, _, _)| *a != extra),
+            "over-capacity peer must not be tracked"
+        );
 
-        // But cumulative counter still includes the bytes
         let total: u64 = (MAX_TRACKED_PEERS as u64 * 100) + 500;
         assert_eq!(metrics.cumulative_bytes_received(), total);
     }

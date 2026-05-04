@@ -33,7 +33,10 @@ The backend is designed for executing untrusted WASM code:
 - Restricted I/O (explicit imports/exports only)
 
 **Wasmtime Defense-in-Depth:**
-- 2GB guard region before linear memories
+- Explicit bounds checks on every memory access (the per-instance
+  reservation is sized to the limiter cap, so guard-page-based check
+  elimination is intentionally disabled — see "Memory Management")
+- One-page guard region as a backstop for tiny-offset overruns
 - Stack overflow guard pages
 - Memory zeroing between instantiations
 - Spectre mitigations for memory bounds checks
@@ -94,8 +97,18 @@ Wasmtime's baseline compiler "Winch":
 
 ### On-Demand Instance Allocation
 
-Uses wasmtime's default on-demand allocation — each instance gets its own
-mmap'd memory region, allocated at instantiation and freed on drop.
+Uses wasmtime's on-demand allocation — each instance gets its own
+mmap'd memory region, allocated at instantiation. The per-instance
+reservation is bounded to `DEFAULT_MAX_MEMORY_PAGES * WASM_PAGE_SIZE`
+(256 MiB) instead of wasmtime's 4 GiB default; the trailing guard
+region is a single wasm page (64 KiB). This keeps virtual memory
+manageable on low-RAM hosts (#3986 — Pi 4 4 GB triggers `mmap failed
+to reserve` after a few concurrent contract instantiations under
+default tuning). The `ResourceLimiter` on `HostState` is the source
+of truth for the cap: it rejects any `memory.grow` past
+`DEFAULT_MAX_MEMORY_PAGES`, including the implicit grow-from-zero at
+instantiation. See `crates/core/src/wasm_runtime/engine/wasmtime_engine.rs`
+(`create_engine`) for the configuration.
 
 ### Compact Code Generation (Cranelift)
 

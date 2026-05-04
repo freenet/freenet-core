@@ -1,6 +1,6 @@
 [package]
 name = "fdev"
-version = "0.3.212"
+version = "0.3.215"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -10,9 +10,18 @@ repository = "https://github.com/freenet/freenet-core"
 readme = "README.md"
 
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/fdev-{ target }.tar.gz"
+# fdev's crate version (0.3.x) is independent of the freenet-core release tag
+# (v0.2.x), so we embed the matching freenet version literally — `v{ version }`
+# would expand to the fdev crate version and 404. release.yml rewrites the
+# `vX.Y.Z` segment whenever the freenet version is bumped (issue #3995).
+pkg-url = "{ repo }/releases/download/v0.2.52/fdev-{ target }.tar.gz"
 pkg-fmt = "tgz"
 bin-dir = "fdev"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v0.2.52/fdev-{ target }.zip"
+pkg-fmt = "zip"
+bin-dir = "fdev.exe"
 
 [dependencies]
 bytesize = "2.3"
@@ -49,7 +58,7 @@ ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 hex = { workspace = true }
 
 # internal
-freenet = { path = "../core", version = "0.2.49", features = ["testing"] }
+freenet = { path = "../core", version = "0.2.52", features = ["testing"] }
 freenet-stdlib = { workspace = true }
 
 [dev-dependencies]

@@ -53,9 +53,8 @@ sha2 = "0.11"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Data structures/storage
-crossbeam = "0.8"
 dashmap = "6.1"
-lru = "0.17.0"
+lru = "0.18.0"
 redb = "4"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
 moka = { version = "0.12", features = ["sync"] }
@@ -150,7 +149,7 @@ muda = "0.17"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-freenet-stdlib = "0.6.0"
+freenet-stdlib = "0.6.1"
 
 [profile.dev.package."*"]
 opt-level = 3

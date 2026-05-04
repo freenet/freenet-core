@@ -45,6 +45,6 @@ Need realistic network test?
 | App | Purpose | Use as reference for |
 |-----|---------|---------------------|
 | `freenet-ping/` | Pub-sub demo | Simple contract + CLI |
-| `freenet-microblogging/` | Social network | Web frontend |
+
 
 > **Note:** `freenet-email-app` has been extracted to its own repo: https://github.com/freenet/freenet-email

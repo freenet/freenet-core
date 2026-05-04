@@ -333,6 +333,34 @@ fn redirect_to_shell_root(
     api_version: ApiVersion,
     query_string: Option<&str>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
+    let shell_url = build_canonical_shell_url(key, api_version, query_string)?;
+    Ok(axum::response::Redirect::to(&shell_url).into_response())
+}
+
+/// Validate `key`, filter sensitive query params, and return the
+/// canonical `/{prefix}/contract/web/{key}/[?query]` URL. Shared
+/// between `redirect_to_shell_root` (303 See Other for cross-contract
+/// HTML subpath redirects) and the no-trailing-slash redirect handlers
+/// in `v1.rs`/`v2.rs` (308 Permanent Redirect for canonical URL form,
+/// freenet/freenet-core#4019).
+///
+/// `key` is interpolated into a `Location` header by the caller, so
+/// validation MUST reject CRLF-bearing input here before
+/// `HeaderValue::try_from` ever sees it. The check via
+/// `ContractInstanceId::from_bytes` also rejects path-traversal-style
+/// inputs like `../../etc/passwd` that would point the redirect at an
+/// attacker-chosen URL on the reader's gateway.
+///
+/// Sensitive query params (`__sandbox`, `authToken`) are stripped:
+/// `__sandbox` would otherwise drop the redirect victim straight into
+/// `web_home`'s sandbox branch, bypassing shell generation; `authToken`
+/// is the shell's auth credential, which must only come from
+/// `AuthToken::generate()` and never from an attacker-supplied URL.
+pub(super) fn build_canonical_shell_url(
+    key: &str,
+    api_version: ApiVersion,
+    query_string: Option<&str>,
+) -> Result<String, WebSocketApiError> {
     if key.is_empty() {
         return Err(WebSocketApiError::InvalidParam {
             error_cause: "empty contract key in redirect target".into(),
@@ -354,11 +382,10 @@ fn redirect_to_shell_root(
         .filter(|s| !s.is_empty());
 
     let prefix = api_version.prefix();
-    let shell_url = match filtered_query {
+    Ok(match filtered_query {
         Some(qs) => format!("/{prefix}/contract/web/{key}/?{qs}"),
         None => format!("/{prefix}/contract/web/{key}/"),
-    };
-    Ok(axum::response::Redirect::to(&shell_url).into_response())
+    })
 }
 
 /// Query parameters that must be stripped before forwarding a user URL

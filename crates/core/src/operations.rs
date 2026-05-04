@@ -181,31 +181,9 @@ where
         // ── No message, has state → keep processing ────────────────────
         Ok(OperationResult::ContinueOp(state)) => {
             if state.finalized() {
-                // Finalized with no outgoing message — check sub-ops.
-                if op_manager.failed_parents().remove(&tx_id).is_some() {
-                    tracing::warn!(
-                        tx = %tx_id,
-                        phase = "error",
-                        "Operation reached finalized state after a sub-operation failure; dropping client response"
-                    );
-                    op_manager.completed(tx_id);
-                    return Ok(None);
-                }
-                if op_manager.all_sub_operations_completed(tx_id) {
-                    tracing::debug!(%tx_id, "operation complete");
-                    op_manager.completed(tx_id);
-                    return Ok(Some(state));
-                } else {
-                    let pending_count = op_manager.count_pending_sub_operations(tx_id);
-                    tracing::debug!(
-                        %tx_id,
-                        pending_count,
-                        "root operation awaiting child completion"
-                    );
-                    op_manager.root_ops_awaiting_sub_ops().insert(tx_id, state);
-                    tracing::info!(tx = %tx_id, phase = "wait_sub_ops", "root operation registered as awaiting sub-ops");
-                    return Ok(None);
-                }
+                tracing::debug!(%tx_id, "operation complete");
+                op_manager.completed(tx_id);
+                return Ok(Some(state));
             } else {
                 // Non-finalized: push state for later processing.
                 let id = *state.id();
@@ -232,27 +210,19 @@ where
             } else {
                 let id = *msg.id();
                 tracing::debug!(%id, "operation in progress");
-                if let Some(target) = next_hop {
-                    tracing::debug!(%id, ?target, "sending updated op state");
-                    // IMPORTANT: Push state BEFORE sending message to avoid race condition.
-                    // If we send first, a fast response might arrive before the state is saved,
-                    // causing load_or_init to fail to find the operation.
-                    op_manager.push(id, updated_state).await?;
-                    send_with_stream(network_bridge, target, msg, stream_data).await?;
-                } else {
-                    tracing::debug!(%id, "queueing op state for local processing");
-                    debug_assert!(
-                        matches!(
-                            msg,
-                            NetMessage::V1(NetMessageV1::Update(
-                                crate::operations::update::UpdateMsg::Broadcasting { .. }
-                            ))
-                        ),
-                        "Only Update::Broadcasting messages should be re-queued locally"
-                    );
-                    op_manager.notify_op_change(msg, updated_state).await?;
-                    return Err(OpError::StatePushed);
-                }
+                let target = next_hop.ok_or_else(|| {
+                    // Only UPDATE's deprecated `Broadcasting` variant produced
+                    // SendAndContinue without a next_hop, and it has been
+                    // removed. Reaching this branch indicates a bug in an
+                    // operation's process_message implementation.
+                    OpError::UnexpectedOpState
+                })?;
+                tracing::debug!(%id, ?target, "sending updated op state");
+                // IMPORTANT: Push state BEFORE sending message to avoid race condition.
+                // If we send first, a fast response might arrive before the state is saved,
+                // causing load_or_init to fail to find the operation.
+                op_manager.push(id, updated_state).await?;
+                send_with_stream(network_bridge, target, msg, stream_data).await?;
             }
         }
 
@@ -701,125 +671,44 @@ pub(crate) async fn broadcast_change_interests(
     }
 }
 
-/// Initiates a subscription after a PUT or GET completes without blocking the parent.
+/// Initiates a subscription after a PUT or GET, routing through the
+/// task-per-tx subscribe driver.
 ///
-/// This does NOT register a parent-child relationship for atomicity tracking,
-/// so the PUT/GET response is sent immediately rather than waiting for the
-/// subscription to complete.
-///
-/// This is appropriate for PUT/GET with subscribe=true, where:
-/// - The client needs immediate confirmation that the contract was stored/fetched
-/// - The subscription can complete asynchronously in the background
-/// - Subscription success/failure doesn't affect the PUT/GET result
-fn start_subscription_request_async(
-    op_manager: &OpManager,
-    parent_tx: Transaction,
-    key: ContractKey,
-) -> Transaction {
-    start_subscription_request_internal(op_manager, parent_tx, key, false)
-}
-
-/// Initiates a subscription after a PUT or GET completes, blocking the parent operation.
-///
-/// This DOES register a parent-child relationship for atomicity tracking,
-/// so the PUT/GET response waits for the subscription to complete before being sent.
-///
-/// This provides stronger atomicity guarantees but may cause timeouts under
-/// poor network conditions.
-fn start_subscription_request_blocking(
-    op_manager: &OpManager,
-    parent_tx: Transaction,
-    key: ContractKey,
-) -> Transaction {
-    start_subscription_request_internal(op_manager, parent_tx, key, true)
-}
-
-/// Initiates a subscription after a PUT or GET, with configurable blocking behavior.
-///
-/// The `blocking` parameter determines whether to block the parent operation on
-/// subscription completion:
-/// - When false (default): subscription completes asynchronously, PUT/GET responds immediately
-/// - When true: PUT/GET waits for subscription to complete before responding
-///
-/// This flag is intended to be passed from the client request (e.g., ContractRequest::Put)
-/// to allow per-operation control over subscription semantics.
+/// `blocking` is accepted for API stability (callers may inspect it for
+/// telemetry), but post-#1454 sub-op SUBSCRIBE migration it has no
+/// behavioral effect: the subscribe runs as a fire-and-forget background
+/// task in either case. The legacy `SubOperationTracker`-based blocking
+/// semantics (parent waits for child via tracker DashMap) are retired —
+/// task-per-tx PUT/GET drivers handle blocking by `await`ing
+/// `subscribe::run_client_subscribe` inline (see `maybe_subscribe_child`
+/// in `put/op_ctx_task.rs` and `get/op_ctx_task.rs`).
 pub(super) fn start_subscription_request(
     op_manager: &OpManager,
     parent_tx: Transaction,
     key: ContractKey,
     blocking: bool,
 ) -> Transaction {
-    if blocking {
-        start_subscription_request_blocking(op_manager, parent_tx, key)
-    } else {
-        start_subscription_request_async(op_manager, parent_tx, key)
-    }
-}
-
-/// Starts a subscription request while allowing callers to opt out of parent tracking.
-fn start_subscription_request_internal(
-    op_manager: &OpManager,
-    parent_tx: Transaction,
-    key: ContractKey,
-    track_parent: bool,
-) -> Transaction {
     let child_tx = Transaction::new_child_of::<subscribe::SubscribeMsg>(&parent_tx);
-    if track_parent {
-        op_manager.expect_and_register_sub_operation(parent_tx, child_tx);
-    }
 
     tracing::debug!(
         %parent_tx,
         %child_tx,
         %key,
-        "created child subscription operation"
+        blocking,
+        "spawning child subscription operation (task-per-tx driver)"
     );
 
-    let op_manager_cloned = op_manager.clone();
-
+    // `run_client_subscribe` requires `Arc<OpManager>`. Callers on
+    // legacy `process_message` paths only have `&OpManager`, so we
+    // wrap a single clone here. PUT/GET task drivers that already
+    // hold `&Arc<OpManager>` route through their own
+    // `maybe_subscribe_child` helper (see
+    // `put/op_ctx_task.rs::maybe_subscribe_child` and the GET
+    // counterpart) and don't pay this cost.
+    let op_manager_arc = std::sync::Arc::new(op_manager.clone());
+    let instance_id = *key.id();
     GlobalExecutor::spawn(async move {
-        tokio::task::yield_now().await;
-
-        // is_renewal: false - GET-triggered subscription is a new subscription
-        let sub_op = subscribe::start_op_with_id(*key.id(), child_tx, false);
-
-        match subscribe::request_subscribe(&op_manager_cloned, sub_op).await {
-            Ok(_) => {
-                tracing::debug!(%child_tx, %parent_tx, "child subscription completed");
-            }
-            Err(error) => {
-                let error_msg = format!("{}", error);
-                tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = error_msg, phase = "error", "child subscription failed");
-
-                if let Err(e) = op_manager_cloned
-                    .sub_operation_failed(child_tx, &error_msg)
-                    .await
-                {
-                    tracing::error!(tx = %parent_tx, child_tx = %child_tx, error = %e, phase = "error", "failed to propagate failure");
-                }
-
-                // Without parent tracking, sub_operation_failed has no parent link
-                // to propagate through, so notify clients via the subscription channel.
-                if !track_parent {
-                    let instance_id = *key.id();
-                    if let Err(e) = op_manager_cloned
-                        .notify_contract_handler(
-                            crate::contract::ContractHandlerEvent::NotifySubscriptionError {
-                                key: instance_id,
-                                reason: format!("Subscription failed: {}", error_msg),
-                            },
-                        )
-                        .await
-                    {
-                        tracing::debug!(
-                            contract = %instance_id,
-                            error = %e,
-                            "Failed to send subscription error to notification channels"
-                        );
-                    }
-                }
-            }
-        }
+        subscribe::run_client_subscribe(op_manager_arc, instance_id, child_tx).await;
     });
 
     child_tx
@@ -877,6 +766,66 @@ async fn has_contract(
 /// "the maximum size for non-streaming transfers", so payloads must exceed it.
 pub(crate) fn should_use_streaming(streaming_threshold: usize, payload_size: usize) -> bool {
     payload_size > streaming_threshold
+}
+
+/// Conservative effective throughput floor for streaming transfers (bytes/sec).
+///
+/// Used to scale the per-attempt timeout for streaming PUTs. Set to 20 KiB/s
+/// so that even a slow link (or congested gateway) has time to drain a large
+/// payload before the retry loop fires. Real-world end-to-end throughput
+/// observed for the freenet.org website upload (2.4 MB in ~62 s) is ~40 KiB/s,
+/// so 20 KiB/s gives ~2x safety margin.
+const STREAMING_THROUGHPUT_FLOOR_BPS: usize = 20 * 1024;
+
+/// Minimum drain budget added to streaming timeouts on top of `OPERATION_TTL`.
+///
+/// Without this floor, payloads just above `streaming_threshold` (where
+/// `payload_size / STREAMING_THROUGHPUT_FLOOR_BPS` rounds down to 0) would
+/// fall back to the unscaled `OPERATION_TTL` even though `process_message`
+/// chose to stream them. That's exactly the #4001 bug — so guarantee at
+/// least an extra 30 s of headroom for *every* streaming-eligible payload.
+/// 30 s covers stream handshake + first chunk RTT + brief congestion.
+const STREAMING_MIN_DRAIN_SECS: u64 = 30;
+
+/// Hard ceiling on the per-attempt timeout for streaming PUTs.
+///
+/// Even at the throughput floor, a 25 MB payload would only need ~21 minutes,
+/// but capping at 10 minutes prevents pathological cases (a wedged remote that
+/// never errors) from holding the driver hostage indefinitely. The retry loop
+/// can still recover by advancing to a different peer when this fires.
+const STREAMING_ATTEMPT_TIMEOUT_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Compute the per-attempt timeout for an operation whose payload may use
+/// streaming transport.
+///
+/// For non-streaming payloads (size <= `streaming_threshold`), returns
+/// [`crate::config::OPERATION_TTL`] (60 s) — there is no per-fragment progress
+/// to wait on, so the standard timeout applies.
+///
+/// For streaming payloads, returns `OPERATION_TTL` (handshake / k-closest /
+/// downstream relays) plus `max(STREAMING_MIN_DRAIN_SECS, payload_size /
+/// STREAMING_THROUGHPUT_FLOOR_BPS)` seconds to give the streaming layer time
+/// to drain the bytes, capped at [`STREAMING_ATTEMPT_TIMEOUT_CAP`] (10 min).
+/// The `STREAMING_MIN_DRAIN_SECS` floor ensures payloads just above the
+/// threshold still escape the unscaled `OPERATION_TTL` (integer truncation
+/// would otherwise reduce the drain term to zero — re-introducing the
+/// #4001 bug for payloads of size `(threshold, threshold + floor_bps)`).
+///
+/// This is a heuristic: it relocates the cliff at which `drive_retry_loop`
+/// fires retries while the original streaming op is still in flight, but does
+/// not eliminate it. Issue #4001 has a follow-up design to replace this with
+/// a true stream-inactivity timeout that observes per-fragment progress.
+pub(crate) fn streaming_aware_attempt_timeout(
+    streaming_threshold: usize,
+    payload_size: usize,
+) -> std::time::Duration {
+    if !should_use_streaming(streaming_threshold, payload_size) {
+        return crate::config::OPERATION_TTL;
+    }
+    let drain_secs =
+        ((payload_size / STREAMING_THROUGHPUT_FLOOR_BPS) as u64).max(STREAMING_MIN_DRAIN_SECS);
+    let total = crate::config::OPERATION_TTL + std::time::Duration::from_secs(drain_secs);
+    total.min(STREAMING_ATTEMPT_TIMEOUT_CAP)
 }
 
 #[cfg(test)]
@@ -981,7 +930,11 @@ mod ordering_invariant_tests {
 
 #[cfg(test)]
 mod streaming_tests {
-    use super::should_use_streaming;
+    use super::{
+        STREAMING_ATTEMPT_TIMEOUT_CAP, should_use_streaming, streaming_aware_attempt_timeout,
+    };
+    use crate::config::OPERATION_TTL;
+    use std::time::Duration;
 
     const DEFAULT_THRESHOLD: usize = 64 * 1024; // 64KB
 
@@ -1011,5 +964,238 @@ mod streaming_tests {
         assert!(!should_use_streaming(0, 0));
         assert!(should_use_streaming(0, 1));
         assert!(should_use_streaming(0, 100));
+    }
+
+    /// Non-streaming payloads (at or below the threshold) get the standard
+    /// `OPERATION_TTL`. Crossing the threshold is what triggers scaling.
+    #[test]
+    fn non_streaming_payload_uses_operation_ttl() {
+        assert_eq!(
+            streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 0),
+            OPERATION_TTL
+        );
+        assert_eq!(
+            streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 1024),
+            OPERATION_TTL
+        );
+        assert_eq!(
+            streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD),
+            OPERATION_TTL
+        );
+    }
+
+    /// Regression test for #4001: a 2.4 MB payload (the freenet.org website
+    /// case) MUST get a per-attempt timeout that exceeds the observed
+    /// end-to-end completion time of ~62 s. With the old hard-coded 60 s
+    /// `OPERATION_TTL`, the retry loop fired three retries while the
+    /// original streaming PUT was still in flight, causing version-conflict
+    /// failures on every push to `freenet/web`.
+    #[test]
+    fn website_payload_attempt_timeout_exceeds_observed_completion() {
+        let website_payload_size = 2_460_242; // bytes, from freenet/web 2026-05-01 logs
+        let timeout = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, website_payload_size);
+        let observed_completion = Duration::from_secs(63); // log: elapsed_ms=62335
+
+        assert!(
+            timeout > observed_completion,
+            "streaming-aware timeout ({timeout:?}) must exceed observed \
+             completion time ({observed_completion:?}) so the retry loop \
+             does not fire while the original streaming PUT is still in \
+             flight (issue #4001)"
+        );
+        assert!(
+            timeout > OPERATION_TTL,
+            "streaming-aware timeout ({timeout:?}) must exceed OPERATION_TTL \
+             ({OPERATION_TTL:?}); otherwise the fix is a no-op for the bug \
+             reported in #4001"
+        );
+    }
+
+    /// Streaming timeouts grow with payload size — a 10 MB payload gets a
+    /// strictly larger timeout than a 1 MB payload, so the cliff scales.
+    #[test]
+    fn streaming_timeout_scales_with_payload_size() {
+        let small_streaming = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 1_000_000);
+        let medium_streaming = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 10_000_000);
+
+        assert!(
+            small_streaming < medium_streaming,
+            "1 MB timeout ({small_streaming:?}) must be smaller than \
+             10 MB timeout ({medium_streaming:?})"
+        );
+        assert!(small_streaming > OPERATION_TTL);
+        assert!(medium_streaming > OPERATION_TTL);
+    }
+
+    /// Pathological payloads cannot push the per-attempt timeout above the
+    /// hard ceiling. Without this, a wedged remote could hold the driver
+    /// hostage indefinitely.
+    #[test]
+    fn streaming_timeout_capped_at_ceiling() {
+        // 1 GB — far beyond the per-attempt ceiling at 20 KB/s floor.
+        let huge = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, 1024 * 1024 * 1024);
+        assert_eq!(
+            huge, STREAMING_ATTEMPT_TIMEOUT_CAP,
+            "huge payloads must clamp to the cap"
+        );
+    }
+
+    /// Boundary: the threshold itself is non-streaming, but `threshold + 1`
+    /// crosses into streaming territory. The timeout MUST jump *strictly*
+    /// above `OPERATION_TTL` at the crossing — otherwise streaming PUTs
+    /// just over the threshold inherit the unscaled 60 s timeout that this
+    /// fix is trying to escape.
+    ///
+    /// Without [`super::STREAMING_MIN_DRAIN_SECS`], integer division
+    /// would truncate `1 / 20 KiB` to 0 s of drain budget for any payload
+    /// of size `(threshold, threshold + STREAMING_THROUGHPUT_FLOOR_BPS)`,
+    /// silently re-introducing the #4001 bug. Pin both ends of that gap.
+    #[test]
+    fn streaming_timeout_jumps_above_threshold_boundary() {
+        let at_threshold = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD);
+        let just_above = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD + 1);
+        // 19 KiB above threshold — would be `0 s drain` under naive
+        // truncation, but the floor saves us.
+        let in_truncation_gap =
+            streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD + 19 * 1024);
+        assert_eq!(at_threshold, OPERATION_TTL);
+        assert!(
+            just_above > OPERATION_TTL,
+            "just-above-threshold timeout {just_above:?} must STRICTLY \
+             exceed OPERATION_TTL ({OPERATION_TTL:?}); a fix that lets \
+             this equal OPERATION_TTL is a no-op for the size range \
+             (threshold, threshold + 20 KiB) — exactly the truncation \
+             gap STREAMING_MIN_DRAIN_SECS exists to close (#4001 \
+             skeptical review)"
+        );
+        assert!(
+            in_truncation_gap > OPERATION_TTL,
+            "payload in the truncation gap (threshold + 19 KiB) must \
+             exceed OPERATION_TTL — STREAMING_MIN_DRAIN_SECS guarantees it"
+        );
+    }
+
+    /// The minimum-drain floor applies to every streaming-eligible payload.
+    /// Pin the exact value so a future tightening of the floor can't
+    /// silently reintroduce the truncation gap.
+    #[test]
+    fn streaming_timeout_min_drain_floor() {
+        let just_above = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, DEFAULT_THRESHOLD + 1);
+        assert_eq!(
+            just_above,
+            OPERATION_TTL + Duration::from_secs(super::STREAMING_MIN_DRAIN_SECS),
+            "streaming-eligible payloads must get at least \
+             OPERATION_TTL + STREAMING_MIN_DRAIN_SECS"
+        );
+    }
+
+    /// Pin the exact payload size where the timeout stops scaling and
+    /// clamps to the 10-min ceiling. With a 60 s base + 20 KiB/s floor +
+    /// 600 s cap, scaling stops at exactly `(600 - 60) * 20 KiB`.
+    #[test]
+    fn streaming_timeout_cap_boundary() {
+        const FLOOR_BPS: usize = 20 * 1024;
+        let scaling_max_bytes =
+            (STREAMING_ATTEMPT_TIMEOUT_CAP - OPERATION_TTL).as_secs() as usize * FLOOR_BPS;
+        let just_below_cap = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, scaling_max_bytes);
+        let at_cap = streaming_aware_attempt_timeout(DEFAULT_THRESHOLD, scaling_max_bytes + 1);
+        assert_eq!(just_below_cap, STREAMING_ATTEMPT_TIMEOUT_CAP);
+        assert_eq!(at_cap, STREAMING_ATTEMPT_TIMEOUT_CAP);
+    }
+}
+
+#[cfg(test)]
+mod sub_op_subscribe_migration_pin_tests {
+    //! Pin tests for the #1454 sub-op SUBSCRIBE migration.
+    //!
+    //! These tests scrape the source of `start_subscription_request` to
+    //! prove that:
+    //! 1. The legacy `subscribe::request_subscribe` driver and the legacy
+    //!    `expect_and_register_sub_operation` registration call are gone
+    //!    from the production sub-op SUBSCRIBE entry point.
+    //! 2. The function spawns the task-per-tx
+    //!    `subscribe::run_client_subscribe` driver instead.
+    //!
+    //! If a future refactor reintroduces the legacy paths, these tests
+    //! will fail loudly and force a re-evaluation against the rationale
+    //! recorded in `.claude/rules/operations.md`.
+
+    fn extract_start_subscription_request_body() -> &'static str {
+        let src = include_str!("operations.rs");
+        // Compose runtime-needle to avoid self-trigger (the test file
+        // itself contains the literal "fn start_subscription_request").
+        let head = ["fn ", "start_subscription_request("].concat();
+        let start = src
+            .find(&head)
+            .expect("`fn start_subscription_request(` must exist in operations.rs");
+        // Walk forward from the function signature to the first `{`,
+        // then track brace depth until we find the matching close.
+        // This is robust against renaming/moving the next function.
+        let body_open = src[start..]
+            .find('{')
+            .map(|off| start + off)
+            .expect("expected `{` after function signature");
+        let mut depth: i32 = 0;
+        let mut end = body_open;
+        for (i, ch) in src[body_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            end > body_open,
+            "failed to find matching `}}` for start_subscription_request"
+        );
+        &src[start..end]
+    }
+
+    #[test]
+    fn start_subscription_request_does_not_call_legacy_request_subscribe() {
+        let body = extract_start_subscription_request_body();
+        assert!(
+            !body.contains("subscribe::request_subscribe"),
+            "`start_subscription_request` must NOT route through the \
+             legacy `subscribe::request_subscribe` driver — sub-op \
+             SUBSCRIBE migrated to `subscribe::run_client_subscribe` \
+             (see #1454 follow-up)."
+        );
+    }
+
+    #[test]
+    fn start_subscription_request_does_not_register_with_sub_op_tracker() {
+        let body = extract_start_subscription_request_body();
+        assert!(
+            !body.contains("expect_and_register_sub_operation"),
+            "`start_subscription_request` must NOT call \
+             `expect_and_register_sub_operation` — `SubOperationTracker` \
+             was deleted in #1454 Phase 3c. Reintroducing it would be a \
+             regression."
+        );
+        assert!(
+            !body.contains("sub_operation_failed"),
+            "`start_subscription_request` must NOT propagate failures \
+             via `sub_operation_failed` — the task-per-tx subscribe \
+             driver publishes its own `HostResult::Err`."
+        );
+    }
+
+    #[test]
+    fn start_subscription_request_spawns_task_per_tx_driver() {
+        let body = extract_start_subscription_request_body();
+        assert!(
+            body.contains("subscribe::run_client_subscribe"),
+            "`start_subscription_request` must spawn the task-per-tx \
+             subscribe driver `subscribe::run_client_subscribe` — \
+             matches the `maybe_subscribe_child` pattern in \
+             `put/op_ctx_task.rs` and `get/op_ctx_task.rs`."
+        );
     }
 }

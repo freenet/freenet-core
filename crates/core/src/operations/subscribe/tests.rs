@@ -476,8 +476,6 @@ async fn test_subscription_validates_k_closest_usage() {
             requester_pub_key: None,
             is_renewal: false,
             stats: None,
-            ack_received: false,
-            speculative_paths: 0,
         };
 
         // State is simplified - skip list is now in the Request message, not state
@@ -569,14 +567,11 @@ fn test_subscribe_op_state_lifecycle() {
         state: SubscribeState::PrepareRequest(super::PrepareRequestData {
             id: tx_id,
             instance_id,
-            is_renewal: false,
         }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     assert!(
@@ -605,8 +600,6 @@ fn test_subscribe_op_state_lifecycle() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     assert!(
@@ -631,8 +624,6 @@ fn test_subscribe_op_state_lifecycle() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     assert!(
@@ -667,8 +658,6 @@ fn test_subscribe_op_failed_state_returns_error() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     // Verify to_host_result returns error
@@ -704,8 +693,6 @@ fn test_local_subscription_completion_state() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     // Verify operation is in completed state
@@ -743,8 +730,6 @@ fn test_is_renewal_flag() {
         requester_pub_key: None,
         is_renewal: true,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
     assert!(renewal_op.is_renewal());
 
@@ -755,8 +740,6 @@ fn test_is_renewal_flag() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
     assert!(!client_op.is_renewal());
 }
@@ -776,8 +759,6 @@ fn test_op_enum_is_subscription_renewal() {
         requester_pub_key: None,
         is_renewal: true,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     });
     assert!(renewal.is_subscription_renewal());
 
@@ -788,8 +769,6 @@ fn test_op_enum_is_subscription_renewal() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     });
     assert!(!non_renewal.is_subscription_renewal());
 }
@@ -817,8 +796,6 @@ fn test_subscribe_failure_outcome() {
             contract_location,
             request_sent_at: Instant::now(),
         }),
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     match op_with_stats.outcome() {
@@ -851,8 +828,6 @@ fn test_subscribe_failure_outcome() {
             contract_location,
             request_sent_at: Instant::now(),
         }),
-        ack_received: false,
-        speculative_paths: 0,
     };
     match op_completed.outcome() {
         OpOutcome::ContractOpSuccess {
@@ -879,8 +854,6 @@ fn test_subscribe_failure_outcome() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
     assert!(
         matches!(op_no_stats.outcome(), OpOutcome::Incomplete),
@@ -899,8 +872,6 @@ fn test_subscribe_failure_outcome() {
             contract_location,
             request_sent_at: Instant::now(),
         }),
-        ack_received: false,
-        speculative_paths: 0,
     };
     let (peer, loc) = op_for_info
         .failure_routing_info()
@@ -937,8 +908,6 @@ fn test_subscribe_outcome_success_untimed_with_stats() {
             contract_location,
             request_sent_at: Instant::now(),
         }),
-        ack_received: false,
-        speculative_paths: 0,
     };
     match op.outcome() {
         OpOutcome::ContractOpSuccessUntimed {
@@ -972,8 +941,6 @@ fn test_subscribe_outcome_irrelevant_without_stats() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
     assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
 }
@@ -998,8 +965,6 @@ fn test_subscribe_outcome_failure_with_stats() {
             contract_location,
             request_sent_at: Instant::now(),
         }),
-        ack_received: false,
-        speculative_paths: 0,
     };
     match op.outcome() {
         OpOutcome::ContractOpFailure {
@@ -1028,8 +993,6 @@ fn test_subscribe_outcome_incomplete_without_stats() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
     assert!(matches!(op.outcome(), OpOutcome::Incomplete));
 }
@@ -1062,8 +1025,6 @@ fn test_subscribe_stats_lifecycle() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
     assert!(matches!(op.outcome(), OpOutcome::Incomplete));
 
@@ -1131,8 +1092,6 @@ fn test_subscribe_renewal_reports_outcome() {
             contract_location,
             request_sent_at: Instant::now(),
         }),
-        ack_received: false,
-        speculative_paths: 0,
     };
     // Renewal should still report success with timing
     match op.outcome() {
@@ -1495,8 +1454,6 @@ fn test_retry_phase3_intermediate_node_forwards_notfound() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     // Intermediate node has requester_addr → should forward NotFound
@@ -1540,8 +1497,6 @@ fn test_retry_phase3_originator_fails_locally() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     // Originator has no requester_addr → should fail locally
@@ -1565,14 +1520,11 @@ fn test_non_awaiting_response_states_skip_retry() {
         state: SubscribeState::PrepareRequest(PrepareRequestData {
             id: tx,
             instance_id,
-            is_renewal: false,
         }),
         requester_addr: None,
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
     assert!(
         !matches!(op_prepare.state, SubscribeState::AwaitingResponse(_)),
@@ -1587,8 +1539,6 @@ fn test_non_awaiting_response_states_skip_retry() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
     assert!(
         !matches!(op_completed.state, SubscribeState::AwaitingResponse(_)),
@@ -1603,8 +1553,6 @@ fn test_non_awaiting_response_states_skip_retry() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
     assert!(
         !matches!(op_failed.state, SubscribeState::AwaitingResponse(_)),
@@ -1745,8 +1693,6 @@ fn awaiting_op(
         requester_pub_key: None,
         is_renewal: false,
         stats,
-        ack_received: false,
-        speculative_paths: 0,
     }
 }
 
@@ -1807,8 +1753,6 @@ fn completed_subscribe_reports_success() {
             contract_location,
             request_sent_at: Instant::now(),
         }),
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     assert!(op.finalized());
@@ -1837,267 +1781,6 @@ fn completed_subscribe_reports_success() {
     }
 }
 
-// ── Subscribe retry tests ──────────────────────────────────────────────
-
-/// Build a SubscribeOp in AwaitingResponse state for retry tests.
-/// Mirrors GET's `make_awaiting_op` helper.
-fn make_retry_op(alternatives: Vec<PeerKeyLocation>, tried: &[PeerKeyLocation]) -> SubscribeOp {
-    let tx_id = Transaction::new::<SubscribeMsg>();
-    let instance_id = ContractInstanceId::new([50u8; 32]);
-    let mut tried_peers = HashSet::new();
-    for p in tried {
-        if let Some(addr) = p.socket_addr() {
-            tried_peers.insert(addr);
-        }
-    }
-    SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            next_hop: tried.first().and_then(|p| p.socket_addr()),
-            instance_id,
-            retries: 0,
-            current_hop: 10,
-            tried_peers,
-            alternatives,
-            attempts_at_hop: 1,
-            visited: crate::operations::VisitedPeers::new(&tx_id),
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    }
-}
-
-/// Extract HTL from a SubscribeMsg::Request, panicking on other variants.
-fn extract_request_htl(msg: &SubscribeMsg) -> usize {
-    match msg {
-        SubscribeMsg::Request { htl, .. } => *htl,
-        other @ SubscribeMsg::Response { .. }
-        | other @ SubscribeMsg::Unsubscribe { .. }
-        | other @ SubscribeMsg::ForwardingAck { .. } => {
-            panic!("Expected Request, got {other:?}")
-        }
-    }
-}
-
-/// Extract the AwaitingResponseData from a SubscribeOp, panicking if in wrong state.
-fn extract_awaiting_data(op: &SubscribeOp) -> &super::AwaitingResponseData {
-    match &op.state {
-        SubscribeState::AwaitingResponse(data) => data,
-        other @ SubscribeState::PrepareRequest(_)
-        | other @ SubscribeState::Completed(_)
-        | other @ SubscribeState::Failed => {
-            panic!("Expected AwaitingResponse, got {other:?}")
-        }
-    }
-}
-
-/// Test that `retry_with_next_alternative` picks the next untried peer.
-#[test]
-fn test_retry_with_next_alternative_picks_next_peer() {
-    let peer1 = random_peer();
-    let peer2 = random_peer();
-    let peer3 = random_peer();
-
-    let op = make_retry_op(vec![peer2.clone(), peer3.clone()], &[peer1]);
-    assert!(op.is_originator(), "No requester_addr means originator");
-
-    let (new_op, msg) = op
-        .retry_with_next_alternative(10, &[])
-        .map_err(|_| "retry should succeed with alternatives available")
-        .unwrap();
-
-    // attempts_at_hop was 1, incremented to 2 before HTL calc: 10/2 = 5
-    assert_eq!(extract_request_htl(&msg), 5);
-
-    let data = extract_awaiting_data(&new_op);
-    assert!(data.tried_peers.contains(&peer2.socket_addr().unwrap()));
-    assert_eq!(data.alternatives.len(), 1, "peer3 should remain");
-}
-
-/// Test that `retry_with_next_alternative` returns Err when no alternatives remain.
-#[test]
-fn test_retry_with_no_alternatives_returns_err() {
-    let op = make_retry_op(vec![], &[]);
-    let result = op.retry_with_next_alternative(10, &[]);
-    assert!(result.is_err(), "Should fail when no alternatives remain");
-}
-
-/// Test that `retry_with_next_alternative` uses fallback peers when alternatives are exhausted.
-#[test]
-fn test_retry_uses_fallback_peers() {
-    let fallback_peer = random_peer();
-    let op = make_retry_op(vec![], &[]);
-
-    let (new_op, _msg) = op
-        .retry_with_next_alternative(10, std::slice::from_ref(&fallback_peer))
-        .map_err(|_| "retry should succeed with fallback peers")
-        .unwrap();
-
-    let data = extract_awaiting_data(&new_op);
-    assert!(
-        data.tried_peers
-            .contains(&fallback_peer.socket_addr().unwrap()),
-        "Fallback peer should be marked as tried"
-    );
-}
-
-/// Test that `retry_with_next_alternative` skips already-tried fallback peers.
-#[test]
-fn test_retry_skips_tried_fallback_peers() {
-    let tried_peer = random_peer();
-    let op = make_retry_op(vec![], std::slice::from_ref(&tried_peer));
-
-    let result = op.retry_with_next_alternative(10, &[tried_peer]);
-    assert!(
-        result.is_err(),
-        "Should fail when all fallback peers already tried"
-    );
-}
-
-/// Verify that retry HTL decreases with each attempt (#3570).
-///
-/// Formula: max_hops_to_live / attempts_at_hop, floored at MIN_RETRY_HTL.
-#[test]
-fn test_retry_htl_decreases_with_attempts() {
-    let op = make_retry_op(vec![random_peer(), random_peer(), random_peer()], &[]);
-
-    // First retry: attempts_at_hop becomes 2 -> 10/2 = 5
-    let (op, msg) = op
-        .retry_with_next_alternative(10, &[])
-        .unwrap_or_else(|_| panic!("retry 1 failed"));
-    assert_eq!(extract_request_htl(&msg), 5);
-
-    // Second retry: attempts_at_hop becomes 3 -> 10/3 = 3 = MIN_RETRY_HTL
-    let (op, msg) = op
-        .retry_with_next_alternative(10, &[])
-        .unwrap_or_else(|_| panic!("retry 2 failed"));
-    assert_eq!(extract_request_htl(&msg), super::MIN_RETRY_HTL);
-
-    // Third retry: attempts_at_hop becomes 4 -> 10/4 = 2, clamped to MIN_RETRY_HTL
-    let (_op, msg) = op
-        .retry_with_next_alternative(10, &[])
-        .unwrap_or_else(|_| panic!("retry 3 failed"));
-    assert_eq!(extract_request_htl(&msg), super::MIN_RETRY_HTL);
-}
-
-/// Verify that MIN_RETRY_HTL floor is applied even with many prior attempts.
-#[test]
-fn test_retry_htl_floor_at_min() {
-    let tx_id = Transaction::new::<SubscribeMsg>();
-    let instance_id = ContractInstanceId::new([61u8; 32]);
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            next_hop: None,
-            instance_id,
-            retries: 0,
-            current_hop: 10,
-            tried_peers: HashSet::new(),
-            alternatives: vec![random_peer()],
-            attempts_at_hop: 20,
-            visited: crate::operations::VisitedPeers::new(&tx_id),
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-
-    let (_op, msg) = op
-        .retry_with_next_alternative(10, &[])
-        .unwrap_or_else(|_| panic!("retry failed"));
-    assert!(
-        extract_request_htl(&msg) >= super::MIN_RETRY_HTL,
-        "HTL should not fall below MIN_RETRY_HTL"
-    );
-}
-
-/// Verify that HTL never exceeds max_hops_to_live, even when MIN_RETRY_HTL is higher.
-///
-/// When max_hops_to_live=2 (< MIN_RETRY_HTL=3), the .min(max_hops_to_live) clamp
-/// must prevent the retry from exceeding the network's configured maximum.
-#[test]
-fn test_retry_htl_capped_at_max_hops() {
-    let alt = random_peer();
-    let op = make_retry_op(vec![alt], &[]);
-
-    let (_op, msg) = op
-        .retry_with_next_alternative(2, &[])
-        .unwrap_or_else(|_| panic!("retry failed"));
-    assert_eq!(
-        extract_request_htl(&msg),
-        2,
-        "HTL must not exceed max_hops_to_live even when MIN_RETRY_HTL is higher"
-    );
-}
-
-/// Verify that bloom-filter-visited peers are excluded from fallback injection (#3570).
-#[test]
-fn test_retry_fallback_skips_bloom_visited() {
-    let visited_peer = random_peer();
-    let fresh_peer = random_peer();
-    let visited_addr = visited_peer.socket_addr().unwrap();
-
-    let tx_id = Transaction::new::<SubscribeMsg>();
-    let mut visited = crate::operations::VisitedPeers::new(&tx_id);
-    visited.mark_visited(visited_addr);
-
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::AwaitingResponse(super::AwaitingResponseData {
-            next_hop: None,
-            instance_id: ContractInstanceId::new([62u8; 32]),
-            retries: 0,
-            current_hop: 10,
-            tried_peers: HashSet::new(),
-            alternatives: vec![],
-            attempts_at_hop: 1,
-            visited,
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-
-    let (new_op, _msg) = op
-        .retry_with_next_alternative(10, &[visited_peer, fresh_peer])
-        .unwrap_or_else(|_| panic!("retry failed"));
-
-    let data = extract_awaiting_data(&new_op);
-    assert_eq!(
-        data.alternatives.len(),
-        0,
-        "Only fresh_peer should be injected (visited_peer filtered by bloom)"
-    );
-}
-
-/// Verify that retry targets are marked in the bloom filter (#3570).
-#[test]
-fn test_retry_marks_target_in_bloom_filter() {
-    let alt = random_peer();
-    let alt_addr = alt.socket_addr().unwrap();
-    let op = make_retry_op(vec![alt], &[]);
-
-    let (new_op, _msg) = op
-        .retry_with_next_alternative(10, &[])
-        .unwrap_or_else(|_| panic!("retry failed"));
-
-    let data = extract_awaiting_data(&new_op);
-    assert!(
-        data.visited.probably_visited(alt_addr),
-        "Retry target should be marked in bloom filter"
-    );
-}
-
 /// Test that non-originator subscribe ops are correctly identified.
 #[test]
 fn test_is_originator_false_for_intermediate_hop() {
@@ -2121,8 +1804,6 @@ fn test_is_originator_false_for_intermediate_hop() {
         requester_pub_key: None,
         is_renewal: false,
         stats: None,
-        ack_received: false,
-        speculative_paths: 0,
     };
 
     assert!(
@@ -2130,58 +1811,6 @@ fn test_is_originator_false_for_intermediate_hop() {
         "Op with requester_addr should not be originator"
     );
 }
-
-/// Test that retry doesn't work on non-AwaitingResponse states.
-#[test]
-fn test_retry_fails_on_wrong_state() {
-    let instance_id = ContractInstanceId::new([55u8; 32]);
-    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([56u8; 32]));
-    let tx_id = Transaction::new::<SubscribeMsg>();
-
-    // PrepareRequest state
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::PrepareRequest(super::PrepareRequestData {
-            id: tx_id,
-            instance_id,
-            is_renewal: false,
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-    assert!(op.retry_with_next_alternative(10, &[]).is_err());
-
-    // Completed state
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-    assert!(op.retry_with_next_alternative(10, &[]).is_err());
-
-    // Failed state
-    let op = SubscribeOp {
-        id: tx_id,
-        state: SubscribeState::Failed,
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-        ack_received: false,
-        speculative_paths: 0,
-    };
-    assert!(op.retry_with_next_alternative(10, &[]).is_err());
-}
-
 // === Tests for ForwardingAck serde round-trip ===
 
 #[test]
@@ -2207,4 +1836,38 @@ fn subscribe_forwarding_ack_serde_roundtrip() {
             panic!("Expected ForwardingAck, got {other}")
         }
     }
+}
+
+// === Pin tests: sub-op GET migration (#1454 phase 5 follow-up) ===
+
+/// fetch_contract_if_missing MUST use the task-per-tx sub-op GET driver.
+/// Regression: legacy `get::start_op + request_get` used to push a
+/// `GetOp` into `OpManager.ops.get`, keeping the GC speculative-retry
+/// block alive for sub-op GETs. Migration retired both.
+#[test]
+fn fetch_contract_if_missing_uses_sub_op_driver() {
+    let src = include_str!("../subscribe.rs");
+    let body = src
+        .split("async fn fetch_contract_if_missing(")
+        .nth(1)
+        .expect("fetch_contract_if_missing must exist")
+        .split(
+            "
+}",
+        )
+        .next()
+        .expect("closing brace");
+    assert!(
+        body.contains("start_sub_op_get"),
+        "fetch_contract_if_missing must call start_sub_op_get — sub-op \
+         GET migration in #1454 phase 5 follow-up"
+    );
+    // Compose the needle at runtime so the assertion source itself
+    // doesn't trip the pin (matches the pattern used in put.rs).
+    let needle = ["get::", "start_op"].concat();
+    assert!(
+        !body.contains(&needle),
+        "fetch_contract_if_missing must NOT call legacy `get::start_op` — \
+         retired in #1454 sub-op GET migration"
+    );
 }

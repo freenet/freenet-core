@@ -3,7 +3,8 @@
 //! Contract web apps are served inside sandboxed iframes to provide origin isolation.
 //! The local API server returns a "shell" page that holds the auth token and
 //! proxies WebSocket connections via postMessage, while the contract runs in an
-//! `<iframe sandbox="allow-scripts allow-forms allow-popups">`
+//! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals"
+//!         allow="clipboard-read; clipboard-write">`
 //! with an opaque origin that cannot access other contracts' data.
 //! Popups inherit the sandbox (no `allow-popups-to-escape-sandbox`); external links
 //! are opened via the `open_url` shell bridge message to avoid CORS issues. Sandbox content
@@ -470,7 +471,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" data-src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -824,12 +825,36 @@ function freenetBridge(authToken) {
         // Open external URLs in a new tab. Popups from the sandboxed iframe
         // inherit the opaque origin, breaking CORS on target sites. The shell
         // opens the URL instead, giving proper origin. See issue #1499.
-        // Security: only allow https: URLs that are NOT localhost/loopback.
+        //
+        // Security model: this scheme allow-list is the PRIMARY gate, not
+        // defence in depth. A malicious contract iframe can postMessage
+        // `open_url` directly without going through the upstream
+        // navigation interceptor, so the URL parser + scheme check below
+        // is what blocks `javascript:` / `data:` / `file:` etc.
+        //
+        // Both http and https are accepted because user-pasted markdown
+        // links commonly target plain-HTTP self-hosted services (e.g.
+        // nova.locut.us:3133, the Freenet network telemetry dashboard,
+        // no TLS configured). Auth tokens never travel through this path
+        // — the only operation is `window.open(url, '_blank',
+        // 'noopener,noreferrer')` — so HTTP doesn't expose credentials.
+        // See freenet/river#231.
+        //
+        // Private networks (RFC1918 192.168/16, 10/8, 172.16-31/12 and
+        // RFC4193 fc00::/7, link-local fe80::/10) are deliberately NOT
+        // blocked. A user who pastes a link to their home router or NAS
+        // expects the link to work; the threat model here is that a
+        // *malicious contract* might forge a markdown link to a LAN
+        // admin panel and trick the user into clicking, which is a
+        // social-engineering attack class we accept.
         try {
           var u = new URL(msg.url);
-          if (u.protocol !== 'https:') return;
+          if (u.protocol !== 'https:' && u.protocol !== 'http:') return;
+          // URL.hostname strips brackets from IPv6 literals, so a URL
+          // `http://[::1]/` parses with hostname `::1`, NOT `[::1]`.
+          // Compare against the bracket-less form.
           var h = u.hostname.toLowerCase();
-          if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '0.0.0.0') return;
+          if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return;
           // Honour shift-click by requesting a popup-style window feature
           // (freenet/freenet-core#3853). Firefox honours this as "open in
           // a new window"; other browsers may still open a tab, which is
@@ -1867,6 +1892,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_page_iframe_sandbox_allows_downloads() {
+        // Regression for freenet/mail#TBD: webapps that emit blob/object-URL
+        // downloads via `<a download>` were silently dropped by Chromium
+        // and Safari because the iframe sandbox omitted `allow-downloads`.
+        // Lock the token in so a future refactor does not regress the fix.
+        let token = AuthToken::generate();
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+        assert!(
+            html.contains("allow-downloads"),
+            "iframe sandbox missing `allow-downloads` — user-initiated \
+             file downloads from sandboxed webapps will be silently blocked \
+             by the browser. Got HTML:\n{html}"
+        );
+    }
+
+    #[tokio::test]
     async fn shell_page_contains_iframe_and_bridge() {
         let token = AuthToken::generate();
         let html =
@@ -1874,8 +1916,15 @@ mod tests {
 
         // Shell page must contain sandboxed iframe
         assert!(
-            html.contains(r#"sandbox="allow-scripts allow-forms allow-popups"#),
-            "iframe sandbox attribute missing"
+            html.contains(
+                r#"sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals""#
+            ),
+            "iframe sandbox attribute missing or wrong allowlist"
+        );
+        // Iframe must grant clipboard via permissions-policy
+        assert!(
+            html.contains(r#"allow="clipboard-read; clipboard-write""#),
+            "iframe permissions-policy missing clipboard grants"
         );
         // Iframe src must include __sandbox=1
         assert!(
@@ -2088,7 +2137,7 @@ mod tests {
         // immediate load before JS can append the hash fragment).
         assert!(
             !html.contains(
-                r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups" src="#
+                r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads" src="#
             ),
             "iframe must use data-src, not src, to avoid loading before JS appends the hash"
         );
@@ -2930,6 +2979,132 @@ mod tests {
         assert!(
             block.contains("'noopener,noreferrer'"),
             "open_url handler must keep the plain new-tab path for non-shift clicks"
+        );
+    }
+
+    /// Regression test for freenet/river#231.
+    ///
+    /// The shell `open_url` handler must accept `http:` URLs in addition to
+    /// `https:`. The original https-only check silently dropped clicks on
+    /// markdown links to plain-HTTP services (e.g. the Network Telemetry
+    /// dashboard `http://nova.locut.us:3133/` linked from the Freenet River
+    /// channel header) — the user clicked the link and nothing happened, no
+    /// console output, no popup, no error. The localhost block stays so a
+    /// pasted `http://127.0.0.1:NNNN/` link can't be used to target services
+    /// running on the reader's machine.
+    #[test]
+    fn shell_open_url_handler_accepts_http_and_https_but_blocks_localhost() {
+        let js = SHELL_BRIDGE_JS;
+        let open_url_idx = js
+            .find("msg.type === 'open_url'")
+            .expect("shell open_url branch present");
+        let rest = &js[open_url_idx..];
+        let next_branch = rest[1..]
+            .find("} else if")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let block = &rest[..next_branch];
+
+        // Both schemes accepted. The check must reject ONLY non-http(s),
+        // not just non-https.
+        assert!(
+            block.contains("u.protocol !== 'https:'") && block.contains("u.protocol !== 'http:'"),
+            "open_url handler must accept both http: and https: schemes \
+             (freenet/river#231); got block: {block}"
+        );
+        // The check must NOT be a bare https-only filter that drops http: URLs
+        // before they reach the localhost block. Pin the precise structure so
+        // a future "tighten security" refactor that re-introduces the
+        // https-only filter trips this test.
+        assert!(
+            !block.contains("if (u.protocol !== 'https:') return;"),
+            "open_url handler must NOT reject http: URLs outright; the bug \
+             this test pins (freenet/river#231) was that an https-only filter \
+             silently dropped clicks on http: links the user pasted. Got: {block}"
+        );
+        // Localhost block must still be present — http: + localhost is the
+        // CSRF/private-network surface the original check was guarding against.
+        assert!(
+            block.contains("'localhost'") && block.contains("'127.0.0.1'"),
+            "open_url handler must continue to block localhost/loopback hosts \
+             so http: scheme acceptance doesn't open a CSRF surface against \
+             services on the reader's machine; got block: {block}"
+        );
+    }
+
+    /// `URL.hostname` strips the brackets from IPv6 literals, so a URL
+    /// `http://[::1]/` parses with `hostname === '::1'` (no brackets), and
+    /// the previous comparison `h === '[::1]'` never matched. The IPv6
+    /// loopback was effectively unblocked. The relaxation in
+    /// freenet/river#231 (accepting http: in addition to https:) makes
+    /// the gap newly reachable for typical home services, so fix it
+    /// alongside the http: change.
+    #[test]
+    fn shell_open_url_handler_blocks_ipv6_loopback_without_brackets() {
+        let js = SHELL_BRIDGE_JS;
+        let open_url_idx = js
+            .find("msg.type === 'open_url'")
+            .expect("shell open_url branch present");
+        let rest = &js[open_url_idx..];
+        let next_branch = rest[1..]
+            .find("} else if")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let block = &rest[..next_branch];
+
+        // The block list must compare against `::1` (no brackets), the
+        // form `URL.hostname` actually returns. The bracketed form is a
+        // dead arm.
+        assert!(
+            block.contains("'::1'"),
+            "open_url handler must block the IPv6 loopback hostname `::1` \
+             (no brackets — URL.hostname strips them); got block: {block}"
+        );
+        assert!(
+            !block.contains("'[::1]'"),
+            "open_url handler must NOT compare against `[::1]` with \
+             brackets — that arm is dead because URL.hostname strips \
+             brackets from IPv6 literals; got block: {block}"
+        );
+    }
+
+    /// Direct postMessages from a malicious iframe can synthesize an
+    /// `open_url` payload without going through the upstream
+    /// `NAVIGATION_INTERCEPTOR_JS` scheme filter, so the shell-side
+    /// `new URL().protocol` allow-list is the primary gate against
+    /// `javascript:` / `data:` / `file:` / `blob:` / `chrome:`. This
+    /// test pins the explicit allow-list shape so a refactor that
+    /// drops the explicit comparison (e.g. switches to a regex or a
+    /// blocklist) is forced to handle these schemes consciously.
+    #[test]
+    fn shell_open_url_handler_rejects_dangerous_schemes() {
+        let js = SHELL_BRIDGE_JS;
+        let open_url_idx = js
+            .find("msg.type === 'open_url'")
+            .expect("shell open_url branch present");
+        let rest = &js[open_url_idx..];
+        let next_branch = rest[1..]
+            .find("} else if")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let block = &rest[..next_branch];
+
+        // The check must be an explicit allow-list of `http:` and `https:`.
+        // `new URL('javascript:alert(1)').protocol === 'javascript:'`,
+        // and `'javascript:' !== 'http:' && 'javascript:' !== 'https:'`,
+        // so the explicit allow-list rejects it. Same for data:, blob:,
+        // file:, chrome:, chrome-extension:, vbscript:.
+        assert!(
+            block.contains("u.protocol !== 'https:'")
+                && block.contains("u.protocol !== 'http:'")
+                && block.contains("&&"),
+            "open_url handler must use an explicit `http:` AND `https:` \
+             allow-list (joined with &&) so dangerous schemes \
+             (javascript:, data:, file:, blob:, chrome:, vbscript:) \
+             are rejected by the shell-side check, which is the \
+             primary scheme gate (a malicious iframe can postMessage \
+             open_url without going through the upstream interceptor); \
+             got block: {block}"
         );
     }
 

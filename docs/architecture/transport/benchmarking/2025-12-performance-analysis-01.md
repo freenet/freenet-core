@@ -1,5 +1,15 @@
 # Freenet Transport Layer - Performance Analysis
 
+> **Note (2026-04-26):** The `fast_channel` recommendation in this document
+> has been **superseded** by [#3960](https://github.com/freenet/freenet-core/pull/3960)
+> (closes [#3959](https://github.com/freenet/freenet-core/issues/3959)).
+> The `fast_channel` wrapper around `crossbeam::channel` was removed after a
+> production node-wide hang caused by `crossbeam::Backoff::snooze` spinning
+> in `sched_yield` indefinitely on a wedged slot. The transport now uses
+> `tokio::sync::mpsc` directly. Treat references to `fast_channel` /
+> `FastSender` / `FastReceiver` below as historical context, not as current
+> design recommendations.
+
 ## Executive Summary
 
 This document analyzes the Freenet transport layer for performance bottlenecks, with particular focus on OS I/O overhead, syscall efficiency, and packet size decisions. The analysis identifies several significant issues and proposes a comprehensive performance test suite.

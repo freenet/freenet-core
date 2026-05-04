@@ -2,12 +2,18 @@ name: CI
 
 # Cost optimization strategy (Ubicloud runners ~$0.13/run):
 # 1. Skip CI entirely for docs-only changes (paths-ignore)
-# 2. Skip expensive jobs on main push - PR already validated
-# 3. Skip NAT validation for dependabot PRs - Test is sufficient for version bumps
+# 2. Skip expensive jobs on main push — PR already validated
+# 3. Skip NAT validation for dependabot PRs — Test is sufficient for version bumps
 # 4. Run fast checks (Fmt, Clippy) in parallel for quick fail-fast
 # 5. Run required checks in merge_group to satisfy branch protection
 # 6. Split unit/integration and simulation tests for parallelism
-# Estimated savings: ~25-30% reduction in CI costs
+# 7. Tiered merge_group depth (#3973):
+#    - PR runs the full suite — catches regressions in the change being made.
+#    - Non-release merge_group runs only Unit & Integration on the heavy runner;
+#      Simulation and NAT Validation are present-but-skipped to keep branch
+#      protection happy without contending for ubicloud-standard-16 slots.
+#    - Release merge_group (commit message starts with "build: release") runs
+#      the full suite as the pre-publish gate, so what ships is known-green.
 
 on:
   push:
@@ -92,6 +98,40 @@ jobs:
       - name: Check code formatting
         run: cargo fmt -- --check
 
+      # Locks the bash predicate that the merge_group release-gate keys off
+      # (#3973). The actual release path is only exercised on a real release
+      # merge_group entry, so a regression in the matching logic would
+      # silently skip the pre-publish gate. This self-test catches predicate
+      # quoting, anchoring, and case-sensitivity bugs on every CI run.
+      - name: Self-test merge_group release detector
+        run: |
+          set -eu
+          check() {
+            local msg="$1"
+            local expected="$2"  # "release" or "non-release"
+            local actual
+            if [[ "$msg" == build:\ release* ]]; then
+              actual="release"
+            else
+              actual="non-release"
+            fi
+            if [[ "$actual" != "$expected" ]]; then
+              echo "FAIL: '$msg' -> expected '$expected', got '$actual'"
+              return 1
+            fi
+            echo "OK:   '$msg' -> $actual"
+          }
+          # Positive cases (release-gate must fire)
+          check "build: release 0.2.49 (#3947)"                "release"
+          check "build: release 1.0.0"                         "release"
+          check "build: release 0.2.49"                        "release"
+          # Negative cases (release-gate must NOT fire)
+          check "chore: bump versions to 0.2.49"               "non-release"
+          check "refactor(ops): retire SubOperationTracker"    "non-release"
+          check "build(deps): bump rand from 0.8.5 to 0.9.2"   "non-release"
+          check "build: replace local release build"           "non-release"
+          check ""                                             "non-release"
+
       - name: Check for old-style mod.rs files
         run: |
           # New modules must use foo.rs + foo/ style, not foo/mod.rs
@@ -165,11 +205,17 @@ jobs:
           # Check ALL Rust files for test additions/removals (not just crates/core/src/)
           # TEST_ATTR_RE matches the set of attributes this repo uses to mark
           # a function as a test:
-          #   #[test]                  — plain libtest
-          #   #[tokio::test]           — async tests
-          #   #[test_log::test]        — tracing-subscriber-enabled tests
-          #   #[freenet_test(...)]     — Freenet integration-test macro
-          TEST_ATTR_RE='#\[((tokio|test_log)::)?test\]|#\[freenet_test'
+          #   #[test]                                          - plain libtest
+          #   #[tokio::test]                                   - async tests
+          #   #[tokio::test(flavor = ..., worker_threads = N)] - parameterized async tests
+          #   #[test_log::test]                                - tracing-subscriber-enabled tests
+          #   #[test_log::test(tokio::test)]                   - parameterized tracing-subscriber-enabled
+          #   #[freenet_test(...)]                             - Freenet integration-test macro
+          # The character class [(\]] after `test` matches either `]` (plain
+          # form) or `(` (parameterized form). Without that, parameterized
+          # tokio::test attributes weren't counted as new tests and fix: PRs
+          # using only such tests were incorrectly rejected.
+          TEST_ATTR_RE='#\[((tokio|test_log)::)?test(\]|\()|#\[freenet_test'
           ALL_ADDED=$(git diff "$BASE"..."$HEAD" -- '**/*.rs' \
             | grep '^+' | grep -v '^+++' || true)
           ALL_ADDED_STRIPPED=$(echo "$ALL_ADDED" | sed 's|//.*||' || true)
@@ -177,21 +223,28 @@ jobs:
           REMOVED=$(git diff "$BASE"..."$HEAD" -- 'crates/core/src/**/*.rs' 'crates/core/tests/**/*.rs' \
             | grep '^-' | grep -v '^---' || true)
           REMOVED_STRIPPED=$(echo "$REMOVED" | sed 's|//.*||' || true)
-          if echo "$REMOVED_STRIPPED" | grep -qE "$TEST_ATTR_RE"; then
+          # The test-exempt label allows mechanical refactors (e.g., retiring a
+          # data structure whose unit tests can't be #[ignore]d because the
+          # type itself is gone) to bypass both rule #4 (deleted tests) and
+          # rule #5 (missing fix-PR test). Justification must be in PR comments.
+          HAS_EXEMPT_LABEL=$(echo "${{ join(github.event.pull_request.labels.*.name, ',') }}" | grep -c 'test-exempt' || true)
+          if [ "$HAS_EXEMPT_LABEL" -eq 0 ] && echo "$REMOVED_STRIPPED" | grep -qE "$TEST_ATTR_RE"; then
             # Check it wasn't just moved (also present in added lines across all files)
             REMOVED_TESTS=$(echo "$REMOVED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
             ADDED_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
             if [ "$REMOVED_TESTS" -gt "$ADDED_TESTS" ]; then
               ERRORS="$ERRORS
           ERROR: Test function(s) removed — tests must not be deleted (use #[ignore] with a tracking issue if broken)
-          Removed $REMOVED_TESTS test(s), added $ADDED_TESTS test(s)"
+          Removed $REMOVED_TESTS test(s), added $ADDED_TESTS test(s)
+          If the deletion is intentional (e.g., retiring a data structure whose
+          tests can't be #[ignore]d because the type is gone), add the
+          'test-exempt' label with a justification comment."
             fi
           fi
 
           # 5. fix: PRs must add at least one new test (check all Rust files, not just src/)
           # PR_TITLE is set via env: above to avoid shell injection from backticks in titles
           IS_FIX=$(echo "$PR_TITLE" | grep -ciE '^fix(\(.*\))?:' || true)
-          HAS_EXEMPT_LABEL=$(echo "${{ join(github.event.pull_request.labels.*.name, ',') }}" | grep -c 'test-exempt' || true)
 
           if [ "$IS_FIX" -gt 0 ] && [ "$HAS_EXEMPT_LABEL" -eq 0 ]; then
             NEW_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
@@ -273,12 +326,18 @@ jobs:
 
   test_unit:
     name: Unit & Integration
-    runs-on: "${{ (github.event_name == 'merge_group' && startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
+    # Always runs on the heavy runner. Unlike test_simulation and nat_validation,
+    # this job has no runner-conditional and no skip_check: Unit & Integration is
+    # the one heavy gate kept on every merge_group entry (release or not), so the
+    # tiered model (#3973) doesn't apply here.
+    runs-on: ubicloud-standard-16
     timeout-minutes: 30
     needs: fmt_check
-    # Skip on push to main (PR already validated) and release PRs (only version bumps).
-    # For release merge_group entries: required checks can't be skipped (would block merge),
-    # so we run on a cheap runner and skip expensive steps via is_release output.
+    # Skip on push to main (PR already validated) and on release branches
+    # themselves (the release version-bump PR is gated by its merge_group entry,
+    # which runs the full suite). The release merge_group entry IS the
+    # pre-publish gate — it must run the full suite so we know what ships is
+    # green.
     if: |
       (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       !startsWith(github.head_ref, 'release/v')
@@ -292,45 +351,27 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
-      - name: Detect release merge queue
-        id: release_check
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          MERGE_COMMIT_MSG: ${{ github.event.merge_group.head_commit.message }}
-        run: |
-          if [[ "$EVENT_NAME" == "merge_group" && "$MERGE_COMMIT_MSG" == build:\ release* ]]; then
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-            echo "Skipping tests — release PRs only bump versions (main CI already validated)"
-          else
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v6
-        if: steps.release_check.outputs.is_release != 'true'
 
       - name: Install mold linker
-        if: steps.release_check.outputs.is_release != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y mold
 
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.release_check.outputs.is_release != 'true'
         with:
           toolchain: 1.93.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: (success() || steps.test.conclusion == 'failure') && steps.release_check.outputs.is_release != 'true'
+        if: success() || steps.test.conclusion == 'failure'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install nextest
-        if: steps.release_check.outputs.is_release != 'true'
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Build
-        if: steps.release_check.outputs.is_release != 'true'
         env:
           # Use mold linker to avoid rust-lld crashes (see issue #2519)
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
@@ -341,14 +382,12 @@ jobs:
           make -C apps/freenet-ping -f run-ping.mk build
 
       - name: Clean test directories
-        if: steps.release_check.outputs.is_release != 'true'
         run: |
           # Remove freenet test directories from /tmp to avoid permission issues
           # when tests create directories with different user ownership
           rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
 
       - name: Test
-        if: steps.release_check.outputs.is_release != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -374,7 +413,7 @@ jobs:
             --profile ci -E 'not test(blocked_peers)'
 
       - name: Test blocked-peers (serial)
-        if: ${{ !cancelled() && steps.release_check.outputs.is_release != 'true' }}
+        if: ${{ !cancelled() }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -387,14 +426,19 @@ jobs:
             -E 'test(blocked_peers)' -j 1
 
       - name: Test ping-types
-        if: ${{ !cancelled() && steps.release_check.outputs.is_release != 'true' }}
+        if: ${{ !cancelled() }}
         # freenet-ping-types tests need the std feature (default).
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
 
   test_simulation:
     name: Simulation
-    runs-on: "${{ (github.event_name == 'merge_group' && startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
+    # Run on the heavy runner for PRs (validates the change) and for release
+    # merge_group entries (the full-suite release gate). Skip the real steps on
+    # non-release merge_group entries to avoid contending for ubicloud-standard-16
+    # slots on every queue entry — the runner stays cheap there since every step
+    # is gated off (see skip_check below).
+    runs-on: "${{ (github.event_name == 'merge_group' && !startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
     timeout-minutes: 30
     needs: fmt_check
     # Same skip conditions as test_unit (see test_unit comment for details)
@@ -407,38 +451,46 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
-      - name: Detect release merge queue
-        id: release_check
+      # Skip every real step on non-release merge_group entries. PR-level CI
+      # already exercised the same code; running heavy ubicloud-standard-16
+      # simulations on every merge-queue entry contends for runner slots
+      # (issue #3973) without catching merge-time-specific regressions. The
+      # release merge_group entry (commit message starts with "build: release")
+      # still runs the full suite as the final pre-publish gate. The job
+      # remains present in the skipped case so branch-protection's required-
+      # check gate stays satisfied.
+      - name: Detect skip
+        id: skip_check
         env:
           EVENT_NAME: ${{ github.event_name }}
           MERGE_COMMIT_MSG: ${{ github.event.merge_group.head_commit.message }}
         run: |
-          if [[ "$EVENT_NAME" == "merge_group" && "$MERGE_COMMIT_MSG" == build:\ release* ]]; then
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-            echo "Skipping tests — release PRs only bump versions (main CI already validated)"
+          if [[ "$EVENT_NAME" == "merge_group" && "$MERGE_COMMIT_MSG" != build:\ release* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping Simulation on non-release merge_group — covered by PR-level CI; full suite runs on release merge_group (#3973)"
           else
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/checkout@v6
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
 
       - name: Install mold linker
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y mold
 
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         with:
           toolchain: 1.93.0
 
       - uses: Swatinem/rust-cache@v2
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
 
       - name: Install nextest
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       # Build the simulation test binaries and fdev up-front in one cargo
@@ -446,7 +498,7 @@ jobs:
       # next two steps can run their *tests* in parallel without contending
       # for the cargo target-dir lock.
       - name: Build simulation tests and fdev
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -460,7 +512,7 @@ jobs:
           cargo build -p fdev --release --locked
 
       - name: Run simulation tests (nextest + fdev in parallel)
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         env:
           RUST_LOG: info,turmoil=warn
         run: |
@@ -575,7 +627,7 @@ jobs:
           exit $FAILED
 
       - name: Upload simulation logs
-        if: always() && steps.release_check.outputs.is_release != 'true'
+        if: always() && steps.skip_check.outputs.skip != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: simulation-logs
@@ -586,13 +638,17 @@ jobs:
   nat_validation:
     name: NAT Validation
     needs: fmt_check
-    runs-on: "${{ (github.event_name == 'merge_group' && startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
+    # Run on the heavy runner for PRs (validates the change) and for release
+    # merge_group entries (the full-suite release gate). Skip the real steps on
+    # non-release merge_group entries to avoid contending for ubicloud-standard-16
+    # slots on every queue entry — the runner stays cheap there since every step
+    # is gated off (see skip_check below).
+    runs-on: "${{ (github.event_name == 'merge_group' && !startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
     timeout-minutes: 30
     # Skip on:
     # - push to main: PR already validated code before merge
-    # - release PRs: only bump versions
+    # - release branches: covered by the release merge_group gate
     # - dependabot PRs: just version bumps, Test job is sufficient
-    # For release merge_group entries: run on cheap runner and skip expensive steps
     if: |
       (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       !startsWith(github.head_ref, 'release/v') &&
@@ -603,47 +659,55 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
-      - name: Detect release merge queue
-        id: release_check
+      # Skip every real step on non-release merge_group entries. PR-level CI
+      # already exercised the same code; running heavy ubicloud-standard-16
+      # Docker NAT validation on every merge-queue entry contends for runner
+      # slots (issue #3973) without catching merge-time-specific regressions.
+      # The release merge_group entry (commit message starts with
+      # "build: release") still runs the full suite as the final pre-publish
+      # gate. The job remains present in the skipped case so branch-
+      # protection's required-check gate stays satisfied.
+      - name: Detect skip
+        id: skip_check
         env:
           EVENT_NAME: ${{ github.event_name }}
           MERGE_COMMIT_MSG: ${{ github.event.merge_group.head_commit.message }}
         run: |
-          if [[ "$EVENT_NAME" == "merge_group" && "$MERGE_COMMIT_MSG" == build:\ release* ]]; then
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-            echo "Skipping tests — release PRs only bump versions (main CI already validated)"
+          if [[ "$EVENT_NAME" == "merge_group" && "$MERGE_COMMIT_MSG" != build:\ release* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping NAT Validation on non-release merge_group — covered by PR-level CI; full suite runs on release merge_group (#3973)"
           else
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/checkout@v6
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
 
       - name: Install dependencies
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y mold liblzma-dev
 
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         with:
           toolchain: 1.93.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
 
       - name: Pull Docker images for NAT simulation
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         run: docker pull alpine:latest
 
       - name: Install nextest
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Build
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -653,7 +717,7 @@ jobs:
           make -C apps/freenet-ping -f run-ping.mk build
 
       - name: Run Docker NAT test
-        if: steps.release_check.outputs.is_release != 'true'
+        if: steps.skip_check.outputs.skip != 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold

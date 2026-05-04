@@ -68,163 +68,6 @@ pub(crate) enum OpNotAvailable {
     Completed,
 }
 
-/// Manages sub-operation tracking for atomic operation execution.
-/// Ensures atomicity: clients receive success only when all sub-operations succeed.
-#[derive(Default, Clone)]
-struct SubOperationTracker {
-    /// Parent-to-children mapping for sub-operation tracking.
-    sub_operations: Arc<DashMap<Transaction, HashSet<Transaction>>>,
-    /// Root operations awaiting sub-operation completion before client notification.
-    root_ops_awaiting_sub_ops: Arc<DashMap<Transaction, OpEnum>>,
-    /// Child-to-parent index for O(1) parent lookups.
-    parent_of: Arc<DashMap<Transaction, Transaction>>,
-    /// Expected sub-operation count per root operation. Pre-registered before spawning
-    /// to prevent race conditions where children complete before parent registration.
-    expected_sub_operations: Arc<DashMap<Transaction, usize>>,
-    /// Root operations with at least one failed sub-operation.
-    failed_parents: Arc<DashSet<Transaction>>,
-}
-
-/// Snapshot of per-map sizes held by `SubOperationTracker`.
-#[derive(Debug, Default)]
-struct SubOpSizes {
-    sub_operations: usize,
-    root_ops_awaiting_sub_ops: usize,
-    parent_of: usize,
-    expected_sub_operations: usize,
-    failed_parents: usize,
-}
-
-impl SubOperationTracker {
-    fn new() -> Self {
-        Self {
-            sub_operations: Arc::new(DashMap::new()),
-            root_ops_awaiting_sub_ops: Arc::new(DashMap::new()),
-            parent_of: Arc::new(DashMap::new()),
-            expected_sub_operations: Arc::new(DashMap::new()),
-            failed_parents: Arc::new(DashSet::new()),
-        }
-    }
-
-    fn sizes(&self) -> SubOpSizes {
-        SubOpSizes {
-            sub_operations: self.sub_operations.len(),
-            root_ops_awaiting_sub_ops: self.root_ops_awaiting_sub_ops.len(),
-            parent_of: self.parent_of.len(),
-            expected_sub_operations: self.expected_sub_operations.len(),
-            failed_parents: self.failed_parents.len(),
-        }
-    }
-
-    /// Marks a child operation as completed and decrements the expected counter.
-    /// Removes tracking entry when all expected children have completed.
-    fn mark_sub_op_completed(&self, root_tx: Transaction) {
-        let mut should_remove = false;
-        if let Some(mut expected) = self.expected_sub_operations.get_mut(&root_tx) {
-            if *expected > 0 {
-                *expected -= 1;
-                tracing::debug!(
-                    root_tx = %root_tx,
-                    remaining = *expected,
-                    "sub-operation completed"
-                );
-            }
-            if *expected == 0 {
-                should_remove = true;
-            }
-        }
-
-        if should_remove {
-            self.expected_sub_operations.remove(&root_tx);
-        }
-    }
-
-    fn remove_child_link(&self, parent: Transaction, child: Transaction) {
-        let should_remove_parent = if let Some(mut children) = self.sub_operations.get_mut(&parent)
-        {
-            children.remove(&child);
-            let is_empty = children.is_empty();
-            drop(children);
-            is_empty
-        } else {
-            false
-        };
-
-        if should_remove_parent {
-            self.sub_operations.remove(&parent);
-        }
-
-        self.parent_of.remove(&child);
-    }
-
-    fn cleanup_parent_tracking(&self, parent: Transaction) {
-        self.expected_sub_operations.remove(&parent);
-        self.sub_operations.remove(&parent);
-    }
-
-    /// Atomically registers both expected count and parent-child relationship.
-    /// This prevents race conditions where children complete before registration.
-    fn expect_and_register_sub_operation(&self, parent: Transaction, child: Transaction) {
-        // Increment expected count
-        self.expected_sub_operations
-            .entry(parent)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-
-        // Register parent-child relationship
-        self.sub_operations.entry(parent).or_default().insert(child);
-
-        self.parent_of.insert(child, parent);
-    }
-
-    /// Returns true if all child operations of the parent have completed.
-    fn all_sub_operations_completed(
-        &self,
-        parent: Transaction,
-        completed_ops: &DashSet<Transaction>,
-    ) -> bool {
-        if let Some(expected) = self.expected_sub_operations.get(&parent) {
-            if *expected > 0 {
-                return false;
-            }
-        }
-
-        match self.sub_operations.get(&parent) {
-            None => true,
-            Some(children) => children.iter().all(|child| completed_ops.contains(child)),
-        }
-    }
-
-    /// Returns the number of pending child operations for the parent.
-    fn count_pending_sub_operations(
-        &self,
-        parent: Transaction,
-        completed_ops: &DashSet<Transaction>,
-    ) -> usize {
-        match self.sub_operations.get(&parent) {
-            None => 0,
-            Some(children) => children
-                .iter()
-                .filter(|child| !completed_ops.contains(child))
-                .count(),
-        }
-    }
-
-    /// Check if a transaction is a sub-operation (has a parent transaction).
-    /// Sub-operations should not send responses directly to clients.
-    ///
-    /// Production guards now use `Transaction::is_sub_operation()` (structural
-    /// check) instead. This method remains for legacy relay paths and unit tests.
-    #[cfg(test)]
-    fn is_sub_operation(&self, tx: Transaction) -> bool {
-        self.parent_of.contains_key(&tx)
-    }
-
-    fn get_parent(&self, child: Transaction) -> Option<Transaction> {
-        self.parent_of.get(&child).map(|entry| *entry)
-    }
-}
-
 #[derive(Default)]
 struct Ops {
     connect: DashMap<Transaction, crate::operations::connect::ConnectOp>,
@@ -236,10 +79,10 @@ struct Ops {
     under_progress: DashSet<Transaction>,
 }
 
-/// Snapshot of per-map sizes held by `Ops` and `SubOperationTracker`.
-/// Emitted periodically from `garbage_cleanup_task` when
-/// `FREENET_MEMORY_STATS=1` is set, to help diagnose retained-state
-/// bloat without forcing a full heap profiler run.
+/// Snapshot of per-map sizes held by `Ops`. Emitted periodically from
+/// `garbage_cleanup_task` when `FREENET_MEMORY_STATS=1` is set, to help
+/// diagnose retained-state bloat without forcing a full heap profiler
+/// run.
 #[derive(Debug, Default)]
 struct OpsSizes {
     connect: usize,
@@ -281,8 +124,6 @@ pub(crate) struct OpManager {
     pub peer_ready: Arc<AtomicBool>,
     /// Whether this node is a gateway
     pub is_gateway: bool,
-    /// Sub-operation tracking for atomic operation execution
-    sub_op_tracker: SubOperationTracker,
     /// Waiters for contract storage notification.
     /// Operations can register to be notified when a specific contract is stored.
     contract_waiters:
@@ -381,7 +222,6 @@ impl Clone for OpManager {
             connect_forward_estimator: self.connect_forward_estimator.clone(),
             peer_ready: self.peer_ready.clone(),
             is_gateway: self.is_gateway,
-            sub_op_tracker: self.sub_op_tracker.clone(),
             contract_waiters: self.contract_waiters.clone(),
             neighbor_hosting: self.neighbor_hosting.clone(),
             interest_manager: self.interest_manager.clone(),
@@ -429,7 +269,6 @@ impl OpManager {
         } else {
             tracing::info_span!(parent: current_span, "garbage_cleanup_task")
         };
-        let sub_op_tracker = SubOperationTracker::new();
         let connect_forward_estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
         let request_router = Arc::new(OnceLock::new());
         let ch_outbound = Arc::new(ch_outbound);
@@ -452,7 +291,6 @@ impl OpManager {
                     ring.live_tx_tracker.clone(),
                     notification_channel.clone(),
                     event_register,
-                    sub_op_tracker.clone(),
                     result_router_tx.clone(),
                     request_router.clone(),
                     ring.clone(),
@@ -509,7 +347,6 @@ impl OpManager {
             connect_forward_estimator,
             peer_ready,
             is_gateway,
-            sub_op_tracker,
             contract_waiters,
             neighbor_hosting,
             interest_manager,
@@ -1085,134 +922,43 @@ impl OpManager {
         self.ops.under_progress.remove(&id);
         self.ops.completed.insert(id);
 
+        // Remove the per-type DashMap entry for this transaction.
+        //
+        // Legacy state-machine paths reach `completed` after `pop` already
+        // removed the entry, so the remove below is a no-op for them.
+        //
+        // Task-per-tx drivers use `OpCtx::send_and_await`, which loops the
+        // outbound message back through the event loop as an InboundMessage
+        // with `source_addr=None`. The originator's multi-hop branch in
+        // `process_message` (e.g. put.rs SendAndContinue when forwarding)
+        // returns a non-finalized state that `handle_op_result` pushes into
+        // `ops.<type>`. The bypass in `handle_pure_network_message_v1` then
+        // routes the terminal Response directly to the driver task, so the
+        // entry never re-enters `handle_op_request` and never gets popped.
+        // Without this remove, the entry leaks for OPERATION_TTL (60s) and
+        // pollutes `has_<type>_op` checks until the GC sweep clears it.
+        match id.transaction_type() {
+            TransactionType::Connect => {
+                self.ops.connect.remove(&id);
+            }
+            TransactionType::Put => {
+                self.ops.put.remove(&id);
+            }
+            TransactionType::Get => {
+                self.ops.get.remove(&id);
+            }
+            TransactionType::Subscribe => {
+                self.ops.subscribe.remove(&id);
+            }
+            TransactionType::Update => {
+                self.ops.update.remove(&id);
+            }
+        }
+
         // Clean up request router to prevent stale entries from blocking subsequent requests
         if let Some(router) = self.request_router.get() {
             router.complete_operation(id);
         }
-
-        if let Some(parent_tx) = self.sub_op_tracker.get_parent(id) {
-            self.sub_op_tracker.remove_child_link(parent_tx, id);
-            self.sub_op_tracker.mark_sub_op_completed(parent_tx);
-
-            let remaining = self
-                .sub_op_tracker
-                .count_pending_sub_operations(parent_tx, &self.ops.completed);
-            tracing::debug!(
-                %id,
-                %parent_tx,
-                remaining,
-                "child operation completed"
-            );
-
-            if self
-                .sub_op_tracker
-                .all_sub_operations_completed(parent_tx, &self.ops.completed)
-            {
-                if let Some((_key, parent_op)) = self
-                    .sub_op_tracker
-                    .root_ops_awaiting_sub_ops
-                    .remove(&parent_tx)
-                {
-                    tracing::info!(
-                        %parent_tx,
-                        "root operation completed after all children finished"
-                    );
-
-                    self.sub_op_tracker.cleanup_parent_tracking(parent_tx);
-                    self.sub_op_tracker.failed_parents.remove(&parent_tx);
-                    self.completed(parent_tx);
-
-                    let host_result = parent_op.to_host_result();
-                    self.send_client_result(parent_tx, host_result);
-                }
-            }
-        }
-    }
-
-    /// Atomically registers both expected count and parent-child relationship.
-    /// This prevents race conditions where children complete before registration.
-    pub fn expect_and_register_sub_operation(&self, parent: Transaction, child: Transaction) {
-        self.sub_op_tracker
-            .expect_and_register_sub_operation(parent, child);
-    }
-
-    /// Returns true if all child operations of the parent have completed.
-    pub fn all_sub_operations_completed(&self, parent: Transaction) -> bool {
-        self.sub_op_tracker
-            .all_sub_operations_completed(parent, &self.ops.completed)
-    }
-
-    /// Returns the number of pending child operations for the parent.
-    pub fn count_pending_sub_operations(&self, parent: Transaction) -> usize {
-        self.sub_op_tracker
-            .count_pending_sub_operations(parent, &self.ops.completed)
-    }
-
-    /// Handle sub-operation failure - propagate error to parent.
-    pub async fn sub_operation_failed(
-        &self,
-        child: Transaction,
-        error_msg: &str,
-    ) -> Result<(), OpError> {
-        tracing::error!(
-            child_tx = %child,
-            error = %error_msg,
-            "Sub-operation failed, propagating to root"
-        );
-
-        if let Some(parent_tx) = self.sub_op_tracker.get_parent(child) {
-            self.sub_op_tracker.remove_child_link(parent_tx, child);
-            self.sub_op_tracker.mark_sub_op_completed(parent_tx);
-
-            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: format!("Sub-operation {} failed: {}", child, error_msg).into(),
-            }
-            .into());
-
-            if self
-                .sub_op_tracker
-                .root_ops_awaiting_sub_ops
-                .remove(&parent_tx)
-                .is_some()
-            {
-                tracing::warn!(
-                    root_tx = %parent_tx,
-                    child_tx = %child,
-                    "Root operation aborted due to sub-operation failure"
-                );
-                self.sub_op_tracker.cleanup_parent_tracking(parent_tx);
-                self.completed(parent_tx);
-            } else {
-                tracing::warn!(
-                    root_tx = %parent_tx,
-                    child_tx = %child,
-                    "Sub-operation failed before root operation started awaiting"
-                );
-                self.sub_op_tracker.failed_parents.insert(parent_tx);
-                // Clean up tracking to prevent memory leak
-                self.sub_op_tracker.cleanup_parent_tracking(parent_tx);
-                // Mark parent as completed to prevent duplicate responses
-                self.completed(parent_tx);
-            }
-
-            self.send_client_result(parent_tx, error_result);
-        } else {
-            tracing::warn!(
-                child_tx = %child,
-                "Sub-operation failed but parent relationship was missing"
-            );
-        }
-        Ok(())
-    }
-
-    /// Exposes root operations awaiting sub-operation completion.
-    pub(crate) fn root_ops_awaiting_sub_ops(&self) -> &Arc<DashMap<Transaction, OpEnum>> {
-        &self.sub_op_tracker.root_ops_awaiting_sub_ops
-    }
-
-    /// Exposes failed parent operations.
-    pub(crate) fn failed_parents(&self) -> &Arc<DashSet<Transaction>> {
-        &self.sub_op_tracker.failed_parents
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
@@ -1713,7 +1459,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     live_tx_tracker: LiveTransactionTracker,
     event_loop_notifier: EventLoopNotificationsSender,
     mut event_register: ER,
-    sub_op_tracker: SubOperationTracker,
     result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
     ring: Arc<Ring>,
@@ -1737,12 +1482,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     let mut ttl_set = BTreeSet::new();
 
     let mut delayed = vec![];
-    let mut get_retried: std::collections::HashMap<Transaction, usize> =
-        std::collections::HashMap::new();
-    let mut subscribe_retried: std::collections::HashMap<Transaction, usize> =
-        std::collections::HashMap::new();
-    let mut put_retried: std::collections::HashMap<Transaction, usize> =
-        std::collections::HashMap::new();
     loop {
         crate::deterministic_select! {
             tx = new_transactions.recv() => {
@@ -1756,11 +1495,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 // Opt-in periodic memory-stats dump. Gated by env var so the
                 // hot path stays quiet in prod. Intended for local / CI sim
                 // runs where we want to correlate RSS growth with retained
-                // state in OpManager/SubOperationTracker.
+                // state in OpManager.
                 if std::env::var("FREENET_MEMORY_STATS").is_ok() {
                     use std::sync::atomic::Ordering;
                     let ops_sizes = ops.sizes();
-                    let sub_sizes = sub_op_tracker.sizes();
                     let pending_fetches = pending_contract_fetches.len();
                     let waiters_len = contract_waiters.lock().len();
                     let relay_inflight =
@@ -1825,11 +1563,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         ops_update = ops_sizes.update,
                         ops_completed = ops_sizes.completed,
                         ops_under_progress = ops_sizes.under_progress,
-                        sub_operations = sub_sizes.sub_operations,
-                        root_ops_awaiting_sub_ops = sub_sizes.root_ops_awaiting_sub_ops,
-                        parent_of = sub_sizes.parent_of,
-                        expected_sub_operations = sub_sizes.expected_sub_operations,
-                        failed_parents = sub_sizes.failed_parents,
                         pending_contract_fetches = pending_fetches,
                         contract_waiters = waiters_len,
                         relay_inflight = relay_inflight,
@@ -1878,436 +1611,41 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     }
                 }
 
-                // ACK-aware speculative retry for GET operations.
-                //
-                // When a relay forwards a GET request, it sends a ForwardingAck back
-                // to its upstream within milliseconds. If no ACK arrives within 3s,
-                // the downstream peer is likely dead — launch a speculative retry on
-                // a different path (same tx ID).
-                //
-                // If an ACK has been received, the chain is alive — trust it for
-                // PROGRESS_TIMEOUT (7s). If no response arrives within that window,
-                // the chain has stalled and we re-enable speculative retry (#3570).
-                // Without this, a single ACK permanently disables retry, causing
-                // the originator to wait the full OPERATION_TTL (60s) with no recovery.
-                //
-                // Only the originator speculates (max 2 parallel paths). Relay peers
-                // just forward once, so network overhead is bounded.
-                const ACK_TIMEOUT: Duration = Duration::from_secs(3);
-                const MAX_SPECULATIVE_PATHS: u8 = 2;
-                /// Time to wait after ForwardingAck before re-enabling retry.
-                /// If a relay ACKed but no response arrives within this window,
-                /// the downstream chain has likely stalled. Even a 4-hop chain
-                /// at 500ms/hop completes in ~2.5s; 7s gives ~3x headroom while
-                /// keeping worst-case stall detection under 10s.
-                const PROGRESS_TIMEOUT: Duration = Duration::from_secs(7);
-                {
-                    // Clean up entries for completed operations
-                    get_retried.retain(|tx, _| ops.get.contains_key(tx));
+                // Shared retry constants for SUBSCRIBE speculative retry below.
+                // (GET speculative retry was retired in #1454 Phase 5-final
+                // slice 1; SUBSCRIBE speculative retry was retired in
+                // Phase 5-final slice 1 follow-up — see comment below.
+                // The shared `ACK_TIMEOUT` / `MAX_SPECULATIVE_PATHS` /
+                // `PROGRESS_TIMEOUT` constants that both blocks consumed
+                // are no longer referenced and have been removed.)
 
-                    let mut retry_candidates: Vec<Transaction> = Vec::new();
-                    for entry in ops.get.iter() {
-                        let tx = *entry.key();
-                        let get_op = entry.value();
-
-                        // Only the originator speculates — relays just forward and ACK.
-                        if !get_op.is_client_initiated() {
-                            continue;
-                        }
-
-                        // Cap speculative paths to bound network overhead
-                        if get_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
-                            continue;
-                        }
-
-                        let elapsed = tx.elapsed();
-
-                        if get_op.ack_received {
-                            // ACK received — the chain was alive when the relay forwarded.
-                            // Trust it for PROGRESS_TIMEOUT, then re-enable retry if no
-                            // response has arrived (#3570: ForwardingAck retry-disable fix).
-                            if elapsed <= PROGRESS_TIMEOUT {
-                                continue;
-                            }
-                            // Chain has stalled past PROGRESS_TIMEOUT — fall through to retry.
-                            tracing::info!(
-                                %tx,
-                                elapsed_ms = elapsed.as_millis(),
-                                "GET chain stalled after ForwardingAck — re-enabling speculative retry"
-                            );
-                        }
-
-                        // No ACK after ACK_TIMEOUT, or ACK received but chain stalled
-                        // past PROGRESS_TIMEOUT — speculative retry with ±20% jitter
-                        let retry_count = get_retried.get(&tx).copied().unwrap_or(0);
-                        let base = if get_op.ack_received {
-                            // For stalled-after-ACK, use PROGRESS_TIMEOUT as the base
-                            // instead of ACK_TIMEOUT to avoid immediate rapid retries
-                            PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32)
-                        } else {
-                            ACK_TIMEOUT * (retry_count as u32 + 1)
-                        };
-                        // Only consume GlobalRng when elapsed exceeds 80% of base
-                        // (minimum possible jittered threshold). This avoids shifting
-                        // the global RNG state on every GC tick for ops that are
-                        // nowhere near retry time.
-                        let min_jittered = base.mul_f64(0.8);
-                        if elapsed > min_jittered {
-                            let jitter_factor: f64 =
-                                crate::config::GlobalRng::random_range(0.8..=1.2);
-                            let jitter = base.mul_f64(jitter_factor);
-                            if elapsed > jitter {
-                                retry_candidates.push(tx);
-                            }
-                        }
-                    }
-
-                    if !retry_candidates.is_empty() {
-                        // Collect all connected peers for DBF fallback (only when needed)
-                        let all_connected: Vec<_> = ring
-                            .connection_manager
-                            .get_connections_by_location()
-                            .values()
-                            .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
-                            .collect();
-
-                        for tx in retry_candidates {
-                            if let Some((_, get_op)) = ops.get.remove(&tx) {
-                                // Capture the stalled peer's routing info BEFORE retry
-                                // overwrites stats.next_peer (get.rs:1039).
-                                let stalled_peer_info = get_op.failure_routing_info();
-                                let max_htl = ring.max_hops_to_live;
-                                match get_op.retry_with_next_alternative(max_htl, &all_connected)
-                                {
-                                    Ok((mut new_op, msg)) => {
-                                        // Only report routing failure when we found an
-                                        // alternative. In small topologies (e.g., 3 nodes)
-                                        // the "stalled" peer may be the only relay — poisoning
-                                        // its routing score would make all future ops fail.
-                                        if let Some((peer, contract_location)) = stalled_peer_info
-                                        {
-                                            ring.routing_finished(crate::router::RouteEvent {
-                                                peer,
-                                                contract_location,
-                                                outcome: crate::router::RouteOutcome::Failure,
-                                                op_type: Some(crate::node::network_status::OpType::Get),
-                                            });
-                                        }
-                                        let msg = crate::message::NetMessage::from(msg);
-                                        // Track speculative path for ACK-aware retry bounds
-                                        new_op.speculative_paths += 1;
-                                        // Reset ack_received for the new path
-                                        new_op.ack_received = false;
-                                        // Insert op BEFORE sending message to avoid race
-                                        // where the response arrives before the op is stored.
-                                        ops.get.insert(tx, new_op);
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(1),
-                                            event_loop_notifier
-                                                .notifications_sender
-                                                .send(Either::Left(msg)),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {
-                                                // Count the retry now that message was sent
-                                                *get_retried.entry(tx).or_insert(0) += 1;
-                                            }
-                                            Ok(Err(_)) | Err(_) => {
-                                                // Channel closed or timeout — op is already
-                                                // stored, will be retried next tick.
-                                                tracing::warn!(
-                                                    %tx,
-                                                    "Failed to send GET retry message, \
-                                                     will retry next tick"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(get_op) => {
-                                        // No alternatives — put it back for normal timeout
-                                        ops.get.insert(tx, *get_op);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Periodically clean up stale pending_contract_fetches entries.
-                    // Entries older than 2x cooldown are removed to prevent unbounded growth.
-                    if tick_count % 12 == 0 {
-                        let cooldown_ms = crate::operations::update::CONTRACT_FETCH_COOLDOWN_MS;
-                        let now_ms = crate::config::GlobalSimulationTime::read_time_ms();
-                        pending_contract_fetches.retain(|_, ts| {
-                            now_ms.saturating_sub(*ts) < cooldown_ms * 2
-                        });
-                    }
+                // Periodically clean up stale pending_contract_fetches entries.
+                // Entries older than 2x cooldown are removed to prevent unbounded growth.
+                if tick_count % 12 == 0 {
+                    let cooldown_ms = crate::operations::update::CONTRACT_FETCH_COOLDOWN_MS;
+                    let now_ms = crate::config::GlobalSimulationTime::read_time_ms();
+                    pending_contract_fetches.retain(|_, ts| {
+                        now_ms.saturating_sub(*ts) < cooldown_ms * 2
+                    });
                 }
 
-                // ACK-aware speculative retry for SUBSCRIBE operations.
-                // Same logic as GET: 3s ACK timeout, max 2 speculative paths.
-                // Only the originator retries — relays just forward and ACK.
-                //
-                // Cap retries per GC tick to avoid flooding the notification channel.
-                // The gateway subscribes to 90+ contracts; retrying all at once saturates
-                // the 2048-capacity event loop channel, blocking UPDATEs and broadcasts.
-                const MAX_SUBSCRIBE_RETRIES_PER_TICK: usize = 10;
-                {
-                    // Clean up entries for completed operations
-                    subscribe_retried.retain(|tx, _| ops.subscribe.contains_key(tx));
-
-                    let mut retry_candidates: Vec<Transaction> = Vec::new();
-                    for entry in ops.subscribe.iter() {
-                        let tx = *entry.key();
-                        let sub_op = entry.value();
-
-                        // Only retry at the originator (no requester_addr means we initiated it).
-                        // Also skip ops without routing stats — these are unsubscribe-routing
-                        // ops created by create_unsubscribe_op(), which use the subscribe map
-                        // for address routing but should not be retried as subscribe requests.
-                        if !sub_op.is_originator() || sub_op.failure_routing_info().is_none() {
-                            continue;
-                        }
-
-                        // Cap speculative paths
-                        if sub_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
-                            continue;
-                        }
-
-                        let elapsed = tx.elapsed();
-
-                        if sub_op.ack_received {
-                            // ACK received — trust chain for PROGRESS_TIMEOUT, then
-                            // re-enable retry (matching GET/PUT behavior).
-                            if elapsed <= PROGRESS_TIMEOUT {
-                                continue;
-                            }
-                            tracing::info!(
-                                %tx,
-                                elapsed_ms = elapsed.as_millis(),
-                                "SUBSCRIBE chain stalled after ForwardingAck \
-                                 — re-enabling speculative retry"
-                            );
-                        }
-
-                        let retry_count = subscribe_retried.get(&tx).copied().unwrap_or(0);
-                        let base = if sub_op.ack_received {
-                            PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32)
-                        } else {
-                            ACK_TIMEOUT * (retry_count as u32 + 1)
-                        };
-                        // Only consume GlobalRng when elapsed exceeds 80% of base
-                        // (minimum possible jittered threshold). This avoids shifting
-                        // the global RNG state on every GC tick for ops that are
-                        // nowhere near retry time.
-                        let min_jittered = base.mul_f64(0.8);
-                        if elapsed > min_jittered {
-                            let jitter_factor: f64 =
-                                crate::config::GlobalRng::random_range(0.8..=1.2);
-                            let jitter = base.mul_f64(jitter_factor);
-                            if elapsed > jitter {
-                                retry_candidates.push(tx);
-                            }
-                        }
-                    }
-
-                    if !retry_candidates.is_empty() {
-                        // Collect all connected peers for fallback
-                        let all_connected: Vec<_> = ring
-                            .connection_manager
-                            .get_connections_by_location()
-                            .values()
-                            .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
-                            .collect();
-
-                        if retry_candidates.len() > MAX_SUBSCRIBE_RETRIES_PER_TICK {
-                            tracing::debug!(
-                                total = retry_candidates.len(),
-                                processing = MAX_SUBSCRIBE_RETRIES_PER_TICK,
-                                "Capping subscribe retries per tick"
-                            );
-                            // Sort by age (oldest first) to guarantee fairness:
-                            // shuffle would cause probabilistic starvation when
-                            // candidates consistently exceed the per-tick cap.
-                            retry_candidates.sort_by_cached_key(|tx| {
-                                std::cmp::Reverse(tx.elapsed())
-                            });
-                        }
-
-                        for tx in retry_candidates.into_iter().take(MAX_SUBSCRIBE_RETRIES_PER_TICK) {
-                            if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
-                                let stalled_peer_info = sub_op.failure_routing_info();
-                                let max_htl = ring.max_hops_to_live;
-                                match sub_op.retry_with_next_alternative(max_htl, &all_connected) {
-                                    Ok((mut new_op, msg)) => {
-                                        // Only report failure when alternative found (see GET comment).
-                                        if let Some((peer, contract_location)) = stalled_peer_info
-                                        {
-                                            ring.routing_finished(crate::router::RouteEvent {
-                                                peer,
-                                                contract_location,
-                                                outcome: crate::router::RouteOutcome::Failure,
-                                                op_type: Some(crate::node::network_status::OpType::Subscribe),
-                                            });
-                                        }
-                                        let msg = crate::message::NetMessage::from(msg);
-                                        // Track speculative path for ACK-aware retry bounds
-                                        new_op.speculative_paths += 1;
-                                        new_op.ack_received = false;
-                                        // Insert op BEFORE sending message to avoid race
-                                        ops.subscribe.insert(tx, new_op);
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(1),
-                                            event_loop_notifier
-                                                .notifications_sender
-                                                .send(Either::Left(msg)),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {
-                                                *subscribe_retried.entry(tx).or_insert(0) += 1;
-                                            }
-                                            Ok(Err(_)) | Err(_) => {
-                                                tracing::warn!(
-                                                    %tx,
-                                                    "Failed to send subscribe retry message, \
-                                                     will retry next tick"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(sub_op) => {
-                                        // No alternatives — put it back for normal timeout
-                                        ops.subscribe.insert(tx, *sub_op);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ACK-aware speculative retry for PUT operations.
-                // Same logic as GET/SUBSCRIBE: 3s ACK timeout, max 2 speculative paths.
-                // Only the originator retries — relays just forward and ACK.
-                {
-                    // Clean up entries for completed operations
-                    put_retried.retain(|tx, _| ops.put.contains_key(tx));
-
-                    let mut put_retry_candidates: Vec<Transaction> = Vec::new();
-                    for entry in ops.put.iter() {
-                        let tx = *entry.key();
-                        let put_op = entry.value();
-
-                        // Phase 3a (#1454): the task-per-tx PUT driver calls
-                        // `op_manager.completed(client_tx)` on terminal reply
-                        // but does not remove the DashMap entry that
-                        // `process_message` created (legacy `report_result`
-                        // removal path is bypassed). Without this guard the
-                        // GC re-dispatches the completed PUT ~9-15s later,
-                        // which replays `finalize_put_at_originator` side
-                        // effects — in particular it resurrects upstream
-                        // subscriptions on other nodes, breaking
-                        // `test_client_disconnect_triggers_upstream_unsubscribe`.
-                        if ops.completed.contains(&tx) {
-                            continue;
-                        }
-
-                        if !put_op.is_client_initiated() {
-                            continue;
-                        }
-                        if put_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
-                            continue;
-                        }
-
-                        let elapsed = tx.elapsed();
-
-                        if put_op.ack_received {
-                            if elapsed <= PROGRESS_TIMEOUT {
-                                continue;
-                            }
-                            tracing::info!(
-                                %tx,
-                                elapsed_ms = elapsed.as_millis(),
-                                "PUT chain stalled after ForwardingAck — re-enabling speculative retry"
-                            );
-                        }
-
-                        let retry_count = put_retried.get(&tx).copied().unwrap_or(0);
-                        let base = if put_op.ack_received {
-                            PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32)
-                        } else {
-                            ACK_TIMEOUT * (retry_count as u32 + 1)
-                        };
-                        let min_jittered = base.mul_f64(0.8);
-                        if elapsed > min_jittered {
-                            let jitter_factor: f64 =
-                                crate::config::GlobalRng::random_range(0.8..=1.2);
-                            let jitter = base.mul_f64(jitter_factor);
-                            if elapsed > jitter {
-                                put_retry_candidates.push(tx);
-                            }
-                        }
-                    }
-
-                    if !put_retry_candidates.is_empty() {
-                        let all_connected: Vec<_> = ring
-                            .connection_manager
-                            .get_connections_by_location()
-                            .values()
-                            .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
-                            .collect();
-
-                        for tx in put_retry_candidates {
-                            if let Some((_, put_op)) = ops.put.remove(&tx) {
-                                let stalled_peer_info = put_op.failure_routing_info();
-                                let max_htl = ring.max_hops_to_live;
-                                match put_op
-                                    .retry_with_next_alternative(max_htl, &all_connected)
-                                {
-                                    Ok((mut new_op, msg)) => {
-                                        // Only report failure when alternative found (see GET comment).
-                                        if let Some((peer, contract_location)) = stalled_peer_info
-                                        {
-                                            ring.routing_finished(crate::router::RouteEvent {
-                                                peer,
-                                                contract_location,
-                                                outcome: crate::router::RouteOutcome::Failure,
-                                                op_type: Some(crate::node::network_status::OpType::Put),
-                                            });
-                                        }
-                                        let msg = crate::message::NetMessage::from(msg);
-                                        new_op.speculative_paths += 1;
-                                        new_op.ack_received = false;
-                                        ops.put.insert(tx, new_op);
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(1),
-                                            event_loop_notifier
-                                                .notifications_sender
-                                                .send(Either::Left(msg)),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {
-                                                *put_retried.entry(tx).or_insert(0) += 1;
-                                            }
-                                            Ok(Err(_)) | Err(_) => {
-                                                tracing::warn!(
-                                                    %tx,
-                                                    "Failed to send PUT retry message, \
-                                                     will retry next tick"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(put_op) => {
-                                        // No alternatives — put it back for normal timeout
-                                        ops.put.insert(tx, *put_op);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                // SUBSCRIBE speculative-retry GC block was retired in #1454
+                // Phase 5-final: every originator-side writer into
+                // `ops.subscribe` (client-initiated, executor auto-subscribe,
+                // renewal, PUT/GET sub-op) now runs on the task-per-tx
+                // driver in `operations/subscribe/op_ctx_task.rs`, which
+                // owns its own retry loop via `advance_to_next_peer` and
+                // never inserts a `SubscribeOp` into the DashMap. The
+                // remaining legacy entries (relay state during multi-hop
+                // forwarding, `create_unsubscribe_op` routing entries) are
+                // not retry candidates: relay entries fail
+                // `is_originator()` and unsubscribe entries fail
+                // `failure_routing_info().is_some()`. The DashMap, the
+                // `SubscribeOp::ack_received` / `speculative_paths` fields,
+                // and `SubscribeMsg::ForwardingAck` survive only as wire-
+                // and bookkeeping-compat for legacy relay traffic;
+                // they are not load-bearing for retry. Mirrors the GET
+                // Phase 5-final retirement in PR #3974.
 
                 let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing.drain(..) {
@@ -2343,9 +1681,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     if still_waiting {
                         delayed.push(tx);
                     } else {
-                        get_retried.remove(&tx);
-                        subscribe_retried.remove(&tx);
-                        put_retried.remove(&tx);
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
                         tracing::info!(
@@ -2355,30 +1690,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             ttl_ms = crate::config::OPERATION_TTL.as_millis(),
                             "Transaction timed out"
                         );
-
-                        // Check if this is a child operation and propagate timeout to parent
-                        if let Some(parent_tx) = sub_op_tracker.get_parent(tx) {
-                            tracing::warn!(
-                                child_tx = %tx,
-                                parent_tx = %parent_tx,
-                                "Child operation timed out, propagating failure to parent"
-                            );
-
-                            // Clean up parent-child tracking to prevent DashMap entry leaks
-                            // in root_ops_awaiting_sub_ops (important for blocking subscriptions).
-                            sub_op_tracker.remove_child_link(parent_tx, tx);
-                            sub_op_tracker.mark_sub_op_completed(parent_tx);
-                            drop(sub_op_tracker.root_ops_awaiting_sub_ops.remove(&parent_tx));
-                            sub_op_tracker.cleanup_parent_tracking(parent_tx);
-
-                            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                                cause: format!("Sub-operation {} timed out", tx).into(),
-                            }.into());
-
-                            if let Err(e) = result_router_tx.try_send((parent_tx, error_result)) {
-                                tracing::warn!(tx = %parent_tx, error = %e, "failed to send sub-op timeout to result router");
-                            }
-                        }
 
                         notify_transaction_timeout(&event_loop_notifier, tx);
                         live_tx_tracker.remove_finished_transaction(tx);
@@ -2447,30 +1758,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             ttl_ms = crate::config::OPERATION_TTL.as_millis(),
                             "Transaction timed out"
                         );
-
-                        // Check if this is a child operation and propagate timeout to parent
-                        if let Some(parent_tx) = sub_op_tracker.get_parent(tx) {
-                            tracing::warn!(
-                                child_tx = %tx,
-                                parent_tx = %parent_tx,
-                                "Child operation timed out, propagating failure to parent"
-                            );
-
-                            // Clean up parent-child tracking to prevent DashMap entry leaks
-                            // in root_ops_awaiting_sub_ops (important for blocking subscriptions).
-                            sub_op_tracker.remove_child_link(parent_tx, tx);
-                            sub_op_tracker.mark_sub_op_completed(parent_tx);
-                            drop(sub_op_tracker.root_ops_awaiting_sub_ops.remove(&parent_tx));
-                            sub_op_tracker.cleanup_parent_tracking(parent_tx);
-
-                            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                                cause: format!("Sub-operation {} timed out", tx).into(),
-                            }.into());
-
-                            if let Err(e) = result_router_tx.try_send((parent_tx, error_result)) {
-                                tracing::warn!(tx = %parent_tx, error = %e, "failed to send sub-op timeout to result router");
-                            }
-                        }
 
                         notify_transaction_timeout(&event_loop_notifier, tx);
                         live_tx_tracker.remove_finished_transaction(tx);
@@ -2731,650 +2018,6 @@ mod tests {
         assert_eq!(waiters[&id1].len(), 1);
     }
 
-    #[test]
-    fn sub_operation_tracker_registers_parent_child_relationship() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child = Transaction::ttl_transaction();
-
-        tracker.expect_and_register_sub_operation(parent, child);
-
-        // Verify parent-child relationship is registered
-        assert!(
-            tracker.is_sub_operation(child),
-            "child should be registered as sub-operation"
-        );
-        assert_eq!(
-            tracker.get_parent(child),
-            Some(parent),
-            "child should have correct parent"
-        );
-
-        // Verify expected count is incremented
-        assert_eq!(
-            tracker.expected_sub_operations.get(&parent).map(|v| *v),
-            Some(1),
-            "expected count should be 1"
-        );
-
-        // Verify sub_operations mapping contains the child
-        assert!(
-            tracker
-                .sub_operations
-                .get(&parent)
-                .map(|children| children.contains(&child))
-                .unwrap_or(false),
-            "parent should have child in sub_operations map"
-        );
-    }
-
-    #[test]
-    fn sub_operation_tracker_registers_multiple_children() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child1 = Transaction::ttl_transaction();
-        let child2 = Transaction::ttl_transaction();
-        let child3 = Transaction::ttl_transaction();
-
-        tracker.expect_and_register_sub_operation(parent, child1);
-        tracker.expect_and_register_sub_operation(parent, child2);
-        tracker.expect_and_register_sub_operation(parent, child3);
-
-        // Verify all children are registered
-        assert!(tracker.is_sub_operation(child1));
-        assert!(tracker.is_sub_operation(child2));
-        assert!(tracker.is_sub_operation(child3));
-
-        // Verify expected count is correct
-        assert_eq!(
-            tracker.expected_sub_operations.get(&parent).map(|v| *v),
-            Some(3),
-            "expected count should be 3"
-        );
-
-        // Verify all children are in the sub_operations map
-        let children = tracker.sub_operations.get(&parent).unwrap();
-        assert_eq!(children.len(), 3);
-        assert!(children.contains(&child1));
-        assert!(children.contains(&child2));
-        assert!(children.contains(&child3));
-    }
-
-    #[test]
-    fn sub_operation_tracker_counts_pending_operations() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child1 = Transaction::ttl_transaction();
-        let child2 = Transaction::ttl_transaction();
-        let child3 = Transaction::ttl_transaction();
-
-        tracker.expect_and_register_sub_operation(parent, child1);
-        tracker.expect_and_register_sub_operation(parent, child2);
-        tracker.expect_and_register_sub_operation(parent, child3);
-
-        let completed = DashSet::new();
-
-        // Initially, all 3 should be pending
-        assert_eq!(
-            tracker.count_pending_sub_operations(parent, &completed),
-            3,
-            "should have 3 pending operations"
-        );
-
-        // Mark first child as completed
-        completed.insert(child1);
-        assert_eq!(
-            tracker.count_pending_sub_operations(parent, &completed),
-            2,
-            "should have 2 pending operations after completing child1"
-        );
-
-        // Mark second child as completed
-        completed.insert(child2);
-        assert_eq!(
-            tracker.count_pending_sub_operations(parent, &completed),
-            1,
-            "should have 1 pending operation after completing child2"
-        );
-
-        // Mark third child as completed
-        completed.insert(child3);
-        assert_eq!(
-            tracker.count_pending_sub_operations(parent, &completed),
-            0,
-            "should have 0 pending operations after completing all children"
-        );
-    }
-
-    #[test]
-    fn sub_operation_tracker_all_sub_operations_completed() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child1 = Transaction::ttl_transaction();
-        let child2 = Transaction::ttl_transaction();
-
-        tracker.expect_and_register_sub_operation(parent, child1);
-        tracker.expect_and_register_sub_operation(parent, child2);
-
-        let completed = DashSet::new();
-
-        // Not all completed initially
-        assert!(
-            !tracker.all_sub_operations_completed(parent, &completed),
-            "should return false when no children completed"
-        );
-
-        // Complete first child
-        completed.insert(child1);
-        tracker.mark_sub_op_completed(parent);
-        assert!(
-            !tracker.all_sub_operations_completed(parent, &completed),
-            "should return false when only one child completed"
-        );
-
-        // Complete second child
-        completed.insert(child2);
-        tracker.mark_sub_op_completed(parent);
-        assert!(
-            tracker.all_sub_operations_completed(parent, &completed),
-            "should return true when all children completed"
-        );
-    }
-
-    #[test]
-    fn sub_operation_tracker_cleanup_parent_tracking() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child1 = Transaction::ttl_transaction();
-        let child2 = Transaction::ttl_transaction();
-
-        tracker.expect_and_register_sub_operation(parent, child1);
-        tracker.expect_and_register_sub_operation(parent, child2);
-
-        // Verify tracking is set up
-        assert!(tracker.expected_sub_operations.contains_key(&parent));
-        assert!(tracker.sub_operations.contains_key(&parent));
-
-        // Cleanup parent tracking
-        tracker.cleanup_parent_tracking(parent);
-
-        // Verify tracking is removed
-        assert!(
-            !tracker.expected_sub_operations.contains_key(&parent),
-            "expected_sub_operations should be cleaned up"
-        );
-        assert!(
-            !tracker.sub_operations.contains_key(&parent),
-            "sub_operations should be cleaned up"
-        );
-
-        // Note: parent_of mappings for children are NOT cleaned up by cleanup_parent_tracking
-        // They should be cleaned up by remove_child_link when each child completes
-    }
-
-    #[test]
-    fn sub_operation_tracker_remove_child_link() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child1 = Transaction::ttl_transaction();
-        let child2 = Transaction::ttl_transaction();
-
-        tracker.expect_and_register_sub_operation(parent, child1);
-        tracker.expect_and_register_sub_operation(parent, child2);
-
-        // Remove first child link
-        tracker.remove_child_link(parent, child1);
-
-        // Verify child1 is removed from parent mapping
-        assert!(
-            !tracker.parent_of.contains_key(&child1),
-            "child1 should be removed from parent_of"
-        );
-        assert!(
-            tracker
-                .sub_operations
-                .get(&parent)
-                .map(|children| !children.contains(&child1))
-                .unwrap_or(false),
-            "child1 should be removed from sub_operations"
-        );
-
-        // Verify child2 still exists
-        assert!(
-            tracker.parent_of.contains_key(&child2),
-            "child2 should still be in parent_of"
-        );
-        assert!(
-            tracker.sub_operations.contains_key(&parent),
-            "parent should still be in sub_operations"
-        );
-
-        // Remove second child link
-        tracker.remove_child_link(parent, child2);
-
-        // Verify parent is removed from sub_operations when last child is removed
-        assert!(
-            !tracker.sub_operations.contains_key(&parent),
-            "parent should be removed from sub_operations when all children removed"
-        );
-        assert!(
-            !tracker.parent_of.contains_key(&child2),
-            "child2 should be removed from parent_of"
-        );
-    }
-
-    #[test]
-    fn sub_operation_tracker_mark_sub_op_completed_decrements_counter() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child1 = Transaction::ttl_transaction();
-        let child2 = Transaction::ttl_transaction();
-        let child3 = Transaction::ttl_transaction();
-
-        tracker.expect_and_register_sub_operation(parent, child1);
-        tracker.expect_and_register_sub_operation(parent, child2);
-        tracker.expect_and_register_sub_operation(parent, child3);
-
-        // Initial count should be 3
-        assert_eq!(
-            tracker.expected_sub_operations.get(&parent).map(|v| *v),
-            Some(3)
-        );
-
-        // Mark one completed
-        tracker.mark_sub_op_completed(parent);
-        assert_eq!(
-            tracker.expected_sub_operations.get(&parent).map(|v| *v),
-            Some(2)
-        );
-
-        // Mark another completed
-        tracker.mark_sub_op_completed(parent);
-        assert_eq!(
-            tracker.expected_sub_operations.get(&parent).map(|v| *v),
-            Some(1)
-        );
-
-        // Mark last one completed
-        tracker.mark_sub_op_completed(parent);
-
-        // Should be removed when count reaches 0
-        assert!(
-            !tracker.expected_sub_operations.contains_key(&parent),
-            "expected_sub_operations entry should be removed when count reaches 0"
-        );
-    }
-
-    #[test]
-    fn sub_operation_tracker_bidirectional_mapping_consistency() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child1 = Transaction::ttl_transaction();
-        let child2 = Transaction::ttl_transaction();
-
-        tracker.expect_and_register_sub_operation(parent, child1);
-        tracker.expect_and_register_sub_operation(parent, child2);
-
-        // Verify bidirectional mapping: parent -> children
-        let children = tracker.sub_operations.get(&parent).unwrap();
-        assert_eq!(children.len(), 2);
-        assert!(children.contains(&child1));
-        assert!(children.contains(&child2));
-
-        // Verify bidirectional mapping: child -> parent
-        assert_eq!(tracker.get_parent(child1), Some(parent));
-        assert_eq!(tracker.get_parent(child2), Some(parent));
-    }
-
-    #[test]
-    fn sub_operation_tracker_prevents_race_condition_with_atomic_registration() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child = Transaction::ttl_transaction();
-
-        // Atomically register both expected count and relationship
-        tracker.expect_and_register_sub_operation(parent, child);
-
-        // Both registrations should happen together
-        assert!(
-            tracker.expected_sub_operations.contains_key(&parent),
-            "expected count should be registered"
-        );
-        assert!(
-            tracker.is_sub_operation(child),
-            "child should be registered as sub-operation"
-        );
-        assert!(
-            tracker.sub_operations.contains_key(&parent),
-            "parent-child mapping should be registered"
-        );
-    }
-
-    #[test]
-    fn sub_operation_tracker_handles_no_children() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let completed = DashSet::new();
-
-        // Parent with no children should be considered complete
-        assert!(
-            tracker.all_sub_operations_completed(parent, &completed),
-            "parent with no children should be complete"
-        );
-
-        // Count should be 0 for parent with no children
-        assert_eq!(
-            tracker.count_pending_sub_operations(parent, &completed),
-            0,
-            "parent with no children should have 0 pending operations"
-        );
-    }
-
-    #[test]
-    fn sub_operation_tracker_does_not_decrement_below_zero() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-
-        // Try to mark completed without any registered children
-        tracker.mark_sub_op_completed(parent);
-
-        // Should not panic or create negative count
-        assert!(
-            !tracker.expected_sub_operations.contains_key(&parent),
-            "should not create entry for non-existent parent"
-        );
-    }
-
-    /// Test that simulates the race condition where a child completes during parent registration.
-    ///
-    /// The `expect_and_register_sub_operation` method performs 3 DashMap operations:
-    /// 1. Increment expected_sub_operations count
-    /// 2. Add child to sub_operations set
-    /// 3. Add parent_of mapping
-    ///
-    /// This test verifies that even if we simulate a child completion between these
-    /// operations, the tracker remains in a consistent state.
-    ///
-    /// Note: In the current implementation, these operations are NOT truly atomic,
-    /// but the design ensures safety: expected_sub_operations is incremented FIRST,
-    /// so even if a child completes early, the counter is already set.
-    #[test]
-    fn sub_operation_tracker_child_completion_during_registration_race_simulation() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child = Transaction::ttl_transaction();
-        let completed = DashSet::new();
-
-        // Step 1: Manually simulate partial registration - only increment expected count
-        tracker
-            .expected_sub_operations
-            .entry(parent)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-
-        // At this point, if a child "completed", it would decrement the counter
-        // Simulate child completion BEFORE full registration
-        tracker.mark_sub_op_completed(parent);
-
-        // Counter should be 0 now (decremented from 1)
-        assert!(
-            !tracker.expected_sub_operations.contains_key(&parent),
-            "Counter should be removed after decrement to 0"
-        );
-
-        // Now complete the registration (simulating the rest of expect_and_register_sub_operation)
-        tracker
-            .sub_operations
-            .entry(parent)
-            .or_default()
-            .insert(child);
-        tracker.parent_of.insert(child, parent);
-
-        // Even after this race, the child is registered but counter is 0
-        // This means all_sub_operations_completed would check sub_operations set
-        completed.insert(child);
-        assert!(
-            tracker.all_sub_operations_completed(parent, &completed),
-            "Should detect completion even after race (child is in completed set)"
-        );
-    }
-
-    /// Test that multiple children completing concurrently maintain correct counter.
-    ///
-    /// Simulates rapid completion of children to verify the counter stays consistent.
-    #[test]
-    fn sub_operation_tracker_multiple_children_concurrent_completion() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let tracker = Arc::new(SubOperationTracker::new());
-        let parent = Transaction::ttl_transaction();
-        let num_children = 10;
-
-        // Register all children first
-        let mut children = Vec::new();
-        for _ in 0..num_children {
-            let child = Transaction::ttl_transaction();
-            children.push(child);
-            tracker.expect_and_register_sub_operation(parent, child);
-        }
-
-        assert_eq!(
-            tracker.expected_sub_operations.get(&parent).map(|v| *v),
-            Some(num_children),
-            "Should have {} expected children",
-            num_children
-        );
-
-        // Simulate concurrent completions using threads
-        let completion_count = Arc::new(AtomicUsize::new(0));
-        let handles: Vec<_> = children
-            .into_iter()
-            .map(|_child| {
-                let tracker = Arc::clone(&tracker);
-                let count = Arc::clone(&completion_count);
-                std::thread::spawn(move || {
-                    tracker.mark_sub_op_completed(parent);
-                    count.fetch_add(1, Ordering::SeqCst);
-                })
-            })
-            .collect();
-
-        // Wait for all completions
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Verify all completions were counted
-        assert_eq!(
-            completion_count.load(Ordering::SeqCst),
-            num_children,
-            "All completions should have been processed"
-        );
-
-        // Verify counter is removed (decremented to 0)
-        assert!(
-            !tracker.expected_sub_operations.contains_key(&parent),
-            "Expected counter should be removed when all children complete"
-        );
-    }
-
-    /// Test that remove_put_and_report_failure returns false for non-existent tx.
-    /// (Ring construction is complex; individual components are unit-tested separately:
-    ///  - PutOp::failure_routing_info() tested in operations/put.rs
-    ///  - report_timeout_failure() calls ring.routing_finished() which calls Router::add_event()
-    ///  - Router::add_event() tested in router.rs)
-    #[test]
-    fn remove_put_returns_false_for_missing_tx() {
-        let ops = Ops::default();
-        let tx = Transaction::new::<crate::operations::put::PutMsg>();
-
-        // Without Ring, test the Ops-level behavior: removal returns false for missing tx
-        assert!(!ops.put.contains_key(&tx));
-        // The DashMap::remove returns None for missing keys
-        assert!(ops.put.remove(&tx).is_none());
-    }
-
-    /// Test that remove_put actually removes from the Ops map when present.
-    #[test]
-    fn remove_put_removes_from_ops_map() {
-        let ops = Ops::default();
-        let tx = Transaction::new::<crate::operations::put::PutMsg>();
-
-        let put_op = crate::operations::put::PutOp::new_empty_for_test(tx);
-        ops.put.insert(tx, put_op);
-        assert!(ops.put.contains_key(&tx));
-
-        // Verify removal works
-        let removed = ops.put.remove(&tx);
-        assert!(removed.is_some());
-        assert!(!ops.put.contains_key(&tx));
-    }
-
-    /// Test that remove_update returns None for missing tx.
-    #[test]
-    fn remove_update_returns_none_for_missing_tx() {
-        let ops = Ops::default();
-        let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
-        assert!(ops.update.remove(&tx).is_none());
-    }
-
-    /// Test that failed child races with parent completion check.
-    ///
-    /// Scenario: A child fails while the parent is checking if all sub-operations completed.
-    /// The failed_parents set should be updated correctly.
-    #[test]
-    fn sub_operation_tracker_failed_child_races_parent_completion() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let child1 = Transaction::ttl_transaction();
-        let child2 = Transaction::ttl_transaction();
-        let completed = DashSet::new();
-
-        // Register children
-        tracker.expect_and_register_sub_operation(parent, child1);
-        tracker.expect_and_register_sub_operation(parent, child2);
-
-        // Child1 completes successfully
-        completed.insert(child1);
-        tracker.mark_sub_op_completed(parent);
-        tracker.remove_child_link(parent, child1);
-
-        // Before child2 completes, check completion status
-        assert!(
-            !tracker.all_sub_operations_completed(parent, &completed),
-            "Should not be complete while child2 is pending"
-        );
-
-        // Now child2 fails - in real code this would call sub_operation_failed
-        // which marks the parent as failed
-        tracker.failed_parents.insert(parent);
-
-        // Even if we mark child2 complete, parent is failed
-        completed.insert(child2);
-        tracker.mark_sub_op_completed(parent);
-
-        // Verify parent is in failed_parents
-        assert!(
-            tracker.failed_parents.contains(&parent),
-            "Parent should be marked as failed"
-        );
-
-        // all_sub_operations_completed returns true (children are done),
-        // but the failed_parents check would catch this in handle_op_result
-        assert!(
-            tracker.all_sub_operations_completed(parent, &completed),
-            "All children completed (even though one failed)"
-        );
-    }
-
-    /// Test interleaved registration and completion across multiple parents.
-    ///
-    /// Verifies that tracking for different parents doesn't interfere.
-    #[test]
-    fn sub_operation_tracker_multiple_parents_interleaved_operations() {
-        let tracker = SubOperationTracker::new();
-        let parent1 = Transaction::ttl_transaction();
-        let parent2 = Transaction::ttl_transaction();
-        let child1a = Transaction::ttl_transaction();
-        let child1b = Transaction::ttl_transaction();
-        let child2a = Transaction::ttl_transaction();
-        let completed = DashSet::new();
-
-        // Interleaved registrations
-        tracker.expect_and_register_sub_operation(parent1, child1a);
-        tracker.expect_and_register_sub_operation(parent2, child2a);
-        tracker.expect_and_register_sub_operation(parent1, child1b);
-
-        // Verify correct parent relationships
-        assert_eq!(tracker.get_parent(child1a), Some(parent1));
-        assert_eq!(tracker.get_parent(child1b), Some(parent1));
-        assert_eq!(tracker.get_parent(child2a), Some(parent2));
-
-        // Complete parent1's children
-        completed.insert(child1a);
-        tracker.mark_sub_op_completed(parent1);
-        completed.insert(child1b);
-        tracker.mark_sub_op_completed(parent1);
-
-        // Parent1 should be complete, parent2 should not
-        assert!(
-            tracker.all_sub_operations_completed(parent1, &completed),
-            "Parent1 should be complete"
-        );
-        assert!(
-            !tracker.all_sub_operations_completed(parent2, &completed),
-            "Parent2 should not be complete yet"
-        );
-
-        // Complete parent2's child
-        completed.insert(child2a);
-        tracker.mark_sub_op_completed(parent2);
-
-        assert!(
-            tracker.all_sub_operations_completed(parent2, &completed),
-            "Parent2 should now be complete"
-        );
-    }
-
-    /// Test that the tracker handles rapid registration-completion cycles.
-    ///
-    /// Simulates a stress scenario where children are registered and completed
-    /// in rapid succession to verify counter consistency.
-    #[test]
-    fn sub_operation_tracker_rapid_registration_completion_cycles() {
-        let tracker = SubOperationTracker::new();
-        let parent = Transaction::ttl_transaction();
-        let completed = DashSet::new();
-
-        // Perform multiple rapid cycles
-        for _ in 0..100 {
-            let child = Transaction::ttl_transaction();
-
-            // Register
-            tracker.expect_and_register_sub_operation(parent, child);
-            assert!(
-                tracker.expected_sub_operations.get(&parent).is_some(),
-                "Should have expected counter after registration"
-            );
-
-            // Complete
-            completed.insert(child);
-            tracker.mark_sub_op_completed(parent);
-            tracker.remove_child_link(parent, child);
-        }
-
-        // After all cycles, everything should be cleaned up
-        assert!(
-            tracker.all_sub_operations_completed(parent, &completed),
-            "All operations should be complete"
-        );
-        assert!(
-            !tracker.sub_operations.contains_key(&parent),
-            "sub_operations should be empty after all children removed"
-        );
-    }
-
     mod record_connect_uphill_timeout_tests {
         use super::super::record_connect_uphill_timeout;
         use crate::message::Transaction;
@@ -3488,66 +2131,6 @@ mod tests {
         }
     }
 
-    /// Regression test for #3535: age-based retry prioritization prevents starvation.
-    ///
-    /// When retry candidates exceed MAX_SUBSCRIBE_RETRIES_PER_TICK, the oldest
-    /// transactions must be processed first (FIFO fairness). Random shuffling
-    /// would cause probabilistic starvation where some transactions could timeout
-    /// without ever being retried.
-    #[test]
-    fn subscribe_retry_candidates_sorted_oldest_first() {
-        use crate::config::GlobalSimulationTime;
-        use crate::operations::subscribe::SubscribeMsg;
-
-        let base_time: u64 = 1_700_000_000_000; // arbitrary epoch ms
-
-        // Create transactions at different simulation times so they have
-        // different ages. Oldest transaction is created first (lowest timestamp).
-        let mut txs = Vec::new();
-        for i in 0..20u64 {
-            GlobalSimulationTime::set_time_ms(base_time + i * 1000);
-            txs.push(Transaction::new::<SubscribeMsg>());
-        }
-
-        // Advance simulation time so elapsed() returns meaningful durations.
-        // tx[0] was created at base_time, tx[19] at base_time + 19s.
-        // At base_time + 30s: tx[0].elapsed() = 30s, tx[19].elapsed() = 11s.
-        GlobalSimulationTime::set_time_ms(base_time + 30_000);
-
-        // Shuffle to simulate arbitrary DashMap iteration order.
-        let mut candidates = txs.clone();
-        candidates.reverse();
-
-        // Apply the same sorting logic used in garbage_cleanup_task.
-        candidates.sort_by_cached_key(|tx| std::cmp::Reverse(tx.elapsed()));
-
-        // Verify: oldest transactions (largest elapsed) come first.
-        for window in candidates.windows(2) {
-            assert!(
-                window[0].elapsed() >= window[1].elapsed(),
-                "candidates not sorted oldest-first: {:?} < {:?}",
-                window[0].elapsed(),
-                window[1].elapsed(),
-            );
-        }
-
-        // The first candidate should be the oldest transaction (txs[0]).
-        assert_eq!(
-            candidates[0].elapsed(),
-            txs[0].elapsed(),
-            "oldest transaction should be first after sorting"
-        );
-
-        // The last candidate should be the newest transaction (txs[19]).
-        assert_eq!(
-            candidates[19].elapsed(),
-            txs[19].elapsed(),
-            "newest transaction should be last after sorting"
-        );
-
-        GlobalSimulationTime::clear_time();
-    }
-
     // ── has_get_op unit tests ─────────────────────────────────────────────
     //
     // `has_get_op` is a thin wrapper over `self.ops.get.contains_key`.
@@ -3574,8 +2157,8 @@ mod tests {
 
         let ops = Ops::default();
         let instance_id = ContractInstanceId::new([0u8; 32]);
-        let get_op = crate::operations::get::start_op(instance_id, false, false, false);
-        let tx = get_op.id;
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let get_op = crate::operations::get::start_op_with_id(instance_id, false, false, false, tx);
 
         // Before insert: absent
         assert!(

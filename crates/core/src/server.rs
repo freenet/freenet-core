@@ -390,10 +390,6 @@ impl AllowedSourceCidrs {
     pub(crate) fn contains_ip(&self, ip: &IpAddr) -> bool {
         self.0.iter().any(|net| net.contains(ip))
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }
 
 /// Minimum IPv4 CIDR prefix length the operator allowlist will accept.

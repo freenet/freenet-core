@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.49"
+version = "0.2.52"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -13,12 +13,17 @@ readme = "README.md"
 # Minimum compatible protocol version. Peers older than this are rejected.
 # Updated by scripts/release.sh during releases. The env var
 # FREENET_MIN_COMPATIBLE_VERSION overrides this at build time.
-min-compatible-version = "0.2.48"
+min-compatible-version = "0.2.51"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
 pkg-fmt = "tgz"
 bin-dir = "freenet"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.zip"
+pkg-fmt = "zip"
+bin-dir = "freenet.exe"
 
 [[bin]]
 name = "freenet"
@@ -39,7 +44,6 @@ chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 clap = { features = ["derive", "env"], workspace = true }
 cookie = "0.18"
-crossbeam = { workspace = true }
 ctrlc = { features = ["termination"], workspace = true }
 dashmap = { workspace = true }
 delegate = { workspace = true }

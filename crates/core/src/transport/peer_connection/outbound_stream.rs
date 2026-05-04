@@ -683,18 +683,18 @@ mod tests {
     use crate::config::GlobalExecutor;
     use crate::simulation::{RealTime, VirtualTime};
     use crate::transport::congestion_control::CongestionControlConfig;
-    use crate::transport::fast_channel::{self, FastSender};
     use crate::transport::ledbat::LedbatConfig;
     use crate::transport::packet_data::PacketData;
     use crate::transport::token_bucket::TokenBucket;
+    use tokio::sync::mpsc;
 
     /// Simple test socket that writes to a channel
     struct TestSocket {
-        sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>,
+        sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
     }
 
     impl TestSocket {
-        fn new(sender: fast_channel::FastSender<(SocketAddr, Arc<[u8]>)>) -> Self {
+        fn new(sender: mpsc::Sender<(SocketAddr, Arc<[u8]>)>) -> Self {
             Self { sender }
         }
     }
@@ -710,7 +710,7 @@ mod tests {
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
             self.sender
-                .send_async((target, buf.into()))
+                .send((target, buf.into()))
                 .await
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             Ok(buf.len())
@@ -718,7 +718,7 @@ mod tests {
 
         fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
             self.sender
-                .send((target, buf.into()))
+                .blocking_send((target, buf.into()))
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             Ok(buf.len())
         }
@@ -726,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_success() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, outbound_receiver) = fast_channel::bounded(1);
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let mut message = vec![0u8; 100_000];
         crate::config::GlobalRng::fill_bytes(&mut message);
@@ -774,7 +774,7 @@ mod tests {
         ));
 
         let mut inbound_bytes = Vec::with_capacity(message.len());
-        while let Ok((_, packet)) = outbound_receiver.recv_async().await {
+        while let Some((_, packet)) = outbound_receiver.recv().await {
             let decrypted_packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
                 .try_decrypt_sym(&cipher)
                 .map_err(|e| e.to_string())?;
@@ -796,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_with_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, outbound_receiver) = fast_channel::bounded(100);
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
         let last_packet_id = Arc::new(AtomicU32::new(0));
@@ -836,14 +836,14 @@ mod tests {
         let start_time = tokio::time::Instant::now();
 
         // Clone sender for receiver task termination
-        let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
+        let sender_clone: mpsc::Sender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
         let key_clone = key.clone();
 
         // Spawn receiver task to collect packets
         let receiver_task = GlobalExecutor::spawn(async move {
             let mut packet_count = 0;
             let mut total_bytes = 0;
-            while let Ok((addr, packet)) = outbound_receiver.recv_async().await {
+            while let Some((addr, packet)) = outbound_receiver.recv().await {
                 assert_eq!(addr, destination_addr);
                 packet_count += 1;
                 total_bytes += packet.len();
@@ -915,7 +915,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, outbound_receiver) = fast_channel::bounded(100);
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
         let last_packet_id = Arc::new(AtomicU32::new(0));
@@ -948,12 +948,12 @@ mod tests {
         let start_time = tokio::time::Instant::now();
 
         // Clone sender for receiver task termination
-        let sender_clone: FastSender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
+        let sender_clone: mpsc::Sender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
 
         // Spawn receiver task to collect packets
         let receiver_task = GlobalExecutor::spawn(async move {
             let mut packet_count = 0;
-            while let Ok((addr, _packet)) = outbound_receiver.recv_async().await {
+            while let Some((addr, _packet)) = outbound_receiver.recv().await {
                 assert_eq!(addr, destination_addr);
                 packet_count += 1;
             }
@@ -1005,7 +1005,7 @@ mod tests {
     /// cwnd is too small for any packet (#3608).
     #[tokio::test(start_paused = true)]
     async fn test_send_stream_cwnd_wait_timeout() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, _outbound_receiver) = fast_channel::bounded(100);
+        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let message = vec![0u8; 10_000];
         let cipher = {
@@ -1156,7 +1156,7 @@ mod tests {
     async fn test_pipe_stream_cwnd_wait_timeout() -> Result<(), Box<dyn std::error::Error>> {
         use crate::transport::peer_connection::streaming::StreamHandle;
 
-        let (outbound_sender, _outbound_receiver) = fast_channel::bounded(100);
+        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let cipher = {
             let mut key = [0u8; 16];

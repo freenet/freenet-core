@@ -108,6 +108,31 @@ pub struct SubscribeResult {
     pub expires_at: Instant,
 }
 
+/// Lease-tracked active subscription state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SubscriptionLease {
+    /// First successful subscribe — preserved across renewals so the
+    /// dashboard can show continuous subscription duration.
+    pub subscribed_since: Instant,
+    /// When the lease expires unless renewed.
+    pub expires_at: Instant,
+    /// Most recent state update observed (for dashboard display).
+    pub last_updated: Option<Instant>,
+}
+
+/// Public dashboard snapshot of one subscribed contract.
+///
+/// Durations are computed inside `HostingManager` so the dashboard does
+/// not need to hold a `tokio::time::Instant` reference.
+#[derive(Debug, Clone)]
+pub struct SubscribedContractSnapshot {
+    pub key: ContractKey,
+    /// Seconds since the subscription was first established (preserved across renewals).
+    pub subscribed_secs: u64,
+    /// Seconds since the most recent observed state update, if any.
+    pub last_updated_secs: Option<u64>,
+}
+
 // =============================================================================
 // HostingManager
 // =============================================================================
@@ -130,9 +155,11 @@ pub struct SubscribeResult {
 /// - Active subscriptions and client subscriptions prevent eviction
 /// - TTL protects recently accessed contracts from premature eviction
 pub(crate) struct HostingManager {
-    /// Active subscriptions with lease expiry timestamps.
-    /// Key: ContractKey, Value: expiry timestamp
-    active_subscriptions: DashMap<ContractKey, Instant>,
+    /// Active subscriptions with lease state and dashboard telemetry.
+    /// Holds the lease expiry plus enough history (subscribed_since,
+    /// last_updated) for the local-peer dashboard to render this map
+    /// directly without a parallel mirror.
+    active_subscriptions: DashMap<ContractKey, SubscriptionLease>,
 
     /// Contracts where a local client (WebSocket) is actively subscribed.
     /// Prevents hosting cache eviction while client subscriptions exist.
@@ -203,12 +230,29 @@ impl HostingManager {
     ///
     /// Creates a new subscription or renews an existing one. The subscription
     /// will expire after `SUBSCRIPTION_LEASE_DURATION` unless renewed.
+    /// `subscribed_since` is preserved on renewal so the dashboard reports
+    /// the continuous subscription duration, not the most recent renewal.
     pub fn subscribe(&self, contract: ContractKey) -> SubscribeResult {
-        let expires_at = self.time_source.now() + SUBSCRIPTION_LEASE_DURATION;
-        let is_new = self
-            .active_subscriptions
-            .insert(contract, expires_at)
-            .is_none();
+        use dashmap::mapref::entry::Entry;
+        let now = self.time_source.now();
+        let expires_at = now + SUBSCRIPTION_LEASE_DURATION;
+        let is_new = match self.active_subscriptions.entry(contract) {
+            Entry::Occupied(mut e) => {
+                // Renewal: advance the lease but DELIBERATELY preserve
+                // `subscribed_since` (continuous duration) and
+                // `last_updated` (most-recent UPDATE timestamp).
+                e.get_mut().expires_at = expires_at;
+                false
+            }
+            Entry::Vacant(e) => {
+                e.insert(SubscriptionLease {
+                    subscribed_since: now,
+                    expires_at,
+                    last_updated: None,
+                });
+                true
+            }
+        };
 
         debug!(
             %contract,
@@ -228,7 +272,7 @@ impl HostingManager {
     #[allow(dead_code)] // Used in tests, may be used for explicit renewal in future
     pub fn renew_subscription(&self, contract: &ContractKey) -> bool {
         if let Some(mut entry) = self.active_subscriptions.get_mut(contract) {
-            *entry = self.time_source.now() + SUBSCRIPTION_LEASE_DURATION;
+            entry.expires_at = self.time_source.now() + SUBSCRIPTION_LEASE_DURATION;
             debug!(%contract, "renew_subscription: lease extended");
             true
         } else {
@@ -243,7 +287,6 @@ impl HostingManager {
     /// (in the hosting cache) until evicted by LRU.
     pub fn unsubscribe(&self, contract: &ContractKey) {
         if self.active_subscriptions.remove(contract).is_some() {
-            crate::node::network_status::record_subscription_removed(&format!("{contract}"));
             debug!(%contract, "unsubscribe: removed active subscription");
         }
     }
@@ -252,7 +295,7 @@ impl HostingManager {
     pub fn is_subscribed(&self, contract: &ContractKey) -> bool {
         self.active_subscriptions
             .get(contract)
-            .map(|expires_at| *expires_at > self.time_source.now())
+            .map(|lease| lease.expires_at > self.time_source.now())
             .unwrap_or(false)
     }
 
@@ -262,12 +305,64 @@ impl HostingManager {
         let mut contracts: Vec<ContractKey> = self
             .active_subscriptions
             .iter()
-            .filter(|entry| *entry.value() > now)
+            .filter(|entry| entry.value().expires_at > now)
             .map(|entry| *entry.key())
             .collect();
         // Sort for deterministic ordering (critical for simulation tests)
         contracts.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
         contracts
+    }
+
+    /// Snapshot of every active subscription for the local-peer dashboard.
+    ///
+    /// Reads directly from the canonical lease map (no parallel mirror).
+    /// The earlier `network_status::subscribed_contracts` mirror silently
+    /// drifted after SUBSCRIBE moved to the task-per-tx driver and lost
+    /// its recording hook.
+    pub fn dashboard_subscription_snapshot(&self) -> Vec<SubscribedContractSnapshot> {
+        let now = self.time_source.now();
+        let mut snapshot: Vec<SubscribedContractSnapshot> = self
+            .active_subscriptions
+            .iter()
+            .filter(|entry| entry.value().expires_at > now)
+            .map(|entry| {
+                let lease = *entry.value();
+                SubscribedContractSnapshot {
+                    key: *entry.key(),
+                    subscribed_secs: now
+                        .saturating_duration_since(lease.subscribed_since)
+                        .as_secs(),
+                    last_updated_secs: lease
+                        .last_updated
+                        .map(|t| now.saturating_duration_since(t).as_secs()),
+                }
+            })
+            .collect();
+        // Most recently updated first; never-updated entries fall to the
+        // end. Ties on `last_updated_secs` (including the (None, None)
+        // case) break by key bytes so the dashboard renders a stable
+        // order across refreshes — DashMap iteration order would
+        // otherwise leak through and reshuffle rows on every poll.
+        snapshot.sort_by(|a, b| {
+            let primary = match (a.last_updated_secs, b.last_updated_secs) {
+                (Some(a_secs), Some(b_secs)) => a_secs.cmp(&b_secs),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            primary.then_with(|| a.key.id().as_bytes().cmp(b.key.id().as_bytes()))
+        });
+        snapshot
+    }
+
+    /// Record that a state update was observed for `contract`.
+    ///
+    /// Updates the dashboard "last seen update" timestamp. No-op if we
+    /// are not currently subscribed.
+    pub fn record_contract_update(&self, contract: &ContractKey) {
+        if let Some(mut entry) = self.active_subscriptions.get_mut(contract) {
+            entry.last_updated = Some(self.time_source.now());
+        }
     }
 
     /// Expire stale subscriptions and return the contracts that were expired.
@@ -290,8 +385,8 @@ impl HostingManager {
         let mut expired = Vec::new();
 
         // Collect expired subscriptions
-        self.active_subscriptions.retain(|contract, expires_at| {
-            if *expires_at <= now {
+        self.active_subscriptions.retain(|contract, lease| {
+            if lease.expires_at <= now {
                 expired.push(*contract);
                 false
             } else {
@@ -300,9 +395,6 @@ impl HostingManager {
         });
 
         if !expired.is_empty() {
-            for contract in &expired {
-                crate::node::network_status::record_subscription_removed(&format!("{contract}"));
-            }
             info!(
                 expired_count = expired.len(),
                 "expire_stale_subscriptions: expired stale subscriptions"
@@ -318,7 +410,7 @@ impl HostingManager {
         let now = self.time_source.now();
         self.active_subscriptions
             .iter()
-            .filter(|entry| *entry.value() > now)
+            .filter(|entry| entry.value().expires_at > now)
             .count()
     }
 
@@ -807,7 +899,7 @@ impl HostingManager {
             .iter()
             .map(|entry| {
                 let contract = *entry.key();
-                let expires_at = *entry.value();
+                let expires_at = entry.value().expires_at;
                 let is_active = expires_at > now;
                 let has_client = self.has_client_subscriptions(contract.id());
                 (contract, has_client, is_active, Some(expires_at))
@@ -841,7 +933,7 @@ impl HostingManager {
         let mut active_subs: Vec<_> = self
             .active_subscriptions
             .iter()
-            .map(|entry| (*entry.key(), *entry.value()))
+            .map(|entry| (*entry.key(), entry.value().expires_at))
             .collect();
         active_subs.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
@@ -862,7 +954,7 @@ impl HostingManager {
             let has_active = self
                 .active_subscriptions
                 .iter()
-                .any(|sub| sub.key().id() == &instance_id && *sub.value() > now);
+                .any(|sub| sub.key().id() == &instance_id && sub.value().expires_at > now);
             if !has_active {
                 // Need to find the ContractKey - check hosting cache
                 if let Some(contract) = self
@@ -890,7 +982,7 @@ impl HostingManager {
                     && !self
                         .active_subscriptions
                         .get(&key)
-                        .map(|e| *e > now)
+                        .map(|e| e.expires_at > now)
                         .unwrap_or(false)
                 {
                     needs_renewal_set.insert(key);
@@ -933,7 +1025,7 @@ impl HostingManager {
         // `contracts` map below, which hides active_subscriptions entries
         // behind hosting cache presence when both exist.
         for entry in self.active_subscriptions.iter() {
-            if *entry.value() > now {
+            if entry.value().expires_at > now {
                 snapshot.active_subscription_keys.insert(*entry.key().id());
             }
         }
@@ -965,7 +1057,7 @@ impl HostingManager {
         let mut active_subs: Vec<_> = self
             .active_subscriptions
             .iter()
-            .map(|entry| (*entry.key(), *entry.value()))
+            .map(|entry| (*entry.key(), entry.value().expires_at))
             .collect();
         active_subs.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
@@ -1406,6 +1498,131 @@ mod tests {
         assert!(subscribed.contains(&c1));
         assert!(!subscribed.contains(&c2));
         assert!(subscribed.contains(&c3));
+    }
+
+    /// Pins the dashboard contract: `subscribe(...)` must be visible in
+    /// `dashboard_subscription_snapshot()` immediately, with no separate
+    /// recording call. The previous parallel `network_status` mirror
+    /// silently drifted when SUBSCRIBE migrated to the task-per-tx driver
+    /// (PR #3806 → #3981); this test prevents the regression.
+    #[tokio::test]
+    async fn dashboard_snapshot_reflects_active_subscriptions() {
+        let manager = HostingManager::new();
+        let c1 = make_contract_key(1);
+        let c2 = make_contract_key(2);
+
+        // Empty before any subscription.
+        assert!(manager.dashboard_subscription_snapshot().is_empty());
+
+        // Subscribing makes the contract visible to the dashboard.
+        manager.subscribe(c1);
+        let snap = manager.dashboard_subscription_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].key, c1);
+        assert!(snap[0].last_updated_secs.is_none());
+
+        // record_contract_update populates last_updated_secs.
+        manager.record_contract_update(&c1);
+        let snap = manager.dashboard_subscription_snapshot();
+        assert!(snap[0].last_updated_secs.is_some());
+
+        // Multiple subscriptions are reflected.
+        manager.subscribe(c2);
+        let snap = manager.dashboard_subscription_snapshot();
+        assert_eq!(snap.len(), 2);
+
+        // Unsubscribe removes the entry.
+        manager.unsubscribe(&c1);
+        let snap = manager.dashboard_subscription_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].key, c2);
+
+        // record_contract_update on a non-subscribed contract is a no-op
+        // (matches the legacy network_status::record_contract_updated
+        // semantics, which silently dropped updates for unknown keys).
+        manager.record_contract_update(&c1);
+        let snap = manager.dashboard_subscription_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(snap.iter().all(|s| s.key != c1));
+    }
+
+    /// Sort order of `dashboard_subscription_snapshot()` must be
+    /// deterministic — DashMap iteration order would otherwise leak
+    /// through to the rendered dashboard, reshuffling rows on every
+    /// 5-second poll. Ties (including `None`/`None` for never-updated
+    /// entries) must break by contract-key bytes.
+    #[tokio::test]
+    async fn dashboard_snapshot_sort_is_deterministic_on_ties() {
+        let manager = HostingManager::new();
+        // Three contracts with distinct, ordered key-byte prefixes
+        // (`make_contract_key(seed)` writes `[seed; 32]` into the
+        // ContractInstanceId, so seeds 0x10/0x40/0xF0 sort low/mid/high).
+        let low = make_contract_key(0x10);
+        let mid = make_contract_key(0x40);
+        let high = make_contract_key(0xF0);
+
+        // Subscribe all three, then drive `last_updated` to the same
+        // wall-clock timestamp for `low` and `high`. `mid` stays
+        // never-updated, so it must sort to the end.
+        manager.subscribe(low);
+        manager.subscribe(mid);
+        manager.subscribe(high);
+        manager.record_contract_update(&high);
+        manager.record_contract_update(&low);
+
+        let snap = manager.dashboard_subscription_snapshot();
+        assert_eq!(snap.len(), 3);
+        // `low` and `high` share `last_updated_secs` (both 0 immediately
+        // after `record_contract_update`); the byte-key tie-break must
+        // place `low` before `high`. `mid` (never updated) goes last.
+        assert_eq!(
+            snap.iter().map(|s| s.key).collect::<Vec<_>>(),
+            vec![low, high, mid],
+            "snapshot must be ordered (low, high, mid); got {:?}",
+            snap.iter().map(|s| s.key).collect::<Vec<_>>()
+        );
+
+        // Re-poll: the order MUST be the same. (Pre-fix: DashMap
+        // iteration order would shuffle on every call.)
+        for _ in 0..5 {
+            let again = manager.dashboard_subscription_snapshot();
+            assert_eq!(
+                again.iter().map(|s| s.key).collect::<Vec<_>>(),
+                vec![low, high, mid],
+                "repeated snapshots must be byte-stable"
+            );
+        }
+    }
+
+    /// Subscription renewal must not reset `subscribed_since`, otherwise
+    /// the dashboard's "subscribed for X seconds" reading would flip back
+    /// to ~0 every renewal interval (2 min) for every River user.
+    #[tokio::test]
+    async fn dashboard_snapshot_preserves_subscribed_since_across_renewals() {
+        let manager = HostingManager::new();
+        let c = make_contract_key(1);
+
+        let read_lease = || {
+            *manager
+                .active_subscriptions
+                .get(&c)
+                .expect("subscription must exist")
+        };
+
+        manager.subscribe(c);
+        let initial = read_lease();
+
+        manager.subscribe(c);
+        let renewed = read_lease();
+
+        assert_eq!(
+            renewed.subscribed_since, initial.subscribed_since,
+            "subscribed_since must be preserved across renewals"
+        );
+        assert!(
+            renewed.expires_at >= initial.expires_at,
+            "expires_at must monotonically advance on renewal"
+        );
     }
 
     #[tokio::test]

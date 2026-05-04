@@ -24,10 +24,10 @@ paths:
 > state-machine path**, which still serves: GC-spawned GET retries and
 > `start_targeted_op` UPDATE-triggered auto-fetch (streaming relay and
 > originator loopback also remain on legacy per #3883 port plan §7),
-> PUT GC / streaming / originator-loopback paths, the deprecated
-> UPDATE `Broadcasting` wire variant (no-op handler), CONNECT, and
-> SUBSCRIBE's renewal / PUT-sub-op / executor / intermediate-peer
-> entry points. Phase 5 follow-up slice A (PR #3910) migrated fresh
+> PUT GC / streaming / originator-loopback paths, CONNECT, and
+> SUBSCRIBE's executor / intermediate-peer entry points (PUT-sub-op
+> SUBSCRIBE migrated in Phase 3a/3b; renewal migrated in the SUBSCRIBE
+> renewal slice — see below). Phase 5 follow-up slice A (PR #3910) migrated fresh
 > inbound non-streaming relay `UpdateMsg::RequestUpdate` and
 > `UpdateMsg::BroadcastTo` to
 > `operations/update/op_ctx_task.rs::start_relay_request_update` /
@@ -38,9 +38,11 @@ paths:
 > relay `PutMsg::Request` to
 > `operations/put/op_ctx_task.rs::start_relay_put` (gated on
 > `source_addr.is_some()` AND `!has_put_op(id)` AND the payload size
-> would not upgrade to streaming on forward); GC speculative retries and
-> client-initiated loopback (`source_addr.is_none()`) still go through
-> legacy. Phase 5 follow-up slice B migrated fresh inbound streaming
+> would not upgrade to streaming on forward). PUT GC speculative
+> retries and the per-op `ack_received` / `speculative_paths` fields
+> have since been retired (PR #3964) along with `PutMsg::ForwardingAck`
+> consumer + senders; only the upgrade-on-forward without inbound
+> `StreamId` and a no-op `ForwardingAck` receiver remain on legacy. Phase 5 follow-up slice B migrated fresh inbound streaming
 > relay `PutMsg::RequestStreaming` to
 > `operations/put/op_ctx_task.rs::start_relay_put_streaming` (same
 > `source_addr.is_some()` AND `!has_put_op(id)` gate). The streaming
@@ -58,10 +60,25 @@ paths:
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
 > `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`
 > (gated on `source_addr.is_some()` AND `!has_subscribe_op(id)`);
-> renewals, PUT sub-op subscribes, executor auto-subscribe,
 > GC-spawned retries that pre-register a `SubscribeOp`,
 > `SubscribeMsg::Unsubscribe`, and `SubscribeMsg::ForwardingAck` all
-> stay on legacy. The driver caps relay-hop retries at 1 (originator
+> stay on legacy. Executor auto-subscribe (the executor's
+> `SubscribeContract::resume_op` adapter) was the last legacy
+> originator-side writer into `ops.subscribe`; it has been migrated to
+> `subscribe::run_executor_subscribe` (reuses
+> `drive_client_subscribe_inner` with `is_renewal=false`, returns
+> `Result<(), OpError>` to the executor, bypasses the `op_request`
+> mediator path entirely). Renewals were
+> previously routed to legacy at this dispatch site so the relay
+> would emit `ForwardingAck` back to the renewal originator (the
+> originator's GC retry timer used `ack_received` for retry-base
+> selection); the SUBSCRIBE renewal migration moved the renewal
+> originator to the same task-per-tx driver as client-initiated
+> subscribe (`subscribe::run_renewal_subscribe` reuses
+> `drive_client_subscribe_inner` with `is_renewal=true`, returning
+> the outcome to the renewal task instead of through
+> `result_router_tx`), so renewals now flow through
+> `start_relay_subscribe` like any other Request. The driver caps relay-hop retries at 1 (originator
 > owns cross-peer retry), reuses `incoming_tx` end-to-end, omits
 > `ForwardingAck` emission, and calls `register_downstream_subscriber`
 > on BOTH local-hit and relayed-Subscribed paths — but DELIBERATELY
@@ -83,9 +100,9 @@ paths:
 > reuses the shared `log_broadcast_to_streaming_failure` classifier
 > and triggers `try_auto_fetch_contract` / `send_summary_back_on_rejection`
 > on the same branches as the legacy handler. The deprecated
-> `UpdateMsg::Broadcasting` wire variant remains on the legacy no-op
-> handler; Phase 6 wire cleanup will delete both the legacy streaming
-> arms in `update.rs:871-1366` and the `Broadcasting` variant.
+> `UpdateMsg::Broadcasting` wire variant has been removed; the
+> `min-compatible-version` floor was bumped to 0.2.50 to gate the
+> incompatible bincode discriminant shift.
 >
 > Task-per-tx drivers have their own invariants documented in the
 > `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.
@@ -93,6 +110,84 @@ paths:
 > state before calling `send_and_await`), but the mechanical
 > `op_manager.push(...)` call is absent. Phase 6 of #1454 will rewrite
 > this rules file in full once all ops have migrated.
+>
+> Sub-operation GETs (subscribe's `fetch_contract_if_missing` and
+> executor's `local_state_or_from_network`) now route through
+> `operations/get/op_ctx_task.rs::start_sub_op_get` — same retry
+> driver as `start_client_get` but skips auto-subscribe,
+> explicit-subscribe hand-off, telemetry route-events
+> (`NetEventLog::get_request` is intentionally not emitted on any
+> task-per-tx originator path — matches `start_client_get`), and
+> `result_router_tx` publication; outcome delivered through a
+> oneshot (`SubOpGetOutcome`). The legacy `request_get` driver and
+> `get::start_op` constructor were retired in this migration; the
+> executor's `GetContract` / `ComposeNetworkMessage<GetOp>` impl is
+> deleted. Legacy `start_targeted_op` (UPDATE-triggered auto-fetch)
+> remains on legacy. The executor's `op_request` mediator path is
+> bypassed for GET; the spawned sub-op task can outlive its caller's
+> outer timeout (e.g., `RELATED_FETCH_TIMEOUT = 10s` wrapping
+> `local_state_or_from_network`'s 120 s receiver timeout) — receiver
+> drop is silent so no leak, just a longer-lived background task.
+> After this migration, no caller pushes a client-initiated `GetOp`
+> into `ops.get`, so the GC speculative-retry block was provably dead
+> for GET. Phase 5-final retired that block, the `get_retried`
+> per-tick HashMap, the `GetOp::ack_received` /
+> `GetOp::speculative_paths` fields, and the 11 unit tests that
+> simulated the GC retry decision.
+>
+> The SUBSCRIBE GC speculative-retry block was retired in the same
+> Phase 5-final pass (slice 1 after GET): all four originator-side
+> writers into `ops.subscribe` (client-initiated, executor
+> auto-subscribe, renewal, PUT/GET sub-op) had migrated to the
+> task-per-tx driver in `operations/subscribe/op_ctx_task.rs` — which
+> owns its own retry loop via `advance_to_next_peer` and never inserts
+> a `SubscribeOp` into the DashMap. The remaining legacy entries in
+> `ops.subscribe` come from relay state during multi-hop forwarding
+> (slice A `start_relay_subscribe` does NOT register; entries arise
+> only when a relay re-enters `subscribe::process_message` for a tx
+> already in the DashMap, which now happens only for `Unsubscribe`
+> routing) and `create_unsubscribe_op` routing entries created by
+> `request_unsubscribe`. Neither is a retry candidate: relay entries
+> fail `is_originator()` and unsubscribe entries fail
+> `failure_routing_info().is_some()`. Slice 1 deletes the block, the
+> `subscribe_retried` per-tick HashMap, and the shared `ACK_TIMEOUT` /
+> `MAX_SPECULATIVE_PATHS` / `PROGRESS_TIMEOUT` constants (also
+> previously used by GET, now fully unreferenced). Slice 2 deleted
+> the `SubscribeOp::ack_received` / `speculative_paths` fields, the
+> `retry_with_next_alternative` helper, the `MIN_RETRY_HTL` constant,
+> and the unit tests that exercised the GC retry decision (the 11
+> `test_retry_*` cases in `subscribe/tests.rs` and the
+> `subscribe_retry_candidates_sorted_oldest_first` test in
+> `op_state_manager.rs`). The `SubscribeMsg::ForwardingAck` handler
+> on the legacy state-machine path was simplified to a no-op (mirrors
+> the GET treatment).
+> `GetMsg::ForwardingAck` and `SubscribeMsg::ForwardingAck` survive as
+> wire variants + telemetry hooks (#3570 diagnostics) but their
+> handlers return the operation unchanged.
+>
+> Sub-operation SUBSCRIBE callers (legacy GET-originator
+> `auto_subscribe_on_get_response` fallback path; PUT/GET task-per-tx
+> drivers already routed via `maybe_subscribe_child`) spawn
+> `subscribe::run_client_subscribe` directly.
+> `start_subscription_request` keeps the `blocking` parameter for API
+> stability but it is no longer behaviorally distinct: blocking
+> semantics in the task-per-tx world are obtained by `await`ing
+> `run_client_subscribe` inline (see `maybe_subscribe_child` in
+> `put/op_ctx_task.rs` and `get/op_ctx_task.rs`);
+> `start_subscription_request` is a fire-and-forget spawner.
+>
+> Phase 3c of #1454 has retired the `SubOperationTracker` entirely:
+> the struct, the OpManager methods (`expect_and_register_sub_operation`,
+> `sub_operation_failed`, `all_sub_operations_completed`,
+> `count_pending_sub_operations`, `root_ops_awaiting_sub_ops`,
+> `failed_parents`), the `parent_of` index, the GC parent-propagation
+> blocks, and the finalized-parent-parking branch in
+> `operations.rs::handle_op_result` are all gone. `OperationResult::ContinueOp`
+> with a finalized state now completes the op directly. Sub-operation
+> identity is structural (`Transaction::is_sub_operation()` via the
+> parent field set by `Transaction::new_child_of`); failure
+> propagation is via the task-per-tx driver's own `HostResult::Err`
+> publication, never through a tracker.
 
 ## Critical Invariant: Push-Before-Send (legacy path)
 
@@ -176,45 +271,20 @@ WRONG:
 
 ## Sub-Operation Rules
 
-### WHEN spawning a sub-operation (legacy state-machine path)
+### WHEN spawning a sub-operation
 
 ```
-1. FIRST: Register with expect_and_register_sub_operation()
-2. THEN: Create and push the child operation
-3. WHY: Prevents race where child completes before parent knows about it
+Sub-operations are identified structurally — create them via
+Transaction::new_child_of::<MsgType>(&parent_tx). The parent field is
+set at construction; Transaction::is_sub_operation() returns true
+without any DashMap registration.
 
-CORRECT:
-  op_manager.expect_and_register_sub_operation(parent_tx, child_tx);
-  let child_op = SubscribeOp::new(...);
-  op_manager.push(child_tx, child_op).await?;
-
-WRONG:
-  let child_op = SubscribeOp::new(...);
-  op_manager.push(child_tx, child_op).await?;  // Child might complete here!
-  op_manager.expect_and_register_sub_operation(parent_tx, child_tx);  // Too late
-```
-
-### WHEN spawning a sub-operation (task-per-tx path)
-
-```
-Task-per-tx drivers (PUT, GET) do NOT register children with
-SubOperationTracker. They create children via Transaction::new_child_of
-and either await them inline (blocking) or fire-and-forget (async).
+Either await the child inline (blocking) or fire-and-forget (async).
+There is no central tracker; failure propagation is the child driver's
+responsibility (publish HostResult::Err on its own task).
 
 The is_sub_operation guards at p2p_protoc.rs, node.rs, and subscribe.rs
-use the structural Transaction::is_sub_operation() check (parent field
-set by new_child_of), not the tracker DashMap. No registration needed.
-
-SubOperationTracker is only used by legacy relay paths that go through
-the finalized-parent-parking branch in operations.rs:182–208.
-```
-
-### WHEN a sub-operation fails
-
-```
-→ Call sub_operation_failed(child_tx, error_msg)
-→ This propagates failure to parent
-→ Parent should handle gracefully (may still complete partially)
+all use the structural check.
 ```
 
 ## Streaming Rules
