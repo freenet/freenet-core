@@ -89,8 +89,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::contract::user_input::{
-    CallerIdentity, PendingPrompts, PromptEvent, PromptSnapshot,
-    pending_prompts as pending_prompts_registry, prompt_events,
+    CallerIdentity, PendingPrompts, PromptEvent, PromptSnapshot, emit_prompt_event, prompt_events,
 };
 
 /// Register permission prompt routes.
@@ -515,14 +514,10 @@ async fn permission_respond(
                 }
                 // Notify SSE subscribers so every open Freenet tab dismisses
                 // its overlay immediately instead of waiting for the polling
-                // fallback (#3836 follow-up). `send` returns `Err` only when
-                // there are no live subscribers — that's the polling-only
-                // fallback case and is fine to ignore.
-                drop(crate::contract::user_input::prompt_events().send(
-                    crate::contract::user_input::PromptEvent::Removed {
-                        nonce: nonce.clone(),
-                    },
-                ));
+                // fallback (#3836 follow-up).
+                emit_prompt_event(PromptEvent::Removed {
+                    nonce: nonce.clone(),
+                });
                 (
                     axum::http::StatusCode::OK,
                     Json(serde_json::json!({"ok": true})),
@@ -641,7 +636,7 @@ fn snapshot_to_json(snapshot: &PromptSnapshot) -> serde_json::Value {
 /// idempotent.
 async fn permission_events(
     headers: HeaderMap,
-    Extension(_pending): Extension<PendingPrompts>,
+    Extension(pending): Extension<PendingPrompts>,
 ) -> axum::response::Response {
     // Connection cap. We do this before any expensive setup so a flood of
     // reconnects from a buggy client cannot exhaust per-process resources.
@@ -681,11 +676,10 @@ async fn permission_events(
     // Subscribe FIRST to avoid the race where a prompt is added between the
     // DashMap snapshot and our first broadcast recv.
     let rx = prompt_events().subscribe();
-    let pending_snapshot = pending_prompts_registry();
 
     // Convert each currently-pending entry to a synthetic Added event so
     // a fresh subscriber catches up to current state.
-    let initial: Vec<Result<Event, Infallible>> = pending_snapshot
+    let initial: Vec<Result<Event, Infallible>> = pending
         .iter()
         .map(|entry| {
             let snapshot = PromptSnapshot {
@@ -1399,7 +1393,7 @@ mod tests {
         origin: Option<&str>,
     ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = bytes::Bytes> + Send>> {
         use axum::response::IntoResponse;
-        let pending = pending_prompts_registry();
+        let pending = crate::contract::user_input::pending_prompts();
         let mut headers = HeaderMap::new();
         if let Some(o) = origin {
             headers.insert("origin", o.parse().unwrap());
@@ -1531,7 +1525,7 @@ mod tests {
     #[tokio::test]
     async fn test_sse_replays_existing_pending_on_subscribe() {
         // Insert into the global registry before subscribing.
-        let pending = pending_prompts_registry();
+        let pending = crate::contract::user_input::pending_prompts();
         let nonce = "ssetest_bootstrap_003".to_string();
         let _rx = insert_prompt(
             &pending,

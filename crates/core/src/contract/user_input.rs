@@ -135,7 +135,7 @@ pub(crate) fn prompt_events() -> broadcast::Sender<PromptEvent> {
 /// are no live subscribers — that's the common case when the shell page
 /// isn't open yet, and the polling fallback covers it. Slow subscribers
 /// see `Lagged` and resync from the DashMap.
-fn emit_prompt_event(event: PromptEvent) {
+pub(crate) fn emit_prompt_event(event: PromptEvent) {
     drop(prompt_events().send(event));
 }
 
@@ -615,12 +615,16 @@ mod tests {
         assert_eq!(&*response, b"Allow");
     }
 
-    /// Verify that `DashboardPrompter::prompt` fires a `PromptEvent::Added`
-    /// after inserting into the pending registry, and a `PromptEvent::Removed`
-    /// after the response cleanup. Without these, the SSE endpoint cannot
-    /// push lifecycle changes to subscribed tabs.
+    /// `DashboardPrompter::prompt` fires `PromptEvent::Added` after inserting
+    /// the entry. The cleanup `Removed` is only fired by the prompter when
+    /// the entry was still present at cleanup time — when an external party
+    /// (the HTTP `/respond` handler in production) already removed the
+    /// entry, the prompter's cleanup is a no-op and the external remover is
+    /// responsible for emitting `Removed`. This test exercises that
+    /// double-emit-avoidance path; the timeout-driven `Removed` path is
+    /// covered by `test_prompt_timeout_emits_removed`.
     #[tokio::test]
-    async fn test_prompt_lifecycle_emits_added_and_removed() {
+    async fn test_prompt_added_emitted_and_external_remove_skips_cleanup_removed() {
         // Subscribe BEFORE spawning the prompter so we don't miss the
         // synchronous Added event.
         let mut rx = prompt_events().subscribe();

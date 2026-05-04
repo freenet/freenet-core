@@ -2098,8 +2098,8 @@ mod tests {
         );
         // The visibility-gated polling loop has been replaced by SSE. SSE
         // pushes regardless of tab visibility, so the visibility-skip code
-        // path that caused #ISSUE (originating tab silently missing prompts
-        // when in the background) MUST NOT be reintroduced. Pin this
+        // path that caused the originating tab to silently miss prompts
+        // when in the background MUST NOT be reintroduced. Pin this
         // contract by asserting `visibilityState` no longer appears in the
         // overlay path. If a future change needs visibility gating for some
         // *other* reason, that change must move this assertion or replace
