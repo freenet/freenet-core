@@ -750,6 +750,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                         continue;
                     };
+                    // Post-authentication wire-byte accounting for the local
+                    // dashboard. Doing this before the symmetric-decrypt
+                    // gate would let an attacker spoof UDP packets from many
+                    // source IPs and inflate the cumulative + per-peer
+                    // counters, see #3999.
+                    super::TRANSPORT_METRICS.record_packet_received(
+                        self.remote_conn.remote_addr,
+                        packet_data.data().len() as u64,
+                    );
                     let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
                     let SymmetricMessage {
                         packet_id,

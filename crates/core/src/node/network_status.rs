@@ -260,6 +260,11 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
             s.connected_peers.retain(|p| p.address != addr);
         }
     }
+    // Free the per-peer metrics slot so the bounded table doesn't accumulate
+    // stale entries across the lifetime of long-running gateways. LRU
+    // eviction in `record_per_peer` is the safety net; this is the
+    // best-effort eager cleanup.
+    TRANSPORT_METRICS.remove_peer(addr);
 }
 
 /// Record an operation result for the dashboard "Operations" panel.

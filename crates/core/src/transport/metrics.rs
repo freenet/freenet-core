@@ -81,8 +81,21 @@ pub struct TransportMetrics {
     slowdowns_triggered: AtomicU32,
 
     // Per-peer wire-byte stats (bounded to MAX_TRACKED_PEERS entries).
-    // Updated at the UDP socket layer alongside the cumulative counters above.
+    //
+    // Receive side is metered post-authentication in
+    // `transport::peer_connection::PeerConnection::recv` — only packets that
+    // pass `try_decrypt_sym` for an established connection contribute. Send
+    // side is metered at the socket layer because outbound targets are
+    // controlled by us, not influenced by remote peers.
+    //
+    // When the table is full a new entry evicts the least-recently-updated
+    // entry (LRU on `last_seen_tick`).
     per_peer_stats: DashMap<SocketAddr, PeerTransferStats>,
+
+    // Monotonically increasing tick stamped onto each per-peer entry on
+    // update. Used purely for LRU ordering — no wall-clock semantics, so
+    // simulation determinism is unaffected.
+    per_peer_tick: AtomicU64,
 
     // RTT tracking (in microseconds for precision)
     min_rtt_us: AtomicU64,
@@ -99,6 +112,9 @@ const MAX_TRACKED_PEERS: usize = 256;
 pub struct PeerTransferStats {
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
+    /// Monotonic tick of the most recent update; smallest tick = oldest entry,
+    /// used for LRU eviction when the table is full.
+    last_seen_tick: AtomicU64,
 }
 
 impl Default for PeerTransferStats {
@@ -106,6 +122,7 @@ impl Default for PeerTransferStats {
         Self {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
+            last_seen_tick: AtomicU64::new(0),
         }
     }
 }
@@ -138,6 +155,7 @@ impl TransportMetrics {
             rtt_sum_us: AtomicU64::new(0),
             rtt_samples: AtomicU32::new(0),
             per_peer_stats: DashMap::new(),
+            per_peer_tick: AtomicU64::new(0),
         }
     }
 
@@ -281,6 +299,11 @@ impl TransportMetrics {
     /// keep-alives, ACKs, and other small control messages all show up on the
     /// local dashboard, not just large stream transfers.
     ///
+    /// Outbound is metered at the socket layer because send targets are
+    /// controlled by us — there is no spoof vector — and we want to surface
+    /// every byte we put on the wire (including NAT-traversal probes that
+    /// never produce a stream).
+    ///
     /// `remote_addr` MUST be the canonical (un-mapped) form used elsewhere in
     /// the system — the same form `recv_from` returns after
     /// `normalize_mapped_addr`. Mismatched callers (e.g. passing a
@@ -293,10 +316,16 @@ impl TransportMetrics {
         self.record_per_peer(remote_addr, bytes, |s| &s.bytes_sent);
     }
 
-    /// Record an inbound UDP packet at the socket layer.
+    /// Record an inbound UDP packet that has passed authentication.
     ///
-    /// See [`Self::record_packet_sent`] for the counter semantics and the
-    /// canonical-address contract on `remote_addr`.
+    /// MUST only be called for packets that have been successfully decrypted
+    /// against an established symmetric session key — see the call site in
+    /// [`crate::transport::peer_connection::PeerConnection::recv`]. Calling
+    /// this on raw `recv_from` output would let an attacker inflate the
+    /// dashboard by spoofing UDP packets from many source IPs (#3999).
+    ///
+    /// See [`Self::record_packet_sent`] for the canonical-address contract on
+    /// `remote_addr`.
     pub fn record_packet_received(&self, remote_addr: SocketAddr, bytes: u64) {
         self.cumulative_bytes_received
             .fetch_add(bytes, Ordering::Relaxed);
@@ -310,27 +339,62 @@ impl TransportMetrics {
 
     /// Record per-peer bytes for the given direction.
     ///
-    /// Bounded to [`MAX_TRACKED_PEERS`] entries: once full, new peers' bytes
-    /// are silently dropped (existing entries continue to update). There is no
-    /// LRU eviction. Combined with the fact that `record_packet_received`
-    /// runs at the raw socket before authentication, an attacker that
-    /// fabricates packets from many spoofed source IPs can fill the table
-    /// with abandoned entries and crowd out legitimate new peers from the
-    /// dashboard's per-peer view. Memory damage is still bounded (256 entries
-    /// × ~16 bytes), and authenticated traffic on the existing connections
-    /// continues to be metered correctly. Follow-up tracked in #3999.
+    /// Bounded to [`MAX_TRACKED_PEERS`] entries with LRU eviction: when the
+    /// table is full, the entry whose `last_seen_tick` is smallest is
+    /// removed before the new entry is inserted. This keeps the dashboard's
+    /// per-peer view current as peers come and go without unbounded growth,
+    /// and combined with the post-authentication call site in
+    /// [`Self::record_packet_received`] closes the spoof inflation vector
+    /// described in #3999.
     fn record_per_peer(
         &self,
         addr: SocketAddr,
         bytes: u64,
         field: impl Fn(&PeerTransferStats) -> &AtomicU64,
     ) {
+        let tick = self.per_peer_tick.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Fast path: existing entry — update bytes and refresh tick.
         if let Some(entry) = self.per_peer_stats.get(&addr) {
             field(&entry).fetch_add(bytes, Ordering::Relaxed);
-        } else if self.per_peer_stats.len() < MAX_TRACKED_PEERS {
-            let entry = self.per_peer_stats.entry(addr).or_default();
-            field(&entry).fetch_add(bytes, Ordering::Relaxed);
+            entry.last_seen_tick.store(tick, Ordering::Relaxed);
+            return;
         }
+
+        // Slow path: insert. If the table is full, evict the LRU entry first.
+        // The capacity check / eviction / insert isn't atomic across threads,
+        // so the table may transiently hold up to MAX_TRACKED_PEERS + a small
+        // burst — acceptable for a dashboard counter.
+        if self.per_peer_stats.len() >= MAX_TRACKED_PEERS {
+            self.evict_oldest_peer();
+        }
+
+        let entry = self.per_peer_stats.entry(addr).or_default();
+        field(&entry).fetch_add(bytes, Ordering::Relaxed);
+        entry.last_seen_tick.store(tick, Ordering::Relaxed);
+    }
+
+    /// Remove the per-peer entry whose `last_seen_tick` is smallest.
+    ///
+    /// O(MAX_TRACKED_PEERS) but called only on insert into a full table.
+    fn evict_oldest_peer(&self) {
+        let oldest = self
+            .per_peer_stats
+            .iter()
+            .min_by_key(|entry| entry.value().last_seen_tick.load(Ordering::Relaxed))
+            .map(|entry| *entry.key());
+        if let Some(addr) = oldest {
+            self.per_peer_stats.remove(&addr);
+        }
+    }
+
+    /// Remove a peer's per-peer stats.
+    ///
+    /// Called when the connection to `addr` is torn down so the slot becomes
+    /// available for a new peer immediately, instead of relying on LRU
+    /// eviction to clean up after the connection-level state is gone.
+    pub fn remove_peer(&self, addr: SocketAddr) {
+        self.per_peer_stats.remove(&addr);
     }
 
     /// Snapshot per-peer transfer stats: `(addr, bytes_sent, bytes_received)`.
@@ -810,18 +874,108 @@ mod tests {
 
         assert_eq!(metrics.per_peer_snapshot().len(), MAX_TRACKED_PEERS);
 
-        // Beyond capacity: new peer not tracked, but cumulative still counts.
+        // Beyond capacity: cumulative still counts AND the new peer is now
+        // tracked because LRU evicts the oldest entry — that's the #3999
+        // behavior change. Pre-fix the new peer would have been silently
+        // dropped from the per-peer view.
         let extra: std::net::SocketAddr = "192.168.1.1:9999".parse().unwrap();
         metrics.record_packet_received(extra, 500);
 
         assert_eq!(metrics.per_peer_snapshot().len(), MAX_TRACKED_PEERS);
-        let snapshot = metrics.per_peer_snapshot();
         assert!(
-            snapshot.iter().all(|(a, _, _)| *a != extra),
-            "over-capacity peer must not be tracked"
+            metrics
+                .per_peer_snapshot()
+                .iter()
+                .any(|(a, _, _)| *a == extra),
+            "new peer must be tracked after LRU evicts the oldest entry"
         );
 
         let total: u64 = (MAX_TRACKED_PEERS as u64 * 100) + 500;
         assert_eq!(metrics.cumulative_bytes_received(), total);
+    }
+
+    #[test]
+    fn test_per_peer_lru_evicts_oldest() {
+        // Fill the table, then record activity on the second-oldest entry to
+        // refresh its tick. The first-inserted entry must be the one evicted
+        // when a brand-new peer is recorded. This pins the LRU ordering
+        // (least-recently-updated, not least-recently-inserted).
+        let metrics = TransportMetrics::new();
+
+        let oldest: std::net::SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        metrics.record_packet_received(oldest, 1);
+
+        let next_oldest: std::net::SocketAddr = "10.0.0.2:1000".parse().unwrap();
+        metrics.record_packet_received(next_oldest, 1);
+
+        // Fill the rest of the table.
+        for i in 2..MAX_TRACKED_PEERS {
+            let addr: std::net::SocketAddr = format!("10.0.{}.{}:{}", i / 256, i % 256, 5000 + i)
+                .parse()
+                .unwrap();
+            metrics.record_packet_received(addr, 1);
+        }
+        assert_eq!(metrics.per_peer_snapshot().len(), MAX_TRACKED_PEERS);
+
+        // Refresh `next_oldest` so it is no longer the LRU candidate.
+        metrics.record_packet_received(next_oldest, 1);
+
+        // Insert a new peer. LRU eviction should remove `oldest`.
+        let newcomer: std::net::SocketAddr = "192.168.7.7:9999".parse().unwrap();
+        metrics.record_packet_received(newcomer, 1);
+
+        let peers = metrics.per_peer_snapshot();
+        assert_eq!(peers.len(), MAX_TRACKED_PEERS);
+        assert!(
+            peers.iter().all(|(a, _, _)| *a != oldest),
+            "the least-recently-updated entry must be evicted"
+        );
+        assert!(
+            peers.iter().any(|(a, _, _)| *a == next_oldest),
+            "the recently-refreshed entry must survive eviction"
+        );
+        assert!(
+            peers.iter().any(|(a, _, _)| *a == newcomer),
+            "the new entry must be tracked after eviction"
+        );
+    }
+
+    #[test]
+    fn test_remove_peer_frees_slot() {
+        // Disconnecting a peer must immediately free its per-peer slot so
+        // the bounded table doesn't accumulate stale entries on long-running
+        // gateways.
+        let metrics = TransportMetrics::new();
+
+        let addr: std::net::SocketAddr = "10.0.0.5:5000".parse().unwrap();
+        metrics.record_packet_received(addr, 100);
+        assert_eq!(metrics.per_peer_snapshot().len(), 1);
+
+        metrics.remove_peer(addr);
+        assert!(
+            metrics.per_peer_snapshot().is_empty(),
+            "remove_peer must drop the entry"
+        );
+
+        // Cumulative counters are wire-byte history and intentionally do
+        // NOT roll back when a peer entry is removed.
+        assert_eq!(metrics.cumulative_bytes_received(), 100);
+    }
+
+    #[test]
+    fn test_record_per_peer_is_idempotent_under_remove() {
+        // Removing a non-existent peer is a no-op (e.g. when
+        // record_peer_disconnected fires for a peer whose stats slot was
+        // already evicted by LRU).
+        let metrics = TransportMetrics::new();
+        let addr: std::net::SocketAddr = "10.0.0.99:9999".parse().unwrap();
+        metrics.remove_peer(addr); // must not panic / corrupt state
+        assert!(metrics.per_peer_snapshot().is_empty());
+
+        metrics.record_packet_received(addr, 50);
+        assert_eq!(metrics.per_peer_snapshot().len(), 1);
+        metrics.remove_peer(addr);
+        metrics.remove_peer(addr); // second remove must be a no-op
+        assert!(metrics.per_peer_snapshot().is_empty());
     }
 }
