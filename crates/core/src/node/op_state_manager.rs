@@ -1482,8 +1482,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     let mut ttl_set = BTreeSet::new();
 
     let mut delayed = vec![];
-    let mut subscribe_retried: std::collections::HashMap<Transaction, usize> =
-        std::collections::HashMap::new();
     loop {
         crate::deterministic_select! {
             tx = new_transactions.recv() => {
@@ -1614,20 +1612,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 }
 
                 // Shared retry constants for SUBSCRIBE speculative retry below.
-                // (GET speculative retry was retired in #1454 Phase 5-final:
-                // client-initiated GETs now drive on a task-per-tx loop, and
-                // the only legacy writer to `ops.get` is `start_targeted_op`
-                // which sets `auto_fetch=true` so `is_client_initiated()` is
-                // false — no entry in `ops.get` could ever satisfy the GET
-                // retry filter.)
-                const ACK_TIMEOUT: Duration = Duration::from_secs(3);
-                const MAX_SPECULATIVE_PATHS: u8 = 2;
-                /// Time to wait after ForwardingAck before re-enabling retry.
-                /// If a relay ACKed but no response arrives within this window,
-                /// the downstream chain has likely stalled. Even a 4-hop chain
-                /// at 500ms/hop completes in ~2.5s; 7s gives ~3x headroom while
-                /// keeping worst-case stall detection under 10s.
-                const PROGRESS_TIMEOUT: Duration = Duration::from_secs(7);
+                // (GET speculative retry was retired in #1454 Phase 5-final
+                // slice 1; SUBSCRIBE speculative retry was retired in
+                // Phase 5-final slice 1 follow-up — see comment below.
+                // The shared `ACK_TIMEOUT` / `MAX_SPECULATIVE_PATHS` /
+                // `PROGRESS_TIMEOUT` constants that both blocks consumed
+                // are no longer referenced and have been removed.)
 
                 // Periodically clean up stale pending_contract_fetches entries.
                 // Entries older than 2x cooldown are removed to prevent unbounded growth.
@@ -1639,148 +1629,23 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     });
                 }
 
-                // ACK-aware speculative retry for SUBSCRIBE operations.
-                // Same logic as GET: 3s ACK timeout, max 2 speculative paths.
-                // Only the originator retries — relays just forward and ACK.
-                //
-                // Cap retries per GC tick to avoid flooding the notification channel.
-                // The gateway subscribes to 90+ contracts; retrying all at once saturates
-                // the 2048-capacity event loop channel, blocking UPDATEs and broadcasts.
-                const MAX_SUBSCRIBE_RETRIES_PER_TICK: usize = 10;
-                {
-                    // Clean up entries for completed operations
-                    subscribe_retried.retain(|tx, _| ops.subscribe.contains_key(tx));
-
-                    let mut retry_candidates: Vec<Transaction> = Vec::new();
-                    for entry in ops.subscribe.iter() {
-                        let tx = *entry.key();
-                        let sub_op = entry.value();
-
-                        // Only retry at the originator (no requester_addr means we initiated it).
-                        // Also skip ops without routing stats — these are unsubscribe-routing
-                        // ops created by create_unsubscribe_op(), which use the subscribe map
-                        // for address routing but should not be retried as subscribe requests.
-                        if !sub_op.is_originator() || sub_op.failure_routing_info().is_none() {
-                            continue;
-                        }
-
-                        // Cap speculative paths
-                        if sub_op.speculative_paths >= MAX_SPECULATIVE_PATHS {
-                            continue;
-                        }
-
-                        let elapsed = tx.elapsed();
-
-                        if sub_op.ack_received {
-                            // ACK received — trust chain for PROGRESS_TIMEOUT, then
-                            // re-enable retry (matching GET/PUT behavior).
-                            if elapsed <= PROGRESS_TIMEOUT {
-                                continue;
-                            }
-                            tracing::info!(
-                                %tx,
-                                elapsed_ms = elapsed.as_millis(),
-                                "SUBSCRIBE chain stalled after ForwardingAck \
-                                 — re-enabling speculative retry"
-                            );
-                        }
-
-                        let retry_count = subscribe_retried.get(&tx).copied().unwrap_or(0);
-                        let base = if sub_op.ack_received {
-                            PROGRESS_TIMEOUT + ACK_TIMEOUT * (retry_count as u32)
-                        } else {
-                            ACK_TIMEOUT * (retry_count as u32 + 1)
-                        };
-                        // Only consume GlobalRng when elapsed exceeds 80% of base
-                        // (minimum possible jittered threshold). This avoids shifting
-                        // the global RNG state on every GC tick for ops that are
-                        // nowhere near retry time.
-                        let min_jittered = base.mul_f64(0.8);
-                        if elapsed > min_jittered {
-                            let jitter_factor: f64 =
-                                crate::config::GlobalRng::random_range(0.8..=1.2);
-                            let jitter = base.mul_f64(jitter_factor);
-                            if elapsed > jitter {
-                                retry_candidates.push(tx);
-                            }
-                        }
-                    }
-
-                    if !retry_candidates.is_empty() {
-                        // Collect all connected peers for fallback
-                        let all_connected: Vec<_> = ring
-                            .connection_manager
-                            .get_connections_by_location()
-                            .values()
-                            .flat_map(|conns| conns.iter().map(|c| c.location.clone()))
-                            .collect();
-
-                        if retry_candidates.len() > MAX_SUBSCRIBE_RETRIES_PER_TICK {
-                            tracing::debug!(
-                                total = retry_candidates.len(),
-                                processing = MAX_SUBSCRIBE_RETRIES_PER_TICK,
-                                "Capping subscribe retries per tick"
-                            );
-                            // Sort by age (oldest first) to guarantee fairness:
-                            // shuffle would cause probabilistic starvation when
-                            // candidates consistently exceed the per-tick cap.
-                            retry_candidates.sort_by_cached_key(|tx| {
-                                std::cmp::Reverse(tx.elapsed())
-                            });
-                        }
-
-                        for tx in retry_candidates.into_iter().take(MAX_SUBSCRIBE_RETRIES_PER_TICK) {
-                            if let Some((_, sub_op)) = ops.subscribe.remove(&tx) {
-                                let stalled_peer_info = sub_op.failure_routing_info();
-                                let max_htl = ring.max_hops_to_live;
-                                match sub_op.retry_with_next_alternative(max_htl, &all_connected) {
-                                    Ok((mut new_op, msg)) => {
-                                        // Only report failure when alternative found (see GET comment).
-                                        if let Some((peer, contract_location)) = stalled_peer_info
-                                        {
-                                            ring.routing_finished(crate::router::RouteEvent {
-                                                peer,
-                                                contract_location,
-                                                outcome: crate::router::RouteOutcome::Failure,
-                                                op_type: Some(crate::node::network_status::OpType::Subscribe),
-                                            });
-                                        }
-                                        let msg = crate::message::NetMessage::from(msg);
-                                        // Track speculative path for ACK-aware retry bounds
-                                        new_op.speculative_paths += 1;
-                                        new_op.ack_received = false;
-                                        // Insert op BEFORE sending message to avoid race
-                                        ops.subscribe.insert(tx, new_op);
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(1),
-                                            event_loop_notifier
-                                                .notifications_sender
-                                                .send(Either::Left(msg)),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {
-                                                *subscribe_retried.entry(tx).or_insert(0) += 1;
-                                            }
-                                            Ok(Err(_)) | Err(_) => {
-                                                tracing::warn!(
-                                                    %tx,
-                                                    "Failed to send subscribe retry message, \
-                                                     will retry next tick"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(sub_op) => {
-                                        // No alternatives — put it back for normal timeout
-                                        ops.subscribe.insert(tx, *sub_op);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
+                // SUBSCRIBE speculative-retry GC block was retired in #1454
+                // Phase 5-final: every originator-side writer into
+                // `ops.subscribe` (client-initiated, executor auto-subscribe,
+                // renewal, PUT/GET sub-op) now runs on the task-per-tx
+                // driver in `operations/subscribe/op_ctx_task.rs`, which
+                // owns its own retry loop via `advance_to_next_peer` and
+                // never inserts a `SubscribeOp` into the DashMap. The
+                // remaining legacy entries (relay state during multi-hop
+                // forwarding, `create_unsubscribe_op` routing entries) are
+                // not retry candidates: relay entries fail
+                // `is_originator()` and unsubscribe entries fail
+                // `failure_routing_info().is_some()`. The DashMap, the
+                // `SubscribeOp::ack_received` / `speculative_paths` fields,
+                // and `SubscribeMsg::ForwardingAck` survive only as wire-
+                // and bookkeeping-compat for legacy relay traffic;
+                // they are not load-bearing for retry. Mirrors the GET
+                // Phase 5-final retirement in PR #3974.
 
                 let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing.drain(..) {
@@ -1816,7 +1681,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     if still_waiting {
                         delayed.push(tx);
                     } else {
-                        subscribe_retried.remove(&tx);
                         ops.under_progress.remove(&tx);
                         ops.completed.remove(&tx);
                         tracing::info!(
