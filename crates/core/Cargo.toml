@@ -104,7 +104,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
 console-subscriber = { workspace = true, optional = true }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 freenet-test-network = { workspace = true, optional = true }
 turmoil = { workspace = true }  # Deterministic simulation scheduling (always enabled for SimNetwork)
 lru = { workspace = true }

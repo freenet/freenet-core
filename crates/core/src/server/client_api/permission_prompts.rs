@@ -1,14 +1,17 @@
 //! HTTP endpoints for delegate permission prompts.
 //!
 //! When a delegate emits `RequestUserInput`, the `DashboardPrompter` stores the
-//! pending prompt and the gateway shell page's JS detects it via polling the
-//! `/permission/pending` endpoint. The shell page renders the prompt as an
-//! in-page overlay (see issue #3836) on every open Freenet tab. When the user
-//! clicks a button in any tab the response is POSTed to
-//! `/permission/{nonce}/respond` and the result flows back to the delegate;
-//! other tabs see the nonce disappear on their next poll and hide the overlay.
+//! pending prompt and broadcasts a `PromptEvent::Added`. The gateway shell
+//! page's JS subscribes to `/permission/events` (Server-Sent Events) and
+//! renders the prompt as an in-page overlay (see issue #3836) on every open
+//! Freenet tab. When the user clicks a button in any tab the response is
+//! POSTed to `/permission/{nonce}/respond`; the gateway then emits
+//! `PromptEvent::Removed` and every tab dismisses its overlay.
 //!
-//! The standalone `/permission/{nonce}` HTML page is retained as a fallback
+//! The legacy `/permission/pending` JSON polling endpoint is retained as a
+//! fallback for environments without `EventSource`, for the SSE bootstrap
+//! reconciliation (used on connect/reconnect/resync), and for tests. The
+//! standalone `/permission/{nonce}` HTML page is retained as a fallback
 //! (e.g. if JS is disabled in the shell, or for debugging / manual testing).
 //!
 //! # Trust model and UI rationale (#3857)
@@ -70,21 +73,52 @@
 //! mirrors this same layout. Both code paths must stay in sync — the
 //! standalone page and the in-page overlay are both regression-tested.
 
+use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
 use axum::extract::Path;
 use axum::http::HeaderMap;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use futures::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
-use crate::contract::user_input::{CallerIdentity, PendingPrompts};
+use crate::contract::user_input::{
+    CallerIdentity, PendingPrompts, PromptEvent, PromptSnapshot,
+    pending_prompts as pending_prompts_registry, prompt_events,
+};
 
 /// Register permission prompt routes.
 pub(super) fn routes() -> Router {
     Router::new()
         .route("/permission/pending", get(pending_prompts))
+        .route("/permission/events", get(permission_events))
         .route("/permission/{nonce}", get(permission_page))
         .route("/permission/{nonce}/respond", post(permission_respond))
+}
+
+/// Cap on simultaneous SSE subscribers. A single browser typically opens one
+/// EventSource per Freenet tab; 64 is generous headroom and protects against
+/// runaway tab counts or a buggy client looping reconnects.
+const MAX_SSE_CONNECTIONS: usize = 64;
+
+/// Live SSE connection count. Used to enforce `MAX_SSE_CONNECTIONS`.
+static SSE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements `SSE_CONNECTIONS` on drop. The connection count must always be
+/// released even if the SSE stream is dropped mid-handshake or panics in a
+/// downstream layer.
+struct SseConnectionGuard;
+
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        SSE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Maximum message length returned to the shell-page overlay. Caps the
@@ -479,6 +513,16 @@ async fn permission_respond(
                 if prompt.response_tx.send(body.index).is_err() {
                     tracing::debug!(nonce = %nonce, "Permission response channel already closed");
                 }
+                // Notify SSE subscribers so every open Freenet tab dismisses
+                // its overlay immediately instead of waiting for the polling
+                // fallback (#3836 follow-up). `send` returns `Err` only when
+                // there are no live subscribers — that's the polling-only
+                // fallback case and is fine to ignore.
+                drop(crate::contract::user_input::prompt_events().send(
+                    crate::contract::user_input::PromptEvent::Removed {
+                        nonce: nonce.clone(),
+                    },
+                ));
                 (
                     axum::http::StatusCode::OK,
                     Json(serde_json::json!({"ok": true})),
@@ -557,6 +601,164 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
+}
+
+/// Render a `PromptSnapshot` as the JSON payload sent over SSE. Mirrors the
+/// shape returned by `/permission/pending` so the shell-page renderer can
+/// consume both code paths interchangeably.
+fn snapshot_to_json(snapshot: &PromptSnapshot) -> serde_json::Value {
+    let message = sanitize_display(&snapshot.message, OVERLAY_MESSAGE_MAX);
+    let labels: Vec<String> = snapshot
+        .labels
+        .iter()
+        .take(OVERLAY_LABELS_MAX)
+        .map(|l| sanitize_display(l, OVERLAY_LABEL_CHARS_MAX))
+        .collect();
+    serde_json::json!({
+        "nonce": snapshot.nonce,
+        "message": message,
+        "labels": labels,
+        "delegate_key": sanitize_display(&snapshot.delegate_key, OVERLAY_KEY_CHARS_MAX),
+        "caller": caller_to_json(&snapshot.caller),
+    })
+}
+
+/// Server-Sent Events stream for permission prompts.
+///
+/// Replaces the 3-second polling loop in the shell page with a push-based
+/// channel. A new prompt becomes visible to every open Freenet tab as soon
+/// as the broadcast event lands, with no polling-floor latency.
+///
+/// Origin gating mirrors `/permission/pending`: trusted loopback origins
+/// receive the full event stream; untrusted origins receive a stream that
+/// emits one `:closed` comment and ends, so the browser doesn't surface a
+/// CORS error in the devtools console.
+///
+/// Race avoidance: we subscribe to the broadcast channel BEFORE snapshotting
+/// the DashMap. Any prompt added between the snapshot and our first
+/// `recv()` arrives via the broadcast (possibly duplicated with a snapshot
+/// entry); the shell-page renderer keys on `nonce`, so duplicates are
+/// idempotent.
+async fn permission_events(
+    headers: HeaderMap,
+    Extension(_pending): Extension<PendingPrompts>,
+) -> axum::response::Response {
+    // Connection cap. We do this before any expensive setup so a flood of
+    // reconnects from a buggy client cannot exhaust per-process resources.
+    let prev = SSE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+    if prev >= MAX_SSE_CONNECTIONS {
+        SSE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+        tracing::warn!(
+            limit = MAX_SSE_CONNECTIONS,
+            "SSE connection cap reached, refusing new /permission/events subscriber"
+        );
+        let stream = stream::once(async {
+            Ok::<_, Infallible>(Event::default().comment("connection-cap-reached"))
+        });
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+    let guard = SseConnectionGuard;
+
+    let trusted = match headers.get("origin") {
+        Some(value) => value.to_str().map(is_trusted_origin).unwrap_or(false),
+        None => true,
+    };
+
+    if !trusted {
+        // Drop the guard immediately so the count is released — we're
+        // returning a degenerate stream that closes after one frame.
+        drop(guard);
+        let stream = stream::once(async {
+            Ok::<_, Infallible>(Event::default().comment("untrusted-origin"))
+        });
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
+    // Subscribe FIRST to avoid the race where a prompt is added between the
+    // DashMap snapshot and our first broadcast recv.
+    let rx = prompt_events().subscribe();
+    let pending_snapshot = pending_prompts_registry();
+
+    // Convert each currently-pending entry to a synthetic Added event so
+    // a fresh subscriber catches up to current state.
+    let initial: Vec<Result<Event, Infallible>> = pending_snapshot
+        .iter()
+        .map(|entry| {
+            let snapshot = PromptSnapshot {
+                nonce: entry.key().clone(),
+                message: entry.value().message.clone(),
+                labels: entry.value().labels.clone(),
+                delegate_key: entry.value().delegate_key.clone(),
+                caller: entry.value().caller.clone(),
+            };
+            Ok(Event::default()
+                .event("prompt_added")
+                .data(snapshot_to_json(&snapshot).to_string()))
+        })
+        .collect();
+
+    let live = BroadcastStream::new(rx).filter_map(|incoming| async move {
+        match incoming {
+            Ok(PromptEvent::Added(snapshot)) => Some(Ok(Event::default()
+                .event("prompt_added")
+                .data(snapshot_to_json(&snapshot).to_string()))),
+            Ok(PromptEvent::Removed { nonce }) => Some(Ok(Event::default()
+                .event("prompt_removed")
+                .data(serde_json::json!({ "nonce": nonce }).to_string()))),
+            // Lag means our subscriber was slow and missed events. The shell
+            // page reconciles by emitting a `resync` event that tells the
+            // client to drop everything and trust a freshly-fetched
+            // /permission/pending list. Rare in practice — capacity 128,
+            // two events per prompt lifecycle, max 32 concurrent prompts.
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "SSE subscriber lagged, requesting resync");
+                Some(Ok(Event::default().event("resync").data("{}")))
+            }
+        }
+    });
+
+    let merged = stream::iter(initial).chain(live);
+    let stream_with_guard = GuardedStream {
+        inner: merged,
+        _guard: guard,
+    };
+
+    Sse::new(stream_with_guard)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(25))
+                .text("keepalive"),
+        )
+        .into_response()
+}
+
+/// Wraps an inner SSE stream together with the connection-count guard so
+/// that dropping the response (client disconnect) decrements the live count.
+/// Without this, an SSE stream that's cancelled mid-flight would leak the
+/// counter slot until process exit.
+#[pin_project::pin_project]
+struct GuardedStream<S> {
+    #[pin]
+    inner: S,
+    _guard: SseConnectionGuard,
+}
+
+impl<S> Stream for GuardedStream<S>
+where
+    S: Stream<Item = Result<Event, Infallible>>,
+{
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.project().inner.poll_next(cx)
+    }
 }
 
 #[cfg(test)]
@@ -1186,5 +1388,179 @@ mod tests {
             html.contains("&quot;onload=&quot;evil()"),
             "escaped caller hash quotes must appear"
         );
+    }
+
+    // ----- SSE endpoint regression tests -----
+
+    /// Open the SSE stream for a given test origin and return the data
+    /// stream as a `Stream<Bytes>`. We avoid `http_body_util` (not a direct
+    /// dev-dep) by using axum's `Body::into_data_stream` adapter.
+    async fn open_sse_with_origin(
+        origin: Option<&str>,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = bytes::Bytes> + Send>> {
+        use axum::response::IntoResponse;
+        let pending = pending_prompts_registry();
+        let mut headers = HeaderMap::new();
+        if let Some(o) = origin {
+            headers.insert("origin", o.parse().unwrap());
+        }
+        let resp = permission_events(headers, Extension(pending))
+            .await
+            .into_response();
+        let stream = resp
+            .into_body()
+            .into_data_stream()
+            .filter_map(|r| async move { r.ok() });
+        Box::pin(stream)
+    }
+
+    /// Read the next non-keepalive SSE frame from a body stream, returning
+    /// the raw bytes (`event: ...\ndata: ...\n\n`). Caller parses. Skips
+    /// keepalive comment lines (starting with `:`).
+    async fn next_event_frame(
+        stream: &mut std::pin::Pin<Box<dyn futures::stream::Stream<Item = bytes::Bytes> + Send>>,
+        timeout_ms: u64,
+    ) -> Option<String> {
+        let deadline = std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let chunk = match tokio::time::timeout(deadline, stream.next()).await {
+                Ok(Some(b)) => b,
+                _ => return None,
+            };
+            let text = String::from_utf8_lossy(&chunk).to_string();
+            // Skip pure keepalive comments (lines starting with ':') and
+            // empty chunks.
+            if text.trim().is_empty() || text.trim_start().starts_with(':') {
+                continue;
+            }
+            return Some(text);
+        }
+    }
+
+    /// Walk frames until we see one matching the predicate, or run out of
+    /// budget. Concurrent tests share the global broadcast channel so we
+    /// must filter by our test's own nonce rather than asserting on the
+    /// "next" frame.
+    async fn frame_matching(
+        stream: &mut std::pin::Pin<Box<dyn futures::stream::Stream<Item = bytes::Bytes> + Send>>,
+        predicate: impl Fn(&str) -> bool,
+        max_frames: usize,
+        per_frame_timeout_ms: u64,
+    ) -> Option<String> {
+        for _ in 0..max_frames {
+            let frame = next_event_frame(stream, per_frame_timeout_ms).await?;
+            if predicate(&frame) {
+                return Some(frame);
+            }
+        }
+        None
+    }
+
+    /// The bug this PR closes: a `prompt_added` lifecycle event must be
+    /// pushed to a subscribed SSE client without polling.
+    #[tokio::test]
+    async fn test_sse_emits_added_when_prompt_inserted() {
+        let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
+
+        let nonce = "ssetest_added_001".to_string();
+        let snapshot = PromptSnapshot {
+            nonce: nonce.clone(),
+            message: "approve?".into(),
+            labels: vec!["Allow".into(), "Deny".into()],
+            delegate_key: "dkey-added-001".into(),
+            caller: webapp_caller("cid-added-001"),
+        };
+        // Wait briefly so the SSE handler has time to subscribe before we
+        // emit the broadcast. Without this, the test would race the spawn.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(prompt_events().send(PromptEvent::Added(snapshot)));
+
+        let frame = frame_matching(
+            &mut body,
+            |f| f.contains("event: prompt_added") && f.contains(&nonce),
+            32,
+            500,
+        )
+        .await
+        .unwrap_or_else(|| panic!("did not see prompt_added for {nonce}"));
+        assert!(frame.contains("dkey-added-001"));
+    }
+
+    /// `prompt_removed` must arrive over SSE so every tab dismisses its
+    /// overlay simultaneously when one tab clicks a button.
+    #[tokio::test]
+    async fn test_sse_emits_removed_when_prompt_responded() {
+        let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
+
+        let nonce = "ssetest_removed_002".to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(prompt_events().send(PromptEvent::Removed {
+            nonce: nonce.clone(),
+        }));
+
+        let frame = frame_matching(
+            &mut body,
+            |f| f.contains("event: prompt_removed") && f.contains(&nonce),
+            32,
+            500,
+        )
+        .await
+        .unwrap_or_else(|| panic!("did not see prompt_removed for {nonce}"));
+        assert!(frame.contains(&nonce));
+    }
+
+    /// Untrusted-origin SSE subscribers must receive a closed stream rather
+    /// than the live event flow. Mirrors the gating on `/permission/pending`.
+    #[tokio::test]
+    async fn test_sse_untrusted_origin_returns_closed_stream() {
+        let mut body = open_sse_with_origin(Some("http://evil.example")).await;
+        let frame = next_event_frame(&mut body, 200).await;
+        // The stream emits exactly one `:untrusted-origin` comment then
+        // closes. Comments are stripped by next_event_frame, so we expect
+        // None (no data events ever arrive on this stream).
+        assert!(
+            frame.is_none(),
+            "untrusted origin must not receive any data events, got: {frame:?}"
+        );
+    }
+
+    /// Initial-state bootstrap: a fresh subscriber must receive
+    /// `prompt_added` events for every currently-pending prompt before any
+    /// new live events arrive. Avoids the race where a prompt added between
+    /// the page load and the SSE subscribe would be invisible.
+    #[tokio::test]
+    async fn test_sse_replays_existing_pending_on_subscribe() {
+        // Insert into the global registry before subscribing.
+        let pending = pending_prompts_registry();
+        let nonce = "ssetest_bootstrap_003".to_string();
+        let _rx = insert_prompt(
+            &pending,
+            &nonce,
+            "bootstrap?",
+            vec!["OK"],
+            "dkey-bootstrap",
+            webapp_caller("cid-bootstrap"),
+        );
+
+        let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
+
+        // Walk frames until we see one referencing our nonce. Other tests
+        // running in parallel may have left additional pending entries in
+        // the shared global registry; any of them being replayed first is
+        // fine.
+        let mut found = false;
+        for _ in 0..16 {
+            let Some(frame) = next_event_frame(&mut body, 500).await else {
+                break;
+            };
+            if frame.contains("event: prompt_added") && frame.contains(&nonce) {
+                found = true;
+                break;
+            }
+        }
+        // Cleanup: remove from the shared registry so other tests aren't
+        // affected.
+        pending.remove(&nonce);
+        assert!(found, "bootstrap replay did not include {nonce}");
     }
 }

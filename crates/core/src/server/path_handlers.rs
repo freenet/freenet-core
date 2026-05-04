@@ -982,10 +982,14 @@ function freenetBridge(authToken) {
   // is pending. The shell is trusted and same-origin with the gateway, so
   // the sandboxed contract cannot reach into this DOM. See issue #3836.
   //
-  // Every open Freenet tab renders the overlay for every pending prompt.
-  // When the user responds in one tab, the gateway removes the nonce from
-  // the pending registry; other tabs see it disappear on their next poll
-  // and hide their overlays automatically.
+  // Every open Freenet tab subscribes to /permission/events (Server-Sent
+  // Events) and renders the overlay as soon as the gateway pushes an
+  // `prompt_added` event. When the user responds in one tab, the gateway
+  // emits `prompt_removed` and every tab dismisses its card. This was
+  // previously a 3-second polling loop with a visibility-skip optimisation
+  // that caused the originating tab to silently miss prompts whenever it
+  // wasn't foregrounded; SSE eliminates both the polling-floor latency and
+  // the visibility race.
   var overlayRoot = null;
   var overlayCards = {}; // nonce -> card element
   var OVERLAY_CSS =
@@ -1263,15 +1267,11 @@ function freenetBridge(authToken) {
       btns.forEach(function(b) { b.disabled = false; b.style.opacity = '1'; });
     });
   }
-  function checkPermissions() {
-    // Skip polling when the tab is hidden: saves bandwidth and gateway
-    // load when the user has many Freenet tabs open in the background.
-    // The tab picks up the prompt again on its next visibility event.
-    if (typeof document !== 'undefined' &&
-        document.visibilityState === 'hidden' &&
-        Object.keys(overlayCards).length === 0) {
-      return;
-    }
+  // Snapshot the current pending list and reconcile against the open
+  // overlay cards. Used for initial bootstrap, on `resync` events when an
+  // SSE subscriber lagged, and as a fallback while the EventSource is
+  // reconnecting.
+  function reconcileFromPending() {
     fetch('/permission/pending').then(function(r) { return r.json(); }).then(function(prompts) {
       if (!Array.isArray(prompts)) return;
       var seen = {};
@@ -1279,26 +1279,55 @@ function freenetBridge(authToken) {
         if (!p || typeof p.nonce !== 'string') return;
         seen[p.nonce] = true;
         if (overlayCards[p.nonce]) return;
-        var card = createCard(p);
-        showCard(p.nonce, card);
+        showCard(p.nonce, createCard(p));
       });
-      // Any card whose nonce is no longer pending was answered elsewhere
-      // (another tab, the 60s auto-deny, or delegate cancelled). Remove it
-      // so the user isn't clicking a dead button.
       Object.keys(overlayCards).forEach(function(nonce) {
         if (!seen[nonce]) hideCard(nonce);
       });
     }).catch(function() {});
   }
-  setInterval(checkPermissions, 3000);
-  checkPermissions();
-  // Re-check as soon as the tab becomes visible again so a user returning
-  // to a background tab sees any prompt that accumulated while they were
-  // away without waiting for the next poll tick.
-  if (typeof document !== 'undefined' && document.addEventListener) {
-    document.addEventListener('visibilitychange', function() {
-      if (document.visibilityState === 'visible') checkPermissions();
+
+  // Open a Server-Sent Events connection so prompts appear with no polling
+  // delay and on every open Freenet tab regardless of foreground/background
+  // state. The browser's EventSource auto-reconnects with exponential
+  // backoff if the connection drops; on each reconnect we re-bootstrap from
+  // /permission/pending so we don't miss anything during the gap.
+  if (typeof EventSource !== 'undefined') {
+    var es = new EventSource('/permission/events');
+    es.addEventListener('prompt_added', function(e) {
+      try {
+        var p = JSON.parse(e.data);
+        if (!p || typeof p.nonce !== 'string') return;
+        if (overlayCards[p.nonce]) return;
+        showCard(p.nonce, createCard(p));
+      } catch (err) {}
     });
+    es.addEventListener('prompt_removed', function(e) {
+      try {
+        var p = JSON.parse(e.data);
+        if (!p || typeof p.nonce !== 'string') return;
+        hideCard(p.nonce);
+      } catch (err) {}
+    });
+    // The server emits `resync` when its broadcast channel laps a slow
+    // subscriber. Drop everything and re-snapshot from the polling endpoint.
+    es.addEventListener('resync', function() {
+      Object.keys(overlayCards).forEach(hideCard);
+      reconcileFromPending();
+    });
+    // EventSource fires `open` on initial connect AND on every reconnect.
+    // Reconcile each time so a transient disconnect doesn't leave us out
+    // of date. The browser's auto-reconnect handles transient failures;
+    // we don't need to manually retry.
+    es.addEventListener('open', reconcileFromPending);
+    // Initial bootstrap so we're populated before the SSE handshake
+    // completes (avoids a brief empty state on slow connections).
+    reconcileFromPending();
+  } else {
+    // EventSource is missing in some embedded webviews. Fall back to the
+    // legacy 3-second poll so users on those clients still see prompts.
+    setInterval(reconcileFromPending, 3000);
+    reconcileFromPending();
   }
 }
 "#;
@@ -1998,10 +2027,17 @@ mod tests {
             "overlay must declare role=dialog for a11y"
         );
         assert!(html.contains("aria-modal"), "overlay must set aria-modal");
-        // Polls the new pending endpoint and POSTs back with the response.
+        // Subscribes to the new SSE endpoint and POSTs back with the response.
+        // /permission/pending is still referenced as the bootstrap-on-connect
+        // and `resync` reconciliation endpoint, plus the no-EventSource
+        // fallback, so the assertion below still holds.
+        assert!(
+            html.contains("/permission/events"),
+            "shell JS must subscribe to /permission/events (SSE)"
+        );
         assert!(
             html.contains("/permission/pending"),
-            "shell JS must poll /permission/pending"
+            "shell JS must reference /permission/pending for bootstrap/resync"
         );
         assert!(
             html.contains("/respond"),
@@ -2013,6 +2049,16 @@ mod tests {
             html.contains("r.status === 404"),
             "shell JS must treat 404 on respond as 'already answered' and hide the card"
         );
+        // SSE event names the server emits — pinning these here ensures the
+        // shell stays in sync with the gateway's wire format.
+        assert!(
+            html.contains("'prompt_added'") || html.contains("\"prompt_added\""),
+            "shell JS must subscribe to the prompt_added SSE event"
+        );
+        assert!(
+            html.contains("'prompt_removed'") || html.contains("\"prompt_removed\""),
+            "shell JS must subscribe to the prompt_removed SSE event"
+        );
         // All delegate-controlled strings must go through textContent, never
         // innerHTML — guards against a future refactor re-opening XSS into
         // the trusted shell origin.
@@ -2020,13 +2066,15 @@ mod tests {
             html.contains("function setText(el, text)"),
             "setText helper (textContent-only) missing"
         );
-        // innerHTML must not appear anywhere in the overlay code path. It
-        // can appear elsewhere in the shell JS if needed, but this test
-        // enforces that the overlay diff doesn't introduce it.
+        // innerHTML must not appear anywhere in the overlay code path. The
+        // boundary marker below was previously `setInterval(checkPermissions`
+        // but that polling loop is gone; we now bound the slice at the
+        // EventSource-fallback `setInterval(reconcileFromPending`.
         let overlay_start = html.find("__freenet_perm_overlay").unwrap();
         let overlay_end = html[overlay_start..]
-            .find("setInterval(checkPermissions")
-            .unwrap();
+            .find("setInterval(reconcileFromPending")
+            .or_else(|| html[overlay_start..].find("EventSource"))
+            .expect("overlay slice must end at the SSE setup or fallback poll");
         let overlay_slice = &html[overlay_start..overlay_start + overlay_end];
         assert!(
             !overlay_slice.contains("innerHTML"),
@@ -2048,10 +2096,19 @@ mod tests {
                 && !html.contains("window.open(\"/permission/"),
             "shell must no longer open /permission/{{nonce}} as a popup (#3836)"
         );
-        // Visibility gating keeps background tabs from polling forever.
+        // The visibility-gated polling loop has been replaced by SSE. SSE
+        // pushes regardless of tab visibility, so the visibility-skip code
+        // path that caused #ISSUE (originating tab silently missing prompts
+        // when in the background) MUST NOT be reintroduced. Pin this
+        // contract by asserting `visibilityState` no longer appears in the
+        // overlay path. If a future change needs visibility gating for some
+        // *other* reason, that change must move this assertion or replace
+        // the visibility-related JS with a deliberate no-op rather than
+        // bringing back the polling-skip loop.
         assert!(
-            html.contains("visibilityState"),
-            "overlay polling should be gated on document.visibilityState"
+            !html.contains("visibilityState"),
+            "overlay must not gate on document.visibilityState — \
+             visibility-skip caused background tabs to miss prompts (SSE replaces polling)"
         );
 
         // Regression test for issue #3857: the overlay must read the new
