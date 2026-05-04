@@ -1509,9 +1509,9 @@ mod tests {
     /// timing on slow CI runners.
     async fn wait_subscribers_then_send(target: usize, event: PromptEvent) {
         let sender = prompt_events();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while sender.receiver_count() < target {
-            if std::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 panic!(
                     "timed out waiting for {target} SSE subscribers; have {}",
                     sender.receiver_count()
@@ -1765,9 +1765,9 @@ mod tests {
         // counter to settle to zero. (No SSE responses should be live at
         // this point because the only test that opens them is this one,
         // serialised by the mutex above.)
-        let deadline0 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline0 = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while SSE_CONNECTIONS.load(Ordering::Relaxed) != 0 {
-            if std::time::Instant::now() >= deadline0 {
+            if tokio::time::Instant::now() >= deadline0 {
                 // A leaked connection from a previous test indicates a real
                 // bug in GuardedStream's drop, but for the purposes of this
                 // test, accept the baseline rather than panic.
@@ -1799,12 +1799,12 @@ mod tests {
         // Drop one held subscriber; the cap-counter must release a slot.
         let dropped = held.pop().unwrap();
         drop(dropped);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if SSE_CONNECTIONS.load(Ordering::Relaxed) < MAX_SSE_CONNECTIONS {
                 break;
             }
-            if std::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 panic!("SSE_CONNECTIONS did not decrement after dropping a subscriber");
             }
             tokio::task::yield_now().await;
@@ -1855,9 +1855,9 @@ mod tests {
 
         // Drain until we see the matching Removed (concurrent tests on the
         // global broadcaster may interleave their own events).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut saw = false;
-        while std::time::Instant::now() < deadline {
+        while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
                 Ok(Ok(PromptEvent::Removed { nonce: n })) if n == nonce => {
                     saw = true;
