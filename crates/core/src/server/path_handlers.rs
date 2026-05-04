@@ -825,10 +825,17 @@ function freenetBridge(authToken) {
         // Open external URLs in a new tab. Popups from the sandboxed iframe
         // inherit the opaque origin, breaking CORS on target sites. The shell
         // opens the URL instead, giving proper origin. See issue #1499.
-        // Security: only allow https: URLs that are NOT localhost/loopback.
+        // Security: allow http: and https: URLs that are NOT localhost/loopback.
+        // Both schemes are allowed because user-pasted markdown links commonly
+        // target plain-HTTP self-hosted services (e.g. nova.locut.us:3133, the
+        // Freenet network telemetry dashboard) that don't have TLS configured.
+        // Auth tokens never travel through this path — only the destination
+        // URL is opened in a top-level tab — so HTTP doesn't expose credentials.
+        // The interceptor upstream already filters non-http(s) schemes, so this
+        // is defence in depth. See freenet/river#231.
         try {
           var u = new URL(msg.url);
-          if (u.protocol !== 'https:') return;
+          if (u.protocol !== 'https:' && u.protocol !== 'http:') return;
           var h = u.hostname.toLowerCase();
           if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '0.0.0.0') return;
           // Honour shift-click by requesting a popup-style window feature
@@ -2955,6 +2962,56 @@ mod tests {
         assert!(
             block.contains("'noopener,noreferrer'"),
             "open_url handler must keep the plain new-tab path for non-shift clicks"
+        );
+    }
+
+    /// Regression test for freenet/river#231.
+    ///
+    /// The shell `open_url` handler must accept `http:` URLs in addition to
+    /// `https:`. The original https-only check silently dropped clicks on
+    /// markdown links to plain-HTTP services (e.g. the Network Telemetry
+    /// dashboard `http://nova.locut.us:3133/` linked from the Freenet River
+    /// channel header) — the user clicked the link and nothing happened, no
+    /// console output, no popup, no error. The localhost block stays so a
+    /// pasted `http://127.0.0.1:NNNN/` link can't be used to target services
+    /// running on the reader's machine.
+    #[test]
+    fn shell_open_url_handler_accepts_http_and_https_but_blocks_localhost() {
+        let js = SHELL_BRIDGE_JS;
+        let open_url_idx = js
+            .find("msg.type === 'open_url'")
+            .expect("shell open_url branch present");
+        let rest = &js[open_url_idx..];
+        let next_branch = rest[1..]
+            .find("} else if")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let block = &rest[..next_branch];
+
+        // Both schemes accepted. The check must reject ONLY non-http(s),
+        // not just non-https.
+        assert!(
+            block.contains("u.protocol !== 'https:'") && block.contains("u.protocol !== 'http:'"),
+            "open_url handler must accept both http: and https: schemes \
+             (freenet/river#231); got block: {block}"
+        );
+        // The check must NOT be a bare https-only filter that drops http: URLs
+        // before they reach the localhost block. Pin the precise structure so
+        // a future "tighten security" refactor that re-introduces the
+        // https-only filter trips this test.
+        assert!(
+            !block.contains("if (u.protocol !== 'https:') return;"),
+            "open_url handler must NOT reject http: URLs outright; the bug \
+             this test pins (freenet/river#231) was that an https-only filter \
+             silently dropped clicks on http: links the user pasted. Got: {block}"
+        );
+        // Localhost block must still be present — http: + localhost is the
+        // CSRF/private-network surface the original check was guarding against.
+        assert!(
+            block.contains("'localhost'") && block.contains("'127.0.0.1'"),
+            "open_url handler must continue to block localhost/loopback hosts \
+             so http: scheme acceptance doesn't open a CSRF surface against \
+             services on the reader's machine; got block: {block}"
         );
     }
 
