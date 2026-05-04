@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "fdev"
-version = "0.3.215"
+version = "0.3.216"
 dependencies = [
  "anyhow",
  "axum",
@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.2.52"
+version = "0.2.53"
 dependencies = [
  "aes-gcm",
  "ahash",
