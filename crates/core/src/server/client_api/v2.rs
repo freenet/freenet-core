@@ -1,4 +1,4 @@
-use axum::{Extension, Router, extract::Path, routing::get};
+use axum::{Extension, Router, extract::Path, response::Redirect, routing::get};
 
 use super::*;
 
@@ -9,6 +9,8 @@ use super::*;
 pub(super) fn routes(config: Config) -> Router {
     Router::new()
         .route("/v2", get(home))
+        // No-trailing-slash redirect — see v1.rs for the rationale.
+        .route("/v2/contract/web/{key}", get(web_root_redirect_v2))
         .route("/v2/contract/web/{key}/", get(web_home_v2))
         .with_state(config)
         .route("/v2/contract/web/{key}/{*path}", get(web_subpages_v2))
@@ -31,4 +33,10 @@ async fn web_subpages_v2(
     Extension(rs): Extension<HttpClientApiRequest>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     web_subpages(key, last_path, ApiVersion::V2, query, headers, rs).await
+}
+
+/// Redirect `/v2/contract/web/{key}` (no trailing slash) to
+/// `/v2/contract/web/{key}/` — see v1.rs for the rationale.
+async fn web_root_redirect_v2(Path(key): Path<String>) -> Redirect {
+    Redirect::permanent(&format!("/v2/contract/web/{key}/"))
 }
