@@ -38,6 +38,10 @@ const MAX_RETRIES: usize = 10;
 /// traversal storms. This floor ensures retries still reach peers 2-3 hops
 /// away, which is the minimum useful search depth in any topology.
 /// Matches GET operation's MIN_RETRY_HTL; change both together.
+/// Used only by `retry_with_next_alternative`, which itself survives
+/// the slice-1 GC retirement only as a test-exercised helper. Allow
+/// `dead_code` until the helper + tests are removed in slice 2.
+#[allow(dead_code)]
 const MIN_RETRY_HTL: usize = 3;
 
 /// Timeout for waiting on contract storage notification.
@@ -603,11 +607,19 @@ pub(crate) struct SubscribeOp {
     is_renewal: bool,
     /// Routing stats for failure reporting.
     stats: Option<SubscribeStats>,
-    /// True when a downstream relay has acknowledged forwarding this request.
-    /// Used by the GC task to distinguish "peer is dead" from "peer is working on it".
+    /// Historically: true when a downstream relay has acknowledged
+    /// forwarding this request. The GC speculative-retry block that
+    /// consumed this signal was retired in #1454 Phase 5-final slice 1
+    /// (mirroring the GET retirement in PR #3974). The field is still
+    /// maintained on the legacy state-machine path and exercised by
+    /// helper tests so the bookkeeping is captured if a future retry
+    /// mechanism reuses it. Allow `dead_code` until the field + tests
+    /// are deleted in slice 2.
+    #[allow(dead_code)]
     pub(crate) ack_received: bool,
-    /// Number of speculative parallel paths launched by the originator's GC task.
-    /// Capped at MAX_SPECULATIVE_PATHS to bound network overhead.
+    /// Historically: number of speculative parallel paths launched by
+    /// the originator's GC task. Same lineage as `ack_received` above.
+    #[allow(dead_code)]
     pub(crate) speculative_paths: u8,
 }
 
@@ -711,6 +723,12 @@ impl SubscribeOp {
     /// from local alternatives, or injects fallback peers if alternatives are exhausted.
     /// Returns `Ok((op, msg))` with the updated op and new Request message,
     /// or `Err(op)` if no alternatives remain.
+    ///
+    /// Historically called by the GC speculative-retry block; that block
+    /// was retired in #1454 Phase 5-final slice 1. Helper retained for
+    /// the existing unit tests until the field + tests are deleted in
+    /// slice 2.
+    #[allow(dead_code)]
     pub(crate) fn retry_with_next_alternative(
         mut self,
         max_hops_to_live: usize,

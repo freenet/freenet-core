@@ -133,21 +133,32 @@ paths:
 > for GET. Phase 5-final retired that block, the `get_retried`
 > per-tick HashMap, the `GetOp::ack_received` /
 > `GetOp::speculative_paths` fields, and the 11 unit tests that
-> simulated the GC retry decision. The shared retry constants
-> (`ACK_TIMEOUT`, `MAX_SPECULATIVE_PATHS`, `PROGRESS_TIMEOUT`) and the
-> SUBSCRIBE retry block stay because legacy intermediate-peer
-> SUBSCRIBE writers (state pushed by `subscribe::process_message` on
-> relay hops) still produce `SubscribeOp`s in `ops.subscribe` that
-> need GC retry coverage. Renewals and executor auto-subscribe were
-> previously also originator-side writers; both have now been
-> migrated to the task-per-tx driver. Retiring the GC retry block
-> requires either migrating the relay-side push-into-`ops.subscribe`
-> to task-per-tx local state OR proving the legacy state-machine
-> entries are short-lived enough that the GC block is dead in
-> practice.
-> `GetMsg::ForwardingAck` survives as a wire variant + telemetry hook
-> (#3570 diagnostics) but its handler now returns the operation
-> unchanged.
+> simulated the GC retry decision.
+>
+> The SUBSCRIBE GC speculative-retry block was retired in the same
+> Phase 5-final pass (slice 1 after GET): all four originator-side
+> writers into `ops.subscribe` (client-initiated, executor
+> auto-subscribe, renewal, PUT/GET sub-op) had migrated to the
+> task-per-tx driver in `operations/subscribe/op_ctx_task.rs` — which
+> owns its own retry loop via `advance_to_next_peer` and never inserts
+> a `SubscribeOp` into the DashMap. The remaining legacy entries in
+> `ops.subscribe` come from relay state during multi-hop forwarding
+> (slice A `start_relay_subscribe` does NOT register; entries arise
+> only when a relay re-enters `subscribe::process_message` for a tx
+> already in the DashMap, which now happens only for `Unsubscribe`
+> routing) and `create_unsubscribe_op` routing entries created by
+> `request_unsubscribe`. Neither is a retry candidate: relay entries
+> fail `is_originator()` and unsubscribe entries fail
+> `failure_routing_info().is_some()`. Slice 1 deletes the block, the
+> `subscribe_retried` per-tick HashMap, and the shared `ACK_TIMEOUT` /
+> `MAX_SPECULATIVE_PATHS` / `PROGRESS_TIMEOUT` constants (also
+> previously used by GET, now fully unreferenced). Slice 2 will delete
+> the `SubscribeOp::ack_received` / `speculative_paths` fields, the
+> `retry_with_next_alternative` helper, and the unit tests that
+> exercised the GC retry decision.
+> `GetMsg::ForwardingAck` and `SubscribeMsg::ForwardingAck` survive as
+> wire variants + telemetry hooks (#3570 diagnostics) but their
+> handlers return the operation unchanged.
 >
 > Sub-operation SUBSCRIBE callers (legacy GET-originator
 > `auto_subscribe_on_get_response` fallback path; PUT/GET task-per-tx
