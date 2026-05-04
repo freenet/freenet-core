@@ -59,9 +59,17 @@ pub struct TransportMetrics {
     bytes_received: AtomicU64,
 
     // Cumulative wire-byte counters (never reset, used by the local dashboard).
-    // Updated at the UDP socket layer for every packet, so they reflect all
-    // traffic including keep-alives, ACKs, NAT-traversal, and small control
-    // messages — not just stream transfer payloads.
+    //
+    // `cumulative_bytes_sent` is updated at the UDP socket layer for every
+    // successful `send_to`, so it reflects every byte we put on the wire
+    // including keep-alives, ACKs, NAT-traversal probes, and small control
+    // messages.
+    //
+    // `cumulative_bytes_received` is updated post-authentication (see
+    // `record_packet_received`), so it counts bytes from packets that pass
+    // `try_decrypt_sym` against an established symmetric session key.
+    // Counting at the raw socket would let an attacker spoofing UDP source
+    // addresses inflate this counter arbitrarily (#3999).
     cumulative_bytes_sent: AtomicU64,
     cumulative_bytes_received: AtomicU64,
 
