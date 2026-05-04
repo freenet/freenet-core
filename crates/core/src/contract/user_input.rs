@@ -20,10 +20,12 @@ const MAX_LABELS: usize = 10;
 /// hashes come from runtime context that is bounded at the source (BLAKE3
 /// hex / base58 contract id, both well under this limit). Capping at the
 /// insertion point keeps the prompt store from holding arbitrarily large
-/// strings if a future caller passes something larger, and matches the
-/// downstream cap applied in `permission_prompts.rs` at the JSON / HTML
-/// boundary so the two layers can never disagree about the maximum.
-const MAX_IDENTITY_HASH_CHARS: usize = 256;
+/// strings if a future caller passes something larger.
+///
+/// `permission_prompts.rs` re-uses this same cap at the JSON / HTML
+/// rendering boundary, so the two layers cannot disagree about the
+/// maximum.
+pub(crate) const MAX_IDENTITY_HASH_CHARS: usize = 256;
 
 /// Runtime-attested identity of the entity that triggered a permission prompt.
 ///
@@ -132,10 +134,22 @@ pub(crate) fn prompt_events() -> broadcast::Sender<PromptEvent> {
 }
 
 /// Fire a prompt lifecycle event. `Sender::send` returns `Err` when there
-/// are no live subscribers — that's the common case when the shell page
+/// are no live subscribers; that's the common case when the shell page
 /// isn't open yet, and the polling fallback covers it. Slow subscribers
 /// see `Lagged` and resync from the DashMap.
+///
+/// Caps the nonce length on `Removed` so that even if an unusual code path
+/// ever passes a client-supplied nonce here (today the only producers are
+/// `DashboardPrompter` itself and the HTTP `respond` handler, which both
+/// route through validated DashMap keys), the broadcast can't carry an
+/// arbitrarily large string to every connected tab.
 pub(crate) fn emit_prompt_event(event: PromptEvent) {
+    let event = match event {
+        PromptEvent::Removed { nonce } => PromptEvent::Removed {
+            nonce: cap_identity_chars(&nonce),
+        },
+        other => other,
+    };
     drop(prompt_events().send(event));
 }
 
@@ -228,7 +242,7 @@ impl UserInputPrompter for DashboardPrompter {
         // entry on a real user click; this remove is a no-op in that case
         // and otherwise covers the timeout / dropped-channel cleanup paths.
         // Always emit Removed so subscribers can hide their overlay
-        // regardless of which path retired the prompt — a duplicate Removed
+        // regardless of which path retired the prompt; a duplicate Removed
         // (when both the HTTP handler and this cleanup fire) is harmless,
         // because the SSE client's hide is idempotent on nonce.
         let was_present = self.pending.remove(&nonce).is_some();
@@ -617,7 +631,7 @@ mod tests {
 
     /// `DashboardPrompter::prompt` fires `PromptEvent::Added` after inserting
     /// the entry. The cleanup `Removed` is only fired by the prompter when
-    /// the entry was still present at cleanup time — when an external party
+    /// the entry was still present at cleanup time. When an external party
     /// (the HTTP `/respond` handler in production) already removed the
     /// entry, the prompter's cleanup is a no-op and the external remover is
     /// responsible for emitting `Removed`. This test exercises that
@@ -673,8 +687,8 @@ mod tests {
         // Note: in this test the response handler ran inside the
         // pending_clone.remove path (we removed the entry ourselves via
         // pending_clone.remove). DashboardPrompter's cleanup remove
-        // returned None (was_present=false) so it did NOT emit Removed
-        // — that path is only fired when the prompter's own cleanup
+        // returned None (was_present=false) so it did NOT emit Removed.
+        // That path is only fired when the prompter's own cleanup
         // actually removes the entry (timeout / channel-dropped paths).
         // The HTTP `/respond` handler fires Removed in the success
         // path; that's covered by the SSE endpoint integration tests.

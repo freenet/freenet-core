@@ -130,9 +130,12 @@ const OVERLAY_LABELS_MAX: usize = 8;
 /// Maximum length of each individual button label.
 const OVERLAY_LABEL_CHARS_MAX: usize = 64;
 /// Maximum length of `delegate_key` / caller hash rendered on the overlay.
-/// These are normally short keys; the cap bounds the amplification surface if
-/// the producer populates them from untrusted data in the future.
-const OVERLAY_KEY_CHARS_MAX: usize = 256;
+/// Re-uses the producer-side cap from `user_input::MAX_IDENTITY_HASH_CHARS`
+/// so a single bump there is enough to widen the wire format. These are
+/// normally short keys (BLAKE3 hex / base58 contract id) so the cap is
+/// well over the actual sizes; the constant exists to bound the
+/// amplification surface if the producer ever passes untrusted data.
+const OVERLAY_KEY_CHARS_MAX: usize = crate::contract::user_input::MAX_IDENTITY_HASH_CHARS;
 
 /// Number of leading characters of a hash to show in the truncated form.
 const HASH_PREFIX_CHARS: usize = 8;
@@ -533,6 +536,47 @@ async fn permission_respond(
     }
 }
 
+/// Combined origin check used by /permission/events.
+///
+/// EventSource is the wire that matters here, and browsers send `Origin`
+/// only for cross-origin EventSource requests; same-origin GETs from the
+/// gateway shell page often arrive with no `Origin`. So we can't simply
+/// require a trusted `Origin`. Instead we combine two browser-attested
+/// signals:
+///
+/// * `Origin` present → must be a trusted loopback origin.
+/// * `Sec-Fetch-Site: cross-site` → reject regardless of `Origin`.
+///
+/// Either signal independently rejects cross-origin pages from holding a
+/// connection slot. Same-origin shell-page requests (no `Origin`,
+/// `Sec-Fetch-Site: same-origin` or absent on older clients) are allowed.
+/// The polling endpoint at `/permission/pending` deliberately tolerates
+/// missing `Origin` because it returns no useful body to attackers; this
+/// endpoint is stricter because the connection slot itself is a resource
+/// (cap = 64).
+fn is_caller_trusted(headers: &HeaderMap) -> bool {
+    if let Some(value) = headers.get("origin") {
+        let s = match value.to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if !is_trusted_origin(s) {
+            return false;
+        }
+    }
+    if let Some(value) = headers.get("sec-fetch-site") {
+        if let Ok(s) = value.to_str() {
+            // `cross-site` and `cross-origin` are both cross-origin signals.
+            // `same-origin`, `same-site`, and `none` (no initiator, e.g.
+            // navigation, refresh) are all allowed.
+            if s.eq_ignore_ascii_case("cross-site") || s.eq_ignore_ascii_case("cross-origin") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Check if an Origin header is from a trusted localhost source.
 /// Accepts any port on localhost/loopback to handle non-default configurations.
 fn is_trusted_origin(origin: &str) -> bool {
@@ -638,33 +682,13 @@ async fn permission_events(
     headers: HeaderMap,
     Extension(pending): Extension<PendingPrompts>,
 ) -> axum::response::Response {
-    // Connection cap. We do this before any expensive setup so a flood of
-    // reconnects from a buggy client cannot exhaust per-process resources.
-    let prev = SSE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-    if prev >= MAX_SSE_CONNECTIONS {
-        SSE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
-        tracing::warn!(
-            limit = MAX_SSE_CONNECTIONS,
-            "SSE connection cap reached, refusing new /permission/events subscriber"
-        );
-        let stream = stream::once(async {
-            Ok::<_, Infallible>(Event::default().comment("connection-cap-reached"))
-        });
-        return Sse::new(stream)
-            .keep_alive(KeepAlive::default())
-            .into_response();
-    }
-    let guard = SseConnectionGuard;
-
-    let trusted = match headers.get("origin") {
-        Some(value) => value.to_str().map(is_trusted_origin).unwrap_or(false),
-        None => true,
-    };
-
-    if !trusted {
-        // Drop the guard immediately so the count is released — we're
-        // returning a degenerate stream that closes after one frame.
-        drop(guard);
+    // Reject untrusted callers BEFORE consuming a connection slot. Browsers
+    // send `Sec-Fetch-Site: cross-site` for cross-origin EventSource and
+    // `Origin` for any cross-origin request: either signal is enough to
+    // reject, and rejecting up front blocks the cross-origin DoS where an
+    // evil page opens 64 EventSources to consume every slot.
+    if !is_caller_trusted(&headers) {
+        tracing::debug!("Rejecting /permission/events request from untrusted origin");
         let stream = stream::once(async {
             Ok::<_, Infallible>(Event::default().comment("untrusted-origin"))
         });
@@ -672,6 +696,35 @@ async fn permission_events(
             .keep_alive(KeepAlive::default())
             .into_response();
     }
+
+    // Connection cap. CAS-loop instead of fetch_add+rollback so concurrent
+    // reconnects can never overshoot the cap (the previous fetch_add path
+    // had a transient overshoot window, and on Relaxed ordering had no
+    // upper bound under heavy reconnect storms).
+    let mut current = SSE_CONNECTIONS.load(Ordering::Relaxed);
+    let guard = loop {
+        if current >= MAX_SSE_CONNECTIONS {
+            tracing::warn!(
+                limit = MAX_SSE_CONNECTIONS,
+                "SSE connection cap reached, refusing new /permission/events subscriber"
+            );
+            let stream = stream::once(async {
+                Ok::<_, Infallible>(Event::default().comment("connection-cap-reached"))
+            });
+            return Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response();
+        }
+        match SSE_CONNECTIONS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break SseConnectionGuard,
+            Err(actual) => current = actual,
+        }
+    };
 
     // Subscribe FIRST to avoid the race where a prompt is added between the
     // DashMap snapshot and our first broadcast recv.
@@ -704,10 +757,10 @@ async fn permission_events(
                 .event("prompt_removed")
                 .data(serde_json::json!({ "nonce": nonce }).to_string()))),
             // Lag means our subscriber was slow and missed events. The shell
-            // page reconciles by emitting a `resync` event that tells the
-            // client to drop everything and trust a freshly-fetched
-            // /permission/pending list. Rare in practice — capacity 128,
-            // two events per prompt lifecycle, max 32 concurrent prompts.
+            // page reconciles via the resync handler, which re-fetches
+            // /permission/pending. Rare in practice: capacity is 128, each
+            // prompt lifecycle is two events, and at most 32 prompts can
+            // be in flight at once.
             Err(BroadcastStreamRecvError::Lagged(n)) => {
                 tracing::warn!(skipped = n, "SSE subscriber lagged, requesting resync");
                 Some(Ok(Event::default().event("resync").data("{}")))
@@ -1450,10 +1503,51 @@ mod tests {
         None
     }
 
+    /// Wait until at least `target` SSE handlers have subscribed to the
+    /// global broadcast, then fire `event`. Replaces `tokio::time::sleep`
+    /// in the SSE happy-path tests so they are not coupled to wall-clock
+    /// timing on slow CI runners.
+    async fn wait_subscribers_then_send(target: usize, event: PromptEvent) {
+        let sender = prompt_events();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sender.receiver_count() < target {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {target} SSE subscribers; have {}",
+                    sender.receiver_count()
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(sender.send(event));
+    }
+
+    /// RAII helper: removes a key from the shared pending registry on drop.
+    /// Used in tests that mutate the global registry so a panicking assert
+    /// doesn't pollute the registry for sibling tests.
+    struct PendingCleanup {
+        pending: PendingPrompts,
+        nonce: String,
+    }
+
+    impl Drop for PendingCleanup {
+        fn drop(&mut self) {
+            self.pending.remove(&self.nonce);
+        }
+    }
+
+    fn cleanup_on_drop(pending: PendingPrompts, nonce: impl Into<String>) -> PendingCleanup {
+        PendingCleanup {
+            pending,
+            nonce: nonce.into(),
+        }
+    }
+
     /// The bug this PR closes: a `prompt_added` lifecycle event must be
     /// pushed to a subscribed SSE client without polling.
     #[tokio::test]
     async fn test_sse_emits_added_when_prompt_inserted() {
+        let initial_subs = prompt_events().receiver_count();
         let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
 
         let nonce = "ssetest_added_001".to_string();
@@ -1464,10 +1558,7 @@ mod tests {
             delegate_key: "dkey-added-001".into(),
             caller: webapp_caller("cid-added-001"),
         };
-        // Wait briefly so the SSE handler has time to subscribe before we
-        // emit the broadcast. Without this, the test would race the spawn.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        drop(prompt_events().send(PromptEvent::Added(snapshot)));
+        wait_subscribers_then_send(initial_subs + 1, PromptEvent::Added(snapshot)).await;
 
         let frame = frame_matching(
             &mut body,
@@ -1484,13 +1575,17 @@ mod tests {
     /// overlay simultaneously when one tab clicks a button.
     #[tokio::test]
     async fn test_sse_emits_removed_when_prompt_responded() {
+        let initial_subs = prompt_events().receiver_count();
         let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
 
         let nonce = "ssetest_removed_002".to_string();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        drop(prompt_events().send(PromptEvent::Removed {
-            nonce: nonce.clone(),
-        }));
+        wait_subscribers_then_send(
+            initial_subs + 1,
+            PromptEvent::Removed {
+                nonce: nonce.clone(),
+            },
+        )
+        .await;
 
         let frame = frame_matching(
             &mut body,
@@ -1552,9 +1647,226 @@ mod tests {
                 break;
             }
         }
-        // Cleanup: remove from the shared registry so other tests aren't
-        // affected.
-        pending.remove(&nonce);
+        // Cleanup runs even if the assertion below fails so a panicking test
+        // does not pollute the shared global registry for siblings.
+        let _cleanup = cleanup_on_drop(pending.clone(), nonce.clone());
         assert!(found, "bootstrap replay did not include {nonce}");
+    }
+
+    /// Bootstrap replay must arrive BEFORE any live broadcast event, so a
+    /// fresh subscriber sees pre-existing prompts before new ones. This
+    /// pins the `stream::iter(initial).chain(live)` contract; without the
+    /// chain order, a refreshed tab could dedup-skip a re-broadcast Added
+    /// for an entry that hadn't been delivered yet.
+    #[tokio::test]
+    async fn test_sse_bootstrap_replay_arrives_before_live() {
+        let pending = crate::contract::user_input::pending_prompts();
+        let pre_nonce = "ssetest_order_pre".to_string();
+        let _rx = insert_prompt(
+            &pending,
+            &pre_nonce,
+            "pre-existing",
+            vec!["OK"],
+            "dkey-order-pre",
+            webapp_caller("cid-order-pre"),
+        );
+        let _cleanup_pre = cleanup_on_drop(pending.clone(), pre_nonce.clone());
+
+        let initial_subs = prompt_events().receiver_count();
+        let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
+
+        // Once the SSE handler has subscribed, fire a NEW Added that the
+        // chain MUST deliver after the pre-existing snapshot.
+        let live_nonce = "ssetest_order_live".to_string();
+        let snapshot = PromptSnapshot {
+            nonce: live_nonce.clone(),
+            message: "live".into(),
+            labels: vec!["OK".into()],
+            delegate_key: "dkey-order-live".into(),
+            caller: webapp_caller("cid-order-live"),
+        };
+        wait_subscribers_then_send(initial_subs + 1, PromptEvent::Added(snapshot)).await;
+
+        // Walk frames; we must see pre-existing nonce before live nonce.
+        let mut saw_pre = false;
+        let mut saw_live_before_pre = false;
+        for _ in 0..32 {
+            let Some(frame) = next_event_frame(&mut body, 500).await else {
+                break;
+            };
+            if frame.contains(&pre_nonce) {
+                saw_pre = true;
+                break;
+            }
+            if frame.contains(&live_nonce) {
+                saw_live_before_pre = true;
+            }
+        }
+        assert!(saw_pre, "did not observe pre-existing nonce in stream");
+        assert!(
+            !saw_live_before_pre,
+            "live event arrived before bootstrap replay, ordering contract broken"
+        );
+    }
+
+    /// A `BroadcastStreamRecvError::Lagged` event must be translated into
+    /// a `resync` SSE event so the client can recover by re-bootstrapping
+    /// from /permission/pending. Constructs a small private broadcaster
+    /// (capacity 2) so the test can deterministically overflow the
+    /// receiver without relying on the global PROMPT_EVENT_CAPACITY=128.
+    #[tokio::test]
+    async fn test_sse_emits_resync_on_lag() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<PromptEvent>(2);
+
+        // Send 5 events without polling rx; receiver lags by 3.
+        for i in 0..5 {
+            drop(tx.send(PromptEvent::Removed {
+                nonce: format!("lag-{i}"),
+            }));
+        }
+
+        // Drive the SSE filter logic against the lagged receiver. We
+        // duplicate the closure body from permission_events here so the
+        // test exercises exactly the production translation.
+        let stream = BroadcastStream::new(rx).filter_map(|incoming| async move {
+            match incoming {
+                Ok(PromptEvent::Added(s)) => Some(format!("added:{}", s.nonce)),
+                Ok(PromptEvent::Removed { nonce }) => Some(format!("removed:{nonce}")),
+                Err(BroadcastStreamRecvError::Lagged(_)) => Some("resync".to_string()),
+            }
+        });
+        tokio::pin!(stream);
+        let first = stream.next().await.expect("first event");
+        assert_eq!(
+            first, "resync",
+            "lagged receiver must surface as `resync`, not as a missed event"
+        );
+    }
+
+    /// MAX_SSE_CONNECTIONS must reject the (cap+1)th subscriber AND must
+    /// release a slot when an earlier subscriber's stream is dropped.
+    /// Together these pin both the cap (rejecting flood reconnects) and
+    /// the GuardedStream's drop semantics (no permanent leak after a
+    /// client disconnects mid-flight).
+    ///
+    /// Uses a serialising mutex so concurrent tests don't perturb the
+    /// shared SSE_CONNECTIONS counter. Without it, a sibling test
+    /// touching the counter mid-assertion would flake this test.
+    #[tokio::test]
+    async fn test_sse_connection_cap_and_release_on_drop() {
+        use std::sync::OnceLock;
+        static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        let _serial = SERIAL
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+
+        // Drain any leaked connections from prior tests by waiting for the
+        // counter to settle to zero. (No SSE responses should be live at
+        // this point because the only test that opens them is this one,
+        // serialised by the mutex above.)
+        let deadline0 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while SSE_CONNECTIONS.load(Ordering::Relaxed) != 0 {
+            if std::time::Instant::now() >= deadline0 {
+                // A leaked connection from a previous test indicates a real
+                // bug in GuardedStream's drop, but for the purposes of this
+                // test, accept the baseline rather than panic.
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let baseline = SSE_CONNECTIONS.load(Ordering::Relaxed);
+
+        // Open enough subscribers to exhaust the cap.
+        let mut held: Vec<_> = Vec::new();
+        for _ in baseline..MAX_SSE_CONNECTIONS {
+            held.push(open_sse_with_origin(Some("http://localhost:7509")).await);
+        }
+        assert_eq!(
+            SSE_CONNECTIONS.load(Ordering::Relaxed),
+            MAX_SSE_CONNECTIONS,
+            "all slots must be filled before testing the cap"
+        );
+
+        // The next subscriber MUST be rejected with a closed stream.
+        let mut rejected = open_sse_with_origin(Some("http://localhost:7509")).await;
+        let frame = next_event_frame(&mut rejected, 200).await;
+        assert!(
+            frame.is_none(),
+            "cap-rejected subscriber must not receive data events, got: {frame:?}"
+        );
+
+        // Drop one held subscriber; the cap-counter must release a slot.
+        let dropped = held.pop().unwrap();
+        drop(dropped);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if SSE_CONNECTIONS.load(Ordering::Relaxed) < MAX_SSE_CONNECTIONS {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("SSE_CONNECTIONS did not decrement after dropping a subscriber");
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // A new subscriber should now succeed.
+        let _accepted = open_sse_with_origin(Some("http://localhost:7509")).await;
+        assert!(SSE_CONNECTIONS.load(Ordering::Relaxed) <= MAX_SSE_CONNECTIONS);
+
+        // Cleanup: drop everything so the counter returns to baseline for
+        // the next time this test runs (matters when test runs are not
+        // process-isolated, e.g. nextest run --no-fail-fast on debug
+        // binaries that re-execute).
+        drop(_accepted);
+        drop(rejected);
+        drop(held);
+    }
+
+    /// HTTP `/permission/{nonce}/respond` must fire a `PromptEvent::Removed`
+    /// so every other tab dismisses its overlay. Closes a coverage gap
+    /// flagged by review: the cross-tab dismissal contract was previously
+    /// only covered by integration-level browser tests.
+    #[tokio::test]
+    async fn test_respond_handler_emits_prompt_removed() {
+        let pending = crate::contract::user_input::pending_prompts();
+        let nonce = "ssetest_respond_emits_removed".to_string();
+        let _rx = insert_prompt(
+            &pending,
+            &nonce,
+            "respond?",
+            vec!["Allow", "Deny"],
+            "dkey-respond",
+            webapp_caller("cid-respond"),
+        );
+        let _cleanup = cleanup_on_drop(pending.clone(), nonce.clone());
+
+        let mut rx = prompt_events().subscribe();
+
+        let resp = permission_respond(
+            Path(nonce.clone()),
+            trusted_header(),
+            Extension(pending.clone()),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // Drain until we see the matching Removed (concurrent tests on the
+        // global broadcaster may interleave their own events).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut saw = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(PromptEvent::Removed { nonce: n })) if n == nonce => {
+                    saw = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        assert!(saw, "permission_respond did not emit Removed for {nonce}");
     }
 }

@@ -1292,6 +1292,23 @@ function freenetBridge(authToken) {
   // state. The browser's EventSource auto-reconnects with exponential
   // backoff if the connection drops; on each reconnect we re-bootstrap from
   // /permission/pending so we don't miss anything during the gap.
+  //
+  // While the EventSource is in the disconnected state (its `error` event
+  // has fired and `readyState !== 1`), we run a 3-second polling fallback
+  // against /permission/pending so a tab whose stream fails (gateway
+  // restart, connection-cap rejection, transient network) still receives
+  // prompt updates. The fallback shuts off as soon as the stream re-opens.
+  var fallbackPollHandle = null;
+  function startFallbackPoll() {
+    if (fallbackPollHandle !== null) return;
+    fallbackPollHandle = setInterval(reconcileFromPending, 3000);
+    reconcileFromPending();
+  }
+  function stopFallbackPoll() {
+    if (fallbackPollHandle === null) return;
+    clearInterval(fallbackPollHandle);
+    fallbackPollHandle = null;
+  }
   if (typeof EventSource !== 'undefined') {
     var es = new EventSource('/permission/events');
     es.addEventListener('prompt_added', function(e) {
@@ -1310,24 +1327,28 @@ function freenetBridge(authToken) {
       } catch (err) {}
     });
     // The server emits `resync` when its broadcast channel laps a slow
-    // subscriber. Drop everything and re-snapshot from the polling endpoint.
-    es.addEventListener('resync', function() {
-      Object.keys(overlayCards).forEach(hideCard);
-      reconcileFromPending();
-    });
+    // subscriber. Reconcile from the polling endpoint instead of clearing
+    // first: the reconcile path's diff already adds new cards and hides
+    // ones that disappeared, with no flicker on cards that survive.
+    es.addEventListener('resync', reconcileFromPending);
     // EventSource fires `open` on initial connect AND on every reconnect.
     // Reconcile each time so a transient disconnect doesn't leave us out
-    // of date. The browser's auto-reconnect handles transient failures;
-    // we don't need to manually retry.
-    es.addEventListener('open', reconcileFromPending);
+    // of date, and stop the fallback poll if it had taken over.
+    es.addEventListener('open', function() {
+      stopFallbackPoll();
+      reconcileFromPending();
+    });
+    // `error` fires on connect failure, transient drops, and when the
+    // server caps us out. Switch to polling until the EventSource
+    // re-opens; the browser auto-reconnects in the background.
+    es.addEventListener('error', startFallbackPoll);
     // Initial bootstrap so we're populated before the SSE handshake
     // completes (avoids a brief empty state on slow connections).
     reconcileFromPending();
   } else {
-    // EventSource is missing in some embedded webviews. Fall back to the
+    // EventSource missing in some embedded webviews -- fall back to the
     // legacy 3-second poll so users on those clients still see prompts.
-    setInterval(reconcileFromPending, 3000);
-    reconcileFromPending();
+    startFallbackPoll();
   }
 }
 "#;
@@ -2049,7 +2070,7 @@ mod tests {
             html.contains("r.status === 404"),
             "shell JS must treat 404 on respond as 'already answered' and hide the card"
         );
-        // SSE event names the server emits — pinning these here ensures the
+        // SSE event names the server emits. Pinning these here ensures the
         // shell stays in sync with the gateway's wire format.
         assert!(
             html.contains("'prompt_added'") || html.contains("\"prompt_added\""),
@@ -2107,7 +2128,7 @@ mod tests {
         // bringing back the polling-skip loop.
         assert!(
             !html.contains("visibilityState"),
-            "overlay must not gate on document.visibilityState — \
+            "overlay must not gate on document.visibilityState; \
              visibility-skip caused background tabs to miss prompts (SSE replaces polling)"
         );
 
