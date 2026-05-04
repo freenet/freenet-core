@@ -670,6 +670,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             // Try to decrypt as intro packet
                             match self.remote_conn.transport_secret_key.decrypt(packet_data.data()) {
                                 Ok(_decrypted_intro) => {
+                                    // Authenticated by asymmetric decryption (peer
+                                    // restart-detection path). Meter as a normal
+                                    // received packet — bytes still represent real
+                                    // authenticated traffic on the wire (#3999).
+                                    super::TRANSPORT_METRICS.record_packet_received(
+                                        self.remote_conn.remote_addr,
+                                        packet_data.data().len() as u64,
+                                    );
                                     tracing::debug!(
                                         peer_addr = %self.remote_conn.remote_addr,
                                         "Successfully decrypted intro packet, sending ACK"
@@ -750,6 +758,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                         continue;
                     };
+                    // Post-authentication wire-byte accounting for the local
+                    // dashboard. Doing this before the symmetric-decrypt
+                    // gate would let an attacker spoof UDP packets from many
+                    // source IPs and inflate the cumulative + per-peer
+                    // counters, see #3999.
+                    super::TRANSPORT_METRICS.record_packet_received(
+                        self.remote_conn.remote_addr,
+                        packet_data.data().len() as u64,
+                    );
                     let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
                     let SymmetricMessage {
                         packet_id,
@@ -2695,5 +2712,131 @@ mod tests {
                  return now()={now} instead of the stored creation_time={creation_time}"
             );
         }
+    }
+
+    /// Regression test for #3999: an authenticated inbound packet (one that
+    /// passes `try_decrypt_sym`) must update both the per-peer entry and the
+    /// cumulative receive counter, AND the byte count must equal the
+    /// encrypted (wire) packet size, not the decrypted payload size.
+    ///
+    /// Without an explicit test, a future refactor that drops the
+    /// `record_packet_received` call from the post-auth hook in `recv` would
+    /// rot the dashboard silently — the spoof regression test only proves
+    /// the *absence* of pre-auth counting, not the *presence* of post-auth
+    /// counting. This test pins both halves.
+    #[tokio::test]
+    async fn recv_records_packet_metrics_post_authentication() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::packet_data::PacketData;
+        use crate::transport::symmetric_message::SymmetricMessagePayload;
+        use crate::util::time_source::SharedMockTimeSource;
+        use bytes::Bytes;
+
+        let time_source = SharedMockTimeSource::new();
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        // Use a deterministic, never-otherwise-used port so concurrent tests
+        // can't accidentally observe our per-peer entry.
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 1).into(), 50001);
+
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        let socket = Arc::new(TestSocket::new(
+            mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
+        ));
+
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher.clone(),
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            time_source,
+        };
+
+        // Build an encrypted ShortMessage so `recv` returns immediately
+        // after metering. Plaintext payload is 100 bytes; the encrypted
+        // wire packet will be larger (nonce + AEAD tag + framing).
+        let plaintext: Vec<u8> = (0..100u8).collect();
+        let payload = SymmetricMessagePayload::ShortMessage {
+            payload: Bytes::from(plaintext.clone()),
+        };
+        let encrypted = SymmetricMessage::serialize_msg_to_packet_data(1, payload, &cipher, vec![])
+            .expect("encrypt");
+        let encrypted_bytes = encrypted.data().to_vec();
+        let wire_size = encrypted_bytes.len() as u64;
+        assert!(
+            wire_size > plaintext.len() as u64,
+            "encrypted wire size ({wire_size}) must exceed plaintext size ({}) — \
+             AEAD tag + nonce + framing always grows the packet",
+            plaintext.len()
+        );
+
+        // Wrap as the unknown-encryption type the inbound channel actually
+        // carries (the listener doesn't know yet whether decryption will
+        // succeed).
+        let packet = PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(
+            &encrypted_bytes,
+        );
+        inbound_tx.send(packet).await.expect("send");
+
+        let metrics_before_recv = crate::transport::TRANSPORT_METRICS
+            .per_peer_snapshot()
+            .into_iter()
+            .find(|(a, _, _)| *a == remote_addr);
+        assert!(
+            metrics_before_recv.is_none(),
+            "test precondition: no entry for our unique remote_addr"
+        );
+        let cumulative_before = crate::transport::TRANSPORT_METRICS.cumulative_bytes_received();
+
+        let mut conn = PeerConnection::new(remote_conn);
+        let _msg = conn.recv().await.expect("recv");
+
+        // Per-peer entry must reflect the wire (encrypted) size — pinning
+        // the byte semantics so a future refactor using
+        // `decrypted.data().len()` would silently regress this.
+        let entry = crate::transport::TRANSPORT_METRICS
+            .per_peer_snapshot()
+            .into_iter()
+            .find(|(a, _, _)| *a == remote_addr)
+            .expect("post-auth recv must create a per-peer entry");
+        assert_eq!(
+            entry.2, wire_size,
+            "per-peer bytes_received must equal the encrypted wire size"
+        );
+
+        // Cumulative counter must also have moved by at least wire_size.
+        // Other concurrent tests may push it higher.
+        let cumulative_after = crate::transport::TRANSPORT_METRICS.cumulative_bytes_received();
+        assert!(
+            cumulative_after >= cumulative_before + wire_size,
+            "cumulative_bytes_received must include this packet (before={cumulative_before}, \
+             after={cumulative_after}, wire_size={wire_size})"
+        );
+
+        // Cleanup so the singleton doesn't leak our address into other tests.
+        crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
     }
 }

@@ -439,7 +439,11 @@ impl Socket for UdpSocket {
         // Normalize ::ffff:x.x.x.x → plain IPv4 so the rest of the system
         // sees a consistent address regardless of socket type.
         let addr = normalize_mapped_addr(addr);
-        metrics::TRANSPORT_METRICS.record_packet_received(addr, len as u64);
+        // Receive-side dashboard metering happens post-authentication — see
+        // `peer_connection::PeerConnection::recv` after `try_decrypt_sym`
+        // succeeds. Doing it here would let an attacker spoofing UDP source
+        // addresses inflate the dashboard counters and crowd legitimate
+        // peers out of the bounded per-peer table (#3999).
         Ok((len, addr))
     }
 
@@ -807,12 +811,15 @@ mod dual_stack_tests {
         assert_eq!(&buf[..len], b"pong");
     }
 
-    /// Regression: every successful send_to / recv_from on the production
-    /// `UdpSocket` must update both the cumulative wire-byte counters and the
-    /// per-peer counters used by the local dashboard. Before this fix, those
-    /// counters only moved on stream-transfer completion, so a node connected
-    /// for hours could legitimately show "—" for SENT/RECV despite real
-    /// keep-alive traffic flowing.
+    /// Regression: every successful send_to on the production `UdpSocket`
+    /// must update the cumulative + per-peer counters used by the local
+    /// dashboard. Before #3996, those counters only moved on stream-transfer
+    /// completion, so a node connected for hours could legitimately show "—"
+    /// for SENT despite real keep-alive traffic flowing.
+    ///
+    /// Receive-side accounting is owned by the post-authentication hook in
+    /// `peer_connection.rs` (see #3999), so this test only asserts send
+    /// behavior — `recv_from` deliberately does NOT bump any counter.
     #[tokio::test]
     async fn udp_socket_records_packet_metrics() {
         use crate::transport::metrics::TRANSPORT_METRICS;
@@ -824,7 +831,6 @@ mod dual_stack_tests {
         let sender_addr = sender.local_addr().unwrap();
 
         let cumulative_sent_before = TRANSPORT_METRICS.cumulative_bytes_sent();
-        let cumulative_recv_before = TRANSPORT_METRICS.cumulative_bytes_received();
 
         let payload = b"keep-alive-sized-control-packet";
         <UdpSocket as Socket>::send_to(&sender, payload, receiver_addr)
@@ -837,21 +843,19 @@ mod dual_stack_tests {
             .unwrap();
         assert_eq!(len, payload.len());
 
-        // Cumulative counters must move at least by the payload size each way.
-        // Other tests running in parallel may push them higher, hence the >=.
+        // Send-side cumulative counter must move at least by the payload.
+        // Other tests running in parallel may push it higher, hence the >=.
         assert!(
             TRANSPORT_METRICS.cumulative_bytes_sent()
                 >= cumulative_sent_before + payload.len() as u64,
             "cumulative_bytes_sent must include the payload"
         );
-        assert!(
-            TRANSPORT_METRICS.cumulative_bytes_received()
-                >= cumulative_recv_before + payload.len() as u64,
-            "cumulative_bytes_received must include the payload"
-        );
 
-        // Per-peer counters keyed by the un-mapped target / normalized source
-        // (both plain IPv4 here) must include the payload.
+        // Per-peer entry for the send target must exist with bytes_sent
+        // covering the payload. The reverse-direction entry (keyed by the
+        // sender's address) must NOT be created by `recv_from` alone —
+        // recv-side accounting moved to the post-auth hook in #3999, so
+        // an unauthenticated packet contributes nothing to per-peer state.
         let peers = TRANSPORT_METRICS.per_peer_snapshot();
         let receiver_entry = peers
             .iter()
@@ -862,14 +866,9 @@ mod dual_stack_tests {
             "per-peer bytes_sent must include the payload (got {})",
             receiver_entry.1
         );
-        let sender_entry = peers
-            .iter()
-            .find(|(a, _, _)| *a == sender_addr)
-            .expect("per-peer entry for recv source must exist");
         assert!(
-            sender_entry.2 >= payload.len() as u64,
-            "per-peer bytes_received must include the payload (got {})",
-            sender_entry.2
+            peers.iter().all(|(a, _, _)| *a != sender_addr),
+            "recv_from must not create a per-peer entry pre-authentication"
         );
     }
 
@@ -997,6 +996,46 @@ mod dual_stack_tests {
         assert!(
             peers.iter().all(|(a, _, _)| *a != mapped),
             "mapped form must not produce a duplicate per-peer entry"
+        );
+    }
+
+    /// Regression for #3999: an attacker that fabricates UDP packets from
+    /// many spoofed source IPs MUST NOT be able to inflate the dashboard
+    /// cumulative_bytes_received counter or fill the bounded per-peer
+    /// table. `recv_from` is the kernel handoff point that sees every
+    /// packet regardless of authentication, so the fix is "don't meter
+    /// here" — receive-side metering moved to the post-`try_decrypt_sym`
+    /// hook in `peer_connection::PeerConnection::recv`.
+    #[tokio::test]
+    async fn udp_socket_recv_from_does_not_record_pre_authentication() {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        let attacker = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let victim = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let victim_addr = victim.local_addr().unwrap();
+        let attacker_addr = attacker.local_addr().unwrap();
+
+        // Simulate a forged UDP packet arriving at the listening port: the
+        // "attacker" socket stands in for any unauthenticated sender.
+        let payload = vec![0xAB; 1024];
+        attacker.send_to(&payload, victim_addr).await.unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (len, src) = <UdpSocket as Socket>::recv_from(&victim, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(len, payload.len());
+        assert_eq!(src, attacker_addr);
+
+        // The packet never reached `try_decrypt_sym`, so it must not have
+        // created a per-peer entry. (Cumulative is process-global and may
+        // be moved by concurrent authenticated paths; only per-peer
+        // absence is reliably observable from this test.)
+        let peers = TRANSPORT_METRICS.per_peer_snapshot();
+        assert!(
+            peers.iter().all(|(a, _, _)| *a != attacker_addr),
+            "spoofed (un-authenticated) source MUST NOT create a per-peer entry"
         );
     }
 }

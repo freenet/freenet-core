@@ -1800,6 +1800,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             cause: "invalid symmetric key".into(),
                         }
                     })?;
+                    // Authenticated handshake-completion ACK; meter it just
+                    // like any other authenticated inbound packet (#3999).
+                    crate::transport::TRANSPORT_METRICS
+                        .record_packet_received(remote_addr, packet.data().len() as u64);
                 }
                 Some(None) => {
                     return Err(TransportError::ConnectionEstablishmentFailure {
@@ -2092,6 +2096,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 if let Ok(decrypted_packet) =
                                     packet.try_decrypt_sym(&inbound_sym_key)
                                 {
+                                    // Authenticated handshake-completion ACK; meter
+                                    // it just like any other authenticated inbound
+                                    // packet (#3999).
+                                    crate::transport::TRANSPORT_METRICS.record_packet_received(
+                                        remote_addr,
+                                        packet.data().len() as u64,
+                                    );
                                     // Remote decrypted our intro and is sending ACK with their key
                                     let symmetric_message =
                                         SymmetricMessage::deser(decrypted_packet.data())?;
