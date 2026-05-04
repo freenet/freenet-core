@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ClientResponse, UserInputRequest};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 
 /// Timeout for user input prompts. After this duration, the request is auto-denied.
 pub(crate) const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -20,10 +20,12 @@ const MAX_LABELS: usize = 10;
 /// hashes come from runtime context that is bounded at the source (BLAKE3
 /// hex / base58 contract id, both well under this limit). Capping at the
 /// insertion point keeps the prompt store from holding arbitrarily large
-/// strings if a future caller passes something larger, and matches the
-/// downstream cap applied in `permission_prompts.rs` at the JSON / HTML
-/// boundary so the two layers can never disagree about the maximum.
-const MAX_IDENTITY_HASH_CHARS: usize = 256;
+/// strings if a future caller passes something larger.
+///
+/// `permission_prompts.rs` re-uses this same cap at the JSON / HTML
+/// rendering boundary, so the two layers cannot disagree about the
+/// maximum.
+pub(crate) const MAX_IDENTITY_HASH_CHARS: usize = 256;
 
 /// Runtime-attested identity of the entity that triggered a permission prompt.
 ///
@@ -92,6 +94,65 @@ pub(crate) fn pending_prompts() -> PendingPrompts {
 /// Maximum concurrent pending prompts to prevent memory exhaustion.
 const MAX_PENDING_PROMPTS: usize = 32;
 
+/// Snapshot of a prompt's display fields, sufficient for the SSE handler to
+/// render an `Added` event without holding the DashMap entry. Cloned out of
+/// the registry so the broadcast path doesn't pin the entry's lock.
+#[derive(Clone, Debug)]
+pub(crate) struct PromptSnapshot {
+    pub nonce: String,
+    pub message: String,
+    pub labels: Vec<String>,
+    pub delegate_key: String,
+    pub caller: CallerIdentity,
+}
+
+/// Lifecycle event for a permission prompt. Consumed by the SSE endpoint to
+/// push state changes to every open Freenet tab in real time. The polling
+/// endpoint at `/permission/pending` is retained as a fallback and is not
+/// driven by this stream.
+#[derive(Clone, Debug)]
+pub(crate) enum PromptEvent {
+    Added(PromptSnapshot),
+    Removed { nonce: String },
+}
+
+/// Broadcast capacity. Each lifecycle is two events (Added + Removed), and
+/// MAX_PENDING_PROMPTS caps concurrent in-flight prompts at 32, so 128 leaves
+/// healthy headroom even if a transient SSE subscriber lags briefly. On
+/// `RecvError::Lagged`, the SSE handler resyncs from the DashMap snapshot.
+const PROMPT_EVENT_CAPACITY: usize = 128;
+
+/// Global lifecycle broadcast for permission prompts.
+static PROMPT_EVENTS: std::sync::OnceLock<broadcast::Sender<PromptEvent>> =
+    std::sync::OnceLock::new();
+
+/// Get or initialize the global prompt-event broadcaster.
+pub(crate) fn prompt_events() -> broadcast::Sender<PromptEvent> {
+    PROMPT_EVENTS
+        .get_or_init(|| broadcast::channel(PROMPT_EVENT_CAPACITY).0)
+        .clone()
+}
+
+/// Fire a prompt lifecycle event. `Sender::send` returns `Err` when there
+/// are no live subscribers; that's the common case when the shell page
+/// isn't open yet, and the polling fallback covers it. Slow subscribers
+/// see `Lagged` and resync from the DashMap.
+///
+/// Caps the nonce length on `Removed` so that even if an unusual code path
+/// ever passes a client-supplied nonce here (today the only producers are
+/// `DashboardPrompter` itself and the HTTP `respond` handler, which both
+/// route through validated DashMap keys), the broadcast can't carry an
+/// arbitrarily large string to every connected tab.
+pub(crate) fn emit_prompt_event(event: PromptEvent) {
+    let event = match event {
+        PromptEvent::Removed { nonce } => PromptEvent::Removed {
+            nonce: cap_identity_chars(&nonce),
+        },
+        other => other,
+    };
+    drop(prompt_events().send(event));
+}
+
 /// Opens the user's browser to the permission page on the local dashboard,
 /// then waits for the user to click a button. The HTTP POST handler sends
 /// the response back via a oneshot channel.
@@ -149,13 +210,24 @@ impl UserInputPrompter for DashboardPrompter {
         self.pending.insert(
             nonce.clone(),
             PendingPrompt {
-                message,
-                labels,
-                delegate_key: stored_delegate_key,
-                caller: stored_caller,
+                message: message.clone(),
+                labels: labels.clone(),
+                delegate_key: stored_delegate_key.clone(),
+                caller: stored_caller.clone(),
                 response_tx: tx,
             },
         );
+
+        // Fire the broadcast Added event AFTER the DashMap insert so any SSE
+        // subscriber that wakes up on the event can immediately find the entry
+        // if it falls back to a registry lookup.
+        emit_prompt_event(PromptEvent::Added(PromptSnapshot {
+            nonce: nonce.clone(),
+            message,
+            labels,
+            delegate_key: stored_delegate_key,
+            caller: stored_caller,
+        }));
 
         // Log at debug, not info -- nonce is the sole auth token for this prompt
         tracing::debug!(
@@ -166,8 +238,19 @@ impl UserInputPrompter for DashboardPrompter {
         // Wait for user response with timeout
         let result = tokio::time::timeout(USER_INPUT_TIMEOUT, rx).await;
 
-        // Clean up if still pending
-        self.pending.remove(&nonce);
+        // Clean up if still pending. The HTTP `respond` handler removes the
+        // entry on a real user click; this remove is a no-op in that case
+        // and otherwise covers the timeout / dropped-channel cleanup paths.
+        // Always emit Removed so subscribers can hide their overlay
+        // regardless of which path retired the prompt; a duplicate Removed
+        // (when both the HTTP handler and this cleanup fire) is harmless,
+        // because the SSE client's hide is idempotent on nonce.
+        let was_present = self.pending.remove(&nonce).is_some();
+        if was_present {
+            emit_prompt_event(PromptEvent::Removed {
+                nonce: nonce.clone(),
+            });
+        }
 
         match result {
             Ok(Ok(idx)) if idx < request.responses.len() => {
@@ -544,5 +627,134 @@ mod tests {
         let (idx, response) = result.unwrap();
         assert_eq!(idx, 0);
         assert_eq!(&*response, b"Allow");
+    }
+
+    /// `DashboardPrompter::prompt` fires `PromptEvent::Added` after inserting
+    /// the entry. The cleanup `Removed` is only fired by the prompter when
+    /// the entry was still present at cleanup time. When an external party
+    /// (the HTTP `/respond` handler in production) already removed the
+    /// entry, the prompter's cleanup is a no-op and the external remover is
+    /// responsible for emitting `Removed`. This test exercises that
+    /// double-emit-avoidance path; the timeout-driven `Removed` path is
+    /// covered by `test_prompt_timeout_emits_removed`.
+    #[tokio::test]
+    async fn test_prompt_added_emitted_and_external_remove_skips_cleanup_removed() {
+        // Subscribe BEFORE spawning the prompter so we don't miss the
+        // synchronous Added event.
+        let mut rx = prompt_events().subscribe();
+
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = DashboardPrompter::new(pending.clone());
+        let req = make_test_request("lifecycle?", vec!["Allow", "Deny"]);
+
+        let pending_clone = pending.clone();
+        let handle =
+            tokio::spawn(async move { prompter.prompt(&req, "dkey-lc", webapp("cid-lc")).await });
+
+        // Drain events until we see our specific Added (other tests in the
+        // same process may fire concurrently against the global broadcast).
+        let mut added_nonce: Option<String> = None;
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(PromptEvent::Added(snap))) if snap.delegate_key == "dkey-lc" => {
+                    added_nonce = Some(snap.nonce);
+                    break;
+                }
+                Ok(_) => continue, // unrelated event from another test, keep draining
+                Err(_) => break,   // timeout: no event in window
+            }
+        }
+        let nonce = added_nonce.expect("PromptEvent::Added with our delegate_key");
+
+        // Respond so the prompter exits its timeout wait and runs cleanup.
+        let (_, prompt) = pending_clone.remove(&nonce).unwrap();
+        prompt.response_tx.send(0).unwrap();
+        let _ = handle.await.unwrap();
+
+        // Expect a matching Removed for that nonce. May be interleaved with
+        // unrelated events.
+        let mut saw_removed = false;
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(PromptEvent::Removed { nonce: n })) if n == nonce => {
+                    saw_removed = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        // Note: in this test the response handler ran inside the
+        // pending_clone.remove path (we removed the entry ourselves via
+        // pending_clone.remove). DashboardPrompter's cleanup remove
+        // returned None (was_present=false) so it did NOT emit Removed.
+        // That path is only fired when the prompter's own cleanup
+        // actually removes the entry (timeout / channel-dropped paths).
+        // The HTTP `/respond` handler fires Removed in the success
+        // path; that's covered by the SSE endpoint integration tests.
+        assert!(
+            !saw_removed,
+            "this test exercises the manual-remove path; \
+             Removed should fire only from the prompter's own cleanup \
+             (timeout) or the HTTP respond handler (covered elsewhere)"
+        );
+    }
+
+    /// When the prompter's own timeout cleanup runs, it must emit Removed
+    /// so SSE subscribers dismiss the overlay.
+    #[tokio::test(start_paused = true)]
+    async fn test_prompt_timeout_emits_removed() {
+        let mut rx = prompt_events().subscribe();
+
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = DashboardPrompter::new(pending.clone());
+        let req = make_test_request("timeout?", vec!["Allow"]);
+
+        let handle = tokio::spawn(async move {
+            prompter
+                .prompt(&req, "dkey-timeout", webapp("cid-timeout"))
+                .await
+        });
+
+        // Capture the nonce of our specific Added event.
+        let mut our_nonce: Option<String> = None;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            match rx.try_recv() {
+                Ok(PromptEvent::Added(snap)) if snap.delegate_key == "dkey-timeout" => {
+                    our_nonce = Some(snap.nonce);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        let nonce = our_nonce.expect("Added event for the timeout test");
+
+        // Advance virtual time past the prompt timeout.
+        tokio::time::advance(USER_INPUT_TIMEOUT + Duration::from_secs(1)).await;
+        let _ = handle.await.unwrap();
+
+        let mut saw_removed = false;
+        for _ in 0..50 {
+            match rx.try_recv() {
+                Ok(PromptEvent::Removed { nonce: n }) if n == nonce => {
+                    saw_removed = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_removed,
+            "prompter timeout must emit PromptEvent::Removed"
+        );
     }
 }
