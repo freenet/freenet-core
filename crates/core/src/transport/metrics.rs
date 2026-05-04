@@ -354,21 +354,18 @@ impl TransportMetrics {
     ) {
         let tick = self.per_peer_tick.fetch_add(1, Ordering::Relaxed) + 1;
 
-        // Fast path: existing entry — update bytes and refresh tick.
         if let Some(entry) = self.per_peer_stats.get(&addr) {
             field(&entry).fetch_add(bytes, Ordering::Relaxed);
             entry.last_seen_tick.store(tick, Ordering::Relaxed);
             return;
         }
 
-        // Slow path: insert. If the table is full, evict the LRU entry first.
         // The capacity check / eviction / insert isn't atomic across threads,
         // so the table may transiently hold up to MAX_TRACKED_PEERS + a small
         // burst — acceptable for a dashboard counter.
         if self.per_peer_stats.len() >= MAX_TRACKED_PEERS {
             self.evict_oldest_peer();
         }
-
         let entry = self.per_peer_stats.entry(addr).or_default();
         field(&entry).fetch_add(bytes, Ordering::Relaxed);
         entry.last_seen_tick.store(tick, Ordering::Relaxed);
@@ -963,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_per_peer_is_idempotent_under_remove() {
+    fn test_remove_peer_is_idempotent() {
         // Removing a non-existent peer is a no-op (e.g. when
         // record_peer_disconnected fires for a peer whose stats slot was
         // already evicted by LRU).

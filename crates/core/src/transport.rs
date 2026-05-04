@@ -831,7 +831,6 @@ mod dual_stack_tests {
         let sender_addr = sender.local_addr().unwrap();
 
         let cumulative_sent_before = TRANSPORT_METRICS.cumulative_bytes_sent();
-        let cumulative_recv_before = TRANSPORT_METRICS.cumulative_bytes_received();
 
         let payload = b"keep-alive-sized-control-packet";
         <UdpSocket as Socket>::send_to(&sender, payload, receiver_addr)
@@ -852,16 +851,11 @@ mod dual_stack_tests {
             "cumulative_bytes_sent must include the payload"
         );
 
-        // recv_from does NOT bump the receive-side counters — that hook is
-        // post-authentication in PeerConnection::recv. We can only assert
-        // that *this* recv didn't bump them on its own; concurrent tests
-        // exercising the post-auth path can still increment the counter,
-        // so we cannot demand strict equality here.
-        let _ = cumulative_recv_before;
-
         // Per-peer entry for the send target must exist with bytes_sent
-        // covering the payload. The recv-side `bytes_received` for that
-        // entry, on the other hand, is NOT touched by `recv_from`.
+        // covering the payload. The reverse-direction entry (keyed by the
+        // sender's address) must NOT be created by `recv_from` alone —
+        // recv-side accounting moved to the post-auth hook in #3999, so
+        // an unauthenticated packet contributes nothing to per-peer state.
         let peers = TRANSPORT_METRICS.per_peer_snapshot();
         let receiver_entry = peers
             .iter()
@@ -872,12 +866,6 @@ mod dual_stack_tests {
             "per-peer bytes_sent must include the payload (got {})",
             receiver_entry.1
         );
-
-        // The reverse-direction entry (keyed by the sender's address) must
-        // NOT be created by recv_from alone — it can only appear if some
-        // other test in the same process drove an authenticated path
-        // against this sender_addr, which is impossible since this test
-        // owns these ephemeral sockets.
         assert!(
             peers.iter().all(|(a, _, _)| *a != sender_addr),
             "recv_from must not create a per-peer entry pre-authentication"
@@ -1028,11 +1016,8 @@ mod dual_stack_tests {
         let victim_addr = victim.local_addr().unwrap();
         let attacker_addr = attacker.local_addr().unwrap();
 
-        let cumulative_recv_before = TRANSPORT_METRICS.cumulative_bytes_received();
-
-        // Simulate a single forged UDP packet arriving at the listening
-        // port. The "attacker" socket here stands in for any unauthenticated
-        // sender — its source IP is a spoof from the victim's perspective.
+        // Simulate a forged UDP packet arriving at the listening port: the
+        // "attacker" socket stands in for any unauthenticated sender.
         let payload = vec![0xAB; 1024];
         attacker.send_to(&payload, victim_addr).await.unwrap();
 
@@ -1043,16 +1028,10 @@ mod dual_stack_tests {
         assert_eq!(len, payload.len());
         assert_eq!(src, attacker_addr);
 
-        // The bounded receive-side counter must NOT include this packet —
-        // it never got past `try_decrypt_sym`. Other tests running in
-        // parallel may push the counter higher (via authenticated paths
-        // they exercise), but this test's spoofed packet contributes
-        // nothing on its own — pinned by snapshotting the table for the
-        // attacker's address.
-        assert!(
-            TRANSPORT_METRICS.cumulative_bytes_received() >= cumulative_recv_before,
-            "cumulative counter is monotonic"
-        );
+        // The packet never reached `try_decrypt_sym`, so it must not have
+        // created a per-peer entry. (Cumulative is process-global and may
+        // be moved by concurrent authenticated paths; only per-peer
+        // absence is reliably observable from this test.)
         let peers = TRANSPORT_METRICS.per_peer_snapshot();
         assert!(
             peers.iter().all(|(a, _, _)| *a != attacker_addr),
