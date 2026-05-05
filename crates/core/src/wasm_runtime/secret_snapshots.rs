@@ -13,6 +13,11 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+// Wall-clock SystemTime (not the project-wide TimeSource trait) is the
+// correct abstraction here: snapshot file names embed epoch_ms so retention
+// stays sortable across process restarts and across nodes that share a
+// data directory. TimeSource returns simulation-relative Duration with no
+// stable origin, which can't be persisted into a filename.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use freenet_stdlib::prelude::SecretsId;
@@ -22,6 +27,18 @@ use freenet_stdlib::prelude::SecretsId;
 /// active secret files; the `get_secret` read path never descends into it.
 pub const SNAPSHOTS_DIR: &str = ".snapshots";
 
+/// Width of the zero-padded epoch-millis used to name snapshot files.
+/// `u64::MAX` is 20 digits, so this width keeps lexicographic order
+/// equivalent to chronological order for the lifetime of the universe.
+pub const SNAPSHOT_NAME_WIDTH: usize = 20;
+
+/// Maximum number of within-the-same-millisecond collision suffixes we'll
+/// try before giving up. 1024 is generous: at burst of 1024 writes/ms a
+/// node would be doing >1M ops/sec to a single secret, far beyond any
+/// realistic delegate workload. Hitting the cap returns an error so the
+/// caller can log instead of silently overwriting an existing snapshot.
+const MAX_SNAPSHOT_COLLISION_SUFFIX: u32 = 1024;
+
 /// Path to the snapshot directory for a particular `(delegate, secret_id)`
 /// pair. Snapshots are organized per secret so retention thinning of one
 /// busy key cannot affect another.
@@ -29,10 +46,46 @@ pub fn snapshot_dir_for(delegate_path: &Path, key: &SecretsId) -> PathBuf {
     delegate_path.join(SNAPSHOTS_DIR).join(key.encode())
 }
 
+/// Pick the snapshot file path for a write happening "now". Uses the
+/// current epoch-millis as the base name, falling back to numeric
+/// collision suffixes when multiple writes land in the same millisecond.
+///
+/// # Errors
+/// `AlreadyExists` if [`MAX_SNAPSHOT_COLLISION_SUFFIX`] consecutive
+/// suffixes are also taken — extremely unlikely in practice, but the
+/// caller (snapshot subsystem) treats this as a best-effort failure and
+/// logs rather than silently overwriting an existing snapshot.
+pub fn next_snapshot_path(snap_dir: &Path) -> std::io::Result<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let unsuffixed = snap_dir.join(format!("{stamp:0width$}", width = SNAPSHOT_NAME_WIDTH));
+    if !unsuffixed.exists() {
+        return Ok(unsuffixed);
+    }
+    for suffix in 0u32..MAX_SNAPSHOT_COLLISION_SUFFIX {
+        let candidate = snap_dir.join(format!(
+            "{stamp:0width$}.{suffix}",
+            width = SNAPSHOT_NAME_WIDTH
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "snapshot path collision exhausted: {} already has {MAX_SNAPSHOT_COLLISION_SUFFIX} entries with stamp {stamp}",
+            snap_dir.display()
+        ),
+    ))
+}
+
 /// Apply the retention policy to a snapshot directory: delete any file
 /// whose timestamp is not selected by `policy` relative to `now`. Files
 /// whose names don't parse as `{epoch_ms}` (with optional `.{counter}`
-/// suffix) are left untouched.
+/// suffix) and non-regular-file entries are left untouched.
 ///
 /// Best-effort: I/O errors during enumeration or unlink are logged but
 /// do not propagate, since thinning is a maintenance operation that must
@@ -40,9 +93,23 @@ pub fn snapshot_dir_for(delegate_path: &Path, key: &SecretsId) -> PathBuf {
 pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime) {
     let mut entries: Vec<(SystemTime, PathBuf)> = match fs::read_dir(snap_dir) {
         Ok(rd) => rd
-            .flatten()
-            .filter_map(|e| {
-                let path = e.path();
+            .filter_map(|res| match res {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    tracing::debug!("snapshot dir entry error in {snap_dir:?}: {err}");
+                    None
+                }
+            })
+            .filter_map(|entry| {
+                // Skip directories, symlinks, anything that isn't a regular
+                // file. A subdirectory whose name happens to be all digits
+                // would otherwise produce a confusing "remove_file failed"
+                // log on every thin pass.
+                let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+                if !is_file {
+                    return None;
+                }
+                let path = entry.path();
                 let stamp = parse_snapshot_stamp(&path)?;
                 Some((UNIX_EPOCH + Duration::from_millis(stamp), path))
             })
@@ -66,11 +133,23 @@ pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime
 }
 
 /// Parse a snapshot file name back into its epoch-millis timestamp.
-/// Accepts either `{stamp}` or `{stamp}.{counter}` (collision suffix);
-/// returns `None` for any other shape.
-fn parse_snapshot_stamp(path: &Path) -> Option<u64> {
+/// Accepts only `{digits}` or `{digits}.{digits}`; any other shape
+/// (including `42.tmp`, `foo`, `1.2.3`, etc.) returns `None` so stray
+/// files in the snapshot directory are not mistaken for snapshots.
+pub(crate) fn parse_snapshot_stamp(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
-    let stamp_part = name.split_once('.').map(|(s, _)| s).unwrap_or(name);
+    let (stamp_part, suffix_part) = match name.split_once('.') {
+        Some((s, t)) => (s, Some(t)),
+        None => (name, None),
+    };
+    if stamp_part.is_empty() || !stamp_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(suffix) = suffix_part
+        && (suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
     stamp_part.parse().ok()
 }
 
@@ -267,6 +346,77 @@ mod tests {
         // call-order not timestamp) wins, but the algorithm walks rev so the
         // last index wins the slot. Either way exactly one survives.
         assert_eq!(keep.len(), 1);
+    }
+
+    #[test]
+    fn parse_snapshot_stamp_accepts_valid_shapes() {
+        use std::path::PathBuf;
+        let pure = PathBuf::from("/tmp/snap/00000000000001234567");
+        assert_eq!(parse_snapshot_stamp(&pure), Some(1_234_567));
+        let suffixed = PathBuf::from("/tmp/snap/00000000000001234567.42");
+        assert_eq!(parse_snapshot_stamp(&suffixed), Some(1_234_567));
+    }
+
+    #[test]
+    fn parse_snapshot_stamp_rejects_garbage() {
+        use std::path::PathBuf;
+        // Non-digit body
+        assert_eq!(parse_snapshot_stamp(&PathBuf::from("foo")), None);
+        // Non-digit suffix (the previous lax implementation accepted these)
+        assert_eq!(parse_snapshot_stamp(&PathBuf::from("123.tmp")), None);
+        // Multiple dots
+        assert_eq!(parse_snapshot_stamp(&PathBuf::from("123.4.5")), None);
+        // Empty stamp
+        assert_eq!(parse_snapshot_stamp(&PathBuf::from(".42")), None);
+        // Empty suffix
+        assert_eq!(parse_snapshot_stamp(&PathBuf::from("123.")), None);
+        // Pure punctuation
+        assert_eq!(parse_snapshot_stamp(&PathBuf::from("...")), None);
+    }
+
+    #[test]
+    fn next_snapshot_path_uses_unsuffixed_when_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = next_snapshot_path(dir.path()).expect("path");
+        // Default name is just digits, no dot.
+        assert!(
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        );
+    }
+
+    #[test]
+    fn next_snapshot_path_falls_back_to_suffix_on_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Pre-create files at every plausible "now" stamp (we can't easily
+        // pin the wall clock, so saturate the directory at and around the
+        // current millisecond and assert the helper picks SOME free path).
+        // Walk a small window of stamps and create the unsuffixed file at
+        // each: this guarantees `next_snapshot_path` will see a collision
+        // for at least one call.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        for offset in 0..3u64 {
+            let p = dir
+                .path()
+                .join(format!("{:0width$}", now + offset, width = 20));
+            std::fs::write(&p, b"").unwrap();
+        }
+        // Ask for a path; the first call may land on a free stamp (now+3+),
+        // but if the clock hasn't ticked we'll hit collision and walk to a
+        // suffixed name. Either way the result must be a free path that
+        // the helper hasn't itself created (existence check).
+        let p = next_snapshot_path(dir.path()).expect("path");
+        assert!(!p.exists());
+        let name = p.file_name().unwrap().to_str().unwrap();
+        // It's either `{stamp}` or `{stamp}.{n}` with all-digit components.
+        assert!(parse_snapshot_stamp(&p).is_some(), "name={name}");
     }
 
     #[test]

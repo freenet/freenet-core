@@ -4,7 +4,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    // Wall-clock SystemTime (not the project-wide TimeSource trait) is the
+    // correct abstraction here: thin_snapshots compares "now" against
+    // file-name epoch_ms values that must remain meaningful across process
+    // restarts. TimeSource returns simulation-relative Duration, which has
+    // no stable epoch and can't be compared to persisted timestamps.
+    time::SystemTime,
 };
 
 use chacha20poly1305::{Error as EncryptionError, XChaCha20Poly1305, XNonce, aead::Aead};
@@ -15,17 +20,14 @@ use crate::config::Secrets;
 use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
-use super::secret_snapshots::{RetentionPolicy, snapshot_dir_for, thin_snapshots};
+use super::secret_snapshots::{
+    RetentionPolicy, next_snapshot_path, snapshot_dir_for, thin_snapshots,
+};
 
 /// Environment variable that disables snapshot-on-write for delegate secrets.
 /// Snapshots are on by default; this is only for ops who explicitly want the
 /// previous behavior (e.g. extreme disk-pressure scenarios).
 const DISABLE_SNAPSHOTS_ENV: &str = "FREENET_DISABLE_SECRET_SNAPSHOTS";
-
-/// Width of the zero-padded epoch-millis used to name snapshot files.
-/// `u64::MAX` is 20 digits, so this width keeps lexicographic order
-/// equivalent to chronological order for the lifetime of the universe.
-const SNAPSHOT_NAME_WIDTH: usize = 20;
 
 type SecretKey = [u8; 32];
 
@@ -47,13 +49,25 @@ struct Encryption {
     nonce: XNonce,
 }
 
+/// Storage layer for delegate secrets and their snapshot history.
+///
+/// **Synchronization.** This type is NOT internally synchronized.
+/// `store_secret` and `remove_secret` take `&mut self` so the borrow
+/// checker forbids concurrent writes against the same instance, and
+/// `get_secret` taking `&self` cannot run concurrently with a write
+/// either. If a future caller wraps this type in interior mutability
+/// (e.g. `Arc<Mutex<SecretsStore>>`), they must hold the lock across
+/// the snapshot+rename+index sequence in `store_secret`; otherwise two
+/// concurrent writes for the same `(delegate, secret_id)` could race
+/// on the snapshot path or the active-file rename window.
 pub struct SecretsStore {
     base_path: PathBuf,
     #[allow(unused)]
     secrets: Secrets,
     ciphers: std::collections::HashMap<DelegateKey, Encryption>,
-    /// In-memory index: DelegateKey -> Set of secret key hashes
-    /// This is populated from ReDb on startup and kept in sync
+    /// In-memory index: DelegateKey -> Set of secret key hashes.
+    /// Populated from ReDb on startup and kept in sync with it; never
+    /// updated unless the corresponding ReDb write succeeded.
     key_to_secret_part: Arc<DashMap<DelegateKey, HashSet<SecretKey>>>,
     /// ReDb storage for persistent index
     db: Storage,
@@ -112,6 +126,14 @@ impl SecretsStore {
         self.retention = policy;
     }
 
+    /// Override the snapshots-enabled flag at runtime. Intended for tests
+    /// that want to exercise the disabled path without mutating the
+    /// process-wide environment.
+    #[cfg(test)]
+    pub(crate) fn set_snapshots_enabled(&mut self, enabled: bool) {
+        self.snapshots_enabled = enabled;
+    }
+
     pub fn register_delegate(
         &mut self,
         delegate: DelegateKey,
@@ -156,37 +178,55 @@ impl SecretsStore {
                 }
             })?;
 
-        // CRITICAL ORDER: Snapshot prior value, write new file, then update index.
-        // This ensures get_secret() can find the file even if we crash between
-        // operations. If we update index first and crash before file write,
-        // the index would point to a non-existent file.
-
         fs::create_dir_all(&delegate_path)?;
 
-        // Step 1: If a prior secret exists, move it into the snapshot history
-        // *before* we open the active path for write. We rename rather than
-        // hard-link because File::create truncates an existing inode in place
-        // (which would otherwise also truncate any hard link to it).
+        // CRITICAL ORDER: hard-link prior value into snapshot history, write
+        // new ciphertext to a tmp path, fsync, then atomically rename
+        // tmp → active. This way:
+        //   - the active path is never absent: a crash leaves either the old
+        //     or new ciphertext (atomic rename guarantees no half-state),
+        //   - the snapshot points at the OLD inode, which is unaffected by
+        //     the new write because the new write goes through a fresh
+        //     inode and only `rename` makes it visible at the active path,
+        //   - update index AFTER the active rename so a crash between rename
+        //     and index-update still gives `get_secret` the new value.
         if self.snapshots_enabled
             && secret_file_path.exists()
             && let Err(e) = self.snapshot_prior_value(&delegate_path, key, &secret_file_path)
         {
             // Snapshotting is best-effort. A failure here must not block the
-            // primary write — the user's data still gets through. Log loudly
-            // so disk problems surface in monitoring.
+            // primary write — the user's data still gets through. Log so
+            // disk problems surface in monitoring.
             tracing::warn!(
                 "failed to snapshot prior secret value for delegate {}: {e}",
                 delegate.encode()
             );
         }
 
-        // Step 2: Write secret to disk
         tracing::debug!("storing secret `{key}` at {secret_file_path:?}");
-        let mut file = File::create(&secret_file_path)?;
-        file.write_all(&ciphertext)?;
-        file.sync_all()?; // Ensure durability before updating index
+        // Write to a sibling tmp path so the active path's inode never has
+        // a half-written state. We pick a fixed suffix (rather than a
+        // random one) because `&mut self` makes concurrent in-process
+        // store_secret calls impossible; a stale `.tmp` from a prior
+        // crashed run is overwritten harmlessly here.
+        let tmp_path = secret_file_path.with_extension("tmp");
+        {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&ciphertext)?;
+            file.sync_all()?;
+        }
+        // Atomic on POSIX (and on Rust >=1.56 Windows: MoveFileExW with
+        // MOVEFILE_REPLACE_EXISTING). If this rename fails, the active
+        // path still holds the old value (or is empty if it never existed)
+        // and the new ciphertext sits in the tmp file for forensics.
+        if let Err(err) = fs::rename(&tmp_path, &secret_file_path) {
+            // Best effort cleanup of the tmp file so we don't leave debris.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
 
-        // Step 3: Update index in ReDb and in-memory
+        // Update index in ReDb and in-memory only after the active path has
+        // the new value durably committed.
         let mut current_secrets: Vec<[u8; 32]> = self
             .key_to_secret_part
             .get(delegate)
@@ -204,10 +244,9 @@ impl SecretsStore {
         let secret_set: HashSet<SecretKey> = current_secrets.into_iter().collect();
         self.key_to_secret_part.insert(delegate.clone(), secret_set);
 
-        // Step 4 (best-effort): thin the snapshot history per the retention
-        // policy. Failures here only mean we keep more snapshots than the
-        // policy targets, which is harmless and self-correcting on the next
-        // write.
+        // Best-effort thin of the snapshot history. Failures here only mean
+        // we keep more snapshots than the policy targets, which is harmless
+        // and self-correcting on the next write.
         if self.snapshots_enabled {
             let snap_dir = snapshot_dir_for(&delegate_path, key);
             if snap_dir.exists() {
@@ -218,8 +257,15 @@ impl SecretsStore {
         Ok(())
     }
 
-    /// Move the existing active secret file into its snapshot directory.
-    /// Returns Ok even if the source did not exist (race with another write).
+    /// Capture the existing active secret file as a snapshot. Uses
+    /// hard-link so the active inode and snapshot inode coexist; the
+    /// subsequent `rename(tmp → active)` updates the active dir-entry to
+    /// a different inode without touching the snapshot.
+    ///
+    /// On filesystems that do not support hard links (FAT, some network
+    /// mounts), falls back to `fs::copy`. The active file is unchanged
+    /// either way, so callers that crash mid-snapshot just lose the
+    /// snapshot, never the live value.
     fn snapshot_prior_value(
         &self,
         delegate_path: &Path,
@@ -228,27 +274,16 @@ impl SecretsStore {
     ) -> std::io::Result<()> {
         let snap_dir = snapshot_dir_for(delegate_path, key);
         fs::create_dir_all(&snap_dir)?;
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let mut snap_path = snap_dir.join(format!("{stamp:0width$}", width = SNAPSHOT_NAME_WIDTH));
-        // If two writes happen within the same millisecond, append a suffix
-        // rather than overwriting the prior snapshot. Walk a small range so
-        // we don't loop pathologically on disk problems.
-        for suffix in 0u32..1024 {
-            if !snap_path.exists() {
-                break;
-            }
-            snap_path = snap_dir.join(format!(
-                "{stamp:0width$}.{suffix}",
-                width = SNAPSHOT_NAME_WIDTH
-            ));
-        }
-        match fs::rename(secret_file_path, &snap_path) {
+        let snap_path = next_snapshot_path(&snap_dir)?;
+        match fs::hard_link(secret_file_path, &snap_path) {
             Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => {
+                // Hard-link unsupported (FAT, cross-device, etc.). Copy
+                // is slower but always works. The active file is not
+                // mutated in this code path so the copy can't tear.
+                fs::copy(secret_file_path, &snap_path).map(|_| ())
+            }
         }
     }
 
@@ -278,11 +313,13 @@ impl SecretsStore {
             Err(err) => return Err(err.into()),
         }
 
-        // Update in-memory and persistent indices. Prior to this fix,
-        // `remove_secret` deleted only the file and left the ReDb +
-        // DashMap entries pointing at a now-missing path. `has_secret`
-        // (which checks the index) would then return true, while
-        // `get_secret` would fail on file-not-found.
+        // Update persistent index FIRST. The previous version of this
+        // method updated the in-memory map unconditionally and only
+        // logged ReDb failures, which let a transient DB error
+        // resurrect the deleted entry on the next restart (because
+        // `new()` rebuilds the in-memory map from ReDb). Mirroring
+        // `store_secret`, we treat persistence failure as fatal here
+        // and only mutate the in-memory map after ReDb commits.
         let secret_key = *key.hash();
         let mut current: Vec<SecretKey> = self
             .key_to_secret_part
@@ -291,12 +328,10 @@ impl SecretsStore {
             .unwrap_or_default();
         current.retain(|k| k != &secret_key);
 
-        if let Err(e) = self.db.store_secrets_index(delegate, &current) {
-            tracing::warn!(
-                "failed to update secrets index after remove_secret({}, {key}): {e}",
-                delegate.encode()
-            );
-        }
+        self.db
+            .store_secrets_index(delegate, &current)
+            .map_err(|e| std::io::Error::other(format!("Failed to update secrets index: {e}")))?;
+
         let secret_set: HashSet<SecretKey> = current.into_iter().collect();
         self.key_to_secret_part.insert(delegate.clone(), secret_set);
 
@@ -392,7 +427,12 @@ mod test {
 
         store.store_secret(delegate.key(), &secret_id, b"v1".to_vec())?;
         // Sleep 2ms to guarantee a distinct epoch-millis stamp on the snapshot.
-        std::thread::sleep(Duration::from_millis(2));
+        // Sleep enough to guarantee a distinct epoch-millis stamp on the
+        // snapshot even on virtualized CI runners with coarse clocks.
+        // A test that lands two writes in the same millisecond would
+        // exercise the collision-suffix branch instead, which has its own
+        // test in the secret_snapshots module.
+        std::thread::sleep(Duration::from_millis(5));
         store.store_secret(delegate.key(), &secret_id, b"v2".to_vec())?;
 
         // Active value is the latest write.
@@ -458,7 +498,12 @@ mod test {
             store.store_secret(delegate.key(), &secret_id, i.to_le_bytes().to_vec())?;
             // Force distinct epoch-millis stamps so the snapshot files don't
             // collide and the count actually reflects the policy.
-            std::thread::sleep(Duration::from_millis(2));
+            // Sleep enough to guarantee a distinct epoch-millis stamp on the
+            // snapshot even on virtualized CI runners with coarse clocks.
+            // A test that lands two writes in the same millisecond would
+            // exercise the collision-suffix branch instead, which has its own
+            // test in the secret_snapshots module.
+            std::thread::sleep(Duration::from_millis(5));
         }
 
         let snap_dir = secrets_dir
@@ -494,7 +539,12 @@ mod test {
         let secret_id = SecretsId::new(vec![9]);
 
         store.store_secret(delegate.key(), &secret_id, b"a".to_vec())?;
-        std::thread::sleep(Duration::from_millis(2));
+        // Sleep enough to guarantee a distinct epoch-millis stamp on the
+        // snapshot even on virtualized CI runners with coarse clocks.
+        // A test that lands two writes in the same millisecond would
+        // exercise the collision-suffix branch instead, which has its own
+        // test in the secret_snapshots module.
+        std::thread::sleep(Duration::from_millis(5));
         store.store_secret(delegate.key(), &secret_id, b"b".to_vec())?;
 
         // Pre-conditions: index has the key, snapshot dir is populated.
@@ -571,6 +621,102 @@ mod test {
             .expect("index lookup")
             .unwrap_or_default();
         assert!(post_index.is_empty());
+        Ok(())
+    }
+
+    /// Disabling snapshots via `set_snapshots_enabled(false)` must skip
+    /// both the snapshot-on-write and the post-write thinning paths so
+    /// no `.snapshots/` directory is ever created.
+    #[tokio::test]
+    async fn disabled_flag_suppresses_snapshots() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        store.set_snapshots_enabled(false);
+
+        let delegate = Delegate::from((&vec![6].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![14]);
+
+        store.store_secret(delegate.key(), &secret_id, b"a".to_vec())?;
+        std::thread::sleep(Duration::from_millis(5));
+        store.store_secret(delegate.key(), &secret_id, b"b".to_vec())?;
+
+        let snap_dir = secrets_dir
+            .join(delegate.key().encode())
+            .join(".snapshots")
+            .join(secret_id.encode());
+        assert!(
+            !snap_dir.exists(),
+            "no snapshot dir should be created when snapshots are disabled"
+        );
+        // Active path still holds the latest write.
+        assert_eq!(store.get_secret(delegate.key(), &secret_id)?, b"b".to_vec());
+        Ok(())
+    }
+
+    /// Two delegates using the same `SecretsId` must keep their snapshot
+    /// histories disjoint — pin that the snapshot dir is rooted at the
+    /// per-delegate path, not at `base_path`.
+    #[tokio::test]
+    async fn delegates_have_disjoint_snapshot_histories() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate_a = Delegate::from((&vec![10].into(), &vec![].into()));
+        let delegate_b = Delegate::from((&vec![11].into(), &vec![].into()));
+        let (ca, na) = fresh_cipher();
+        let (cb, nb) = fresh_cipher();
+        store.register_delegate(delegate_a.key().clone(), ca, na)?;
+        store.register_delegate(delegate_b.key().clone(), cb, nb)?;
+        let shared_id = SecretsId::new(vec![99]);
+
+        // Two writes per delegate against the same SecretsId.
+        for value in [&b"a1"[..], &b"a2"[..]] {
+            store.store_secret(delegate_a.key(), &shared_id, value.to_vec())?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for value in [&b"b1"[..], &b"b2"[..]] {
+            store.store_secret(delegate_b.key(), &shared_id, value.to_vec())?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let snap_a = secrets_dir
+            .join(delegate_a.key().encode())
+            .join(".snapshots")
+            .join(shared_id.encode());
+        let snap_b = secrets_dir
+            .join(delegate_b.key().encode())
+            .join(".snapshots")
+            .join(shared_id.encode());
+        assert!(
+            snap_a != snap_b,
+            "snapshot dirs must differ across delegates"
+        );
+        assert!(snap_a.exists() && snap_b.exists());
+
+        // Each delegate has exactly one snapshot (one prior overwrite each).
+        assert_eq!(std::fs::read_dir(&snap_a)?.count(), 1);
+        assert_eq!(std::fs::read_dir(&snap_b)?.count(), 1);
+
+        // And get_secret on each delegate returns its own most-recent value.
+        assert_eq!(
+            store.get_secret(delegate_a.key(), &shared_id)?,
+            b"a2".to_vec()
+        );
+        assert_eq!(
+            store.get_secret(delegate_b.key(), &shared_id)?,
+            b"b2".to_vec()
+        );
         Ok(())
     }
 
