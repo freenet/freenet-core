@@ -277,6 +277,101 @@ impl OpCtx {
         Ok(response_receiver)
     }
 
+    /// Dispatch `msg` and return a multi-reply receiver. Caller drains
+    /// the receiver until its own completion predicate fires.
+    ///
+    /// This is the load-bearing primitive for ops with fan-in semantics:
+    /// CONNECT (#1454 Phase 2c) sends a single Request and expects up to
+    /// `target_connections` ConnectResponses arriving over time as relay
+    /// branches accept the joiner. `send_and_await` and
+    /// `send_to_and_register_waiter` both use a capacity-1 channel that
+    /// is consumed-and-dropped after one reply, so they cannot model
+    /// fan-in. This primitive accepts a `capacity` argument so the caller
+    /// sizes the channel to the expected fan-in.
+    ///
+    /// # When the bypass forwards multiple replies
+    ///
+    /// `node::try_forward_task_per_tx_reply` calls `try_send` on the
+    /// stored callback. With a capacity > 1 channel, multiple inbound
+    /// replies for the same tx land in the channel without dropping each
+    /// other (capacity-1 callers would receive only the first because the
+    /// receiver hangs up after `recv().await` resolves once and the second
+    /// `try_send` fails as `Closed`). Bypass call sites that want
+    /// multi-reply behaviour must opt in by NOT returning early after the
+    /// first forward; the channel-side capacity governs how many concurrent
+    /// replies can be buffered before `try_send` drops.
+    ///
+    /// # Cleanup
+    ///
+    /// The `pending_op_results` slot is NOT cleaned up by this primitive.
+    /// Callers must call `OpManager::release_pending_op_slot(tx)` when the
+    /// driver task exits, or the entry will live until the 60s sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpError::NotificationError`] if the event-loop
+    /// `op_execution_sender` channel is closed (receiver dropped —
+    /// typically only happens during node shutdown).
+    #[allow(dead_code)] // Phase 2c slice 0: dormant scaffolding for CONNECT originator (#1454).
+    pub async fn send_and_collect_replies(
+        &mut self,
+        msg: NetMessage,
+        capacity: usize,
+    ) -> Result<mpsc::Receiver<NetMessage>, OpError> {
+        debug_assert_eq!(
+            msg.id(),
+            &self.tx,
+            "OpCtx::send_and_collect_replies: msg.id must match ctx.tx"
+        );
+        debug_assert!(
+            capacity >= 1,
+            "OpCtx::send_and_collect_replies: capacity must be >= 1"
+        );
+
+        let (response_sender, response_receiver) = mpsc::channel::<NetMessage>(capacity);
+
+        self.op_execution_sender
+            .send((response_sender, msg, None))
+            .await
+            .map_err(|_| OpError::NotificationError)?;
+
+        Ok(response_receiver)
+    }
+
+    /// Like [`Self::send_and_collect_replies`] but dispatches to a specific
+    /// target instead of looping back to the local event loop.
+    ///
+    /// CONNECT joiner sends Request to its first-hop gateway via this
+    /// primitive: the request travels over the network, fans out through
+    /// relays, and ConnectResponses bubble back along distinct paths to
+    /// the joiner.
+    #[allow(dead_code)] // Phase 2c slice 0: dormant scaffolding for CONNECT originator (#1454).
+    pub async fn send_to_and_collect_replies(
+        &mut self,
+        target_addr: SocketAddr,
+        msg: NetMessage,
+        capacity: usize,
+    ) -> Result<mpsc::Receiver<NetMessage>, OpError> {
+        debug_assert_eq!(
+            msg.id(),
+            &self.tx,
+            "OpCtx::send_to_and_collect_replies: msg.id must match ctx.tx"
+        );
+        debug_assert!(
+            capacity >= 1,
+            "OpCtx::send_to_and_collect_replies: capacity must be >= 1"
+        );
+
+        let (response_sender, response_receiver) = mpsc::channel::<NetMessage>(capacity);
+
+        self.op_execution_sender
+            .send((response_sender, msg, Some(target_addr)))
+            .await
+            .map_err(|_| OpError::NotificationError)?;
+
+        Ok(response_receiver)
+    }
+
     async fn send_and_await_inner(
         &mut self,
         msg: NetMessage,
@@ -938,5 +1033,162 @@ mod tests {
         }
         let d = DefaultDriver;
         assert_eq!(d.attempt_timeout(), OPERATION_TTL);
+    }
+
+    /// `send_and_collect_replies` returns a receiver that buffers multiple
+    /// inbound replies for the same tx. Phase 2c (#1454) needs this for
+    /// CONNECT joiners that fan-in N `ConnectResponse`s from distinct
+    /// relay branches against a single outbound `ConnectMsg::Request`.
+    ///
+    /// This test exercises the channel-level invariant only: the executor
+    /// fires three replies before the caller drains, all three must land
+    /// in the receiver in order. The full integration path (bypass
+    /// forwarding, capacity exhaustion behaviour, slot cleanup via
+    /// `release_pending_op_slot`) is covered by slice-1/slice-2 tests.
+    #[tokio::test]
+    async fn send_and_collect_replies_buffers_multiple_inbound_replies() {
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut op_execution_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        let executor = tokio::spawn(async move {
+            let (reply_sender, outbound, target_addr) = op_execution_receiver
+                .recv()
+                .await
+                .expect("outbound msg should be delivered");
+            assert_eq!(outbound.id(), &tx, "outbound msg tx must match the ctx tx");
+            assert_eq!(
+                target_addr, None,
+                "send_and_collect_replies should not specify a target"
+            );
+            for _ in 0..3 {
+                reply_sender
+                    .try_send(dummy_reply_with_tx(tx))
+                    .expect("capacity-N reply channel should accept all sends within capacity");
+            }
+            // Hold reply_sender to keep the channel open while the caller drains.
+            reply_sender
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        let mut rx = timeout(
+            Duration::from_secs(1),
+            ctx.send_and_collect_replies(outbound, 4),
+        )
+        .await
+        .expect("send_and_collect_replies should complete quickly")
+        .expect("send_and_collect_replies should return Ok");
+
+        let _reply_sender = executor
+            .await
+            .expect("executor task should complete without panicking");
+
+        for i in 0..3 {
+            let reply = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("recv #{i} should yield buffered reply"));
+            let reply = reply.unwrap_or_else(|| panic!("recv #{i} returned None"));
+            assert_eq!(reply.id(), &tx, "reply #{i} tx must match ctx tx");
+        }
+    }
+
+    /// `send_to_and_collect_replies` propagates the caller-supplied target
+    /// address, mirroring the `send_to_and_await` regression for #3838.
+    /// CONNECT slice 2 will use this to route the joiner's outbound
+    /// `Request` to the gateway over the wire (not through a local
+    /// `InboundMessage` short-circuit).
+    #[tokio::test]
+    async fn send_to_and_collect_replies_forwards_target_address() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut op_execution_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+        let expected_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 7)), 9090);
+
+        let executor = tokio::spawn(async move {
+            let (reply_sender, outbound, target_addr) = op_execution_receiver
+                .recv()
+                .await
+                .expect("outbound msg should be delivered");
+            assert_eq!(outbound.id(), &tx);
+            assert_eq!(
+                target_addr,
+                Some(expected_target),
+                "send_to_and_collect_replies must propagate target_addr"
+            );
+            reply_sender
+                .try_send(dummy_reply_with_tx(tx))
+                .expect("capacity-N channel accepts first send");
+            reply_sender
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        let mut rx = timeout(
+            Duration::from_secs(1),
+            ctx.send_to_and_collect_replies(expected_target, outbound, 2),
+        )
+        .await
+        .expect("send_to_and_collect_replies should complete quickly")
+        .expect("send_to_and_collect_replies should return Ok");
+
+        let _reply_sender = executor
+            .await
+            .expect("executor task should complete without panicking");
+
+        let reply = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("recv should yield buffered reply")
+            .expect("recv returned None");
+        assert_eq!(reply.id(), &tx);
+    }
+
+    /// Capacity-1 collect_replies is the degenerate case: one buffered
+    /// reply, then `try_send` fails on the executor side. This pins the
+    /// expectation that the caller is free to choose `capacity = 1` if
+    /// fan-in turns out to be unnecessary, without a panic from the
+    /// `debug_assert!(capacity >= 1)` invariant.
+    #[tokio::test]
+    async fn send_and_collect_replies_capacity_one_works_like_single_shot() {
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut op_execution_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        let executor = tokio::spawn(async move {
+            let (reply_sender, _outbound, _target_addr) = op_execution_receiver
+                .recv()
+                .await
+                .expect("outbound msg should be delivered");
+            reply_sender
+                .try_send(dummy_reply_with_tx(tx))
+                .expect("capacity-1 channel accepts first send");
+            reply_sender
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        let mut rx = ctx
+            .send_and_collect_replies(outbound, 1)
+            .await
+            .expect("send_and_collect_replies should return Ok");
+
+        let _reply_sender = executor.await.expect("executor task should complete");
+
+        let reply = rx.recv().await.expect("first recv should yield reply");
+        assert_eq!(reply.id(), &tx);
     }
 }
