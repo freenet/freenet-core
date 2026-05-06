@@ -2147,6 +2147,9 @@ impl P2pConnManager {
                             NodeEvent::SendInterestMessage { target, message } => {
                                 ctx.handle_send_interest_message(target, message).await;
                             }
+                            NodeEvent::SendNetMessage { target, msg } => {
+                                ctx.handle_send_net_message(target, *msg).await;
+                            }
                             NodeEvent::Disconnect { cause } => {
                                 tracing::info!(
                                     cause = ?cause,
@@ -4114,6 +4117,34 @@ impl P2pConnManager {
                 peer_addr = %target,
                 error = %e,
                 "Failed to send interest message to peer"
+            );
+        }
+    }
+
+    /// Send an arbitrary `NetMessage` to a target peer without registering
+    /// a `pending_op_results` callback for the message's transaction.
+    ///
+    /// Mirrors `handle_send_interest_message` but accepts a fully-formed
+    /// `NetMessage`. Introduced for #1454 phase 2c (CONNECT originator
+    /// task-per-tx driver) so the joiner can emit `ConnectFailed` upstream
+    /// without disturbing its own multi-reply receiver slot.
+    #[allow(dead_code)] // Reachable only via NodeEvent::SendNetMessage which is dormant until slice 2.
+    async fn handle_send_net_message(
+        &mut self,
+        target: SocketAddr,
+        msg: crate::message::NetMessage,
+    ) {
+        tracing::debug!(
+            target = %target,
+            tx = %msg.id(),
+            "Sending net message to peer"
+        );
+
+        if let Err(e) = self.bridge.send(target, msg).await {
+            tracing::warn!(
+                peer_addr = %target,
+                error = %e,
+                "Failed to send net message to peer"
             );
         }
     }
