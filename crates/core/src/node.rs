@@ -945,6 +945,45 @@ where
 
         match msg {
             NetMessageV1::Connect(ref op) => {
+                // Phase 2c slice 0 (#1454): task-per-tx reply forwarding for
+                // CONNECT. Mirrors the SUBSCRIBE/PUT/GET bypass: when a
+                // task-per-tx CONNECT driver has registered a reply waiter
+                // in `pending_op_results`, forward terminal `ConnectMsg`
+                // variants to it.
+                //
+                // CONNECT differs from the other ops in that the joiner
+                // expects fan-in: up to `target_connections` `Response`s
+                // arrive over time as relay branches accept the joiner.
+                // The waiter side uses `OpCtx::send_and_collect_replies`
+                // with capacity > 1 so multiple replies can buffer without
+                // dropping each other; the bypass below opts in to this
+                // multi-forward shape by NOT short-circuiting on the first
+                // forward — we still return `Ok(None)` (so the legacy
+                // pipeline does not re-process the message) but the next
+                // inbound reply for the same tx will hit this same code
+                // path and forward to the same channel.
+                //
+                // `Rejected` and `ConnectFailed` are also terminal-from-
+                // the-driver's-perspective for legacy fallback paths, but
+                // slice 0 only forwards the success-shaped variants
+                // (`Response`, `Rejected`); `ConnectFailed` flows in the
+                // opposite direction (downstream from the joiner) and
+                // requires a different waiter shape, deferred to slice 1
+                // / slice 2. `ObservedAddress` is a side-channel update
+                // and stays on legacy `process_message` so its own_addr /
+                // own_location updates run through the normal
+                // `load_or_init` short-circuit.
+                if matches!(
+                    op,
+                    connect::ConnectMsg::Response { .. } | connect::ConnectMsg::Rejected { .. }
+                ) && try_forward_task_per_tx_reply(
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Connect((*op).clone())),
+                    "connect",
+                ) {
+                    return Ok(None);
+                }
+
                 let parent_span = tracing::Span::current();
                 let span = tracing::info_span!(
                     parent: parent_span,
