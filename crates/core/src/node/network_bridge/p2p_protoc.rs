@@ -4128,7 +4128,6 @@ impl P2pConnManager {
     /// `NetMessage`. Introduced for #1454 phase 2c (CONNECT originator
     /// task-per-tx driver) so the joiner can emit `ConnectFailed` upstream
     /// without disturbing its own multi-reply receiver slot.
-    #[allow(dead_code)] // Reachable only via NodeEvent::SendNetMessage which is dormant until slice 2.
     async fn handle_send_net_message(
         &mut self,
         target: SocketAddr,

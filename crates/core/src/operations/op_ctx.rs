@@ -345,7 +345,6 @@ impl OpCtx {
     /// primitive: the request travels over the network, fans out through
     /// relays, and ConnectResponses bubble back along distinct paths to
     /// the joiner.
-    #[allow(dead_code)] // Phase 2c slice 0: dormant scaffolding for CONNECT originator (#1454).
     pub async fn send_to_and_collect_replies(
         &mut self,
         target_addr: SocketAddr,
