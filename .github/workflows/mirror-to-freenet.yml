@@ -1,0 +1,35 @@
+name: Mirror to Freenet
+
+# Pushes the latest freenet-core HEAD to the Freenet-hosted demo repo
+# at `freenet:3GEERif5ihbf/freenet-core` whenever main moves.
+#
+# Mode is `snapshot` because freenet-core's full git history (~176 MiB)
+# does not fit in the repo contract; the demo carries the source tree
+# at HEAD only, as a single orphan commit. The reusable workflow lives
+# in freenet/freenet-git -- see its header comment for details on how
+# to set up the identity bundle and gateway WS URL secrets.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Daily safety net in case a push trigger was missed (e.g. a force
+    # push to main that GitHub coalesced). 11:42 UTC = mid-morning US.
+    - cron: "42 11 * * *"
+
+jobs:
+  mirror:
+    # Pinned to the merge SHA of freenet-git#17 rather than `@main`.
+    # `secrets: inherit` would pass every secret in this repo (Apple
+    # notarization keys, Claude OAuth, OpenAI key, Matrix tokens,
+    # River signing key) into whatever happens to be on freenet-git's
+    # main, so an unpinned ref + inherit is a textbook supply-chain
+    # pivot. Bump the SHA when the reusable workflow is rev'd.
+    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@4a4ab090c5591473f579ce2d1b626aba7b3a8ba3
+    with:
+      freenet_repo: "3GEERif5ihbf/freenet-core"
+      mode: snapshot
+    secrets:
+      FREENET_GIT_IDENTITY_BUNDLE_BASE64: ${{ secrets.FREENET_GIT_IDENTITY_BUNDLE_BASE64 }}
+      FREENET_GIT_WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
