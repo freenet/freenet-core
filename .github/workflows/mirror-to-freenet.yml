@@ -1,0 +1,27 @@
+name: Mirror to Freenet
+
+# Pushes the latest freenet-core HEAD to the Freenet-hosted demo repo
+# at `freenet:3GEERif5ihbf/freenet-core` whenever main moves.
+#
+# Mode is `snapshot` because freenet-core's full git history (~176 MiB)
+# does not fit in the repo contract; the demo carries the source tree
+# at HEAD only, as a single orphan commit. The reusable workflow lives
+# in freenet/freenet-git -- see its header comment for details on how
+# to set up the identity bundle and gateway WS URL secrets.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Daily safety net in case a push trigger was missed (e.g. a force
+    # push to main that GitHub coalesced). 11:42 UTC = mid-morning US.
+    - cron: "42 11 * * *"
+
+jobs:
+  mirror:
+    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@main
+    with:
+      freenet_repo: "3GEERif5ihbf/freenet-core"
+      mode: snapshot
+    secrets: inherit
