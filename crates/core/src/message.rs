@@ -671,6 +671,24 @@ pub(crate) enum NodeEvent {
         target: SocketAddr,
         message: InterestMessage,
     },
+    /// Send an arbitrary `NetMessage` to a specific peer without registering
+    /// a `pending_op_results` callback.
+    ///
+    /// Use case (#1454 phase 2c): the CONNECT task-per-tx originator driver
+    /// holds an active multi-reply receiver for its transaction. When the
+    /// joiner's hole-punch to an acceptor fails, it must emit
+    /// `ConnectMsg::ConnectFailed` upstream so the relay chain can re-route.
+    /// Routing that emission through `op_execution_sender`
+    /// (`OpCtx::send_fire_and_forget` or similar) would overwrite the
+    /// existing `pending_op_results` slot for the same tx, tearing down
+    /// the multi-reply receiver. This event delivers the message via
+    /// `ConnEvent::OutboundMessageWithTarget` without touching
+    /// `pending_op_results`.
+    #[allow(dead_code)] // Wired by #1454 phase 2c slice 2 (CONNECT originator driver).
+    SendNetMessage {
+        target: SocketAddr,
+        msg: Box<NetMessage>,
+    },
     /// Broadcast state change to interested network peers.
     /// Emitted by executor when local state changes.
     /// Handled by p2p_protoc which has access to OpManager and network.
@@ -805,6 +823,9 @@ impl Display for NodeEvent {
                     }
                 };
                 write!(f, "SendInterestMessage (to: {target}, {msg_summary})")
+            }
+            NodeEvent::SendNetMessage { target, msg } => {
+                write!(f, "SendNetMessage (to: {target}, tx: {})", msg.id())
             }
             NodeEvent::BroadcastStateChange { key, .. } => {
                 write!(f, "BroadcastStateChange (contract: {key})")
@@ -1145,6 +1166,40 @@ mod tests {
         assert!(
             display.contains("ChangeInterests(+2 -1 hashes)"),
             "{display}"
+        );
+    }
+
+    #[test]
+    fn test_send_net_message_display_includes_target_and_tx() {
+        use std::net::SocketAddr;
+
+        use crate::message::{NetMessageV1, Transaction};
+        use crate::operations::connect::ConnectMsg;
+
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let tx = Transaction::new::<ConnectMsg>();
+        let net_msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::ConnectFailed {
+            id: tx,
+            failed_acceptor_addr: "10.0.0.1:1000".parse().unwrap(),
+        }));
+
+        let event = NodeEvent::SendNetMessage {
+            target: addr,
+            msg: Box::new(net_msg),
+        };
+
+        let display = format!("{event}");
+        assert!(
+            display.contains("SendNetMessage"),
+            "should name event: {display}"
+        );
+        assert!(
+            display.contains("127.0.0.1:9000"),
+            "should include target: {display}"
+        );
+        assert!(
+            display.contains(&tx.to_string()),
+            "should include tx id: {display}"
         );
     }
 }
