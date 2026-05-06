@@ -20,8 +20,16 @@ on:
 
 jobs:
   mirror:
-    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@main
+    # Pinned to the merge SHA of freenet-git#17 rather than `@main`.
+    # `secrets: inherit` would pass every secret in this repo (Apple
+    # notarization keys, Claude OAuth, OpenAI key, Matrix tokens,
+    # River signing key) into whatever happens to be on freenet-git's
+    # main, so an unpinned ref + inherit is a textbook supply-chain
+    # pivot. Bump the SHA when the reusable workflow is rev'd.
+    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@362e547c7035d28968651d2f4106fbfa891c31e2
     with:
       freenet_repo: "3GEERif5ihbf/freenet-core"
       mode: snapshot
-    secrets: inherit
+    secrets:
+      FREENET_GIT_IDENTITY_BUNDLE_BASE64: ${{ secrets.FREENET_GIT_IDENTITY_BUNDLE_BASE64 }}
+      FREENET_GIT_WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
