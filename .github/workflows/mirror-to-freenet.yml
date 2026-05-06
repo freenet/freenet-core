@@ -26,7 +26,7 @@ jobs:
     # River signing key) into whatever happens to be on freenet-git's
     # main, so an unpinned ref + inherit is a textbook supply-chain
     # pivot. Bump the SHA when the reusable workflow is rev'd.
-    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@362e547c7035d28968651d2f4106fbfa891c31e2
+    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@4a4ab090c5591473f579ce2d1b626aba7b3a8ba3
     with:
       freenet_repo: "3GEERif5ihbf/freenet-core"
       mode: snapshot
