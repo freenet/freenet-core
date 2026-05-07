@@ -44,6 +44,72 @@ use crate::tracing::NetEventLog;
 
 use super::{ConnectMsg, ConnectOp};
 
+// ─── Relay CONNECT scaffolding (#1454 phase 2c slice 1, commit 1) ───
+//
+// Counters and RAII guard for the upcoming `start_relay_connect`
+// driver. Unused by this commit; the driver body and dispatch site
+// land in slice 1 commit 2. Defined now so the counter symbols are
+// stable across commits and the scaffolding lands as a single
+// reviewable unit before the larger semantic change.
+
+/// Test-only counter incremented every time a relay-CONNECT driver is
+/// spawned. Used by test_relay_driver_calls_per_op-style guards to
+/// confirm the dispatch site actually routed a fresh inbound Request
+/// through the task-per-tx driver vs. the legacy
+/// `handle_op_request` path.
+#[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
+pub static RELAY_CONNECT_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of relay-CONNECT driver tasks currently executing.
+/// Incremented on spawn, decremented on completion.
+#[allow(dead_code)]
+pub static RELAY_CONNECT_INFLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Lifetime count of relay-CONNECT driver spawns. Paired with
+/// `RELAY_CONNECT_COMPLETED_TOTAL`.
+#[allow(dead_code)]
+pub static RELAY_CONNECT_SPAWNED_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Lifetime count of relay-CONNECT driver completions.
+#[allow(dead_code)]
+pub static RELAY_CONNECT_COMPLETED_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Lifetime count of relay-CONNECT spawns rejected by the dedup gate
+/// because a driver for the same `incoming_tx` was already active on
+/// this node.
+#[allow(dead_code)]
+pub static RELAY_CONNECT_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard that decrements `RELAY_CONNECT_INFLIGHT`, bumps
+/// `RELAY_CONNECT_COMPLETED_TOTAL`, and removes the driver's
+/// `incoming_tx` from `active_relay_connect_txs` on drop. Mirrors
+/// `RelaySubscribeInflightGuard` / `RelayInflightGuard` patterns for
+/// the other relay drivers.
+///
+/// Defined now (slice 1 commit 1) so the lifecycle is locked even
+/// before `start_relay_connect` lands in commit 2.
+#[allow(dead_code)]
+pub(crate) struct RelayConnectInflightGuard {
+    pub(crate) op_manager: std::sync::Arc<OpManager>,
+    pub(crate) incoming_tx: Transaction,
+}
+
+impl Drop for RelayConnectInflightGuard {
+    fn drop(&mut self) {
+        self.op_manager
+            .active_relay_connect_txs
+            .remove(&self.incoming_tx);
+        RELAY_CONNECT_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        RELAY_CONNECT_COMPLETED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Drive a client-initiated CONNECT to completion.
 ///
 /// Replaces the legacy `send_gateway_connect` + `process_message`
