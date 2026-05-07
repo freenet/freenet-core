@@ -205,15 +205,7 @@ async fn drive_client_connect_inner(
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
 
     loop {
-        // Honour the transaction's own TTL (Transaction::timed_out — same
-        // bound the legacy GC path used at op_state_manager.rs:688). The
-        // driver does not push state into `ops.connect`, so the legacy
-        // GC sweep never sees this tx; without an internal exit on
-        // tx_timed_out, an originator with `target_connections` larger
-        // than the reachable network would block its task forever and
-        // its `pending_op_results` slot would only be reclaimed by the
-        // 60s sweep.
-        if tx.timed_out() {
+        if should_exit_for_ttl(&tx) {
             tracing::debug!(
                 %tx,
                 accepted = accepted.len(),
@@ -298,6 +290,17 @@ async fn drive_client_connect_inner(
                             elapsed_ms = tx.elapsed().as_millis(),
                             "connect driver: joined peer"
                         );
+                        // `record_acceptor_outcome` accepts a
+                        // `tokio::time::Instant` because the
+                        // `ConnectionManager` stores acceptor stats as
+                        // tokio Instants throughout (see
+                        // `connection_manager.rs:28` use). Tokio's
+                        // `start_paused(true)` runtime (used by the
+                        // simulation harness) keeps tokio time
+                        // deterministic, so this is DST-safe. Routing
+                        // this through `TimeSource` would require
+                        // changing `ConnectionManager`'s public API —
+                        // out of scope for this slice.
                         let now = tokio::time::Instant::now();
                         op_manager.ring.connection_manager.record_acceptor_outcome(
                             acceptor_addr,
@@ -461,11 +464,26 @@ fn compute_reply_capacity(target_connections: usize) -> usize {
     target_connections.saturating_mul(2).max(2)
 }
 
+/// Decide whether the driver loop should exit because the transaction
+/// has exceeded its TTL.
+///
+/// Mirrors the legacy GC path at `op_state_manager.rs:688`
+/// (`Transaction::timed_out()` check). The driver does not push state
+/// into `ops.connect`, so the legacy GC sweep never sees this tx;
+/// without an internal exit on TTL, an originator with
+/// `target_connections` larger than the reachable network would block
+/// its task forever, leaking its `pending_op_results` slot until the
+/// 60s sweep. Extracted as a free function so the predicate can be
+/// regression-tested without standing up a full `OpManager`.
+fn should_exit_for_ttl(tx: &Transaction) -> bool {
+    tx.timed_out()
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::compute_reply_capacity;
+    use super::{compute_reply_capacity, should_exit_for_ttl};
     use crate::message::Transaction;
     use crate::operations::connect::ConnectMsg;
 
@@ -496,6 +514,37 @@ mod tests {
     /// failure branch) sent the *acceptor* addr; if a future refactor
     /// flipped this to `gateway_addr`, the gateway would treat itself
     /// as the failed peer and refuse to re-route.
+    /// Regression guard for the `tx.timed_out()` exit at the top of
+    /// `drive_client_connect_inner`'s loop. Before this fix, an
+    /// originator with `target_connections` larger than the reachable
+    /// network would block on `receiver.recv()` forever, never
+    /// declaring CONNECT complete and never running the cleanup that
+    /// `release_pending_op_slot` covers. Symptom in CI:
+    /// `test_get_routing_coverage_low_htl` failure — joiners never
+    /// reset jitter / `gateway_backoff.record_success` /
+    /// `record_connection_success`, breaking downstream GET routing.
+    ///
+    /// `Transaction::ttl_transaction()` produces a transaction whose
+    /// timestamp is already at the TTL cutoff, so `timed_out()` is
+    /// true on first inspection — same condition the loop checks.
+    #[test]
+    fn should_exit_for_ttl_returns_true_for_expired_tx() {
+        let expired = Transaction::ttl_transaction();
+        assert!(
+            should_exit_for_ttl(&expired),
+            "TTL-expired tx must trigger driver exit"
+        );
+    }
+
+    #[test]
+    fn should_exit_for_ttl_returns_false_for_fresh_tx() {
+        let fresh = Transaction::new::<ConnectMsg>();
+        assert!(
+            !should_exit_for_ttl(&fresh),
+            "fresh tx must NOT trigger driver exit on first iteration"
+        );
+    }
+
     #[test]
     fn connect_failed_carries_acceptor_addr_not_gateway() {
         let acceptor_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)), 50001);
