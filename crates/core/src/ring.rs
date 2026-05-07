@@ -2250,7 +2250,9 @@ impl Ring {
                         "Zero connections — attempting gateway bootstrap"
                     );
                     for gw in eligible.iter().take(BASE_CONCURRENT_CONNECTIONS) {
-                        match crate::operations::connect::join_ring_request(gw, &op_manager).await {
+                        match crate::operations::connect::join_ring_request(gw, &op_manager, None)
+                            .await
+                        {
                             Ok(()) => tracing::debug!(gateway = %gw, "Gateway bootstrap initiated"),
                             Err(e) => {
                                 tracing::warn!(gateway = %gw, error = %e, "Gateway bootstrap failed")

@@ -684,7 +684,6 @@ pub(crate) enum NodeEvent {
     /// the multi-reply receiver. This event delivers the message via
     /// `ConnEvent::OutboundMessageWithTarget` without touching
     /// `pending_op_results`.
-    #[allow(dead_code)] // Wired by #1454 phase 2c slice 2 (CONNECT originator driver).
     SendNetMessage {
         target: SocketAddr,
         msg: Box<NetMessage>,

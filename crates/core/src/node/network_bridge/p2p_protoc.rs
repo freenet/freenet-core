@@ -3870,11 +3870,30 @@ impl P2pConnManager {
     ) -> EventResult {
         match msg {
             Some((callback, msg, target_addr)) => {
-                state.pending_op_results.insert(*msg.id(), callback);
-                crate::config::GlobalTestMetrics::record_pending_op_insert();
-                crate::config::GlobalTestMetrics::record_pending_op_size(
-                    state.pending_op_results.len() as u64,
-                );
+                // The driver task may have been cancelled between
+                // `op_execution_sender.send()` and our processing of the
+                // event — e.g. simulation teardown drops driver futures.
+                // When the response receiver is dropped before we reach
+                // here, the callback sender is closed; inserting it
+                // would leak `pending_op_results` until the 60s sweep,
+                // detectable as imbalance in #3100's regression guard
+                // `test_pending_op_results_bounded`. Skipping the
+                // insert keeps the HashMap bounded; the outbound
+                // request below still dispatches because the receiving
+                // peer's view of the operation is independent of the
+                // local driver's lifecycle.
+                if callback.is_closed() {
+                    tracing::debug!(
+                        tx = %msg.id(),
+                        "handle_op_execution: callback already closed (driver cancelled before insert); skipping"
+                    );
+                } else {
+                    state.pending_op_results.insert(*msg.id(), callback);
+                    crate::config::GlobalTestMetrics::record_pending_op_insert();
+                    crate::config::GlobalTestMetrics::record_pending_op_size(
+                        state.pending_op_results.len() as u64,
+                    );
+                }
                 // When the driver supplied an explicit target, dispatch the
                 // message to that peer over the network instead of looping it
                 // back as a local InboundMessage. The reply still flows back
@@ -4128,7 +4147,6 @@ impl P2pConnManager {
     /// `NetMessage`. Introduced for #1454 phase 2c (CONNECT originator
     /// task-per-tx driver) so the joiner can emit `ConnectFailed` upstream
     /// without disturbing its own multi-reply receiver slot.
-    #[allow(dead_code)] // Reachable only via NodeEvent::SendNetMessage which is dormant until slice 2.
     async fn handle_send_net_message(
         &mut self,
         target: SocketAddr,

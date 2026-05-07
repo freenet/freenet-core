@@ -858,6 +858,44 @@ fn try_forward_task_per_tx_reply(
     true
 }
 
+/// Mirror the legacy joiner-side fill at `connect.rs:1723-1745`: an
+/// acceptor behind NAT does not know its own external address, so when
+/// a `ConnectMsg::Response` arrives with `acceptor.peer_addr =
+/// Unknown`, the inbound transport's `source_addr` is used to backstop
+/// the missing address before the driver reads it. The task-per-tx
+/// driver does not see `source_addr`, so the rewrite must happen at
+/// the bypass site.
+///
+/// Non-`Response` variants pass through unchanged. `Response` with an
+/// already-`Known` acceptor address passes through unchanged.
+fn fill_connect_response_acceptor_addr(
+    op: connect::ConnectMsg,
+    source_addr: Option<std::net::SocketAddr>,
+) -> connect::ConnectMsg {
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match op {
+        connect::ConnectMsg::Response { id, mut payload } => {
+            if payload.acceptor.peer_addr.is_unknown() {
+                if let Some(addr) = source_addr {
+                    payload.acceptor.peer_addr = crate::ring::PeerAddr::Known(addr);
+                    tracing::debug!(
+                        acceptor_pub_key = %payload.acceptor.pub_key(),
+                        acceptor_addr = %addr,
+                        "connect bypass: filled acceptor address from source_addr"
+                    );
+                } else {
+                    tracing::warn!(
+                        acceptor_pub_key = %payload.acceptor.pub_key(),
+                        "connect bypass: response received without source_addr, cannot fill acceptor address"
+                    );
+                }
+            }
+            connect::ConnectMsg::Response { id, payload }
+        }
+        other => other,
+    }
+}
+
 /// If `op_result` indicates the operation completed and a `pending_op_result`
 /// callback is wired, forward `reply` to the awaiting caller of
 /// [`crate::operations::OpCtx::send_and_await`].
@@ -976,12 +1014,15 @@ where
                 if matches!(
                     op,
                     connect::ConnectMsg::Response { .. } | connect::ConnectMsg::Rejected { .. }
-                ) && try_forward_task_per_tx_reply(
-                    pending_op_result.as_ref(),
-                    NetMessage::V1(NetMessageV1::Connect((*op).clone())),
-                    "connect",
                 ) {
-                    return Ok(None);
+                    let forwarded_op = fill_connect_response_acceptor_addr(op.clone(), source_addr);
+                    if try_forward_task_per_tx_reply(
+                        pending_op_result.as_ref(),
+                        NetMessage::V1(NetMessageV1::Connect(forwarded_op)),
+                        "connect",
+                    ) {
+                        return Ok(None);
+                    }
                 }
 
                 let parent_span = tracing::Span::current();
@@ -2616,7 +2657,7 @@ async fn handle_aborted_op(
                         }
 
                         tracing::debug!("Retrying connection to gateway {}", gateway);
-                        connect::join_ring_request(&gateway, op_manager).await?;
+                        connect::join_ring_request(&gateway, op_manager, None).await?;
                     }
                 }
                 Ok(Some(OpEnum::Connect(op))) => {
@@ -2630,7 +2671,7 @@ async fn handle_aborted_op(
                     if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                         tracing::warn!("Retrying joining the ring with an other gateway");
                         if let Some(gateway) = gateways.iter().shuffle().next() {
-                            connect::join_ring_request(gateway, op_manager).await?
+                            connect::join_ring_request(gateway, op_manager, None).await?
                         }
                     }
                 }
@@ -4277,6 +4318,131 @@ mod tests {
                 "SUBSCRIBE dispatch must NOT destructure ForwardingAck variant \
                  for relay driver — fire-and-forget ack stays on legacy."
             );
+        }
+    }
+
+    /// Tests for `fill_connect_response_acceptor_addr` (#1454 phase 2c
+    /// slice 2 review M1). Mirrors the legacy joiner-side fill at
+    /// `connect.rs:1723-1745`. The driver does not see `source_addr`,
+    /// so the bypass must rewrite the payload before forwarding.
+    mod fill_connect_response_acceptor_addr_tests {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use super::super::fill_connect_response_acceptor_addr;
+        use crate::message::Transaction;
+        use crate::operations::connect::{ConnectMsg, ConnectResponse};
+        use crate::ring::{PeerAddr, PeerKeyLocation};
+
+        fn dummy_unknown_pkl() -> PeerKeyLocation {
+            let pkl = PeerKeyLocation::random();
+            PeerKeyLocation {
+                pub_key: pkl.pub_key,
+                peer_addr: PeerAddr::Unknown,
+            }
+        }
+
+        fn known_addr() -> SocketAddr {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), 50051)
+        }
+
+        #[test]
+        fn fills_unknown_acceptor_addr_from_source_addr() {
+            let id = Transaction::new::<ConnectMsg>();
+            let payload = ConnectResponse {
+                acceptor: dummy_unknown_pkl(),
+            };
+            let msg = ConnectMsg::Response { id, payload };
+
+            let source = known_addr();
+            let filled = fill_connect_response_acceptor_addr(msg, Some(source));
+
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match filled {
+                ConnectMsg::Response { payload, .. } => {
+                    assert_eq!(payload.acceptor.socket_addr(), Some(source));
+                }
+                other => panic!("expected Response, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn leaves_known_acceptor_addr_unchanged() {
+            let id = Transaction::new::<ConnectMsg>();
+            let original_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 12345);
+            let pkl = PeerKeyLocation::random();
+            let payload = ConnectResponse {
+                acceptor: PeerKeyLocation {
+                    pub_key: pkl.pub_key,
+                    peer_addr: PeerAddr::Known(original_addr),
+                },
+            };
+            let msg = ConnectMsg::Response { id, payload };
+
+            let filled = fill_connect_response_acceptor_addr(msg, Some(known_addr()));
+
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match filled {
+                ConnectMsg::Response { payload, .. } => {
+                    assert_eq!(
+                        payload.acceptor.socket_addr(),
+                        Some(original_addr),
+                        "fill must NOT overwrite a known acceptor address"
+                    );
+                }
+                other => panic!("expected Response, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn unknown_acceptor_without_source_addr_passes_through() {
+            // No source_addr available (e.g. inbound delivery dropped it).
+            // The helper must not panic; the unknown address survives so
+            // the driver's downstream `socket_addr()` check logs+drops.
+            let id = Transaction::new::<ConnectMsg>();
+            let payload = ConnectResponse {
+                acceptor: dummy_unknown_pkl(),
+            };
+            let msg = ConnectMsg::Response { id, payload };
+
+            let filled = fill_connect_response_acceptor_addr(msg, None);
+
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match filled {
+                ConnectMsg::Response { payload, .. } => {
+                    assert!(
+                        payload.acceptor.peer_addr.is_unknown(),
+                        "fill must remain Unknown when source_addr is None"
+                    );
+                }
+                other => panic!("expected Response, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn rejected_variant_passes_through_untouched() {
+            // The bypass forwards both Response and Rejected; only Response
+            // carries an acceptor. The helper must leave Rejected alone.
+            use crate::ring::Location;
+            let id = Transaction::new::<ConnectMsg>();
+            let dl = Location::new(0.42);
+            let msg = ConnectMsg::Rejected {
+                id,
+                desired_location: dl,
+            };
+
+            let filled = fill_connect_response_acceptor_addr(msg, Some(known_addr()));
+
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match filled {
+                ConnectMsg::Rejected {
+                    id: rid,
+                    desired_location,
+                } => {
+                    assert_eq!(rid, id);
+                    assert_eq!(desired_location, dl);
+                }
+                other => panic!("expected Rejected, got {other:?}"),
+            }
         }
     }
 }

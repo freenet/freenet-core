@@ -118,6 +118,8 @@ use freenet_stdlib::client_api::HostResponse;
 
 use super::VisitedPeers;
 
+pub(crate) mod op_ctx_task;
+
 const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 const RECENCY_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -2444,6 +2446,7 @@ async fn dispatch_expect_connection_from(
 pub(crate) async fn join_ring_request(
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
+    overall_timeout: Option<std::time::Duration>,
 ) -> Result<(), OpError> {
     use crate::node::ConnectionError;
     let gateway_location = gateway.location().ok_or_else(|| {
@@ -2554,7 +2557,15 @@ pub(crate) async fn join_ring_request(
         // Bootstrap mode: target own location with jitter after failures.
         apply_bootstrap_jitter(base_location)
     };
-    send_gateway_connect(gateway, gateway_addr, op_manager, own, desired_location).await
+    op_ctx_task::start_client_connect(
+        gateway.clone(),
+        gateway_addr,
+        op_manager,
+        own,
+        desired_location,
+        overall_timeout,
+    )
+    .await
 }
 
 /// Resolve the socket address of a gateway selected for a version probe.
@@ -2588,83 +2599,15 @@ pub(crate) async fn gateway_version_probe(
     let own = op_manager.ring.connection_manager.own_location();
     let desired_location = own.location().unwrap_or_else(Location::random);
 
-    send_gateway_connect(gateway, gateway_addr, op_manager, own, desired_location).await
-}
-
-/// Shared CONNECT initiation: build operation, emit telemetry, send via `notify_op_change`.
-/// On failure, cleans up in-transit reservations so subsequent attempts are not blocked.
-async fn send_gateway_connect(
-    gateway: &PeerKeyLocation,
-    gateway_addr: std::net::SocketAddr,
-    op_manager: &OpManager,
-    own: PeerKeyLocation,
-    desired_location: Location,
-) -> Result<(), OpError> {
-    let ttl = op_manager
-        .ring
-        .max_hops_to_live
-        .max(1)
-        .min(u8::MAX as usize) as u8;
-    let target_connections = op_manager.ring.connection_manager.min_connections;
-
-    let failed_addrs = op_manager.ring.connection_manager.recently_failed_addrs();
-    let connected_addrs = op_manager.ring.connection_manager.connected_peer_addrs();
-    tracing::debug!(
-        failed = failed_addrs.len(),
-        connected = connected_addrs.len(),
-        "pre-populating bloom filter with excluded peer addresses"
-    );
-    let mut exclude_addrs = failed_addrs;
-    exclude_addrs.extend(connected_addrs);
-
-    let (tx, mut op, msg) = ConnectOp::initiate_join_request(
-        own.clone(),
+    op_ctx_task::start_client_connect(
         gateway.clone(),
-        desired_location,
-        ttl,
-        target_connections,
-        op_manager.connect_forward_estimator.clone(),
-        &exclude_addrs,
-    );
-
-    if let Some(event) = NetEventLog::connect_request_sent(
-        &tx,
-        &op_manager.ring,
-        desired_location,
+        gateway_addr,
+        op_manager,
         own,
-        gateway.clone(),
-        ttl,
-        true, // is_initial
-    ) {
-        op_manager.ring.register_events(Either::Left(event)).await;
-    }
-
-    op.first_hop = Some(Box::new(gateway.clone()));
-
-    tracing::debug!(
-        gateway = %gateway.pub_key(),
-        tx = %tx,
-        target_connections,
-        ttl,
-        "Initiating gateway connect"
-    );
-
-    if let Err(e) = op_manager
-        .notify_op_change(
-            NetMessage::V1(NetMessageV1::Connect(msg)),
-            OpEnum::Connect(Box::new(op)),
-        )
-        .await
-    {
-        // Clean up the reservation so subsequent attempts are not blocked (#3244).
-        op_manager
-            .ring
-            .connection_manager
-            .prune_in_transit_connection(gateway_addr);
-        return Err(e);
-    }
-
-    Ok(())
+        desired_location,
+        None,
+    )
+    .await
 }
 
 /// When a gateway is in backoff but the node already has ring connections,
@@ -2752,27 +2695,26 @@ pub(crate) async fn initial_join_procedure(
                         let op_mgr = op_manager.clone();
                         let peer = peer.clone();
                         GlobalExecutor::spawn(async move {
-                            match tokio::time::timeout(
-                                CACHED_PEER_TIMEOUT,
-                                join_ring_request(&peer, &op_mgr),
-                            )
-                            .await
+                            // Pass timeout into the driver instead of
+                            // wrapping in `tokio::time::timeout`. Outer
+                            // wrappers cancel the future mid-flight,
+                            // leaving `pending_op_results` slots until
+                            // the 60s sweep (#3100). The internal
+                            // timeout exits gracefully through the
+                            // normal `release_pending_op_slot` cleanup.
+                            // Driver returns Ok(()) on internal timeout
+                            // — same outcome as the legacy "timed out"
+                            // branch.
+                            match join_ring_request(&peer, &op_mgr, Some(CACHED_PEER_TIMEOUT)).await
                             {
-                                Ok(Ok(())) => {
+                                Ok(()) => {
                                     tracing::info!(peer = %peer, "Reconnected to cached peer");
                                     true
                                 }
-                                Ok(Err(e)) => {
+                                Err(e) => {
                                     tracing::debug!(
                                         peer = %peer, error = %e,
                                         "Cached peer reconnection failed"
-                                    );
-                                    false
-                                }
-                                Err(_) => {
-                                    tracing::debug!(
-                                        peer = %peer,
-                                        "Cached peer reconnection timed out"
                                     );
                                     false
                                 }
@@ -2933,7 +2875,7 @@ pub(crate) async fn initial_join_procedure(
                     tracing::info!(%gateway, "Attempting connection to gateway");
                     let op_manager = op_manager.clone();
                     select_all.push(async move {
-                        (join_ring_request(gateway, &op_manager).await, gateway)
+                        (join_ring_request(gateway, &op_manager, None).await, gateway)
                     });
                 }
                 select_all
@@ -2984,7 +2926,10 @@ pub(crate) async fn initial_join_procedure(
                         let gateway = gateway.clone();
                         let op_manager = op_manager.clone();
                         select_all.push(async move {
-                            (join_ring_request(&gateway, &op_manager).await, gateway)
+                            (
+                                join_ring_request(&gateway, &op_manager, None).await,
+                                gateway,
+                            )
                         });
                     }
                     select_all
