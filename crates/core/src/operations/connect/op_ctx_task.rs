@@ -50,6 +50,14 @@ use super::{ConnectMsg, ConnectOp};
 /// joiner state machine for the originator. Returns when the joiner
 /// has accumulated `target_connections` accepted peers, the gateway
 /// rejects, or the bypass receiver closes.
+///
+/// `gateway_addr` is the first-hop target — for client-initiated
+/// CONNECT, the gateway is always the first hop. The driver uses
+/// `gateway_addr` as both the initial Request destination and the
+/// upstream target for `ConnectFailed` re-route signalling. If a
+/// future caller introduces a non-gateway first hop, split this
+/// parameter into `first_hop_addr` and `gateway_addr` (legacy
+/// `get_next_hop_addr()` returned the first hop, not the gateway).
 pub(crate) async fn start_client_connect(
     gateway: PeerKeyLocation,
     gateway_addr: SocketAddr,
@@ -57,6 +65,13 @@ pub(crate) async fn start_client_connect(
     own: PeerKeyLocation,
     desired_location: Location,
 ) -> Result<(), OpError> {
+    // Snapshot whether the joiner knows its own external address before
+    // contacting the gateway. Mirrors legacy `JoinerState`'s
+    // `started_without_address` field at connect.rs:1162. Used at the
+    // completion debug-assert below to catch transport-layer regressions
+    // where `ObservedAddress` is never delivered (e.g. if the transport
+    // prematurely fills in the joiner's address, preventing emission).
+    let started_without_address = op_manager.ring.connection_manager.get_own_addr().is_none();
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -79,6 +94,7 @@ pub(crate) async fn start_client_connect(
     // driver owns state in task locals). Drop it. Future cleanup: split
     // the bloom-filter / Request-message construction off into a free
     // helper so the legacy ConnectOp allocation is avoided entirely.
+    // Tracked for follow-up — addressed alongside Phase 6 cleanup.
     let (tx, _legacy_op, request_msg) = ConnectOp::initiate_join_request(
         own.clone(),
         gateway.clone(),
@@ -110,10 +126,7 @@ pub(crate) async fn start_client_connect(
     );
 
     let mut ctx = op_manager.op_ctx(tx);
-    // capacity = target_connections * 2 (room for one response + one
-    // rejection per slot). Bypass uses try_send; over-capacity drops
-    // additional replies with an error log.
-    let capacity = target_connections.saturating_mul(2).max(2);
+    let capacity = compute_reply_capacity(target_connections);
     let receiver = match ctx
         .send_to_and_collect_replies(
             gateway_addr,
@@ -124,7 +137,10 @@ pub(crate) async fn start_client_connect(
     {
         Ok(rx) => rx,
         Err(e) => {
-            // Mirror legacy cleanup at send_gateway_connect:2659-2664
+            // Mirror legacy cleanup at send_gateway_connect:2659-2664.
+            // Slot was never inserted into pending_op_results on this
+            // failure path (send_to_and_collect_replies fails before
+            // insertion), so release_pending_op_slot is unnecessary.
             op_manager
                 .ring
                 .connection_manager
@@ -139,6 +155,7 @@ pub(crate) async fn start_client_connect(
         gateway_addr,
         desired_location,
         target_connections,
+        started_without_address,
         receiver,
         op_manager,
     )
@@ -150,12 +167,14 @@ pub(crate) async fn start_client_connect(
 
 /// Inner driver loop. Drains `receiver` until `target_connections`
 /// acceptances accumulate or a fatal Rejected arrives.
+#[allow(clippy::too_many_arguments)]
 async fn drive_client_connect_inner(
     tx: Transaction,
     gateway: PeerKeyLocation,
     gateway_addr: SocketAddr,
     desired_location: Location,
     target_connections: usize,
+    started_without_address: bool,
     mut receiver: mpsc::Receiver<NetMessage>,
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
@@ -264,6 +283,13 @@ async fn drive_client_connect_inner(
                         gateway = %gateway_addr,
                         "connect driver: sending ConnectFailed to gateway for re-routing"
                     );
+                    // Legacy `network_bridge.send().await?` on this path
+                    // would unwind the whole Response handler. The driver
+                    // logs and continues instead so other in-flight
+                    // replies still drain — the upstream re-route path is
+                    // best-effort regardless. If the event loop is wedged
+                    // the channel.recv() below also returns None and the
+                    // driver exits benignly.
                     if let Err(e) = op_manager
                         .notify_node_event(NodeEvent::SendNetMessage {
                             target: gateway_addr,
@@ -281,6 +307,19 @@ async fn drive_client_connect_inner(
                 }
 
                 if accepted.len() >= target_connections {
+                    // INVARIANT (mirrors legacy JoinerState::register_acceptance
+                    // at connect.rs:1352-1359): if the joiner started without
+                    // knowing its external address, ObservedAddress must have
+                    // landed by the time CONNECT completes. Catches transport-
+                    // layer regressions where ObservedAddress is never emitted
+                    // (e.g. transport prematurely fills the joiner's address).
+                    debug_assert!(
+                        !started_without_address
+                            || op_manager.ring.connection_manager.get_own_addr().is_some(),
+                        "BUG: Connect completed but joiner never received ObservedAddress. \
+                         This indicates the transport layer may have prematurely filled in \
+                         the joiner's address, preventing ObservedAddress emission."
+                    );
                     op_manager
                         .ring
                         .connection_manager
@@ -350,4 +389,79 @@ async fn drive_client_connect_inner(
         "connect driver: receiver closed"
     );
     Ok(())
+}
+
+/// Capacity for the multi-reply receiver registered with the bypass.
+/// `target_connections * 2` provides headroom for one Response and one
+/// Rejected per acceptor slot. Bounded below by 2 so the channel can
+/// always buffer at least one reply when `target_connections` is 0
+/// (defensive — production never sets it to 0 but
+/// `mpsc::channel(0)` panics).
+///
+/// Bypass uses `try_send`; over-capacity replies drop with an error
+/// log. Sequential hole-punch (seconds per acceptor) means worst-case
+/// burst is bounded by simultaneously-arriving relay-branch replies,
+/// which `2x` covers for normal min_connections values. A flood of
+/// rejects beyond `2x` would drop legitimate replies — flagged as
+/// follow-up but acceptable here because the driver re-issues nothing.
+fn compute_reply_capacity(target_connections: usize) -> usize {
+    target_connections.saturating_mul(2).max(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::compute_reply_capacity;
+    use crate::message::Transaction;
+    use crate::operations::connect::ConnectMsg;
+
+    #[test]
+    fn compute_reply_capacity_floor_is_two() {
+        assert_eq!(compute_reply_capacity(0), 2, "0 must clamp to 2");
+        assert_eq!(compute_reply_capacity(1), 2, "1*2 == 2");
+    }
+
+    #[test]
+    fn compute_reply_capacity_doubles_target() {
+        assert_eq!(compute_reply_capacity(5), 10);
+        assert_eq!(compute_reply_capacity(10), 20);
+    }
+
+    #[test]
+    fn compute_reply_capacity_saturates_on_overflow() {
+        // Defensive: `usize::MAX * 2` saturates instead of wrapping.
+        assert_eq!(compute_reply_capacity(usize::MAX), usize::MAX);
+    }
+
+    /// `ConnectFailed` is constructed inline by the driver on hole-punch
+    /// failure and emitted via `NodeEvent::SendNetMessage`. The variant
+    /// must carry the failed acceptor's address (not the gateway's), so
+    /// the upstream gateway can route the re-attempt away from that
+    /// specific peer. Regression guard: legacy joiner-side handler at
+    /// `connect.rs::process_message::ConnectMsg::Response` (hole-punch
+    /// failure branch) sent the *acceptor* addr; if a future refactor
+    /// flipped this to `gateway_addr`, the gateway would treat itself
+    /// as the failed peer and refuse to re-route.
+    #[test]
+    fn connect_failed_carries_acceptor_addr_not_gateway() {
+        let acceptor_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)), 50001);
+        let id = Transaction::new::<ConnectMsg>();
+
+        let failed = ConnectMsg::ConnectFailed {
+            id,
+            failed_acceptor_addr: acceptor_addr,
+        };
+
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match failed {
+            ConnectMsg::ConnectFailed {
+                failed_acceptor_addr,
+                ..
+            } => {
+                assert_eq!(failed_acceptor_addr, acceptor_addr);
+            }
+            other => panic!("expected ConnectFailed, got {other:?}"),
+        }
+    }
 }
