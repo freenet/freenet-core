@@ -449,7 +449,7 @@ impl ConnectForwardEstimator {
         }
     }
 
-    fn record(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
+    pub(super) fn record(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
         if peer.location().is_none() {
             return;
         }
@@ -2379,7 +2379,7 @@ fn ring_distance(a: Option<Location>, b: Option<Location>) -> Option<f64> {
 /// call leaves the joiner stuck in `transient_connections` on the acceptor,
 /// so downstream lookups like `get_peer_by_addr` (used by subscribe interest
 /// registration, broadcast fan-out, etc.) never find the peer.
-async fn dispatch_expect_connection_from(
+pub(super) async fn dispatch_expect_connection_from(
     op_manager: &OpManager,
     tx: Transaction,
     peer: PeerKeyLocation,
