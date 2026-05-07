@@ -204,7 +204,38 @@ async fn drive_client_connect_inner(
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
 
-    while let Some(msg) = receiver.recv().await {
+    loop {
+        // Honour the transaction's own TTL (Transaction::timed_out — same
+        // bound the legacy GC path used at op_state_manager.rs:688). The
+        // driver does not push state into `ops.connect`, so the legacy
+        // GC sweep never sees this tx; without an internal exit on
+        // tx_timed_out, an originator with `target_connections` larger
+        // than the reachable network would block its task forever and
+        // its `pending_op_results` slot would only be reclaimed by the
+        // 60s sweep.
+        if tx.timed_out() {
+            tracing::debug!(
+                %tx,
+                accepted = accepted.len(),
+                target_connections,
+                "connect driver: transaction timed out; exiting"
+            );
+            return Ok(());
+        }
+
+        // Poll the receiver with a periodic timeout so the loop can
+        // re-evaluate `tx.timed_out()` even when no replies are
+        // arriving. Without this the driver would hang on `recv` for
+        // indefinitely-long periods after the gateway has stopped
+        // sending Responses (e.g. when target_connections exceeds the
+        // reachable network).
+        const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        let msg = match tokio::time::timeout(RECV_POLL_INTERVAL, receiver.recv()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+
         let connect_msg = match msg {
             NetMessage::V1(NetMessageV1::Connect(c)) => c,
             other => {
