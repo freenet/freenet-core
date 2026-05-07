@@ -3617,4 +3617,75 @@ mod tests {
         assert!(matches!(not_found, super::SubOpGetOutcome::NotFound(_)));
         assert!(matches!(infra, super::SubOpGetOutcome::Infra(_)));
     }
+
+    /// Pin: each transport-level failure arm of `drive_relay_get_inner`
+    /// records a routing event for the failing peer. Without these
+    /// hooks, the per-peer dashboard's failure-probability model is
+    /// trained only on originated ops and the symptom this PR fixes
+    /// reappears for the relay path. Source-scrape because the
+    /// behaviour is positional inside the retry loop and a deletion
+    /// would not break any unit-test assertion otherwise.
+    #[test]
+    fn drive_relay_get_inner_records_route_events_on_transport_failure() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+
+        // The send_to_and_await error arm and the timeout arm must
+        // record `Failure` for the chosen peer. Identify each by its
+        // log-message phrase, then check the arm's body up to the
+        // `continue` for the helper call.
+        for log_phrase in [
+            "send_to_and_await failed; advancing to next peer",
+            "attempt timed out; advancing to next peer",
+        ] {
+            let pos = body.unwrap_or_default_pos(log_phrase);
+            let after = &body[pos..pos + 1500.min(body.len() - pos)];
+            assert!(
+                after.contains("record_relay_route_event")
+                    && after.contains("RouteOutcome::Failure"),
+                "drive_relay_get_inner arm for `{log_phrase}` must call \
+                 record_relay_route_event with RouteOutcome::Failure. \
+                 Without this, transport failures from relay-forwarded \
+                 GETs are dropped and the per-peer failure-probability \
+                 model regresses to the originator-only state that \
+                 motivated PR #4051."
+            );
+        }
+
+        // The InlineFound success arm must record SuccessUntimed.
+        let pos = body.unwrap_or_default_pos("downstream returned Found");
+        let after = &body[pos..pos + 1500.min(body.len() - pos)];
+        assert!(
+            after.contains("record_relay_route_event")
+                && after.contains("RouteOutcome::SuccessUntimed"),
+            "drive_relay_get_inner InlineFound arm must call \
+             record_relay_route_event with RouteOutcome::SuccessUntimed."
+        );
+
+        // The Retry/NotFound arm must record SuccessUntimed too — see
+        // the outcome-attribution rationale in operations.rs::record_relay_route_event
+        // rustdoc. A peer answering NotFound has not failed.
+        let pos = body.unwrap_or_default_pos("downstream returned NotFound; advancing");
+        let after = &body[pos..pos + 1500.min(body.len() - pos)];
+        assert!(
+            after.contains("record_relay_route_event")
+                && after.contains("RouteOutcome::SuccessUntimed"),
+            "drive_relay_get_inner Retry (NotFound) arm must call \
+             record_relay_route_event with RouteOutcome::SuccessUntimed \
+             (NotFound is a correct protocol response, not a routing \
+             failure). Recording it as Failure would systematically \
+             de-prioritise peers that don't host the queried contract."
+        );
+    }
+
+    trait FindOrPanic {
+        fn unwrap_or_default_pos(&self, needle: &str) -> usize;
+    }
+    impl FindOrPanic for str {
+        fn unwrap_or_default_pos(&self, needle: &str) -> usize {
+            self.find(needle).unwrap_or_else(|| {
+                panic!("expected `{needle}` to appear in drive_relay_get_inner body")
+            })
+        }
+    }
 }

@@ -2441,4 +2441,52 @@ mod tests {
              land downstream (otherwise a fast reply races past the waiter)"
         );
     }
+
+    /// Pin: each transport-failure arm of `drive_relay_put` records a
+    /// routing event for the chosen peer. Without these hooks, the
+    /// per-peer dashboard's failure-probability model is trained only
+    /// on originated PUT ops and the symptom this PR fixes reappears
+    /// for the relay path. Source-scrape because the behaviour is
+    /// positional inside the match and a deletion would not break any
+    /// unit-test assertion otherwise.
+    #[test]
+    fn drive_relay_put_records_route_events_on_transport_failure() {
+        let src = include_str!("op_ctx_task.rs");
+        // drive_relay_put body — non-streaming relay.
+        let body_start = src
+            .find("async fn drive_relay_put(")
+            .expect("drive_relay_put fn must exist");
+        let body_end = src[body_start..]
+            .find("/// Store a relayed PUT")
+            .map(|i| body_start + i)
+            .unwrap_or(src.len());
+        let body = &src[body_start..body_end];
+
+        for log_phrase in ["send_to_and_await failed", "downstream timed out"] {
+            let pos = body
+                .find(log_phrase)
+                .unwrap_or_else(|| panic!("expected `{log_phrase}` in drive_relay_put"));
+            let after = &body[pos..pos + 1500.min(body.len() - pos)];
+            assert!(
+                after.contains("record_relay_route_event")
+                    && after.contains("RouteOutcome::Failure"),
+                "drive_relay_put arm for `{log_phrase}` must call \
+                 record_relay_route_event with RouteOutcome::Failure. \
+                 Without this, transport failures from relay-forwarded \
+                 PUTs are dropped — the regression PR #4051 fixes."
+            );
+        }
+
+        // Success arms (Response and ResponseStreaming downgrade) must
+        // record SuccessUntimed.
+        let pos = body
+            .find("downstream returned Response; bubbling upstream")
+            .expect("Response success arm not found");
+        let after = &body[pos..pos + 1500.min(body.len() - pos)];
+        assert!(
+            after.contains("record_relay_route_event")
+                && after.contains("RouteOutcome::SuccessUntimed"),
+            "drive_relay_put Response arm must record SuccessUntimed."
+        );
+    }
 }
