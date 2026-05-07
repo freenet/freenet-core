@@ -97,10 +97,6 @@ pub static RELAY_CONNECT_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
 /// `incoming_tx` from `active_relay_connect_txs` on drop. Mirrors
 /// `RelaySubscribeInflightGuard` / `RelayInflightGuard` patterns for
 /// the other relay drivers.
-///
-/// Defined now (slice 1 commit 1) so the lifecycle is locked even
-/// before `start_relay_connect` lands in commit 2.
-#[allow(dead_code)]
 pub(crate) struct RelayConnectInflightGuard {
     pub(crate) op_manager: std::sync::Arc<OpManager>,
     pub(crate) incoming_tx: Transaction,
