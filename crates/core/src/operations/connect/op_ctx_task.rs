@@ -58,12 +58,20 @@ use super::{ConnectMsg, ConnectOp};
 /// future caller introduces a non-gateway first hop, split this
 /// parameter into `first_hop_addr` and `gateway_addr` (legacy
 /// `get_next_hop_addr()` returned the first hop, not the gateway).
+///
+/// `overall_timeout`, when supplied, bounds the driver's lifetime
+/// internally — exceeding it causes a graceful exit through the
+/// normal `release_pending_op_slot` cleanup. Use this in preference
+/// to wrapping the future in `tokio::time::timeout`, which would
+/// cancel the future mid-flight and leak the
+/// `pending_op_results` slot until the 60s sweep (#3100).
 pub(crate) async fn start_client_connect(
     gateway: PeerKeyLocation,
     gateway_addr: SocketAddr,
     op_manager: &OpManager,
     own: PeerKeyLocation,
     desired_location: Location,
+    overall_timeout: Option<std::time::Duration>,
 ) -> Result<(), OpError> {
     // Snapshot whether the joiner knows its own external address before
     // contacting the gateway. Mirrors legacy `JoinerState`'s
@@ -140,7 +148,7 @@ pub(crate) async fn start_client_connect(
             // Mirror legacy cleanup at send_gateway_connect:2659-2664.
             // Slot was never inserted into pending_op_results on this
             // failure path (send_to_and_collect_replies fails before
-            // insertion), so release_pending_op_slot is unnecessary.
+            // insertion), so no guard needed.
             op_manager
                 .ring
                 .connection_manager
@@ -149,7 +157,7 @@ pub(crate) async fn start_client_connect(
         }
     };
 
-    let outcome = drive_client_connect_inner(
+    let inner = drive_client_connect_inner(
         tx,
         gateway,
         gateway_addr,
@@ -158,8 +166,22 @@ pub(crate) async fn start_client_connect(
         started_without_address,
         receiver,
         op_manager,
-    )
-    .await;
+    );
+
+    let outcome = match overall_timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, inner).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::debug!(
+                    %tx,
+                    timeout_ms = timeout.as_millis(),
+                    "connect driver: overall timeout fired; exiting gracefully"
+                );
+                Ok(())
+            }
+        },
+        None => inner.await,
+    };
 
     op_manager.release_pending_op_slot(tx).await;
     outcome

@@ -2657,7 +2657,7 @@ async fn handle_aborted_op(
                         }
 
                         tracing::debug!("Retrying connection to gateway {}", gateway);
-                        connect::join_ring_request(&gateway, op_manager).await?;
+                        connect::join_ring_request(&gateway, op_manager, None).await?;
                     }
                 }
                 Ok(Some(OpEnum::Connect(op))) => {
@@ -2671,7 +2671,7 @@ async fn handle_aborted_op(
                     if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
                         tracing::warn!("Retrying joining the ring with an other gateway");
                         if let Some(gateway) = gateways.iter().shuffle().next() {
-                            connect::join_ring_request(gateway, op_manager).await?
+                            connect::join_ring_request(gateway, op_manager, None).await?
                         }
                     }
                 }

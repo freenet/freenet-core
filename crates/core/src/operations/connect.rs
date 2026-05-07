@@ -2446,6 +2446,7 @@ async fn dispatch_expect_connection_from(
 pub(crate) async fn join_ring_request(
     gateway: &PeerKeyLocation,
     op_manager: &OpManager,
+    overall_timeout: Option<std::time::Duration>,
 ) -> Result<(), OpError> {
     use crate::node::ConnectionError;
     let gateway_location = gateway.location().ok_or_else(|| {
@@ -2562,6 +2563,7 @@ pub(crate) async fn join_ring_request(
         op_manager,
         own,
         desired_location,
+        overall_timeout,
     )
     .await
 }
@@ -2603,6 +2605,7 @@ pub(crate) async fn gateway_version_probe(
         op_manager,
         own,
         desired_location,
+        None,
     )
     .await
 }
@@ -2692,27 +2695,26 @@ pub(crate) async fn initial_join_procedure(
                         let op_mgr = op_manager.clone();
                         let peer = peer.clone();
                         GlobalExecutor::spawn(async move {
-                            match tokio::time::timeout(
-                                CACHED_PEER_TIMEOUT,
-                                join_ring_request(&peer, &op_mgr),
-                            )
-                            .await
+                            // Pass timeout into the driver instead of
+                            // wrapping in `tokio::time::timeout`. Outer
+                            // wrappers cancel the future mid-flight,
+                            // leaving `pending_op_results` slots until
+                            // the 60s sweep (#3100). The internal
+                            // timeout exits gracefully through the
+                            // normal `release_pending_op_slot` cleanup.
+                            // Driver returns Ok(()) on internal timeout
+                            // — same outcome as the legacy "timed out"
+                            // branch.
+                            match join_ring_request(&peer, &op_mgr, Some(CACHED_PEER_TIMEOUT)).await
                             {
-                                Ok(Ok(())) => {
+                                Ok(()) => {
                                     tracing::info!(peer = %peer, "Reconnected to cached peer");
                                     true
                                 }
-                                Ok(Err(e)) => {
+                                Err(e) => {
                                     tracing::debug!(
                                         peer = %peer, error = %e,
                                         "Cached peer reconnection failed"
-                                    );
-                                    false
-                                }
-                                Err(_) => {
-                                    tracing::debug!(
-                                        peer = %peer,
-                                        "Cached peer reconnection timed out"
                                     );
                                     false
                                 }
@@ -2873,7 +2875,7 @@ pub(crate) async fn initial_join_procedure(
                     tracing::info!(%gateway, "Attempting connection to gateway");
                     let op_manager = op_manager.clone();
                     select_all.push(async move {
-                        (join_ring_request(gateway, &op_manager).await, gateway)
+                        (join_ring_request(gateway, &op_manager, None).await, gateway)
                     });
                 }
                 select_all
@@ -2924,7 +2926,10 @@ pub(crate) async fn initial_join_procedure(
                         let gateway = gateway.clone();
                         let op_manager = op_manager.clone();
                         select_all.push(async move {
-                            (join_ring_request(&gateway, &op_manager).await, gateway)
+                            (
+                                join_ring_request(&gateway, &op_manager, None).await,
+                                gateway,
+                            )
                         });
                     }
                     select_all
