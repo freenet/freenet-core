@@ -577,7 +577,6 @@ fn compute_reply_capacity(target_connections: usize) -> usize {
 // into the per-tx multi-reply receiver registered by
 // `OpCtx::send_to_and_collect_replies`.
 
-#[allow(dead_code)] // Wired by commit 3 (dispatch site).
 const RELAY_RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Spawn a relay driver for a fresh inbound `ConnectMsg::Request`.
@@ -608,7 +607,6 @@ const RELAY_RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// because the in-flight driver will service the original. The
 /// telemetry counter `RELAY_CONNECT_DEDUP_REJECTS` increments so
 /// re-entry storms are visible.
-#[allow(dead_code)] // Wired by commit 3 (dispatch site at node.rs).
 pub(crate) async fn start_relay_connect(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,

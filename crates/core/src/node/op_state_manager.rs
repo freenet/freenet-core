@@ -945,10 +945,6 @@ impl OpManager {
     /// already has a `ConnectOp` from a prior `process_message` call
     /// (existing op → fall through to the legacy `handle_op_request`
     /// path).
-    ///
-    /// `#[allow(dead_code)]` because the dispatch site lands in slice 1
-    /// commit 2; this commit only adds the scaffolding.
-    #[allow(dead_code)]
     pub fn has_connect_op(&self, id: &Transaction) -> bool {
         self.ops.connect.contains_key(id)
     }

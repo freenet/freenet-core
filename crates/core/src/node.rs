@@ -1038,6 +1038,52 @@ where
                     }
                 }
 
+                // Phase 2c slice 1 commit 3 (#1454): relay-CONNECT
+                // task-per-tx dispatch.
+                //
+                // Fresh inbound `ConnectMsg::Request` with a real
+                // upstream address (`source_addr.is_some()`) and no
+                // existing `ConnectOp` (`!has_connect_op(id)`) and no
+                // already-spawned relay driver (`!active_relay_connect_txs
+                // .contains(id)`) spawns `start_relay_connect`. The
+                // driver owns the entire transaction lifetime in
+                // task locals. The negative checks dedup against:
+                //   - GC-spawned retries that pre-register a `ConnectOp`
+                //   - already-running drivers from a duplicate Request
+                //
+                // `source_addr.is_none()` (originator loop-back from
+                // `start_client_connect`'s `send_to_and_collect_replies`)
+                // never reaches this branch — the bypass above handles
+                // joiner-side replies first.
+                //
+                // After commit 4 retires the relay branches of
+                // `connect::process_message`, this dispatch is the only
+                // entry point for relay CONNECT handling.
+                if let connect::ConnectMsg::Request { id, payload } = op {
+                    if let Some(upstream_addr) = source_addr {
+                        if !op_manager.has_connect_op(id)
+                            && !op_manager.active_relay_connect_txs.contains(id)
+                        {
+                            if let Err(err) = connect::op_ctx_task::start_relay_connect(
+                                op_manager.clone(),
+                                *id,
+                                payload.clone(),
+                                upstream_addr,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    %upstream_addr,
+                                    error = %err,
+                                    "CONNECT relay dispatch: start_relay_connect failed"
+                                );
+                            }
+                            return Ok(None);
+                        }
+                    }
+                }
+
                 let parent_span = tracing::Span::current();
                 let span = tracing::info_span!(
                     parent: parent_span,
@@ -4553,6 +4599,80 @@ mod tests {
                  Request is the spawn signal for start_relay_connect; \
                  forwarding it would route fresh Requests into a multi-reply \
                  receiver that doesn't exist yet."
+            );
+        }
+
+        /// Phase 2c slice 1 commit 3: the Connect branch MUST dispatch
+        /// to `start_relay_connect` for fresh inbound Requests.
+        #[test]
+        fn connect_branch_dispatches_start_relay_connect_for_fresh_request() {
+            let window = connect_branch_window();
+            assert!(
+                window.contains("start_relay_connect("),
+                "Connect branch no longer calls start_relay_connect for \
+                 relay dispatch. Slice 1 commit 3 (#1454) wired this; \
+                 removing it strands relay CONNECT on legacy."
+            );
+        }
+
+        /// Relay dispatch must be gated on `source_addr.is_some()` so
+        /// originator loop-back from `start_client_connect` falls
+        /// through to legacy.
+        #[test]
+        fn connect_relay_dispatch_gated_on_source_addr() {
+            let window = connect_branch_window();
+            let dispatch_anchor = "start_relay_connect(";
+            let dispatch_pos = window
+                .find(dispatch_anchor)
+                .expect("start_relay_connect not found in Connect branch");
+            // Look at ~400 chars preceding the dispatch call for the gate.
+            let gate_start = dispatch_pos.saturating_sub(500);
+            let gate_window = &window[gate_start..dispatch_pos];
+            assert!(
+                gate_window.contains("source_addr"),
+                "CONNECT relay dispatch is not gated on source_addr. \
+                 Originator loop-back (source_addr.is_none()) must fall \
+                 through to legacy or the bypass."
+            );
+        }
+
+        /// Relay dispatch must be guarded by `!has_connect_op(id)` so
+        /// that GC-spawned retries with a pre-existing ConnectOp fall
+        /// through to legacy.
+        #[test]
+        fn connect_relay_dispatch_guarded_by_has_connect_op() {
+            let window = connect_branch_window();
+            let dispatch_pos = window
+                .find("start_relay_connect(")
+                .expect("start_relay_connect not found in Connect branch");
+            let gate_start = dispatch_pos.saturating_sub(500);
+            let gate_window = &window[gate_start..dispatch_pos];
+            assert!(
+                gate_window.contains("has_connect_op"),
+                "CONNECT relay dispatch is not guarded by has_connect_op. \
+                 Pre-registered ConnectOps (GC-spawned retries) must fall \
+                 through to legacy handle_op_request."
+            );
+        }
+
+        /// Relay dispatch must also check `!active_relay_connect_txs.contains(id)`
+        /// to avoid re-spawning a driver while a previous one is still running
+        /// (e.g. duplicate Request retransmission while the driver is mid-
+        /// handle_request).
+        #[test]
+        fn connect_relay_dispatch_guarded_by_active_relay_set() {
+            let window = connect_branch_window();
+            let dispatch_pos = window
+                .find("start_relay_connect(")
+                .expect("start_relay_connect not found in Connect branch");
+            let gate_start = dispatch_pos.saturating_sub(500);
+            let gate_window = &window[gate_start..dispatch_pos];
+            assert!(
+                gate_window.contains("active_relay_connect_txs"),
+                "CONNECT relay dispatch is not guarded by \
+                 active_relay_connect_txs.contains(id). Without it, a \
+                 duplicate Request retransmission could spawn a second \
+                 driver before the first inserts into the dedup set."
             );
         }
     }
