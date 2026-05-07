@@ -478,19 +478,44 @@ async fn drive_client_connect_inner(
                 }
                 return Ok(());
             }
-            other @ ConnectMsg::Request { .. }
-            | other @ ConnectMsg::ObservedAddress { .. }
-            | other @ ConnectMsg::ConnectFailed { .. } => {
-                // Driver bypass at node.rs:976-985 forwards only Response
-                // and Rejected variants. Reaching this arm means a future
-                // change to the bypass `matches!` started routing one of
-                // these variants without expanding driver semantics; log
-                // and drop. Specifically:
-                //   Request          — joiner does not receive Requests
-                //   ObservedAddress  — handled by legacy load_or_init
-                //                      stateless side effect
-                //   ConnectFailed    — emitted by this driver, never
-                //                      received by it
+            ConnectMsg::ObservedAddress { address, .. } => {
+                // Phase 2c slice 1 (#1454): the bypass at node.rs forwards
+                // ObservedAddress to the joiner driver inbox. The joiner
+                // doesn't know its external IP behind NAT, so the gateway
+                // observes it from the UDP packet source and ships it back
+                // here. We update both `own_addr` (for diagnostics) and
+                // `own_location` (for routing) — mirrors legacy at
+                // connect.rs:1956-1974. Idempotent: subsequent observations
+                // for the same tx overwrite, which is the legacy semantic.
+                let location = Location::from_address(&address);
+                op_manager.ring.connection_manager.set_own_addr(address);
+                op_manager
+                    .ring
+                    .connection_manager
+                    .update_location(Some(location));
+                tracing::info!(
+                    tx = %tx,
+                    observed_address = %address,
+                    location = %location,
+                    "connect driver: updated own_addr and location from ObservedAddress"
+                );
+            }
+            other @ ConnectMsg::Request { .. } | other @ ConnectMsg::ConnectFailed { .. } => {
+                // Bypass at node.rs forwards Response/Rejected/
+                // ObservedAddress/ConnectFailed. ConnectFailed is
+                // forwarded for the relay driver's inbox — but the
+                // joiner driver also subscribes to the same per-tx
+                // waiter, so it can receive ConnectFailed too. The
+                // joiner emitted ConnectFailed on hole-punch failure
+                // (line 398-427 above) and would not normally receive
+                // its own emission, but a relay could theoretically
+                // bounce it back. Drop with a debug log — joiner-side
+                // semantic is "the originator already learned of the
+                // failure when it emitted the message".
+                //
+                // Request is the spawn signal handled by the dispatch
+                // gate before reaching the bypass forward; reaching
+                // this arm would mean a routing bug.
                 tracing::debug!(
                     tx = %tx,
                     "connect driver: ignoring unexpected variant on bypass: {}",

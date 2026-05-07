@@ -1001,19 +1001,32 @@ where
                 // inbound reply for the same tx will hit this same code
                 // path and forward to the same channel.
                 //
-                // `Rejected` and `ConnectFailed` are also terminal-from-
-                // the-driver's-perspective for legacy fallback paths, but
-                // slice 0 only forwards the success-shaped variants
-                // (`Response`, `Rejected`); `ConnectFailed` flows in the
-                // opposite direction (downstream from the joiner) and
-                // requires a different waiter shape, deferred to slice 1
-                // / slice 2. `ObservedAddress` is a side-channel update
-                // and stays on legacy `process_message` so its own_addr /
-                // own_location updates run through the normal
-                // `load_or_init` short-circuit.
+                // Phase 2c slice 1 (#1454): the bypass forwards every non-
+                // `Request` `ConnectMsg` variant to the per-tx driver inbox
+                // when a waiter is registered. The relay-CONNECT driver
+                // (`operations::connect::op_ctx_task::start_relay_connect`)
+                // owns the entire tx lifetime — Request handling, downstream
+                // forward, and re-entry processing for Response / Rejected /
+                // ObservedAddress / ConnectFailed — in task locals, so all
+                // four reply variants must reach the driver's
+                // `send_to_and_collect_replies` receiver.
+                //
+                // `Request` is NEVER forwarded here: it is the spawn signal
+                // handled by the dispatch gate below (commit 3) which
+                // checks `!has_connect_op(id) && !active_relay_connect_txs
+                // .contains(id)` to avoid spawning duplicate drivers.
+                //
+                // `ObservedAddress` was previously left on the legacy
+                // `load_or_init` stateless side-effect path
+                // (`connect.rs:1473-1490`); the joiner driver now handles
+                // it on its inbox match arm in `op_ctx_task.rs:481-499`,
+                // calling `set_own_addr` + `update_location` itself.
                 if matches!(
                     op,
-                    connect::ConnectMsg::Response { .. } | connect::ConnectMsg::Rejected { .. }
+                    connect::ConnectMsg::Response { .. }
+                        | connect::ConnectMsg::Rejected { .. }
+                        | connect::ConnectMsg::ObservedAddress { .. }
+                        | connect::ConnectMsg::ConnectFailed { .. }
                 ) {
                     let forwarded_op = fill_connect_response_acceptor_addr(op.clone(), source_addr);
                     if try_forward_task_per_tx_reply(
@@ -4443,6 +4456,104 @@ mod tests {
                 }
                 other => panic!("expected Rejected, got {other:?}"),
             }
+        }
+    }
+
+    /// Regression guards for the CONNECT bypass `matches!` predicate
+    /// (#1454 phase 2c slice 1 commit 1). The relay-CONNECT driver
+    /// (`start_relay_connect`, commit 2) owns the entire tx lifetime
+    /// in task locals, so all four non-Request `ConnectMsg` variants
+    /// (Response, Rejected, ObservedAddress, ConnectFailed) must reach
+    /// the per-tx waiter receiver. `Request` is the spawn signal and
+    /// is handled by the dispatch gate, never the bypass forward.
+    mod connect_bypass_coverage_guards {
+        const SOURCE: &str = include_str!("node.rs");
+
+        fn connect_branch_window() -> &'static str {
+            let branch_anchor = "NetMessageV1::Connect(ref op) => {";
+            let branch_start = SOURCE.find(branch_anchor).expect(
+                "Connect branch of handle_pure_network_message_v1 not found; \
+                 the match arm has been renamed or moved — update this guard",
+            );
+
+            let window_end = SOURCE[branch_start..]
+                .find("handle_op_request::<ConnectOp, _>")
+                .expect("Connect branch no longer calls handle_op_request — update guard")
+                + branch_start;
+
+            &SOURCE[branch_start..window_end]
+        }
+
+        #[test]
+        fn connect_branch_bypass_forwards_response() {
+            assert!(
+                connect_branch_window().contains("connect::ConnectMsg::Response { .. }"),
+                "Connect bypass `matches!` no longer forwards Response. \
+                 Response is the joiner-fan-in terminal variant and MUST \
+                 reach the per-tx multi-reply receiver."
+            );
+        }
+
+        #[test]
+        fn connect_branch_bypass_forwards_rejected() {
+            assert!(
+                connect_branch_window().contains("connect::ConnectMsg::Rejected { .. }"),
+                "Connect bypass `matches!` no longer forwards Rejected. \
+                 Relay drivers and the joiner driver both observe Rejected \
+                 to record connection failure / record_connection_failure."
+            );
+        }
+
+        #[test]
+        fn connect_branch_bypass_forwards_observed_address() {
+            assert!(
+                connect_branch_window().contains("connect::ConnectMsg::ObservedAddress { .. }"),
+                "Connect bypass `matches!` no longer forwards ObservedAddress. \
+                 Phase 2c slice 1 (#1454) moved the set_own_addr / \
+                 update_location side effect into the joiner driver inbox; \
+                 dropping ObservedAddress here would prevent NAT-discovery \
+                 from completing."
+            );
+        }
+
+        #[test]
+        fn connect_branch_bypass_forwards_connect_failed() {
+            assert!(
+                connect_branch_window().contains("connect::ConnectMsg::ConnectFailed { .. }"),
+                "Connect bypass `matches!` no longer forwards ConnectFailed. \
+                 Phase 2c slice 1 (#1454) moved hole-punch failure re-route \
+                 into the relay driver inbox; dropping ConnectFailed here \
+                 would strand re-route attempts on legacy `process_message`."
+            );
+        }
+
+        #[test]
+        fn connect_branch_bypass_does_not_forward_request() {
+            // `Request` is the spawn signal handled by the dispatch
+            // gate (commit 3); forwarding it via the bypass would
+            // route fresh Requests into a multi-reply receiver that
+            // doesn't exist yet, dropping them silently.
+            let window = connect_branch_window();
+            // Locate the bypass `matches!` block specifically — the
+            // dispatch gate further down does destructure
+            // `ConnectMsg::Request { id, payload }`, which is fine.
+            let bypass_anchor = "if matches!(\n                    op,";
+            let bypass_start = window
+                .find(bypass_anchor)
+                .expect("bypass `matches!` block not found in Connect branch — guard outdated");
+            let bypass_end = window[bypass_start..]
+                .find(") {")
+                .expect("bypass `matches!` block has no closing `) {`")
+                + bypass_start;
+            let bypass_block = &window[bypass_start..bypass_end];
+
+            assert!(
+                !bypass_block.contains("connect::ConnectMsg::Request"),
+                "Connect bypass `matches!` MUST NOT forward Request. \
+                 Request is the spawn signal for start_relay_connect; \
+                 forwarding it would route fresh Requests into a multi-reply \
+                 receiver that doesn't exist yet."
+            );
         }
     }
 }
