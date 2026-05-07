@@ -1962,8 +1962,12 @@ async fn drive_relay_get_inner(
             }
             AttemptOutcome::Terminal(Terminal::Streaming { .. }) => {
                 // Streaming relay forwarding is out of scope for #3883 commit 1.
-                // Log and fall through to next peer (treat as NotFound for now).
-                // A follow-up PR will add proper chunk pipe-through.
+                // The downstream peer answered correctly with a streaming
+                // response; the relay's inability to forward streams is a
+                // local implementation gap, not a peer-routing failure. Do
+                // NOT record a route event here — penalising the peer for
+                // a relay-side limitation would systematically de-prioritise
+                // peers that happen to host large contracts.
                 tracing::warn!(
                     tx = %incoming_tx,
                     %instance_id,
@@ -1972,36 +1976,29 @@ async fn drive_relay_get_inner(
                      streaming relay forwarding not yet implemented (port plan §7); \
                      trying next peer"
                 );
-                crate::operations::record_relay_route_event(
-                    op_manager,
-                    peer.clone(),
-                    crate::ring::Location::from(&instance_id),
-                    crate::router::RouteOutcome::Failure,
-                    crate::node::network_status::OpType::Get,
-                );
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
             AttemptOutcome::Terminal(Terminal::LocalCompletion) => {
                 // A relay driver should never receive a Request-echo because
-                // `send_to_and_await` targets a specific remote peer (not loopback).
-                // If this arrives, treat it as Unexpected.
+                // `send_to_and_await` targets a specific remote peer (not
+                // loopback). If this arrives, it is a local protocol bug —
+                // not a peer-routing failure. Do NOT record a route event.
                 tracing::warn!(
                     tx = %incoming_tx,
                     %instance_id,
                     "GET relay (task-per-tx): unexpected LocalCompletion (Request-echo) — trying next peer"
                 );
-                crate::operations::record_relay_route_event(
-                    op_manager,
-                    peer.clone(),
-                    crate::ring::Location::from(&instance_id),
-                    crate::router::RouteOutcome::Failure,
-                    crate::node::network_status::OpType::Get,
-                );
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
             AttemptOutcome::Retry => {
+                // Downstream peer correctly answered NotFound. The peer
+                // behaved well at the protocol level — it just doesn't host
+                // this contract. Record `SuccessUntimed`: the failure-
+                // probability model should treat this peer as healthy, even
+                // though the relay tries another candidate for *this*
+                // contract location.
                 tracing::debug!(
                     tx = %incoming_tx,
                     target = %peer,
@@ -2011,7 +2008,7 @@ async fn drive_relay_get_inner(
                     op_manager,
                     peer.clone(),
                     crate::ring::Location::from(&instance_id),
-                    crate::router::RouteOutcome::Failure,
+                    crate::router::RouteOutcome::SuccessUntimed,
                     crate::node::network_status::OpType::Get,
                 );
                 // Mark the failed peer so future iterations don't re-select it.
@@ -2020,17 +2017,14 @@ async fn drive_relay_get_inner(
                 continue;
             }
             AttemptOutcome::Unexpected => {
+                // Unexpected reply variant — could be a local bug or a peer
+                // misbehaviour. Without knowing which, do NOT record a route
+                // event; the helper's invariant is one event per
+                // unambiguously-attributable observation.
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %peer,
                     "GET relay (task-per-tx): unexpected reply variant; advancing to next peer"
-                );
-                crate::operations::record_relay_route_event(
-                    op_manager,
-                    peer.clone(),
-                    crate::ring::Location::from(&instance_id),
-                    crate::router::RouteOutcome::Failure,
-                    crate::node::network_status::OpType::Get,
                 );
                 new_visited.mark_visited(peer_addr);
                 continue;

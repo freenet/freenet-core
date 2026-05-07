@@ -843,6 +843,30 @@ pub(crate) fn streaming_aware_attempt_timeout(
 /// disconnect paths are already covered by `report_timeout_failure` in
 /// `node/op_state_manager.rs` via `failure_routing_info`.
 ///
+/// # Outcome attribution
+///
+/// The `outcome` argument matches the legacy originator-side semantics
+/// (see `OpOutcome::Contract*` and the per-op `outcome()` methods). In
+/// particular, **prompt `NotFound` from a downstream peer is recorded
+/// as `RouteOutcome::Failure`**, not Success. A peer that promptly
+/// answers "I don't host this contract" behaved correctly at the
+/// transport level, but the failure-probability model is asking "will
+/// this peer deliver the contract at this location?" and a `NotFound`
+/// reply means it won't — so for routing-decision purposes it's a
+/// negative signal for *that contract location*. The relay sites
+/// follow the same convention used by the originator's stalled-peer
+/// retry path (`get.rs:2686` and `report_timeout_failure` in
+/// `op_state_manager.rs`). Splitting transport-success from
+/// content-availability would require a new `RouteOutcome::NotHosted`
+/// variant and is out of scope here.
+///
+/// `LocalCompletion` and unexpected-reply variants are also recorded as
+/// `Failure` against the downstream peer; these are "shouldn't happen"
+/// paths and recording them as failures matches the relay's decision to
+/// abandon that peer and try another.
+///
+/// # UPDATE exclusion
+///
 /// **UPDATE is intentionally not covered by this helper at relay sites.**
 /// UPDATE relays use `send_fire_and_forget` for downstream forwarding
 /// (`drive_relay_request_update`, `drive_relay_broadcast_to`, and the
@@ -873,17 +897,25 @@ pub(crate) fn record_relay_route_event(
     }
     // Feed only the routing model — NOT peer_health or topology_manager.
     //
-    // Why bypass `Ring::routing_finished` and call `router.add_event`
-    // directly: `routing_finished` also updates `peer_health` (which
-    // uses `std::time::Instant::now()` — a pre-existing TimeSource
-    // rule violation in `connection_manager.rs:185`) and the
-    // topology_manager's `request_density_tracker`. Both are reached
-    // from the originator path; amplifying their call rate from relay
-    // paths can compound wall-clock-driven divergence in
-    // strict-determinism simulation tests. The router itself reads
-    // its event log via failure-probability and Renegade ML
-    // estimators that don't use real wall-clock time, so feeding it
-    // from relay sites is determinism-safe.
+    // `Ring::routing_finished` also updates `peer_health` (which uses
+    // `std::time::Instant::now()` in `connection_manager.rs::PeerHealthTracker`
+    // around lines 182-203, a pre-existing TimeSource rule violation)
+    // and the topology_manager's `request_density_tracker`. An earlier
+    // iteration of this branch routed relay events through
+    // `routing_finished` and broke three strict-determinism tests
+    // (`test_strict_determinism_*` / `test_direct_runner_determinism` /
+    // `test_thundering_herd_connect_storm`). Bypassing those side
+    // effects fixed all three.
+    //
+    // CAVEAT: `Router::add_event` itself transitively calls
+    // `RoutingPredictor::record` → `wall_clock_hours()` → `SystemTime::now()`
+    // (see `router/routing_predictor.rs:608-614`). So the router path is
+    // not strictly TimeSource-clean either; the determinism tests pass
+    // because the wall-clock variance there is well below the events
+    // each test counts. Migrating both `peer_health` and
+    // `routing_predictor` to `TimeSource` would let
+    // `record_relay_route_event` go back to calling `routing_finished`
+    // straightforwardly. Tracked as a follow-up.
     op_manager
         .ring
         .router

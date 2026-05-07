@@ -1510,7 +1510,7 @@ fn peer_detail_html(address_str: &str) -> String {
             if event_count == 0 && tab_name != "All" {
                 write!(
                     panel_content,
-                    r#"<div class="empty-chart">No {name} operations have routed through this peer yet — chart will populate as the network sends or relays {name}s through this connection</div>"#,
+                    r#"<div class="empty-chart">No {name} operations have routed through this peer yet. The chart will populate as the network sends or relays {name}s through this connection.</div>"#,
                     name = tab_name,
                 )
                 .ok();
@@ -1620,7 +1620,7 @@ fn peer_detail_html(address_str: &str) -> String {
                 ts = fmt_prediction_speed(pred.transfer_speed_bps),
             )
         } else {
-            r#"<div class="card"><h2>Prediction</h2><p class="empty">Not enough routing data yet to predict this peer's behavior — fills in as operations are routed through it.</p></div>"#.to_string()
+            r#"<div class="card"><h2>Prediction</h2><p class="empty">Not enough routing data yet to predict this peer's behavior. The card fills in as operations are routed through it.</p></div>"#.to_string()
         }
     } else {
         String::new()
@@ -1692,7 +1692,7 @@ fn build_estimator_chart(
 ) -> String {
     if curve_points.is_empty() {
         return format!(
-            r#"<div class="chart-section"><h3>{title}</h3><div class="empty-chart">No data yet — populates as operations route through this peer</div></div>"#,
+            r#"<div class="chart-section"><h3>{title}</h3><div class="empty-chart">No data yet. Populates as operations route through this peer.</div></div>"#,
             title = title,
         );
     }

@@ -958,18 +958,14 @@ async fn drive_relay_put(
             relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
         }
         other => {
+            // Unexpected reply variant: unclear whether it's a local
+            // bug or peer misbehaviour. Do NOT record a route event;
+            // the helper invariant is one event per unambiguous attribution.
             tracing::warn!(
                 tx = %incoming_tx,
                 contract = %key,
                 reply_variant = ?std::mem::discriminant(&other),
                 "PUT relay (task-per-tx): unexpected reply variant; treating as failure"
-            );
-            crate::operations::record_relay_route_event(
-                op_manager,
-                next_peer.clone(),
-                crate::ring::Location::from(&key),
-                crate::router::RouteOutcome::Failure,
-                crate::node::network_status::OpType::Put,
             );
             Err(OpError::UnexpectedOpState)
         }
@@ -1637,21 +1633,15 @@ where
                 relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
             }
             other => {
+                // Unexpected reply variant: unclear attribution. Skip the
+                // route-event hook (matches the non-streaming relay's
+                // unexpected-variant arm).
                 tracing::warn!(
                     tx = %incoming_tx,
                     contract = %key,
                     reply_variant = ?std::mem::discriminant(&other),
                     "PUT streaming relay (task-per-tx): unexpected reply variant"
                 );
-                if let Some(ref peer) = next_hop {
-                    crate::operations::record_relay_route_event(
-                        op_manager,
-                        peer.clone(),
-                        crate::ring::Location::from(&key),
-                        crate::router::RouteOutcome::Failure,
-                        crate::node::network_status::OpType::Put,
-                    );
-                }
                 relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await
             }
         }

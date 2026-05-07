@@ -1593,6 +1593,10 @@ async fn drive_relay_subscribe(
             result: SubscribeMsgResult::NotFound,
             ..
         })) => {
+            // Downstream peer correctly answered NotFound. The peer
+            // behaved well at the protocol level — it just doesn't host
+            // this contract. Record SuccessUntimed so the model treats
+            // this peer as healthy. See `record_relay_route_event` rustdoc.
             tracing::debug!(
                 tx = %incoming_tx,
                 %instance_id,
@@ -1603,24 +1607,20 @@ async fn drive_relay_subscribe(
                 op_manager,
                 next_hop.clone(),
                 crate::ring::Location::from(&instance_id),
-                crate::router::RouteOutcome::Failure,
+                crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Subscribe,
             );
             SubscribeMsgResult::NotFound
         }
         other => {
+            // Unexpected reply variant: unclear whether it's a local
+            // bug or peer misbehaviour. Do NOT record a route event;
+            // the helper invariant is one event per unambiguous attribution.
             tracing::warn!(
                 tx = %incoming_tx,
                 %instance_id,
                 reply_variant = ?std::mem::discriminant(&other),
                 "SUBSCRIBE relay (task-per-tx): unexpected reply variant; treating as NotFound"
-            );
-            crate::operations::record_relay_route_event(
-                op_manager,
-                next_hop.clone(),
-                crate::ring::Location::from(&instance_id),
-                crate::router::RouteOutcome::Failure,
-                crate::node::network_status::OpType::Subscribe,
             );
             SubscribeMsgResult::NotFound
         }
