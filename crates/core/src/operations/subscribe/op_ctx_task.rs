@@ -1505,6 +1505,13 @@ async fn drive_relay_subscribe(
                 error = %err,
                 "SUBSCRIBE relay (task-per-tx): send_to_and_await failed"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_hop.clone(),
+                crate::ring::Location::from(&instance_id),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Subscribe,
+            );
             return relay_subscribe_send_response(
                 op_manager,
                 incoming_tx,
@@ -1522,6 +1529,13 @@ async fn drive_relay_subscribe(
                 timeout_secs = OPERATION_TTL.as_secs(),
                 "SUBSCRIBE relay (task-per-tx): downstream timed out"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_hop.clone(),
+                crate::ring::Location::from(&instance_id),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Subscribe,
+            );
             return relay_subscribe_send_response(
                 op_manager,
                 incoming_tx,
@@ -1534,6 +1548,10 @@ async fn drive_relay_subscribe(
     };
 
     // ── Step 4: Classify reply, register requester if Subscribed, bubble up ──
+    //
+    // Feed the relay's downstream-peer choice into the local Router so
+    // future routing decisions are informed by relay-observed outcomes
+    // (see operations.rs::record_relay_route_event).
     let result = match reply {
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
             result: SubscribeMsgResult::Subscribed { key },
@@ -1562,6 +1580,13 @@ async fn drive_relay_subscribe(
                 phase = "relay_subscribe_bubble",
                 "SUBSCRIBE relay (task-per-tx): downstream Subscribed; bubbling upstream"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_hop.clone(),
+                crate::ring::Location::from(&key),
+                crate::router::RouteOutcome::SuccessUntimed,
+                crate::node::network_status::OpType::Subscribe,
+            );
             SubscribeMsgResult::Subscribed { key }
         }
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
@@ -1574,6 +1599,13 @@ async fn drive_relay_subscribe(
                 phase = "relay_subscribe_bubble_not_found",
                 "SUBSCRIBE relay (task-per-tx): downstream NotFound; bubbling upstream"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_hop.clone(),
+                crate::ring::Location::from(&instance_id),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Subscribe,
+            );
             SubscribeMsgResult::NotFound
         }
         other => {
@@ -1582,6 +1614,13 @@ async fn drive_relay_subscribe(
                 %instance_id,
                 reply_variant = ?std::mem::discriminant(&other),
                 "SUBSCRIBE relay (task-per-tx): unexpected reply variant; treating as NotFound"
+            );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_hop.clone(),
+                crate::ring::Location::from(&instance_id),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Subscribe,
             );
             SubscribeMsgResult::NotFound
         }
