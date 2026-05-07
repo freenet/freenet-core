@@ -871,12 +871,29 @@ pub(crate) fn record_relay_route_event(
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
-    op_manager.ring.routing_finished(crate::router::RouteEvent {
-        peer: next_hop,
-        contract_location,
-        outcome,
-        op_type: Some(op_type),
-    });
+    // Feed only the routing model — NOT peer_health or topology_manager.
+    //
+    // Why bypass `Ring::routing_finished` and call `router.add_event`
+    // directly: `routing_finished` also updates `peer_health` (which
+    // uses `std::time::Instant::now()` — a pre-existing TimeSource
+    // rule violation in `connection_manager.rs:185`) and the
+    // topology_manager's `request_density_tracker`. Both are reached
+    // from the originator path; amplifying their call rate from relay
+    // paths can compound wall-clock-driven divergence in
+    // strict-determinism simulation tests. The router itself reads
+    // its event log via failure-probability and Renegade ML
+    // estimators that don't use real wall-clock time, so feeding it
+    // from relay sites is determinism-safe.
+    op_manager
+        .ring
+        .router
+        .write()
+        .add_event(crate::router::RouteEvent {
+            peer: next_hop,
+            contract_location,
+            outcome,
+            op_type: Some(op_type),
+        });
 }
 
 /// Test hook: counter incremented every time `record_relay_route_event`
