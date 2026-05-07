@@ -208,6 +208,19 @@ pub(crate) struct OpManager {
     /// gate rejects duplicate inbound `SubscribeMsg::Request` for a tx
     /// that already has a live relay driver.
     pub(crate) active_relay_subscribe_txs: Arc<DashSet<Transaction>>,
+    /// Set of transactions currently being driven by a relay CONNECT
+    /// task-per-tx driver on this node. Same role as
+    /// `active_relay_get_txs` but for CONNECT relay (#1454 phase 2c
+    /// slice 1). The dedup gate rejects duplicate inbound
+    /// `ConnectMsg::Request` for a tx that already has a live relay
+    /// driver — prevents bloom-filter rekey re-entries and
+    /// uphill-retry false-positive retransmissions from spawning
+    /// redundant drivers. Phase 2c slice 1 covers the
+    /// Request→Response forward path; Rejected within-relay retries
+    /// and ConnectFailed downstream propagation stay on legacy
+    /// `process_message`, gated by the dedup set's absence on those
+    /// branches.
+    pub(crate) active_relay_connect_txs: Arc<DashSet<Transaction>>,
 }
 
 impl Clone for OpManager {
@@ -238,6 +251,7 @@ impl Clone for OpManager {
             active_relay_update_txs: self.active_relay_update_txs.clone(),
             active_relay_put_txs: self.active_relay_put_txs.clone(),
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
+            active_relay_connect_txs: self.active_relay_connect_txs.clone(),
         }
     }
 }
@@ -281,6 +295,7 @@ impl OpManager {
         let active_relay_update_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
         let active_relay_put_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
         let active_relay_subscribe_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
+        let active_relay_connect_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
 
         task_monitor.register(
             "garbage_cleanup",
@@ -301,6 +316,7 @@ impl OpManager {
                     active_relay_update_txs.clone(),
                     active_relay_put_txs.clone(),
                     active_relay_subscribe_txs.clone(),
+                    active_relay_connect_txs.clone(),
                 )
                 .instrument(garbage_span),
             ),
@@ -372,6 +388,7 @@ impl OpManager {
             active_relay_update_txs,
             active_relay_put_txs,
             active_relay_subscribe_txs,
+            active_relay_connect_txs,
         })
     }
 
@@ -915,6 +932,25 @@ impl OpManager {
     /// path).
     pub fn has_subscribe_op(&self, id: &Transaction) -> bool {
         self.ops.subscribe.contains_key(id)
+    }
+
+    /// Returns `true` if a `ConnectOp` is currently registered for this
+    /// transaction in `OpManager.ops.connect`.
+    ///
+    /// Same role as `has_get_op` but for the relay CONNECT dispatch
+    /// gate (#1454 phase 2c slice 1). Used by `node.rs` to distinguish
+    /// a fresh inbound relay CONNECT Request (no existing op → spawn
+    /// the task-per-tx driver) from a within-relay Rejected retry, a
+    /// ConnectFailed downstream re-route, or any other re-entry that
+    /// already has a `ConnectOp` from a prior `process_message` call
+    /// (existing op → fall through to the legacy `handle_op_request`
+    /// path).
+    ///
+    /// `#[allow(dead_code)]` because the dispatch site lands in slice 1
+    /// commit 2; this commit only adds the scaffolding.
+    #[allow(dead_code)]
+    pub fn has_connect_op(&self, id: &Transaction) -> bool {
+        self.ops.connect.contains_key(id)
     }
 
     pub fn completed(&self, id: Transaction) {
@@ -1471,6 +1507,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     active_relay_update_txs: Arc<DashSet<Transaction>>,
     active_relay_put_txs: Arc<DashSet<Transaction>>,
     active_relay_subscribe_txs: Arc<DashSet<Transaction>>,
+    active_relay_connect_txs: Arc<DashSet<Transaction>>,
 ) {
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     /// How often to clean up stale contract_waiters entries (every N ticks).
@@ -1553,6 +1590,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DEDUP_REJECTS
                             .load(Ordering::Relaxed);
                     let relay_subscribe_active_txs = active_relay_subscribe_txs.len();
+                    let relay_connect_active_txs = active_relay_connect_txs.len();
                     tracing::info!(
                         target: "memory_stats",
                         tick = tick_count,
@@ -1585,6 +1623,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         relay_subscribe_completed = relay_subscribe_completed,
                         relay_subscribe_dedup_rejects = relay_subscribe_dedup_rejects,
                         relay_subscribe_active_txs = relay_subscribe_active_txs,
+                        relay_connect_active_txs = relay_connect_active_txs,
                         "memory stats"
                     );
                 }
