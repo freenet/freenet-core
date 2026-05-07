@@ -127,6 +127,18 @@ pub mod dev_tool {
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DRIVER_CALL_COUNT;
 
+    // Test hooks for the relay-hop routing-event plumbing. Each counter
+    // increments every time `operations::record_relay_route_event` fires
+    // for the corresponding op type. Used by simulation tests to verify
+    // that relay-forwarded operations actually feed the local Router's
+    // failure-probability model — without these hooks, the router would
+    // only see events from originator paths (the bug this work fixes).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::{
+        RELAY_GET_ROUTE_EVENT_COUNT, RELAY_PUT_ROUTE_EVENT_COUNT,
+        RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT, RELAY_UPDATE_ROUTE_EVENT_COUNT,
+    };
+
     // Re-export state verification for telemetry-based consistency analysis
     pub use crate::tracing::state_verifier::{StateAnomaly, StateVerifier, VerificationReport};
 

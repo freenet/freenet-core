@@ -1874,6 +1874,17 @@ async fn drive_relay_get_inner(
                     error = %err,
                     "GET relay (task-per-tx): send_to_and_await failed; advancing to next peer"
                 );
+                // Feed the relay's failed peer choice into the local Router
+                // so future routing decisions de-prioritize this peer. Without
+                // this hook, only originator-side failures train the router
+                // and per-peer dashboard panels stay empty on relay-heavy nodes.
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
+                );
                 // Continue loop to try next peer.
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -1884,6 +1895,13 @@ async fn drive_relay_get_inner(
                     target = %peer,
                     timeout_secs = OPERATION_TTL.as_secs(),
                     "GET relay (task-per-tx): attempt timed out; advancing to next peer"
+                );
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
                 );
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -1917,6 +1935,18 @@ async fn drive_relay_get_inner(
                 cache_contract_locally(op_manager, key, state.clone(), contract.clone(), false)
                     .await;
 
+                // Feed the relay's successful peer choice into the local
+                // Router. Without this hook, only originator-side successes
+                // train the failure-probability model and per-peer dashboard
+                // panels stay empty on relay-heavy nodes.
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::SuccessUntimed,
+                    crate::node::network_status::OpType::Get,
+                );
+
                 // Bubble up to upstream.
                 relay_send_found(
                     op_manager,
@@ -1942,6 +1972,13 @@ async fn drive_relay_get_inner(
                      streaming relay forwarding not yet implemented (port plan §7); \
                      trying next peer"
                 );
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
+                );
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
@@ -1954,6 +1991,13 @@ async fn drive_relay_get_inner(
                     %instance_id,
                     "GET relay (task-per-tx): unexpected LocalCompletion (Request-echo) — trying next peer"
                 );
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
+                );
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
@@ -1962,6 +2006,13 @@ async fn drive_relay_get_inner(
                     tx = %incoming_tx,
                     target = %peer,
                     "GET relay (task-per-tx): downstream returned NotFound; advancing to next peer"
+                );
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
                 );
                 // Mark the failed peer so future iterations don't re-select it.
                 new_visited.mark_visited(peer_addr);
@@ -1973,6 +2024,13 @@ async fn drive_relay_get_inner(
                     tx = %incoming_tx,
                     target = %peer,
                     "GET relay (task-per-tx): unexpected reply variant; advancing to next peer"
+                );
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
                 );
                 new_visited.mark_visited(peer_addr);
                 continue;

@@ -849,6 +849,17 @@ pub(crate) fn record_relay_route_event(
     outcome: crate::router::RouteOutcome,
     op_type: crate::node::network_status::OpType,
 ) {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        use std::sync::atomic::Ordering;
+        let counter = match op_type {
+            crate::node::network_status::OpType::Get => &RELAY_GET_ROUTE_EVENT_COUNT,
+            crate::node::network_status::OpType::Put => &RELAY_PUT_ROUTE_EVENT_COUNT,
+            crate::node::network_status::OpType::Update => &RELAY_UPDATE_ROUTE_EVENT_COUNT,
+            crate::node::network_status::OpType::Subscribe => &RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
     op_manager.ring.routing_finished(crate::router::RouteEvent {
         peer: next_hop,
         contract_location,
@@ -856,6 +867,25 @@ pub(crate) fn record_relay_route_event(
         op_type: Some(op_type),
     });
 }
+
+/// Test hook: counter incremented every time `record_relay_route_event`
+/// fires for a relay-forwarded GET. Used by simulation tests to verify
+/// the per-op-type relay hooks are reached. See `dev_tool` re-export.
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_GET_ROUTE_EVENT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_PUT_ROUTE_EVENT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_UPDATE_ROUTE_EVENT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod ordering_invariant_tests {
