@@ -24,10 +24,17 @@ paths:
 > state-machine path**, which still serves: GC-spawned GET retries and
 > `start_targeted_op` UPDATE-triggered auto-fetch (streaming relay and
 > originator loopback also remain on legacy per #3883 port plan §7),
-> PUT GC / streaming / originator-loopback paths, CONNECT, and
-> SUBSCRIBE's executor / intermediate-peer entry points (PUT-sub-op
-> SUBSCRIBE migrated in Phase 3a/3b; renewal migrated in the SUBSCRIBE
-> renewal slice — see below). Phase 5 follow-up slice A (PR #3910) migrated fresh
+> PUT GC / streaming / originator-loopback paths, CONNECT's joiner
+> branches reachable only from in-file unit tests + the legacy
+> stateless `ObservedAddress` path in `load_or_init` (relay CONNECT
+> fully migrated to `connect::op_ctx_task::start_relay_connect` in
+> Phase 2c slice 1 — fresh `Request`s with `source_addr.is_some()`
+> AND `!has_connect_op(id)` route to the task-per-tx driver, all four
+> non-Request `ConnectMsg` variants flow through the per-tx waiter
+> receiver via the bypass extension at `node.rs`), and SUBSCRIBE's
+> executor / intermediate-peer entry points (PUT-sub-op SUBSCRIBE
+> migrated in Phase 3a/3b; renewal migrated in the SUBSCRIBE renewal
+> slice — see below). Phase 5 follow-up slice A (PR #3910) migrated fresh
 > inbound non-streaming relay `UpdateMsg::RequestUpdate` and
 > `UpdateMsg::BroadcastTo` to
 > `operations/update/op_ctx_task.rs::start_relay_request_update` /

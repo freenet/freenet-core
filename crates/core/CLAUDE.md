@@ -80,12 +80,25 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              `start_relay_broadcast_to_streaming` —
                              claim inbound stream, assemble, apply
                              locally; BroadcastStateChange propagates)
-    All four relay drivers share the per-node dedup gate pattern
-    (`active_relay_{get,update,put,subscribe}_txs`) and the
+  connect/op_ctx_task.rs   → client-initiated CONNECT driver (Phase 2c
+                             slice 2, `start_client_connect`) + fresh
+                             inbound relay CONNECT driver (Phase 2c
+                             slice 1, `start_relay_connect`: full
+                             state machine in task locals — initial
+                             `handle_request` decision, downstream
+                             forward, upstream emits, plus re-entry
+                             handling for Response/Rejected/
+                             ObservedAddress/ConnectFailed via
+                             `OpCtx::send_to_and_collect_replies`)
+    All five relay drivers share the per-node dedup gate pattern
+    (`active_relay_{get,update,put,subscribe,connect}_txs`) and the
     `Relay*InflightGuard` RAII. PUT and UPDATE streaming relays now run
     on the task-per-tx path. The deprecated UPDATE `Broadcasting` wire
     variant has been removed (gated by a `min-compatible-version`
-    bump). SUBSCRIBE has no streaming variants. Renewals migrated to
+    bump). SUBSCRIBE has no streaming variants. CONNECT relay's
+    admission RAII guard is scoped to the initial-actions block (NOT
+    held across the recv loop) to avoid admission slot starvation
+    under load. Renewals migrated to
     `subscribe::run_renewal_subscribe` (reuses the client-initiated
     driver with `is_renewal=true`, returns the outcome to the renewal
     task instead of through `result_router_tx`). PUT sub-op subscribes
