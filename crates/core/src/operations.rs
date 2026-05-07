@@ -828,6 +828,35 @@ pub(crate) fn streaming_aware_attempt_timeout(
     total.min(STREAMING_ATTEMPT_TIMEOUT_CAP)
 }
 
+/// Records a routing event observed by a relay/forwarding hop.
+///
+/// Without this hook, only the operation's originator feeds events into the
+/// router. `OpOutcome::ContractOp*` is only produced for ops where
+/// `upstream_addr.is_none()`, and relay hops return `SendAndComplete` without
+/// going through `outcome()`. On a relay-heavy node the router would see
+/// almost no per-peer data, leaving the failure-probability model untrained
+/// and the per-peer dashboard panels empty even when MB of traffic flowed
+/// through each connection.
+///
+/// Call this at the relay-side response sites in each operation when the
+/// downstream peer the relay chose returns success or failure. Timeout and
+/// disconnect paths are already covered by `report_timeout_failure` in
+/// `node/op_state_manager.rs` via `failure_routing_info`.
+pub(crate) fn record_relay_route_event(
+    op_manager: &OpManager,
+    next_hop: PeerKeyLocation,
+    contract_location: Location,
+    outcome: crate::router::RouteOutcome,
+    op_type: crate::node::network_status::OpType,
+) {
+    op_manager.ring.routing_finished(crate::router::RouteEvent {
+        peer: next_hop,
+        contract_location,
+        outcome,
+        op_type: Some(op_type),
+    });
+}
+
 #[cfg(test)]
 mod ordering_invariant_tests {
     //! Tests documenting critical ordering invariants in the operations module.

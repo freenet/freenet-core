@@ -2378,6 +2378,22 @@ impl Operation for GetOp {
                             });
                         }
                         tracing::debug!(tx = %id, %key, upstream = ?self.upstream_addr, "Returning contract to upstream");
+                        // Feed the relay's downstream-peer choice into the
+                        // local Router's failure-probability model. Without
+                        // this, a relay-heavy node only learns from ops it
+                        // originated and the per-peer dashboard panels stay
+                        // empty even with MB of forwarded traffic.
+                        if let Some(ref s) = stats {
+                            if let Some(ref next_peer) = s.next_peer {
+                                super::record_relay_route_event(
+                                    op_manager,
+                                    next_peer.clone(),
+                                    s.contract_location,
+                                    crate::router::RouteOutcome::SuccessUntimed,
+                                    crate::node::network_status::OpType::Get,
+                                );
+                            }
+                        }
                         result = Some(GetResult {
                             key,
                             state: value.clone(),
