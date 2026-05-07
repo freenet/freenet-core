@@ -842,6 +842,17 @@ pub(crate) fn streaming_aware_attempt_timeout(
 /// downstream peer the relay chose returns success or failure. Timeout and
 /// disconnect paths are already covered by `report_timeout_failure` in
 /// `node/op_state_manager.rs` via `failure_routing_info`.
+///
+/// **UPDATE is intentionally not covered by this helper at relay sites.**
+/// UPDATE relays use `send_fire_and_forget` for downstream forwarding
+/// (`drive_relay_request_update`, `drive_relay_broadcast_to`, and the
+/// streaming variants), so the relay never observes whether the downstream
+/// peer succeeded or failed. Recording only the local send-error path
+/// would bias the per-peer UPDATE failure rate to 100% by construction.
+/// `report_timeout_failure` in `op_state_manager.rs` still records UPDATE
+/// timeouts via `failure_routing_info` on the originator side; this is
+/// the same signal as for the other ops, just not augmented by relay
+/// observations.
 pub(crate) fn record_relay_route_event(
     op_manager: &OpManager,
     next_hop: PeerKeyLocation,

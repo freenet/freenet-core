@@ -2380,7 +2380,10 @@ mod tests {
         let pos = b
             .find("downstream reply timed out")
             .expect("timeout arm not found");
-        let arm = &b[pos..pos + 400.min(b.len() - pos)];
+        // Window widened from 400 → 800 bytes to accommodate the
+        // record_relay_route_event hook inserted between the timeout
+        // log and the bubble-Response call.
+        let arm = &b[pos..pos + 800.min(b.len() - pos)];
         assert!(
             arm.contains("relay_put_send_response"),
             "timeout arm must still call relay_put_send_response so the \
