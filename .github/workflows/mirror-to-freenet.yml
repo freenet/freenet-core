@@ -15,17 +15,31 @@ on:
   workflow_dispatch:
   schedule:
     # Daily safety net in case a push trigger was missed (e.g. a force
-    # push to main that GitHub coalesced). 11:42 UTC = mid-morning US.
+    # push to main that GitHub coalesced). 11:42 UTC = mid-morning US;
+    # staggered from freenet-stdlib's 12:53 for log readability only --
+    # the reusable workflow's concurrency group keys on
+    # `inputs.freenet_repo`, so different prefixes do not contend on
+    # the receiver side.
     - cron: "42 11 * * *"
 
 jobs:
   mirror:
-    # Pinned to the merge SHA of freenet-git#17 rather than `@main`.
-    # `secrets: inherit` would pass every secret in this repo (Apple
+    # Pinned to the merge SHA of freenet-git#17 (with the
+    # deterministic-snapshot fix from #18) rather than `@main`. An
+    # unpinned ref + `secrets: inherit` would let any commit to
+    # freenet-git/main exfiltrate this repo's secrets (Apple
     # notarization keys, Claude OAuth, OpenAI key, Matrix tokens,
-    # River signing key) into whatever happens to be on freenet-git's
-    # main, so an unpinned ref + inherit is a textbook supply-chain
-    # pivot. Bump the SHA when the reusable workflow is rev'd.
+    # River signing key). SHA-pinning + explicit `secrets:` mapping
+    # below closes the workflow-definition vector; bump the SHA when
+    # the reusable workflow is rev'd.
+    #
+    # Note: the reusable workflow's `cargo install freenet-git --locked`
+    # step still pulls the latest crates.io release of freenet-git (its
+    # `freenet_git_version` input defaults to `latest` and we don't
+    # override it). A malicious freenet-git release would still execute
+    # under this caller's secrets. Acceptable today because we control
+    # crates.io publishing for that crate; if that changes, override
+    # `freenet_git_version` here with a pinned semver.
     uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@4a4ab090c5591473f579ce2d1b626aba7b3a8ba3
     with:
       freenet_repo: "3GEERif5ihbf/freenet-core"
