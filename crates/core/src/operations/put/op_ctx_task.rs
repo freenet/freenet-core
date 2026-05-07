@@ -885,6 +885,13 @@ async fn drive_relay_put(
                 error = %err,
                 "PUT relay (task-per-tx): send_to_and_await failed"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&key),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Put,
+            );
             return Err(err);
         }
         Err(_elapsed) => {
@@ -895,11 +902,21 @@ async fn drive_relay_put(
                 timeout_secs = OPERATION_TTL.as_secs(),
                 "PUT relay (task-per-tx): downstream timed out"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&key),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Put,
+            );
             return Err(OpError::UnexpectedOpState);
         }
     };
 
     // ── Step 4: Classify reply and bubble Response upstream ────────────────
+    // Feed the relay's downstream-peer choice into the local Router so
+    // future routing decisions are informed by relay-observed outcomes,
+    // not just events from ops this node originated.
     match reply {
         NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key: reply_key, .. })) => {
             tracing::info!(
@@ -907,6 +924,13 @@ async fn drive_relay_put(
                 contract = %reply_key,
                 phase = "relay_put_bubble",
                 "PUT relay (task-per-tx): downstream returned Response; bubbling upstream"
+            );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&reply_key),
+                crate::router::RouteOutcome::SuccessUntimed,
+                crate::node::network_status::OpType::Put,
             );
             relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
         }
@@ -924,6 +948,13 @@ async fn drive_relay_put(
                 "PUT relay (task-per-tx): downstream returned ResponseStreaming — \
                  synthesizing non-streaming Response upstream (slice A limitation)"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&reply_key),
+                crate::router::RouteOutcome::SuccessUntimed,
+                crate::node::network_status::OpType::Put,
+            );
             relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
         }
         other => {
@@ -932,6 +963,13 @@ async fn drive_relay_put(
                 contract = %key,
                 reply_variant = ?std::mem::discriminant(&other),
                 "PUT relay (task-per-tx): unexpected reply variant; treating as failure"
+            );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&key),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Put,
             );
             Err(OpError::UnexpectedOpState)
         }
@@ -1529,6 +1567,11 @@ where
     .await?;
 
     // ── Step 7: Await downstream reply (if piping), then bubble upstream ──
+    //
+    // Per-relay routing-event recording: the relay's chosen `next_hop`
+    // either responded usefully (Success) or didn't (Failure). Feeding
+    // these into the local Router lets the failure-probability model
+    // learn from forwarded traffic, not just originator-side ops.
     if let Some((next_addr, mut rx)) = downstream_reply_rx {
         let reply = match tokio::time::timeout(OPERATION_TTL, rx.recv()).await {
             Ok(Some(reply)) => reply,
@@ -1538,6 +1581,15 @@ where
                     target = %next_addr,
                     "PUT streaming relay (task-per-tx): downstream reply channel closed before reply"
                 );
+                if let Some(ref peer) = next_hop {
+                    crate::operations::record_relay_route_event(
+                        op_manager,
+                        peer.clone(),
+                        crate::ring::Location::from(&key),
+                        crate::router::RouteOutcome::Failure,
+                        crate::node::network_status::OpType::Put,
+                    );
+                }
                 op_manager.release_pending_op_slot(incoming_tx).await;
                 return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
             }
@@ -1547,6 +1599,15 @@ where
                     target = %next_addr,
                     "PUT streaming relay (task-per-tx): downstream reply timed out"
                 );
+                if let Some(ref peer) = next_hop {
+                    crate::operations::record_relay_route_event(
+                        op_manager,
+                        peer.clone(),
+                        crate::ring::Location::from(&key),
+                        crate::router::RouteOutcome::Failure,
+                        crate::node::network_status::OpType::Put,
+                    );
+                }
                 op_manager.release_pending_op_slot(incoming_tx).await;
                 return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
             }
@@ -1564,6 +1625,15 @@ where
                     phase = "relay_put_streaming_bubble",
                     "PUT streaming relay (task-per-tx): downstream replied; bubbling Response upstream"
                 );
+                if let Some(ref peer) = next_hop {
+                    crate::operations::record_relay_route_event(
+                        op_manager,
+                        peer.clone(),
+                        crate::ring::Location::from(&reply_key),
+                        crate::router::RouteOutcome::SuccessUntimed,
+                        crate::node::network_status::OpType::Put,
+                    );
+                }
                 relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
             }
             other => {
@@ -1573,6 +1643,15 @@ where
                     reply_variant = ?std::mem::discriminant(&other),
                     "PUT streaming relay (task-per-tx): unexpected reply variant"
                 );
+                if let Some(ref peer) = next_hop {
+                    crate::operations::record_relay_route_event(
+                        op_manager,
+                        peer.clone(),
+                        crate::ring::Location::from(&key),
+                        crate::router::RouteOutcome::Failure,
+                        crate::node::network_status::OpType::Put,
+                    );
+                }
                 relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await
             }
         }

@@ -691,6 +691,20 @@ impl Operation for PutOp {
                             "Forwarding PUT Response to upstream"
                         );
 
+                        // Feed the relay's downstream-peer choice into the
+                        // local Router. See operations.rs::record_relay_route_event
+                        // for rationale: without this, a relay-heavy node only
+                        // trains its routing model on originated ops.
+                        if let Some(ref s) = stats {
+                            super::record_relay_route_event(
+                                op_manager,
+                                s.target_peer.clone(),
+                                s.contract_location,
+                                crate::router::RouteOutcome::SuccessUntimed,
+                                crate::node::network_status::OpType::Put,
+                            );
+                        }
+
                         let response = PutMsg::Response { id, key: *key };
 
                         Ok(OperationResult::SendAndComplete {
@@ -1248,6 +1262,16 @@ impl Operation for PutOp {
                             phase = "response",
                             "Forwarding PUT ResponseStreaming to upstream"
                         );
+
+                        if let Some(ref s) = stats {
+                            super::record_relay_route_event(
+                                op_manager,
+                                s.target_peer.clone(),
+                                s.contract_location,
+                                crate::router::RouteOutcome::SuccessUntimed,
+                                crate::node::network_status::OpType::Put,
+                            );
+                        }
 
                         // Forward as regular Response for simplicity
                         // (streaming is only needed for large payloads, responses are small)
