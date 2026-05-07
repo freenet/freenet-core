@@ -1874,6 +1874,17 @@ async fn drive_relay_get_inner(
                     error = %err,
                     "GET relay (task-per-tx): send_to_and_await failed; advancing to next peer"
                 );
+                // Feed the relay's failed peer choice into the local Router
+                // so future routing decisions de-prioritize this peer. Without
+                // this hook, only originator-side failures train the router
+                // and per-peer dashboard panels stay empty on relay-heavy nodes.
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
+                );
                 // Continue loop to try next peer.
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -1884,6 +1895,13 @@ async fn drive_relay_get_inner(
                     target = %peer,
                     timeout_secs = OPERATION_TTL.as_secs(),
                     "GET relay (task-per-tx): attempt timed out; advancing to next peer"
+                );
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
                 );
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -1917,6 +1935,18 @@ async fn drive_relay_get_inner(
                 cache_contract_locally(op_manager, key, state.clone(), contract.clone(), false)
                     .await;
 
+                // Feed the relay's successful peer choice into the local
+                // Router. Without this hook, only originator-side successes
+                // train the failure-probability model and per-peer dashboard
+                // panels stay empty on relay-heavy nodes.
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::SuccessUntimed,
+                    crate::node::network_status::OpType::Get,
+                );
+
                 // Bubble up to upstream.
                 relay_send_found(
                     op_manager,
@@ -1932,8 +1962,12 @@ async fn drive_relay_get_inner(
             }
             AttemptOutcome::Terminal(Terminal::Streaming { .. }) => {
                 // Streaming relay forwarding is out of scope for #3883 commit 1.
-                // Log and fall through to next peer (treat as NotFound for now).
-                // A follow-up PR will add proper chunk pipe-through.
+                // The downstream peer answered correctly with a streaming
+                // response; the relay's inability to forward streams is a
+                // local implementation gap, not a peer-routing failure. Do
+                // NOT record a route event here — penalising the peer for
+                // a relay-side limitation would systematically de-prioritise
+                // peers that happen to host large contracts.
                 tracing::warn!(
                     tx = %incoming_tx,
                     %instance_id,
@@ -1947,8 +1981,9 @@ async fn drive_relay_get_inner(
             }
             AttemptOutcome::Terminal(Terminal::LocalCompletion) => {
                 // A relay driver should never receive a Request-echo because
-                // `send_to_and_await` targets a specific remote peer (not loopback).
-                // If this arrives, treat it as Unexpected.
+                // `send_to_and_await` targets a specific remote peer (not
+                // loopback). If this arrives, it is a local protocol bug —
+                // not a peer-routing failure. Do NOT record a route event.
                 tracing::warn!(
                     tx = %incoming_tx,
                     %instance_id,
@@ -1958,10 +1993,23 @@ async fn drive_relay_get_inner(
                 continue;
             }
             AttemptOutcome::Retry => {
+                // Downstream peer correctly answered NotFound. The peer
+                // behaved well at the protocol level — it just doesn't host
+                // this contract. Record `SuccessUntimed`: the failure-
+                // probability model should treat this peer as healthy, even
+                // though the relay tries another candidate for *this*
+                // contract location.
                 tracing::debug!(
                     tx = %incoming_tx,
                     target = %peer,
                     "GET relay (task-per-tx): downstream returned NotFound; advancing to next peer"
+                );
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::SuccessUntimed,
+                    crate::node::network_status::OpType::Get,
                 );
                 // Mark the failed peer so future iterations don't re-select it.
                 new_visited.mark_visited(peer_addr);
@@ -1969,6 +2017,10 @@ async fn drive_relay_get_inner(
                 continue;
             }
             AttemptOutcome::Unexpected => {
+                // Unexpected reply variant — could be a local bug or a peer
+                // misbehaviour. Without knowing which, do NOT record a route
+                // event; the helper's invariant is one event per
+                // unambiguously-attributable observation.
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %peer,
@@ -3564,5 +3616,76 @@ mod tests {
         assert!(matches!(found, super::SubOpGetOutcome::Found(_)));
         assert!(matches!(not_found, super::SubOpGetOutcome::NotFound(_)));
         assert!(matches!(infra, super::SubOpGetOutcome::Infra(_)));
+    }
+
+    /// Pin: each transport-level failure arm of `drive_relay_get_inner`
+    /// records a routing event for the failing peer. Without these
+    /// hooks, the per-peer dashboard's failure-probability model is
+    /// trained only on originated ops and the symptom this PR fixes
+    /// reappears for the relay path. Source-scrape because the
+    /// behaviour is positional inside the retry loop and a deletion
+    /// would not break any unit-test assertion otherwise.
+    #[test]
+    fn drive_relay_get_inner_records_route_events_on_transport_failure() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+
+        // The send_to_and_await error arm and the timeout arm must
+        // record `Failure` for the chosen peer. Identify each by its
+        // log-message phrase, then check the arm's body up to the
+        // `continue` for the helper call.
+        for log_phrase in [
+            "send_to_and_await failed; advancing to next peer",
+            "attempt timed out; advancing to next peer",
+        ] {
+            let pos = body.unwrap_or_default_pos(log_phrase);
+            let after = &body[pos..pos + 1500.min(body.len() - pos)];
+            assert!(
+                after.contains("record_relay_route_event")
+                    && after.contains("RouteOutcome::Failure"),
+                "drive_relay_get_inner arm for `{log_phrase}` must call \
+                 record_relay_route_event with RouteOutcome::Failure. \
+                 Without this, transport failures from relay-forwarded \
+                 GETs are dropped and the per-peer failure-probability \
+                 model regresses to the originator-only state that \
+                 motivated PR #4051."
+            );
+        }
+
+        // The InlineFound success arm must record SuccessUntimed.
+        let pos = body.unwrap_or_default_pos("downstream returned Found");
+        let after = &body[pos..pos + 1500.min(body.len() - pos)];
+        assert!(
+            after.contains("record_relay_route_event")
+                && after.contains("RouteOutcome::SuccessUntimed"),
+            "drive_relay_get_inner InlineFound arm must call \
+             record_relay_route_event with RouteOutcome::SuccessUntimed."
+        );
+
+        // The Retry/NotFound arm must record SuccessUntimed too — see
+        // the outcome-attribution rationale in operations.rs::record_relay_route_event
+        // rustdoc. A peer answering NotFound has not failed.
+        let pos = body.unwrap_or_default_pos("downstream returned NotFound; advancing");
+        let after = &body[pos..pos + 1500.min(body.len() - pos)];
+        assert!(
+            after.contains("record_relay_route_event")
+                && after.contains("RouteOutcome::SuccessUntimed"),
+            "drive_relay_get_inner Retry (NotFound) arm must call \
+             record_relay_route_event with RouteOutcome::SuccessUntimed \
+             (NotFound is a correct protocol response, not a routing \
+             failure). Recording it as Failure would systematically \
+             de-prioritise peers that don't host the queried contract."
+        );
+    }
+
+    trait FindOrPanic {
+        fn unwrap_or_default_pos(&self, needle: &str) -> usize;
+    }
+    impl FindOrPanic for str {
+        fn unwrap_or_default_pos(&self, needle: &str) -> usize {
+            self.find(needle).unwrap_or_else(|| {
+                panic!("expected `{needle}` to appear in drive_relay_get_inner body")
+            })
+        }
     }
 }

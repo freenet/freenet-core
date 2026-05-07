@@ -1478,6 +1478,24 @@ impl Operation for GetOp {
                                 tried_peers.insert(addr);
                             }
 
+                            // The downstream peer correctly answered NotFound:
+                            // it behaved well at the protocol level, just
+                            // doesn't host this contract. Record SuccessUntimed
+                            // so the failure-probability model treats this peer
+                            // as healthy, even though the relay tries another
+                            // candidate for *this* contract location. See
+                            // `operations::record_relay_route_event` rustdoc
+                            // for the attribution policy.
+                            if let Some(ref answered_peer) = sender {
+                                super::record_relay_route_event(
+                                    op_manager,
+                                    answered_peer.clone(),
+                                    crate::ring::Location::from(&instance_id),
+                                    crate::router::RouteOutcome::SuccessUntimed,
+                                    crate::node::network_status::OpType::Get,
+                                );
+                            }
+
                             // First, check if we have alternatives at this hop level
                             if !alternatives.is_empty() && attempts_at_hop < DEFAULT_MAX_BREADTH {
                                 // Try the next alternative
@@ -2378,6 +2396,22 @@ impl Operation for GetOp {
                             });
                         }
                         tracing::debug!(tx = %id, %key, upstream = ?self.upstream_addr, "Returning contract to upstream");
+                        // Feed the relay's downstream-peer choice into the
+                        // local Router's failure-probability model. Without
+                        // this, a relay-heavy node only learns from ops it
+                        // originated and the per-peer dashboard panels stay
+                        // empty even with MB of forwarded traffic.
+                        if let Some(ref s) = stats {
+                            if let Some(ref next_peer) = s.next_peer {
+                                super::record_relay_route_event(
+                                    op_manager,
+                                    next_peer.clone(),
+                                    s.contract_location,
+                                    crate::router::RouteOutcome::SuccessUntimed,
+                                    crate::node::network_status::OpType::Get,
+                                );
+                            }
+                        }
                         result = Some(GetResult {
                             key,
                             state: value.clone(),
@@ -2991,6 +3025,20 @@ impl Operation for GetOp {
                             phase = "forward",
                             "GET response piping in progress to upstream"
                         );
+                        // Relay observed a streaming Found from downstream and
+                        // is piping it upstream. Feed the Router so this peer's
+                        // routing-quality stats reflect streaming relays too.
+                        if let Some(ref s) = stats {
+                            if let Some(ref next_peer) = s.next_peer {
+                                super::record_relay_route_event(
+                                    op_manager,
+                                    next_peer.clone(),
+                                    s.contract_location,
+                                    crate::router::RouteOutcome::SuccessUntimed,
+                                    crate::node::network_status::OpType::Get,
+                                );
+                            }
+                        }
                         return_msg = None;
                         new_state = None;
                     } else {
@@ -3003,6 +3051,19 @@ impl Operation for GetOp {
                             "Forwarding GET response as non-streaming to upstream"
                         );
 
+                        // Same relay-Success accounting as the piping branch
+                        // and the non-streaming Response handler at line ~2386.
+                        if let Some(ref s) = stats {
+                            if let Some(ref next_peer) = s.next_peer {
+                                super::record_relay_route_event(
+                                    op_manager,
+                                    next_peer.clone(),
+                                    s.contract_location,
+                                    crate::router::RouteOutcome::SuccessUntimed,
+                                    crate::node::network_status::OpType::Get,
+                                );
+                            }
+                        }
                         return_msg = Some(GetMsg::Response {
                             id,
                             instance_id: *instance_id,

@@ -7427,9 +7427,10 @@ fn test_get_routing_coverage_low_htl() {
     use std::sync::atomic::Ordering;
 
     use freenet::dev_tool::{
-        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, RELAY_PUT_DRIVER_CALL_COUNT,
-        RELAY_SUBSCRIBE_DRIVER_CALL_COUNT, ScheduledOperation, SimOperation,
-        register_crdt_contract,
+        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, RELAY_GET_ROUTE_EVENT_COUNT,
+        RELAY_PUT_DRIVER_CALL_COUNT, RELAY_PUT_ROUTE_EVENT_COUNT,
+        RELAY_SUBSCRIBE_DRIVER_CALL_COUNT, RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT, ScheduledOperation,
+        SimOperation, register_crdt_contract,
     };
 
     // Seed updated: per-peer acceptor reliability scoring replaces binary
@@ -7450,6 +7451,19 @@ fn test_get_routing_coverage_low_htl() {
     let relay_baseline = GET_RELAY_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
     let relay_put_baseline = RELAY_PUT_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
     let relay_subscribe_baseline = RELAY_SUBSCRIBE_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+
+    // Baselines for the relay-hop routing-event counters. Each fires when
+    // a relay forwards a downstream peer's response and feeds the result
+    // into the local Router via record_relay_route_event. Without these
+    // hooks the per-peer dashboard panels stay empty and the failure-
+    // probability model is trained only on originator-side events.
+    // The same workload that exercises the relay drivers above must
+    // also exercise these counters — drivers running without route-event
+    // emission would silently regress router quality.
+    let relay_get_route_event_baseline = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    let relay_put_route_event_baseline = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    let relay_subscribe_route_event_baseline =
+        RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
 
     let rt = create_runtime();
 
@@ -7605,6 +7619,50 @@ fn test_get_routing_coverage_low_htl() {
          subscribe must traverse a relay hop. Dispatch gate for \
          SUBSCRIBE has likely regressed. \
          Baseline: {relay_subscribe_baseline}, after: {relay_subscribe_after}."
+    );
+
+    // Relay-hop routing-event counters: every relay that forwards a
+    // downstream response should feed the local Router. Drivers running
+    // without route-event emission means the per-peer dashboard panels
+    // stay empty and the failure-probability model is undertrained on
+    // relay-heavy nodes (the bug this work fixes).
+    let relay_get_route_event_after = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    let relay_get_route_event_delta =
+        relay_get_route_event_after.saturating_sub(relay_get_route_event_baseline);
+    assert!(
+        relay_get_route_event_delta > 0,
+        "RELAY_GET_ROUTE_EVENT_COUNT did not advance — at least one \
+         relay-forwarded GET should have produced a routing event for \
+         the local Router. {num_nodes}-node / HTL=3 workload with 15 \
+         GETs must traverse at least one relay hop. \
+         Baseline: {relay_get_route_event_baseline}, after: {relay_get_route_event_after}."
+    );
+
+    let relay_put_route_event_after = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    let relay_put_route_event_delta =
+        relay_put_route_event_after.saturating_sub(relay_put_route_event_baseline);
+    assert!(
+        relay_put_route_event_delta > 0,
+        "RELAY_PUT_ROUTE_EVENT_COUNT did not advance — the gateway PUT \
+         at HTL=3 should have produced a routing event at every relay \
+         hop. \
+         Baseline: {relay_put_route_event_baseline}, after: {relay_put_route_event_after}."
+    );
+
+    // SUBSCRIBE route-event coverage is intentionally NOT asserted in
+    // this test. With the gateway PUT seeded at HTL=3 and 12 nodes
+    // subscribing, every subscribe in this workload hits the local-hit
+    // fast path at `subscribe/op_ctx_task.rs::drive_relay_subscribe`
+    // step 1 — the first relay always has the contract cached and
+    // replies `Subscribed` without forwarding downstream. That's a
+    // correct zero for the route-event counter, since the route-event
+    // hook only fires on actual forwards. A dedicated SUBSCRIBE forward
+    // test (subscriber + sparse cache topology) belongs as a follow-up.
+    // The relay SUBSCRIBE driver itself is still exercised — see the
+    // RELAY_SUBSCRIBE_DRIVER_CALL_COUNT assertion above.
+    let _ = (
+        RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT.load(Ordering::SeqCst),
+        relay_subscribe_route_event_baseline,
     );
 
     // StateVerifier anomaly check
