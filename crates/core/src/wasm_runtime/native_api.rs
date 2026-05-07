@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -37,6 +38,35 @@ pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateCallEnv>> =
 pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
     DashMap<ContractInstanceId, HashSet<DelegateKey>>,
 > = LazyLock::new(DashMap::default);
+
+/// Shared, in-memory cache of `DelegateContext` bytes keyed by `DelegateKey`.
+///
+/// The delegate ABI exposes `ctx.write(...)` and `ctx.read()` as a way for a
+/// delegate to stash state across `process()` calls — the canonical use is a
+/// permission prompt: the delegate writes its `PendingPrompt` blob during the
+/// call that emits `RequestUserInput`, then reads it back when the executor
+/// re-enters with the user's `UserResponse`.
+///
+/// The runtime's per-call context `Vec` lives only for the duration of one
+/// `inbound_app_message` invocation, so without persistence between calls
+/// every prompt round-trip would lose its pending state and the delegate
+/// would hit "received UserResponse with no pending context". This cache
+/// closes that gap: `inbound_app_message` seeds its local `Vec` from here on
+/// entry and stores the (possibly-mutated) `Vec` back on exit. Cleared on
+/// `UnregisterDelegate` so an unregistered delegate can't accumulate state.
+///
+/// Concurrency: the runtime serializes calls into a given delegate instance
+/// (one WASM `process()` at a time), so two prompt round-trips on the same
+/// delegate cannot interleave context writes. Wrapped in `Arc` so a
+/// `RuntimePool` of `Runtime`s shares one cache: a delegate's first call
+/// might run on executor A and its `UserResponse` follow-up on executor B,
+/// so per-`Runtime` storage would have the same locality bug as the
+/// per-call `Vec`.
+pub(crate) type DelegateContextCache = Arc<DashMap<DelegateKey, Vec<u8>>>;
+
+pub(crate) fn new_delegate_context_cache() -> DelegateContextCache {
+    Arc::new(DashMap::default())
+}
 
 /// Tracks message origins inherited by child delegates from their parent.
 /// When a delegate with an origin contract creates a child, the child inherits

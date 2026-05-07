@@ -194,6 +194,10 @@ pub struct Runtime {
     pub(super) delegate_store: DelegateStore,
     /// LRU cache of compiled delegate modules (shared across pool executors).
     pub(super) delegate_modules: SharedModuleCache<DelegateKey>,
+    /// Persisted `ctx.write()` bytes per delegate, shared across pool
+    /// executors so a prompt round-trip routed to a different `Runtime` still
+    /// sees the pending state. See `native_api::DelegateContextCache`.
+    pub(super) delegate_contexts: super::native_api::DelegateContextCache,
 
     /// Local contract storage.
     pub(crate) contract_store: ContractStore,
@@ -241,6 +245,7 @@ impl Runtime {
 
             contract_store,
             delegate_modules: Arc::new(Mutex::new(LruCache::new(cache_capacity))),
+            delegate_contexts: super::native_api::new_delegate_context_cache(),
             state_store_db: None,
         })
     }
@@ -274,6 +279,10 @@ impl Runtime {
     /// Compiled modules store references to the compiling Engine's internal data
     /// structures. Using a Module compiled by one Engine in a Store backed by a
     /// different Engine causes SIGSEGV.
+    // Each parameter is a distinct shared resource the pool wires through
+    // explicitly; bundling them into a struct just to satisfy the lint
+    // would obscure which executor sees which cache.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_with_shared_module_caches(
         contract_store: ContractStore,
         delegate_store: DelegateStore,
@@ -281,6 +290,7 @@ impl Runtime {
         host_mem: bool,
         contract_modules: SharedModuleCache<ContractKey>,
         delegate_modules: SharedModuleCache<DelegateKey>,
+        delegate_contexts: super::native_api::DelegateContextCache,
         shared_backend: BackendEngine,
     ) -> RuntimeResult<Self> {
         let engine =
@@ -292,6 +302,7 @@ impl Runtime {
             contract_modules,
             contract_store,
             delegate_modules,
+            delegate_contexts,
             state_store_db: None,
         })
     }
