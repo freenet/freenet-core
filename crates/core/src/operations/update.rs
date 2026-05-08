@@ -1898,6 +1898,8 @@ pub(crate) async fn update_contract(
 
 /// This will be called from the node when processing an open request
 // todo: new_state should be a delta when possible!
+// Orphan after #1454 phase 5; deletion follows in commit 2.
+#[allow(dead_code)]
 pub(crate) fn start_op(
     key: ContractKey,
     update_data: UpdateData<'static>,
@@ -1953,6 +1955,8 @@ pub(crate) fn start_op_with_id(
 }
 
 /// Entry point from node to operations logic
+// Orphan after #1454 phase 5; deletion follows in commit 2.
+#[allow(dead_code)]
 pub(crate) async fn request_update(
     op_manager: &OpManager,
     mut update_op: UpdateOp,
@@ -2202,6 +2206,8 @@ pub(crate) async fn request_update(
     Ok(())
 }
 
+// Orphan after #1454 phase 5; deletion follows in commit 2.
+#[allow(dead_code)]
 async fn deliver_update_result(
     op_manager: &OpManager,
     id: Transaction,
@@ -2623,6 +2629,9 @@ pub struct FinishedData {
 }
 
 /// Data for the PrepareRequest state: client-initiated update being prepared.
+// Orphan after #1454 phase 5; deletion follows in commit 2 with the
+// surrounding `UpdateState::PrepareRequest` variant and `request_update`.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PrepareRequestData {
     pub key: ContractKey,
