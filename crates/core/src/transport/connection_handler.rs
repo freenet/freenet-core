@@ -428,8 +428,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
 pub struct ExpectedInboundTracker(Arc<DashSet<IpAddr>>);
 
 impl ExpectedInboundTracker {
-    /// Construct an empty tracker. Test-only — production code reaches a
-    /// tracker through `OutboundConnectionHandler::expected_inbound_tracker`.
+    /// Construct an empty tracker. Test-only; production code obtains one via
+    /// `OutboundConnectionHandler::expected_inbound_tracker`.
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
         ExpectedInboundTracker(Arc::new(DashSet::new()))

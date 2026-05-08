@@ -5374,21 +5374,14 @@ fn test_pending_op_results_bounded() {
          regression of #3100 (unbounded HashMap growth)"
     );
     let leak = inserts.saturating_sub(removes);
-    // The 10 → 30 → 60 threshold creep was driven entirely by
-    // simulation-shutdown noise (#4057): `handle.abort()` on each
-    // peer's event loop dropped `state.pending_op_results` without
-    // recording the corresponding removes, so `inserts > removes`
-    // even though the memory was freed. `EventListenerState::Drop`
-    // now records a remove for every entry still resident at exit,
-    // balancing the accounting on every event-loop exit path
-    // (graceful Shutdown, abort, Disconnect, unexpected stream end).
-    // The threshold can therefore return to a tight bound. A small
-    // allowance survives for the narrow window where a relay driver
-    // calls `release_pending_op_slot` AFTER the event loop's `state`
-    // has been dropped: the channel is closed, no remove is recorded
-    // by the warn arm, and the entry was never accounted for by Drop
-    // because it had been removed by the periodic cleanup at
-    // p2p_protoc.rs:967-986 first.
+    // Threshold previously crept 10 -> 30 -> 60 to absorb simulation-shutdown
+    // noise; #4057's `EventListenerState::Drop` now balances the accounting on
+    // every event-loop exit path, so the bound is back to a tight value. The
+    // small remaining allowance covers the race where a relay driver calls
+    // `release_pending_op_slot` AFTER the event loop's `state` has been
+    // dropped: the entry was already reclaimed by the periodic cleanup at
+    // p2p_protoc.rs:967-986, so neither Drop nor the warn arm records a
+    // remove for it.
     assert!(
         leak <= 5,
         "pending_op_results leak at shutdown: {leak} entries \
