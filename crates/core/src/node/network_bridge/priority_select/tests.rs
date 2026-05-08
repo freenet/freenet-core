@@ -2410,6 +2410,96 @@ async fn test_high_load_fairness_config(
     );
 }
 
+/// Regression test for issue #4056: a backlog of P7 (client transaction) items
+/// must drain at most O(burst + N) events behind a flood of tier-1 traffic, not
+/// O(burst × N).
+///
+/// Before #4056, each Phase 1 force-poll only released a single P7 item, so a
+/// backlog of N items needed N × MAX_HIGH_PRIORITY_BURST events to clear —
+/// causing the producer side (`waiting_for_transaction_result`, capacity 1000,
+/// 30s send-timeout) to saturate and time out under realistic concurrent
+/// multi-WebSocket PUT load on the production gateway.
+///
+/// The fix drains all currently-available P7 items into a per-stream buffer in
+/// a single Phase 1 entry, then returns them with absolute priority on
+/// subsequent `poll_next` calls (via Phase 0). Once the burst limit is hit,
+/// the queued P7 items appear within `burst + p7_count` indices.
+#[tokio::test]
+#[test_log::test]
+async fn test_p7_backlog_drains_in_one_burst_cycle() {
+    const P1_COUNT: usize = 5_000;
+    const P7_COUNT: usize = 200;
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+
+    let (notif_tx, notif_rx) = mpsc::channel(P1_COUNT + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (client_tx, client_rx) = mpsc::channel(P7_COUNT + 10);
+    let (_, executor_rx) = mpsc::channel::<Transaction>(1);
+
+    for _ in 0..P1_COUNT {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    for _ in 0..P7_COUNT {
+        client_tx.send(dummy_client_tx()).await.unwrap();
+    }
+    drop(notif_tx);
+    drop(client_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorReceiverStream { rx: executor_rx },
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = drain_stream(&mut stream, P1_COUNT + P7_COUNT + 20).await;
+
+    let total_notif = events.iter().filter(|&&e| e == "notification").count();
+    let total_client = events
+        .iter()
+        .filter(|&&e| e == "client_transaction")
+        .count();
+    assert_eq!(total_notif, P1_COUNT, "All P1 messages received");
+    assert_eq!(total_client, P7_COUNT, "All P7 messages received");
+
+    // The first P7 must appear no later than `burst` (anti-starvation kicks
+    // in after MAX_HIGH_PRIORITY_BURST tier-1 items).
+    let first_p7 = events
+        .iter()
+        .position(|&e| e == "client_transaction")
+        .unwrap();
+    assert!(
+        first_p7 <= burst,
+        "first P7 at index {first_p7} exceeds burst {burst}"
+    );
+
+    // The whole P7 backlog must clear in O(burst + P7_COUNT) events, not the
+    // O(burst × P7_COUNT) the pre-fix single-item drain produced. Tokio's
+    // mpsc cooperative budget yields `Pending` after a bounded number of
+    // `poll_recv` calls, so the backlog drains over a few burst windows
+    // rather than a single Phase 1 entry — the ×3 headroom absorbs that.
+    let last_p7 = events
+        .iter()
+        .rposition(|&e| e == "client_transaction")
+        .unwrap();
+    let expected_last_p7_max = (P7_COUNT + burst) * 3;
+    assert!(
+        last_p7 <= expected_last_p7_max,
+        "last P7 at index {last_p7} exceeds expected max {expected_last_p7_max} — \
+         backlog is not draining as a batch (regression of #4056). \
+         Pre-fix single-item drain landed last P7 at ≈P7_COUNT × burst = {}.",
+        P7_COUNT * burst
+    );
+}
+
 // =============================================================================
 // Handshake starvation tests (issue #3224)
 // =============================================================================

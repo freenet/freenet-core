@@ -281,7 +281,12 @@ pub(crate) fn contract_handler_channel() -> (
     ContractHandlerChannel<WaitingResolution>,
 ) {
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
-    let (wait_for_res_tx, wait_for_res_rx) = mpsc::channel(100);
+    // Capacity sized to comfortably absorb concurrent multi-WebSocket bursts
+    // (e.g. freenet-git's 8-way parallel chunked PUT pool) while the event
+    // loop's anti-starvation force-poll drains it. Smaller values caused
+    // 30s producer-side timeouts on the production gateway under realistic
+    // mirror traffic. See issue #4056.
+    let (wait_for_res_tx, wait_for_res_rx) = mpsc::channel(1000);
     (
         ContractHandlerChannel {
             end: SenderHalve {
@@ -962,9 +967,10 @@ pub mod test {
 
         let (send_halve, _rcv_halve, _wait_res) = contract_handler_channel();
 
-        // Fill the channel to capacity (100 items). We hold _wait_res so
+        // Fill the channel to capacity. We hold _wait_res so
         // the receiver isn't dropped (which would give a different error).
-        for _ in 0..100 {
+        let cap = send_halve.end.wait_for_res_tx.max_capacity();
+        for _ in 0..cap {
             let tx = Transaction::new::<PutMsg>();
             send_halve
                 .end
@@ -974,7 +980,7 @@ pub mod test {
                 .expect("channel should accept items up to capacity");
         }
 
-        // The 101st send should block, and with paused time we can
+        // The next send should block, and with paused time we can
         // advance past the timeout instantly.
         let tx = Transaction::new::<PutMsg>();
         let result = send_halve

@@ -3,6 +3,7 @@
 
 use either::Either;
 use futures::Stream;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
@@ -90,6 +91,12 @@ where
     /// When this reaches MAX_HIGH_PRIORITY_BURST, Tier-2 (P7-P8) and
     /// the Handshake channel are force-polled first to prevent starvation.
     high_priority_streak: u32,
+
+    /// P7/P8 items batch-drained during a Phase 1 force-poll. Returned with
+    /// absolute priority in Phase 0 so a backlog clears in O(N) rather than
+    /// O(N × burst). See `poll_next` Phase 1 for the full rationale (#4056).
+    p7_buffer: VecDeque<(ClientId, WaitingTransaction)>,
+    p8_buffer: VecDeque<Transaction>,
 }
 
 impl<H, C, E> PrioritySelectStream<H, C, E>
@@ -129,6 +136,8 @@ where
             client_transaction_closed: false,
             executor_transaction_closed: false,
             high_priority_streak: 0,
+            p7_buffer: VecDeque::new(),
+            p8_buffer: VecDeque::new(),
         }
     }
 
@@ -149,6 +158,17 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
+        // Phase 0: Return any P7/P8 items batch-drained by a previous
+        // Phase 1 force-poll. Absolute priority — see Phase 1 below (#4056).
+        if let Some(item) = this.p7_buffer.pop_front() {
+            this.high_priority_streak = 0;
+            return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(item))));
+        }
+        if let Some(item) = this.p8_buffer.pop_front() {
+            this.high_priority_streak = 0;
+            return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(item))));
+        }
 
         // Track if any channel closed (to report after checking all sources)
         let mut first_closed_channel: Option<SelectResult> = None;
@@ -189,41 +209,56 @@ where
                 }
             }
 
-            // Force-poll P7: Client transaction handler
+            // Force-poll P7: drain all currently-available items into the
+            // buffer, then return one. Subsequent `poll_next` calls return
+            // the rest in Phase 0. Single-item draining caused #4056: P7
+            // backlogs took N × burst events to clear under tier-1 flood.
             if !this.client_transaction_closed {
-                match Pin::new(&mut this.client_transaction_handler).poll_next(cx) {
-                    Poll::Ready(Some(result)) => {
-                        this.high_priority_streak = 0;
-                        return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))));
-                    }
-                    Poll::Ready(None) => {
-                        this.client_transaction_closed = true;
-                        if first_closed_channel.is_none() {
-                            first_closed_channel = Some(SelectResult::ClientTransaction(Err(
-                                anyhow::anyhow!("channel closed"),
-                            )));
+                loop {
+                    match Pin::new(&mut this.client_transaction_handler).poll_next(cx) {
+                        Poll::Ready(Some(result)) => {
+                            this.p7_buffer.push_back(result);
                         }
+                        Poll::Ready(None) => {
+                            this.client_transaction_closed = true;
+                            if first_closed_channel.is_none() {
+                                first_closed_channel = Some(SelectResult::ClientTransaction(Err(
+                                    anyhow::anyhow!("channel closed"),
+                                )));
+                            }
+                            break;
+                        }
+                        Poll::Pending => break,
                     }
-                    Poll::Pending => {}
+                }
+                if let Some(result) = this.p7_buffer.pop_front() {
+                    this.high_priority_streak = 0;
+                    return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))));
                 }
             }
 
-            // Force-poll P8: Executor transaction handler
+            // Force-poll P8: Executor transaction handler (same pattern as P7)
             if !this.executor_transaction_closed {
-                match Pin::new(&mut this.executor_transaction_handler).poll_next(cx) {
-                    Poll::Ready(Some(tx)) => {
-                        this.high_priority_streak = 0;
-                        return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(tx))));
-                    }
-                    Poll::Ready(None) => {
-                        this.executor_transaction_closed = true;
-                        if first_closed_channel.is_none() {
-                            first_closed_channel = Some(SelectResult::ExecutorTransaction(Err(
-                                anyhow::anyhow!("channel closed"),
-                            )));
+                loop {
+                    match Pin::new(&mut this.executor_transaction_handler).poll_next(cx) {
+                        Poll::Ready(Some(tx)) => {
+                            this.p8_buffer.push_back(tx);
                         }
+                        Poll::Ready(None) => {
+                            this.executor_transaction_closed = true;
+                            if first_closed_channel.is_none() {
+                                first_closed_channel = Some(SelectResult::ExecutorTransaction(
+                                    Err(anyhow::anyhow!("channel closed")),
+                                ));
+                            }
+                            break;
+                        }
+                        Poll::Pending => break,
                     }
-                    Poll::Pending => {}
+                }
+                if let Some(tx) = this.p8_buffer.pop_front() {
+                    this.high_priority_streak = 0;
+                    return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(tx))));
                 }
             }
 
