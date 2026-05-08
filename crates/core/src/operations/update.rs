@@ -114,6 +114,15 @@ pub(crate) struct BroadcastTargetResult {
     pub skipped_sender: usize,
 }
 
+// `UpdateOp` and its inherent impl + `IsOperationCompleted` impl
+// became orphan after #1454 phase 5 final retired the
+// `OpEnum::Update` carrier and the `ops.update` DashMap. The struct
+// (and its helper methods / `UpdateStats` / `UpdateState` /
+// `FinishedData`) are kept under `#[allow(dead_code)]` so the inline
+// tests in this module stay green; phase 6 will delete the carrier
+// and migrate the surviving outcome / failure-routing tests to the
+// task-per-tx driver tests in `op_ctx_task.rs`.
+#[allow(dead_code)]
 pub(crate) struct UpdateOp {
     pub id: Transaction,
     pub(crate) state: Option<UpdateState>,
@@ -123,6 +132,7 @@ pub(crate) struct UpdateOp {
     pub(crate) upstream_addr: Option<std::net::SocketAddr>,
 }
 
+#[allow(dead_code)]
 impl UpdateOp {
     pub fn id(&self) -> &Transaction {
         &self.id
@@ -252,6 +262,7 @@ impl UpdateOp {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct UpdateStats {
     pub(crate) target: Option<PeerKeyLocation>,
     pub(crate) contract_location: Option<Location>,
@@ -763,6 +774,7 @@ pub(crate) async fn update_contract(
     }
 }
 
+#[allow(dead_code)]
 impl IsOperationCompleted for UpdateOp {
     fn is_completed(&self) -> bool {
         matches!(self.state, Some(UpdateState::Finished(_)))
@@ -1119,6 +1131,7 @@ mod messages {
 ///
 /// The `Finished` state only indicates that the LOCAL update was applied successfully.
 /// It does NOT mean all subscribers have received the update - that's unknowable.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct FinishedData {
     pub key: ContractKey,
