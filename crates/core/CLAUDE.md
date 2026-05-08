@@ -79,7 +79,19 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              `start_relay_request_update_streaming`,
                              `start_relay_broadcast_to_streaming` —
                              claim inbound stream, assemble, apply
-                             locally; BroadcastStateChange propagates)
+                             locally; BroadcastStateChange propagates).
+                             **Phase 5 final** retired the legacy carrier:
+                             `OpEnum::Update`, `OpManager.ops.update`
+                             DashMap, `impl Operation for UpdateOp`,
+                             `request_update`, `start_op`,
+                             `has_update_op`, `remove_update_and_report_failure`,
+                             and the `handle_op_request<UpdateOp>`
+                             fallthrough in node.rs are all gone. Every
+                             UPDATE wire variant now dispatches
+                             unconditionally to a task-per-tx driver.
+                             `UpdateOp` itself plus 17 inline outcome /
+                             failure-routing tests survive under
+                             `#[allow(dead_code)]` pending phase 6.
   connect/op_ctx_task.rs   → client-initiated CONNECT driver (Phase 2c
                              slice 2, `start_client_connect`) + fresh
                              inbound relay CONNECT driver (Phase 2c

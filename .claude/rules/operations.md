@@ -38,9 +38,24 @@ paths:
 > inbound non-streaming relay `UpdateMsg::RequestUpdate` and
 > `UpdateMsg::BroadcastTo` to
 > `operations/update/op_ctx_task.rs::start_relay_request_update` /
-> `start_relay_broadcast_to` (gated on `source_addr.is_some()` AND
-> `!has_update_op(id)`); GC retries / `start_targeted_op` UPDATE
-> auto-fetch / originator loopback still go through legacy. Phase 5
+> `start_relay_broadcast_to` (originally gated on
+> `source_addr.is_some()` AND `!has_update_op(id)`).
+>
+> **#1454 phase 5 final (UPDATE slice) retired the entire legacy
+> UPDATE state-machine path.** `OpEnum::Update`, `OpManager.ops.update`
+> DashMap, `impl Operation for UpdateOp`, `request_update` /
+> `start_op` / `start_op_with_id`, `has_update_op`,
+> `remove_update_and_report_failure`, and the
+> `handle_op_request<UpdateOp>` fallthrough in node.rs are all gone.
+> Every UPDATE wire variant now dispatches unconditionally to a
+> task-per-tx driver — the `!has_update_op(id)` guard was redundant
+> because the DashMap could no longer be populated (every writer
+> lived inside the deleted `process_message`). The dead executor
+> network UPDATE path (`UpdateContract` /
+> `ComposeNetworkMessage<UpdateOp>` / network branch of
+> `perform_contract_update`) was retired in commit 1; it had been
+> unreachable in production because no `OperationMode::Network`
+> constructor exists in the tree. Phase 5
 > follow-up slice A (PR #3917) migrated fresh inbound non-streaming
 > relay `PutMsg::Request` to
 > `operations/put/op_ctx_task.rs::start_relay_put` (gated on
