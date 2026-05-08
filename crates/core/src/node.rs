@@ -1580,51 +1580,38 @@ where
                         // fall through to legacy for GC / originator-loopback
                         // paths. Wildcard arm exists ONLY to satisfy
                         // non-exhaustive matches; do not expand.
-                        _ => {}
-                    }
-                }
-
-                let op_result = handle_op_request::<update::UpdateOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    source_addr,
-                )
-                .await;
-
-                // Handle pending operation results (network concern)
-                forward_pending_op_result_if_completed(
-                    &op_result,
-                    pending_op_result.as_ref(),
-                    NetMessage::V1(NetMessageV1::Update((*op).clone())),
-                );
-
-                if let Err(OpError::OpNotAvailable(state)) = &op_result {
-                    match state {
-                        OpNotAvailable::Running => {
-                            let delay = op_retry_backoff(i);
-                            tracing::debug!(
-                                delay_ms = delay.as_millis() as u64,
-                                attempt = i,
-                                "Pure network: Operation still running, backing off"
+                        _ => {
+                            // #1454 phase 5 final: legacy
+                            // `handle_op_request::<UpdateOp>` fallthrough has
+                            // been retired together with
+                            // `impl Operation for UpdateOp`. Every reachable
+                            // UPDATE wire variant is dispatched above:
+                            // RequestUpdate / BroadcastTo (slice A) and
+                            // their Streaming counterparts (slice C). A new
+                            // variant arriving here means a missing dispatch
+                            // case; log + drop instead of panicking.
+                            tracing::warn!(
+                                tx = %op.id(),
+                                ?op,
+                                "UPDATE: unhandled variant after task-per-tx \
+                                 dispatch (legacy fallthrough retired in \
+                                 #1454 phase 5 final)"
                             );
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        OpNotAvailable::Completed => {
-                            tracing::debug!("Pure network: Operation already completed");
-                            return Ok(None);
                         }
                     }
+                } else {
+                    // source_addr.is_none() — internal caller. Phase 4
+                    // migrated client UPDATEs to `start_client_update`;
+                    // there are no other internal originators after the
+                    // executor UPDATE path was retired in commit 1.
+                    tracing::debug!(
+                        tx = %op.id(),
+                        ?op,
+                        "UPDATE: internal-source variant ignored — no legacy \
+                         fallthrough after #1454 phase 5 final"
+                    );
                 }
-
-                return handle_pure_network_result(
-                    tx,
-                    op_result,
-                    &op_manager,
-                    &mut *event_listener,
-                )
-                .await;
+                return Ok(None);
             }
             NetMessageV1::Subscribe(ref op) => {
                 // Phase 2b (#1454): task-per-tx bypass for client-initiated

@@ -2237,19 +2237,14 @@ mod tests {
     /// once removed.
     #[test]
     fn has_update_op_returns_true_after_insert_false_after_remove() {
-        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
-
         let ops = Ops::default();
-        let instance_id = ContractInstanceId::new([0u8; 32]);
-        let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([1u8; 32]));
-        let update_op = crate::operations::update::start_op(
-            key,
-            freenet_stdlib::prelude::UpdateData::State(freenet_stdlib::prelude::State::from(vec![
-                1, 2, 3,
-            ])),
-            freenet_stdlib::prelude::RelatedContracts::default(),
-        );
-        let tx = update_op.id;
+        let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
+        let update_op = crate::operations::update::UpdateOp {
+            id: tx,
+            state: None,
+            stats: None,
+            upstream_addr: None,
+        };
 
         assert!(
             !ops.update.contains_key(&tx),
