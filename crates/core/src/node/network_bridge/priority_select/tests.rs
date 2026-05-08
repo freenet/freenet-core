@@ -2500,6 +2500,274 @@ async fn test_p7_backlog_drains_in_one_burst_cycle() {
     );
 }
 
+/// P8 (executor transaction) symmetric regression test for #4056. The fix
+/// applies the same drain-into-buffer pattern to both Tier-2 channels; this
+/// pins the P8 path so a future refactor that diverges them fails CI.
+#[tokio::test]
+#[test_log::test]
+async fn test_p8_backlog_drains_in_one_burst_cycle() {
+    const P1_COUNT: usize = 5_000;
+    const P8_COUNT: usize = 200;
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+
+    let (notif_tx, notif_rx) = mpsc::channel(P1_COUNT + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (_, client_rx) = mpsc::channel(1);
+    let (executor_tx, executor_rx) = mpsc::channel::<Transaction>(P8_COUNT + 10);
+
+    for _ in 0..P1_COUNT {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    for _ in 0..P8_COUNT {
+        executor_tx
+            .send(crate::message::Transaction::new::<
+                crate::operations::put::PutMsg,
+            >())
+            .await
+            .unwrap();
+    }
+    drop(notif_tx);
+    drop(executor_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorReceiverStream { rx: executor_rx },
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = drain_stream(&mut stream, P1_COUNT + P8_COUNT + 20).await;
+
+    let total_notif = events.iter().filter(|&&e| e == "notification").count();
+    let total_executor = events
+        .iter()
+        .filter(|&&e| e == "executor_transaction")
+        .count();
+    assert_eq!(total_notif, P1_COUNT);
+    assert_eq!(total_executor, P8_COUNT);
+
+    let last_p8 = events
+        .iter()
+        .rposition(|&e| e == "executor_transaction")
+        .unwrap();
+    let expected_max = (P8_COUNT + burst) * 3;
+    assert!(
+        last_p8 <= expected_max,
+        "last P8 at index {} exceeds expected max {} — P8 drain regression",
+        last_p8,
+        expected_max
+    );
+}
+
+/// Regression test for review feedback on #4056: a handshake event arriving
+/// AFTER the P7 buffer is loaded must NOT wait for the entire buffer to
+/// drain. The Phase 0 handshake yield restores the bounded
+/// handshake-latency invariant added in #3224.
+///
+/// To deterministically trigger the buggy ordering, we wrap the handshake
+/// receiver in a custom stream that holds back the event until the P7
+/// buffer is in mid-drain (signalled by an external counter the
+/// PrioritySelectStream's P7 polls increment).
+#[tokio::test]
+#[test_log::test]
+async fn test_handshake_yields_during_p7_buffer_drain() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const P1_COUNT: usize = 100;
+    const P7_COUNT: usize = 200;
+    // Release the handshake event after the Phase 1 force-poll has loaded
+    // the buffer and Phase 0 has returned at least 5 items — i.e. clearly
+    // mid-drain, so the regression behaviour (handshake waits for full
+    // drain) would land it at index ≥ burst + P7_COUNT.
+    const RELEASE_AFTER: usize = 5;
+
+    /// Wrapper that releases the wrapped event only after `counter` reaches
+    /// `release_after`.
+    struct GatedHandshakeStream {
+        event: Option<crate::node::network_bridge::handshake::Event>,
+        counter: Arc<AtomicUsize>,
+        release_after: usize,
+        emitted: bool,
+    }
+    impl Stream for GatedHandshakeStream {
+        type Item = crate::node::network_bridge::handshake::Event;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if self.emitted {
+                return Poll::Pending;
+            }
+            if self.counter.load(Ordering::SeqCst) >= self.release_after {
+                self.emitted = true;
+                let ev = self.event.take().expect("event was already taken");
+                return Poll::Ready(Some(ev));
+            }
+            // Make sure we get re-polled.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    /// Wrapper that increments a counter on every successful poll_next, so
+    /// the gated handshake can know when P7 drains have started.
+    struct CountingClientStream {
+        rx: mpsc::Receiver<(ClientId, WaitingTransaction)>,
+        counter: Arc<AtomicUsize>,
+    }
+    impl Stream for CountingClientStream {
+        type Item = (ClientId, WaitingTransaction);
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match Pin::new(&mut self.rx).poll_recv(cx) {
+                Poll::Ready(Some(item)) => {
+                    self.counter.fetch_add(1, Ordering::SeqCst);
+                    Poll::Ready(Some(item))
+                }
+                other => other,
+            }
+        }
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let (notif_tx, notif_rx) = mpsc::channel(P1_COUNT + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (client_tx, client_rx) = mpsc::channel(P7_COUNT + 10);
+    let (_, executor_rx) = mpsc::channel::<Transaction>(1);
+
+    for _ in 0..P1_COUNT {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    for _ in 0..P7_COUNT {
+        client_tx.send(dummy_client_tx()).await.unwrap();
+    }
+    drop(notif_tx);
+    drop(client_tx);
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        GatedHandshakeStream {
+            event: Some(dummy_handshake_event()),
+            counter: counter.clone(),
+            release_after: RELEASE_AFTER,
+            emitted: false,
+        },
+        node_rx,
+        CountingClientStream {
+            rx: client_rx,
+            counter: counter.clone(),
+        },
+        MockExecutorReceiverStream { rx: executor_rx },
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    let events = drain_stream(&mut stream, P1_COUNT + P7_COUNT + 20).await;
+
+    let hs_idx = events
+        .iter()
+        .position(|&e| e == "handshake")
+        .expect("handshake event must be delivered");
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+    // With the Phase 0 handshake yield, the handshake fires within
+    // `burst + RELEASE_AFTER + 1` events — the burst's worth of P1, the
+    // first P7 returned by Phase 1 plus a few buffered drains, then the
+    // very next Phase 0 call yields the handshake. Without the yield,
+    // handshake would wait until the entire P7 buffer flushed and would
+    // land near `burst + P7_COUNT`.
+    let hs_max_acceptable = burst + RELEASE_AFTER + 4;
+    assert!(
+        hs_idx <= hs_max_acceptable,
+        "handshake delivered at index {} but should land within {} \
+         (burst {} + release-after {} + epsilon). Without the Phase 0 \
+         yield, handshake waits for the full P7 buffer to drain (~{}).",
+        hs_idx,
+        hs_max_acceptable,
+        burst,
+        RELEASE_AFTER,
+        burst + P7_COUNT
+    );
+}
+
+/// Regression test for review feedback on #4056: when P7 channel closes
+/// while the buffer holds drained items, the closure-signal `Err` must
+/// still be emitted exactly once after the buffer drains. The pre-fix
+/// "set client_transaction_closed = true" + "first_closed_channel" path
+/// silently lost the signal because the buffer return preempted it and
+/// future polls don't re-poll the closed receiver.
+#[tokio::test]
+#[test_log::test]
+async fn test_p7_close_signal_emitted_after_buffer_drain() {
+    const P1_COUNT: usize = 50;
+    const P7_COUNT: usize = 5;
+    let burst = PrioritySelectStream::<MockHandshakeStream, MockClientStream, MockExecutorStream>::MAX_HIGH_PRIORITY_BURST as usize;
+    assert!(P1_COUNT > burst, "need a force-poll trigger");
+
+    let (notif_tx, notif_rx) = mpsc::channel(P1_COUNT + 10);
+    let (_, op_rx) = mpsc::channel(1);
+    let (_, conn_event_rx) = mpsc::channel(1);
+    let (_, bridge_rx) = mpsc::channel(1);
+    let (_, node_rx) = mpsc::channel(1);
+    let (client_tx, client_rx) = mpsc::channel(P7_COUNT + 10);
+    let (_, executor_rx) = mpsc::channel::<Transaction>(1);
+
+    for _ in 0..P1_COUNT {
+        notif_tx.send(dummy_notif_msg()).await.unwrap();
+    }
+    for _ in 0..P7_COUNT {
+        client_tx.send(dummy_client_tx()).await.unwrap();
+    }
+    drop(notif_tx);
+    drop(client_tx); // Closure happens AFTER P7 items are queued.
+
+    let stream = PrioritySelectStream::new(
+        notif_rx,
+        op_rx,
+        bridge_rx,
+        create_mock_handshake_stream(),
+        node_rx,
+        MockClientReceiverStream { rx: client_rx },
+        MockExecutorReceiverStream { rx: executor_rx },
+        conn_event_rx,
+    );
+    tokio::pin!(stream);
+
+    // Drive the stream and capture whether the closure signal `Err` was
+    // delivered. `drain_stream` skips closure signals; use a direct loop
+    // instead so we can detect them.
+    use futures::StreamExt;
+    let mut p7_oks = 0usize;
+    let mut p7_close_seen = false;
+    for _ in 0..(P1_COUNT + P7_COUNT + 20) {
+        match tokio::time::timeout(std::time::Duration::from_millis(50), stream.as_mut().next())
+            .await
+        {
+            Ok(Some(SelectResult::ClientTransaction(Ok(_)))) => p7_oks += 1,
+            Ok(Some(SelectResult::ClientTransaction(Err(_)))) => p7_close_seen = true,
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+
+    assert_eq!(p7_oks, P7_COUNT, "all P7 items must be delivered");
+    assert!(
+        p7_close_seen,
+        "P7 channel-closed Err must be emitted after the buffer drains \
+         (regression of the lost-closure-signal review finding)"
+    );
+}
+
 // =============================================================================
 // Handshake starvation tests (issue #3224)
 // =============================================================================

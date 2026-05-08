@@ -97,6 +97,16 @@ where
     /// O(N × burst). See `poll_next` Phase 1 for the full rationale (#4056).
     p7_buffer: VecDeque<(ClientId, WaitingTransaction)>,
     p8_buffer: VecDeque<Transaction>,
+
+    /// Closure of the P7/P8 channels detected during a Phase 1 drain that
+    /// also collected items into the buffer. We defer emitting the
+    /// `SelectResult::*(Err(channel closed))` notification until the
+    /// buffer drains; otherwise the buffer return preempts the closure
+    /// signal and the consumer never learns the channel closed (the
+    /// `client_transaction_closed` / `executor_transaction_closed` flags
+    /// keep us from re-polling, so the signal would be lost forever).
+    p7_close_pending: bool,
+    p8_close_pending: bool,
 }
 
 impl<H, C, E> PrioritySelectStream<H, C, E>
@@ -138,6 +148,8 @@ where
             high_priority_streak: 0,
             p7_buffer: VecDeque::new(),
             p8_buffer: VecDeque::new(),
+            p7_close_pending: false,
+            p8_close_pending: false,
         }
     }
 
@@ -159,8 +171,27 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        // Phase 0: Return any P7/P8 items batch-drained by a previous
-        // Phase 1 force-poll. Absolute priority — see Phase 1 below (#4056).
+        // Phase 0: Return P7/P8 items batch-drained by a previous Phase 1
+        // force-poll. Absolute priority over Tier-1 — see Phase 1 below
+        // (#4056). Yield to handshake first, though, so a long buffer drain
+        // doesn't delay connection-lifecycle events past the bound added
+        // in #3224.
+        let buffer_has_items = !this.p7_buffer.is_empty() || !this.p8_buffer.is_empty();
+        if buffer_has_items && !this.handshake_closed {
+            match Pin::new(&mut this.handshake_handler).poll_next(cx) {
+                Poll::Ready(Some(event)) => {
+                    this.high_priority_streak = 0;
+                    return Poll::Ready(Some(SelectResult::Handshake(Some(event))));
+                }
+                Poll::Ready(None) => {
+                    this.handshake_closed = true;
+                    // Don't preempt buffer drain with the closure signal;
+                    // it'll be re-discovered by Phase 1/2 once the buffer
+                    // empties.
+                }
+                Poll::Pending => {}
+            }
+        }
         if let Some(item) = this.p7_buffer.pop_front() {
             this.high_priority_streak = 0;
             return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(item))));
@@ -168,6 +199,20 @@ where
         if let Some(item) = this.p8_buffer.pop_front() {
             this.high_priority_streak = 0;
             return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(item))));
+        }
+        // Buffer just drained; emit any closure signal Phase 1 deferred
+        // so the consumer learns the channel closed exactly once.
+        if this.p7_close_pending {
+            this.p7_close_pending = false;
+            return Poll::Ready(Some(SelectResult::ClientTransaction(Err(anyhow::anyhow!(
+                "channel closed"
+            )))));
+        }
+        if this.p8_close_pending {
+            this.p8_close_pending = false;
+            return Poll::Ready(Some(SelectResult::ExecutorTransaction(Err(
+                anyhow::anyhow!("channel closed"),
+            ))));
         }
 
         // Track if any channel closed (to report after checking all sources)
@@ -209,10 +254,17 @@ where
                 }
             }
 
-            // Force-poll P7: drain all currently-available items into the
-            // buffer, then return one. Subsequent `poll_next` calls return
-            // the rest in Phase 0. Single-item draining caused #4056: P7
-            // backlogs took N × burst events to clear under tier-1 flood.
+            // Force-poll P7 and P8: drain all currently-available items
+            // into their buffers, then return one (P7 first). Subsequent
+            // `poll_next` calls return the rest via Phase 0. Single-item
+            // draining caused #4056: P7 backlogs took N × burst events to
+            // clear under tier-1 flood.
+            //
+            // We drain BOTH channels before returning so a sustained P7
+            // flood can't starve P8 — under the old single-poll approach,
+            // P8 was reachable here only when P7 was empty in the same
+            // call (and the same is true today inside Phase 2's strict
+            // priority order).
             if !this.client_transaction_closed {
                 loop {
                     match Pin::new(&mut this.client_transaction_handler).poll_next(cx) {
@@ -221,23 +273,25 @@ where
                         }
                         Poll::Ready(None) => {
                             this.client_transaction_closed = true;
-                            if first_closed_channel.is_none() {
-                                first_closed_channel = Some(SelectResult::ClientTransaction(Err(
-                                    anyhow::anyhow!("channel closed"),
-                                )));
+                            // If items were buffered before the closure, defer
+                            // emitting the closure signal until Phase 0 has
+                            // returned them; otherwise the buffer return would
+                            // preempt and the closure would be lost forever.
+                            if this.p7_buffer.is_empty() {
+                                if first_closed_channel.is_none() {
+                                    first_closed_channel = Some(SelectResult::ClientTransaction(
+                                        Err(anyhow::anyhow!("channel closed")),
+                                    ));
+                                }
+                            } else {
+                                this.p7_close_pending = true;
                             }
                             break;
                         }
                         Poll::Pending => break,
                     }
                 }
-                if let Some(result) = this.p7_buffer.pop_front() {
-                    this.high_priority_streak = 0;
-                    return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))));
-                }
             }
-
-            // Force-poll P8: Executor transaction handler (same pattern as P7)
             if !this.executor_transaction_closed {
                 loop {
                     match Pin::new(&mut this.executor_transaction_handler).poll_next(cx) {
@@ -246,20 +300,28 @@ where
                         }
                         Poll::Ready(None) => {
                             this.executor_transaction_closed = true;
-                            if first_closed_channel.is_none() {
-                                first_closed_channel = Some(SelectResult::ExecutorTransaction(
-                                    Err(anyhow::anyhow!("channel closed")),
-                                ));
+                            if this.p8_buffer.is_empty() {
+                                if first_closed_channel.is_none() {
+                                    first_closed_channel = Some(SelectResult::ExecutorTransaction(
+                                        Err(anyhow::anyhow!("channel closed")),
+                                    ));
+                                }
+                            } else {
+                                this.p8_close_pending = true;
                             }
                             break;
                         }
                         Poll::Pending => break,
                     }
                 }
-                if let Some(tx) = this.p8_buffer.pop_front() {
-                    this.high_priority_streak = 0;
-                    return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(tx))));
-                }
+            }
+            if let Some(result) = this.p7_buffer.pop_front() {
+                this.high_priority_streak = 0;
+                return Poll::Ready(Some(SelectResult::ClientTransaction(Ok(result))));
+            }
+            if let Some(tx) = this.p8_buffer.pop_front() {
+                this.high_priority_streak = 0;
+                return Poll::Ready(Some(SelectResult::ExecutorTransaction(Ok(tx))));
             }
 
             // Neither Handshake, P7, nor P8 yielded an item. Decide whether to reset streak:
