@@ -5376,16 +5376,18 @@ fn test_pending_op_results_bounded() {
     let leak = inserts.saturating_sub(removes);
     // Threshold previously crept 10 -> 30 -> 60 to absorb simulation-shutdown
     // noise; #4057's `EventListenerState::Drop` now balances the accounting on
-    // every event-loop exit path, so the bound is back to a tight value. The
-    // small remaining allowance covers the race where a relay driver calls
-    // `release_pending_op_slot` AFTER the event loop's `state` has been
-    // dropped: the entry was already reclaimed by the periodic cleanup at
-    // p2p_protoc.rs:967-986, so neither Drop nor the warn arm records a
-    // remove for it.
-    assert!(
-        leak <= 5,
+    // every event-loop exit path. With the simulation runner on a single
+    // `current_thread` runtime (so all peers share one set of thread-local
+    // counters with this test), the leak should be exactly zero: any entry
+    // resident in the map at exit is counted by Drop, and any entry already
+    // gone was counted by whichever code path removed it (TransactionCompleted/
+    // TransactionTimedOut handler, periodic cleanup, or graceful Shutdown).
+    // Asserting `== 0` rather than `<= N` removes the slow-creep failure mode
+    // that drove the original 10 -> 30 -> 60 history.
+    assert_eq!(
+        leak, 0,
         "pending_op_results leak at shutdown: {leak} entries \
-         (inserts={inserts}, removes={removes}) — significant leak detected"
+         (inserts={inserts}, removes={removes})"
     );
 }
 

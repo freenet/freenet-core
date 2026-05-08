@@ -4751,6 +4751,11 @@ impl Drop for EventListenerState {
         // unexpected stream end). Memory is freed regardless; only the metric
         // backing #3100's regression guard `test_pending_op_results_bounded`
         // depends on this, so a missed remove looks like a phantom leak (#4057).
+        //
+        // No double-counting on graceful Shutdown: the explicit drain at the
+        // ClosedChannel(ChannelCloseReason::Shutdown) branch above already
+        // records `pending_count` removes and then `pending_op_results.drain()`
+        // empties the map, so the loop below sees `len() == 0`.
         for _ in 0..self.pending_op_results.len() {
             crate::config::GlobalTestMetrics::record_pending_op_remove();
         }
