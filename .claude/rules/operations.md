@@ -22,8 +22,8 @@ paths:
 > `OpManager.ops.*`, so rules below that talk about "pushing state" /
 > `load_or_init` / `handle_op_result` apply only to the **legacy
 > state-machine path**, which still serves: GC-spawned GET retries and
-> `start_targeted_op` UPDATE-triggered auto-fetch (streaming relay and
-> originator loopback also remain on legacy per #3883 port plan §7),
+> `start_targeted_op` (a GET legacy entry point invoked from UPDATE's
+> auto-fetch — spawns `OpEnum::Get`, not `OpEnum::Update`),
 > PUT GC / streaming / originator-loopback paths, CONNECT's joiner
 > branches reachable only from in-file unit tests + the legacy
 > stateless `ObservedAddress` path in `load_or_init` (relay CONNECT
@@ -144,8 +144,9 @@ paths:
 > oneshot (`SubOpGetOutcome`). The legacy `request_get` driver and
 > `get::start_op` constructor were retired in this migration; the
 > executor's `GetContract` / `ComposeNetworkMessage<GetOp>` impl is
-> deleted. Legacy `start_targeted_op` (UPDATE-triggered auto-fetch)
-> remains on legacy. The executor's `op_request` mediator path is
+> deleted. `start_targeted_op` (the GET legacy entry point that
+> UPDATE's auto-fetch spawns as a `OpEnum::Get`) remains on the
+> legacy GET path. The executor's `op_request` mediator path is
 > bypassed for GET; the spawned sub-op task can outlive its caller's
 > outer timeout (e.g., `RELATED_FETCH_TIMEOUT = 10s` wrapping
 > `local_state_or_from_network`'s 120 s receiver timeout) — receiver
