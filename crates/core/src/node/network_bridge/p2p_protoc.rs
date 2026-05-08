@@ -4744,6 +4744,24 @@ impl EventListenerState {
     }
 }
 
+impl Drop for EventListenerState {
+    fn drop(&mut self) {
+        // Mirror the explicit drain on `Shutdown` (see this file's
+        // pending_op_results.drain() block) for *all* event-loop exit
+        // paths — including `handle.abort()` from simulation teardown,
+        // `Disconnect` events, and unexpected stream end. Without this,
+        // entries still resident in `pending_op_results` at exit are
+        // dropped without their `record_pending_op_remove` accounting,
+        // creating a phantom "leak" in the metric used by #3100's
+        // regression guard `test_pending_op_results_bounded`. The
+        // memory is freed either way; only the metric was wrong.
+        let remaining = self.pending_op_results.len();
+        for _ in 0..remaining {
+            crate::config::GlobalTestMetrics::record_pending_op_remove();
+        }
+    }
+}
+
 enum EventResult {
     Continue,
     Event(Box<ConnEvent>),
@@ -5435,6 +5453,52 @@ mod tests {
              This test validates the bug exists when drain is missing.",
             count
         );
+    }
+
+    /// Regression guard for #4057: `EventListenerState::Drop` must record
+    /// a `pending_op_remove` for every entry still resident in
+    /// `pending_op_results` at the time the state is dropped. Without
+    /// this, simulation `handle.abort()` shutdowns inflate
+    /// `inserts - removes` in the global metric and trip the
+    /// `test_pending_op_results_bounded` regression guard for #3100.
+    #[test]
+    fn event_listener_state_drop_records_remaining_pending_op_removes() {
+        use crate::config::GlobalTestMetrics;
+        use crate::message::Transaction;
+        use crate::transport::ExpectedInboundTracker;
+
+        let removes_before = GlobalTestMetrics::pending_op_removes();
+
+        // Build a state with a few pending entries, then drop it.
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        for _ in 0..3 {
+            let (callback, _rx) = mpsc::channel(1);
+            state
+                .pending_op_results
+                .insert(Transaction::ttl_transaction(), callback);
+        }
+        assert_eq!(state.pending_op_results.len(), 3);
+        drop(state);
+
+        let recorded = GlobalTestMetrics::pending_op_removes() - removes_before;
+        assert_eq!(
+            recorded, 3,
+            "Drop must record one pending_op_remove per resident entry; \
+             got {recorded} (expected 3)"
+        );
+    }
+
+    /// Companion to the test above: a clean drop of an empty state must
+    /// not record any spurious removes.
+    #[test]
+    fn event_listener_state_drop_empty_records_nothing() {
+        use crate::config::GlobalTestMetrics;
+        use crate::transport::ExpectedInboundTracker;
+
+        let removes_before = GlobalTestMetrics::pending_op_removes();
+        let state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        drop(state);
+        assert_eq!(GlobalTestMetrics::pending_op_removes(), removes_before);
     }
 
     /// Test that connection_id generation produces unique, monotonically increasing IDs.

@@ -5374,26 +5374,23 @@ fn test_pending_op_results_bounded() {
          regression of #3100 (unbounded HashMap growth)"
     );
     let leak = inserts.saturating_sub(removes);
-    // Threshold relaxed from 10 → 30 alongside #1454 phase 2c slice 2,
-    // and from 30 → 60 alongside #1454 phase 2c slice 1 (the CONNECT
-    // RELAY task-per-tx driver in addition to the originator):
-    // simulation-shutdown-induced cancels race the
-    // `release_pending_op_slot` cleanup at the end of each driver's
-    // `run_relay_*`. The 60s sweep at p2p_protoc.rs:967-986 reclaims
-    // the entries in production; for short-running simulations the
-    // leak count maps to the number of in-flight relay drivers
-    // cancelled by node teardown — bounded by the number of relay
-    // hops × the number of CONNECT operations active at shutdown.
-    // The skip-if-closed gate at handle_op_execution prevents leaks
-    // when the driver's receiver closes BEFORE the event-loop
-    // processes the insert; the residual ≤60 cases are receivers
-    // closed AFTER insert. The Drop impls of `Relay*InflightGuard`
-    // are sync and cannot call the async `release_pending_op_slot`,
-    // so the only options are bumping the threshold or migrating to
-    // an explicit `tokio::spawn` from Drop — Phase 6 cleanup will
-    // revisit alongside the legacy-arm cleanup pass.
+    // The 10 → 30 → 60 threshold creep was driven entirely by
+    // simulation-shutdown noise (#4057): `handle.abort()` on each
+    // peer's event loop dropped `state.pending_op_results` without
+    // recording the corresponding removes, so `inserts > removes`
+    // even though the memory was freed. `EventListenerState::Drop`
+    // now records a remove for every entry still resident at exit,
+    // balancing the accounting on every event-loop exit path
+    // (graceful Shutdown, abort, Disconnect, unexpected stream end).
+    // The threshold can therefore return to a tight bound. A small
+    // allowance survives for the narrow window where a relay driver
+    // calls `release_pending_op_slot` AFTER the event loop's `state`
+    // has been dropped: the channel is closed, no remove is recorded
+    // by the warn arm, and the entry was never accounted for by Drop
+    // because it had been removed by the periodic cleanup at
+    // p2p_protoc.rs:967-986 first.
     assert!(
-        leak <= 60,
+        leak <= 5,
         "pending_op_results leak at shutdown: {leak} entries \
          (inserts={inserts}, removes={removes}) — significant leak detected"
     );
