@@ -302,7 +302,10 @@ pub(crate) enum OpEnum {
     Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
-    Update(update::UpdateOp),
+    // `Update` variant retired in #1454 phase 5 final together with the
+    // `ops.update` DashMap. UPDATE wire flows now run on task-per-tx
+    // drivers in `update::op_ctx_task::*` and never produce an
+    // `OpEnum::Update`.
 }
 
 impl OpEnum {
@@ -312,7 +315,6 @@ impl OpEnum {
             OpEnum::Put(op) => op,
             OpEnum::Get(op) => op,
             OpEnum::Subscribe(op) => op,
-            OpEnum::Update(op) => op,
         } {
             pub fn id(&self) -> &Transaction;
             pub fn outcome(&self) -> OpOutcome<'_>;
@@ -353,7 +355,6 @@ try_from_op_enum!(
     subscribe::SubscribeOp,
     TransactionType::Subscribe
 );
-try_from_op_enum!(OpEnum::Update, update::UpdateOp, TransactionType::Update);
 
 #[derive(Debug)]
 pub(crate) enum OpOutcome<'a> {

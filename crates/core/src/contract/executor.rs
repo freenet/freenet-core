@@ -682,6 +682,13 @@ mod sealed {
     impl ChannelHalve for Callback {}
 }
 
+// `ComposeNetworkMessage` was the executor → event-loop adapter trait
+// for op_request mediator dispatch. Its last implementor (UpdateContract)
+// was retired in #1454 phase 5. The trait, `op_request` method, and
+// `op_request_channel`/`run_op_request_mediator` plumbing remain in the
+// tree as orphan scaffolding pending a phase 6 cleanup PR (their removal
+// cascades through Executor::new, RuntimePool, and p2p_impl wiring).
+#[allow(dead_code)]
 trait ComposeNetworkMessage<Op>
 where
     Self: Sized,
@@ -701,10 +708,11 @@ where
 // `subscribe::run_executor_subscribe` directly (mirrors
 // `local_state_or_from_network` for GET).
 
-struct UpdateContract {
-    key: ContractKey,
-    new_state: WrappedState,
-}
+// `UpdateContract` and its `ComposeNetworkMessage<UpdateOp>` impl were
+// retired in #1454 phase 5: the only callsite (the network branch of
+// `perform_contract_update` in runtime.rs) was unreachable because no
+// production code constructs `OperationMode::Network`. Network-mode
+// UPDATEs flow through `start_client_update` (client_events.rs).
 
 #[derive(Debug)]
 pub(crate) enum UpsertResult {
@@ -715,27 +723,6 @@ pub(crate) enum UpsertResult {
     /// The current state won the CRDT merge - incoming was rejected.
     /// Contains the winning current state which should be propagated.
     CurrentWon(WrappedState),
-}
-
-impl ComposeNetworkMessage<operations::update::UpdateOp> for UpdateContract {
-    fn initiate_op(self, _op_manager: &OpManager) -> operations::update::UpdateOp {
-        let UpdateContract { key, new_state } = self;
-        let related_contracts = RelatedContracts::default();
-        // Wrap the computed state as UpdateData::State for the update operation.
-        // The executor computes state without committing, expecting update_contract
-        // to handle persistence and change detection.
-        let update_data = freenet_stdlib::prelude::UpdateData::State(
-            freenet_stdlib::prelude::State::from(new_state),
-        );
-        operations::update::start_op(key, update_data, related_contracts)
-    }
-
-    async fn resume_op(
-        op: operations::update::UpdateOp,
-        op_manager: &OpManager,
-    ) -> Result<(), OpError> {
-        operations::update::request_update(op_manager, op).await
-    }
 }
 
 pub(crate) trait ContractExecutor: Send + 'static {
@@ -877,6 +864,10 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     init_tracker: ContractInitTracker,
 
     /// Channel to send operation requests to the event loop (cloneable).
+    /// Orphan after #1454 phase 5; kept threaded through pool builders to
+    /// minimize churn in this slice. See `ComposeNetworkMessage` comment
+    /// above for the planned phase 6 cleanup.
+    #[allow(dead_code)]
     op_sender: Option<OpRequestSender>,
     /// Reference to the operation manager for initiating operations.
     op_manager: Option<Arc<OpManager>>,
@@ -1021,6 +1012,8 @@ where
         Ok((contract_store, delegate_store, secret_store))
     }
 
+    // Orphan after #1454 phase 5; see `ComposeNetworkMessage` comment.
+    #[allow(dead_code)]
     async fn op_request<Op, M>(&mut self, request: M) -> Result<Op::Result, ExecutorError>
     where
         Op: Operation + Send + TryFrom<OpEnum, Error = OpError> + 'static,

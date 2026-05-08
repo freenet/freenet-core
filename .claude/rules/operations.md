@@ -22,8 +22,8 @@ paths:
 > `OpManager.ops.*`, so rules below that talk about "pushing state" /
 > `load_or_init` / `handle_op_result` apply only to the **legacy
 > state-machine path**, which still serves: GC-spawned GET retries and
-> `start_targeted_op` UPDATE-triggered auto-fetch (streaming relay and
-> originator loopback also remain on legacy per #3883 port plan §7),
+> `start_targeted_op` (a GET legacy entry point invoked from UPDATE's
+> auto-fetch — spawns `OpEnum::Get`, not `OpEnum::Update`),
 > PUT GC / streaming / originator-loopback paths, CONNECT's joiner
 > branches reachable only from in-file unit tests + the legacy
 > stateless `ObservedAddress` path in `load_or_init` (relay CONNECT
@@ -38,9 +38,24 @@ paths:
 > inbound non-streaming relay `UpdateMsg::RequestUpdate` and
 > `UpdateMsg::BroadcastTo` to
 > `operations/update/op_ctx_task.rs::start_relay_request_update` /
-> `start_relay_broadcast_to` (gated on `source_addr.is_some()` AND
-> `!has_update_op(id)`); GC retries / `start_targeted_op` UPDATE
-> auto-fetch / originator loopback still go through legacy. Phase 5
+> `start_relay_broadcast_to` (originally gated on
+> `source_addr.is_some()` AND `!has_update_op(id)`).
+>
+> **#1454 phase 5 final (UPDATE slice) retired the entire legacy
+> UPDATE state-machine path.** `OpEnum::Update`, `OpManager.ops.update`
+> DashMap, `impl Operation for UpdateOp`, `request_update` /
+> `start_op` / `start_op_with_id`, `has_update_op`,
+> `remove_update_and_report_failure`, and the
+> `handle_op_request<UpdateOp>` fallthrough in node.rs are all gone.
+> Every UPDATE wire variant now dispatches unconditionally to a
+> task-per-tx driver — the `!has_update_op(id)` guard was redundant
+> because the DashMap could no longer be populated (every writer
+> lived inside the deleted `process_message`). The dead executor
+> network UPDATE path (`UpdateContract` /
+> `ComposeNetworkMessage<UpdateOp>` / network branch of
+> `perform_contract_update`) was retired in commit 1; it had been
+> unreachable in production because no `OperationMode::Network`
+> constructor exists in the tree. Phase 5
 > follow-up slice A (PR #3917) migrated fresh inbound non-streaming
 > relay `PutMsg::Request` to
 > `operations/put/op_ctx_task.rs::start_relay_put` (gated on
@@ -129,8 +144,9 @@ paths:
 > oneshot (`SubOpGetOutcome`). The legacy `request_get` driver and
 > `get::start_op` constructor were retired in this migration; the
 > executor's `GetContract` / `ComposeNetworkMessage<GetOp>` impl is
-> deleted. Legacy `start_targeted_op` (UPDATE-triggered auto-fetch)
-> remains on legacy. The executor's `op_request` mediator path is
+> deleted. `start_targeted_op` (the GET legacy entry point that
+> UPDATE's auto-fetch spawns as a `OpEnum::Get`) remains on the
+> legacy GET path. The executor's `op_request` mediator path is
 > bypassed for GET; the spawned sub-op task can outlive its caller's
 > outer timeout (e.g., `RELATED_FETCH_TIMEOUT = 10s` wrapping
 > `local_state_or_from_network`'s 120 s receiver timeout) — receiver
