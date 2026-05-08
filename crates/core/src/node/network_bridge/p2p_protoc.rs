@@ -4744,6 +4744,24 @@ impl EventListenerState {
     }
 }
 
+impl Drop for EventListenerState {
+    fn drop(&mut self) {
+        // Balance pending_op_results accounting on every event-loop exit path
+        // (graceful Shutdown, simulation `handle.abort()`, Disconnect,
+        // unexpected stream end). Memory is freed regardless; only the metric
+        // backing #3100's regression guard `test_pending_op_results_bounded`
+        // depends on this, so a missed remove looks like a phantom leak (#4057).
+        //
+        // No double-counting on graceful Shutdown: the explicit drain at the
+        // ClosedChannel(ChannelCloseReason::Shutdown) branch above already
+        // records `pending_count` removes and then `pending_op_results.drain()`
+        // empties the map, so the loop below sees `len() == 0`.
+        for _ in 0..self.pending_op_results.len() {
+            crate::config::GlobalTestMetrics::record_pending_op_remove();
+        }
+    }
+}
+
 enum EventResult {
     Continue,
     Event(Box<ConnEvent>),
@@ -5435,6 +5453,47 @@ mod tests {
              This test validates the bug exists when drain is missing.",
             count
         );
+    }
+
+    /// Regression guard for #4057: `EventListenerState::Drop` must record one
+    /// `pending_op_remove` per resident entry, otherwise non-Shutdown exit paths
+    /// (simulation `handle.abort()`, etc.) leave `inserts - removes` inflated
+    /// and trip `test_pending_op_results_bounded` (#3100).
+    #[test]
+    fn event_listener_state_drop_records_remaining_pending_op_removes() {
+        use crate::config::GlobalTestMetrics;
+        use crate::message::Transaction;
+        use crate::transport::ExpectedInboundTracker;
+
+        let removes_before = GlobalTestMetrics::pending_op_removes();
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        for _ in 0..3 {
+            let (callback, _rx) = mpsc::channel(1);
+            state
+                .pending_op_results
+                .insert(Transaction::ttl_transaction(), callback);
+        }
+        drop(state);
+
+        assert_eq!(
+            GlobalTestMetrics::pending_op_removes() - removes_before,
+            3,
+            "Drop must record one pending_op_remove per resident entry"
+        );
+    }
+
+    /// Boundary case: dropping an empty state must not record spurious removes.
+    #[test]
+    fn event_listener_state_drop_empty_records_nothing() {
+        use crate::config::GlobalTestMetrics;
+        use crate::transport::ExpectedInboundTracker;
+
+        let removes_before = GlobalTestMetrics::pending_op_removes();
+        drop(super::EventListenerState::new(
+            ExpectedInboundTracker::empty_for_test(),
+        ));
+        assert_eq!(GlobalTestMetrics::pending_op_removes(), removes_before);
     }
 
     /// Test that connection_id generation produces unique, monotonically increasing IDs.
