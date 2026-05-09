@@ -125,19 +125,31 @@ must be re-confirmed before deletion.
    legacy `process_message` that would crash if the fields are
    already gone.
 
-3. **`PutMsg::ForwardingAck` consumer.** Per existing
+3. **`PutMsg::ForwardingAck` consumer.** ~~Per existing
    operations.md note: "only the upgrade-on-forward without
    inbound `StreamId` and a no-op `ForwardingAck` receiver remain
-   on legacy." Decide whether the no-op receiver moves into the
-   task-per-tx driver or is simply deleted (mirrors GET +
-   SUBSCRIBE which already deleted theirs to no-op handlers).
+   on legacy."~~ As of PR #4063 the upgrade-on-forward edge has
+   been absorbed into `start_relay_put`. Only the no-op
+   `ForwardingAck` receiver remains on legacy. Decide whether the
+   no-op receiver moves into the task-per-tx driver or is simply
+   deleted (mirrors GET + SUBSCRIBE which already deleted theirs
+   to no-op handlers).
 
-4. **Streaming upgrade-on-forward.** The legacy path handles
+4. **Streaming upgrade-on-forward.** ~~The legacy path handles
    `PutMsg::Request` whose forwarded payload would exceed
    `streaming_threshold` — the relay needs to upgrade the
    downstream send to a `RequestStreaming`. Slice B left this on
-   legacy. Verify whether the slice-B driver can absorb it (or
-   the slice should retire that legacy edge first).
+   legacy.~~ **RESOLVED (PR #4063):** `start_relay_put` now
+   performs the upgrade-on-forward decision itself: after
+   `relay_put_store_locally` it re-serializes the merged payload,
+   calls `should_use_streaming`, and conditionally builds either
+   `PutMsg::Request` or `PutMsg::RequestStreaming +
+   NetworkBridge::send_stream` for the forward. The streaming
+   branch uses `OpCtx::send_to_and_register_waiter` to install the
+   reply waiter BEFORE dispatching stream fragments. The dispatch
+   gate in node.rs no longer pre-checks `should_use_streaming` —
+   every fresh inbound non-streaming Request dispatches via
+   `start_relay_put`. This unblocks PUT slice retirement.
 
 ## Estimated size
 

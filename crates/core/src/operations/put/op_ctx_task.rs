@@ -2118,8 +2118,17 @@ mod tests {
     /// relay IS req/response (like GET), so we need the reply to bubble
     /// upstream. If this flips to `send_fire_and_forget`, downstream
     /// Response never makes it back to originator.
+    ///
+    /// As of PR #4063, the driver has two forward paths:
+    /// - non-streaming: `ctx.send_to_and_await(...)` — pinned here
+    /// - upgrade-to-streaming: `ctx.send_to_and_register_waiter(...) +
+    ///   conn_manager.send_stream(...)` — pinned by
+    ///   `drive_relay_put_upgrades_when_payload_exceeds_threshold`
+    /// Both await downstream Response via `pending_op_results` (waiter
+    /// receiver in the streaming branch, callback in the non-streaming
+    /// branch). Neither uses `send_fire_and_forget`.
     #[test]
-    fn drive_relay_put_forwards_via_send_to_and_await() {
+    fn drive_relay_put_non_streaming_path_uses_send_to_and_await() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
             .find("async fn drive_relay_put<CB>(")
@@ -2131,13 +2140,13 @@ mod tests {
         let driver_src = &src[driver_start..driver_end];
         assert!(
             driver_src.contains("ctx.send_to_and_await("),
-            "drive_relay_put must forward downstream via send_to_and_await \
-             so the downstream Response bubbles back to this relay"
+            "drive_relay_put non-streaming path must forward downstream via \
+             send_to_and_await so the downstream Response bubbles back"
         );
         assert!(
             !driver_src.contains("send_fire_and_forget"),
             "drive_relay_put must NOT fire-and-forget the downstream forward; \
-             PUT relay is req/response"
+             PUT relay is req/response on both streaming and non-streaming paths"
         );
     }
 
@@ -2268,6 +2277,123 @@ mod tests {
         assert!(
             helper_src.contains("announce_contract_hosted"),
             "helper MUST call announce_contract_hosted for first-time hosting"
+        );
+    }
+
+    // ── Upgrade-on-forward error paths (PR #4063) ─────────────────────
+    //
+    // The streaming branch of `drive_relay_put` introduces two error
+    // paths: (a) `send_to_and_register_waiter` fails, (b) `send_stream`
+    // fails. Each MUST release the per-tx `pending_op_results` slot
+    // BEFORE returning `Err`, otherwise the slot leaks until the 60 s
+    // periodic sweep and the test_pending_op_results_bounded regression
+    // guard in tests/simulation_integration.rs trips. These pins lock
+    // the slot-release ordering at the source level since the project's
+    // existing test pattern for relay-driver behaviour is structural
+    // (mock-runtime tests for the driver body would be a much bigger
+    // change — see drive_relay_put_streaming_* pins above for the same
+    // pattern in slice B).
+
+    fn drive_relay_put_body(src: &str) -> &str {
+        let start = src
+            .find("async fn drive_relay_put<CB>(")
+            .expect("drive_relay_put not found");
+        let end = src[start..]
+            .find("\nasync fn relay_put_store_locally(")
+            .expect("driver body end not found")
+            + start;
+        &src[start..end]
+    }
+
+    /// Pin: upgrade-on-forward branch MUST exist and contain both the
+    /// `RequestStreaming` build site and the `send_stream` raw fragment
+    /// dispatch.
+    #[test]
+    fn drive_relay_put_upgrades_when_payload_exceeds_threshold() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = drive_relay_put_body(src);
+        assert!(
+            body.contains("should_use_streaming("),
+            "drive_relay_put must call should_use_streaming on the merged payload"
+        );
+        assert!(
+            body.contains("PutMsg::RequestStreaming {"),
+            "drive_relay_put must build PutMsg::RequestStreaming on upgrade"
+        );
+        assert!(
+            body.contains("conn_manager\n            .send_stream(")
+                || body.contains("conn_manager.send_stream("),
+            "drive_relay_put must call NetworkBridge::send_stream after metadata send"
+        );
+    }
+
+    /// Pin: `send_to_and_register_waiter` MUST install the reply waiter
+    /// BEFORE `send_stream` dispatches fragments. Without this
+    /// ordering, a fast downstream Response arriving on the wire
+    /// would race the `pending_op_results` insertion and be dropped
+    /// as OpNotPresent. Mirrors the metadata-first ordering pinned for
+    /// `drive_relay_put_streaming`.
+    #[test]
+    fn drive_relay_put_upgrade_installs_waiter_before_send_stream() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = drive_relay_put_body(src);
+        let waiter_pos = body
+            .find("send_to_and_register_waiter(")
+            .expect("send_to_and_register_waiter call missing in upgrade branch");
+        let stream_pos = body
+            .find(".send_stream(")
+            .expect("send_stream call missing in upgrade branch");
+        assert!(
+            waiter_pos < stream_pos,
+            "send_to_and_register_waiter MUST run before send_stream so the \
+             reply waiter is installed before the first fragment lands"
+        );
+    }
+
+    /// Pin: BOTH error paths in the upgrade branch MUST call
+    /// `release_pending_op_slot(incoming_tx)` BEFORE returning `Err`.
+    /// Without the release, each failed upgrade leaks one
+    /// `pending_op_results` entry — `test_pending_op_results_bounded`
+    /// will flag the imbalance.
+    #[test]
+    fn drive_relay_put_upgrade_error_paths_release_slot() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = drive_relay_put_body(src);
+
+        // Find the `if upgrade_to_streaming {` branch and bound the
+        // window to the matching else.
+        let branch_start = body
+            .find("if upgrade_to_streaming {")
+            .expect("upgrade_to_streaming branch not found");
+        let branch_end = body[branch_start..]
+            .find("} else {")
+            .expect("upgrade branch closing else not found")
+            + branch_start;
+        let branch = &body[branch_start..branch_end];
+
+        // Each `return Err(` inside the upgrade branch must be
+        // preceded by a `release_pending_op_slot` call within a
+        // small window.
+        let mut search = 0;
+        let mut return_count = 0;
+        while let Some(pos) = branch[search..].find("return Err(") {
+            return_count += 1;
+            let abs = search + pos;
+            // Look back up to 400 chars (covers the tracing::warn!
+            // block + release call).
+            let window_start = abs.saturating_sub(400);
+            let window = &branch[window_start..abs];
+            assert!(
+                window.contains("release_pending_op_slot(incoming_tx)"),
+                "upgrade branch `return Err` at offset {abs} must be preceded by \
+                 release_pending_op_slot — leaks pending_op_results otherwise"
+            );
+            search = abs + "return Err(".len();
+        }
+        assert!(
+            return_count >= 2,
+            "expected at least 2 error-return paths in upgrade branch \
+             (send_to_and_register_waiter fail, send_stream fail); found {return_count}"
         );
     }
 
