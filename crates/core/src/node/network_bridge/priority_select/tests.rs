@@ -2629,7 +2629,7 @@ async fn test_handshake_yields_during_p7_buffer_drain() {
                     self.counter.fetch_add(1, Ordering::SeqCst);
                     Poll::Ready(Some(item))
                 }
-                other => other,
+                other @ Poll::Ready(None) | other @ Poll::Pending => other,
             }
         }
     }

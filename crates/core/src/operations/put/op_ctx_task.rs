@@ -2124,6 +2124,7 @@ mod tests {
     /// - upgrade-to-streaming: `ctx.send_to_and_register_waiter(...) +
     ///   conn_manager.send_stream(...)` — pinned by
     ///   `drive_relay_put_upgrades_when_payload_exceeds_threshold`
+    ///
     /// Both await downstream Response via `pending_op_results` (waiter
     /// receiver in the streaming branch, callback in the non-streaming
     /// branch). Neither uses `send_fire_and_forget`.
