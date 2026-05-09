@@ -1185,52 +1185,37 @@ where
                 {
                     if let Some(upstream_addr) = source_addr {
                         if !op_manager.has_put_op(id) {
-                            let would_upgrade_to_streaming = {
-                                let payload = put::PutStreamingPayload {
-                                    contract: contract.clone(),
-                                    related_contracts: related_contracts.clone(),
-                                    value: value.clone(),
-                                };
-                                bincode::serialize(&payload)
-                                    .map(|b| {
-                                        crate::operations::should_use_streaming(
-                                            op_manager.streaming_threshold,
-                                            b.len(),
-                                        )
-                                    })
-                                    .unwrap_or(false)
-                            };
-                            if !would_upgrade_to_streaming {
-                                if let Err(err) = put::op_ctx_task::start_relay_put(
-                                    op_manager.clone(),
-                                    *id,
-                                    contract.clone(),
-                                    related_contracts.clone(),
-                                    value.clone(),
-                                    *htl,
-                                    skip_list.clone(),
-                                    upstream_addr,
-                                )
-                                .await
-                                {
-                                    tracing::error!(
-                                        tx = %id,
-                                        contract = %contract.key(),
-                                        error = %err,
-                                        "PUT relay dispatch: start_relay_put failed"
-                                    );
-                                }
-                                return Ok(None);
+                            // Upgrade-on-forward (Request → RequestStreaming
+                            // when serialized payload exceeds
+                            // `streaming_threshold`) is now handled inside
+                            // `start_relay_put`, so the dispatch gate no
+                            // longer distinguishes by payload size. The
+                            // driver re-serializes the payload after
+                            // `relay_put_store_locally` returns the merged
+                            // value, then conditionally builds either
+                            // `PutMsg::Request` or `PutMsg::RequestStreaming
+                            // + send_stream` for the forward.
+                            if let Err(err) = put::op_ctx_task::start_relay_put(
+                                op_manager.clone(),
+                                conn_manager.clone(),
+                                *id,
+                                contract.clone(),
+                                related_contracts.clone(),
+                                value.clone(),
+                                *htl,
+                                skip_list.clone(),
+                                upstream_addr,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    tx = %id,
+                                    contract = %contract.key(),
+                                    error = %err,
+                                    "PUT relay dispatch: start_relay_put failed"
+                                );
                             }
-                            // Upgrade-to-streaming path (non-streaming
-                            // inbound `PutMsg::Request` whose serialized
-                            // payload exceeds `streaming_threshold` on
-                            // forward) stays on the legacy path: there
-                            // is no inbound `StreamId` to claim via
-                            // `orphan_stream_registry`, so slice B's
-                            // driver does not apply. Direct
-                            // `RequestStreaming` inbounds are dispatched
-                            // by the arm below.
+                            return Ok(None);
                         }
                     }
                 }
@@ -4085,30 +4070,42 @@ mod tests {
             );
         }
 
+        /// Pin: `start_relay_put` (slice A driver) MUST itself perform
+        /// the upgrade-on-forward decision. The dispatch gate in
+        /// node.rs no longer pre-checks `should_use_streaming` —
+        /// the driver re-serializes the merged payload after
+        /// `relay_put_store_locally` and conditionally builds either
+        /// `PutMsg::Request` or `PutMsg::RequestStreaming` +
+        /// `send_stream`.
         #[test]
-        fn put_branch_checks_streaming_upgrade_on_forward() {
-            const SOURCE: &str = include_str!("node.rs");
-            let anchor = "NetMessageV1::Put(ref op) => {";
-            let branch_start = SOURCE.find(anchor).expect("PUT branch not found");
-            let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<put::PutOp, _>")
-                .expect("PUT branch no longer calls handle_op_request")
-                + branch_start;
-            let window = &SOURCE[branch_start..window_end];
-            // H1/H2 guard: dispatch must check that the payload wouldn't
-            // upgrade to streaming on forward; otherwise slice A's
-            // non-streaming-only driver would silently drop the streamed
-            // state upstream.
+        fn start_relay_put_handles_upgrade_on_forward() {
+            const SOURCE: &str = include_str!("operations/put/op_ctx_task.rs");
+            let anchor = "async fn drive_relay_put<CB>(";
+            let driver_start = SOURCE
+                .find(anchor)
+                .expect("drive_relay_put fn not found — has the signature changed?");
+            // Bound the search to the function body. End at the next
+            // top-level `async fn` declaration in the module.
+            let driver_end = SOURCE[driver_start + anchor.len()..]
+                .find("\nasync fn ")
+                .map(|idx| idx + driver_start + anchor.len())
+                .unwrap_or(SOURCE.len());
+            let body = &SOURCE[driver_start..driver_end];
             assert!(
-                window.contains("should_use_streaming("),
-                "PUT relay dispatch must check should_use_streaming — \
-                 slice A driver only handles end-to-end non-streaming hops; \
-                 payloads that would upgrade on forward must fall through to legacy."
+                body.contains("should_use_streaming("),
+                "drive_relay_put must call should_use_streaming on the merged \
+                 payload to decide between non-streaming Request and streaming \
+                 upgrade on forward."
             );
             assert!(
-                window.contains("would_upgrade_to_streaming"),
-                "PUT relay dispatch must gate on the would_upgrade_to_streaming \
-                 flag — see H1/H2 review findings."
+                body.contains("PutMsg::RequestStreaming {"),
+                "drive_relay_put must build PutMsg::RequestStreaming when the \
+                 forwarded payload would exceed streaming_threshold."
+            );
+            assert!(
+                body.contains("send_stream("),
+                "drive_relay_put must call NetworkBridge::send_stream for the \
+                 raw fragments after the RequestStreaming metadata send."
             );
         }
 
