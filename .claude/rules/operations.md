@@ -75,10 +75,24 @@ paths:
 > bubbles a non-streaming `PutMsg::Response` upstream (mirrors the
 > legacy downgrade at `put.rs:1517`). The dispatch site passes a
 > cloned `NetworkBridge` into the spawn so the driver can call
-> `pipe_stream` without a detour through `OpCtx`. The upgrade-only
-> case — `PutMsg::Request` whose serialized payload would exceed
-> `streaming_threshold` on forward but has no inbound `StreamId` to
-> claim — stays on the legacy path in slice B. Phase 5 follow-up slice A (PR
+> `pipe_stream` without a detour through `OpCtx`.
+>
+> **Upgrade-on-forward (PR #4063):** `start_relay_put` (slice A's
+> driver) now performs the upgrade-on-forward decision itself:
+> after `relay_put_store_locally` it re-serializes the merged
+> payload, calls `should_use_streaming`, and conditionally builds
+> either `PutMsg::Request` or `PutMsg::RequestStreaming +
+> NetworkBridge::send_stream` for the forward. The streaming branch
+> uses `OpCtx::send_to_and_register_waiter` to install the reply
+> waiter BEFORE dispatching stream fragments (closes the race where
+> a fast downstream Response arrives before `pending_op_results` is
+> populated). The dispatch gate in node.rs no longer pre-checks
+> `should_use_streaming` — every fresh inbound non-streaming
+> Request dispatches via `start_relay_put`, which owns the upgrade
+> decision. This closed the legacy-only edge case (a non-streaming
+> `Request` that needs streaming on forward but has no inbound
+> `StreamId` to claim via `orphan_stream_registry`) and is the
+> prerequisite for PUT slice retirement of the legacy state machine. Phase 5 follow-up slice A (PR
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
 > `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`
 > (gated on `source_addr.is_some()` AND `!has_subscribe_op(id)`);
