@@ -176,21 +176,9 @@ async fn run_client_get(
     subscribe: bool,
     blocking_subscribe: bool,
 ) {
-    // RAII guard: clears any legacy `ops.get` entry on every exit
-    // path of this task — happy path, retry exhaustion, infra error,
-    // *and* a panic inside the driver. The originator's first
-    // `send_and_await(target=None)` loops back as an InboundMessage
-    // with `source_addr=None`, which falls through to legacy
-    // `process_message::GetMsg::Request` (the dispatch gate at
-    // `node.rs::handle_pure_network_message_v1` requires
-    // `source_addr.is_some()`) and pushes a `GetOp` into `ops.get`
-    // keyed by `client_tx`. Without this guard the entry lingers
-    // until the periodic GC sweep at OPERATION_TTL=60s, which races
-    // the driver's per-attempt timeout (also 60s) and emits a
-    // misleading `phase=get_timeout` log + duplicate `OperationError`
-    // to the client (#4066). `op_manager.completed` is idempotent;
-    // calling it when the driver never registered a legacy entry is
-    // harmless.
+    // RAII guard: clears the ops.get entry that the originator
+    // loopback pushes via legacy process_message::GetMsg::Request
+    // (#4066; full rationale in .claude/rules/operations.md).
     let _completion_guard = ClientGetCompletionGuard {
         op_manager: op_manager.clone(),
         client_tx,
@@ -1124,10 +1112,7 @@ async fn run_sub_op_get(
     return_contract_code: bool,
     out_tx: tokio::sync::oneshot::Sender<SubOpGetOutcome>,
 ) {
-    // RAII guard: see ClientGetCompletionGuard. Same mechanism for
-    // sub-op GETs — they go through the same originator-loopback that
-    // pushes a GetOp into `ops.get`, and need cleanup on every exit
-    // path including panics.
+    // RAII guard: same loopback-cleanup as ClientGetCompletionGuard (#4066).
     let _completion_guard = SubOpGetCompletionGuard {
         op_manager: op_manager.clone(),
         tx,

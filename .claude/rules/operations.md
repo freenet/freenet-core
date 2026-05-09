@@ -165,12 +165,32 @@ paths:
 > outer timeout (e.g., `RELATED_FETCH_TIMEOUT = 10s` wrapping
 > `local_state_or_from_network`'s 120 s receiver timeout) — receiver
 > drop is silent so no leak, just a longer-lived background task.
-> After this migration, no caller pushes a client-initiated `GetOp`
-> into `ops.get`, so the GC speculative-retry block was provably dead
-> for GET. Phase 5-final retired that block, the `get_retried`
-> per-tick HashMap, the `GetOp::ack_received` /
-> `GetOp::speculative_paths` fields, and the 11 unit tests that
-> simulated the GC retry decision.
+> After this migration, no caller PURPOSEFULLY pushes a
+> client-initiated `GetOp` into `ops.get`, so the GC
+> speculative-retry block was provably dead for GET. Phase 5-final
+> retired that block, the `get_retried` per-tick HashMap, the
+> `GetOp::ack_received` / `GetOp::speculative_paths` fields, and the
+> 11 unit tests that simulated the GC retry decision.
+>
+> **Loopback corner case (#4066):** the originator's first
+> `OpCtx::send_and_await(target=None)` loops back as an
+> `InboundMessage` with `source_addr=None`. The relay-driver
+> dispatch in `node.rs::handle_pure_network_message_v1` is gated on
+> `source_addr.is_some()`, so the loopback Request falls through to
+> legacy `process_message::GetMsg::Request` and incidentally pushes
+> a `GetOp` into `ops.get` keyed by `client_tx`. The entry's state
+> is never read (the bypass at the top of
+> `handle_pure_network_message_v1` intercepts terminal Responses
+> before `handle_op_request` runs), but the GC sweep at
+> `OPERATION_TTL=60s` still reaps it and used to emit a phantom
+> `phase=get_timeout` log + duplicate `OperationError`. Closed by
+> `ClientGetCompletionGuard` / `SubOpGetCompletionGuard` in
+> `get/op_ctx_task.rs`: a Drop guard on the driver task calls
+> `op_manager.completed(tx)` on every exit path including panics,
+> clearing the legacy entry before the GC sweep can race it. A
+> cleaner architectural fix would be a dedicated thin handler for
+> originator-loopback Requests that emits the Request-echo without
+> inserting into `ops.get` at all — phase 6 cleanup item.
 >
 > The SUBSCRIBE GC speculative-retry block was retired in the same
 > Phase 5-final pass (slice 1 after GET): all four originator-side
