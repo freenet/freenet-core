@@ -65,7 +65,25 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              inbound stream via orphan_stream_registry,
                              pipes fragments downstream via
                              NetworkBridge::pipe_stream, bubbles a
-                             downgraded non-streaming Response upstream)
+                             downgraded non-streaming Response upstream).
+                             **Phase 5 final (PUT slice)** retired the
+                             legacy carrier: `OpEnum::Put`,
+                             `OpManager.ops.put` DashMap, `impl Operation
+                             for PutOp`, `has_put_op`,
+                             `remove_put_and_report_failure`, and the
+                             `handle_op_request<PutOp>` fallthrough in
+                             node.rs are all gone. Every PUT wire variant
+                             dispatches unconditionally to a task-per-tx
+                             driver. `PutOp`, `PutState`, `PutStats`,
+                             `AwaitingResponseData`, `FinishedData` plus
+                             25 inline outcome / failure-routing /
+                             wire-format / pin tests survive under
+                             `#[allow(dead_code)]` pending phase 6. The
+                             legacy upgrade-on-forward branch (non-stream
+                             `Request` whose serialized payload exceeds
+                             `streaming_threshold`) now dispatches
+                             through `start_relay_put`; the driver itself
+                             owns the upgrade decision.
   get/op_ctx_task.rs       → client-initiated GET driver (Phase 3b)
                              + fresh inbound relay GET driver (Phase 5,
                              PR #3896, `start_relay_get`)

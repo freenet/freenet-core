@@ -58,14 +58,14 @@ paths:
 > constructor exists in the tree. Phase 5
 > follow-up slice A (PR #3917) migrated fresh inbound non-streaming
 > relay `PutMsg::Request` to
-> `operations/put/op_ctx_task.rs::start_relay_put` (gated on
+> `operations/put/op_ctx_task.rs::start_relay_put` (originally gated on
 > `source_addr.is_some()` AND `!has_put_op(id)` AND the payload size
 > would not upgrade to streaming on forward). PUT GC speculative
 > retries and the per-op `ack_received` / `speculative_paths` fields
 > have since been retired (PR #3964) along with `PutMsg::ForwardingAck`
-> consumer + senders; only the upgrade-on-forward without inbound
-> `StreamId` and a no-op `ForwardingAck` receiver remain on legacy. Phase 5 follow-up slice B migrated fresh inbound streaming
-> relay `PutMsg::RequestStreaming` to
+> senders; the receiver was a no-op carried for backward-compat with
+> pre-#3964 peers. Phase 5 follow-up slice B migrated fresh inbound
+> streaming relay `PutMsg::RequestStreaming` to
 > `operations/put/op_ctx_task.rs::start_relay_put_streaming` (same
 > `source_addr.is_some()` AND `!has_put_op(id)` gate). The streaming
 > driver claims the inbound stream via
@@ -92,7 +92,36 @@ paths:
 > decision. This closed the legacy-only edge case (a non-streaming
 > `Request` that needs streaming on forward but has no inbound
 > `StreamId` to claim via `orphan_stream_registry`) and is the
-> prerequisite for PUT slice retirement of the legacy state machine. Phase 5 follow-up slice A (PR
+> prerequisite for PUT slice retirement of the legacy state machine.
+>
+> **#1454 phase 5 final (PUT slice) retired the legacy PUT
+> state-machine path.** `OpEnum::Put`, `OpManager.ops.put` DashMap,
+> `impl Operation for PutOp`, `has_put_op`,
+> `remove_put_and_report_failure`, the `OpEnum::Put` arm in
+> `IsOperationCompleted for OpEnum`, the `OpEnum::Put` arm in the
+> abort handler, the `try_from_op_enum!(OpEnum::Put, ...)` macro
+> entry, and the `handle_op_request<PutOp>` fallthrough in node.rs
+> are all gone. Every PUT wire variant now dispatches unconditionally
+> to a task-per-tx driver — the `!has_put_op(id)` guard was redundant
+> because the DashMap could no longer be populated (every writer
+> lived inside the deleted `process_message`). `PutOp`, `PutState`,
+> `PutStats`, `AwaitingResponseData`, `FinishedData` and 25 inline
+> outcome / failure-routing / wire-format / pin tests survive under
+> `#[allow(dead_code)]` pending phase 6.
+>
+> **Originator-loopback fix.** `start_client_put`'s
+> `send_and_await(target=None)` loops the Request back as
+> `InboundMessage` with `source_addr=None`. With the legacy
+> fallthrough gone, the dispatch site in node.rs maps
+> `source_addr=None` → `upstream_addr=own_addr` so the same
+> `start_relay_put` driver handles both true relay hops and
+> originator-loopback. The driver's local-store + forward-or-finalize
+> logic is identical for both: store, find next hop (excluding
+> own_addr → loopback skips itself), forward OR finalize and send
+> Response upstream (lands at the originator's `pending_op_results`
+> waiter via the bypass).
+>
+> Phase 5 follow-up slice A (PR
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
 > `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`
 > (gated on `source_addr.is_some()` AND `!has_subscribe_op(id)`);

@@ -1135,14 +1135,19 @@ where
                 .await;
             }
             NetMessageV1::Put(ref op) => {
-                // Phase 3a (#1454): task-per-tx bypass for client-initiated
-                // PUT. Mirror of the SUBSCRIBE bypass at the Subscribe arm.
+                // #1454 phase 5 final (PUT slice): every PUT wire variant
+                // routes to a task-per-tx driver. The legacy
+                // `OpManager.ops.put` DashMap, `Operation` impl, and
+                // legacy state-machine fallthrough were retired in this
+                // PR. The slice-A/B DashMap-existence dispatch gate is
+                // gone: the DashMap can no longer be populated.
                 //
-                // Only forward **terminal** Response/ResponseStreaming messages.
-                // Non-terminal messages (Request, RequestStreaming, ForwardingAck,
-                // BroadcastTo, SuccessfulUpdate) must NOT be forwarded: they would
-                // fill the capacity-1 reply channel and cause classify_reply to
-                // fail with Unexpected (Phase 2b bug 2).
+                // Only forward **terminal** Response/ResponseStreaming messages
+                // to the originator's awaiting task via the bypass.
+                // Non-terminal messages (Request, RequestStreaming,
+                // ForwardingAck) must NOT be forwarded: they would fill
+                // the capacity-1 reply channel and cause classify_reply
+                // to fail with Unexpected (Phase 2b bug 2).
                 if matches!(
                     op,
                     put::PutMsg::Response { .. } | put::PutMsg::ResponseStreaming { .. }
@@ -1154,47 +1159,35 @@ where
                     return Ok(None);
                 }
 
-                // #1454 phase 5 follow-up: relay PUT task-per-tx dispatch.
+                // Relay PUT dispatch: spawn the appropriate task-per-tx
+                // driver. `start_relay_put` handles non-streaming
+                // Request (with upgrade-on-forward to streaming when
+                // payload > threshold, PR #4063);
+                // `start_relay_put_streaming` handles direct
+                // `RequestStreaming` inbound. `ForwardingAck` is a
+                // no-op kept for backward compatibility with pre-#3964
+                // peers.
                 //
-                // For true relay hops (source_addr.is_some() AND no PutOp
-                // already exists in OpManager for this tx), spawn the
-                // appropriate relay driver and return. Non-streaming
-                // forwards (payload fits under `streaming_threshold`) go
-                // to slice A's `start_relay_put`; streaming forwards —
-                // either via a direct `RequestStreaming` inbound OR a
-                // `Request` whose serialized payload would upgrade —
-                // go to slice B's `start_relay_put_streaming`.
-                //
-                // source_addr.is_none() (client-initiated PUT's
-                // send_and_await loop-back) falls through to legacy.
-                // has_put_op(id) returning true means the legacy path has
-                // a PutOp (GC retry, speculative path) — also falls
-                // through.
-                //
-                // `PutMsg::ForwardingAck` stays on the legacy path — the
-                // driver does not emit it (same rationale as GET/PUT
-                // slice A).
-                if let put::PutMsg::Request {
-                    id,
-                    contract,
-                    related_contracts,
-                    value,
-                    htl,
-                    skip_list,
-                } = op
-                {
-                    if let Some(upstream_addr) = source_addr {
-                        if !op_manager.has_put_op(id) {
-                            // Upgrade-on-forward (Request → RequestStreaming
-                            // when serialized payload exceeds
-                            // `streaming_threshold`) is now handled inside
-                            // `start_relay_put`, so the dispatch gate no
-                            // longer distinguishes by payload size. The
-                            // driver re-serializes the payload after
-                            // `relay_put_store_locally` returns the merged
-                            // value, then conditionally builds either
-                            // `PutMsg::Request` or `PutMsg::RequestStreaming
-                            // + send_stream` for the forward.
+                // `start_client_put`'s `send_and_await(target=None)`
+                // loops the Request back into the local event loop as
+                // an InboundMessage with `source_addr=None`. Map that
+                // to `upstream_addr = own_addr` so the same
+                // `start_relay_put` driver handles both true relay hops
+                // and originator-loopback. The driver's local-store +
+                // forward-or-finalize logic is identical for both.
+                let effective_upstream =
+                    source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
+                if let Some(upstream_addr) = effective_upstream {
+                    #[allow(clippy::wildcard_enum_match_arm)]
+                    match op {
+                        put::PutMsg::Request {
+                            id,
+                            contract,
+                            related_contracts,
+                            value,
+                            htl,
+                            skip_list,
+                        } => {
                             if let Err(err) = put::op_ctx_task::start_relay_put(
                                 op_manager.clone(),
                                 conn_manager.clone(),
@@ -1215,23 +1208,16 @@ where
                                     "PUT relay dispatch: start_relay_put failed"
                                 );
                             }
-                            return Ok(None);
                         }
-                    }
-                }
-
-                if let put::PutMsg::RequestStreaming {
-                    id,
-                    stream_id,
-                    contract_key,
-                    total_size,
-                    htl,
-                    skip_list,
-                    subscribe,
-                } = op
-                {
-                    if let Some(upstream_addr) = source_addr {
-                        if !op_manager.has_put_op(id) {
+                        put::PutMsg::RequestStreaming {
+                            id,
+                            stream_id,
+                            contract_key,
+                            total_size,
+                            htl,
+                            skip_list,
+                            subscribe,
+                        } => {
                             if let Err(err) = put::op_ctx_task::start_relay_put_streaming(
                                 op_manager.clone(),
                                 conn_manager.clone(),
@@ -1253,61 +1239,26 @@ where
                                     "PUT relay dispatch: start_relay_put_streaming failed"
                                 );
                             }
-                            return Ok(None);
                         }
-                    }
-                }
-
-                tracing::debug!(
-                    tx = %op.id(),
-                    "handle_pure_network_message_v1: Processing PUT message"
-                );
-                let op_result = handle_op_request::<put::PutOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    source_addr,
-                )
-                .await;
-                tracing::debug!(
-                    tx = %op.id(),
-                    op_result_ok = op_result.is_ok(),
-                    "handle_pure_network_message_v1: PUT handle_op_request completed"
-                );
-
-                // Handle pending operation results (network concern)
-                forward_pending_op_result_if_completed(
-                    &op_result,
-                    pending_op_result.as_ref(),
-                    NetMessage::V1(NetMessageV1::Put((*op).clone())),
-                );
-
-                if let Err(OpError::OpNotAvailable(state)) = &op_result {
-                    match state {
-                        OpNotAvailable::Running => {
-                            let delay = op_retry_backoff(i);
+                        _ => {
                             tracing::debug!(
-                                delay_ms = delay.as_millis() as u64,
-                                attempt = i,
-                                "Pure network: Operation still running, backing off"
+                                tx = %op.id(),
+                                ?op,
+                                "PUT: non-dispatch variant ignored \
+                                 (Response/ResponseStreaming already handled \
+                                 by bypass; ForwardingAck is no-op)"
                             );
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        OpNotAvailable::Completed => {
-                            tracing::debug!("Pure network: Operation already completed");
-                            return Ok(None);
                         }
                     }
+                } else {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        ?op,
+                        "PUT: no own_addr available — pre-handshake \
+                         message ignored"
+                    );
                 }
-
-                return handle_pure_network_result(
-                    tx,
-                    op_result,
-                    &op_manager,
-                    &mut *event_listener,
-                )
-                .await;
+                return Ok(None);
             }
             NetMessageV1::Get(ref op) => {
                 // Phase 3b (#1454): task-per-tx bypass for client-initiated
@@ -2708,24 +2659,11 @@ async fn handle_aborted_op(
             }
             _ => {}
         },
-        TransactionType::Put => match op_manager.pop(&tx) {
-            Ok(Some(OpEnum::Put(op))) => {
-                if let Err(err) = op.handle_abort(op_manager).await {
-                    if !matches!(err, OpError::StatePushed) {
-                        return Err(err);
-                    }
-                }
-            }
-            Ok(Some(other)) => {
-                op_manager.push(tx, other).await?;
-            }
-            _ => {}
-        },
-        TransactionType::Update => {
-            // UPDATE has no DashMap entry post-#1454 phase 5 final; the
-            // task-per-tx driver owns abort handling through its own
-            // cancellation surface (the `result_router_tx` publication
-            // path is the only externally observable result).
+        TransactionType::Put | TransactionType::Update => {
+            // PUT and UPDATE have no DashMap entry post-#1454 phase 5
+            // final; the task-per-tx driver owns abort handling through
+            // its own cancellation surface (the `result_router_tx`
+            // publication path is the only externally observable result).
         }
     }
     Ok(())
@@ -2903,7 +2841,6 @@ impl IsOperationCompleted for OpEnum {
     fn is_completed(&self) -> bool {
         match self {
             OpEnum::Connect(op) => op.is_completed(),
-            OpEnum::Put(op) => op.is_completed(),
             OpEnum::Get(op) => op.is_completed(),
             OpEnum::Subscribe(op) => op.is_completed(),
         }
@@ -3676,20 +3613,20 @@ mod tests {
                  the match arm has been renamed or moved — update this regression guard",
             );
 
+            // End the window at the next NetMessageV1 variant to bound
+            // the search to the PUT arm only.
+            let next_variant = "NetMessageV1::Get(ref op) => {";
             let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<put::PutOp, _>")
-                .expect("PUT branch no longer calls handle_op_request — update guard")
+                .find(next_variant)
+                .expect("could not find end of PUT arm")
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
 
             assert!(
                 window.contains("try_forward_task_per_tx_reply("),
-                "PUT branch no longer calls try_forward_task_per_tx_reply \
-                 before handle_op_request. This is the bypass Phase 3a (#1454) \
-                 added to prevent task-per-tx callers from hanging on replies \
-                 that load_or_init would drop as OpNotPresent. Either restore \
-                 the bypass invocation or update this regression guard if the \
-                 branch has been legitimately refactored."
+                "PUT branch no longer calls try_forward_task_per_tx_reply. \
+                 This is the bypass Phase 3a (#1454) added to prevent \
+                 task-per-tx callers from hanging on replies."
             );
 
             assert!(
@@ -3702,6 +3639,24 @@ mod tests {
                 window.contains("put::PutMsg::ResponseStreaming { .. }"),
                 "PUT branch bypass is not gated on ResponseStreaming. \
                  Both terminal variants must be forwarded."
+            );
+
+            // #1454 phase 5 final (PUT slice): legacy fallthrough is
+            // gone. The arm must NOT call handle_op_request<PutOp> and
+            // must NOT gate on the retired DashMap-existence check.
+            // Compose needles at runtime so the assert source itself
+            // does not contain them.
+            let legacy_dispatch_needle = format!("handle{}::<put::PutOp, _>", "_op_request");
+            assert!(
+                !window.contains(&legacy_dispatch_needle),
+                "PUT branch must not call legacy state-machine dispatch — \
+                 retired in #1454 phase 5 final (PUT slice)"
+            );
+            let dashmap_gate_needle = format!("has{}_op", "_put");
+            assert!(
+                !window.contains(&dashmap_gate_needle),
+                "PUT branch must not gate dispatch on the retired DashMap \
+                 existence check — gate retired in #1454 phase 5 final (PUT slice)"
             );
         }
 
@@ -4025,48 +3980,58 @@ mod tests {
             );
         }
 
-        // ── Relay PUT dispatch structural pin tests (#1454 phase 5
-        // follow-up slice A). Mirror of the UPDATE tests above.
+        // ── Relay PUT dispatch structural pin tests
+        // (#1454 phase 5 final, PUT slice). Mirror of the UPDATE
+        // tests above.
 
         #[test]
-        fn put_branch_dispatches_relay_driver() {
+        fn put_branch_dispatches_relay_drivers() {
             const SOURCE: &str = include_str!("node.rs");
             let anchor = "NetMessageV1::Put(ref op) => {";
             let branch_start = SOURCE.find(anchor).expect(
                 "PUT branch of handle_pure_network_message_v1 not found; \
                  the match arm has been renamed or moved — update this guard",
             );
+            // End the window at the next NetMessageV1 variant to bound
+            // the search to the PUT arm only.
+            let next_variant = "NetMessageV1::Get(ref op) => {";
             let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<put::PutOp, _>")
-                .expect("PUT branch no longer calls handle_op_request — update guard")
+                .find(next_variant)
+                .expect("could not find end of PUT arm")
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
             assert!(
                 window.contains("start_relay_put("),
-                "PUT branch no longer calls start_relay_put for relay dispatch. \
-                 #1454 phase-5 slice A relay PUT dispatch was removed — restore it."
-            );
-        }
-
-        #[test]
-        fn put_branch_dispatch_gates_on_source_and_existing_op() {
-            const SOURCE: &str = include_str!("node.rs");
-            let anchor = "NetMessageV1::Put(ref op) => {";
-            let branch_start = SOURCE.find(anchor).expect("PUT branch not found");
-            let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<put::PutOp, _>")
-                .expect("PUT branch no longer calls handle_op_request")
-                + branch_start;
-            let window = &SOURCE[branch_start..window_end];
-            assert!(
-                window.contains("source_addr"),
-                "PUT relay dispatch must be gated on source_addr — internal \
-                 callers (source_addr.is_none()) must fall through to legacy."
+                "PUT branch no longer calls start_relay_put for relay dispatch."
             );
             assert!(
-                window.contains("has_put_op"),
-                "PUT relay dispatch must be guarded by has_put_op — GC-spawned \
-                 retries / pre-registered ops must fall through to legacy."
+                window.contains("start_relay_put_streaming("),
+                "PUT branch must call start_relay_put_streaming for streaming relay hops."
+            );
+            // After #1454 phase 5 final (PUT slice), the originator-
+            // loopback case (source_addr=None) is mapped to
+            // upstream=own_addr instead of falling through to legacy.
+            // The dispatch is therefore conditional on an effective
+            // upstream rather than on source_addr.is_some() directly.
+            assert!(
+                window.contains("effective_upstream") || window.contains("upstream_addr"),
+                "PUT relay dispatch must thread an effective upstream address \
+                 (source_addr or own_addr loopback) into the relay drivers."
+            );
+            // Legacy fallthrough and gate must stay deleted. Compose
+            // needles at runtime so the assert source itself does not
+            // contain them.
+            let legacy_dispatch_needle = format!("handle{}::<put::PutOp, _>", "_op_request");
+            assert!(
+                !window.contains(&legacy_dispatch_needle),
+                "PUT branch must NOT call legacy state-machine dispatch — \
+                 retired in #1454 phase 5 final (PUT slice)"
+            );
+            let dashmap_gate_needle = format!("has{}_op", "_put");
+            assert!(
+                !window.contains(&dashmap_gate_needle),
+                "PUT branch must NOT gate on the retired DashMap existence \
+                 check — retired in #1454 phase 5 final (PUT slice)"
             );
         }
 
@@ -4106,57 +4071,6 @@ mod tests {
                 body.contains("send_stream("),
                 "drive_relay_put must call NetworkBridge::send_stream for the \
                  raw fragments after the RequestStreaming metadata send."
-            );
-        }
-
-        /// Slice B (#1454 phase 5 follow-up): dispatch gate now routes
-        /// `PutMsg::RequestStreaming` through the streaming relay driver
-        /// when the tx is fresh + upstream is remote.
-        #[test]
-        fn put_branch_dispatches_streaming_relay_driver() {
-            const SOURCE: &str = include_str!("node.rs");
-            let anchor = "NetMessageV1::Put(ref op) => {";
-            let branch_start = SOURCE.find(anchor).expect("PUT branch not found");
-            let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<put::PutOp, _>")
-                .expect("PUT branch no longer calls handle_op_request")
-                + branch_start;
-            let window = &SOURCE[branch_start..window_end];
-            assert!(
-                window.contains("put::PutMsg::RequestStreaming {"),
-                "PUT branch must dispatch RequestStreaming through the \
-                 streaming relay driver (slice B)."
-            );
-            assert!(
-                window.contains("start_relay_put_streaming("),
-                "PUT branch must call start_relay_put_streaming for \
-                 fresh inbound streaming relay hops."
-            );
-        }
-
-        /// Slice B guardrail: streaming dispatch must gate on source_addr
-        /// + has_put_op, mirroring slice A.
-        #[test]
-        fn put_streaming_dispatch_gates_on_source_and_existing_op() {
-            const SOURCE: &str = include_str!("node.rs");
-            let rs_anchor = "put::PutMsg::RequestStreaming {";
-            let rs_start = SOURCE
-                .find(rs_anchor)
-                .expect("RequestStreaming dispatch block not found");
-            let rs_end = SOURCE[rs_start..]
-                .find("start_relay_put_streaming(")
-                .expect("streaming driver call not found")
-                + rs_start;
-            let window = &SOURCE[rs_start..rs_end];
-            assert!(
-                window.contains("Some(upstream_addr) = source_addr"),
-                "streaming dispatch must gate on source_addr (client-loopback \
-                 falls through to legacy)."
-            );
-            assert!(
-                window.contains("!op_manager.has_put_op(id)"),
-                "streaming dispatch must gate on !has_put_op (GC retries \
-                 stay on legacy)."
             );
         }
 
