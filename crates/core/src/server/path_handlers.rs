@@ -1017,6 +1017,9 @@ function freenetBridge(authToken) {
     '#__freenet_perm_overlay .fn-msg{font-size:15px;line-height:1.5;margin:0 0 22px 0;' +
     'padding:14px 16px;background:var(--bg);border-left:3px solid var(--warn);' +
     'border-radius:4px;white-space:pre-wrap;word-wrap:break-word;color:var(--fg);}' +
+    '#__freenet_perm_overlay .fn-msg-pre{font-family:ui-monospace,SFMono-Regular,' +
+    'Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.45;' +
+    'max-height:300px;overflow:auto;}' +
     '#__freenet_perm_overlay .fn-btns{display:flex;gap:10px;flex-wrap:wrap;}' +
     '#__freenet_perm_overlay .fn-btn{padding:10px 20px;border-radius:8px;' +
     'font-size:14px;cursor:pointer;flex:1;min-width:100px;font-weight:500;' +
@@ -1132,10 +1135,47 @@ function freenetBridge(authToken) {
     msgLabel.className = 'fn-msg-label';
     msgLabel.textContent = 'Delegate says:';
     card.appendChild(msgLabel);
-    var msg = document.createElement('p');
-    msg.className = 'fn-msg';
-    setText(msg, p.message || 'A delegate is requesting permission.');
-    card.appendChild(msg);
+    // Try to render the delegate-supplied message as pretty-printed JSON
+    // when it parses as JSON. Falls back to a plain paragraph for plain
+    // text. The pretty form makes structured token requests legible
+    // (#190) — users routinely see one-line blobs like
+    //   {"token":{"max_age":"31536000 seconds","tier":"Min10"},...}
+    // and have to mentally parse them to make a security decision.
+    //
+    // Security: still rendered via textContent (setText), so no HTML
+    // interpretation. Long values are wrapped via CSS (white-space:
+    // pre-wrap on .fn-msg-pre). Render is best-effort: any parse error
+    // falls back to the original raw string in a <p>.
+    var rawMsg = p.message || 'A delegate is requesting permission.';
+    var pretty = null;
+    if (typeof rawMsg === 'string' && rawMsg.length > 0) {
+      var trimmed = rawMsg.trim();
+      if (trimmed.length <= 64 * 1024 &&
+          (trimmed.charAt(0) === '{' || trimmed.charAt(0) === '[')) {
+        try {
+          var parsed = JSON.parse(trimmed);
+          pretty = JSON.stringify(parsed, null, 2);
+          // Cap rendered output at 16 KiB after pretty-printing so a
+          // hostile delegate can't force a multi-MiB layout pass.
+          if (pretty.length > 16 * 1024) {
+            pretty = pretty.slice(0, 16 * 1024) + '\n…';
+          }
+        } catch (e) {
+          pretty = null;
+        }
+      }
+    }
+    if (pretty !== null) {
+      var msgPre = document.createElement('pre');
+      msgPre.className = 'fn-msg fn-msg-pre';
+      setText(msgPre, pretty);
+      card.appendChild(msgPre);
+    } else {
+      var msg = document.createElement('p');
+      msg.className = 'fn-msg';
+      setText(msg, rawMsg);
+      card.appendChild(msg);
+    }
 
     var buttons = document.createElement('div');
     buttons.className = 'fn-btns';
