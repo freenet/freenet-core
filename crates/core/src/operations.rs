@@ -472,6 +472,14 @@ impl OpError {
         matches!(self, Self::ExecutorError(e) if e.is_contract_exec_rejection())
     }
 
+    /// Narrow predicate for the originator-side UPDATE auto-fetch
+    /// trigger: returns true only for "missing contract parameters"
+    /// from `runtime.rs::get_params`. See
+    /// `ExecutorError::is_missing_contract_parameters` for rationale.
+    pub fn is_missing_contract_parameters(&self) -> bool {
+        matches!(self, Self::ExecutorError(e) if e.is_missing_contract_parameters())
+    }
+
     /// Returns true ONLY when the contract WASM merge function rejected the
     /// update with a typed `InvalidUpdate{,WithInfo}` error (the benign
     /// stale-state case from issue #3914). Use this for log-severity

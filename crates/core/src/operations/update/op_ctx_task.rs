@@ -235,12 +235,47 @@ async fn drive_client_update(
                 return Err(OpError::RingError(RingError::NoHostingPeers(*key.id())));
             }
 
+            // No remote target → no peer to auto-fetch from. If
+            // `is_hosting_contract` reports true but `state_store`
+            // doesn't have params, that's an internal inconsistency
+            // (the ring's hosting registry is the announce/subscribe
+            // layer, not the executor's StateStore — they CAN
+            // diverge if a hosting announcement races with state
+            // eviction). Surface the missing-params case explicitly
+            // so operators can correlate the inconsistency, instead
+            // of letting it bubble as an opaque OpError.
             let UpdateExecution {
                 value: _,
                 summary,
                 changed,
                 ..
-            } = super::update_contract(op_manager, key, update_data, related_contracts).await?;
+            } = match super::update_contract(op_manager, key, update_data, related_contracts).await
+            {
+                Ok(execution) => execution,
+                Err(err) if err.is_missing_contract_parameters() => {
+                    tracing::error!(
+                        tx = %client_tx,
+                        contract = %key,
+                        error = %err,
+                        phase = "ring_state_store_inconsistency",
+                        "update (task-per-tx): is_hosting_contract reports true \
+                         but state_store has no params for this contract; cannot \
+                         auto-fetch (no remote target) — the ring/state-store \
+                         divergence must be repaired by a re-PUT or a manual \
+                         seeding step (#4066)"
+                    );
+                    return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                        cause: format!(
+                            "originator hosts {key} per ring but local state_store \
+                             is missing contract code/params; no remote peer \
+                             available to auto-fetch from"
+                        )
+                        .into(),
+                    }
+                    .into())));
+                }
+                Err(err) => return Err(err),
+            };
 
             if !changed {
                 tracing::debug!(
@@ -289,28 +324,95 @@ async fn drive_client_update(
                 "update (task-per-tx): applying locally before forwarding"
             );
 
-            let UpdateExecution {
-                value: updated_value,
-                summary,
-                changed: _,
-                ..
-            } = super::update_contract(
+            let local_apply = super::update_contract(
                 op_manager,
                 key,
                 update_data.clone(),
                 related_contracts.clone(),
             )
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    tx = %client_tx,
-                    contract = %key,
-                    error = %e,
-                    phase = "error",
-                    "update (task-per-tx): failed to apply update locally before forwarding"
-                );
-                e
-            })?;
+            .await;
+
+            let UpdateExecution {
+                value: updated_value,
+                summary,
+                changed: _,
+                ..
+            } = match local_apply {
+                Ok(execution) => execution,
+                Err(err) => {
+                    // The wire format `UpdateMsg::RequestUpdate.value:
+                    // WrappedState` carries a post-merge full state, so this
+                    // branch must produce one before forwarding. The narrow
+                    // failure mode self-heal addresses is "missing contract
+                    // parameters" from `runtime.rs::get_params` (the local
+                    // `state_store` has no entry for this contract because
+                    // the originator never PUT/GET'd it).
+                    //
+                    // Self-heal by triggering a background GET from the
+                    // target peer chosen by proximity / ring routing for
+                    // this contract key. After the auto-fetch lands, the
+                    // local store is primed and a client retry succeeds.
+                    //
+                    // Why `target_addr` and not some other peer: the
+                    // auto-fetch is a directed `start_targeted_op` GET to
+                    // a SocketAddr, and `target_addr` is the only addr we
+                    // have at this site that the routing layer just
+                    // confirmed is reachable AND closer to the key than
+                    // we are. It may not host the contract directly, but
+                    // its own proximity cache / closest_hosting routing
+                    // is far more likely to land on a hoster on the next
+                    // hop than ours is (we don't host the contract, by
+                    // definition of being in this branch).
+                    //
+                    // Discriminator is the NARROW
+                    // `is_missing_contract_parameters` predicate, NOT the
+                    // broader `!is_contract_exec_rejection`: an
+                    // `is_contract_exec_rejection`-negation also matches
+                    // `Deser` / `InvalidState` / `InvalidDelta` / `Other`
+                    // / `DoublePut` / `InvalidArrayLength` and storage
+                    // errors. Auto-fetching on a malformed-input or
+                    // disk-error case is wasted work and an
+                    // amplification vector (every malformed delta
+                    // triggers a wire-level GET). Skeptical-review
+                    // callout on PR #4072 #4 (#4066).
+                    if err.is_missing_contract_parameters() {
+                        tracing::warn!(
+                            tx = %client_tx,
+                            contract = %key,
+                            error = %err,
+                            target = %target_addr,
+                            phase = "auto_fetch_originator",
+                            "update (task-per-tx): originator has no contract \
+                             code/params for this contract; triggering \
+                             auto-fetch from target and asking client to retry"
+                        );
+                        op_manager.try_auto_fetch_contract(&key, target_addr);
+                        return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                            cause: format!(
+                                "originator missing contract code/params for {key}; \
+                                     auto-fetch triggered from {target_addr}, \
+                                     client should retry after the local store \
+                                     is primed (typically <5s in healthy \
+                                     networks). Note: `try_auto_fetch_contract` \
+                                     is rate-limited 5min/contract, so retries \
+                                     within that window will surface the same \
+                                     error until the in-flight GET completes."
+                            )
+                            .into(),
+                        }
+                        .into())));
+                    }
+
+                    tracing::error!(
+                        tx = %client_tx,
+                        contract = %key,
+                        error = %err,
+                        phase = "error",
+                        "update (task-per-tx): failed to apply update locally before forwarding"
+                    );
+                    return Err(err);
+                }
+            };
 
             // Emit telemetry: UPDATE request initiated (mirrors legacy line 2047)
             if let Some(event) =
@@ -2382,6 +2484,104 @@ mod tests {
         assert!(classify_update_outcome_for_op_stats(&publish_ok));
         assert!(!classify_update_outcome_for_op_stats(&publish_err));
         assert!(!classify_update_outcome_for_op_stats(&infra));
+    }
+
+    /// Regression for #4066: when the originator is non-hosting and
+    /// `super::update_contract` fails because the local executor lacks
+    /// contract code/params (the "missing contract parameters" error
+    /// from `runtime.rs:920-953`), the client-initiated remote-target
+    /// branch must self-heal by triggering `try_auto_fetch_contract`
+    /// against the chosen forward target and synthesise a retriable
+    /// `OperationError` instead of returning a raw `OpError` to the
+    /// driver loop. Without this, every UPDATE from a non-hosting
+    /// originator returns a hard failure to the client and never
+    /// primes the local store, so subsequent retries also fail.
+    ///
+    /// The discriminator is the NARROW
+    /// `is_missing_contract_parameters` predicate, NOT the broader
+    /// `!is_contract_exec_rejection` (skeptical-review callout on
+    /// PR #4072). The broad form negates errors like `Deser`,
+    /// `InvalidState`, `InvalidDelta`, `Other`, `DoublePut`,
+    /// `InvalidArrayLength`, and storage errors — auto-fetching on
+    /// any of those is wasted work and an amplification vector
+    /// (every malformed delta would trigger a wire-level GET).
+    #[test]
+    fn drive_client_update_remote_target_auto_fetches_on_missing_params() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "async fn drive_client_update(");
+
+        // Locate the remote-target arm. The `Some(target) =>` arm of the
+        // match on the proximity/ring-routed target peer is the only
+        // place `update_contract` is called for forwarding.
+        let arm = body
+            .find("Some(target) =>")
+            .expect("drive_client_update must have a Some(target) remote-target arm");
+        let arm_body = &body[arm..];
+
+        assert!(
+            arm_body.contains("is_missing_contract_parameters"),
+            "remote-target arm must distinguish missing-code/params errors \
+             via the NARROW `is_missing_contract_parameters` predicate, \
+             NOT `!is_contract_exec_rejection` — see #4066. Auto-fetching \
+             on the broader negation triggers unnecessary GETs for \
+             malformed-input and storage failures."
+        );
+        assert!(
+            !arm_body.contains("!err.is_contract_exec_rejection()"),
+            "remote-target arm must NOT use the broad \
+             `!is_contract_exec_rejection` discriminator — see the \
+             skeptical-review callout on PR #4072 #4. Use the narrow \
+             `is_missing_contract_parameters` predicate instead."
+        );
+        assert!(
+            arm_body.contains("try_auto_fetch_contract"),
+            "remote-target arm must call `op_manager.try_auto_fetch_contract` \
+             when the local apply fails with the missing-params error so the \
+             contract code/params get pulled from the chosen target peer. \
+             See #4066."
+        );
+    }
+
+    /// The local-only branch (`None =>`, no remote target) must
+    /// surface `is_hosting_contract` / `state_store` divergence
+    /// explicitly instead of letting it bubble as an opaque
+    /// `OpError`. There is no remote peer to auto-fetch from, so the
+    /// only correct behavior is a structured error so operators can
+    /// correlate the inconsistency. Skeptical-review callout on
+    /// PR #4072 #1.
+    #[test]
+    fn drive_client_update_local_branch_surfaces_ring_state_store_divergence() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "async fn drive_client_update(");
+
+        // Locate the local-only branch (no remote target).
+        let arm = body
+            .find("None =>")
+            .expect("drive_client_update must have a None local-only arm");
+        // Bound at the next match arm.
+        let arm_body = &body[arm..];
+        let arm_end = arm_body[1..]
+            .find("Some(target) =>")
+            .map(|p| p + 1)
+            .unwrap_or(arm_body.len());
+        let arm_slice = &arm_body[..arm_end];
+
+        assert!(
+            arm_slice.contains("is_missing_contract_parameters"),
+            "local-only arm must explicitly handle the \
+             `is_missing_contract_parameters` failure — see #4066. \
+             Without this, an `is_hosting_contract`/`state_store` \
+             divergence surfaces as an opaque OpError rather than a \
+             structured error operators can act on."
+        );
+        assert!(
+            arm_slice.contains("ring_state_store_inconsistency"),
+            "local-only arm must log the divergence with phase = \
+             \"ring_state_store_inconsistency\" so the inconsistency \
+             is searchable in operator dashboards (#4066)"
+        );
     }
 
     /// Truncate the source at the `#[cfg(test)]` marker so the pin
