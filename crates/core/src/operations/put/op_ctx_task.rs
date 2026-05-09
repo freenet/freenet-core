@@ -709,7 +709,7 @@ async fn run_relay_put<CB>(
 {
     let _guard = guard;
 
-    if let Err(err) = drive_relay_put(
+    let drive_result = drive_relay_put(
         &op_manager,
         &conn_manager,
         incoming_tx,
@@ -720,14 +720,41 @@ async fn run_relay_put<CB>(
         skip_list,
         upstream_addr,
     )
-    .await
-    {
+    .await;
+
+    if let Err(err) = &drive_result {
         tracing::warn!(
             tx = %incoming_tx,
             error = %err,
             phase = "relay_put_error",
             "PUT relay (task-per-tx): driver returned error"
         );
+    }
+
+    // Originator-loopback error path (#1454 phase 5 final PUT slice
+    // follow-up): when the relay driver runs on the originator's own
+    // node and fails (e.g., `put_contract` rejects an invalid state),
+    // the originator's `start_client_put` `send_and_await` waiter has
+    // no `PutMsg::Response` to consume — it would hang until the test
+    // / client times out. Mirror the legacy `report_result` Err arm
+    // (node.rs:636-651) by publishing a `HostResult::Err` to the
+    // originator's client transaction, then completing the tx.
+    //
+    // Safe in non-loopback mode because remote relays don't share
+    // tx-space with a local client (the originator is on a different
+    // node, so `incoming_tx` is not registered with our SessionActor).
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let originator_loopback = Some(upstream_addr) == own_addr;
+    if originator_loopback {
+        if let Err(err) = drive_result {
+            let client_error = freenet_stdlib::client_api::ClientError::from(
+                freenet_stdlib::client_api::ErrorKind::OperationError {
+                    cause: err.to_string().into(),
+                },
+            );
+            op_manager.send_client_result(incoming_tx, Err(client_error));
+            op_manager.completed(incoming_tx);
+        }
     }
 
     // Release the per-tx `pending_op_results` slot at driver exit, same
@@ -746,8 +773,7 @@ async fn run_relay_put<CB>(
     // completion path (via `send_client_result` →
     // `release_pending_op_slot`) cleans up the slot.
     tokio::task::yield_now().await;
-    let own_addr = op_manager.ring.connection_manager.get_own_addr();
-    if Some(upstream_addr) != own_addr {
+    if !originator_loopback {
         op_manager.release_pending_op_slot(incoming_tx).await;
     }
 }
@@ -2343,9 +2369,55 @@ mod tests {
         );
         assert!(
             preceding.rfind("Some(upstream_addr) != own_addr").is_some()
-                || preceding.rfind("upstream_addr) != own_addr").is_some(),
+                || preceding.rfind("upstream_addr) != own_addr").is_some()
+                || preceding.rfind("!originator_loopback").is_some(),
             "run_relay_put must guard release_pending_op_slot with an \
              upstream != own_addr check (originator-loopback exception)"
+        );
+    }
+
+    /// Pin: when `drive_relay_put` returns `Err` AND the driver is
+    /// running in originator-loopback mode (`upstream_addr ==
+    /// own_addr`), `run_relay_put` MUST publish a `HostResult::Err`
+    /// for `incoming_tx` via `send_client_result` and complete the
+    /// transaction. This mirrors the legacy `report_result` Err arm
+    /// (node.rs:636-651) — without this, an invalid-state PUT (e.g.,
+    /// `put_contract` rejection) leaves the originator's
+    /// `start_client_put` `send_and_await` waiter hanging until the
+    /// client times out. Repro: `test_put_error_notification` in
+    /// `crates/core/tests/error_notification.rs`.
+    #[test]
+    fn run_relay_put_publishes_error_on_loopback_failure() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn run_relay_put<CB>(")
+            .expect("run_relay_put not found");
+        let fn_end = src[fn_start..]
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn drive_relay_put<CB>(")
+            .expect("end-of-run_relay_put marker not found")
+            + fn_start;
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("originator_loopback"),
+            "run_relay_put must compute originator_loopback to gate the \
+             error-publication path"
+        );
+        assert!(
+            body.contains("send_client_result(incoming_tx"),
+            "run_relay_put must call send_client_result(incoming_tx, Err(_)) \
+             on driver failure in originator-loopback mode"
+        );
+        assert!(
+            body.contains("ErrorKind::OperationError"),
+            "run_relay_put must wrap the OpError in \
+             freenet_stdlib::client_api::ErrorKind::OperationError before \
+             publishing to the client"
+        );
+        assert!(
+            body.contains("op_manager.completed(incoming_tx)"),
+            "run_relay_put must call op_manager.completed(incoming_tx) \
+             after publishing the loopback-failure error so the tx is \
+             marked done"
         );
     }
 
