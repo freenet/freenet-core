@@ -289,28 +289,69 @@ async fn drive_client_update(
                 "update (task-per-tx): applying locally before forwarding"
             );
 
-            let UpdateExecution {
-                value: updated_value,
-                summary,
-                changed: _,
-                ..
-            } = super::update_contract(
+            let local_apply = super::update_contract(
                 op_manager,
                 key,
                 update_data.clone(),
                 related_contracts.clone(),
             )
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    tx = %client_tx,
-                    contract = %key,
-                    error = %e,
-                    phase = "error",
-                    "update (task-per-tx): failed to apply update locally before forwarding"
-                );
-                e
-            })?;
+            .await;
+
+            let UpdateExecution {
+                value: updated_value,
+                summary,
+                changed: _,
+                ..
+            } = match local_apply {
+                Ok(execution) => execution,
+                Err(err) => {
+                    // The wire format `UpdateMsg::RequestUpdate.value:
+                    // WrappedState` carries a post-merge full state, so this
+                    // branch must produce one before forwarding. When the
+                    // failure is NOT a contract-exec rejection (i.e. the
+                    // contract code/params aren't local — the only example in
+                    // production is the "missing contract parameters" error
+                    // from `runtime.rs:920-953`), we cannot fabricate the
+                    // merged state. Self-heal by triggering a background GET
+                    // from the target peer (which the proximity cache /
+                    // ring routing chose, so it likely hosts the contract)
+                    // and synthesise a retriable `OperationError` so the
+                    // client retries — by then the auto-fetch will have
+                    // primed the local store and the second attempt will
+                    // succeed (#4066).
+                    if !err.is_contract_exec_rejection() {
+                        tracing::warn!(
+                            tx = %client_tx,
+                            contract = %key,
+                            error = %err,
+                            target = %target_addr,
+                            phase = "auto_fetch_originator",
+                            "update (task-per-tx): cannot apply locally on \
+                             non-hosting originator (likely missing contract \
+                             parameters); triggering auto-fetch from target \
+                             and asking client to retry"
+                        );
+                        op_manager.try_auto_fetch_contract(&key, target_addr);
+                        return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                            cause: format!(
+                                "originator missing contract code/params for {key}; \
+                                     auto-fetch triggered, client should retry"
+                            )
+                            .into(),
+                        }
+                        .into())));
+                    }
+
+                    tracing::error!(
+                        tx = %client_tx,
+                        contract = %key,
+                        error = %err,
+                        phase = "error",
+                        "update (task-per-tx): failed to apply update locally before forwarding"
+                    );
+                    return Err(err);
+                }
+            };
 
             // Emit telemetry: UPDATE request initiated (mirrors legacy line 2047)
             if let Some(event) =
@@ -2382,6 +2423,51 @@ mod tests {
         assert!(classify_update_outcome_for_op_stats(&publish_ok));
         assert!(!classify_update_outcome_for_op_stats(&publish_err));
         assert!(!classify_update_outcome_for_op_stats(&infra));
+    }
+
+    /// Regression for #4066: when the originator is non-hosting and
+    /// `super::update_contract` fails because the local executor lacks
+    /// contract code/params (the "missing contract parameters" error
+    /// from `runtime.rs:920-953`), the client-initiated remote-target
+    /// branch must self-heal by triggering `try_auto_fetch_contract`
+    /// against the chosen forward target and synthesise a retriable
+    /// `OperationError` instead of returning a raw `OpError` to the
+    /// driver loop. Without this, every UPDATE from a non-hosting
+    /// originator returns a hard failure to the client and never
+    /// primes the local store, so subsequent retries also fail.
+    ///
+    /// Pin the structure: the `Some(target) =>` branch must distinguish
+    /// `is_contract_exec_rejection() == false` (auto-fetch path) from
+    /// real WASM exec rejections (propagate as before).
+    #[test]
+    fn drive_client_update_remote_target_auto_fetches_on_missing_params() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "async fn drive_client_update(");
+
+        // Locate the remote-target arm. The `Some(target) =>` arm of the
+        // match on the proximity/ring-routed target peer is the only
+        // place `update_contract` is called for forwarding.
+        let arm = body
+            .find("Some(target) =>")
+            .expect("drive_client_update must have a Some(target) remote-target arm");
+        let arm_body = &body[arm..];
+
+        assert!(
+            arm_body.contains("is_contract_exec_rejection"),
+            "remote-target arm must distinguish missing-code/params errors \
+             from real WASM merge rejections via `is_contract_exec_rejection` \
+             — see #4066. Without this, every UPDATE from a non-hosting \
+             originator surfaces \"missing contract parameters\" to the \
+             client and never primes the local store."
+        );
+        assert!(
+            arm_body.contains("try_auto_fetch_contract"),
+            "remote-target arm must call `op_manager.try_auto_fetch_contract` \
+             when the local apply fails with a non-rejection error so the \
+             contract code/params get pulled from the chosen target peer. \
+             See #4066."
+        );
     }
 
     /// Truncate the source at the `#[cfg(test)]` marker so the pin
