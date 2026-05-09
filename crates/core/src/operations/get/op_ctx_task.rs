@@ -447,13 +447,29 @@ async fn drive_client_get_inner(
             Ok(DriverOutcome::Publish(host_result))
         }
         RetryLoopOutcome::Exhausted(cause) => {
+            // Originator's first `send_and_await(target=None)` loops back as an
+            // InboundMessage with `source_addr=None`, which falls through to
+            // legacy `process_message` (node.rs gates relay-driver dispatch on
+            // `source_addr.is_some()`) and pushes a `GetOp` into `ops.get`
+            // keyed by `client_tx`. Without this `completed()` call, the legacy
+            // entry lingers until the periodic GC sweep at OPERATION_TTL=60s,
+            // which races the driver's per-attempt timeout (also 60s) and
+            // emits a misleading `phase=get_timeout` log + duplicate
+            // `OperationError` to the client (#4066).
+            op_manager.completed(client_tx);
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
             }
             .into())))
         }
-        RetryLoopOutcome::Unexpected => Err(OpError::UnexpectedOpState),
-        RetryLoopOutcome::InfraError(err) => Err(err),
+        RetryLoopOutcome::Unexpected => {
+            op_manager.completed(client_tx);
+            Err(OpError::UnexpectedOpState)
+        }
+        RetryLoopOutcome::InfraError(err) => {
+            op_manager.completed(client_tx);
+            Err(err)
+        }
     }
 }
 
@@ -1219,9 +1235,22 @@ async fn drive_sub_op_get(
                 _ => SubOpGetOutcome::NotFound(missing_state_cause(&instance_id)),
             }
         }
-        RetryLoopOutcome::Exhausted(cause) => SubOpGetOutcome::NotFound(cause),
-        RetryLoopOutcome::Unexpected => SubOpGetOutcome::Infra(OpError::UnexpectedOpState),
-        RetryLoopOutcome::InfraError(err) => SubOpGetOutcome::Infra(err),
+        RetryLoopOutcome::Exhausted(cause) => {
+            // See `drive_client_get_inner`'s matching arm: legacy `ops.get`
+            // entry created by the originator-loopback Request must be
+            // cleared on every exit path or the GC sweep emits a phantom
+            // `phase=get_timeout` (#4066).
+            op_manager.completed(tx);
+            SubOpGetOutcome::NotFound(cause)
+        }
+        RetryLoopOutcome::Unexpected => {
+            op_manager.completed(tx);
+            SubOpGetOutcome::Infra(OpError::UnexpectedOpState)
+        }
+        RetryLoopOutcome::InfraError(err) => {
+            op_manager.completed(tx);
+            SubOpGetOutcome::Infra(err)
+        }
     }
 }
 
@@ -3676,6 +3705,89 @@ mod tests {
              failure). Recording it as Failure would systematically \
              de-prioritise peers that don't host the queried contract."
         );
+    }
+
+    /// Regression for #4066: the originator's first
+    /// `send_and_await(target=None)` loops back as an InboundMessage
+    /// with `source_addr=None`, which falls through to legacy
+    /// `process_message` (the relay-driver dispatch is gated on
+    /// `source_addr.is_some()`) and pushes a `GetOp` into
+    /// `OpManager.ops.get` keyed by `client_tx`. If the driver exits
+    /// via any non-Done arm without calling `op_manager.completed()`,
+    /// the legacy entry lingers until the periodic GC sweep at
+    /// OPERATION_TTL=60s (which races the driver's per-attempt
+    /// timeout, also 60s) and emits a misleading
+    /// `phase=get_timeout` log + duplicate `OperationError` to the
+    /// client. Pin every retry-loop arm to call `completed()`.
+    #[test]
+    fn drive_client_get_inner_completes_op_on_every_exit_path() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        for arm in &[
+            "RetryLoopOutcome::Exhausted",
+            "RetryLoopOutcome::Unexpected",
+            "RetryLoopOutcome::InfraError",
+        ] {
+            let arm_start = body.find(arm).unwrap_or_else(|| {
+                panic!(
+                    "drive_client_get_inner must have a {arm} arm — without it the \
+                     legacy ops.get entry created by the originator-loopback Request \
+                     leaks until the GC sweep emits phantom phase=get_timeout (#4066)"
+                )
+            });
+            // Bound the search to this arm body — clip at the next match arm
+            // (RetryLoopOutcome::* or the closing `}` of the match).
+            let tail = &body[arm_start..];
+            let arm_end = tail[1..]
+                .find("RetryLoopOutcome::")
+                .map(|p| p + 1)
+                .unwrap_or(tail.len());
+            let arm_body = &tail[..arm_end];
+            assert!(
+                arm_body.contains("op_manager.completed("),
+                "drive_client_get_inner {arm} arm must call \
+                 op_manager.completed(client_tx) to clear the legacy ops.get \
+                 entry created by the originator-loopback Request — see #4066. \
+                 Without this the GC sweep races the driver and emits a \
+                 phantom `phase=get_timeout` log + duplicate OperationError."
+            );
+        }
+    }
+
+    /// Same invariant for the sub-op driver (`drive_sub_op_get`):
+    /// callers (executor's `local_state_or_from_network`,
+    /// subscribe's `fetch_contract_if_missing`) feed the sub-op
+    /// outcome into their own logic, but the originator-loopback
+    /// path that creates the legacy `ops.get` entry runs on the
+    /// SAME node, keyed by the sub-op `tx`. If we don't clear it
+    /// here, the sub-op's caller observes a clean failure but the
+    /// node still emits `phase=get_timeout` 60s later for the
+    /// orphaned entry.
+    #[test]
+    fn drive_sub_op_get_completes_op_on_every_exit_path() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_sub_op_get(");
+        for arm in &[
+            "RetryLoopOutcome::Exhausted",
+            "RetryLoopOutcome::Unexpected",
+            "RetryLoopOutcome::InfraError",
+        ] {
+            let arm_start = body
+                .find(arm)
+                .unwrap_or_else(|| panic!("drive_sub_op_get must have a {arm} arm (#4066)"));
+            let tail = &body[arm_start..];
+            let arm_end = tail[1..]
+                .find("RetryLoopOutcome::")
+                .map(|p| p + 1)
+                .unwrap_or(tail.len());
+            let arm_body = &tail[..arm_end];
+            assert!(
+                arm_body.contains("op_manager.completed("),
+                "drive_sub_op_get {arm} arm must call op_manager.completed(tx) \
+                 — see drive_client_get_inner_completes_op_on_every_exit_path \
+                 for the failure mode (#4066)"
+            );
+        }
     }
 
     trait FindOrPanic {
