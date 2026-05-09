@@ -9,7 +9,10 @@ use freenet_stdlib::prelude::{
 };
 
 use super::engine::{InstanceHandle, WasmEngine};
-use super::native_api::{CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, InstanceId};
+use super::native_api::{
+    self, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, DelegateContextEntry,
+    InstanceId,
+};
 use super::{Runtime, RuntimeResult};
 use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
@@ -514,10 +517,15 @@ impl DelegateRuntimeInterface for Runtime {
         // UserResponse with no pending context" because the Vec only used to
         // live for one `inbound_app_message` call. See
         // `native_api::DelegateContextCache`.
+        //
+        // Amortised TTL sweep on every entry prevents the cache from holding
+        // bytes for prompts whose `UserResponse` never arrives (user
+        // dismisses, app crashes, network partition).
+        native_api::prune_expired_contexts(&self.delegate_contexts);
         let mut context: Vec<u8> = self
             .delegate_contexts
             .get(delegate_key)
-            .map(|c| c.clone())
+            .map(|entry| entry.bytes.clone())
             .unwrap_or_default();
 
         // Process all messages, collecting the result.
@@ -702,7 +710,13 @@ impl DelegateRuntimeInterface for Runtime {
         if context.is_empty() {
             self.delegate_contexts.remove(delegate_key);
         } else if context.len() < freenet_stdlib::prelude::DelegateContext::MAX_SIZE {
-            self.delegate_contexts.insert(delegate_key.clone(), context);
+            self.delegate_contexts.insert(
+                delegate_key.clone(),
+                DelegateContextEntry {
+                    bytes: context,
+                    last_write: tokio::time::Instant::now(),
+                },
+            );
         } else {
             tracing::warn!(
                 delegate_key = %delegate_key,
@@ -1528,6 +1542,142 @@ mod test {
         assert!(
             !cache.contains_key(delegate.key()),
             "unregister_delegate should clear delegate_contexts entry"
+        );
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Pin the oversize-context drop path: a delegate that writes a context
+    /// larger than `DelegateContext::MAX_SIZE` must NOT crash the runtime on
+    /// the subsequent call. The runtime drops the persisted bytes (with a
+    /// warn-level log) and the next call sees an empty context.
+    ///
+    /// Without this guard the next `inbound_app_message` would assert inside
+    /// `DelegateContext::new(...)` when threading the bytes back to the WASM
+    /// boundary, taking down the executor pool worker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_context_oversize_is_dropped_not_crashed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Write past MAX_SIZE — `ctx.write` host fn has no size cap of its
+        // own, so the WASM call itself succeeds even though the bytes won't
+        // fit in `DelegateContext`.
+        let oversize = freenet_stdlib::prelude::DelegateContext::MAX_SIZE + 1024;
+        let payload = bincode::serialize(&InboundAppMessage::WriteLargeContext(oversize))?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )?;
+        assert!(
+            matches!(&outbound[0], OutboundDelegateMsg::ApplicationMessage(_)),
+            "first call should still produce a normal ApplicationMessage outbound"
+        );
+
+        // The persisted entry must be dropped — readers don't get to see
+        // bytes that would crash on the next round-trip.
+        assert!(
+            !runtime.delegate_contexts.contains_key(delegate.key()),
+            "oversize ctx.write should be dropped from the persisted cache"
+        );
+
+        // A follow-up call must succeed (no crash) and the delegate must
+        // observe an empty context (NOT the oversize bytes).
+        let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )?;
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            other => panic!("Expected ApplicationMessage, got {other:?}"),
+        };
+        match response {
+            OutboundAppMessage::ContextData(data) => {
+                assert!(
+                    data.is_empty(),
+                    "after oversize drop, next call must read an empty context, got {} bytes",
+                    data.len()
+                );
+            }
+            other => panic!("Expected ContextData, got {other:?}"),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Pin the TTL-based eviction: an entry whose `last_write` is older than
+    /// `DELEGATE_CONTEXT_TTL` is dropped on the next sweep, even if
+    /// `unregister_delegate` is never called. Without TTL the cache leaks
+    /// pending-state bytes for any delegate whose `RequestUserInput` doesn't
+    /// receive a matching `UserResponse` (prompt dismissed, app crash,
+    /// network partition) until process restart.
+    ///
+    /// Doesn't go through the WASM path; manipulates the cache and then
+    /// drives a no-op `inbound_app_message` so the loader's `prune_expired`
+    /// runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_context_ttl_evicts_stale_entry() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::InboundAppMessage;
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Plant an entry whose last_write is older than the TTL. Using
+        // `tokio::time::Instant` matches the entry's storage type and lets
+        // `tokio::time::pause` / `tokio::time::advance` drive the sweep
+        // deterministically in future tests if needed.
+        let stale_at = tokio::time::Instant::now()
+            .checked_sub(super::native_api::DELEGATE_CONTEXT_TTL)
+            .expect("Instant arithmetic on test platform")
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("Instant arithmetic on test platform");
+        runtime.delegate_contexts.insert(
+            delegate.key().clone(),
+            super::native_api::DelegateContextEntry {
+                bytes: vec![0xAA; 64],
+                last_write: stale_at,
+            },
+        );
+        assert!(runtime.delegate_contexts.contains_key(delegate.key()));
+
+        // Drive any inbound — the loader's prune sweep runs first.
+        let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+        runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )?;
+
+        // The stale entry must be gone. The ReadContext call wrote nothing,
+        // so no fresh entry was inserted in its place.
+        assert!(
+            !runtime.delegate_contexts.contains_key(delegate.key()),
+            "TTL sweep should evict an entry older than DELEGATE_CONTEXT_TTL"
         );
 
         std::mem::drop(temp_dir);

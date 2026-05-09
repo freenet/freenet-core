@@ -62,10 +62,51 @@ pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
 /// might run on executor A and its `UserResponse` follow-up on executor B,
 /// so per-`Runtime` storage would have the same locality bug as the
 /// per-call `Vec`.
-pub(crate) type DelegateContextCache = Arc<DashMap<DelegateKey, Vec<u8>>>;
+///
+/// TTL: each entry stores the `Instant` it was last written. On every
+/// `inbound_app_message` call the loader prunes entries older than
+/// `DELEGATE_CONTEXT_TTL`. Without this, a `RequestUserInput` whose
+/// `UserResponse` never arrives (user dismisses the prompt, app crashes,
+/// network partition) leaves bytes pinned until the matching
+/// `UnregisterDelegate` — which may be never for long-lived delegates. The
+/// AGENTS.md GC rule requires that any cleanup-exemption be time-bounded.
+pub(crate) type DelegateContextCache = Arc<DashMap<DelegateKey, DelegateContextEntry>>;
+
+#[derive(Clone)]
+pub(crate) struct DelegateContextEntry {
+    pub bytes: Vec<u8>,
+    /// Last-write timestamp for TTL eviction. `tokio::time::Instant` (not
+    /// `std::time::Instant`) so test code using `tokio::time::pause` /
+    /// `tokio::time::advance` can drive the eviction sweep deterministically,
+    /// matching the convention used by `RealTime` in `simulation/time.rs`.
+    pub last_write: tokio::time::Instant,
+}
+
+/// How long an unconsumed delegate context survives in the cache.
+///
+/// 10 minutes is comfortably longer than any reasonable interactive
+/// `RequestUserInput → UserResponse` round-trip (the prompt itself
+/// auto-denies at 60 s; users who walk away typically come back within
+/// seconds-to-minutes), and shorter than the lifetime of any real
+/// long-lived registered delegate, so genuine in-flight prompts never
+/// expire prematurely. If a future delegate needs context to survive
+/// across longer gaps, that's a sign it should persist via its own
+/// secret store rather than relying on this ephemeral cache.
+pub(crate) const DELEGATE_CONTEXT_TTL: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
 
 pub(crate) fn new_delegate_context_cache() -> DelegateContextCache {
     Arc::new(DashMap::default())
+}
+
+/// Drop entries whose last write is older than `DELEGATE_CONTEXT_TTL`.
+///
+/// Called from `inbound_app_message` so eviction is amortised across normal
+/// delegate activity — no background sweep task and no extra lock contention
+/// when the node is idle.
+pub(crate) fn prune_expired_contexts(cache: &DelegateContextCache) {
+    let now = tokio::time::Instant::now();
+    cache.retain(|_, entry| now.duration_since(entry.last_write) < DELEGATE_CONTEXT_TTL);
 }
 
 /// Tracks message origins inherited by child delegates from their parent.
