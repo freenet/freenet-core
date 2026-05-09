@@ -724,9 +724,19 @@ function freenetBridge(authToken) {
         //  - base64: capped at ~10 MiB raw bytes
         //  - rate-limit: 1 download per 2s, same reasoning as clipboard
         var now2 = Date.now();
-        if (now2 - lastDownload < 2000) return;
+        if (now2 - lastDownload < 2000) {
+          console.warn('[freenet] download rate-limited (>1 per 2s)');
+          return;
+        }
+        // Charge the rate-limit budget for *every* attempt (even rejected
+        // ones) so a malicious iframe can't burn host CPU by spamming
+        // invalid payloads at high frequency.
+        lastDownload = now2;
         var rawName = msg.filename;
-        if (rawName.indexOf('\0') !== -1) return;
+        if (rawName.indexOf('\0') !== -1) {
+          console.warn('[freenet] download rejected: null byte in filename');
+          return;
+        }
         // Strip path components — keep only the basename. Normalise
         // both `/` and `\` so a malicious contract can't smuggle in a
         // backslash on POSIX.
@@ -737,7 +747,10 @@ function freenetBridge(authToken) {
         // Strip leading dots so a contract can't write a dotfile.
         while (rawName.charAt(0) === '.') rawName = rawName.slice(1);
         rawName = rawName.slice(0, 128);
-        if (rawName.length === 0) return;
+        if (rawName.length === 0) {
+          console.warn('[freenet] download rejected: empty filename after sanitisation');
+          return;
+        }
         var mime = typeof msg.mimeType === 'string' ? msg.mimeType : 'application/octet-stream';
         var ALLOWED_MIME = {
           'application/json': 1,
@@ -745,22 +758,39 @@ function freenetBridge(authToken) {
           'text/plain': 1,
           'text/csv': 1
         };
-        if (!ALLOWED_MIME[mime]) mime = 'application/octet-stream';
+        // Disallowed MIMEs are downgraded to octet-stream rather than
+        // rejected, so callers always get *some* download — but log it
+        // so the contract author can fix the mismatch.
+        if (!ALLOWED_MIME[mime]) {
+          console.warn('[freenet] download MIME ' + mime + ' downgraded to application/octet-stream');
+          mime = 'application/octet-stream';
+        }
         // base64 max length ≈ 4/3 * raw size; 10 MiB raw → ~13.4 MiB b64.
-        if (msg.base64.length > 14 * 1024 * 1024) return;
+        // Round up to 14 MiB for a small safety margin.
+        if (msg.base64.length > 14 * 1024 * 1024) {
+          console.warn('[freenet] download rejected: payload exceeds 14 MiB base64 cap');
+          return;
+        }
         var raw;
         try {
           raw = atob(msg.base64);
         } catch (e) {
+          console.warn('[freenet] download rejected: base64 decode failed');
           return;
         }
         var len = raw.length;
         var bytes = new Uint8Array(len);
         for (var i = 0; i < len; i++) bytes[i] = raw.charCodeAt(i) & 0xff;
         var blob;
-        try { blob = new Blob([bytes], { type: mime }); } catch (e) { return; }
+        try { blob = new Blob([bytes], { type: mime }); } catch (e) {
+          console.warn('[freenet] download rejected: Blob construction failed');
+          return;
+        }
         var url;
-        try { url = URL.createObjectURL(blob); } catch (e) { return; }
+        try { url = URL.createObjectURL(blob); } catch (e) {
+          console.warn('[freenet] download rejected: createObjectURL failed');
+          return;
+        }
         var a = document.createElement('a');
         a.href = url;
         a.download = rawName;
@@ -770,7 +800,6 @@ function freenetBridge(authToken) {
         document.body.removeChild(a);
         // Defer revoke so the browser has time to start the download.
         setTimeout(function() { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
-        lastDownload = now2;
       } else if (msg.type === 'navigate' && typeof msg.href === 'string') {
         // Navigation from the sandboxed iframe. The iframe cannot navigate
         // the top window itself, so it postMessages the shell, which does
