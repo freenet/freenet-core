@@ -2183,6 +2183,75 @@ mod tests {
         );
     }
 
+    /// Pin: `relay_put_send_response` MUST switch to local-loopback
+    /// when `upstream_addr == own_addr`. Without this, the wire-bound
+    /// `send_fire_and_forget(own_addr, ...)` tries to ship over a
+    /// non-existent self-connection and the originator-loopback PUT
+    /// fails with "Cannot establish connection - peer not found".
+    /// Repro: `test_minimal_state_put_get` and the rest of
+    /// `edge_case_state_sizes` (#1454 phase 5 final, PUT slice fixup).
+    #[test]
+    fn relay_put_send_response_uses_loopback_when_upstream_is_own_addr() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn relay_put_send_response(")
+            .expect("relay_put_send_response not found");
+        let fn_end = src[fn_start..]
+            .find("\n// ── Relay streaming PUT driver")
+            .expect("end-of-relay-fn marker not found")
+            + fn_start;
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("send_local_loopback("),
+            "relay_put_send_response must call send_local_loopback for the \
+             upstream==own_addr branch (originator-loopback PUT path)"
+        );
+        assert!(
+            body.contains("get_own_addr()"),
+            "relay_put_send_response must compare upstream_addr to \
+             connection_manager.get_own_addr() to detect the loopback case"
+        );
+    }
+
+    /// Pin: `run_relay_put` MUST skip `release_pending_op_slot` when
+    /// running in originator-loopback mode (`upstream_addr ==
+    /// own_addr`). The `pending_op_results` callback for `incoming_tx`
+    /// in that mode is the originator's `send_and_await` waiter, not
+    /// one this driver installed; releasing it would emit
+    /// `TransactionCompleted` and remove the originator's callback
+    /// BEFORE the loopback `PutMsg::Response` reaches the bypass
+    /// (notifications channel has higher priority than op_execution
+    /// in priority_select). Repro: `test_minimal_state_put_get`.
+    #[test]
+    fn run_relay_put_skips_release_in_originator_loopback() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn run_relay_put<CB>(")
+            .expect("run_relay_put not found");
+        let fn_end = src[fn_start..]
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn drive_relay_put<CB>(")
+            .expect("end-of-run_relay_put marker not found")
+            + fn_start;
+        let body = &src[fn_start..fn_end];
+        // The release call must be guarded by an own_addr comparison.
+        let release_pos = body
+            .find("release_pending_op_slot(incoming_tx)")
+            .expect("release_pending_op_slot call not found in run_relay_put");
+        let preceding = &body[..release_pos];
+        assert!(
+            preceding.rfind("get_own_addr()").is_some(),
+            "run_relay_put must call get_own_addr() before \
+             release_pending_op_slot to gate the release on the \
+             upstream != own_addr case"
+        );
+        assert!(
+            preceding.rfind("Some(upstream_addr) != own_addr").is_some()
+                || preceding.rfind("upstream_addr) != own_addr").is_some(),
+            "run_relay_put must guard release_pending_op_slot with an \
+             upstream != own_addr check (originator-loopback exception)"
+        );
+    }
+
     /// Pin: driver forward must reuse `incoming_tx` — legacy PUT relay
     /// uses the same tx end-to-end. Minting a fresh tx per hop breaks
     /// the dispatch gate's has_put_op check at the downstream peer.
