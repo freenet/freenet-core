@@ -617,6 +617,7 @@ function freenetBridge(authToken) {
   var iframe = document.getElementById('app');
   var connections = new Map();
   var lastClipboard = 0;
+  var lastDownload = 0;
 
   // Build iframe src from data-src, appending any URL hash for deep
   // linking. Using data-src (not src) in the HTML means the iframe
@@ -706,6 +707,70 @@ function freenetBridge(authToken) {
           lastClipboard = now;
           try { navigator.clipboard.writeText(msg.text.slice(0, 2048)); } catch(e) {}
         }
+      } else if (msg.type === 'download' &&
+                 typeof msg.filename === 'string' &&
+                 typeof msg.base64 === 'string') {
+        // Download proxy: contracts inside the sandboxed (null-origin)
+        // iframe can't reliably trigger file downloads — `<a download>`
+        // either silently fails (Firefox) or saves to an inaccessible
+        // location (Chrome). The shell runs in the real origin and
+        // can do it normally.
+        //
+        // Validation:
+        //  - filename: stripped of path separators and leading dots,
+        //    capped at 128 chars, no nulls
+        //  - mimeType: only a small allowlist (data URLs from arbitrary
+        //    types could be exploited by malicious contracts)
+        //  - base64: capped at ~10 MiB raw bytes
+        //  - rate-limit: 1 download per 2s, same reasoning as clipboard
+        var now2 = Date.now();
+        if (now2 - lastDownload < 2000) return;
+        var rawName = msg.filename;
+        if (rawName.indexOf('\0') !== -1) return;
+        // Strip path components — keep only the basename. Normalise
+        // both `/` and `\` so a malicious contract can't smuggle in a
+        // backslash on POSIX.
+        var slash = rawName.lastIndexOf('/');
+        if (slash >= 0) rawName = rawName.slice(slash + 1);
+        var bslash = rawName.lastIndexOf('\\');
+        if (bslash >= 0) rawName = rawName.slice(bslash + 1);
+        // Strip leading dots so a contract can't write a dotfile.
+        while (rawName.charAt(0) === '.') rawName = rawName.slice(1);
+        rawName = rawName.slice(0, 128);
+        if (rawName.length === 0) return;
+        var mime = typeof msg.mimeType === 'string' ? msg.mimeType : 'application/octet-stream';
+        var ALLOWED_MIME = {
+          'application/json': 1,
+          'application/octet-stream': 1,
+          'text/plain': 1,
+          'text/csv': 1
+        };
+        if (!ALLOWED_MIME[mime]) mime = 'application/octet-stream';
+        // base64 max length ≈ 4/3 * raw size; 10 MiB raw → ~13.4 MiB b64.
+        if (msg.base64.length > 14 * 1024 * 1024) return;
+        var raw;
+        try {
+          raw = atob(msg.base64);
+        } catch (e) {
+          return;
+        }
+        var len = raw.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) bytes[i] = raw.charCodeAt(i) & 0xff;
+        var blob;
+        try { blob = new Blob([bytes], { type: mime }); } catch (e) { return; }
+        var url;
+        try { url = URL.createObjectURL(blob); } catch (e) { return; }
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = rawName;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        try { a.click(); } catch (e) {}
+        document.body.removeChild(a);
+        // Defer revoke so the browser has time to start the download.
+        setTimeout(function() { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+        lastDownload = now2;
       } else if (msg.type === 'navigate' && typeof msg.href === 'string') {
         // Navigation from the sandboxed iframe. The iframe cannot navigate
         // the top window itself, so it postMessages the shell, which does
