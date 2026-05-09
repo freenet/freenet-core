@@ -176,6 +176,26 @@ async fn run_client_get(
     subscribe: bool,
     blocking_subscribe: bool,
 ) {
+    // RAII guard: clears any legacy `ops.get` entry on every exit
+    // path of this task — happy path, retry exhaustion, infra error,
+    // *and* a panic inside the driver. The originator's first
+    // `send_and_await(target=None)` loops back as an InboundMessage
+    // with `source_addr=None`, which falls through to legacy
+    // `process_message::GetMsg::Request` (the dispatch gate at
+    // `node.rs::handle_pure_network_message_v1` requires
+    // `source_addr.is_some()`) and pushes a `GetOp` into `ops.get`
+    // keyed by `client_tx`. Without this guard the entry lingers
+    // until the periodic GC sweep at OPERATION_TTL=60s, which races
+    // the driver's per-attempt timeout (also 60s) and emits a
+    // misleading `phase=get_timeout` log + duplicate `OperationError`
+    // to the client (#4066). `op_manager.completed` is idempotent;
+    // calling it when the driver never registered a legacy entry is
+    // harmless.
+    let _completion_guard = ClientGetCompletionGuard {
+        op_manager: op_manager.clone(),
+        client_tx,
+    };
+
     let outcome = drive_client_get(
         op_manager.clone(),
         client_tx,
@@ -186,6 +206,20 @@ async fn run_client_get(
     )
     .await;
     deliver_outcome(&op_manager, client_tx, outcome);
+}
+
+/// RAII guard that calls `op_manager.completed(client_tx)` on drop,
+/// covering every exit path including panics. Documented at the
+/// guard installation site in `run_client_get`.
+struct ClientGetCompletionGuard {
+    op_manager: Arc<OpManager>,
+    client_tx: Transaction,
+}
+
+impl Drop for ClientGetCompletionGuard {
+    fn drop(&mut self) {
+        self.op_manager.completed(self.client_tx);
+    }
 }
 
 /// GET driver has exactly two outcomes, matching PUT 3a.
@@ -270,13 +304,19 @@ async fn drive_client_get_inner(
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "get", &mut driver).await;
 
+    // `op_manager.completed(client_tx)` runs from the
+    // `ClientGetCompletionGuard` in `run_client_get` AFTER this fn
+    // returns (and the side-effect block below has run). Do not add
+    // explicit `completed()` calls in the arms here — doing so would
+    // race the originator-side side effects (`cache_contract_locally`,
+    // `auto_subscribe_on_get_response`, `maybe_subscribe_child`)
+    // because once the tx is in `ops.completed`, any
+    // `op_manager.push(...)` for that tx is silently dropped (see
+    // `op_state_manager.rs::push` short-circuit on
+    // `ops.completed.contains`).
+
     match loop_result {
         RetryLoopOutcome::Done(terminal) => {
-            // Clean up any DashMap entry left behind. `op_manager.completed`
-            // is idempotent, so calling it even when the driver never
-            // pushed is harmless.
-            op_manager.completed(client_tx);
-
             // Mirror the originator-side side effects that the legacy
             // `process_message` Response{Found} branch does
             // (`get.rs:2218–2450`): PutQuery the fetched state into
@@ -447,29 +487,13 @@ async fn drive_client_get_inner(
             Ok(DriverOutcome::Publish(host_result))
         }
         RetryLoopOutcome::Exhausted(cause) => {
-            // Originator's first `send_and_await(target=None)` loops back as an
-            // InboundMessage with `source_addr=None`, which falls through to
-            // legacy `process_message` (node.rs gates relay-driver dispatch on
-            // `source_addr.is_some()`) and pushes a `GetOp` into `ops.get`
-            // keyed by `client_tx`. Without this `completed()` call, the legacy
-            // entry lingers until the periodic GC sweep at OPERATION_TTL=60s,
-            // which races the driver's per-attempt timeout (also 60s) and
-            // emits a misleading `phase=get_timeout` log + duplicate
-            // `OperationError` to the client (#4066).
-            op_manager.completed(client_tx);
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
             }
             .into())))
         }
-        RetryLoopOutcome::Unexpected => {
-            op_manager.completed(client_tx);
-            Err(OpError::UnexpectedOpState)
-        }
-        RetryLoopOutcome::InfraError(err) => {
-            op_manager.completed(client_tx);
-            Err(err)
-        }
+        RetryLoopOutcome::Unexpected => Err(OpError::UnexpectedOpState),
+        RetryLoopOutcome::InfraError(err) => Err(err),
     }
 }
 
@@ -1100,10 +1124,32 @@ async fn run_sub_op_get(
     return_contract_code: bool,
     out_tx: tokio::sync::oneshot::Sender<SubOpGetOutcome>,
 ) {
+    // RAII guard: see ClientGetCompletionGuard. Same mechanism for
+    // sub-op GETs — they go through the same originator-loopback that
+    // pushes a GetOp into `ops.get`, and need cleanup on every exit
+    // path including panics.
+    let _completion_guard = SubOpGetCompletionGuard {
+        op_manager: op_manager.clone(),
+        tx,
+    };
+
     let outcome = drive_sub_op_get(&op_manager, tx, instance_id, return_contract_code).await;
     // Receiver drop is acceptable — fire-and-forget callers expect this.
     #[allow(clippy::let_underscore_must_use)]
     let _ = out_tx.send(outcome);
+}
+
+/// RAII guard counterpart to `ClientGetCompletionGuard` for sub-op
+/// GET drivers.
+struct SubOpGetCompletionGuard {
+    op_manager: Arc<OpManager>,
+    tx: Transaction,
+}
+
+impl Drop for SubOpGetCompletionGuard {
+    fn drop(&mut self) {
+        self.op_manager.completed(self.tx);
+    }
 }
 
 async fn drive_sub_op_get(
@@ -1145,10 +1191,12 @@ async fn drive_sub_op_get(
 
     let loop_result = drive_retry_loop(op_manager, tx, "get-subop", &mut driver).await;
 
+    // `op_manager.completed(tx)` runs from the
+    // `SubOpGetCompletionGuard` in `run_sub_op_get` AFTER this fn
+    // returns. See the matching comment in `drive_client_get_inner`.
+
     match loop_result {
         RetryLoopOutcome::Done(terminal) => {
-            op_manager.completed(tx);
-
             let reply_key = match &terminal {
                 Terminal::InlineFound {
                     key,
@@ -1235,22 +1283,9 @@ async fn drive_sub_op_get(
                 _ => SubOpGetOutcome::NotFound(missing_state_cause(&instance_id)),
             }
         }
-        RetryLoopOutcome::Exhausted(cause) => {
-            // See `drive_client_get_inner`'s matching arm: legacy `ops.get`
-            // entry created by the originator-loopback Request must be
-            // cleared on every exit path or the GC sweep emits a phantom
-            // `phase=get_timeout` (#4066).
-            op_manager.completed(tx);
-            SubOpGetOutcome::NotFound(cause)
-        }
-        RetryLoopOutcome::Unexpected => {
-            op_manager.completed(tx);
-            SubOpGetOutcome::Infra(OpError::UnexpectedOpState)
-        }
-        RetryLoopOutcome::InfraError(err) => {
-            op_manager.completed(tx);
-            SubOpGetOutcome::Infra(err)
-        }
+        RetryLoopOutcome::Exhausted(cause) => SubOpGetOutcome::NotFound(cause),
+        RetryLoopOutcome::Unexpected => SubOpGetOutcome::Infra(OpError::UnexpectedOpState),
+        RetryLoopOutcome::InfraError(err) => SubOpGetOutcome::Infra(err),
     }
 }
 
@@ -3712,82 +3747,101 @@ mod tests {
     /// with `source_addr=None`, which falls through to legacy
     /// `process_message` (the relay-driver dispatch is gated on
     /// `source_addr.is_some()`) and pushes a `GetOp` into
-    /// `OpManager.ops.get` keyed by `client_tx`. If the driver exits
-    /// via any non-Done arm without calling `op_manager.completed()`,
-    /// the legacy entry lingers until the periodic GC sweep at
-    /// OPERATION_TTL=60s (which races the driver's per-attempt
-    /// timeout, also 60s) and emits a misleading
+    /// `OpManager.ops.get` keyed by `client_tx`. If the driver task
+    /// exits without `op_manager.completed()` having been called for
+    /// `client_tx`, the legacy entry lingers until the periodic GC
+    /// sweep at OPERATION_TTL=60s (which races the driver's
+    /// per-attempt timeout, also 60s) and emits a misleading
     /// `phase=get_timeout` log + duplicate `OperationError` to the
-    /// client. Pin every retry-loop arm to call `completed()`.
+    /// client.
+    ///
+    /// Implemented via an RAII guard installed at the top of
+    /// `run_client_get` so cleanup runs on every exit path —
+    /// including a panic inside the driver loop, which the previous
+    /// per-arm `completed()` calls did not cover (skeptical-reviewer
+    /// callout on PR #4070, "panic / abort path still leaks").
+    /// Pin both the guard installation and the Drop impl that clears
+    /// the legacy entry.
     #[test]
-    fn drive_client_get_inner_completes_op_on_every_exit_path() {
+    fn run_client_get_installs_completion_guard() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_client_get_inner(");
-        for arm in &[
-            "RetryLoopOutcome::Exhausted",
-            "RetryLoopOutcome::Unexpected",
-            "RetryLoopOutcome::InfraError",
-        ] {
-            let arm_start = body.find(arm).unwrap_or_else(|| {
-                panic!(
-                    "drive_client_get_inner must have a {arm} arm — without it the \
-                     legacy ops.get entry created by the originator-loopback Request \
-                     leaks until the GC sweep emits phantom phase=get_timeout (#4066)"
-                )
-            });
-            // Bound the search to this arm body — clip at the next match arm
-            // (RetryLoopOutcome::* or the closing `}` of the match).
-            let tail = &body[arm_start..];
-            let arm_end = tail[1..]
-                .find("RetryLoopOutcome::")
-                .map(|p| p + 1)
-                .unwrap_or(tail.len());
-            let arm_body = &tail[..arm_end];
-            assert!(
-                arm_body.contains("op_manager.completed("),
-                "drive_client_get_inner {arm} arm must call \
-                 op_manager.completed(client_tx) to clear the legacy ops.get \
-                 entry created by the originator-loopback Request — see #4066. \
-                 Without this the GC sweep races the driver and emits a \
-                 phantom `phase=get_timeout` log + duplicate OperationError."
-            );
-        }
+        let body = extract_fn_body(src, "async fn run_client_get(");
+        assert!(
+            body.contains("ClientGetCompletionGuard {"),
+            "run_client_get must install a ClientGetCompletionGuard so the \
+             legacy ops.get entry created by the originator-loopback Request \
+             is cleared on every exit path including a driver panic (#4066). \
+             Per-arm completed() calls in drive_client_get_inner are NOT \
+             enough — a panic inside drive_retry_loop or any of its awaits \
+             aborts the task before reaching the match block, leaving the \
+             entry to be reaped by the GC sweep that emits phantom \
+             phase=get_timeout."
+        );
+        assert!(
+            body.contains("let _completion_guard = ClientGetCompletionGuard"),
+            "ClientGetCompletionGuard must be bound to a guard binding \
+             (`let _completion_guard = ...`) so it lives for the full \
+             function scope. A bare `let _ = ...` would drop it immediately."
+        );
+
+        // The guard's Drop must call op_manager.completed.
+        let drop_impl = src
+            .split("impl Drop for ClientGetCompletionGuard")
+            .nth(1)
+            .expect("ClientGetCompletionGuard must have an explicit Drop impl");
+        let drop_body = drop_impl
+            .split("fn drop")
+            .nth(1)
+            .expect("ClientGetCompletionGuard Drop impl must define fn drop");
+        // Bound the search to the body of fn drop — the next `}` after
+        // the opening `{` belongs to the inner block; we just need to
+        // confirm `completed(` appears somewhere inside the impl block.
+        assert!(
+            drop_body.contains(".completed(self.client_tx)"),
+            "ClientGetCompletionGuard::drop must call \
+             op_manager.completed(self.client_tx) — see #4066"
+        );
     }
 
-    /// Same invariant for the sub-op driver (`drive_sub_op_get`):
-    /// callers (executor's `local_state_or_from_network`,
-    /// subscribe's `fetch_contract_if_missing`) feed the sub-op
-    /// outcome into their own logic, but the originator-loopback
-    /// path that creates the legacy `ops.get` entry runs on the
-    /// SAME node, keyed by the sub-op `tx`. If we don't clear it
-    /// here, the sub-op's caller observes a clean failure but the
-    /// node still emits `phase=get_timeout` 60s later for the
-    /// orphaned entry.
+    /// Same invariant for the sub-op driver: callers (executor's
+    /// `local_state_or_from_network`, subscribe's
+    /// `fetch_contract_if_missing`) feed the sub-op outcome into their
+    /// own logic, but the originator-loopback path that creates the
+    /// legacy `ops.get` entry runs on the SAME node, keyed by the
+    /// sub-op `tx`. Without the guard, the sub-op's caller observes a
+    /// clean failure but the node still emits `phase=get_timeout` 60s
+    /// later for the orphaned entry.
     #[test]
-    fn drive_sub_op_get_completes_op_on_every_exit_path() {
+    fn run_sub_op_get_installs_completion_guard() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_sub_op_get(");
-        for arm in &[
-            "RetryLoopOutcome::Exhausted",
-            "RetryLoopOutcome::Unexpected",
-            "RetryLoopOutcome::InfraError",
-        ] {
-            let arm_start = body
-                .find(arm)
-                .unwrap_or_else(|| panic!("drive_sub_op_get must have a {arm} arm (#4066)"));
-            let tail = &body[arm_start..];
-            let arm_end = tail[1..]
-                .find("RetryLoopOutcome::")
-                .map(|p| p + 1)
-                .unwrap_or(tail.len());
-            let arm_body = &tail[..arm_end];
-            assert!(
-                arm_body.contains("op_manager.completed("),
-                "drive_sub_op_get {arm} arm must call op_manager.completed(tx) \
-                 — see drive_client_get_inner_completes_op_on_every_exit_path \
-                 for the failure mode (#4066)"
-            );
-        }
+        let body = extract_fn_body(src, "async fn run_sub_op_get(");
+        assert!(
+            body.contains("SubOpGetCompletionGuard {"),
+            "run_sub_op_get must install a SubOpGetCompletionGuard so the \
+             legacy ops.get entry created by the originator-loopback Request \
+             is cleared on every exit path — see \
+             run_client_get_installs_completion_guard for the failure mode \
+             (#4066)"
+        );
+        assert!(
+            body.contains("let _completion_guard = SubOpGetCompletionGuard"),
+            "SubOpGetCompletionGuard must be bound to a guard binding so it \
+             lives for the full function scope"
+        );
+
+        let drop_impl = src
+            .split("impl Drop for SubOpGetCompletionGuard")
+            .nth(1)
+            .expect("SubOpGetCompletionGuard must have an explicit Drop impl");
+        let drop_body = drop_impl
+            .split("fn drop")
+            .nth(1)
+            .expect("SubOpGetCompletionGuard Drop impl must define fn drop");
+        assert!(
+            drop_body.contains(".completed(self.tx)"),
+            "SubOpGetCompletionGuard::drop must call \
+             op_manager.completed(self.tx) — see #4066"
+        );
     }
 
     trait FindOrPanic {
