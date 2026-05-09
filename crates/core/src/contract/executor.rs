@@ -260,6 +260,36 @@ impl ExecutorError {
         }
     }
 
+    /// Narrow discriminator for the specific failure that the
+    /// originator-side UPDATE auto-fetch heals: contract code/params
+    /// are not present in the local `state_store`, so
+    /// `update_contract` cannot run the merge.
+    ///
+    /// Distinct from `is_contract_exec_rejection` (which negates a
+    /// broader set including other contract-side validation errors
+    /// like `Deser`/`InvalidState`/`InvalidDelta`/`Other`/`DoublePut`/
+    /// `InvalidArrayLength` and storage errors). Auto-fetching on
+    /// those broader failures is wasted work — the contract IS
+    /// present, the input is bad. Use this narrow predicate at
+    /// originator UPDATE call sites so a malformed delta or a disk
+    /// error never triggers auto-fetch storms.
+    ///
+    /// Discriminator: stdlib's `ContractError::Update` with a cause
+    /// containing the literal "missing contract parameters" string
+    /// (produced by `runtime.rs`'s `get_params` failure path,
+    /// approx. lines 920–953). Any other `Update` variant cause
+    /// returns false.
+    pub fn is_missing_contract_parameters(&self) -> bool {
+        match &self.inner {
+            Either::Left(req_err) => matches!(
+                req_err.as_ref(),
+                RequestError::ContractError(StdContractError::Update { cause, .. })
+                    if cause.contains("missing contract parameters")
+            ),
+            Either::Right(_) => false,
+        }
+    }
+
     /// Returns true ONLY when the contract WASM merge function ran to completion
     /// and returned a typed `InvalidUpdate` / `InvalidUpdateWithInfo` rejection
     /// (e.g., "New state version N must be higher than current version N"). This
