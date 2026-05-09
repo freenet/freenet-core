@@ -299,20 +299,18 @@ async fn send_with_stream<CB: NetworkBridge>(
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum OpEnum {
     Connect(Box<connect::ConnectOp>),
-    Put(put::PutOp),
     Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
-    // `Update` variant retired in #1454 phase 5 final together with the
-    // `ops.update` DashMap. UPDATE wire flows now run on task-per-tx
-    // drivers in `update::op_ctx_task::*` and never produce an
-    // `OpEnum::Update`.
+    // `Put` variant retired in #1454 phase 5 final (PUT slice) together
+    // with the `ops.put` DashMap. PUT wire flows now run on task-per-tx
+    // drivers in `put::op_ctx_task::*` and never produce an
+    // `OpEnum::Put`. `Update` retired in the prior UPDATE slice.
 }
 
 impl OpEnum {
     delegate::delegate! {
         to match self {
             OpEnum::Connect(op) => op,
-            OpEnum::Put(op) => op,
             OpEnum::Get(op) => op,
             OpEnum::Subscribe(op) => op,
         } {
@@ -348,7 +346,6 @@ macro_rules! try_from_op_enum {
     };
 }
 
-try_from_op_enum!(OpEnum::Put, put::PutOp, TransactionType::Put);
 try_from_op_enum!(OpEnum::Get, get::GetOp, TransactionType::Get);
 try_from_op_enum!(
     OpEnum::Subscribe,

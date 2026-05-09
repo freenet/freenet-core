@@ -58,14 +58,14 @@ paths:
 > constructor exists in the tree. Phase 5
 > follow-up slice A (PR #3917) migrated fresh inbound non-streaming
 > relay `PutMsg::Request` to
-> `operations/put/op_ctx_task.rs::start_relay_put` (gated on
+> `operations/put/op_ctx_task.rs::start_relay_put` (originally gated on
 > `source_addr.is_some()` AND `!has_put_op(id)` AND the payload size
 > would not upgrade to streaming on forward). PUT GC speculative
 > retries and the per-op `ack_received` / `speculative_paths` fields
 > have since been retired (PR #3964) along with `PutMsg::ForwardingAck`
-> consumer + senders; only the upgrade-on-forward without inbound
-> `StreamId` and a no-op `ForwardingAck` receiver remain on legacy. Phase 5 follow-up slice B migrated fresh inbound streaming
-> relay `PutMsg::RequestStreaming` to
+> senders; the receiver was a no-op carried for backward-compat with
+> pre-#3964 peers. Phase 5 follow-up slice B migrated fresh inbound
+> streaming relay `PutMsg::RequestStreaming` to
 > `operations/put/op_ctx_task.rs::start_relay_put_streaming` (same
 > `source_addr.is_some()` AND `!has_put_op(id)` gate). The streaming
 > driver claims the inbound stream via
@@ -75,10 +75,37 @@ paths:
 > bubbles a non-streaming `PutMsg::Response` upstream (mirrors the
 > legacy downgrade at `put.rs:1517`). The dispatch site passes a
 > cloned `NetworkBridge` into the spawn so the driver can call
-> `pipe_stream` without a detour through `OpCtx`. The upgrade-only
-> case — `PutMsg::Request` whose serialized payload would exceed
-> `streaming_threshold` on forward but has no inbound `StreamId` to
-> claim — stays on the legacy path in slice B. Phase 5 follow-up slice A (PR
+> `pipe_stream` without a detour through `OpCtx`.
+>
+> **#1454 phase 5 final (PUT slice) retired the legacy PUT
+> state-machine path.** `OpEnum::Put`, `OpManager.ops.put` DashMap,
+> `impl Operation for PutOp`, `has_put_op`,
+> `remove_put_and_report_failure`, the `OpEnum::Put` arm in
+> `IsOperationCompleted for OpEnum`, the `OpEnum::Put` arm in the
+> abort handler, the `try_from_op_enum!(OpEnum::Put, ...)` macro
+> entry, and the `handle_op_request<PutOp>` fallthrough in node.rs
+> are all gone. Every PUT wire variant now dispatches unconditionally
+> to a task-per-tx driver — the `!has_put_op(id)` guard was redundant
+> because the DashMap could no longer be populated (every writer
+> lived inside the deleted `process_message`). `PutOp`, `PutState`,
+> `PutStats`, `AwaitingResponseData`, `FinishedData` and 25 inline
+> outcome / failure-routing / wire-format / pin tests survive under
+> `#[allow(dead_code)]` pending phase 6.
+>
+> **Upgrade-on-forward edge case.** Slice A's `start_relay_put`
+> driver does not yet perform the legacy
+> `should_use_streaming(payload_size)` re-check + upgrade-to-streaming
+> on forward (see legacy `put.rs::process_message` lines 480-528
+> pre-deletion). Inbound non-streaming `Request`s whose serialized
+> payload would exceed `streaming_threshold` on the forward would
+> have routed to the legacy path; with legacy retired, the dispatch
+> site in `node.rs` drops them with a `tracing::warn!` rather than
+> forwarding unstreamed. Originators running task-per-tx
+> (`start_client_put`) pre-serialize and choose `RequestStreaming`
+> when payload > threshold, so this only fires for peers running
+> pre-#1454 builds. A follow-up slice can teach `start_relay_put` to
+> upgrade-on-forward; until then this edge surfaces as a sender-side
+> timeout. Phase 5 follow-up slice A (PR
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
 > `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`
 > (gated on `source_addr.is_some()` AND `!has_subscribe_op(id)`);
