@@ -734,8 +734,22 @@ async fn run_relay_put<CB>(
     // rationale as GET relay — `send_to_and_await` leaves an is_closed
     // sender in the slot that only the 60s sweep would reclaim without
     // this explicit release.
+    //
+    // Originator-loopback exception (#1454 phase 5 final PUT slice):
+    // when this driver runs on the originator's own node
+    // (`upstream_addr == own_addr`), the `pending_op_results` callback
+    // for `incoming_tx` is the *originator's* `send_and_await` waiter,
+    // NOT one this driver installed. Releasing it here would emit
+    // `TransactionCompleted` and remove the originator's callback
+    // BEFORE the loopback `PutMsg::Response` arrives at the bypass —
+    // racing the originator's wait. The originator's own driver
+    // completion path (via `send_client_result` →
+    // `release_pending_op_slot`) cleans up the slot.
     tokio::task::yield_now().await;
-    op_manager.release_pending_op_slot(incoming_tx).await;
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    if Some(upstream_addr) != own_addr {
+        op_manager.release_pending_op_slot(incoming_tx).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1195,6 +1209,18 @@ async fn relay_put_finalize_local(
 
 /// Send `PutMsg::Response` upstream (fire-and-forget: upstream relay
 /// awaits via its own `send_to_and_await`, no reply expected).
+///
+/// Originator-loopback case (`upstream_addr == own_addr`, added in
+/// #1454 phase 5 final PUT slice): when the relay driver is running
+/// on the originator's own node — because `start_client_put`'s
+/// `send_and_await(target=None)` looped the Request back into the
+/// local event loop and the dispatch site mapped `source_addr=None`
+/// to `upstream=own_addr` — the Response cannot ship over the wire
+/// (no self-connection). Route via `send_local_loopback` so the
+/// message lands as an `InboundMessage`, hits the PUT bypass in
+/// `handle_pure_network_message_v1`, and forwards to the originator's
+/// `pending_op_results` waiter. Mirrors the legacy `LocalCompletion`
+/// terminal-reply contract.
 async fn relay_put_send_response(
     op_manager: &OpManager,
     incoming_tx: Transaction,
@@ -1206,9 +1232,16 @@ async fn relay_put_send_response(
         key,
     });
     let mut ctx = op_manager.op_ctx(incoming_tx);
-    ctx.send_fire_and_forget(upstream_addr, msg)
-        .await
-        .map_err(|_| OpError::NotificationError)
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    if Some(upstream_addr) == own_addr {
+        ctx.send_local_loopback(msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    } else {
+        ctx.send_fire_and_forget(upstream_addr, msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    }
 }
 
 // ── Relay streaming PUT driver (#1454 phase 5 follow-up slice B) ────────────

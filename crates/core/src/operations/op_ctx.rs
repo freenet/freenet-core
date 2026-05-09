@@ -226,6 +226,35 @@ impl OpCtx {
             .map_err(|_| OpError::NotificationError)
     }
 
+    /// Fire-and-forget loopback: dispatch `msg` to the local event loop
+    /// as an `InboundMessage` (target=None semantics) without awaiting
+    /// a reply.
+    ///
+    /// Used by `relay_put_finalize_local` when the relay driver is
+    /// running on the originator's own node (originator-loopback PUT,
+    /// added in #1454 phase 5 final PUT slice). Sending a wire-bound
+    /// `PutMsg::Response` to `own_addr` fails — there's no
+    /// self-connection. Routing it through `InboundMessage` instead
+    /// lands at `handle_pure_network_message_v1`'s PUT bypass and
+    /// forwards to the originator's `pending_op_results` waiter via
+    /// `try_forward_task_per_tx_reply`, mirroring the legacy
+    /// `LocalCompletion` echo semantics (where the looped-back Request
+    /// satisfied the driver as a terminal reply).
+    pub async fn send_local_loopback(&mut self, msg: NetMessage) -> Result<(), OpError> {
+        debug_assert_eq!(
+            msg.id(),
+            &self.tx,
+            "OpCtx::send_local_loopback: msg.id must match ctx.tx"
+        );
+
+        let (response_sender, _response_receiver) = mpsc::channel::<NetMessage>(1);
+
+        self.op_execution_sender
+            .send((response_sender, msg, None))
+            .await
+            .map_err(|_| OpError::NotificationError)
+    }
+
     /// Dispatch `msg` to `target_addr` and return the reply receiver
     /// without awaiting the response.
     ///
