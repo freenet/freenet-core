@@ -288,6 +288,8 @@ async fn drive_client_get_inner(
         retries: 0,
         current_target,
         attempt_visited: VisitedPeers::new(&client_tx),
+        request_sent_at: None,
+        response_received_at: None,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "get", &mut driver).await;
@@ -322,12 +324,27 @@ async fn drive_client_get_inner(
             // would fail with OpNotPresent for a task-per-tx op), so
             // the driver is the only place these side effects can
             // happen for Phase 3b.
+            // Payload accounting for the router's `transfer_rate_estimator`
+            // and `response_start_time_estimator` (see router.rs:798 +
+            // router.rs:443). Set on the InlineFound/Streaming success
+            // paths; LocalCompletion is a request-echo with no network
+            // transfer so both stay zero (the router will skip the
+            // transfer-rate observation when payload_size==0).
+            let mut payload_size: usize = 0;
+            let mut transfer_duration: std::time::Duration = std::time::Duration::ZERO;
+
             let reply_key = match &terminal {
                 Terminal::InlineFound {
                     key,
                     state,
                     contract,
                 } => {
+                    // InlineFound delivers state + optional contract in
+                    // the same envelope as the Response header, so the
+                    // payload transfer time is effectively zero — the
+                    // bytes arrived alongside the timing-of-first-response.
+                    payload_size =
+                        state.size() + contract.as_ref().map(|c| c.data().len()).unwrap_or(0);
                     cache_contract_locally(
                         op_manager,
                         *key,
@@ -350,6 +367,7 @@ async fn drive_client_get_inner(
                     // single-hop response case where the responder
                     // equals the selected target.
                     if let Some(peer_addr) = driver.current_target.socket_addr() {
+                        let stream_start = std::time::Instant::now();
                         if let Err(e) = assemble_and_cache_stream(
                             op_manager,
                             peer_addr,
@@ -365,6 +383,27 @@ async fn drive_client_get_inner(
                                 "get (task-per-tx): stream assembly failed — \
                                  state will not be cached locally"
                             );
+                        } else {
+                            transfer_duration = stream_start.elapsed();
+                            // Re-query the store to learn the actual
+                            // assembled payload size. We do this here
+                            // rather than threading the size out of
+                            // `assemble_and_cache_stream` to keep that
+                            // helper focused on side-effects; the
+                            // store lookup is fast (in-memory LRU).
+                            if let Ok(ContractHandlerEvent::GetResponse {
+                                response: Ok(StoreResponse { state, contract }),
+                                ..
+                            }) = op_manager
+                                .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                                    instance_id: *key.id(),
+                                    return_contract_code: *includes_contract,
+                                })
+                                .await
+                            {
+                                payload_size = state.map(|s| s.size()).unwrap_or(0)
+                                    + contract.map(|c| c.data().len()).unwrap_or(0);
+                            }
                         }
                     } else {
                         tracing::warn!(
@@ -428,16 +467,33 @@ async fn drive_client_get_inner(
             // intercepted the Response. Without this, the router's
             // prediction model never receives GET success feedback.
             //
-            // The success flag tracks the actual client-visible
-            // outcome (`host_result.is_ok()`), not the wire-level
-            // reply — if the store re-query returned nothing, the
-            // client sees OperationError and telemetry must agree.
+            // Prefer the timed `Success` variant so the router's
+            // `response_start_time_estimator` and
+            // `transfer_rate_estimator` receive observations. Fall back
+            // to `SuccessUntimed` only when timing capture failed
+            // (e.g., synthetic Request-echo from a non-network path).
+            // Without this, the dashboard's Response Time and
+            // Transfer Rate charts stay permanently empty because
+            // those estimators are fed exclusively from
+            // `RouteOutcome::Success`. The success flag tracks the
+            // actual client-visible outcome (`host_result.is_ok()`),
+            // not the wire-level reply — if the store re-query
+            // returned nothing, the client sees OperationError and
+            // telemetry must agree.
             let contract_location = Location::from(&reply_key);
+            let timed_outcome = match (driver.request_sent_at, driver.response_received_at) {
+                (Some(sent), Some(received)) if received >= sent => Some(RouteOutcome::Success {
+                    time_to_response_start: received.duration_since(sent),
+                    payload_size,
+                    payload_transfer_time: transfer_duration,
+                }),
+                _ => None,
+            };
             let route_event = RouteEvent {
                 peer: driver.current_target.clone(),
                 contract_location,
                 outcome: if host_result.is_ok() {
-                    RouteOutcome::SuccessUntimed
+                    timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed)
                 } else {
                     RouteOutcome::Failure
                 },
@@ -503,6 +559,16 @@ struct GetRetryDriver<'a> {
     retries: usize,
     current_target: PeerKeyLocation,
     attempt_visited: VisitedPeers,
+    /// Wall-clock at the start of the most recent `build_request` call.
+    /// Paired with `response_received_at` (captured in `classify`) to
+    /// feed `time_to_response_start` into the router's isotonic
+    /// regression. The winning attempt's values are used.
+    request_sent_at: Option<std::time::Instant>,
+    /// Wall-clock when `classify` last returned a `Terminal` outcome.
+    /// Reset to `None` until a terminal arrives; non-terminal classify
+    /// outcomes (Retry / Unexpected) leave it untouched and the next
+    /// `build_request` overwrites `request_sent_at`.
+    response_received_at: Option<std::time::Instant>,
 }
 
 /// Terminal value for the GET driver.
@@ -614,6 +680,10 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 
     fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {
+        // Capture send time per attempt. The winning attempt's timestamp
+        // is read after the retry loop returns to compute
+        // `time_to_response_start` for routing-prediction telemetry.
+        self.request_sent_at = Some(std::time::Instant::now());
         NetMessage::from(GetMsg::Request {
             id: attempt_tx,
             instance_id: self.instance_id,
@@ -625,7 +695,13 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 
     fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Terminal> {
-        classify(reply)
+        let outcome = classify(reply);
+        if matches!(outcome, AttemptOutcome::Terminal(_)) {
+            // Only capture on Terminal so non-terminal Retry/Unexpected
+            // outcomes leave the field as None until a terminal arrives.
+            self.response_received_at = Some(std::time::Instant::now());
+        }
+        outcome
     }
 
     fn advance(&mut self) -> AdvanceOutcome {
@@ -1256,6 +1332,8 @@ async fn drive_sub_op_get(
         retries: 0,
         current_target,
         attempt_visited: VisitedPeers::new(&tx),
+        request_sent_at: None,
+        response_received_at: None,
     };
 
     let loop_result = drive_retry_loop(op_manager, tx, "get-subop", &mut driver).await;
@@ -2393,6 +2471,55 @@ mod tests {
         assert!(
             retries >= MAX_RETRIES,
             "should exhaust at MAX_RETRIES={MAX_RETRIES}"
+        );
+    }
+
+    /// Regression for the peer-dashboard prediction-graph data-collection
+    /// regression: the client GET driver must emit a TIMED
+    /// `RouteOutcome::Success { time_to_response_start, payload_size,
+    /// payload_transfer_time }` on the success path so the router's
+    /// `response_start_time_estimator` and `transfer_rate_estimator`
+    /// receive observations. Before this fix the driver always emitted
+    /// `RouteOutcome::SuccessUntimed`, leaving the Response Time and
+    /// Transfer Rate charts on the peer dashboard permanently empty.
+    #[test]
+    fn drive_client_get_inner_emits_timed_success_on_success_path() {
+        let src = production_source();
+        let inner_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        let build_body =
+            extract_fn_body(src, "fn build_request(&mut self, attempt_tx: Transaction)");
+        let classify_body = extract_fn_body(src, "fn classify(&mut self, reply: NetMessage)");
+
+        // Driver must capture send time at attempt construction.
+        assert!(
+            build_body.contains("self.request_sent_at = Some(std::time::Instant::now())"),
+            "GetRetryDriver::build_request must capture request_sent_at; \
+             without this the Done branch has no `time_to_response_start`."
+        );
+        // Driver must capture receive time on Terminal classification.
+        assert!(
+            classify_body.contains("self.response_received_at = Some(std::time::Instant::now())"),
+            "GetRetryDriver::classify must capture response_received_at on Terminal; \
+             without this the Done branch has no `time_to_response_start`."
+        );
+        // Done branch must construct a timed Success with all three fields.
+        assert!(
+            inner_body.contains("RouteOutcome::Success {")
+                && inner_body.contains("time_to_response_start")
+                && inner_body.contains("payload_size")
+                && inner_body.contains("payload_transfer_time"),
+            "drive_client_get_inner Done branch must build RouteOutcome::Success \
+             with time_to_response_start + payload_size + payload_transfer_time. \
+             Emitting SuccessUntimed instead leaves the router's response-time \
+             and transfer-rate estimators with zero observations forever \
+             (Failure-Probability-only peer-dashboard regression)."
+        );
+        // SuccessUntimed remains as a fallback when timing was not captured
+        // (e.g., Request-echo / LocalCompletion paths).
+        assert!(
+            inner_body.contains("RouteOutcome::SuccessUntimed"),
+            "Done branch must keep a SuccessUntimed fallback for paths \
+             without timing capture."
         );
     }
 
