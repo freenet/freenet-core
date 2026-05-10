@@ -3451,6 +3451,84 @@ mod tests {
         );
     }
 
+    /// Pin: `relay_send_not_found` and `relay_send_found` MUST use
+    /// `send_local_loopback` when `upstream_addr == own_addr`.
+    /// Sending wire-bound `send_fire_and_forget(own_addr, ...)` would
+    /// attempt a UDP self-connection that has no peer entry, failing
+    /// silently. Routing as `InboundMessage` via `send_local_loopback`
+    /// lands at the bypass in `handle_pure_network_message_v1` and
+    /// forwards to the originator's `pending_op_results` waiter
+    /// (#1454 phase 5 final, GET slice fixup commit 8107da8a).
+    #[test]
+    fn relay_send_responses_use_local_loopback_on_own_addr() {
+        let src = include_str!("../get/op_ctx_task.rs");
+        for fn_name in [
+            "async fn relay_send_not_found(",
+            "async fn relay_send_found(",
+        ] {
+            let fn_start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("{fn_name} not found"));
+            // Bound the search at the next async fn declaration.
+            let fn_end = src[fn_start + fn_name.len()..]
+                .find("\nasync fn ")
+                .map(|idx| idx + fn_start + fn_name.len())
+                .unwrap_or(src.len());
+            let body = &src[fn_start..fn_end];
+            assert!(
+                body.contains("send_local_loopback("),
+                "{fn_name} must call send_local_loopback for \
+                 upstream==own_addr (originator-loopback path)"
+            );
+            assert!(
+                body.contains("get_own_addr()"),
+                "{fn_name} must compare upstream_addr to \
+                 connection_manager.get_own_addr() to detect loopback"
+            );
+        }
+    }
+
+    /// Pin: `drive_relay_get_inner`'s retry loop MUST switch to
+    /// `send_fire_and_forget` (no waiter install) when the relay
+    /// driver runs in originator-loopback. `send_to_and_await`
+    /// would `state.pending_op_results.insert(*tx, callback)`,
+    /// silently OVERWRITING the originator's `start_client_get`
+    /// waiter (`incoming_tx == client_tx` in loopback). The peer's
+    /// downstream Response would then land in the relay-driver's
+    /// callback and never reach the client driver. After loopback
+    /// dispatch, the driver returns immediately so the client
+    /// driver's still-installed callback receives the Response via
+    /// the bypass and owns retry semantics. Mirrors PUT slice's
+    /// `drive_relay_put` originator-loopback branch (#1454 phase 5
+    /// final, GET slice fixup commit 8107da8a).
+    #[test]
+    fn drive_relay_get_loopback_uses_fire_and_forget() {
+        let src = include_str!("../get/op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn drive_relay_get_inner(")
+            .expect("drive_relay_get_inner not found");
+        let fn_end = src[fn_start + "async fn drive_relay_get_inner(".len()..]
+            .find("\nasync fn ")
+            .map(|idx| idx + fn_start + "async fn drive_relay_get_inner(".len())
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("originator_loopback"),
+            "drive_relay_get_inner must compute originator_loopback \
+             in the retry loop to gate the waiter-install branch"
+        );
+        // `send_fire_and_forget(peer_addr` must appear in the loopback
+        // branch (compose at runtime so this test's own source doesn't
+        // match the negative-grep).
+        let needle = format!("send_fire_and_{}(peer_addr,", "forget");
+        assert!(
+            body.contains(&needle),
+            "drive_relay_get_inner loopback branch must use \
+             send_fire_and_forget(peer_addr, ...) to avoid overwriting \
+             the originator's pending_op_results waiter"
+        );
+    }
+
     // ── C1: cache_contract_locally must gate mark_local_client_access ──────
 
     /// Regression guard for the relay hosting-cache taint bug caught in

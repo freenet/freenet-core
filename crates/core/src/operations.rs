@@ -439,26 +439,6 @@ impl OpError {
         }
     }
 
-    #[allow(dead_code)] // Used by retired legacy state-machine paths; kept
-    // for the sole remaining caller (subscribe.rs `OpInitialization` flow)
-    // and as a debug helper for any future state-machine reintroduction.
-    pub fn invalid_transition_with_state(
-        tx: Transaction,
-        state: Box<dyn std::fmt::Debug + Send + Sync>,
-    ) -> Self {
-        #[cfg(not(debug_assertions))]
-        {
-            drop(state);
-        }
-        Self::InvalidStateTransition {
-            tx,
-            #[cfg(debug_assertions)]
-            state: Some(state),
-            #[cfg(debug_assertions)]
-            trace: StdTrace::force_capture(),
-        }
-    }
-
     /// Returns true if this error indicates a contract's WASM merge function
     /// ran and rejected the update. When true, the contract code is present
     /// locally and auto-fetching would be unnecessary.
