@@ -288,6 +288,8 @@ async fn drive_client_get_inner(
         retries: 0,
         current_target,
         attempt_visited: VisitedPeers::new(&client_tx),
+        request_sent_at: None,
+        response_received_at: None,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "get", &mut driver).await;
@@ -322,12 +324,36 @@ async fn drive_client_get_inner(
             // would fail with OpNotPresent for a task-per-tx op), so
             // the driver is the only place these side effects can
             // happen for Phase 3b.
+            // Payload accounting for the router's `transfer_rate_estimator`
+            // (router.rs:443) and `response_start_time_estimator`
+            // (router.rs:405). Set on the InlineFound/Streaming success
+            // paths; `Terminal::LocalCompletion` is the loopback
+            // Request-echo with no network round-trip — both stay zero
+            // AND we explicitly null the captured per-attempt timing
+            // below (see `timed_outcome`) to avoid poisoning the
+            // response-time model with sub-millisecond loopback latency
+            // samples attributed to `driver.current_target`.
+            let mut payload_size: usize = 0;
+            let mut transfer_duration: std::time::Duration = std::time::Duration::ZERO;
+
             let reply_key = match &terminal {
                 Terminal::InlineFound {
                     key,
                     state,
                     contract,
                 } => {
+                    // InlineFound delivers state + optional contract in
+                    // the same envelope as the Response header, so the
+                    // payload transfer time is effectively zero — the
+                    // bytes arrived alongside the response. The router
+                    // deliberately skips `transfer_rate_estimator`
+                    // observations with `transfer_time.is_zero()`
+                    // (router.rs:443) so InlineFound feeds response-time
+                    // only; the legacy `GetStats` shape did the same
+                    // thing for the same reason (no measurable transfer
+                    // phase for an envelope-bundled payload).
+                    payload_size =
+                        state.size() + contract.as_ref().map(|c| c.data().len()).unwrap_or(0);
                     cache_contract_locally(
                         op_manager,
                         *key,
@@ -342,7 +368,18 @@ async fn drive_client_get_inner(
                     key,
                     stream_id,
                     includes_contract,
+                    total_size,
                 } => {
+                    // `total_size` is the wire-authoritative payload byte
+                    // count from the `ResponseStreaming` header. Using it
+                    // here (rather than re-querying the local store after
+                    // `cache_contract_locally`) prevents a TOCTOU race
+                    // where a concurrent UPDATE for the same contract
+                    // would mis-attribute a different payload's size to
+                    // this GET's transfer-rate observation, and side-steps
+                    // a separate "store evicted before re-query"
+                    // failure mode (the LRU has finite capacity).
+                    payload_size = *total_size as usize;
                     // Assemble the stream and cache locally. Mirrors
                     // the legacy `process_message` streaming branch
                     // at `get.rs:2721-3196`. Uses `current_target`
@@ -350,6 +387,16 @@ async fn drive_client_get_inner(
                     // single-hop response case where the responder
                     // equals the selected target.
                     if let Some(peer_addr) = driver.current_target.socket_addr() {
+                        // `transfer_duration` covers stream claim +
+                        // assemble + deserialize + local cache write —
+                        // the same composite measurement the legacy
+                        // `GetStats::record_transfer_end` captured at
+                        // `get.rs:1542`. For small payloads near the
+                        // streaming threshold the local-work component
+                        // is non-negligible, but keeping the metric
+                        // composite matches the existing router prior
+                        // built on the legacy code path.
+                        let stream_start = tokio::time::Instant::now();
                         if let Err(e) = assemble_and_cache_stream(
                             op_manager,
                             peer_addr,
@@ -365,6 +412,14 @@ async fn drive_client_get_inner(
                                 "get (task-per-tx): stream assembly failed — \
                                  state will not be cached locally"
                             );
+                            // Assembly failed → don't emit a transfer-rate
+                            // observation (transfer_duration stays ZERO,
+                            // which makes the router skip the rate sample
+                            // at router.rs:443). The response-time
+                            // observation still goes through because the
+                            // header DID arrive.
+                        } else {
+                            transfer_duration = stream_start.elapsed();
                         }
                     } else {
                         tracing::warn!(
@@ -428,16 +483,59 @@ async fn drive_client_get_inner(
             // intercepted the Response. Without this, the router's
             // prediction model never receives GET success feedback.
             //
-            // The success flag tracks the actual client-visible
-            // outcome (`host_result.is_ok()`), not the wire-level
-            // reply — if the store re-query returned nothing, the
-            // client sees OperationError and telemetry must agree.
+            // Prefer the timed `Success` variant so the router's
+            // `response_start_time_estimator` and
+            // `transfer_rate_estimator` receive observations. Fall back
+            // to `SuccessUntimed` only when the reply was a loopback
+            // Request-echo (`Terminal::LocalCompletion`) — there is no
+            // wire round-trip to measure, so the captured per-attempt
+            // timing reflects pure in-process latency and would poison
+            // the response-time model with sub-millisecond samples
+            // attributed to the selected target peer. The other paths
+            // (InlineFound + Streaming) do measure real wire round-trip
+            // time. Without timed Success on those paths the dashboard's
+            // Response Time and Transfer Rate charts stay permanently
+            // empty because those estimators are fed exclusively from
+            // `RouteOutcome::Success`. The success flag tracks the
+            // actual client-visible outcome (`host_result.is_ok()`), not
+            // the wire-level reply — if the store re-query returned
+            // nothing the client sees `OperationError` and telemetry
+            // must agree.
             let contract_location = Location::from(&reply_key);
+            let timed_outcome = if matches!(terminal, Terminal::LocalCompletion) {
+                None
+            } else {
+                match (driver.request_sent_at, driver.response_received_at) {
+                    (Some(sent), Some(received)) if received >= sent => {
+                        Some(RouteOutcome::Success {
+                            time_to_response_start: received.duration_since(sent),
+                            payload_size,
+                            payload_transfer_time: transfer_duration,
+                        })
+                    }
+                    (Some(sent), Some(received)) => {
+                        // `tokio::time::Instant` is monotonic, so this
+                        // arm should be unreachable on real hardware.
+                        // Logging instead of silently masking guards
+                        // against a clock-source regression slipping in
+                        // unnoticed.
+                        tracing::warn!(
+                            tx = %client_tx,
+                            sent_at_elapsed_secs = sent.elapsed().as_secs_f64(),
+                            received_at_elapsed_secs = received.elapsed().as_secs_f64(),
+                            "get (task-per-tx): received < sent on winning attempt; \
+                             falling back to SuccessUntimed"
+                        );
+                        None
+                    }
+                    _ => None,
+                }
+            };
             let route_event = RouteEvent {
                 peer: driver.current_target.clone(),
                 contract_location,
                 outcome: if host_result.is_ok() {
-                    RouteOutcome::SuccessUntimed
+                    timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed)
                 } else {
                     RouteOutcome::Failure
                 },
@@ -503,6 +601,19 @@ struct GetRetryDriver<'a> {
     retries: usize,
     current_target: PeerKeyLocation,
     attempt_visited: VisitedPeers,
+    /// Wall-clock at the start of the most recent `build_request` call.
+    /// Paired with `response_received_at` (captured in `classify`) to
+    /// feed `time_to_response_start` into the router's isotonic
+    /// regression. The winning attempt's values are used. `tokio::time::Instant`
+    /// is auto-paused in test builds with `start_paused(true)`, so
+    /// simulation tests see virtual elapsed time rather than wall-clock —
+    /// matches the rest of `crates/core/`'s timing primitives.
+    request_sent_at: Option<tokio::time::Instant>,
+    /// Wall-clock when `classify` last returned a `Terminal` outcome.
+    /// Reset to `None` until a terminal arrives; non-terminal classify
+    /// outcomes (Retry / Unexpected) leave it untouched and the next
+    /// `build_request` overwrites `request_sent_at`.
+    response_received_at: Option<tokio::time::Instant>,
 }
 
 /// Terminal value for the GET driver.
@@ -526,11 +637,15 @@ enum Terminal {
     /// driver claims the stream, awaits assembly, and caches the
     /// assembled state + contract locally — mirroring what the
     /// legacy `process_message` streaming branch does at
-    /// `get.rs:2721-3196`.
+    /// `get.rs:2721-3196`. `total_size` carries the wire-authoritative
+    /// payload byte count from the streaming header so the driver
+    /// doesn't have to re-query the store post-assembly (which would
+    /// race a concurrent UPDATE for the same contract).
     Streaming {
         key: ContractKey,
         stream_id: StreamId,
         includes_contract: bool,
+        total_size: u64,
     },
     /// Request-echo from `forward_pending_op_result_if_completed` —
     /// state was already in the local store (via the pre-send
@@ -577,11 +692,13 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
             key,
             stream_id,
             includes_contract,
+            total_size,
             ..
         })) => AttemptOutcome::Terminal(Terminal::Streaming {
             key,
             stream_id,
             includes_contract,
+            total_size,
         }),
         NetMessage::V1(NetMessageV1::Get(GetMsg::Request { .. })) => {
             AttemptOutcome::Terminal(Terminal::LocalCompletion)
@@ -614,6 +731,10 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 
     fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {
+        // Capture send time per attempt. The winning attempt's timestamp
+        // is read after the retry loop returns to compute
+        // `time_to_response_start` for routing-prediction telemetry.
+        self.request_sent_at = Some(tokio::time::Instant::now());
         NetMessage::from(GetMsg::Request {
             id: attempt_tx,
             instance_id: self.instance_id,
@@ -625,7 +746,13 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 
     fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Terminal> {
-        classify(reply)
+        let outcome = classify(reply);
+        if matches!(outcome, AttemptOutcome::Terminal(_)) {
+            // Only capture on Terminal so non-terminal Retry/Unexpected
+            // outcomes leave the field as None until a terminal arrives.
+            self.response_received_at = Some(tokio::time::Instant::now());
+        }
+        outcome
     }
 
     fn advance(&mut self) -> AdvanceOutcome {
@@ -1256,6 +1383,8 @@ async fn drive_sub_op_get(
         retries: 0,
         current_target,
         attempt_visited: VisitedPeers::new(&tx),
+        request_sent_at: None,
+        response_received_at: None,
     };
 
     let loop_result = drive_retry_loop(op_manager, tx, "get-subop", &mut driver).await;
@@ -1286,6 +1415,10 @@ async fn drive_sub_op_get(
                     key,
                     stream_id,
                     includes_contract,
+                    // Sub-op GETs don't feed the router (no RouteEvent
+                    // is emitted on the sub-op path), so payload size
+                    // attribution is irrelevant here.
+                    total_size: _,
                 } => {
                     if let Some(peer_addr) = driver.current_target.socket_addr() {
                         if let Err(e) = assemble_and_cache_stream(
@@ -2393,6 +2526,113 @@ mod tests {
         assert!(
             retries >= MAX_RETRIES,
             "should exhaust at MAX_RETRIES={MAX_RETRIES}"
+        );
+    }
+
+    /// Regression for the peer-dashboard prediction-graph data-collection
+    /// regression: the client GET driver must emit a TIMED
+    /// `RouteOutcome::Success { time_to_response_start, payload_size,
+    /// payload_transfer_time }` on the success path so the router's
+    /// `response_start_time_estimator` and `transfer_rate_estimator`
+    /// receive observations. Before this fix the driver always emitted
+    /// `RouteOutcome::SuccessUntimed`, leaving the Response Time and
+    /// Transfer Rate charts on the peer dashboard permanently empty.
+    #[test]
+    fn drive_client_get_inner_emits_timed_success_on_success_path() {
+        let src = production_source();
+        let inner_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        let build_body =
+            extract_fn_body(src, "fn build_request(&mut self, attempt_tx: Transaction)");
+        let classify_body = extract_fn_body(src, "fn classify(&mut self, reply: NetMessage)");
+
+        // Driver must capture send time at attempt construction. The
+        // body must use `tokio::time::Instant::now()` — `std::time::Instant::now()`
+        // is banned in `crates/core/` by Rule Lint (see
+        // .claude/rules/code-style.md) AND would not virtualize under
+        // `start_paused(true)` in DST simulation tests.
+        assert!(
+            build_body.contains("self.request_sent_at = Some(tokio::time::Instant::now())"),
+            "GetRetryDriver::build_request must capture request_sent_at via \
+             tokio::time::Instant::now(); without this the Done branch has \
+             no `time_to_response_start`."
+        );
+        // Driver must capture receive time on Terminal classification.
+        assert!(
+            classify_body.contains("self.response_received_at = Some(tokio::time::Instant::now())"),
+            "GetRetryDriver::classify must capture response_received_at on \
+             Terminal via tokio::time::Instant::now(); without this the Done \
+             branch has no `time_to_response_start`."
+        );
+        // Done branch must construct a timed Success with all three fields.
+        assert!(
+            inner_body.contains("RouteOutcome::Success {")
+                && inner_body.contains("time_to_response_start")
+                && inner_body.contains("payload_size")
+                && inner_body.contains("payload_transfer_time"),
+            "drive_client_get_inner Done branch must build RouteOutcome::Success \
+             with time_to_response_start + payload_size + payload_transfer_time. \
+             Emitting SuccessUntimed instead leaves the router's response-time \
+             and transfer-rate estimators with zero observations forever \
+             (Failure-Probability-only peer-dashboard regression)."
+        );
+        // SuccessUntimed remains as a fallback when timing was not captured
+        // (e.g., Request-echo / LocalCompletion paths).
+        assert!(
+            inner_body.contains("RouteOutcome::SuccessUntimed"),
+            "Done branch must keep a SuccessUntimed fallback for paths \
+             without timing capture."
+        );
+        // The streaming path must use the wire-authoritative `total_size`
+        // rather than re-querying the store after assembly. Re-querying
+        // races a concurrent UPDATE on the same contract and can also
+        // return 0 if the LRU evicted the entry under cache pressure —
+        // both failure modes silently zero out the transfer-rate sample.
+        assert!(
+            inner_body.contains("payload_size = *total_size as usize"),
+            "Streaming branch must use wire-authoritative total_size for \
+             payload_size, not a post-assembly store re-query."
+        );
+        // The `Terminal::LocalCompletion` arm is a loopback Request-echo
+        // with no wire round-trip. Emitting timed Success there would
+        // poison the response-time model with sub-millisecond loopback
+        // samples attributed to the selected target peer.
+        assert!(
+            inner_body.contains("matches!(terminal, Terminal::LocalCompletion)"),
+            "Done branch must skip timed Success for Terminal::LocalCompletion \
+             (loopback Request-echo — no network round-trip to measure)."
+        );
+    }
+
+    /// Regression: when the GET retry loop exhausts all peers without a
+    /// Terminal classification, no `RouteOutcome::Success` is emitted.
+    /// A future "always emit a final route-event" refactor would silently
+    /// poison the success estimator with timed entries from peers that
+    /// returned NotFound for the whole retry chain.
+    #[test]
+    fn drive_client_get_inner_exhausted_does_not_emit_success() {
+        let src = production_source();
+        let inner_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        let exhausted_pos = inner_body
+            .find("RetryLoopOutcome::Exhausted(")
+            .expect("Done/Exhausted match must exist");
+        let exhausted_arm = &inner_body[exhausted_pos..];
+        // Bound the arm to the next match-arm by clipping at the next
+        // top-level `RetryLoopOutcome::` token.
+        let arm_end = exhausted_arm[1..]
+            .find("RetryLoopOutcome::")
+            .map(|p| p + 1)
+            .unwrap_or(exhausted_arm.len());
+        let arm_body = &exhausted_arm[..arm_end];
+        assert!(
+            !arm_body.contains("RouteOutcome::Success {"),
+            "Exhausted arm must NOT emit a timed RouteOutcome::Success — \
+             that would poison the response-time/transfer-rate estimators \
+             with synthetic data for peers that never produced a Terminal."
+        );
+        assert!(
+            !arm_body.contains("routing_finished("),
+            "Exhausted arm must NOT call routing_finished — no wire success \
+             attribution is appropriate for a peer set that returned NotFound."
         );
     }
 
