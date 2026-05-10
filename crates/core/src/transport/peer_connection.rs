@@ -634,7 +634,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             keep_alive_handle: Some(keep_alive_handle),
             pending_pings,
             streaming_registry: Arc::new(streaming::StreamRegistry::new()),
-            streaming_handles: HashMap::new(), // Each entry: (StreamHandle, last_activity_nanos)
+            streaming_handles: HashMap::new(),
             time_source,
             orphan_stream_registry: None,
             dispatched_msg_hashes: lru::LruCache::new(DEDUP_CACHE_CAPACITY),
@@ -3388,5 +3388,72 @@ mod tests {
 
         // Restore so a later test inheriting this thread isn't surprised.
         SimulationIdleTimeout::disable();
+    }
+
+    /// Pins the `last_activity_nanos` refresh path in `process_inbound`
+    /// against the only progress signal that should advance the sweep
+    /// deadline. Background: the original fix refreshed the timestamp
+    /// before checking `push_fragment`'s return value, which Codex flagged
+    /// as a replay-extension vector (a peer can keep a dead stream alive
+    /// indefinitely by replaying the same fragment every <30 s). The fix
+    /// gates the refresh on `Ok(true)` — actual new fragment inserted.
+    ///
+    /// This test combines a behavioral exercise of `StreamHandle::push_fragment`
+    /// (so the test breaks if the underlying API ever stops returning
+    /// `Ok(false)` for duplicates or `Err(InvalidFragment)` for OOB indices)
+    /// with a source-grep pin on the production guard. Without both, a
+    /// regression that loosens the guard (e.g., to `Ok(_)`) or removes it
+    /// entirely would silently re-open the replay vector while leaving all
+    /// the sweep-mechanic tests green.
+    #[test]
+    fn last_activity_refresh_strictly_gated_on_ok_true() {
+        use streaming::{StreamError, StreamRegistry};
+        use streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        // --- Part 1: behavioral pin on push_fragment's return values ---
+        let registry = StreamRegistry::new();
+        let id = StreamId::next();
+        // 2 fragments + 1 overflow slot = 3 valid indices; index 99 is OOB.
+        let handle = registry.register(id, (FRAGMENT_PAYLOAD_SIZE * 2) as u64);
+
+        let r_new = handle.push_fragment(1, bytes::Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]));
+        assert!(
+            matches!(r_new, Ok(true)),
+            "first push of fragment 1 must be Ok(true); got {:?}",
+            r_new
+        );
+
+        let r_dup = handle.push_fragment(1, bytes::Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]));
+        assert!(
+            matches!(r_dup, Ok(false)),
+            "duplicate push of fragment 1 must be Ok(false); got {:?}",
+            r_dup
+        );
+
+        let r_invalid = handle.push_fragment(99, bytes::Bytes::from_static(b"oob"));
+        assert!(
+            matches!(r_invalid, Err(StreamError::InvalidFragment { .. })),
+            "out-of-range push must be Err(InvalidFragment); got {:?}",
+            r_invalid
+        );
+
+        // --- Part 2: source pin on the production refresh guard ---
+        let source = include_str!("peer_connection.rs");
+        assert!(
+            source.contains("if matches!(push_result, Ok(true)) {"),
+            "PR #4083 / issue #4079: `last_activity_nanos` refresh in \
+             process_inbound must be gated on Ok(true) ONLY. Loosening \
+             this to Ok(_) or removing the guard re-opens the replay \
+             vector that lets a peer keep a dead stream alive \
+             indefinitely by replaying the same fragment every <30 s. \
+             See the comment block above the guard in process_inbound."
+        );
+        assert!(
+            source.contains("Refresh `last_activity_nanos` ONLY on real forward"),
+            "PR #4083 / issue #4079: the production code block explaining \
+             why the refresh is gated on Ok(true) must remain in place. \
+             If you intentionally rewrote it, update this pin to match \
+             the new comment."
+        );
     }
 }
