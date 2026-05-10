@@ -83,6 +83,14 @@ pub(crate) fn start_op_with_id(
 /// Create a GET operation pre-targeted at a specific peer, bypassing normal routing.
 /// Returns the operation and the message to send. Used for auto-fetching contracts
 /// from peers known to have them (e.g., UPDATE senders).
+// Note (#1454 phase 5 final, GET slice — commit 1):
+// `start_targeted_op` was the legacy entry point for UPDATE's auto-fetch.
+// Commit 1 of the GET slice migrated `OpManager::try_auto_fetch_contract`
+// to `op_ctx_task::start_targeted_sub_op_get`. This legacy helper is now
+// unreachable but stays under `#[allow(dead_code)]` so commit 2 can
+// delete it together with the rest of the legacy GET state machine
+// (`impl Operation for GetOp`).
+#[allow(dead_code)]
 pub(crate) fn start_targeted_op(
     instance_id: ContractInstanceId,
     target: PeerKeyLocation,

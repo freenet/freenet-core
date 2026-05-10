@@ -335,38 +335,12 @@ impl OpManager {
             "Auto-fetching contract from UPDATE sender (missing parameters)"
         );
 
-        // Create a GET operation that targets the sender directly
-        let max_htl = self.ring.max_hops_to_live;
-        let op_manager = self.clone();
-
-        crate::config::GlobalExecutor::spawn(async move {
-            let (targeted_op, msg) =
-                super::get::start_targeted_op(instance_id, sender_pkl, max_htl);
-
-            match op_manager
-                .notify_op_change(
-                    crate::message::NetMessage::from(msg),
-                    super::OpEnum::Get(targeted_op),
-                )
-                .await
-            {
-                Ok(()) => {
-                    tracing::info!(
-                        contract = %instance_id,
-                        target = %sender_addr,
-                        "Auto-fetch GET sent directly to UPDATE sender"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        contract = %instance_id,
-                        error = %e,
-                        "Auto-fetch GET failed to send to UPDATE sender"
-                    );
-                    op_manager.pending_contract_fetches.remove(&instance_id);
-                }
-            }
-        });
+        // Spawn a targeted task-per-tx GET. The driver targets `sender_pkl`
+        // for its first hop and falls back to `k_closest_potentially_hosting`
+        // for any retries. Fire-and-forget — the side effect (contract cached
+        // locally via `cache_contract_locally`) is what callers depend on.
+        // Outcome is logged inside the driver.
+        let _tx = super::get::op_ctx_task::start_targeted_sub_op_get(self, instance_id, sender_pkl);
     }
 
     /// Get the list of network subscribers to broadcast an UPDATE to.

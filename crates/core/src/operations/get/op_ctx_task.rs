@@ -1099,10 +1099,50 @@ pub(crate) fn start_sub_op_get(
         tx,
         instance_id,
         return_contract_code,
-        out_tx,
+        None,
+        Some(out_tx),
     ));
 
     (tx, out_rx)
+}
+
+/// Spawn a sub-operation GET that targets a specific peer for its
+/// first hop (the legacy `start_targeted_op` migration site for
+/// UPDATE's auto-fetch). Fire-and-forget — the outcome is logged and
+/// the caller relies on the side effect (contract cached locally).
+///
+/// Used by `OpManager::try_auto_fetch_contract` when an UPDATE
+/// broadcast fails because the recipient lacks the contract's
+/// parameters: the directed target is the UPDATE sender, who is
+/// known to host the contract. If the directed peer responds
+/// `NotFound`, the retry loop falls back to `k_closest_potentially_hosting`
+/// just like a regular sub-op GET.
+pub(crate) fn start_targeted_sub_op_get(
+    op_manager: &OpManager,
+    instance_id: ContractInstanceId,
+    target: PeerKeyLocation,
+) -> Transaction {
+    let op_manager = Arc::new(op_manager.clone());
+
+    let tx = Transaction::new::<GetMsg>();
+
+    tracing::debug!(
+        %tx,
+        contract = %instance_id,
+        ?target,
+        "get (task-per-tx): spawning targeted sub-op task (UPDATE auto-fetch)"
+    );
+
+    GlobalExecutor::spawn(run_sub_op_get(
+        op_manager,
+        tx,
+        instance_id,
+        true, // auto-fetch always wants the contract code
+        Some(target),
+        None,
+    ));
+
+    tx
 }
 
 async fn run_sub_op_get(
@@ -1110,7 +1150,8 @@ async fn run_sub_op_get(
     tx: Transaction,
     instance_id: ContractInstanceId,
     return_contract_code: bool,
-    out_tx: tokio::sync::oneshot::Sender<SubOpGetOutcome>,
+    initial_target: Option<PeerKeyLocation>,
+    out_tx: Option<tokio::sync::oneshot::Sender<SubOpGetOutcome>>,
 ) {
     // RAII guard: same loopback-cleanup as ClientGetCompletionGuard (#4066).
     let _completion_guard = SubOpGetCompletionGuard {
@@ -1118,10 +1159,42 @@ async fn run_sub_op_get(
         tx,
     };
 
-    let outcome = drive_sub_op_get(&op_manager, tx, instance_id, return_contract_code).await;
-    // Receiver drop is acceptable — fire-and-forget callers expect this.
-    #[allow(clippy::let_underscore_must_use)]
-    let _ = out_tx.send(outcome);
+    let outcome = drive_sub_op_get(
+        &op_manager,
+        tx,
+        instance_id,
+        return_contract_code,
+        initial_target,
+    )
+    .await;
+
+    if let Some(out_tx) = out_tx {
+        // Receiver drop is acceptable — fire-and-forget callers expect this.
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = out_tx.send(outcome);
+    } else {
+        // Fire-and-forget targeted auto-fetch. Log the outcome so operators
+        // can correlate UPDATE auto-fetch attempts to success/failure.
+        match outcome {
+            SubOpGetOutcome::Found(_) => tracing::info!(
+                %tx,
+                contract = %instance_id,
+                "get (task-per-tx targeted sub-op): UPDATE auto-fetch succeeded"
+            ),
+            SubOpGetOutcome::NotFound(cause) => tracing::warn!(
+                %tx,
+                contract = %instance_id,
+                cause,
+                "get (task-per-tx targeted sub-op): UPDATE auto-fetch did not find state"
+            ),
+            SubOpGetOutcome::Infra(err) => tracing::warn!(
+                %tx,
+                contract = %instance_id,
+                error = %err,
+                "get (task-per-tx targeted sub-op): UPDATE auto-fetch hit infra error"
+            ),
+        }
+    }
 }
 
 /// RAII guard counterpart to `ClientGetCompletionGuard` for sub-op
@@ -1142,6 +1215,7 @@ async fn drive_sub_op_get(
     tx: Transaction,
     instance_id: ContractInstanceId,
     return_contract_code: bool,
+    initial_target: Option<PeerKeyLocation>,
 ) -> SubOpGetOutcome {
     let htl = op_manager.ring.max_hops_to_live;
 
@@ -1149,11 +1223,13 @@ async fn drive_sub_op_get(
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
         tried.push(own_addr);
     }
-    let initial_target = op_manager
-        .ring
-        .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
-        .into_iter()
-        .next();
+    let initial_target = initial_target.or_else(|| {
+        op_manager
+            .ring
+            .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
+            .into_iter()
+            .next()
+    });
     let current_target = match initial_target {
         Some(peer) => {
             if let Some(addr) = peer.socket_addr() {
