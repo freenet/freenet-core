@@ -1,0 +1,7 @@
+# Allow the release-agent to invoke the update script as root, with NO other
+# arguments accepted. sudoers matches the command line literally, so any flag
+# other than `--force` is rejected by sudo before reaching the script.
+#
+# Install path: /etc/sudoers.d/freenet-release-agent (mode 0440, owner root:root).
+# Validate with: visudo -c -f /etc/sudoers.d/freenet-release-agent
+freenet-update ALL=(root) NOPASSWD: /usr/local/bin/gateway-auto-update.sh --force

@@ -1,0 +1,36 @@
+[package]
+name = "freenet-release-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "HTTP agent that lets the freenet-core release pipeline trigger gateway updates"
+repository = "https://github.com/freenet/freenet-core"
+
+[[bin]]
+name = "freenet-release-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true, default-features = false, features = ["http1", "json", "tokio"] }
+clap = { workspace = true, features = ["derive", "env"] }
+hex = { workspace = true }
+# Pinned to the 0.10/0.12 digest line so hmac + sha2 share a digest version.
+# The workspace's sha2 0.11 pulls digest 0.11, which is incompatible with the
+# only stable hmac release (0.12, on digest 0.10).
+hmac = "0.12"
+sha2 = "0.10"
+reqwest = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "signal", "process", "fs", "time"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "test-util"] }
