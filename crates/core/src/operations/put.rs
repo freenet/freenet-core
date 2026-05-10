@@ -1166,18 +1166,21 @@ mod tests {
             .expect("OpManager::completed closing brace not found")
             + fn_start;
         let body = &src[fn_start..fn_end];
-        for op in ["self.ops.get", "self.ops.subscribe"] {
+        // SUBSCRIBE is the only surviving DashMap with a task-per-tx
+        // leak risk after #1454 phase 5 final (GET/PUT/UPDATE retired).
+        assert!(
+            body.contains("self.ops.subscribe.remove"),
+            "OpManager::completed must call `self.ops.subscribe.remove(&id)` \
+             to prevent the Phase 3a-style task-per-tx DashMap leak"
+        );
+        // PUT removed in PUT slice of phase 5 final; GET in GET slice.
+        for retired in ["self.ops.put", "self.ops.get"] {
             assert!(
-                body.contains(&format!("{op}.remove")),
-                "OpManager::completed must call `{op}.remove(&id)` to \
-                 prevent the Phase 3a-style task-per-tx DashMap leak"
+                !body.contains(retired),
+                "OpManager::completed must not reference `{retired}` after \
+                 #1454 phase 5 final retired the corresponding DashMap"
             );
         }
-        // PUT removed in this slice (PUT slice of phase 5 final).
-        assert!(
-            !body.contains("self.ops.put"),
-            "OpManager::completed must not reference ops.put after PUT slice"
-        );
     }
 
     /// Pin: legacy ForwardingAck senders MUST NOT come back at the

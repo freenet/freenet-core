@@ -2852,91 +2852,32 @@ mod tests {
     // already provided by `test_get_routing_coverage_low_htl` and
     // `test_get_reliability_*` (nightly).
 
-    // ── G1/G2: Dispatch gates live in node.rs ────────────────────────────
+    // ── Dispatch shape pin (#1454 phase 5 final, GET slice) ───────────────
+    //
+    // After the GET slice retired the legacy state machine, the GET arm
+    // in node.rs no longer falls through to `handle_op_request<GetOp>`
+    // and no longer gates relay dispatch on `has_get_op` /
+    // `source_addr.is_some()`. Originator-loopback (source_addr=None)
+    // is mapped to `upstream_addr=own_addr` so the same `start_relay_get`
+    // driver handles both true relay hops and originator-loopback. The
+    // structural guard for that shape lives at
+    // `node::tests::callback_forward_tests::get_branch_dispatches_relay_driver`.
 
-    /// G1: `source_addr.is_none()` (originator loopback from the phase-3b
-    /// client driver's `send_and_await(target=None)`) MUST NOT be routed
-    /// to the relay driver. The dispatch site in `node.rs` must check
-    /// `source_addr.is_some()` before calling `start_relay_get`; otherwise
-    /// the client driver's `Terminal::LocalCompletion` Request-echo contract
-    /// breaks and client-initiated GETs either hang or deadlock.
     #[test]
-    fn dispatch_gate_loopback_source_addr_none_uses_legacy() {
+    fn relay_dispatch_target_is_start_relay_get() {
         const NODE_RS: &str = include_str!("../../node.rs");
-        let dispatch_start = NODE_RS
-            .find("// #1454 phase 5 / #3883: relay GET task-per-tx dispatch.")
-            .expect("relay dispatch comment anchor must exist in node.rs");
-        let dispatch_end = NODE_RS[dispatch_start..]
-            .find("let op_result = handle_op_request::<get::GetOp, _>")
-            .expect("legacy fallthrough anchor must follow relay dispatch");
-        let block = &NODE_RS[dispatch_start..dispatch_start + dispatch_end];
-        assert!(
-            block.contains("if let Some(upstream_addr) = source_addr"),
-            "Relay dispatch block must gate on `source_addr.is_some()` so that \
-             originator loopback (source_addr=None from phase-3b client driver) \
-             falls through to the legacy `handle_op_request` path. Without this \
-             gate, the Request-echo contract `drive_client_get_inner::classify` \
-             relies on for Terminal::LocalCompletion breaks. See port plan §2."
-        );
-    }
-
-    /// G2: `has_get_op(id) == true` (GC-spawned retries, `start_targeted_op`
-    /// UPDATE auto-fetch) MUST NOT be routed to the relay driver. Those
-    /// callers register a `GetOp` in `OpManager.ops.get` BEFORE the
-    /// Request hits the wire and rely on the legacy `process_message`
-    /// re-entry loop for their state machine. The dispatch site in
-    /// `node.rs` must check `!op_manager.has_get_op(id)` before calling
-    /// `start_relay_get`.
-    #[test]
-    fn dispatch_gate_existing_get_op_uses_legacy() {
-        const NODE_RS: &str = include_str!("../../node.rs");
-        let dispatch_start = NODE_RS
-            .find("// #1454 phase 5 / #3883: relay GET task-per-tx dispatch.")
-            .expect("relay dispatch comment anchor must exist in node.rs");
-        let dispatch_end = NODE_RS[dispatch_start..]
-            .find("let op_result = handle_op_request::<get::GetOp, _>")
-            .expect("legacy fallthrough anchor must follow relay dispatch");
-        let block = &NODE_RS[dispatch_start..dispatch_start + dispatch_end];
-        assert!(
-            block.contains("!op_manager.has_get_op(id)"),
-            "Relay dispatch block must gate on `!op_manager.has_get_op(id)` so that \
-             GC-spawned retries and `start_targeted_op` (UPDATE auto-fetch) continue \
-             through the legacy `handle_op_request` path. Without this gate, the \
-             relay driver would hijack transactions the legacy state machine owns."
-        );
-    }
-
-    /// G3 (companion): the dispatch block must sit AFTER the
-    /// `try_forward_task_per_tx_reply` bypass (phase-3b terminal forward)
-    /// and BEFORE the legacy `handle_op_request` call, so that:
-    ///   - terminal Response/ResponseStreaming from phase-3b client driver
-    ///     get forwarded to its pending callback, NOT handed to the relay
-    ///     driver (which would spawn a spurious task);
-    ///   - legacy handling still runs for the loopback / has_get_op gated
-    ///     fall-through cases.
-    #[test]
-    fn dispatch_gate_ordering_bypass_before_relay_before_legacy() {
-        const NODE_RS: &str = include_str!("../../node.rs");
-        let get_arm = NODE_RS
+        let arm_start = NODE_RS
             .find("NetMessageV1::Get(ref op) => {")
             .expect("Get arm must exist in handle_pure_network_message_v1");
-        let tail = &NODE_RS[get_arm..];
-        let bypass_pos = tail
-            .find("try_forward_task_per_tx_reply")
-            .expect("phase-3b bypass must exist in Get arm");
-        let relay_pos = tail
-            .find("get::op_ctx_task::start_relay_get")
-            .expect("phase-5 relay dispatch must exist in Get arm");
-        let legacy_pos = tail
-            .find("handle_op_request::<get::GetOp, _>")
-            .expect("legacy fallthrough must exist in Get arm");
+        let next_variant = NODE_RS[arm_start..]
+            .find("NetMessageV1::Update(ref op) => {")
+            .expect("Update arm must follow Get arm")
+            + arm_start;
+        let arm = &NODE_RS[arm_start..next_variant];
         assert!(
-            bypass_pos < relay_pos && relay_pos < legacy_pos,
-            "Dispatch ordering in the Get arm must be: \
-             try_forward_task_per_tx_reply (phase-3b terminal bypass) \
-             THEN start_relay_get (phase-5 relay dispatch) \
-             THEN handle_op_request (legacy loopback + has_get_op fallthrough). \
-             Got bypass={bypass_pos}, relay={relay_pos}, legacy={legacy_pos}."
+            arm.contains("get::op_ctx_task::start_relay_get("),
+            "GET arm must dispatch fresh inbound Request to \
+             `get::op_ctx_task::start_relay_get`."
         );
     }
 
@@ -3343,41 +3284,36 @@ mod tests {
         );
     }
 
-    // ── N: Concurrent same-key GET — dispatch gate is per-tx, not per-key ──
-
-    /// The dispatch gate in `node.rs` is `!op_manager.has_get_op(id)` —
-    /// keyed on the transaction id, NOT the contract key/instance. This
-    /// means two concurrent relay GETs for the *same* contract (from
-    /// different upstreams) each get their own driver task, each its
-    /// own `incoming_tx`. This is intentional: each upstream expects a
-    /// reply on its own tx, so per-tx independence preserves the
-    /// upstream-reply invariant. Per-key dedup would break it.
-    ///
-    /// This test pins the documented semantic so a well-meaning "add
-    /// per-key dedup" refactor can't silently land.
+    // ── Per-tx independence pin (#1454 phase 5 final, GET slice) ──────────
+    //
+    // The legacy `has_get_op(id)` dispatch gate is gone. Per-tx
+    // independence is now enforced by `active_relay_get_txs` —
+    // `start_relay_get` rejects a duplicate inbound Request whose
+    // `incoming_tx` already has a live driver via the
+    // `Relay*InflightGuard` RAII pattern. Dedup remains keyed on
+    // transaction id (NOT contract instance id), so two concurrent
+    // relay GETs for the *same* contract from different upstreams each
+    // get their own driver task and their own upstream reply.
     #[test]
-    fn dispatch_gate_is_per_transaction_not_per_contract() {
-        const NODE_RS: &str = include_str!("../../node.rs");
-        let dispatch_start = NODE_RS
-            .find("// #1454 phase 5 / #3883: relay GET task-per-tx dispatch.")
-            .expect("relay dispatch comment anchor must exist in node.rs");
-        let dispatch_end = NODE_RS[dispatch_start..]
-            .find("let op_result = handle_op_request::<get::GetOp, _>")
-            .expect("legacy fallthrough anchor must follow relay dispatch");
-        let block = &NODE_RS[dispatch_start..dispatch_start + dispatch_end];
+    fn relay_inflight_dedup_is_per_transaction_not_per_contract() {
+        const SRC: &str = include_str!("../get/op_ctx_task.rs");
+        let guard_start = SRC
+            .find("RelayGetInflightGuard")
+            .expect("RelayGetInflightGuard must exist");
+        let window = &SRC[guard_start..(guard_start + 4000).min(SRC.len())];
         assert!(
-            block.contains("has_get_op(id)"),
-            "Dispatch gate must be keyed on `has_get_op(id)` (per-transaction), \
-             not `instance_id` / contract key (per-key). Per-key dedup would \
-             break the upstream-reply invariant: two upstreams GETting the \
-             same contract need independent replies, each on its own tx."
+            window.contains("active_relay_get_txs"),
+            "Relay GET inflight dedup must use `active_relay_get_txs` \
+             (per-transaction DashSet)."
         );
-        // Negative: no contract-key dedup construct in the dispatch block.
+        // Compose the negative-match needles at runtime so this test's
+        // own source doesn't match against `include_str!`.
+        let per_key_needle_a = format!("active_relay_get_{}", "keys");
+        let per_key_needle_b = format!("active_relay_get_{}", "instance_ids");
         assert!(
-            !block.contains("has_get_op(instance_id)")
-                && !block.contains("has_get_op(contract_id)"),
-            "Dispatch block must not gate on contract key (per-key dedup). \
-             Found a suspicious has_get_op variant: {block}"
+            !window.contains(&per_key_needle_a) && !window.contains(&per_key_needle_b),
+            "Inflight dedup must NOT key on contract instance id; per-key \
+             dedup would break the upstream-reply invariant."
         );
     }
 

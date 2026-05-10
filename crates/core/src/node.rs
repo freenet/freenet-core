@@ -1261,14 +1261,20 @@ where
                 return Ok(None);
             }
             NetMessageV1::Get(ref op) => {
-                // Phase 3b (#1454): task-per-tx bypass for client-initiated
-                // GET. Mirror of the PUT bypass above.
+                // #1454 phase 5 final (GET slice): every GET wire variant
+                // routes to a task-per-tx driver. The legacy
+                // `OpManager.ops.get` DashMap, `Operation` impl, and
+                // legacy state-machine fallthrough were retired in this
+                // PR. The slice-A DashMap-existence dispatch gate is
+                // gone: the DashMap can no longer be populated.
                 //
-                // Only forward **terminal** Response/ResponseStreaming messages.
-                // Non-terminal messages (Request, ResponseStreamingAck,
-                // ForwardingAck) must NOT be forwarded: they would fill the
-                // capacity-1 reply channel and cause classify_reply to fail
-                // with Unexpected (Phase 2b bug 2).
+                // Only forward **terminal** Response/ResponseStreaming
+                // messages to the originator's awaiting task via the
+                // bypass. Non-terminal messages (Request,
+                // ResponseStreamingAck, ForwardingAck) must NOT be
+                // forwarded: they would fill the capacity-1 reply
+                // channel and cause classify_reply to fail with
+                // Unexpected (Phase 2b bug 2).
                 if matches!(
                     op,
                     get::GetMsg::Response { .. } | get::GetMsg::ResponseStreaming { .. }
@@ -1280,38 +1286,28 @@ where
                     return Ok(None);
                 }
 
-                // #1454 phase 5 / #3883: relay GET task-per-tx dispatch.
-                //
-                // For true relay hops (source_addr.is_some() AND incoming
-                // variant is GetMsg::Request AND no GetOp already exists in
-                // OpManager for this tx), spawn the relay driver and return.
-                // The driver owns routing, forwarding, retry, and upstream
-                // bubble-up in its task locals.
-                //
-                // source_addr.is_none() (originator loop-back from phase-3b
-                // client driver's send_and_await with target=None) falls
-                // through to the legacy path to preserve the Request-echo
-                // contract that drive_client_get_inner's `classify` relies on
-                // for Terminal::LocalCompletion.
-                //
-                // GC-spawned retries and start_targeted_op register a GetOp
-                // in OpManager before the Request hits the wire, so
-                // op_manager.has_get_op(id) returning true means this is not
-                // a fresh inbound relay call — fall through to legacy.
-                if let get::GetMsg::Request {
-                    id,
-                    instance_id,
-                    fetch_contract,
-                    htl,
-                    visited,
-                    subscribe,
-                } = op
-                {
-                    if let Some(upstream_addr) = source_addr {
-                        if !op_manager.has_get_op(id) {
-                            // True relay: no existing op, remote source, fresh
-                            // Request. Fire-and-forget spawn; driver publishes
-                            // its own upstream response.
+                // Relay GET dispatch: spawn `start_relay_get`. Mirrors
+                // the PUT branch above. `start_client_get`'s
+                // `send_and_await(target=None)` loops the Request back
+                // into the local event loop as an InboundMessage with
+                // `source_addr=None`. Map that to
+                // `upstream_addr = own_addr` so the same
+                // `start_relay_get` driver handles both true relay hops
+                // and originator-loopback. The driver's local-cache +
+                // forward-or-finalize logic is identical for both.
+                let effective_upstream =
+                    source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
+                if let Some(upstream_addr) = effective_upstream {
+                    #[allow(clippy::wildcard_enum_match_arm)]
+                    match op {
+                        get::GetMsg::Request {
+                            id,
+                            instance_id,
+                            fetch_contract,
+                            htl,
+                            visited,
+                            subscribe,
+                        } => {
                             if let Err(err) = get::op_ctx_task::start_relay_get(
                                 op_manager.clone(),
                                 *id,
@@ -1331,52 +1327,27 @@ where
                                     "GET relay dispatch: start_relay_get failed"
                                 );
                             }
-                            return Ok(None);
                         }
-                    }
-                }
-
-                let op_result = handle_op_request::<get::GetOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    source_addr,
-                )
-                .await;
-
-                // Handle pending operation results (network concern)
-                forward_pending_op_result_if_completed(
-                    &op_result,
-                    pending_op_result.as_ref(),
-                    NetMessage::V1(NetMessageV1::Get((*op).clone())),
-                );
-
-                if let Err(OpError::OpNotAvailable(state)) = &op_result {
-                    match state {
-                        OpNotAvailable::Running => {
-                            let delay = op_retry_backoff(i);
+                        _ => {
                             tracing::debug!(
-                                delay_ms = delay.as_millis() as u64,
-                                attempt = i,
-                                "Pure network: Operation still running, backing off"
+                                tx = %op.id(),
+                                ?op,
+                                "GET: non-dispatch variant ignored \
+                                 (Response/ResponseStreaming already handled \
+                                 by bypass; ForwardingAck is no-op; \
+                                 ResponseStreamingAck handled by stream layer)"
                             );
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        OpNotAvailable::Completed => {
-                            tracing::debug!("Pure network: Operation already completed");
-                            return Ok(None);
                         }
                     }
+                } else {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        ?op,
+                        "GET: no own_addr available — pre-handshake \
+                         message ignored"
+                    );
                 }
-
-                return handle_pure_network_result(
-                    tx,
-                    op_result,
-                    &op_manager,
-                    &mut *event_listener,
-                )
-                .await;
+                return Ok(None);
             }
             NetMessageV1::Update(ref op) => {
                 // #1454 phase 5 final: every UPDATE wire variant routes
@@ -2633,19 +2604,6 @@ async fn handle_aborted_op(
                 _ => {}
             }
         }
-        TransactionType::Get => match op_manager.pop(&tx) {
-            Ok(Some(OpEnum::Get(op))) => {
-                if let Err(err) = op.handle_abort(op_manager).await {
-                    if !matches!(err, OpError::StatePushed) {
-                        return Err(err);
-                    }
-                }
-            }
-            Ok(Some(other)) => {
-                op_manager.push(tx, other).await?;
-            }
-            _ => {}
-        },
         TransactionType::Subscribe => match op_manager.pop(&tx) {
             Ok(Some(OpEnum::Subscribe(op))) => {
                 if let Err(err) = op.handle_abort(op_manager).await {
@@ -2659,8 +2617,8 @@ async fn handle_aborted_op(
             }
             _ => {}
         },
-        TransactionType::Put | TransactionType::Update => {
-            // PUT and UPDATE have no DashMap entry post-#1454 phase 5
+        TransactionType::Get | TransactionType::Put | TransactionType::Update => {
+            // GET, PUT and UPDATE have no DashMap entry post-#1454 phase 5
             // final; the task-per-tx driver owns abort handling through
             // its own cancellation surface (the `result_router_tx`
             // publication path is the only externally observable result).
@@ -2841,7 +2799,6 @@ impl IsOperationCompleted for OpEnum {
     fn is_completed(&self) -> bool {
         match self {
             OpEnum::Connect(op) => op.is_completed(),
-            OpEnum::Get(op) => op.is_completed(),
             OpEnum::Subscribe(op) => op.is_completed(),
         }
     }
@@ -3800,36 +3757,38 @@ mod tests {
         // Source-literal guard: verify the GET branch invokes
         // try_forward_task_per_tx_reply before start_relay_get dispatch,
         // gated on Response|ResponseStreaming only (phase-3b bypass).
+        // ── Relay GET dispatch structural pin tests
+        // (#1454 phase 5 final, GET slice). Mirror of the PUT/UPDATE
+        // tests below.
+
         #[test]
-        fn bypass_is_wired_into_get_branch_regression_guard() {
+        fn get_branch_dispatches_relay_driver() {
             const SOURCE: &str = include_str!("node.rs");
-
-            let get_branch_anchor = "NetMessageV1::Get(ref op) => {";
-            let branch_start = SOURCE.find(get_branch_anchor).expect(
+            let anchor = "NetMessageV1::Get(ref op) => {";
+            let branch_start = SOURCE.find(anchor).expect(
                 "GET branch of handle_pure_network_message_v1 not found; \
-                 the match arm has been renamed or moved — update this regression guard",
+                 the match arm has been renamed or moved — update this guard",
             );
-
+            // End the window at the next NetMessageV1 variant to bound
+            // the search to the GET arm only.
+            let next_variant = "NetMessageV1::Update(ref op) => {";
             let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<get::GetOp, _>")
-                .expect("GET branch no longer calls handle_op_request — update guard")
+                .find(next_variant)
+                .expect("could not find end of GET arm")
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
 
-            // Phase-3b bypass must still be present (unchanged).
+            // Phase-3b bypass must still be present (gated on terminal variants).
             assert!(
                 window.contains("try_forward_task_per_tx_reply("),
                 "GET branch no longer calls try_forward_task_per_tx_reply \
-                 before handle_op_request. Phase-3b (#1454) bypass removed — restore it."
+                 before relay dispatch. Phase-3b (#1454) bypass removed — restore it."
             );
-
-            // Bypass must be gated on terminal variants only.
             assert!(
                 window.contains("get::GetMsg::Response { .. }"),
                 "GET branch bypass is not gated on Response. \
                  Non-terminal messages must NOT be forwarded to the task-per-tx channel."
             );
-
             assert!(
                 window.contains("get::GetMsg::ResponseStreaming { .. }"),
                 "GET branch bypass is not gated on ResponseStreaming. \
@@ -3839,50 +3798,44 @@ mod tests {
             // Relay dispatch must call start_relay_get.
             assert!(
                 window.contains("start_relay_get("),
-                "GET branch no longer calls start_relay_get for relay dispatch. \
-                 #3883 phase-5 relay dispatch was removed — restore it."
+                "GET branch no longer calls start_relay_get for relay dispatch."
             );
 
-            // Relay dispatch must be gated on source_addr (relay vs. loop-back).
+            // After #1454 phase 5 final (GET slice), the originator-
+            // loopback case (source_addr=None) is mapped to
+            // upstream=own_addr instead of falling through to legacy.
+            // The dispatch is therefore conditional on an effective
+            // upstream rather than on source_addr.is_some() directly.
             assert!(
-                window.contains("source_addr"),
-                "GET branch relay dispatch is not gated on source_addr. \
-                 Originator loop-back (source_addr.is_none()) must fall through to legacy."
+                window.contains("effective_upstream") || window.contains("upstream_addr"),
+                "GET relay dispatch must thread an effective upstream address \
+                 (source_addr or own_addr loopback) into the relay driver."
             );
 
-            // Relay dispatch must guard on no existing GetOp (has_get_op).
+            // Legacy fallthrough and gate must stay deleted. Compose
+            // needles at runtime so the assert source itself does not
+            // contain them.
+            let legacy_dispatch_needle = format!("handle{}::<get::GetOp, _>", "_op_request");
             assert!(
-                window.contains("has_get_op"),
-                "GET branch relay dispatch is not guarded by has_get_op. \
-                 GC-spawned retries must fall through to legacy handle_op_request."
+                !window.contains(&legacy_dispatch_needle),
+                "GET branch must NOT call legacy state-machine dispatch — \
+                 retired in #1454 phase 5 final (GET slice)"
             );
-        }
+            let dashmap_gate_needle = format!("has{}_op", "_get");
+            assert!(
+                !window.contains(&dashmap_gate_needle),
+                "GET branch must NOT gate on the retired DashMap existence \
+                 check — retired in #1454 phase 5 final (GET slice)"
+            );
 
-        // Source-literal guard: verify the GET branch wires
-        // try_forward_task_per_tx_reply before start_relay_get.
-        // (Ordering: phase-3b bypass comes first in source order.)
-        #[test]
-        fn get_branch_phase3b_bypass_precedes_relay_dispatch() {
-            const SOURCE: &str = include_str!("node.rs");
-
-            let get_branch_anchor = "NetMessageV1::Get(ref op) => {";
-            let branch_start = SOURCE
-                .find(get_branch_anchor)
-                .expect("GET branch not found");
-
-            let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<get::GetOp, _>")
-                .expect("GET branch no longer calls handle_op_request")
-                + branch_start;
-            let window = &SOURCE[branch_start..window_end];
-
+            // Bypass must precede relay dispatch in source order
+            // (terminal-reply fast path has priority).
             let bypass_pos = window
                 .find("try_forward_task_per_tx_reply(")
                 .expect("try_forward_task_per_tx_reply not found in GET branch");
             let relay_pos = window
                 .find("start_relay_get(")
                 .expect("start_relay_get not found in GET branch");
-
             assert!(
                 bypass_pos < relay_pos,
                 "Phase-3b bypass (try_forward_task_per_tx_reply) must appear \

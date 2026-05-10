@@ -32,7 +32,6 @@ use crate::{
     operations::{
         OpCtx, OpEnum, OpError,
         connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
-        get::GetOp,
         orphan_streams::OrphanStreamRegistry,
         subscribe::SubscribeOp,
     },
@@ -69,14 +68,14 @@ pub(crate) enum OpNotAvailable {
 #[derive(Default)]
 struct Ops {
     connect: DashMap<Transaction, crate::operations::connect::ConnectOp>,
-    get: DashMap<Transaction, GetOp>,
     subscribe: DashMap<Transaction, SubscribeOp>,
-    // `put` and `update` DashMaps retired in #1454 phase 5 final
-    // (UPDATE slice 1, PUT slice 2): every PUT/UPDATE wire path
+    // `get`, `put` and `update` DashMaps retired in #1454 phase 5 final
+    // (UPDATE slice, PUT slice, GET slice): every wire path
     // (client + non-streaming relay + streaming relay) now runs on
     // `op_ctx_task::*` task-per-tx drivers that own their state in
-    // task locals. The legacy `Operation` impl, `request_update`,
-    // and the `OpEnum::{Put,Update}` carriers were deleted in earlier
+    // task locals. The legacy `Operation` impl, the `request_*` /
+    // `start_op*` originator helpers, and the
+    // `OpEnum::{Get,Put,Update}` carriers were deleted in earlier
     // commits.
     completed: DashSet<Transaction>,
     under_progress: DashSet<Transaction>,
@@ -89,7 +88,6 @@ struct Ops {
 #[derive(Debug, Default)]
 struct OpsSizes {
     connect: usize,
-    get: usize,
     subscribe: usize,
     completed: usize,
     under_progress: usize,
@@ -99,7 +97,6 @@ impl Ops {
     fn sizes(&self) -> OpsSizes {
         OpsSizes {
             connect: self.connect.len(),
-            get: self.get.len(),
             subscribe: self.subscribe.len(),
             completed: self.completed.len(),
             under_progress: self.under_progress.len(),
@@ -713,11 +710,6 @@ impl OpManager {
                 check_id_op!(id.transaction_type(), TransactionType::Connect);
                 self.ops.connect.insert(id, *op);
             }
-            OpEnum::Get(op) => {
-                #[cfg(debug_assertions)]
-                check_id_op!(id.transaction_type(), TransactionType::Get);
-                self.ops.get.insert(id, op);
-            }
             OpEnum::Subscribe(op) => {
                 #[cfg(debug_assertions)]
                 check_id_op!(id.transaction_type(), TransactionType::Subscribe);
@@ -740,15 +732,14 @@ impl OpManager {
                 .connect
                 .get(id)
                 .and_then(|op| op.get_next_hop_addr()),
-            TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_next_hop_addr()),
             TransactionType::Subscribe => self
                 .ops
                 .subscribe
                 .get(id)
                 .and_then(|op| op.get_next_hop_addr()),
-            // PUT and UPDATE have no DashMap entry post-#1454 phase 5
-            // final; task-per-tx drivers manage their own routing.
-            TransactionType::Put | TransactionType::Update => None,
+            // GET, PUT and UPDATE have no DashMap entry post-#1454
+            // phase 5 final; task-per-tx drivers manage their own routing.
+            TransactionType::Get | TransactionType::Put | TransactionType::Update => None,
         }
     }
 
@@ -772,16 +763,16 @@ impl OpManager {
 
     /// Get the current hop count (remaining HTL) for an operation.
     /// Used for calculating hop_count in success/failure events.
-    pub fn get_current_hop(&self, id: &Transaction) -> Option<usize> {
-        match id.transaction_type() {
-            TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_current_hop()),
-            // TODO: Add support for Subscribe operations when they track HTL
-            // PUT/UPDATE have no DashMap entry post-#1454 phase 5 final.
-            TransactionType::Connect
-            | TransactionType::Put
-            | TransactionType::Subscribe
-            | TransactionType::Update => None,
-        }
+    pub fn get_current_hop(&self, _id: &Transaction) -> Option<usize> {
+        // GET, PUT and UPDATE have no DashMap entry post-#1454 phase 5
+        // final; SUBSCRIBE doesn't track HTL; CONNECT has no current
+        // hop concept exposed. The `get_current_hop` getter is kept for
+        // API compatibility with the tracing/telemetry consumer at
+        // `crates/core/src/tracing.rs:1266` (which uses it to decorate
+        // event logs with the operation's remaining HTL when known).
+        // Post-GET-slice retirement, no live operation reports a hop
+        // here — telemetry sites get `None` and skip the decoration.
+        None
     }
 
     pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
@@ -802,15 +793,15 @@ impl OpManager {
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(|op| OpEnum::Connect(Box::new(op))),
-            TransactionType::Get => self.ops.get.remove(id).map(|(_k, v)| v).map(OpEnum::Get),
             TransactionType::Subscribe => self
                 .ops
                 .subscribe
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(OpEnum::Subscribe),
-            // PUT and UPDATE have no DashMap entry post-#1454 phase 5 final.
-            TransactionType::Put | TransactionType::Update => None,
+            // GET, PUT and UPDATE have no DashMap entry post-#1454
+            // phase 5 final.
+            TransactionType::Get | TransactionType::Put | TransactionType::Update => None,
         };
         self.ops.under_progress.insert(*id);
         Ok(op)
@@ -866,19 +857,13 @@ impl OpManager {
         .await
     }
 
-    /// Returns `true` if there is an active `GetOp` stored in `OpManager.ops.get`
-    /// for the given transaction.
-    ///
-    /// Used by the relay GET dispatch in `node.rs` to distinguish a fresh inbound
-    /// relay request (no existing op → spawn the task-per-tx driver) from a
-    /// GC-spawned retry or `start_targeted_op` (existing op → fall through to the
-    /// legacy `handle_op_request` path).
-    ///
-    /// Does **not** check `completed` or `under_progress` — those are covered by
-    /// `pop` / `load_or_init`. This is a lightweight existence check only.
-    pub fn has_get_op(&self, id: &Transaction) -> bool {
-        self.ops.get.contains_key(id)
-    }
+    // `has_get_op` was the relay GET dispatch gate; retired in
+    // #1454 phase 5 final (GET slice) together with the `ops.get`
+    // DashMap. Every GET wire variant now spawns its task-per-tx
+    // driver unconditionally (the legacy `handle_op_request<GetOp>`
+    // fallthrough is gone), so the gate has no remaining decision
+    // value. The dispatch site in `node.rs::NetMessageV1::Get` was
+    // simplified in this slice.
 
     // `has_update_op` was the relay UPDATE dispatch gate; retired in
     // #1454 phase 5 final together with the `ops.update` DashMap.
@@ -948,14 +933,12 @@ impl OpManager {
             TransactionType::Connect => {
                 self.ops.connect.remove(&id);
             }
-            TransactionType::Get => {
-                self.ops.get.remove(&id);
-            }
             TransactionType::Subscribe => {
                 self.ops.subscribe.remove(&id);
             }
-            // PUT and UPDATE have no DashMap entry post-#1454 phase 5 final.
-            TransactionType::Put | TransactionType::Update => {}
+            // GET, PUT and UPDATE have no DashMap entry post-#1454
+            // phase 5 final.
+            TransactionType::Get | TransactionType::Put | TransactionType::Update => {}
         }
 
         // Clean up request router to prevent stale entries from blocking subsequent requests
@@ -1017,15 +1000,15 @@ impl OpManager {
     }
 
     /// Returns pending operation counts: [connect, put, get, subscribe, update].
-    /// PUT and UPDATE slots are always 0 after #1454 phase 5 final
-    /// retired the `ops.put` and `ops.update` DashMaps; kept in the
-    /// array for API stability with the home-page renderer / telemetry
+    /// GET, PUT and UPDATE slots are always 0 after #1454 phase 5 final
+    /// retired the `ops.{get,put,update}` DashMaps; kept in the array
+    /// for API stability with the home-page renderer / telemetry
     /// consumers.
     pub fn pending_op_counts(&self) -> [u32; 5] {
         [
             self.ops.connect.len() as u32,
             0,
-            self.ops.get.len() as u32,
+            0,
             self.ops.subscribe.len() as u32,
             0,
         ]
@@ -1300,50 +1283,12 @@ fn remove_subscribe_and_notify_timeout(
     Some(())
 }
 
-/// Removes a get operation from the ops map, reports timeout failure if stats are available,
-/// and notifies the client with an error so they don't wait silently until their own timeout.
-/// Returns `true` if the operation was found and removed, `false` otherwise.
-fn remove_get_and_report_failure(
-    ops: &Ops,
-    tx: &Transaction,
-    ring: &crate::ring::Ring,
-    result_router_tx: &mpsc::Sender<(Transaction, HostResult)>,
-) -> bool {
-    if let Some((_, get_op)) = ops.get.remove(tx) {
-        if let Some((peer, contract_location)) = get_op.failure_routing_info() {
-            report_timeout_failure(ring, tx, peer, contract_location);
-        }
-        // Log GET timeout so failures are visible in traces
-        let instance_id = get_op.instance_id();
-        tracing::warn!(
-            tx = %tx,
-            instance_id = ?instance_id,
-            elapsed_ms = tx.elapsed().as_millis(),
-            phase = "get_timeout",
-            "GET operation timed out without receiving a response"
-        );
-        // Notify client of timeout so they get an immediate error instead of
-        // waiting silently for their own client-side timeout (#3423).
-        // Only for client-initiated GETs (requester is None); forwarded GETs
-        // have no local client waiting.
-        if get_op.is_client_initiated() {
-            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: "GET operation timed out".into(),
-            }
-            .into());
-            if let Err(e) = result_router_tx.try_send((*tx, error_result)) {
-                tracing::warn!(
-                    %tx,
-                    error = %e,
-                    "failed to send GET timeout error to client"
-                );
-            }
-        }
-        true
-    } else {
-        false
-    }
-}
+// `remove_get_and_report_failure` retired in #1454 phase 5 final
+// (GET slice) together with the `ops.get` DashMap. Originator-side
+// timeout reporting is now owned by the task-per-tx driver via the
+// `RetryLoopOutcome::Exhausted` → `result_router_tx` publication
+// path. Relay drivers expire their inflight guards naturally; no GC
+// sweep is needed.
 
 /// Log when a connect operation in Relaying state with an outstanding uphill forward times out,
 /// and record the unresponsive peer as an acceptor failure for reliability scoring.
@@ -1394,7 +1339,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     live_tx_tracker: LiveTransactionTracker,
     event_loop_notifier: EventLoopNotificationsSender,
     mut event_register: ER,
-    result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
+    _result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
     ring: Arc<Ring>,
     ch_outbound: Arc<crate::contract::ContractHandlerChannel<crate::contract::SenderHalve>>,
@@ -1494,9 +1439,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         target: "memory_stats",
                         tick = tick_count,
                         ops_connect = ops_sizes.connect,
-                        // ops_put / ops_update retired in #1454 phase 5 final
+                        // ops_get / ops_put / ops_update retired in
+                        // #1454 phase 5 final.
                         ops_put = 0,
-                        ops_get = ops_sizes.get,
+                        ops_get = 0,
                         ops_subscribe = ops_sizes.subscribe,
                         ops_update = 0,
                         ops_completed = ops_sizes.completed,
@@ -1610,13 +1556,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 true
                             }
                         }
-                        TransactionType::Get => !remove_get_and_report_failure(&ops, &tx, &ring, &result_router_tx),
                         TransactionType::Subscribe => {
                             remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_none()
                         }
-                        // PUT and UPDATE have no DashMap entry post-#1454
-                        // phase 5 final; nothing to remove, nothing pending.
-                        TransactionType::Put | TransactionType::Update => false,
+                        // GET, PUT and UPDATE have no DashMap entry
+                        // post-#1454 phase 5 final; task-per-tx
+                        // drivers own their own timeout reporting.
+                        TransactionType::Get | TransactionType::Put | TransactionType::Update => false,
                     };
                     if still_waiting {
                         delayed.push(tx);
@@ -1683,13 +1629,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 false
                             }
                         }
-                        TransactionType::Get => remove_get_and_report_failure(&ops, &tx, &ring, &result_router_tx),
                         TransactionType::Subscribe => {
                             remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_some()
                         }
-                        // PUT and UPDATE have no DashMap entry post-#1454
-                        // phase 5 final; nothing to remove or report.
-                        TransactionType::Put | TransactionType::Update => false,
+                        // GET, PUT and UPDATE have no DashMap entry
+                        // post-#1454 phase 5 final; task-per-tx drivers
+                        // own their own timeout reporting.
+                        TransactionType::Get | TransactionType::Put | TransactionType::Update => false,
                     };
                     if removed {
                         tracing::info!(
@@ -2072,58 +2018,9 @@ mod tests {
         }
     }
 
-    // ── has_get_op unit tests ─────────────────────────────────────────────
-    //
-    // `has_get_op` is a thin wrapper over `self.ops.get.contains_key`.
-    // Since `OpManager` requires complex infrastructure to construct in unit
-    // tests, we exercise the underlying `Ops::get` DashMap directly — the
-    // same pattern used by `remove_put_returns_false_for_missing_tx` above.
-    // The delegation in `has_get_op` is one line and trivially correct.
-
-    /// has_get_op returns false for an unknown transaction.
-    #[test]
-    fn has_get_op_returns_false_for_unknown_tx() {
-        let ops = Ops::default();
-        let tx = Transaction::new::<crate::operations::get::GetMsg>();
-        assert!(
-            !ops.get.contains_key(&tx),
-            "ops.get should not contain a never-inserted tx"
-        );
-    }
-
-    /// has_get_op returns true after a GetOp is inserted, and false once removed.
-    #[test]
-    fn has_get_op_returns_true_after_insert_false_after_remove() {
-        use freenet_stdlib::prelude::ContractInstanceId;
-
-        let ops = Ops::default();
-        let instance_id = ContractInstanceId::new([0u8; 32]);
-        let tx = Transaction::new::<crate::operations::get::GetMsg>();
-        let get_op = crate::operations::get::start_op_with_id(instance_id, false, false, false, tx);
-
-        // Before insert: absent
-        assert!(
-            !ops.get.contains_key(&tx),
-            "ops.get should not contain tx before insertion"
-        );
-
-        // After insert: present
-        ops.get.insert(tx, get_op);
-        assert!(
-            ops.get.contains_key(&tx),
-            "ops.get should contain tx after insertion"
-        );
-
-        // After remove: absent again
-        ops.get.remove(&tx);
-        assert!(
-            !ops.get.contains_key(&tx),
-            "ops.get should not contain tx after removal"
-        );
-    }
-
-    // `has_update_op_returns_*` and `has_put_op_returns_*` tests were
-    // retired in #1454 phase 5 final together with the corresponding
-    // APIs and DashMaps. Equivalent coverage for the remaining ops
-    // lives in `has_get_op_*` above.
+    // `has_get_op_*`, `has_update_op_returns_*` and
+    // `has_put_op_returns_*` tests were retired in #1454 phase 5 final
+    // together with the corresponding APIs and DashMaps. Equivalent
+    // coverage for the surviving ops (CONNECT, SUBSCRIBE) lives in the
+    // relay-driver dedup tests under `op_ctx_task` modules.
 }
