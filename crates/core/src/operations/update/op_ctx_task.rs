@@ -354,7 +354,8 @@ async fn drive_client_update(
                     // local store is primed and a client retry succeeds.
                     //
                     // Why `target_addr` and not some other peer: the
-                    // auto-fetch is a directed `start_targeted_op` GET to
+                    // auto-fetch is a directed `start_targeted_sub_op_get`
+                    // GET (post-#1454 phase 5 final, GET slice) targeting
                     // a SocketAddr, and `target_addr` is the only addr we
                     // have at this site that the routing layer just
                     // confirmed is reachable AND closer to the key than
@@ -540,11 +541,15 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 //
 // NOT migrated (stays on legacy path; see port plan §3 / §9):
 //   - `UpdateMsg::RequestUpdateStreaming` /
-//     `UpdateMsg::BroadcastToStreaming` (slice B follow-up — orphan
-//      stream claim + assembly).
-//   - GC-spawned retries / `start_targeted_op` UPDATE-triggered fetch
-//     (existing `UpdateOp` in `OpManager.ops.update` falls through to
-//     legacy via `has_update_op` dispatch gate).
+//     `UpdateMsg::BroadcastToStreaming` — migrated in slice C.
+//
+// UPDATE auto-fetch (`OpManager::try_auto_fetch_contract`) used to
+// invoke the legacy `get::start_targeted_op` constructor. Phase 5
+// final (GET slice) migrated it to
+// `get::op_ctx_task::start_targeted_sub_op_get` (a directed
+// task-per-tx GET that pre-seeds the UPDATE sender as the first
+// hop and falls back to `k_closest_potentially_hosting` for
+// retries). The legacy `OpEnum::Get` carrier is gone.
 
 /// Spawn a relay driver for a fresh inbound `UpdateMsg::RequestUpdate`.
 ///

@@ -3334,6 +3334,53 @@ mod tests {
         );
     }
 
+    /// Pin: `run_relay_get` MUST skip `release_pending_op_slot` when
+    /// running in originator-loopback mode (`upstream_addr ==
+    /// own_addr`). The `pending_op_results` callback for `incoming_tx`
+    /// in that mode is the originator's `send_and_await` waiter, not
+    /// one this driver installed; releasing it would emit
+    /// `TransactionCompleted` and remove the originator's callback
+    /// BEFORE the loopback `GetMsg::Response` reaches the bypass
+    /// (notifications channel has higher priority than op_execution
+    /// in priority_select). Repro: `test_get_notfound_no_forwarding_targets`
+    /// (#1454 phase 5 final, GET slice follow-up commit 6cb3ca18).
+    #[test]
+    fn run_relay_get_skips_release_in_originator_loopback() {
+        let src = include_str!("../get/op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn run_relay_get(")
+            .expect("run_relay_get not found");
+        // Bound the search window: `drive_relay_get` follows
+        // `run_relay_get` in source order, gated by the
+        // `clippy::too_many_arguments` attr.
+        let fn_end = src[fn_start..]
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn drive_relay_get(")
+            .expect("end-of-run_relay_get marker not found")
+            + fn_start;
+        let body = &src[fn_start..fn_end];
+        // The release call must be guarded by an own_addr comparison.
+        let release_pos = body
+            .find("release_pending_op_slot(incoming_tx)")
+            .expect("release_pending_op_slot call not found in run_relay_get");
+        let preceding = &body[..release_pos];
+        assert!(
+            preceding.rfind("get_own_addr()").is_some(),
+            "run_relay_get must call get_own_addr() before \
+             release_pending_op_slot to gate the release on the \
+             upstream != own_addr case"
+        );
+        assert!(
+            preceding.rfind("!originator_loopback").is_some(),
+            "run_relay_get must guard release_pending_op_slot with the \
+             `!originator_loopback` check (originator-loopback exception)"
+        );
+        assert!(
+            body.contains("originator_loopback"),
+            "run_relay_get must compute originator_loopback to gate the \
+             release path"
+        );
+    }
+
     // ── C1: cache_contract_locally must gate mark_local_client_access ──────
 
     /// Regression guard for the relay hosting-cache taint bug caught in
