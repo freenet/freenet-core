@@ -1501,7 +1501,7 @@ async fn run_relay_get(
         incoming_tx,
     };
 
-    if let Err(err) = drive_relay_get(
+    let drive_result = drive_relay_get(
         &op_manager,
         incoming_tx,
         instance_id,
@@ -1511,8 +1511,9 @@ async fn run_relay_get(
         fetch_contract,
         subscribe,
     )
-    .await
-    {
+    .await;
+
+    if let Err(err) = &drive_result {
         tracing::warn!(
             tx = %incoming_tx,
             %instance_id,
@@ -1530,6 +1531,18 @@ async fn run_relay_get(
     // removes the entry immediately so `test_pending_op_results_bounded`
     // stays under its leak ceiling.
     //
+    // Originator-loopback exception (#1454 phase 5 final GET slice,
+    // mirrors PUT slice): when this driver runs on the originator's
+    // own node (`upstream_addr == own_addr`), the
+    // `pending_op_results` callback for `incoming_tx` is the
+    // originator's `send_and_await` waiter — NOT one this driver
+    // installed. Releasing it here would emit `TransactionCompleted`
+    // and remove the originator's callback BEFORE the loopback
+    // `GetMsg::Response` arrives at the bypass, racing the
+    // originator's wait. The originator's own driver completion path
+    // (via `ClientGetCompletionGuard` → `release_pending_op_slot`)
+    // cleans up the slot.
+    //
     // Yield first so any in-flight `send_fire_and_forget` has time to
     // run through the event loop's `handle_op_execution` and actually
     // INSERT into `pending_op_results`. `release_pending_op_slot` uses
@@ -1537,8 +1550,12 @@ async fn run_relay_get(
     // the TransactionCompleted arrives before the insert and the
     // cleanup is a no-op (per the caveat in `OpCtx::send_fire_and_forget`
     // docs).
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let originator_loopback = Some(upstream_addr) == own_addr;
     tokio::task::yield_now().await;
-    op_manager.release_pending_op_slot(incoming_tx).await;
+    if !originator_loopback {
+        op_manager.release_pending_op_slot(incoming_tx).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
