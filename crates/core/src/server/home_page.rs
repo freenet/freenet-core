@@ -1469,7 +1469,7 @@ function compareSemver(a, b) {
 function showUpdateBadge(latestTag) {
     var el = document.getElementById('update-badge');
     if (!el) return;
-    el.textContent = 'Update: ' + (String(latestTag).replace(/^v/, '') ? 'v' + String(latestTag).replace(/^v/, '') : latestTag);
+    el.textContent = 'Update: v' + String(latestTag).replace(/^v/, '');
     el.title = 'A newer Freenet release is available — click to view release notes';
     el.hidden = false;
 }
