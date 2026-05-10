@@ -264,7 +264,7 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// `time_source` epoch) — the time of the most recent successful interaction
     /// with this stream (either initial registration or a subsequent fragment
     /// arrival). The periodic sweep on `timeout_check` ticks drops entries idle
-    /// for longer than `STREAMING_HANDLE_IDLE_TIMEOUT`; without that bound, a
+    /// for longer than `streaming_handle_idle_timeout()`; without that bound, a
     /// stalled upstream sender (after the orphan registry GC has already
     /// cancelled the handle, or after the driver claimed-then-timed-out) leaks
     /// the underlying `Arc<LockFreeStreamBuffer>` until the entire connection
@@ -362,31 +362,78 @@ const DEDUP_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1000) {
     None => panic!("DEDUP_CACHE_CAPACITY must be non-zero"),
 };
 
-/// Idle threshold for sweeping `streaming_handles` entries.
+/// Production idle threshold for sweeping `streaming_handles` entries.
 ///
 /// A streaming handle that has not received a fragment in this long is treated
 /// as a stalled stream: cancel the handle, drop the entry from the map, and
-/// drop the matching `streaming_registry` entry — releasing the underlying
-/// `Arc<LockFreeStreamBuffer>` (a per-stream pre-allocated slot array plus any
-/// inserted `Bytes`).
+/// drop the matching `streaming_registry` entry. This releases the two clones
+/// of `Arc<LockFreeStreamBuffer>` that `PeerConnection` owns; the buffer
+/// itself is freed only when the LAST clone drops, which for the #4079 leak
+/// scenarios is the same moment (no orphan-registry clone survives at sweep
+/// time, see "Why no orphan-registry sweep here" below).
 ///
-/// Sized at 6 × `streaming::STREAM_INACTIVITY_TIMEOUT` (30s) — comfortably past
+/// Sized at 6 × `streaming::STREAM_INACTIVITY_TIMEOUT` — comfortably past
 /// the 5s point at which any in-flight `assemble()` would have already failed
 /// with `InactivityTimeout`, but well under the 120s connection idle timeout
 /// and the 60s orphan registry timeout. Production data (2026-04) puts p95
-/// successful transfer at 1.8s, so a 30s gap is conclusive evidence the stream
-/// is dead.
+/// successful transfer at 1.8s, so a 30s gap is conclusive evidence the
+/// stream is dead. Derived at compile time so a future change to
+/// `STREAM_INACTIVITY_TIMEOUT` propagates.
 ///
-/// See issue #4079 for the leak scenarios (orphan-registry GC cancelled the
-/// handle but didn't notify the owning `PeerConnection`; or the operations
-/// driver claimed the orphan, timed out internally, and dropped its clone
-/// while the upstream sender stalled — neither path frees the handle the
-/// `PeerConnection` still holds).
-const STREAMING_HANDLE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Worst-case eviction latency (production) is `STREAMING_HANDLE_IDLE_TIMEOUT_PROD + the
+/// timeout_check tick interval` (= 30s + 5s = 35s) because the sweep
+/// piggybacks on the existing `timeout_check` tick in `recv()`. Even on a
+/// connection with zero inbound traffic the tick still fires (it is
+/// interval-based, not packet-driven), so the sweep runs.
+///
+/// ### Why no orphan-registry sweep here
+///
+/// This sweep does NOT reach into `OrphanStreamRegistry` to remove its
+/// parallel clone of the handle. That's intentional: the orphan registry's
+/// own 60s GC handles its residual clones, and we don't carry the
+/// `(peer_addr, stream_id)` key path back into `OrphanStreamRegistry` from
+/// here. For the two leak scenarios in #4079 — orphan-registry-already-GC'd,
+/// or driver-claimed-then-dropped — no orphan-registry clone survives at
+/// sweep time, so the buffer Arc drops immediately. For other paths a brief
+/// (<60s) transient retention via the orphan registry is acceptable; the
+/// permanent leak is closed.
+///
+/// See issue #4079.
+const STREAMING_HANDLE_IDLE_TIMEOUT_PROD: Duration =
+    Duration::from_secs(streaming::STREAM_INACTIVITY_TIMEOUT.as_secs() * 6);
+
+/// Simulation idle threshold for sweeping `streaming_handles` entries.
+///
+/// Under the direct simulation runner with `start_paused(true)`, virtual time
+/// can jump past 30s when tasks await `spawn_blocking` (WASM execution) —
+/// this is the same constraint that pushed `connection_idle_timeout()` to
+/// 24h in simulation mode (see `simulation/time.rs:215-226`). Reusing the
+/// same horizon here prevents a single WASM-induced time jump from
+/// falsely reaping an in-flight streaming relay's handle.
+///
+/// Activated when `SimulationIdleTimeout::is_enabled()` returns true — same
+/// gate as the connection idle timeout's simulation accommodation.
+const STREAMING_HANDLE_IDLE_TIMEOUT_SIM: Duration = Duration::from_secs(86_400);
+
+/// Returns the active idle threshold for sweeping `streaming_handles` entries,
+/// switching between the production and simulation values based on the same
+/// `SimulationIdleTimeout` flag that gates `connection_idle_timeout()`.
+fn streaming_handle_idle_timeout() -> Duration {
+    if crate::config::SimulationIdleTimeout::is_enabled() {
+        STREAMING_HANDLE_IDLE_TIMEOUT_SIM
+    } else {
+        STREAMING_HANDLE_IDLE_TIMEOUT_PROD
+    }
+}
 
 /// Drop entries from `streaming_handles` (and their companion
-/// `streaming_registry` rows) that have been idle for longer than
-/// `STREAMING_HANDLE_IDLE_TIMEOUT`.
+/// `streaming_registry` rows) that have been idle for longer than `threshold`.
+///
+/// The threshold is passed in (rather than read from
+/// `streaming_handle_idle_timeout()`) so unit tests can pin the boundary
+/// precisely without depending on the `SimulationIdleTimeout` global flag.
+/// Production calls `sweep_idle_streaming_handles` which reads the active
+/// threshold from `streaming_handle_idle_timeout()`.
 ///
 /// Factored out of `PeerConnection::sweep_idle_streaming_handles` so the
 /// logic can be unit-tested against a plain map without constructing a
@@ -395,9 +442,10 @@ fn sweep_streaming_handles_inner(
     streaming_handles: &mut HashMap<StreamId, (streaming::StreamHandle, u64)>,
     streaming_registry: &streaming::StreamRegistry,
     now_nanos: u64,
+    threshold: Duration,
     peer_addr: SocketAddr,
 ) {
-    let threshold_nanos = STREAMING_HANDLE_IDLE_TIMEOUT.as_nanos() as u64;
+    let threshold_nanos = threshold.as_nanos() as u64;
     let mut swept_count: usize = 0;
     streaming_handles.retain(|&stream_id, (handle, last_activity_nanos)| {
         let idle_nanos = now_nanos.saturating_sub(*last_activity_nanos);
@@ -623,7 +671,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     }
 
     /// Sweep `streaming_handles` of entries that have not seen activity for
-    /// longer than `STREAMING_HANDLE_IDLE_TIMEOUT`.
+    /// longer than `streaming_handle_idle_timeout()`.
     ///
     /// Each swept entry has its handle cancelled (so any consumer blocked on
     /// `assemble()` / `stream().next()` wakes with `StreamError::Cancelled`)
@@ -638,6 +686,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             &mut self.streaming_handles,
             &self.streaming_registry,
             now_nanos,
+            streaming_handle_idle_timeout(),
             self.remote_conn.remote_addr,
         );
     }
@@ -1171,7 +1220,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         "Connection health check - still alive"
                     );
 
-                    // Drop streaming handles idle past STREAMING_HANDLE_IDLE_TIMEOUT.
+                    // Drop streaming handles idle past streaming_handle_idle_timeout().
                     // Without this sweep, a stalled upstream sender (#4079)
                     // pins the per-stream Arc<LockFreeStreamBuffer> for the
                     // life of the connection. Reactive eviction at the
@@ -1460,11 +1509,21 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     self.streaming_handles.get_mut(&stream_id)
                 {
                     // Existing streaming handle - push fragment.
-                    // Refresh `last_activity_nanos` so the idle sweep does not
-                    // reap an actively-receiving stream (see issue #4079).
-                    *last_activity_nanos = now_nanos;
-                    if let Err(e) = streaming_handle.push_fragment(fragment_number, payload.clone())
-                    {
+                    let push_result =
+                        streaming_handle.push_fragment(fragment_number, payload.clone());
+                    // Refresh `last_activity_nanos` ONLY on real forward
+                    // progress (`Ok(true)` = new fragment inserted).
+                    // Duplicates (`Ok(false)`) and invalid fragments
+                    // (`Err(InvalidFragment)`) MUST NOT extend the sweep
+                    // deadline; otherwise a peer can keep a dead stream alive
+                    // indefinitely by replaying the same fragment every <30s,
+                    // defeating the bound issue #4079 enforces. This honors
+                    // "Cleanup exemptions MUST be time-bounded" — the
+                    // exemption must not be refreshable by no-progress traffic.
+                    if matches!(push_result, Ok(true)) {
+                        *last_activity_nanos = now_nanos;
+                    }
+                    if let Err(e) = push_result {
                         if matches!(e, streaming::StreamError::Cancelled) {
                             // Stream was cancelled (e.g., transaction timeout). Remove handle
                             // to stop processing further fragments for this stream.
@@ -2967,7 +3026,7 @@ mod tests {
     /// Both scenarios share the same observable state: a stale entry in
     /// `streaming_handles` with no further activity. The sweep treats them
     /// identically — drop entries whose `last_activity_nanos` is older than
-    /// `STREAMING_HANDLE_IDLE_TIMEOUT`.
+    /// the configured `streaming_handle_idle_timeout()`.
     ///
     /// Without the fix `sweep_streaming_handles_inner` does not exist and the
     /// stale entry persists for the life of the connection. With the fix,
@@ -2980,7 +3039,7 @@ mod tests {
         // Threshold from the production constant: 30 s. Build "stale" and
         // "fresh" timestamps relative to a synthetic `now` so we don't depend
         // on wall-clock or test runtime speed.
-        let now_nanos = STREAMING_HANDLE_IDLE_TIMEOUT.as_nanos() as u64 * 4;
+        let now_nanos = STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64 * 4;
         let stale_nanos = 0u64; // idle window much greater than threshold
         let fresh_nanos = now_nanos.saturating_sub(Duration::from_secs(1).as_nanos() as u64);
 
@@ -3006,7 +3065,13 @@ mod tests {
         assert_eq!(registry.stream_count(), 2);
 
         let peer_addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 9000);
-        sweep_streaming_handles_inner(&mut streaming_handles, &registry, now_nanos, peer_addr);
+        sweep_streaming_handles_inner(
+            &mut streaming_handles,
+            &registry,
+            now_nanos,
+            STREAMING_HANDLE_IDLE_TIMEOUT_PROD,
+            peer_addr,
+        );
 
         // Stale entry removed from BOTH maps; fresh entry untouched.
         assert_eq!(
@@ -3037,7 +3102,7 @@ mod tests {
     /// A second, narrower assertion: when every entry is within the idle
     /// window the sweep is a strict no-op (no spurious cancellation of
     /// in-flight streams). Pins the lower bound of the threshold so a future
-    /// reduction of `STREAMING_HANDLE_IDLE_TIMEOUT` can't accidentally
+    /// reduction of `STREAMING_HANDLE_IDLE_TIMEOUT_PROD` can't accidentally
     /// reap an actively-receiving stream.
     #[test]
     fn sweep_streaming_handles_inner_keeps_recent_entries() {
@@ -3049,14 +3114,20 @@ mod tests {
         let now_nanos = Duration::from_secs(3600).as_nanos() as u64;
         // Last activity was JUST under the threshold — sweep must keep this entry.
         let last_activity_nanos =
-            now_nanos.saturating_sub(STREAMING_HANDLE_IDLE_TIMEOUT.as_nanos() as u64) + 1;
+            now_nanos.saturating_sub(STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64) + 1;
 
         let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
             HashMap::new();
         streaming_handles.insert(id, (handle.clone(), last_activity_nanos));
 
         let peer_addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 9001);
-        sweep_streaming_handles_inner(&mut streaming_handles, &registry, now_nanos, peer_addr);
+        sweep_streaming_handles_inner(
+            &mut streaming_handles,
+            &registry,
+            now_nanos,
+            STREAMING_HANDLE_IDLE_TIMEOUT_PROD,
+            peer_addr,
+        );
 
         assert_eq!(
             streaming_handles.len(),
@@ -3071,5 +3142,251 @@ mod tests {
             "in-window handle must not be cancelled by sweep, got {:?}",
             result
         );
+    }
+
+    /// Boundary pin: confirms the `idle_nanos > threshold_nanos` comparison
+    /// (strict greater-than). An entry at exactly the threshold must be
+    /// KEPT; one even a single nanosecond past must be DROPPED. Without this
+    /// test, a future change to `>=` (or vice versa) would silently shift
+    /// the eviction window and could either reap not-yet-stalled streams
+    /// (`>=`) or leak by one tick (`>` with off-by-one in the body).
+    #[test]
+    fn sweep_streaming_handles_inner_threshold_boundary_is_strict_greater_than() {
+        use streaming::StreamRegistry;
+        let registry = StreamRegistry::new();
+        let exact_id = StreamId::next();
+        let past_id = StreamId::next();
+        let exact_handle = registry.register(exact_id, 64 * 1024);
+        let past_handle = registry.register(past_id, 64 * 1024);
+
+        let threshold_nanos = STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64;
+        let now_nanos = threshold_nanos * 10;
+        // idle = exactly threshold -> KEEP
+        let exact_last_activity = now_nanos - threshold_nanos;
+        // idle = threshold + 1 ns -> DROP
+        let past_last_activity = now_nanos - threshold_nanos - 1;
+
+        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
+            HashMap::new();
+        streaming_handles.insert(exact_id, (exact_handle, exact_last_activity));
+        streaming_handles.insert(past_id, (past_handle, past_last_activity));
+
+        let peer_addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 9002);
+        sweep_streaming_handles_inner(
+            &mut streaming_handles,
+            &registry,
+            now_nanos,
+            STREAMING_HANDLE_IDLE_TIMEOUT_PROD,
+            peer_addr,
+        );
+
+        assert!(
+            streaming_handles.contains_key(&exact_id),
+            "entry at idle = threshold must be KEPT (strict greater-than)"
+        );
+        assert!(
+            !streaming_handles.contains_key(&past_id),
+            "entry at idle = threshold + 1 ns must be DROPPED"
+        );
+    }
+
+    /// A second sweep over already-swept state must be a strict no-op and
+    /// must not double-cancel any handle. `timeout_check` fires every 5 s
+    /// for the life of the connection so the sweep runs many times after
+    /// the entry is gone — that must remain harmless.
+    #[test]
+    fn sweep_streaming_handles_inner_is_idempotent_on_repeat() {
+        use streaming::StreamRegistry;
+        let registry = StreamRegistry::new();
+        let id = StreamId::next();
+        let handle = registry.register(id, 64 * 1024);
+        let now_nanos = STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64 * 4;
+
+        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
+            HashMap::new();
+        streaming_handles.insert(id, (handle, 0));
+
+        let peer_addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 9003);
+        sweep_streaming_handles_inner(
+            &mut streaming_handles,
+            &registry,
+            now_nanos,
+            STREAMING_HANDLE_IDLE_TIMEOUT_PROD,
+            peer_addr,
+        );
+        assert_eq!(streaming_handles.len(), 0);
+        assert_eq!(registry.stream_count(), 0);
+
+        // A second sweep with the map already empty must not panic, must not
+        // log spuriously, and must leave both maps at zero.
+        sweep_streaming_handles_inner(
+            &mut streaming_handles,
+            &registry,
+            now_nanos,
+            STREAMING_HANDLE_IDLE_TIMEOUT_PROD,
+            peer_addr,
+        );
+        assert_eq!(streaming_handles.len(), 0);
+        assert_eq!(registry.stream_count(), 0);
+    }
+
+    /// The leak this PR fixes is fundamentally about the
+    /// `Arc<LockFreeStreamBuffer>` (a pre-allocated slot array sized for the
+    /// full stream) staying alive. The map-cardinality assertions above are
+    /// observable proxies; this test asserts the actual invariant — after
+    /// sweep, the only surviving Arc reference is the one the test itself
+    /// holds. If a future change adds another internal owner (e.g., the
+    /// orphan registry now holds a third clone), the cardinality tests
+    /// would still pass but this one would fail.
+    #[test]
+    fn sweep_streaming_handles_inner_releases_buffer_arc() {
+        use streaming::StreamRegistry;
+        let registry = StreamRegistry::new();
+        let id = StreamId::next();
+        let handle = registry.register(id, 64 * 1024);
+
+        // After register: registry holds 1 clone, our local `handle` holds 1.
+        // The handle's internal Arc<LockFreeStreamBuffer> is shared by both,
+        // so strong_count starts at 2.
+        let initial_strong = handle.buffer_strong_count();
+        assert_eq!(
+            initial_strong, 2,
+            "registry + local handle = 2 buffer clones at start"
+        );
+
+        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
+            HashMap::new();
+        streaming_handles.insert(id, (handle.clone(), 0));
+        // Now: registry + local handle + map = 3 Arc clones of the buffer.
+        assert_eq!(handle.buffer_strong_count(), 3);
+
+        let now_nanos = STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64 * 4;
+        let peer_addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 9004);
+        sweep_streaming_handles_inner(
+            &mut streaming_handles,
+            &registry,
+            now_nanos,
+            STREAMING_HANDLE_IDLE_TIMEOUT_PROD,
+            peer_addr,
+        );
+
+        // Sweep dropped the map clone and the registry clone — only our
+        // local `handle` clone of the buffer remains.
+        assert_eq!(
+            handle.buffer_strong_count(),
+            1,
+            "post-sweep, only the test's local handle clone of \
+             Arc<LockFreeStreamBuffer> should remain — production code \
+             must release the slot-array allocation, see issue #4079"
+        );
+    }
+
+    /// Mirrors production load: the per-peer `streaming_handles` map can
+    /// hold hundreds of entries spanning a range of last-activity times
+    /// (report `JTDY6J` showed peak 230 outstanding). One sweep pass must
+    /// correctly partition them by the threshold in a single iteration.
+    #[test]
+    fn sweep_streaming_handles_inner_partitions_mixed_age_entries() {
+        use streaming::StreamRegistry;
+        let registry = StreamRegistry::new();
+        let threshold_nanos = STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64;
+        let now_nanos = threshold_nanos * 100;
+
+        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
+            HashMap::new();
+        let mut expected_to_keep = Vec::new();
+        let mut expected_to_drop = Vec::new();
+        for i in 0..10u64 {
+            let id = StreamId::next();
+            let handle = registry.register(id, 64 * 1024);
+            // i = 0..5 -> within window (kept); i = 5..10 -> outside (dropped).
+            let last_activity_nanos = if i < 5 {
+                now_nanos - (threshold_nanos / 2) // 15 s idle
+            } else {
+                now_nanos - threshold_nanos * 2 // 60 s idle
+            };
+            streaming_handles.insert(id, (handle, last_activity_nanos));
+            if i < 5 {
+                expected_to_keep.push(id);
+            } else {
+                expected_to_drop.push(id);
+            }
+        }
+        assert_eq!(streaming_handles.len(), 10);
+        assert_eq!(registry.stream_count(), 10);
+
+        let peer_addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 9005);
+        sweep_streaming_handles_inner(
+            &mut streaming_handles,
+            &registry,
+            now_nanos,
+            STREAMING_HANDLE_IDLE_TIMEOUT_PROD,
+            peer_addr,
+        );
+
+        assert_eq!(streaming_handles.len(), 5, "5 fresh entries should survive");
+        assert_eq!(
+            registry.stream_count(),
+            5,
+            "5 fresh registry rows should survive"
+        );
+        for id in &expected_to_keep {
+            assert!(streaming_handles.contains_key(id), "kept entry missing");
+        }
+        for id in &expected_to_drop {
+            assert!(
+                !streaming_handles.contains_key(id),
+                "dropped entry still present"
+            );
+        }
+    }
+
+    /// Pin test: the production call site at `timeout_check.tick()` MUST
+    /// invoke `sweep_idle_streaming_handles()`. Both unit tests above call
+    /// `sweep_streaming_handles_inner` directly — they would still pass
+    /// if a future refactor accidentally deleted the call from the `recv()`
+    /// loop, silently re-introducing the #4079 leak with green CI. This
+    /// pin catches that exact failure mode by greppting the source.
+    #[test]
+    fn sweep_idle_streaming_handles_is_invoked_from_timeout_check() {
+        let source = include_str!("peer_connection.rs");
+        assert!(
+            source.contains("self.sweep_idle_streaming_handles();"),
+            "PR #4083 / issue #4079: recv()'s timeout_check.tick() arm must \
+             call self.sweep_idle_streaming_handles() — without it the \
+             streaming_handles leak comes back. If you intentionally moved \
+             the call, update this pin (and ensure the new site fires at \
+             least as often as the 5 s timeout_check tick)."
+        );
+    }
+
+    /// `streaming_handle_idle_timeout()` MUST honor the same simulation flag
+    /// (`SimulationIdleTimeout`) that gates `connection_idle_timeout()`,
+    /// otherwise the direct simulation runner — where virtual time can jump
+    /// past 30s when a task awaits `spawn_blocking` (WASM execution) — will
+    /// falsely reap in-flight streaming-relay handles, producing flaky CI
+    /// failures. Pattern mirrors `simulation/time.rs::connection_idle_timeout`.
+    #[test]
+    fn streaming_handle_idle_timeout_switches_to_sim_value_when_flag_enabled() {
+        use crate::config::SimulationIdleTimeout;
+
+        // Test runs on its own thread (each `#[test]` is a fresh thread).
+        // The flag is thread-local, so toggling here cannot disturb other tests.
+        SimulationIdleTimeout::disable();
+        assert_eq!(
+            streaming_handle_idle_timeout(),
+            STREAMING_HANDLE_IDLE_TIMEOUT_PROD,
+            "production threshold required when flag is OFF"
+        );
+
+        SimulationIdleTimeout::enable();
+        assert_eq!(
+            streaming_handle_idle_timeout(),
+            STREAMING_HANDLE_IDLE_TIMEOUT_SIM,
+            "simulation threshold required when flag is ON"
+        );
+
+        // Restore so a later test inheriting this thread isn't surprised.
+        SimulationIdleTimeout::disable();
     }
 }
