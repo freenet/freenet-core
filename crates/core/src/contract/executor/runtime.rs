@@ -3927,4 +3927,77 @@ mod sub_op_get_migration_pin_tests {
              retired in #1454 phase 5 final"
         );
     }
+
+    /// Pin: the three sites that resolve a contract's `requires(...)`
+    /// related-list MUST fan out via `join_all`, not iterate serially
+    /// inside a `for` loop. Regression: the previous serial loops shared
+    /// a single 10s wall-clock budget (`RELATED_FETCH_TIMEOUT`), so for
+    /// N>1 ids the per-fetch budget was ~10s/N. On real networks where
+    /// AFT-style related contracts are far in keyspace, this pinned
+    /// receivers' inboxes at empty state forever — see
+    /// `freenet/freenet-core#4077` and `freenet/mail#198 / mail#202`
+    /// for the production trace and the app-side workaround.
+    ///
+    /// We can't unit-test the parallelism timing directly: the
+    /// `TEST_NETWORK_FETCH_OVERRIDE` stub is sync (`Rc<dyn Fn>`), so a
+    /// per-id artificial delay would block the executor thread rather
+    /// than yield. A source-string pin ensures none of the three sites
+    /// silently regresses to a `for id in &unique_ids { ... await ... }`
+    /// loop, which is the exact failure mode #4077 documents.
+    #[test]
+    fn related_contract_fetch_sites_use_join_all() {
+        let src = include_str!("runtime.rs");
+
+        // Each entry: (function name, exact split needle for body extraction).
+        let sites: &[(&str, &str)] = &[
+            (
+                "fetch_related_for_validation",
+                "async fn fetch_related_for_validation(",
+            ),
+            (
+                "fetch_related_for_validation_network",
+                "async fn fetch_related_for_validation_network(",
+            ),
+        ];
+
+        for (name, needle) in sites {
+            let body = src
+                .split(needle)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must exist in runtime.rs"))
+                .split("\n    }\n")
+                .next()
+                .unwrap_or_else(|| panic!("{name} closing brace not found"));
+            assert!(
+                body.contains("join_all"),
+                "{name} must call futures::future::join_all — serial fetch \
+                 regressed in freenet/freenet-core#4077; do not revert"
+            );
+            // Spot-check the loop construct doesn't reappear: a plain
+            // `for id in &unique_ids` inside the function body almost
+            // certainly means the parallel fan-out is gone.
+            let serial_needle = ["for ", "id in &unique_ids"].concat();
+            assert!(
+                !body.contains(&serial_needle),
+                "{name} must not iterate serially over &unique_ids — \
+                 regressed to pre-#4077 behavior"
+            );
+        }
+
+        // The third site is inline inside `upsert_contract_state`, not
+        // its own function. Pin it by confirming the comment marker
+        // that frames the parallel-fetch block is present and that the
+        // block contains `join_all`. Brittle by design: a refactor that
+        // moves the comment also has to move the assertion.
+        let inline_marker = "Parallel fetch: each related contract goes through its";
+        let after_marker = src.split(inline_marker).nth(1).expect(
+            "inline UPDATE-side parallel-fetch marker missing — \
+                 #4077 regressed",
+        );
+        assert!(
+            after_marker[..2_000].contains("join_all"),
+            "UPDATE-side inline related fetch must call \
+             futures::future::join_all (#4077)"
+        );
+    }
 }
