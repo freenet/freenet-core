@@ -1398,35 +1398,57 @@ where
                     }));
                 }
 
+                // Parallel fetch: each related contract goes through its
+                // own GET sub-op concurrently. Previously this loop ran
+                // serially under a single 10s wall-clock budget, so a
+                // contract requesting N>1 related ids could time out at
+                // ~10s/N effective per fetch. Fan-out via `join_all`
+                // turns the budget back into 10s _per id_ in the common
+                // case (network bandwidth, not CPU, is the constraint).
+                // See freenet/freenet-core#4077.
                 let mut fetched_updates = updates.clone();
-                let mut failed_id: Option<ContractInstanceId> = None;
-                for id in &unique_ids {
-                    let mut got: Option<State<'static>> = None;
-                    if let Some(full_key) = self.bridged_lookup_key(id) {
-                        if let Ok(state) = self.state_store.get(&full_key).await {
-                            got = Some(State::from(state.as_ref().to_vec()));
-                        }
-                    }
-                    if got.is_none() {
-                        match fetch_related_via_network(self.op_manager.as_ref(), id).await {
-                            Ok(state) => got = Some(State::from(state.as_ref().to_vec())),
-                            Err(err) => {
-                                tracing::warn!(
-                                    contract = %key,
-                                    related_id = %id,
-                                    error = %err,
-                                    "Failed to fetch related contract for update_state requires()"
-                                );
-                                failed_id = Some(*id);
-                                break;
+                let fetch_results: Vec<(
+                    ContractInstanceId,
+                    Result<State<'static>, ExecutorError>,
+                )> = {
+                    // Reborrow as `&Self` so the per-id futures all share
+                    // an immutable borrow; this releases the outer
+                    // `&mut self` only for the duration of `fetch_all`,
+                    // which is fully awaited before the next `&mut self`
+                    // call (`attempt_state_update` below).
+                    let this: &Self = &*self;
+                    futures::future::join_all(unique_ids.iter().map(|id| {
+                        let id = *id;
+                        async move {
+                            if let Some(full_key) = this.bridged_lookup_key(&id) {
+                                if let Ok(state) = this.state_store.get(&full_key).await {
+                                    return (id, Ok(State::from(state.as_ref().to_vec())));
+                                }
                             }
+                            let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
+                                .await
+                                .map(|state| State::from(state.as_ref().to_vec()));
+                            (id, outcome)
                         }
-                    }
-                    if let Some(state) = got {
-                        fetched_updates.push(UpdateData::RelatedState {
-                            related_to: *id,
+                    }))
+                    .await
+                };
+                let mut failed_id: Option<ContractInstanceId> = None;
+                for (id, res) in fetch_results {
+                    match res {
+                        Ok(state) => fetched_updates.push(UpdateData::RelatedState {
+                            related_to: id,
                             state,
-                        });
+                        }),
+                        Err(err) => {
+                            tracing::warn!(
+                                contract = %key,
+                                related_id = %id,
+                                error = %err,
+                                "Failed to fetch related contract for update_state requires()"
+                            );
+                            failed_id.get_or_insert(id);
+                        }
                     }
                 }
                 if let Some(id) = failed_id {
@@ -2115,20 +2137,39 @@ where
         let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
             HashMap::with_capacity(unique_ids.len());
 
+        // Parallel fetch via `join_all`: previously serial under a single
+        // 10s wall-clock budget, so N related ids each got ~10s/N
+        // effective. Each id now races its own sub-op GET, so the budget
+        // is per-id in the common case. See freenet/freenet-core#4077.
+        //
+        // Reborrow as `&Self` so the per-id futures share an immutable
+        // borrow; the outer `&mut self` is reclaimed once `fetch_all`
+        // is awaited.
+        let this: &Self = &*self;
         let fetch_all = async {
-            for id in &unique_ids {
-                if let Some(full_key) = self.bridged_lookup_key(id) {
-                    if let Ok(state) = self.state_store.get(&full_key).await {
-                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
-                        continue;
+            let results: Vec<(ContractInstanceId, Result<State<'static>, ExecutorError>)> =
+                futures::future::join_all(unique_ids.iter().map(|id| {
+                    let id = *id;
+                    async move {
+                        if let Some(full_key) = this.bridged_lookup_key(&id) {
+                            if let Ok(state) = this.state_store.get(&full_key).await {
+                                return (id, Ok(State::from(state.as_ref().to_vec())));
+                            }
+                        }
+                        // Local lookup miss → escalate via the
+                        // network-fallback helper (factored out so the
+                        // per-id branch logic is testable with a stubbed
+                        // fetcher). Mock executors that lack an
+                        // `op_manager` get the legacy MissingRelated.
+                        let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
+                            .await
+                            .map(|state| State::from(state.as_ref().to_vec()));
+                        (id, outcome)
                     }
-                }
-                // Local lookup miss → escalate via the network-fallback
-                // helper (factored out so the per-id branch logic is
-                // testable with a stubbed fetcher). Mock executors that
-                // lack an `op_manager` get the legacy MissingRelated.
-                let fetched = fetch_related_via_network(self.op_manager.as_ref(), id).await?;
-                related_map.insert(*id, Some(State::from(fetched.as_ref().to_vec())));
+                }))
+                .await;
+            for (id, res) in results {
+                related_map.insert(id, Some(res?));
             }
             Ok::<(), ExecutorError>(())
         };
@@ -3401,17 +3442,37 @@ impl Executor<Runtime> {
         let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
             HashMap::with_capacity(unique_ids.len());
 
+        // Parallel fetch — see fetch_related_for_validation for rationale
+        // (freenet/freenet-core#4077). The serial loop here had the same
+        // 10s/N effective per fetch problem.
+        //
+        // We can't reuse the `&mut self` `local_state_or_from_network`
+        // helper across multiple concurrent futures, so the per-id body
+        // is inlined: try the local state_store first, escalate to
+        // `fetch_related_via_network` (which only borrows
+        // `&Option<Arc<OpManager>>`). Reborrow as `&Self` so the
+        // per-id futures share an immutable borrow; the outer
+        // `&mut self` is reclaimed once `fetch_all` is awaited.
+        let this: &Self = &*self;
         let fetch_all = async {
-            for id in &unique_ids {
-                match self.local_state_or_from_network(id, false).await? {
-                    Either::Left(state) => {
-                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+            let results: Vec<(ContractInstanceId, Result<State<'static>, ExecutorError>)> =
+                futures::future::join_all(unique_ids.iter().map(|id| {
+                    let id = *id;
+                    async move {
+                        if let Some(full_key) = this.lookup_key(&id) {
+                            if let Ok(state) = this.state_store.get(&full_key).await {
+                                return (id, Ok(State::from(state.as_ref().to_vec())));
+                            }
+                        }
+                        let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
+                            .await
+                            .map(|state| State::from(state.as_ref().to_vec()));
+                        (id, outcome)
                     }
-                    Either::Right(get_result) => {
-                        related_map
-                            .insert(*id, Some(State::from(get_result.state.as_ref().to_vec())));
-                    }
-                }
+                }))
+                .await;
+            for (id, res) in results {
+                related_map.insert(id, Some(res?));
             }
             Ok::<(), ExecutorError>(())
         };
@@ -3864,6 +3925,79 @@ mod sub_op_get_migration_pin_tests {
             !body.contains(&request_update_needle),
             "perform_contract_update must NOT call legacy request_update — \
              retired in #1454 phase 5 final"
+        );
+    }
+
+    /// Pin: the three sites that resolve a contract's `requires(...)`
+    /// related-list MUST fan out via `join_all`, not iterate serially
+    /// inside a `for` loop. Regression: the previous serial loops shared
+    /// a single 10s wall-clock budget (`RELATED_FETCH_TIMEOUT`), so for
+    /// N>1 ids the per-fetch budget was ~10s/N. On real networks where
+    /// AFT-style related contracts are far in keyspace, this pinned
+    /// receivers' inboxes at empty state forever — see
+    /// `freenet/freenet-core#4077` and `freenet/mail#198 / mail#202`
+    /// for the production trace and the app-side workaround.
+    ///
+    /// We can't unit-test the parallelism timing directly: the
+    /// `TEST_NETWORK_FETCH_OVERRIDE` stub is sync (`Rc<dyn Fn>`), so a
+    /// per-id artificial delay would block the executor thread rather
+    /// than yield. A source-string pin ensures none of the three sites
+    /// silently regresses to a `for id in &unique_ids { ... await ... }`
+    /// loop, which is the exact failure mode #4077 documents.
+    #[test]
+    fn related_contract_fetch_sites_use_join_all() {
+        let src = include_str!("runtime.rs");
+
+        // Each entry: (function name, exact split needle for body extraction).
+        let sites: &[(&str, &str)] = &[
+            (
+                "fetch_related_for_validation",
+                "async fn fetch_related_for_validation(",
+            ),
+            (
+                "fetch_related_for_validation_network",
+                "async fn fetch_related_for_validation_network(",
+            ),
+        ];
+
+        for (name, needle) in sites {
+            let body = src
+                .split(needle)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must exist in runtime.rs"))
+                .split("\n    }\n")
+                .next()
+                .unwrap_or_else(|| panic!("{name} closing brace not found"));
+            assert!(
+                body.contains("join_all"),
+                "{name} must call futures::future::join_all — serial fetch \
+                 regressed in freenet/freenet-core#4077; do not revert"
+            );
+            // Spot-check the loop construct doesn't reappear: a plain
+            // `for id in &unique_ids` inside the function body almost
+            // certainly means the parallel fan-out is gone.
+            let serial_needle = ["for ", "id in &unique_ids"].concat();
+            assert!(
+                !body.contains(&serial_needle),
+                "{name} must not iterate serially over &unique_ids — \
+                 regressed to pre-#4077 behavior"
+            );
+        }
+
+        // The third site is inline inside `upsert_contract_state`, not
+        // its own function. Pin it by confirming the comment marker
+        // that frames the parallel-fetch block is present and that the
+        // block contains `join_all`. Brittle by design: a refactor that
+        // moves the comment also has to move the assertion.
+        let inline_marker = "Parallel fetch: each related contract goes through its";
+        let after_marker = src.split(inline_marker).nth(1).expect(
+            "inline UPDATE-side parallel-fetch marker missing — \
+                 #4077 regressed",
+        );
+        assert!(
+            after_marker[..2_000].contains("join_all"),
+            "UPDATE-side inline related fetch must call \
+             futures::future::join_all (#4077)"
         );
     }
 }
