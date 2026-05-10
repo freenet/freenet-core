@@ -474,11 +474,19 @@ async fn drive_client_get_inner(
 
             Ok(DriverOutcome::Publish(host_result))
         }
-        RetryLoopOutcome::Exhausted(cause) => {
-            Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                cause: cause.into(),
-            }
-            .into())))
+        RetryLoopOutcome::Exhausted(_cause) => {
+            // Exhaustion after retry loop means every peer either responded
+            // NotFound or the operation could not be forwarded at all
+            // (e.g., isolated gateway with zero ring connections). Surface
+            // as `ContractResponse::NotFound` so client integrations
+            // (`fdev`, `apps/freenet-ping`, integration tests) can
+            // distinguish "contract genuinely absent" from "operation
+            // failed". Mirrors the legacy `process_message`
+            // Response{NotFound} terminal arm at `get.rs:2470-2496`
+            // (pre-#1454 phase 5 final).
+            Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
+            ))))
         }
         RetryLoopOutcome::Unexpected => Err(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => Err(err),
