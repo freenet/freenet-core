@@ -94,11 +94,16 @@ pub mod dev_tool {
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::DRIVER_CALL_COUNT as GET_DRIVER_CALL_COUNT;
 
-    // #1454 Phase 5 / #3883 — test hook to verify the dispatch gate in
-    // `handle_pure_network_message_v1` actually routes fresh inbound relay
-    // GETs through the task-per-tx driver (vs. the legacy
-    // `handle_op_request` fallthrough used for originator loopback,
-    // GC-spawned retries, and `start_targeted_op` UPDATE auto-fetch).
+    // #1454 Phase 5 / #3883 — test hook to verify the dispatch site in
+    // `handle_pure_network_message_v1` routes fresh inbound relay
+    // GETs through the task-per-tx driver. Phase 5 final (GET slice)
+    // retired the legacy `handle_op_request<GetOp>` fallthrough; every
+    // GET wire variant now dispatches unconditionally to a task-per-tx
+    // driver. The originator-loopback case (`source_addr=None`) is
+    // mapped to `upstream_addr=own_addr` at the dispatch site, so the
+    // same `start_relay_get` driver handles both true relay hops and
+    // originator-loopback. UPDATE auto-fetch was migrated to
+    // `start_targeted_sub_op_get` in the same slice.
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::RELAY_DRIVER_CALL_COUNT as GET_RELAY_DRIVER_CALL_COUNT;
 

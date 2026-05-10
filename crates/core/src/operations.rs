@@ -299,19 +299,18 @@ async fn send_with_stream<CB: NetworkBridge>(
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum OpEnum {
     Connect(Box<connect::ConnectOp>),
-    Get(get::GetOp),
     Subscribe(subscribe::SubscribeOp),
-    // `Put` variant retired in #1454 phase 5 final (PUT slice) together
-    // with the `ops.put` DashMap. PUT wire flows now run on task-per-tx
-    // drivers in `put::op_ctx_task::*` and never produce an
-    // `OpEnum::Put`. `Update` retired in the prior UPDATE slice.
+    // `Get` variant retired in #1454 phase 5 final (GET slice) together
+    // with the `ops.get` DashMap. GET wire flows now run on task-per-tx
+    // drivers in `get::op_ctx_task::*` and never produce an
+    // `OpEnum::Get`.
+    // `Put` retired in the prior PUT slice; `Update` in the UPDATE slice.
 }
 
 impl OpEnum {
     delegate::delegate! {
         to match self {
             OpEnum::Connect(op) => op,
-            OpEnum::Get(op) => op,
             OpEnum::Subscribe(op) => op,
         } {
             pub fn id(&self) -> &Transaction;
@@ -346,7 +345,6 @@ macro_rules! try_from_op_enum {
     };
 }
 
-try_from_op_enum!(OpEnum::Get, get::GetOp, TransactionType::Get);
 try_from_op_enum!(
     OpEnum::Subscribe,
     subscribe::SubscribeOp,
@@ -441,23 +439,6 @@ impl OpError {
         }
     }
 
-    pub fn invalid_transition_with_state(
-        tx: Transaction,
-        state: Box<dyn std::fmt::Debug + Send + Sync>,
-    ) -> Self {
-        #[cfg(not(debug_assertions))]
-        {
-            drop(state);
-        }
-        Self::InvalidStateTransition {
-            tx,
-            #[cfg(debug_assertions)]
-            state: Some(state),
-            #[cfg(debug_assertions)]
-            trace: StdTrace::force_capture(),
-        }
-    }
-
     /// Returns true if this error indicates a contract's WASM merge function
     /// ran and rejected the update. When true, the contract code is present
     /// locally and auto-fetching would be unnecessary.
@@ -526,6 +507,12 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
 /// Registers:
 /// 1. Upstream peer (response sender) as interest source for Unsubscribe routing
 /// 2. Downstream peer (GET requester) as downstream subscriber for UPDATE propagation
+// Sole caller (legacy GET relay `process_message::Response{Found}` branch)
+// retired in #1454 phase 5 final (GET slice). The task-per-tx GET relay
+// driver inlines its own subscription-forwarding side effect path. This
+// helper is kept for symmetry with similar relay-side helpers and as
+// reference for any future legacy-style relay reintroduction.
+#[allow(dead_code)]
 pub(crate) async fn setup_subscription_forwarding_at_relay(
     op_manager: &OpManager,
     key: &ContractKey,

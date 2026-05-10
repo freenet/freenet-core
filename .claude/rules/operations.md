@@ -21,10 +21,8 @@ paths:
 > op state lives in task locals and is never pushed into
 > `OpManager.ops.*`, so rules below that talk about "pushing state" /
 > `load_or_init` / `handle_op_result` apply only to the **legacy
-> state-machine path**, which still serves: GC-spawned GET retries and
-> `start_targeted_op` (a GET legacy entry point invoked from UPDATE's
-> auto-fetch — spawns `OpEnum::Get`, not `OpEnum::Update`),
-> PUT GC / streaming / originator-loopback paths, CONNECT's joiner
+> state-machine path**, which now serves only:
+> CONNECT's joiner
 > branches reachable only from in-file unit tests + the legacy
 > stateless `ObservedAddress` path in `load_or_init` (relay CONNECT
 > fully migrated to `connect::op_ctx_task::start_relay_connect` in
@@ -120,6 +118,29 @@ paths:
 > own_addr → loopback skips itself), forward OR finalize and send
 > Response upstream (lands at the originator's `pending_op_results`
 > waiter via the bypass).
+>
+> **#1454 phase 5 final (GET slice) retired the legacy GET
+> state-machine path.** `OpEnum::Get`, `OpManager.ops.get` DashMap,
+> `impl Operation for GetOp`, `start_op` / `start_op_with_id` /
+> `start_targeted_op`, `request_get`, `has_get_op`,
+> `remove_get_and_report_failure`, the `OpEnum::Get` arm in
+> `IsOperationCompleted for OpEnum`, the `OpEnum::Get` arm in the
+> abort handler, the `try_from_op_enum!(OpEnum::Get, ...)` macro
+> entry, and the `handle_op_request<GetOp>` fallthrough in node.rs
+> are all gone. Every GET wire variant now dispatches unconditionally
+> to a task-per-tx driver. The dispatch site in node.rs maps
+> `source_addr=None` → `upstream_addr=own_addr` (mirrors the PUT
+> originator-loopback fix) so the same `start_relay_get` driver
+> handles both true relay hops and originator-loopback. UPDATE
+> auto-fetch (`OpManager::try_auto_fetch_contract`) was migrated to
+> a new `start_targeted_sub_op_get` adapter that reuses the existing
+> `run_sub_op_get` body with an `initial_target` override — the
+> legacy `start_targeted_op` constructor and its
+> `notify_op_change(OpEnum::Get(...))` round-trip are gone.
+> `GetOp`, `GetState`, `GetStats`, `AwaitingResponseData`,
+> `FinishedData` plus a small inline outcome / failure-routing /
+> wire-format / pin-test surface survive under
+> `#[allow(dead_code)]` pending phase 6.
 >
 > Phase 5 follow-up slice A (PR
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to

@@ -87,6 +87,26 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
   get/op_ctx_task.rs       → client-initiated GET driver (Phase 3b)
                              + fresh inbound relay GET driver (Phase 5,
                              PR #3896, `start_relay_get`)
+                             + sub-op GET driver (`start_sub_op_get`)
+                             + targeted sub-op GET driver
+                             (`start_targeted_sub_op_get`, replaces
+                             legacy `start_targeted_op`).
+                             **Phase 5 final (GET slice)** retired the
+                             legacy carrier: `OpEnum::Get`,
+                             `OpManager.ops.get` DashMap, `impl Operation
+                             for GetOp`, `start_op` / `start_op_with_id`
+                             / `start_targeted_op`, `request_get`,
+                             `has_get_op`, `remove_get_and_report_failure`,
+                             and the `handle_op_request<GetOp>`
+                             fallthrough in node.rs are all gone.
+                             Every GET wire variant dispatches
+                             unconditionally to a task-per-tx driver.
+                             `GetOp`, `GetState`, `GetStats`,
+                             `AwaitingResponseData`, `FinishedData` plus
+                             a small inline outcome / failure-routing /
+                             wire-format / pin-test surface survive
+                             under `#[allow(dead_code)]` pending
+                             phase 6.
   update/op_ctx_task.rs    → client-initiated UPDATE driver (Phase 4,
                              fire-and-forget) + fresh inbound non-streaming
                              relay UPDATE drivers (Phase 5 follow-up slice
