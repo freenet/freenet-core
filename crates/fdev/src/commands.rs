@@ -73,23 +73,57 @@ pub async fn put(config: PutConfig, other: BaseConfig) -> anyhow::Result<()> {
     }
 }
 
+/// Load a contract code file for `Put` / `get-contract-id` and wrap
+/// it in a `ContractContainer` ready to ship over the WS API.
+///
+/// Distinguishes raw WASM (magic at offset 0) from a packaged contract
+/// emitted by `fdev build` (8-byte version + 32-byte hash header,
+/// WASM magic at offset 40). Without this discrimination a packaged
+/// file flows through `ContractCode::load_raw` (which is just
+/// `read_to_end`), the metadata bytes get folded into
+/// `ContractCode.data`, and the receiving node hands them to wasmtime
+/// as-is. wasmtime's name-section parser then fails UTF-8 validation
+/// on the metadata bytes and returns
+/// `compile: input bytes aren't valid utf-8`.
+///
+/// Mirror of #2924 / #3012 — that fix covered the disk-fetch path
+/// (`fetch_contract` now strips the prefix via
+/// `load_versioned_from_path`); this is the symmetric fix on the
+/// publish-input path. Both call sites (`put_contract` and
+/// `get_contract_id`) had the same wrong precedence and now route
+/// through this helper.
+///
+/// # Errors
+///
+/// Returns `Err` if the file cannot be read at all, or if the bytes
+/// look packaged but `ContractCode::load_versioned_from_path` rejects
+/// them (truncated header, unsupported API version, etc.). An empty
+/// file surfaces the underlying read error rather than silently
+/// producing a malformed contract.
+fn load_contract_for_publish(
+    code_path: &std::path::Path,
+    params: Parameters<'static>,
+) -> anyhow::Result<ContractContainer> {
+    const WASM_MAGIC: &[u8; 4] = b"\0asm";
+    let container = match ContractCode::load_raw(code_path) {
+        Ok(raw_code) if raw_code.data().starts_with(WASM_MAGIC) => {
+            let code = ContractCode::from(raw_code.data().to_vec());
+            let wrapped = WrappedContract::new(Arc::new(code), params);
+            let api_version = ContractWasmAPIVersion::V1(wrapped);
+            ContractContainer::from(api_version)
+        }
+        _ => ContractContainer::try_from((code_path, params))?,
+    };
+    Ok(container)
+}
+
 async fn put_contract(
     config: &PutConfig,
     contract_config: &PutContract,
     other: BaseConfig,
     params: Parameters<'static>,
 ) -> anyhow::Result<()> {
-    // Try to load as raw WASM first
-    let contract = if let Ok(raw_code) = ContractCode::load_raw(&config.code) {
-        // Add version wrapper
-        let code = ContractCode::from(raw_code.data().to_vec());
-        let wrapped = WrappedContract::new(Arc::new(code), params);
-        let api_version = ContractWasmAPIVersion::V1(wrapped);
-        ContractContainer::from(api_version)
-    } else {
-        // Fall back to trying as already versioned
-        ContractContainer::try_from((config.code.as_path(), params))?
-    };
+    let contract = load_contract_for_publish(&config.code, params)?;
     let state = if let Some(ref webapp_archive) = contract_config.webapp_archive {
         // Read pre-compressed webapp archive
         let mut archive = vec![];
@@ -317,14 +351,7 @@ pub async fn get_contract_id(config: GetContractIdConfig) -> anyhow::Result<()> 
         Parameters::from(&[] as &[u8])
     };
 
-    let contract = if let Ok(raw_code) = ContractCode::load_raw(&config.code) {
-        let code = ContractCode::from(raw_code.data().to_vec());
-        let wrapped = WrappedContract::new(Arc::new(code), params);
-        let api_version = ContractWasmAPIVersion::V1(wrapped);
-        ContractContainer::from(api_version)
-    } else {
-        ContractContainer::try_from((config.code.as_path(), params))?
-    };
+    let contract = load_contract_for_publish(&config.code, params)?;
 
     let key = contract.key();
     // Print to stdout for scripting use (not tracing, which may be filtered)
@@ -604,5 +631,108 @@ pub(crate) async fn execute_command(
             tracing::error!("Server returned error: {}", e);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Minimal-but-real WASM module: just the magic + version. The
+    /// helper doesn't compile the bytes; it only inspects the magic
+    /// to choose the load path, so an empty module is enough.
+    const TINY_WASM: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, // \0asm magic
+        0x01, 0x00, 0x00, 0x00, // version 1
+    ];
+
+    fn write_tmp(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().expect("create tmp");
+        f.write_all(bytes).expect("write tmp");
+        f.flush().expect("flush tmp");
+        f
+    }
+
+    /// Raw WASM file (magic at offset 0) takes the V1-wrapping path
+    /// and lands in `ContractCode.data` byte-for-byte unchanged.
+    #[test]
+    fn raw_wasm_loads_into_v1_container() {
+        let f = write_tmp(TINY_WASM);
+        let container = load_contract_for_publish(f.path(), Parameters::from(vec![]))
+            .expect("raw WASM should load");
+        match container {
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped)) => {
+                assert_eq!(wrapped.code().data(), TINY_WASM);
+            }
+            other => panic!("expected V1 wasm container, got: {other:?}"),
+        }
+    }
+
+    /// Packaged contract emitted by `fdev build`: 8-byte version
+    /// (u64 BE) + 32-byte code hash + WASM. The bug under fix folded
+    /// the 40-byte header into `ContractCode.data` and then wasmtime
+    /// rejected those bytes as `compile: input bytes aren't valid utf-8`.
+    /// After the fix the discrimination routes through
+    /// `ContractContainer::try_from`, which strips the prefix.
+    ///
+    /// This test would fail on the pre-fix code path because
+    /// `wrapped.code().data()` would equal the full `packed` blob
+    /// (40 extra header bytes), not just `TINY_WASM`.
+    #[test]
+    fn packaged_contract_strips_version_prefix() {
+        let mut packed = Vec::new();
+        // APIVersion::Version0_0_1 encodes as u64 0 (see
+        // freenet-stdlib `APIVersion::into_u64`).
+        packed.extend_from_slice(&0u64.to_be_bytes());
+        packed.extend_from_slice(&[0xab; 32]); // dummy code_hash
+        packed.extend_from_slice(TINY_WASM);
+        let f = write_tmp(&packed);
+
+        let container = load_contract_for_publish(f.path(), Parameters::from(vec![]))
+            .expect("packaged contract should load");
+
+        match container {
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped)) => {
+                assert_eq!(
+                    wrapped.code().data(),
+                    TINY_WASM,
+                    "version prefix must be stripped before reaching ContractCode \
+                     (regression: pre-fix this kept the 40-byte header attached)"
+                );
+            }
+            other => panic!("expected V1 wasm container, got: {other:?}"),
+        }
+    }
+
+    /// File whose bytes are neither WASM nor a parseable versioned
+    /// container surfaces an error rather than silently producing a
+    /// malformed contract that would only fail on the receiving node.
+    #[test]
+    fn garbage_file_surfaces_error() {
+        let f = write_tmp(&[0xff; 16]);
+        let err = load_contract_for_publish(f.path(), Parameters::from(vec![]))
+            .expect_err("non-WASM, non-versioned bytes must surface as error");
+        assert!(
+            !err.to_string().is_empty(),
+            "error must carry a diagnostic message, got: {err:?}"
+        );
+    }
+
+    /// Empty input file: load_raw succeeds (zero bytes), magic check
+    /// fails (no first 4 bytes), fallback to load_versioned tries to
+    /// read a u64 version header out of nothing and returns Err.
+    /// Important boundary: we MUST NOT silently produce an empty
+    /// contract — that would be accepted as a valid "raw WASM of
+    /// length 0" without the magic check.
+    #[test]
+    fn empty_file_surfaces_error() {
+        let f = write_tmp(&[]);
+        let err = load_contract_for_publish(f.path(), Parameters::from(vec![]))
+            .expect_err("empty file must surface as error, not produce empty contract");
+        assert!(
+            !err.to_string().is_empty(),
+            "error must carry a diagnostic message, got: {err:?}"
+        );
     }
 }
