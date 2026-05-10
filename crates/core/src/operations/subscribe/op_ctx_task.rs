@@ -615,7 +615,11 @@ async fn drive_client_subscribe_inner(
         // winning attempt's `request_sent_at` paired with the time of
         // terminal-reply arrival feeds the router's
         // `response_start_time_estimator` via `RouteOutcome::Success`.
-        let request_sent_at = std::time::Instant::now();
+        // `tokio::time::Instant` is auto-paused in test builds with
+        // `start_paused(true)`, so simulation tests see virtual elapsed
+        // time rather than wall-clock — matches the rest of
+        // `crates/core/`'s timing primitives.
+        let request_sent_at = tokio::time::Instant::now();
         let round_trip = tokio::time::timeout(
             OPERATION_TTL,
             ctx.send_to_and_await(current_target_addr, NetMessage::from(request)),
@@ -2708,12 +2712,17 @@ mod tests {
         let prod = production_source(SOURCE);
         let body = extract_fn_body(prod, "async fn drive_client_subscribe_inner(");
 
-        // Send-time capture must precede the round-trip await.
+        // Send-time capture must precede the round-trip await and MUST
+        // use `tokio::time::Instant` — `std::time::Instant` is banned in
+        // `crates/core/` by Rule Lint (see .claude/rules/code-style.md)
+        // and would not virtualize under `start_paused(true)` in DST
+        // simulation tests.
         assert!(
-            body.contains("let request_sent_at = std::time::Instant::now();"),
-            "drive_client_subscribe_inner must capture request_sent_at before \
-             send_to_and_await; without this the Subscribed branch has no \
-             time_to_response_start for the router."
+            body.contains("let request_sent_at = tokio::time::Instant::now();"),
+            "drive_client_subscribe_inner must capture request_sent_at via \
+             tokio::time::Instant::now() before send_to_and_await; without \
+             this the Subscribed branch has no time_to_response_start for \
+             the router."
         );
 
         // Subscribed branch must build a timed RouteOutcome::Success with

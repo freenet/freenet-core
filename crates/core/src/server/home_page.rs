@@ -2905,6 +2905,56 @@ mod tests {
         );
     }
 
+    /// Regression: the per-tab "Routing Predictions" panel must call
+    /// `build_estimator_chart_or_placeholder` for all three
+    /// prediction-component slots (Failure Probability, Response Time,
+    /// Transfer Rate). Hiding empty slots previously masked the
+    /// task-per-tx data-collection regression for months — keeping every
+    /// slot visible makes future regressions detectable on sight.
+    /// Source-scrape rather than HTML-grep because the visible-when-empty
+    /// behaviour depends on a router_snapshot being present, and the
+    /// `home_page.rs::tests` module does not have a snapshot fixture
+    /// builder.
+    #[test]
+    fn peer_detail_panel_calls_estimator_helper_for_all_three_components() {
+        let src = include_str!("home_page.rs");
+        // Truncate at the test marker so the assertion below doesn't
+        // match against this very test's source.
+        let cutoff = src
+            .find("#[cfg(test)]")
+            .expect("home_page.rs must have a #[cfg(test)] section");
+        let prod = &src[..cutoff];
+        for title in [
+            "Failure Probability",
+            "Response Time (s)",
+            "Transfer Rate (B/s)",
+        ] {
+            // Find the helper call site and walk forward up to 200 bytes
+            // for the title literal. Whitespace-tolerant so rustfmt
+            // doesn't churn this pin.
+            let mut found = false;
+            let mut cursor = 0;
+            while let Some(call) = prod[cursor..].find("build_estimator_chart_or_placeholder(") {
+                let abs = cursor + call;
+                let tail_end = (abs + 400).min(prod.len());
+                let needle = format!("\"{title}\"");
+                if prod[abs..tail_end].contains(&needle) {
+                    found = true;
+                    break;
+                }
+                cursor = abs + 1;
+            }
+            assert!(
+                found,
+                "peer-detail panel builder must call \
+                 build_estimator_chart_or_placeholder with title {title:?} so the slot is \
+                 always visible. Without this every prediction-component \
+                 slot can silently disappear when its estimator has no \
+                 data — the original regression."
+            );
+        }
+    }
+
     #[test]
     fn build_estimator_chart_or_placeholder_renders_chart_when_data_present() {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
