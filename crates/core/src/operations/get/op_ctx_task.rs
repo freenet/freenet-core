@@ -1725,8 +1725,22 @@ async fn relay_send_not_found(
         result: GetMsgResult::NotFound,
     });
     let mut ctx = op_manager.op_ctx(tx);
-    // Fire-and-forget — relay doesn't await the upstream's ack.
-    if let Err(err) = ctx.send_fire_and_forget(upstream_addr, msg).await {
+    // Originator-loopback: when this driver runs on the originator's
+    // own node (`upstream_addr == own_addr`), routing the wire-bound
+    // `send_fire_and_forget(own_addr, ...)` would attempt a
+    // self-connection (no peer entry exists for own_addr). Use
+    // `send_local_loopback` to route as `InboundMessage` instead, so
+    // the bypass at `handle_pure_network_message_v1` can forward the
+    // terminal Response to the originator's `pending_op_results`
+    // waiter. Mirrors PUT slice's `relay_put_send_response` loopback
+    // branch (#1454 phase 5 final, GET slice fixup).
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let send_result = if Some(upstream_addr) == own_addr {
+        ctx.send_local_loopback(msg).await
+    } else {
+        ctx.send_fire_and_forget(upstream_addr, msg).await
+    };
+    if let Err(err) = send_result {
         tracing::warn!(
             tx = %tx,
             %instance_id,
@@ -1760,10 +1774,19 @@ async fn relay_send_found(
         },
     });
     let mut ctx = op_manager.op_ctx(tx);
-    // Fire-and-forget toward upstream — relay doesn't await upstream's ack.
-    ctx.send_fire_and_forget(upstream_addr, msg)
-        .await
-        .map_err(|_| OpError::NotificationError)
+    // Originator-loopback: route via `send_local_loopback` to avoid
+    // the wire-bound self-connection failure. See `relay_send_not_found`
+    // for the full rationale (#1454 phase 5 final, GET slice fixup).
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    if Some(upstream_addr) == own_addr {
+        ctx.send_local_loopback(msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    } else {
+        ctx.send_fire_and_forget(upstream_addr, msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1999,8 +2022,47 @@ async fn drive_relay_get_inner(
             subscribe,
         });
 
-        // Send to downstream peer and await reply (keyed on incoming_tx).
+        // Originator-loopback: when the relay driver runs on the
+        // originator's own node, `incoming_tx == client_tx`. Calling
+        // `send_to_and_await(peer_addr, ...)` would install a NEW
+        // `pending_op_results[client_tx]` callback OVERWRITING the
+        // originator's `start_client_get` waiter (`handle_op_execution`
+        // calls `state.pending_op_results.insert(...)` which overwrites).
+        // The peer's downstream Response would then land in the
+        // relay-driver's callback and never reach the client driver.
+        //
+        // Fix: in originator-loopback, fire-and-forget the downstream
+        // Request and exit without awaiting — `send_fire_and_forget`
+        // dispatches a callback whose receiver is dropped, so
+        // `handle_op_execution` skips the insert (closed-callback
+        // guard at p2p_protoc.rs). The peer's eventual Response
+        // returns over the wire, and the bypass at
+        // `handle_pure_network_message_v1` forwards it to the
+        // originator's still-installed callback. The client driver
+        // owns retry semantics; the relay driver has nothing to add.
+        // Mirrors PUT slice (#1454 phase 5 final, PUT slice) which
+        // uses the same fire-and-forget pattern in
+        // `drive_relay_put`'s originator-loopback branch.
+        let own_addr = op_manager.ring.connection_manager.get_own_addr();
+        let originator_loopback = Some(upstream_addr) == own_addr;
         let mut ctx = op_manager.op_ctx(incoming_tx);
+        if originator_loopback {
+            if let Err(err) = ctx.send_fire_and_forget(peer_addr, request).await {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    target = %peer,
+                    error = %err,
+                    "GET relay (task-per-tx, loopback): \
+                     send_fire_and_forget failed"
+                );
+                // Fall through to NotFound — client driver waiter
+                // owns the retry decision.
+                return Err(err);
+            }
+            // Exit driver: client driver owns the response handling.
+            return Ok(());
+        }
+
         let round_trip =
             tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(peer_addr, request)).await;
 
