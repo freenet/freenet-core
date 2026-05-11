@@ -189,8 +189,12 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
     are dispatched via `subscribe::run_client_subscribe`. Executor
     auto-subscribe migrated to `subscribe::run_executor_subscribe`
     (returns `Result<(), OpError>` directly; bypasses the `op_request`
-    mediator). `Unsubscribe` and `ForwardingAck` still run on the
-    legacy state machine.
+    mediator). `Unsubscribe` now routes to
+    `subscribe::handle_unsubscribe_inbound` (free function — removes
+    downstream subscriber + propagates upstream when interest hits
+    zero; replaces the legacy `process_message::Unsubscribe` arm
+    retired in #1454 phase 5 final SUBSCRIBE slice). `ForwardingAck`
+    is a no-op telemetry hook with no state mutation.
 ```
 
 ## Module Map
