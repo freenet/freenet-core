@@ -53,7 +53,18 @@ paths:
 > `ComposeNetworkMessage<UpdateOp>` / network branch of
 > `perform_contract_update`) was retired in commit 1; it had been
 > unreachable in production because no `OperationMode::Network`
-> constructor exists in the tree. Phase 5
+> constructor exists in the tree. **Phase 6 (UPDATE slice)** deleted
+> the surviving `UpdateOp`, `UpdateState`, `UpdateStats`,
+> `FinishedData` scaffolding, the inline outcome / failure-routing
+> pin tests, and the two stale `process_message`-anchored pin tests
+> (driver-side pin tests in `update/op_ctx_task.rs:2063` / `:2345`
+> cover the same `send_summary_back_on_rejection` invariant). The
+> wire-format types, `BroadcastDedupCache`, `BroadcastTargetResult`,
+> `OpManager::try_auto_fetch_contract`, `update_contract` +
+> `UpdateExecution` + the log helpers, and the post-merge propagation
+> helpers + the `log_severity` regression suite (#3914) + the
+> `summary_back_helper_gates_on_summary_equality` pin remain because
+> the task-per-tx drivers consume them. Phase 5
 > follow-up slice A (PR #3917) migrated fresh inbound non-streaming
 > relay `PutMsg::Request` to
 > `operations/put/op_ctx_task.rs::start_relay_put` (originally gated on
@@ -102,10 +113,16 @@ paths:
 > are all gone. Every PUT wire variant now dispatches unconditionally
 > to a task-per-tx driver — the `!has_put_op(id)` guard was redundant
 > because the DashMap could no longer be populated (every writer
-> lived inside the deleted `process_message`). `PutOp`, `PutState`,
-> `PutStats`, `AwaitingResponseData`, `FinishedData` and 25 inline
-> outcome / failure-routing / wire-format / pin tests survive under
-> `#[allow(dead_code)]` pending phase 6.
+> lived inside the deleted `process_message`). **Phase 6 (PUT slice)**
+> deleted `PutOp`, `PutState`, `PutStats`, `AwaitingResponseData`,
+> `FinishedData`, the 22 inline outcome / failure-routing /
+> type-state pin tests, and the four anti-regression pins for the
+> retired speculative-retry fields (#3964). The wire-format types,
+> `op_state_manager.rs` GC pin tests, the
+> `put_forwarding_ack_senders` source-grep pin, and the originator
+> finalization helpers (`finalize_put_at_originator` /
+> `PutFinalizationData`) + the local-store helper (`put_contract`)
+> remain because the task-per-tx drivers consume them.
 >
 > **Originator-loopback fix.** `start_client_put`'s
 > `send_and_await(target=None)` loops the Request back as
@@ -137,10 +154,13 @@ paths:
 > `run_sub_op_get` body with an `initial_target` override — the
 > legacy `start_targeted_op` constructor and its
 > `notify_op_change(OpEnum::Get(...))` round-trip are gone.
-> `GetOp`, `GetState`, `GetStats`, `AwaitingResponseData`,
-> `FinishedData` plus a small inline outcome / failure-routing /
-> wire-format / pin-test surface survive under
-> `#[allow(dead_code)]` pending phase 6.
+> **Phase 6 (GET slice)** deleted `GetOp`, `GetState`, `GetStats`,
+> `AwaitingResponseData`, `PrepareRequestData`, `FinishedData`,
+> `TryFrom<GetOp> for GetResult`, the inline outcome /
+> failure-routing / type-state / relay-cache-decision pin tests, and
+> the unused `GetResult.key` field. The wire-format types and the
+> originator result envelope `GetResult` (state + contract only)
+> remain because the task-per-tx drivers and the executor consume them.
 >
 > **#1454 phase 5 final (SUBSCRIBE slice) retired the legacy SUBSCRIBE
 > state-machine path.** `OpEnum::Subscribe`, `OpManager.ops.subscribe`
@@ -173,12 +193,17 @@ paths:
 > Unsubscribe through `OpCtx::send_fire_and_forget(target_addr, msg)`
 > directly, bypassing `ops.subscribe` entirely — no synthetic
 > `create_unsubscribe_op` push, no `notify_op_change_nonblocking`
-> round-trip. `SubscribeOp`, `SubscribeState`, `SubscribeStats`,
-> `AwaitingResponseData`, `PrepareRequestData`, `CompletedData`, the
-> `create_unsubscribe_op` / `start_op` / `start_op_with_id` test
-> fixtures, plus the inline outcome / failure-routing / wire-format /
-> pin-test surface survive under module-level
-> `#![allow(dead_code)]` pending phase 6.
+> round-trip. **Phase 6 (SUBSCRIBE slice)** deleted `SubscribeOp`,
+> `SubscribeState`, `SubscribeStats`, `AwaitingResponseData`,
+> `PrepareRequestData`, `CompletedData`, `SubscribeResult`, the
+> `start_op` / `start_op_with_id` test fixtures, the dead
+> `fetch_contract_if_missing` helper, and the inline state-machine /
+> retry / outcome / lifecycle pin tests. The wire-format types,
+> `handle_unsubscribe_inbound` (the post-#1454 inbound handler),
+> `register_downstream_subscriber`, `prepare_initial_request` /
+> `InitialRequest` (shared by all driver entry points), and
+> `complete_local_subscription` remain because the task-per-tx
+> drivers consume them.
 >
 > Phase 5 follow-up slice A (PR
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to

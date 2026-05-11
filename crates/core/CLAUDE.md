@@ -81,14 +81,27 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              surviving `OpManager::send_unsubscribe_upstream`
                              sends Unsubscribe through
                              `OpCtx::send_fire_and_forget` directly
-                             (bypasses `ops.subscribe`). `SubscribeOp`,
+                             (bypasses `ops.subscribe`). **Phase 6
+                             (SUBSCRIBE slice)** retired the surviving
+                             scaffolding: `SubscribeOp`,
                              `SubscribeState`, `SubscribeStats`,
                              `AwaitingResponseData`,
-                             `PrepareRequestData`, `CompletedData`
-                             plus the inline outcome /
-                             failure-routing / wire-format / pin-test
-                             surface survive under module-level
-                             `#![allow(dead_code)]` pending phase 6.
+                             `PrepareRequestData`, `CompletedData`,
+                             `SubscribeResult`, the `start_op` /
+                             `start_op_with_id` test fixtures, the
+                             dead `fetch_contract_if_missing` helper
+                             plus the inline state-machine / retry
+                             matrix / outcome / lifecycle pin tests
+                             are all gone. The surviving wire-format
+                             types, `handle_unsubscribe_inbound` (the
+                             post-#1454 inbound handler),
+                             `register_downstream_subscriber`,
+                             `prepare_initial_request` /
+                             `InitialRequest` (shared by all driver
+                             entry points), and
+                             `complete_local_subscription` remain
+                             because the task-per-tx drivers consume
+                             them.
   put/op_ctx_task.rs       → client-initiated PUT driver (Phase 3a)
                              + fresh inbound non-streaming relay PUT
                              driver (Phase 5 follow-up slice A, PR #3917,
@@ -108,11 +121,22 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              `handle_op_request<PutOp>` fallthrough in
                              node.rs are all gone. Every PUT wire variant
                              dispatches unconditionally to a task-per-tx
-                             driver. `PutOp`, `PutState`, `PutStats`,
-                             `AwaitingResponseData`, `FinishedData` plus
-                             25 inline outcome / failure-routing /
-                             wire-format / pin tests survive under
-                             `#[allow(dead_code)]` pending phase 6. The
+                             driver. **Phase 6 (PUT slice)** retired
+                             the surviving scaffolding: `PutOp`,
+                             `PutState`, `PutStats`,
+                             `AwaitingResponseData`, `FinishedData`,
+                             the 22 inline outcome / failure-routing /
+                             type-state pin tests, and the four
+                             anti-regression pins for retired
+                             speculative-retry fields (#3964) are all
+                             gone. The surviving wire-format types,
+                             the `op_state_manager.rs` GC pin tests,
+                             the `put_forwarding_ack_senders` source
+                             grep, and the originator finalization
+                             helpers (`finalize_put_at_originator` /
+                             `PutFinalizationData`) + the local-store
+                             helper (`put_contract`) remain because
+                             the task-per-tx drivers consume them. The
                              legacy upgrade-on-forward branch (non-stream
                              `Request` whose serialized payload exceeds
                              `streaming_threshold`) now dispatches
@@ -135,12 +159,21 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              fallthrough in node.rs are all gone.
                              Every GET wire variant dispatches
                              unconditionally to a task-per-tx driver.
-                             `GetOp`, `GetState`, `GetStats`,
-                             `AwaitingResponseData`, `FinishedData` plus
-                             a small inline outcome / failure-routing /
-                             wire-format / pin-test surface survive
-                             under `#[allow(dead_code)]` pending
-                             phase 6.
+                             **Phase 6 (GET slice)** retired the
+                             surviving scaffolding: `GetOp`,
+                             `GetState`, `GetStats`,
+                             `AwaitingResponseData`,
+                             `PrepareRequestData`, `FinishedData`,
+                             `TryFrom<GetOp> for GetResult`, the
+                             inline outcome / failure-routing /
+                             type-state / relay-cache-decision pin
+                             tests, and the unused `GetResult.key`
+                             field are all gone. The surviving
+                             wire-format types and the originator
+                             result envelope `GetResult` (state +
+                             contract only) remain because the
+                             task-per-tx drivers and the executor
+                             consume them.
   update/op_ctx_task.rs    → client-initiated UPDATE driver (Phase 4,
                              fire-and-forget) + fresh inbound non-streaming
                              relay UPDATE drivers (Phase 5 follow-up slice
@@ -161,9 +194,29 @@ Plus task-per-transaction drivers from #1454 Phase 2b onwards:
                              fallthrough in node.rs are all gone. Every
                              UPDATE wire variant now dispatches
                              unconditionally to a task-per-tx driver.
-                             `UpdateOp` itself plus 17 inline outcome /
-                             failure-routing tests survive under
-                             `#[allow(dead_code)]` pending phase 6.
+                             **Phase 6 (UPDATE slice)** retired the
+                             surviving scaffolding: `UpdateOp`,
+                             `UpdateState`, `UpdateStats`,
+                             `FinishedData`, the inline outcome /
+                             failure-routing pin tests, and the two
+                             stale `process_message`-anchored pin
+                             tests (driver-side pin tests in
+                             `update/op_ctx_task.rs:2063` /
+                             `:2345` cover the same
+                             `send_summary_back_on_rejection`
+                             invariant). The surviving wire-format
+                             types, `BroadcastDedupCache`,
+                             `BroadcastTargetResult`,
+                             `OpManager::try_auto_fetch_contract`,
+                             `update_contract` + `UpdateExecution` +
+                             the log helpers, and the
+                             post-merge propagation helpers
+                             (`send_proactive_summary_notification` /
+                             `send_summary_back_on_rejection`) +
+                             the `log_severity` regression suite (#3914)
+                             + the `summary_back_helper_gates_on_summary_equality`
+                             pin remain because the task-per-tx
+                             drivers consume them.
   connect/op_ctx_task.rs   → client-initiated CONNECT driver (Phase 2c
                              slice 2, `start_client_connect`) + fresh
                              inbound relay CONNECT driver (Phase 2c
