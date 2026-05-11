@@ -332,6 +332,8 @@ pub(crate) enum OpOutcome<'a> {
     },
     /// An op which involves a contract completed successfully but has no timing data
     /// (put, update). Feeds only the failure estimator.
+    #[allow(dead_code)]
+    // Constructed only by retired UpdateOp/PutOp.outcome(); tests still match it.
     ContractOpSuccessUntimed {
         target_peer: &'a PeerKeyLocation,
         contract_location: Location,
