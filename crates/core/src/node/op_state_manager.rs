@@ -535,12 +535,13 @@ impl OpManager {
         });
 
         // #1454 phase 5 final (SUBSCRIBE slice): fire-and-forget the
-        // Unsubscribe wire message through OpCtx instead of pushing a
-        // synthetic SubscribeOp into `ops.subscribe` so the event loop's
-        // `peek_next_hop_addr` lookup can recover the target. The
-        // op-execution channel routes to `OutboundMessageWithTarget`
-        // directly given `Some(target_addr)`; no operation state is
-        // required since Unsubscribe has no reply.
+        // Unsubscribe wire message through OpCtx. The legacy path pushed
+        // a synthetic SubscribeOp into `ops.subscribe` so the event
+        // loop's `peek_next_hop_addr` SUBSCRIBE arm could recover the
+        // target address; both that arm and the DashMap were retired in
+        // this slice. The op-execution channel routes directly to
+        // `OutboundMessageWithTarget` given `Some(target_addr)`, so no
+        // operation state is required (Unsubscribe has no reply).
         let mut ctx = self.op_ctx(tx);
         match ctx.send_fire_and_forget(target_addr, msg).await {
             Ok(()) => {
@@ -1330,22 +1331,15 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 }
 
                 // SUBSCRIBE speculative-retry GC block was retired in #1454
-                // Phase 5-final: every originator-side writer into
-                // `ops.subscribe` (client-initiated, executor auto-subscribe,
-                // renewal, PUT/GET sub-op) now runs on the task-per-tx
-                // driver in `operations/subscribe/op_ctx_task.rs`, which
-                // owns its own retry loop via `advance_to_next_peer` and
-                // never inserts a `SubscribeOp` into the DashMap. The
-                // remaining legacy entries (relay state during multi-hop
-                // forwarding, `create_unsubscribe_op` routing entries) are
-                // not retry candidates: relay entries fail
-                // `is_originator()` and unsubscribe entries fail
-                // `failure_routing_info().is_some()`. The DashMap, the
-                // `SubscribeOp::ack_received` / `speculative_paths` fields,
-                // and `SubscribeMsg::ForwardingAck` survive only as wire-
-                // and bookkeeping-compat for legacy relay traffic;
-                // they are not load-bearing for retry. Mirrors the GET
-                // Phase 5-final retirement in PR #3974.
+                // Phase 5-final. The `ops.subscribe` DashMap itself was
+                // then retired in the SUBSCRIBE slice (this PR): every
+                // SUBSCRIBE wire variant now runs on the task-per-tx
+                // driver in `operations/subscribe/op_ctx_task.rs`
+                // (Request) or a dedicated free function
+                // (`handle_unsubscribe_inbound` for Unsubscribe), and
+                // the surviving `send_unsubscribe_upstream` writer uses
+                // `OpCtx::send_fire_and_forget` directly. There is no
+                // longer a DashMap to GC-sweep.
 
                 let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing.drain(..) {

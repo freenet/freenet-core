@@ -263,37 +263,6 @@ pub(crate) fn start_op_with_id(
     }
 }
 
-/// Create a SubscribeOp for routing an Unsubscribe message to a target peer.
-///
-/// Test fixture only after #1454 phase 5 final (SUBSCRIBE slice).
-/// Production callers now send Unsubscribe through `OpCtx::send_fire_and_forget`
-/// directly from `OpManager::send_unsubscribe_upstream`, bypassing
-/// `ops.subscribe` entirely.
-#[cfg(test)]
-pub(crate) fn create_unsubscribe_op(
-    instance_id: ContractInstanceId,
-    tx: Transaction,
-    target_addr: std::net::SocketAddr,
-) -> SubscribeOp {
-    SubscribeOp {
-        id: tx,
-        state: SubscribeState::AwaitingResponse(AwaitingResponseData {
-            next_hop: Some(target_addr),
-            instance_id,
-            retries: 0,
-            current_hop: 0,
-            tried_peers: HashSet::new(),
-            alternatives: Vec::new(),
-            attempts_at_hop: 0,
-            visited: super::VisitedPeers::new(&tx),
-        }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-    }
-}
-
 // `request_subscribe` was the legacy state-machine entry point that
 // pushed a `SubscribeOp` into `OpManager.ops.subscribe` via
 // `notify_op_change(_nonblocking)`. It was retired by #1454:
