@@ -142,6 +142,44 @@ paths:
 > wire-format / pin-test surface survive under
 > `#[allow(dead_code)]` pending phase 6.
 >
+> **#1454 phase 5 final (SUBSCRIBE slice) retired the legacy SUBSCRIBE
+> state-machine path.** `OpEnum::Subscribe`, `OpManager.ops.subscribe`
+> DashMap, `impl Operation for SubscribeOp`, `has_subscribe_op`,
+> `remove_subscribe_and_notify_timeout`, the `OpEnum::Subscribe` arms in
+> `IsOperationCompleted for OpEnum` and the abort handler, the
+> `try_from_op_enum!(OpEnum::Subscribe, ...)` macro entry, the
+> `OpEnum::is_subscription_renewal` helper, `OpError::StatePushed`
+> (no remaining live constructor across all five ops), the
+> `ContractHandlerEvent::NotifySubscriptionError` /
+> `NotifySubscriptionErrorResponse` chain (executor trait method,
+> `bridged_notify_subscription_error`, `send_subscription_error_to_clients`),
+> and the `handle_op_request<SubscribeOp>` fallthrough in node.rs are
+> all gone. Every SUBSCRIBE wire variant now dispatches unconditionally:
+>
+> - `SubscribeMsg::Request` → `start_relay_subscribe` (source_addr=None
+>   loopback maps to `upstream_addr=own_addr`, mirroring the GET / PUT
+>   originator-loopback fix; relay driver owns both true relay hops and
+>   originator-loopback).
+> - `SubscribeMsg::Response` → bypass to originator's `pending_op_results`
+>   waiter (terminal-reply fast path).
+> - `SubscribeMsg::Unsubscribe` → `handle_unsubscribe_inbound`
+>   (free function: removes downstream subscriber tracking + chains
+>   unsubscribe upstream when interest hits zero — replaces the legacy
+>   `process_message::Unsubscribe` arm).
+> - `SubscribeMsg::ForwardingAck` → no-op (telemetry hook preserved for
+>   pre-#3964 peer compatibility).
+>
+> The surviving `OpManager::send_unsubscribe_upstream` writer sends
+> Unsubscribe through `OpCtx::send_fire_and_forget(target_addr, msg)`
+> directly, bypassing `ops.subscribe` entirely — no synthetic
+> `create_unsubscribe_op` push, no `notify_op_change_nonblocking`
+> round-trip. `SubscribeOp`, `SubscribeState`, `SubscribeStats`,
+> `AwaitingResponseData`, `PrepareRequestData`, `CompletedData`, the
+> `create_unsubscribe_op` / `start_op` / `start_op_with_id` test
+> fixtures, plus the inline outcome / failure-routing / wire-format /
+> pin-test surface survive under module-level
+> `#![allow(dead_code)]` pending phase 6.
+>
 > Phase 5 follow-up slice A (PR
 > #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
 > `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`

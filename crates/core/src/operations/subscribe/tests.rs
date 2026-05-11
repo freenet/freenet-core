@@ -744,34 +744,12 @@ fn test_is_renewal_flag() {
     assert!(!client_op.is_renewal());
 }
 
-#[test]
-fn test_op_enum_is_subscription_renewal() {
-    use crate::operations::OpEnum;
-
-    let instance_id = ContractInstanceId::new([22u8; 32]);
-    let contract_key = ContractKey::from_id_and_code(instance_id, CodeHash::new([23u8; 32]));
-    let tx = Transaction::new::<SubscribeMsg>();
-
-    let renewal = OpEnum::Subscribe(SubscribeOp {
-        id: tx,
-        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: true,
-        stats: None,
-    });
-    assert!(renewal.is_subscription_renewal());
-
-    let non_renewal = OpEnum::Subscribe(SubscribeOp {
-        id: tx,
-        state: SubscribeState::Completed(super::CompletedData { key: contract_key }),
-        requester_addr: None,
-        requester_pub_key: None,
-        is_renewal: false,
-        stats: None,
-    });
-    assert!(!non_renewal.is_subscription_renewal());
-}
+// `test_op_enum_is_subscription_renewal` retired in #1454 phase 5 final
+// (SUBSCRIBE slice) together with `OpEnum::Subscribe` and the
+// `OpEnum::is_subscription_renewal` helper. Renewals now flow through
+// `subscribe::op_ctx_task::run_renewal_subscribe` which carries
+// `is_renewal=true` on the task locals; there is no `OpEnum` carrier
+// for the helper to inspect anymore.
 
 /// Test that SubscribeOp::outcome() returns ContractOpFailure when the operation
 /// has stats but is not finalized (i.e., the subscription failed).

@@ -683,13 +683,6 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
         delta: Result<StateDelta<'static>, ExecutorError>,
     },
-    /// Notify subscribed clients that a subscription failed
-    NotifySubscriptionError {
-        key: ContractInstanceId,
-        reason: String,
-    },
-    /// Response to NotifySubscriptionError
-    NotifySubscriptionErrorResponse,
     /// A client has disconnected — clean up its entries in shared_summaries
     /// and shared_notifications. Fire-and-forget: no response is sent.
     ClientDisconnect {
@@ -803,12 +796,6 @@ impl std::fmt::Display for ContractHandlerEvent {
                 Ok(_) => write!(f, "get delta response {{ {key} }}"),
                 Err(e) => write!(f, "get delta failed {{ {key}, error: {e} }}"),
             },
-            ContractHandlerEvent::NotifySubscriptionError { key, reason } => {
-                write!(f, "notify subscription error {{ {key}, reason: {reason} }}")
-            }
-            ContractHandlerEvent::NotifySubscriptionErrorResponse => {
-                write!(f, "notify subscription error response")
-            }
             ContractHandlerEvent::ClientDisconnect { client_id } => {
                 write!(f, "client disconnect {{ {client_id} }}")
             }

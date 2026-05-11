@@ -550,15 +550,6 @@ async fn report_result(
                         tx = %transaction,
                         "Skipping client notification for sub-operation"
                     );
-                } else if op_res.is_subscription_renewal() {
-                    // Subscription renewals are node-internal operations spawned by the
-                    // renewal manager (ring.rs). No client registered a transaction
-                    // for these, so sending to the session actor would just produce
-                    // "registered transactions: 0" noise. See #2891.
-                    tracing::debug!(
-                        tx = %transaction,
-                        "Skipping client notification for subscription renewal"
-                    );
                 } else {
                     let host_result = op_res.to_host_result();
                     // Await result delivery to ensure the client receives the response
@@ -1491,28 +1482,19 @@ where
                 return Ok(None);
             }
             NetMessageV1::Subscribe(ref op) => {
-                // Phase 2b (#1454): task-per-tx bypass for client-initiated
-                // SUBSCRIBE. See `try_forward_task_per_tx_reply` for the
-                // full reasoning (reply-side structural gap between Phase
-                // 1's forwarding hook and task-per-tx callers who never
-                // push an op into the OpManager DashMap).
+                // #1454 phase 5 final (SUBSCRIBE slice): every SUBSCRIBE
+                // wire variant routes to a task-per-tx driver or a thin
+                // inbound handler. The legacy `OpManager.ops.subscribe`
+                // DashMap, `Operation` impl, and re-entry fallthrough
+                // were retired in this PR. The slice-A DashMap-existence
+                // dispatch gate is gone: the DashMap can no longer be
+                // populated.
                 //
                 // Only forward **terminal** Response messages to the
-                // task-per-tx channel. Non-terminal messages like
-                // ForwardingAck (sent by relay peers to signal "I'm working
-                // on it") must NOT be forwarded: they would fill the
-                // capacity-1 reply channel before the real Response arrives,
-                // causing the task to classify the ForwardingAck as
-                // Unexpected and fail with UnexpectedOpState.
-                //
-                // When a Response IS present and a callback is registered,
-                // the bypass returns Ok(None) and skips handle_op_request.
-                // For non-Response messages (Request, ForwardingAck, etc.)
-                // with a pending callback, the bypass doesn't fire and we
-                // fall through to handle_op_request. If handle_op_request
-                // completes the operation (e.g., local subscribe completion),
-                // forward_pending_op_result_if_completed below delivers
-                // the result to the OpCtx::send_and_await callback.
+                // originator's awaiting task via the bypass. Non-terminal
+                // messages (Request, ForwardingAck) must NOT be forwarded:
+                // they would fill the capacity-1 reply channel and cause
+                // classify_reply to fail with Unexpected.
                 if matches!(op, subscribe::SubscribeMsg::Response { .. })
                     && try_forward_task_per_tx_reply(
                         pending_op_result.as_ref(),
@@ -1523,50 +1505,26 @@ where
                     return Ok(None);
                 }
 
-                // #1454 phase 5 follow-up (slice A): relay SUBSCRIBE
-                // task-per-tx dispatch.
-                //
-                // For true relay hops (source_addr.is_some() AND incoming
-                // variant is SubscribeMsg::Request AND no SubscribeOp
-                // already exists in OpManager for this tx), spawn the
-                // relay driver and return. The driver owns local-hit
-                // response + single downstream forward + upstream
-                // bubble-up in its task locals.
-                //
-                // source_addr.is_none() (originator loop-back from the
-                // phase-2b client-init driver's send_to_and_await) falls
-                // through to legacy. The client driver never relies on
-                // a Request-echo — it awaits Response — so the
-                // `SubscribeMsg::Response` bypass above handles the
-                // originator reply.
-                //
-                // Existing SubscribeOp means a PUT sub-op, executor
-                // auto-subscribe, or GC-spawned retry already registered
-                // state in the DashMap — those paths must stay on legacy.
-                //
-                // ForwardingAck / Unsubscribe never match the Request
-                // arm so they flow to legacy naturally.
-                //
-                // Renewals were previously routed to legacy here so the
-                // relay would emit `SubscribeMsg::ForwardingAck` back to
-                // the renewal originator (the originator's GC retry
-                // selector relied on `ack_received` for retry-base
-                // selection). The renewal originator now runs on the
-                // same task-per-tx driver as client-initiated subscribe
-                // (#1454 SUBSCRIBE renewal migration), so the relay no
-                // longer needs to emit `ForwardingAck`. The `is_renewal`
-                // flag is still propagated so the responder knows
-                // whether to skip sending state.
-                if let subscribe::SubscribeMsg::Request {
-                    id,
-                    instance_id,
-                    htl,
-                    visited,
-                    is_renewal,
-                } = op
-                {
-                    if let Some(upstream_addr) = source_addr {
-                        if !op_manager.has_subscribe_op(id) {
+                // Relay SUBSCRIBE dispatch: spawn `start_relay_subscribe`.
+                // Mirrors the GET / PUT / UPDATE branches above.
+                // `start_client_subscribe`'s `send_and_await(target=None)`
+                // loops the Request back as an InboundMessage with
+                // `source_addr=None`. Map that to
+                // `upstream_addr = own_addr` so the same
+                // `start_relay_subscribe` driver handles both true relay
+                // hops and originator-loopback.
+                let effective_upstream =
+                    source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
+                if let Some(upstream_addr) = effective_upstream {
+                    #[allow(clippy::wildcard_enum_match_arm)]
+                    match op {
+                        subscribe::SubscribeMsg::Request {
+                            id,
+                            instance_id,
+                            htl,
+                            visited,
+                            is_renewal,
+                        } => {
                             if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
                                 op_manager.clone(),
                                 *id,
@@ -1585,89 +1543,38 @@ where
                                     "SUBSCRIBE relay dispatch: start_relay_subscribe failed"
                                 );
                             }
-                            return Ok(None);
                         }
-                    }
-                }
-
-                let op_result = handle_op_request::<subscribe::SubscribeOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    source_addr,
-                )
-                .await;
-
-                // Forward result to OpCtx::send_and_await callback when
-                // the operation completes. This path fires when the
-                // originator processes its own Request locally via
-                // handle_op_execution (pending_op_result is Some) and
-                // the subscribe completes without needing the network
-                // (e.g., contract available locally). Without this,
-                // the response_sender in pending_op_results is dropped
-                // without a reply, causing send_and_await to fail.
-                //
-                // We synthesize a Response (not forward the original
-                // Request) because classify_reply in op_ctx_task expects
-                // a SubscribeMsg::Response variant.
-                if let Some(ref callback) = pending_op_result {
-                    if is_operation_completed(&op_result) {
-                        let instance_id = match op {
-                            subscribe::SubscribeMsg::Request { instance_id, .. }
-                            | subscribe::SubscribeMsg::Response { instance_id, .. }
-                            | subscribe::SubscribeMsg::Unsubscribe { instance_id, .. }
-                            | subscribe::SubscribeMsg::ForwardingAck { instance_id, .. } => {
-                                *instance_id
-                            }
-                        };
-                        let result = match &op_result {
-                            Ok(Some(OpEnum::Subscribe(sub_op))) => match sub_op.completed_key() {
-                                Some(key) => subscribe::SubscribeMsgResult::Subscribed { key },
-                                None => subscribe::SubscribeMsgResult::NotFound,
-                            },
-                            _ => subscribe::SubscribeMsgResult::NotFound,
-                        };
-                        let reply = NetMessage::from(subscribe::SubscribeMsg::Response {
-                            id: *op.id(),
-                            instance_id,
-                            result,
-                        });
-                        if let Err(err) = callback.try_send(reply) {
+                        subscribe::SubscribeMsg::Unsubscribe { id, instance_id } => {
+                            subscribe::handle_unsubscribe_inbound(
+                                &op_manager,
+                                *id,
+                                *instance_id,
+                                source_addr,
+                            )
+                            .await;
+                        }
+                        _ => {
+                            // Response handled by bypass above; ForwardingAck
+                            // is a wire-only telemetry hook (#3570 diagnostics)
+                            // with no state mutation post-#1454 phase 5.
                             tracing::debug!(
-                                %err,
-                                "subscribe local-completion: callback send failed \
-                                 (task may have timed out)"
+                                tx = %op.id(),
+                                ?op,
+                                "SUBSCRIBE: non-dispatch variant ignored \
+                                 (Response already handled by bypass; \
+                                 ForwardingAck is no-op)"
                             );
                         }
                     }
+                } else {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        ?op,
+                        "SUBSCRIBE: no own_addr available — pre-handshake \
+                         message ignored"
+                    );
                 }
-
-                if let Err(OpError::OpNotAvailable(state)) = &op_result {
-                    match state {
-                        OpNotAvailable::Running => {
-                            let delay = op_retry_backoff(i);
-                            tracing::debug!(
-                                delay_ms = delay.as_millis() as u64,
-                                attempt = i,
-                                "Pure network: Operation still running, backing off"
-                            );
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        OpNotAvailable::Completed => {
-                            tracing::debug!("Pure network: Operation already completed");
-                            return Ok(None);
-                        }
-                    }
-                }
-
-                return handle_pure_network_result(
-                    tx,
-                    op_result,
-                    &op_manager,
-                    &mut *event_listener,
-                )
-                .await;
+                return Ok(None);
             }
             // Non-transactional message types: process once and return immediately.
             // These must NOT fall through to the post-loop "Dropping message" warning,
@@ -1801,13 +1708,11 @@ where
                 // from the gateway join path. The gateways list is only used by
                 // Connect retries; other operation types ignore it entirely.
                 if let Err(err) = handle_aborted_op(tx, &op_manager, &[]).await {
-                    if !matches!(err, OpError::StatePushed) {
-                        tracing::error!(
-                            %tx,
-                            error = %err,
-                            "Error handling aborted operation"
-                        );
-                    }
+                    tracing::error!(
+                        %tx,
+                        error = %err,
+                        "Error handling aborted operation"
+                    );
                 }
                 return Ok(None);
             }
@@ -1850,9 +1755,6 @@ async fn handle_pure_network_result(
         }
         Ok(None) => {
             tracing::debug!("Network operation returned no result");
-        }
-        Err(OpError::StatePushed) => {
-            return Ok(None);
         }
         Err(OpError::OpNotPresent(tx_id)) => {
             // OpNotPresent means a response arrived for an operation that no longer exists.
@@ -2598,30 +2500,18 @@ async fn handle_aborted_op(
                         }
                     }
                 }
-                Ok(Some(other)) => {
-                    op_manager.push(tx, other).await?;
-                }
                 _ => {}
             }
         }
-        TransactionType::Subscribe => match op_manager.pop(&tx) {
-            Ok(Some(OpEnum::Subscribe(op))) => {
-                if let Err(err) = op.handle_abort(op_manager).await {
-                    if !matches!(err, OpError::StatePushed) {
-                        return Err(err);
-                    }
-                }
-            }
-            Ok(Some(other)) => {
-                op_manager.push(tx, other).await?;
-            }
-            _ => {}
-        },
-        TransactionType::Get | TransactionType::Put | TransactionType::Update => {
-            // GET, PUT and UPDATE have no DashMap entry post-#1454 phase 5
-            // final; the task-per-tx driver owns abort handling through
-            // its own cancellation surface (the `result_router_tx`
-            // publication path is the only externally observable result).
+        TransactionType::Get
+        | TransactionType::Put
+        | TransactionType::Update
+        | TransactionType::Subscribe => {
+            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
+            // post-#1454 phase 5 final; the task-per-tx driver owns abort
+            // handling through its own cancellation surface (the
+            // `result_router_tx` publication path is the only externally
+            // observable result).
         }
     }
     Ok(())
@@ -2799,7 +2689,6 @@ impl IsOperationCompleted for OpEnum {
     fn is_completed(&self) -> bool {
         match self {
             OpEnum::Connect(op) => op.is_completed(),
-            OpEnum::Subscribe(op) => op.is_completed(),
         }
     }
 }
@@ -3056,7 +2945,6 @@ mod tests {
     #[rstest]
     #[case::with_none(Ok(None), false)]
     #[case::with_running_error(Err(OpError::OpNotAvailable(super::OpNotAvailable::Running)), false)]
-    #[case::with_state_pushed_error(Err(OpError::StatePushed), false)]
     fn test_is_operation_completed(
         #[case] result: Result<Option<OpEnum>, OpError>,
         #[case] expected: bool,
@@ -4028,7 +3916,11 @@ mod tests {
         }
 
         // ── Relay SUBSCRIBE dispatch structural pin tests (#1454 phase 5
-        // follow-up slice A). Mirror of the PUT / UPDATE pin tests.
+        // final, SUBSCRIBE slice). After the legacy state-machine
+        // fallthrough was retired, every SUBSCRIBE wire variant routes
+        // either to the task-per-tx relay driver (Request) or to a
+        // dedicated inbound handler (Unsubscribe). Mirror the GET-slice
+        // pin pattern.
 
         #[test]
         fn subscribe_branch_dispatches_relay_driver() {
@@ -4038,125 +3930,81 @@ mod tests {
                 "SUBSCRIBE branch of handle_pure_network_message_v1 not found; \
                  the match arm has been renamed or moved — update this guard",
             );
+            // End the window at the next NetMessageV1 variant to bound
+            // the search to the SUBSCRIBE arm only.
+            let next_variant = "// Non-transactional message types:";
             let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<subscribe::SubscribeOp, _>")
-                .expect("SUBSCRIBE branch no longer calls handle_op_request — update guard")
+                .find(next_variant)
+                .expect("could not find end of SUBSCRIBE arm")
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
+
+            // Terminal-reply bypass must still be present (gated on
+            // SubscribeMsg::Response).
+            assert!(
+                window.contains("try_forward_task_per_tx_reply("),
+                "SUBSCRIBE branch no longer calls try_forward_task_per_tx_reply \
+                 before relay dispatch — restore it."
+            );
+            assert!(
+                window.contains("subscribe::SubscribeMsg::Response { .. }"),
+                "SUBSCRIBE branch bypass is not gated on Response. \
+                 Non-terminal messages must NOT be forwarded to the task-per-tx channel."
+            );
+
+            // Relay dispatch must call start_relay_subscribe and route
+            // the Unsubscribe variant through the inbound handler.
             assert!(
                 window.contains("start_relay_subscribe("),
                 "SUBSCRIBE branch no longer calls start_relay_subscribe for relay \
-                 dispatch. #1454 phase-5 slice A SUBSCRIBE relay dispatch was \
-                 removed — restore it."
-            );
-        }
-
-        #[test]
-        fn subscribe_branch_dispatch_gates_on_source_and_existing_op() {
-            const SOURCE: &str = include_str!("node.rs");
-            let anchor = "NetMessageV1::Subscribe(ref op) => {";
-            let branch_start = SOURCE.find(anchor).expect("SUBSCRIBE branch not found");
-            let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<subscribe::SubscribeOp, _>")
-                .expect("SUBSCRIBE branch no longer calls handle_op_request")
-                + branch_start;
-            let window = &SOURCE[branch_start..window_end];
-            assert!(
-                window.contains("source_addr"),
-                "SUBSCRIBE relay dispatch must be gated on source_addr — internal \
-                 / originator callers (source_addr.is_none()) must fall through."
+                 dispatch — restore it."
             );
             assert!(
-                window.contains("has_subscribe_op"),
-                "SUBSCRIBE relay dispatch must be guarded by has_subscribe_op — \
-                 renewals, PUT sub-ops, and GC-spawned retries that pre-register \
-                 a SubscribeOp must fall through to legacy."
-            );
-        }
-
-        #[test]
-        fn subscribe_branch_dispatches_renewals_through_driver() {
-            const SOURCE: &str = include_str!("node.rs");
-            let anchor = "NetMessageV1::Subscribe(ref op) => {";
-            let branch_start = SOURCE.find(anchor).expect("SUBSCRIBE branch not found");
-            let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<subscribe::SubscribeOp, _>")
-                .expect("SUBSCRIBE branch no longer calls handle_op_request")
-                + branch_start;
-            let window = &SOURCE[branch_start..window_end];
-            // Strip line comments so doc strings that mention the absent
-            // `if !*is_renewal` text as a negative constraint do not
-            // trip the substring scan.
-            let stripped: String = window
-                .lines()
-                .map(|line| match line.find("//") {
-                    Some(idx) => &line[..idx],
-                    None => line,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            // After SUBSCRIBE renewal migration, renewals MUST flow through
-            // `start_relay_subscribe` like non-renewal Requests. The
-            // `is_renewal` flag is propagated to the responder (so it
-            // skips sending state) but the dispatch gate no longer
-            // discriminates on it. Reintroducing `if !*is_renewal {` (or
-            // any equivalent shape — `match is_renewal { true => ... }`,
-            // `if *is_renewal { return ...; }`, etc.) would silently
-            // route renewals back through the legacy state machine and
-            // reopen the asymmetry the migration resolved.
-            assert!(
-                !stripped.contains("if !*is_renewal"),
-                "SUBSCRIBE relay dispatch must NOT special-case `is_renewal` — \
-                 renewals run on the same task-per-tx driver as client-initiated \
-                 SUBSCRIBE after the renewal migration."
-            );
-            assert!(
-                !stripped.contains("if *is_renewal"),
-                "SUBSCRIBE relay dispatch must NOT special-case `is_renewal` — \
-                 (inverted-form check)."
-            );
-            assert!(
-                !stripped.contains("match is_renewal"),
-                "SUBSCRIBE relay dispatch must NOT match on `is_renewal` to \
-                 fork dispatch — every Request goes through start_relay_subscribe."
+                window.contains("handle_unsubscribe_inbound("),
+                "SUBSCRIBE branch must call handle_unsubscribe_inbound for \
+                 Unsubscribe wire messages — replaces the legacy state-machine \
+                 Unsubscribe arm retired in #1454 phase 5 final."
             );
 
-            // Positive assertion: the dispatch site MUST contain the
-            // start_relay_subscribe call. Without this, a refactor that
-            // removes the call and falls through to legacy for ALL
-            // requests would still pass the negative assertions above.
+            // After #1454 phase 5 final (SUBSCRIBE slice), the
+            // originator-loopback case (source_addr=None) is mapped to
+            // upstream=own_addr instead of falling through to legacy.
             assert!(
-                stripped.contains("subscribe::op_ctx_task::start_relay_subscribe("),
-                "SUBSCRIBE relay dispatch must call \
-                 `subscribe::op_ctx_task::start_relay_subscribe` for fresh \
-                 inbound Requests (renewal and non-renewal alike)."
+                window.contains("effective_upstream") || window.contains("upstream_addr"),
+                "SUBSCRIBE relay dispatch must thread an effective upstream address \
+                 (source_addr or own_addr loopback) into the relay driver."
             );
-        }
 
-        #[test]
-        fn subscribe_branch_only_dispatches_request_variant() {
-            const SOURCE: &str = include_str!("node.rs");
-            let anchor = "NetMessageV1::Subscribe(ref op) => {";
-            let branch_start = SOURCE.find(anchor).expect("SUBSCRIBE branch not found");
-            let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<subscribe::SubscribeOp, _>")
-                .expect("SUBSCRIBE branch no longer calls handle_op_request")
-                + branch_start;
-            let window = &SOURCE[branch_start..window_end];
-            // Driver site should only destructure the Request variant.
-            // Unsubscribe/ForwardingAck stay on legacy — binding them
-            // into the relay dispatch would misroute fire-and-forget
-            // cleanup traffic.
+            // Legacy fallthrough and gate must stay deleted. Compose
+            // needles at runtime so the assert source itself does not
+            // contain them.
+            let legacy_dispatch_needle =
+                format!("handle{}::<subscribe::SubscribeOp, _>", "_op_request");
             assert!(
-                !window.contains("SubscribeMsg::Unsubscribe {"),
-                "SUBSCRIBE dispatch must NOT destructure Unsubscribe variant \
-                 for relay driver — fire-and-forget cleanup stays on legacy."
+                !window.contains(&legacy_dispatch_needle),
+                "SUBSCRIBE branch must NOT call legacy state-machine dispatch — \
+                 retired in #1454 phase 5 final (SUBSCRIBE slice)"
             );
+            let dashmap_gate_needle = format!("has{}_op", "_subscribe");
             assert!(
-                !window.contains("SubscribeMsg::ForwardingAck {"),
-                "SUBSCRIBE dispatch must NOT destructure ForwardingAck variant \
-                 for relay driver — fire-and-forget ack stays on legacy."
+                !window.contains(&dashmap_gate_needle),
+                "SUBSCRIBE branch must NOT gate on the retired DashMap existence \
+                 check — retired in #1454 phase 5 final (SUBSCRIBE slice)"
+            );
+
+            // Bypass must precede relay dispatch in source order
+            // (terminal-reply fast path has priority).
+            let bypass_pos = window
+                .find("try_forward_task_per_tx_reply(")
+                .expect("try_forward_task_per_tx_reply not found in SUBSCRIBE branch");
+            let relay_pos = window
+                .find("start_relay_subscribe(")
+                .expect("start_relay_subscribe not found in SUBSCRIBE branch");
+            assert!(
+                bypass_pos < relay_pos,
+                "SUBSCRIBE bypass (try_forward_task_per_tx_reply) must appear \
+                 BEFORE relay dispatch (start_relay_subscribe). Swapping order \
+                 would break the client-driver terminal-reply fast path."
             );
         }
     }

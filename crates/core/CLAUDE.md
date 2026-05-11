@@ -54,7 +54,41 @@ Each file is a state machine:
 Plus task-per-transaction drivers from #1454 Phase 2b onwards:
   subscribe/op_ctx_task.rs → client-initiated SUBSCRIBE driver
                              + fresh inbound relay SUBSCRIBE driver
-                             (Phase 5 follow-up slice A, `start_relay_subscribe`)
+                             (Phase 5 follow-up slice A, `start_relay_subscribe`).
+                             **Phase 5 final (SUBSCRIBE slice)** retired the
+                             legacy carrier: `OpEnum::Subscribe`,
+                             `OpManager.ops.subscribe` DashMap, `impl
+                             Operation for SubscribeOp`, `has_subscribe_op`,
+                             `remove_subscribe_and_notify_timeout`, the
+                             `OpEnum::Subscribe` arm in
+                             `IsOperationCompleted for OpEnum`, the
+                             `OpEnum::Subscribe` arm in the abort
+                             handler, the `try_from_op_enum!(OpEnum::Subscribe, ...)`
+                             macro entry, `OpError::StatePushed` (no
+                             remaining live constructor),
+                             `OpEnum::is_subscription_renewal`, the
+                             `ContractHandlerEvent::NotifySubscriptionError`
+                             / `...ErrorResponse` chain (executor
+                             trait method, bridged helper,
+                             send_subscription_error_to_clients), and
+                             the `handle_op_request<SubscribeOp>`
+                             fallthrough in node.rs are all gone.
+                             Every SUBSCRIBE wire variant dispatches
+                             unconditionally: Request → `start_relay_subscribe`,
+                             Unsubscribe → `handle_unsubscribe_inbound`,
+                             Response → bypass to originator waiter,
+                             ForwardingAck → no-op. The
+                             surviving `OpManager::send_unsubscribe_upstream`
+                             sends Unsubscribe through
+                             `OpCtx::send_fire_and_forget` directly
+                             (bypasses `ops.subscribe`). `SubscribeOp`,
+                             `SubscribeState`, `SubscribeStats`,
+                             `AwaitingResponseData`,
+                             `PrepareRequestData`, `CompletedData`
+                             plus the inline outcome /
+                             failure-routing / wire-format / pin-test
+                             surface survive under module-level
+                             `#![allow(dead_code)]` pending phase 6.
   put/op_ctx_task.rs       → client-initiated PUT driver (Phase 3a)
                              + fresh inbound non-streaming relay PUT
                              driver (Phase 5 follow-up slice A, PR #3917,

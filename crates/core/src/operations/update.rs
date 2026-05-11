@@ -705,8 +705,6 @@ pub(crate) async fn update_contract(
                             | ContractHandlerEvent::GetSummaryResponse { .. }
                             | ContractHandlerEvent::GetDeltaQuery { .. }
                             | ContractHandlerEvent::GetDeltaResponse { .. }
-                            | ContractHandlerEvent::NotifySubscriptionError { .. }
-                            | ContractHandlerEvent::NotifySubscriptionErrorResponse
                             | ContractHandlerEvent::ClientDisconnect { .. } => None,
                         });
 

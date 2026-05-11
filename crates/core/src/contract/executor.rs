@@ -812,9 +812,6 @@ pub(crate) trait ContractExecutor: Send + 'static {
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 
-    /// Notify all subscribed clients for a contract that the subscription has failed.
-    fn notify_subscription_error(&self, key: ContractInstanceId, reason: String);
-
     /// Remove all subscriptions for a disconnected client.
     ///
     /// Default implementation is a no-op (for mock executors that don't track subscriptions).

@@ -53,39 +53,6 @@ fn subscriber_limit_error(instance_id: ContractInstanceId, cause: &str) -> Box<R
     }))
 }
 
-/// Send a subscription error to all clients registered for a contract.
-/// Takes a snapshot of the channels to avoid holding any lock during sends.
-fn send_subscription_error_to_clients(
-    channels: &[(ClientId, tokio::sync::mpsc::Sender<HostResult>)],
-    key: ContractInstanceId,
-    reason: String,
-) {
-    let error: freenet_stdlib::client_api::ClientError =
-        freenet_stdlib::client_api::ErrorKind::OperationError {
-            cause: reason.into(),
-        }
-        .into();
-    for (client_id, sender) in channels {
-        match sender.try_send(Err(error.clone())) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    client = %client_id,
-                    contract = %key,
-                    "Subscriber notification channel full — subscription error dropped"
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::debug!(
-                    client = %client_id,
-                    contract = %key,
-                    "Failed to send subscription error notification (channel closed)"
-                );
-            }
-        }
-    }
-}
-
 // ============================================================================
 // RuntimePool - Pool of executors for concurrent contract execution
 // ============================================================================
@@ -182,8 +149,8 @@ pub struct RuntimePool {
     /// `summarize_contract_state`, `get_contract_state_delta`.
     /// Intentionally NOT tracked in: `execute_delegate_request` (no contract key),
     /// `register_contract_notifier` (synchronous, no executor checkout),
-    /// `lookup_key`, `get_subscription_info`, `notify_subscription_error`,
-    /// `remove_client` (read-only / no executor checkout).
+    /// `lookup_key`, `get_subscription_info`, `remove_client`
+    /// (read-only / no executor checkout).
     in_flight_contracts: HashMap<ContractKey, usize>,
 }
 
@@ -692,16 +659,6 @@ impl ContractExecutor for RuntimePool {
                     .collect::<Vec<_>>()
             })
             .collect()
-    }
-
-    fn notify_subscription_error(&self, key: ContractInstanceId, reason: String) {
-        let channels = self
-            .shared_notifications
-            .get(&key)
-            .map(|e| e.value().clone());
-        if let Some(channels) = channels {
-            send_subscription_error_to_clients(&channels, key, reason);
-        }
     }
 
     /// Remove all subscriptions for a disconnected client.
@@ -1679,16 +1636,6 @@ where
         Ok(())
     }
 
-    pub(super) fn bridged_notify_subscription_error(
-        &self,
-        key: ContractInstanceId,
-        reason: String,
-    ) {
-        if let Some(channels) = self.update_notifications.get(&key) {
-            send_subscription_error_to_clients(channels, key, reason);
-        }
-    }
-
     pub(super) async fn bridged_summarize_contract_state(
         &mut self,
         key: ContractKey,
@@ -2574,10 +2521,6 @@ impl ContractExecutor for Executor<Runtime> {
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         self.get_subscription_info()
-    }
-
-    fn notify_subscription_error(&self, key: ContractInstanceId, reason: String) {
-        self.bridged_notify_subscription_error(key, reason)
     }
 
     async fn summarize_contract_state(

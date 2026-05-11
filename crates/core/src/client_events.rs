@@ -342,8 +342,7 @@ async fn report_op_init_error(
         | OpError::OpNotPresent(_)
         | OpError::OpNotAvailable(_)
         | OpError::StreamCancelled
-        | OpError::OrphanStreamClaimFailed
-        | OpError::StatePushed => ErrorKind::OperationError {
+        | OpError::OrphanStreamClaimFailed => ErrorKind::OperationError {
             cause: format!("{op_name} operation failed: {err}").into(),
         },
     };
