@@ -489,41 +489,6 @@ impl OpManager {
         Ok(())
     }
 
-    /// Non-blocking variant of [`notify_op_change`] that fails fast when the
-    /// notification channel is full instead of blocking for 30 seconds.
-    /// On failure the pushed operation is cleaned up so it does not leak.
-    pub async fn notify_op_change_nonblocking(
-        &self,
-        msg: NetMessage,
-        op: OpEnum,
-    ) -> Result<(), OpError> {
-        let tx = *msg.id();
-        self.push(tx, op).await?;
-
-        match self
-            .to_event_listener
-            .notifications_sender()
-            .try_send(Either::Left(msg))
-        {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    tx = %tx,
-                    channel_pending = self.to_event_listener.notification_channel_pending(),
-                    "notify_op_change_nonblocking: channel full, failing fast"
-                );
-                self.completed(tx);
-                Err(OpError::NotificationChannelError(
-                    "notification channel full (non-blocking send)".into(),
-                ))
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.completed(tx);
-                Err(OpError::NotificationError)
-            }
-        }
-    }
-
     // An early, fast path, return for communicating events in the node to the main message handler,
     // without any transmission in the network whatsoever and avoiding any state transition.
     //
@@ -624,13 +589,15 @@ impl OpManager {
             instance_id,
         });
 
-        let op = OpEnum::Subscribe(crate::operations::subscribe::create_unsubscribe_op(
-            instance_id,
-            tx,
-            target_addr,
-        ));
-
-        match self.notify_op_change_nonblocking(msg, op).await {
+        // #1454 phase 5 final (SUBSCRIBE slice): fire-and-forget the
+        // Unsubscribe wire message through OpCtx instead of pushing a
+        // synthetic SubscribeOp into `ops.subscribe` so the event loop's
+        // `peek_next_hop_addr` lookup can recover the target. The
+        // op-execution channel routes to `OutboundMessageWithTarget`
+        // directly given `Some(target_addr)`; no operation state is
+        // required since Unsubscribe has no reply.
+        let mut ctx = self.op_ctx(tx);
+        match ctx.send_fire_and_forget(target_addr, msg).await {
             Ok(()) => {
                 tracing::debug!(
                     contract = %contract,

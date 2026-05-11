@@ -259,9 +259,11 @@ pub(crate) fn start_op_with_id(
 
 /// Create a SubscribeOp for routing an Unsubscribe message to a target peer.
 ///
-/// The operation is created in `AwaitingResponse` state so `peek_next_hop_addr`
-/// resolves the target address for the event loop's message router.
-/// The caller should mark it completed immediately after sending.
+/// Test fixture only after #1454 phase 5 final (SUBSCRIBE slice).
+/// Production callers now send Unsubscribe through `OpCtx::send_fire_and_forget`
+/// directly from `OpManager::send_unsubscribe_upstream`, bypassing
+/// `ops.subscribe` entirely.
+#[cfg(test)]
 pub(crate) fn create_unsubscribe_op(
     instance_id: ContractInstanceId,
     tx: Transaction,
