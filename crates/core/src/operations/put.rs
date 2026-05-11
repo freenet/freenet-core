@@ -1,185 +1,31 @@
 //! A contract is PUT within a location distance, this entails that all nodes within
 //! a given radius will cache a copy of the contract and it's current value,
 //! as well as will broadcast updates to the contract value to all subscribers.
+//!
+//! #1454 phase 5 final (PUT slice) retired the legacy state machine.
+//! Every PUT wire variant now dispatches unconditionally to a task-per-tx
+//! driver — see `op_ctx_task::start_client_put`, `start_relay_put`, and
+//! `start_relay_put_streaming`.
+//!
+//! Phase 6 (#1454) retired the surviving `#[allow(dead_code)]` scaffolding
+//! (`PutOp`, `PutState`, `PutStats`, `AwaitingResponseData`,
+//! `FinishedData` + the inline outcome / failure-routing / type-state pin
+//! tests). The wire format types (`PutMsg`, `PutStreamingPayload`), the
+//! originator finalization helpers (`finalize_put_at_originator`,
+//! `PutFinalizationData`), and the local-store helper (`put_contract`) all
+//! survive because they are consumed by the task-per-tx drivers.
 
 pub(crate) mod op_ctx_task;
 
 pub(crate) use self::messages::{PutMsg, PutStreamingPayload};
-use freenet_stdlib::{
-    client_api::{ErrorKind, HostResponse},
-    prelude::*,
-};
+use freenet_stdlib::prelude::*;
 
-use super::{OpError, OpOutcome, put};
-
-use crate::node::IsOperationCompleted;
+use super::OpError;
 use crate::{
-    client_events::HostResult,
-    contract::ContractHandlerEvent,
-    message::Transaction,
-    node::OpManager,
-    ring::{Location, PeerKeyLocation},
-    tracing::{NetEventLog, OperationFailure},
+    contract::ContractHandlerEvent, message::Transaction, node::OpManager, ring::PeerKeyLocation,
+    tracing::NetEventLog,
 };
 use either::Either;
-
-/// Routing stats for put operations, used to report success/failure to the router.
-///
-/// `PutStats`, `PutOp`, `PutState`, `AwaitingResponseData`, `FinishedData`
-/// are kept under `#[allow(dead_code)]` after #1454 phase 5 final retired
-/// the legacy state machine. The 25 inline outcome / failure-routing /
-/// wire-format tests in `mod tests` below exercise them as historical
-/// documentation; phase 6 will remove them entirely.
-#[allow(dead_code)]
-struct PutStats {
-    target_peer: PeerKeyLocation,
-    contract_location: Location,
-}
-
-#[allow(dead_code)]
-pub(crate) struct PutOp {
-    pub id: Transaction,
-    state: Option<PutState>,
-    /// The address we received this operation's message from.
-    /// Used for connection-based routing: responses are sent back to this address.
-    upstream_addr: Option<std::net::SocketAddr>,
-    /// Routing stats for reporting outcomes to the router.
-    stats: Option<PutStats>,
-}
-
-#[allow(dead_code)]
-impl PutOp {
-    pub(super) fn outcome(&self) -> OpOutcome<'_> {
-        if self.finalized() {
-            if let Some(ref stats) = self.stats {
-                return OpOutcome::ContractOpSuccessUntimed {
-                    target_peer: &stats.target_peer,
-                    contract_location: stats.contract_location,
-                };
-            }
-            return OpOutcome::Irrelevant;
-        }
-        // Not completed — if we have stats, report as failure
-        if let Some(ref stats) = self.stats {
-            OpOutcome::ContractOpFailure {
-                target_peer: &stats.target_peer,
-                contract_location: stats.contract_location,
-            }
-        } else {
-            OpOutcome::Incomplete
-        }
-    }
-
-    /// Returns true if this PUT was initiated by a local client (not forwarded from a peer).
-    pub(crate) fn is_client_initiated(&self) -> bool {
-        self.upstream_addr.is_none()
-    }
-
-    /// Extract routing failure info for timeout reporting.
-    pub(crate) fn failure_routing_info(&self) -> Option<(PeerKeyLocation, Location)> {
-        self.stats
-            .as_ref()
-            .map(|s| (s.target_peer.clone(), s.contract_location))
-    }
-
-    pub(super) fn finalized(&self) -> bool {
-        self.state.is_none() || matches!(self.state, Some(PutState::Finished(_)))
-    }
-
-    pub(super) fn to_host_result(&self) -> HostResult {
-        if let Some(PutState::Finished(data)) = &self.state {
-            let key = &data.key;
-            Ok(HostResponse::ContractResponse(
-                freenet_stdlib::client_api::ContractResponse::PutResponse { key: *key },
-            ))
-        } else {
-            Err(ErrorKind::OperationError {
-                cause: "put didn't finish successfully".into(),
-            }
-            .into())
-        }
-    }
-
-    /// Get the next hop address if this operation is in a state that needs to send
-    /// an outbound message to a downstream peer.
-    pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
-        match &self.state {
-            Some(PutState::AwaitingResponse(data)) => data.next_hop,
-            _ => None,
-        }
-    }
-
-    /// Get the current HTL (remaining hops) for this operation.
-    /// Returns None if the operation is not in AwaitingResponse state.
-    pub(crate) fn get_current_htl(&self) -> Option<usize> {
-        match &self.state {
-            Some(PutState::AwaitingResponse(data)) => Some(data.current_htl),
-            _ => None,
-        }
-    }
-
-    /// Handle aborted connections.
-    pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
-        tracing::warn!(
-            tx = %self.id,
-            "Put operation aborted due to connection failure"
-        );
-
-        // Extract key and current_htl from state if available
-        let (key, current_htl) = match &self.state {
-            Some(PutState::AwaitingResponse(data)) => (None, Some(data.current_htl)),
-            Some(PutState::Finished(data)) => (Some(data.key), None),
-            None => (None, None),
-        };
-
-        // Calculate hop_count: max_htl - current_htl
-        let hop_count = current_htl.map(|htl| op_manager.ring.max_hops_to_live.saturating_sub(htl));
-
-        // Emit failure event if we have the key
-        if let Some(key) = key {
-            if let Some(event) = NetEventLog::put_failure(
-                &self.id,
-                &op_manager.ring,
-                key,
-                OperationFailure::ConnectionDropped,
-                hop_count,
-            ) {
-                op_manager.ring.register_events(Either::Left(event)).await;
-            }
-        }
-
-        // Create an error result to notify the client
-        let error_result: crate::client_events::HostResult =
-            Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: "Put operation failed: peer connection dropped".into(),
-            }
-            .into());
-
-        // Send the error to the client via the result router.
-        // Use try_send to avoid blocking the event loop (see channel-safety.md).
-        if let Err(err) = op_manager
-            .result_router_tx
-            .try_send((self.id, error_result))
-        {
-            tracing::error!(
-                tx = %self.id,
-                error = %err,
-                "Failed to send abort notification to client \
-                 (result router channel full or closed)"
-            );
-        }
-
-        // Mark the operation as completed so it's removed from tracking
-        op_manager.completed(self.id);
-        Ok(())
-    }
-}
-
-impl IsOperationCompleted for PutOp {
-    fn is_completed(&self) -> bool {
-        matches!(self.state, Some(put::PutState::Finished(_)))
-    }
-}
 
 /// Telemetry data for originator-side PUT finalization.
 pub(super) struct PutFinalizationData {
@@ -192,12 +38,7 @@ pub(super) struct PutFinalizationData {
 /// Originator-side finalization after a PUT has been accepted by the network.
 ///
 /// Emits `put_success` telemetry and, if `subscribe` is true, starts a
-/// post-PUT subscription. Called by both the legacy `process_message`
-/// originator branches and the task-per-tx driver (Phase 3a).
-///
-/// The caller is responsible for constructing and delivering the client
-/// result (`OperationResult::ContinueOp` on the legacy path,
-/// `DriverOutcome::Publish` on the task-per-tx path).
+/// post-PUT subscription. Called by the task-per-tx driver (Phase 3a).
 pub(super) async fn finalize_put_at_originator(
     op_manager: &OpManager,
     id: Transaction,
@@ -248,57 +89,6 @@ async fn start_subscription_after_put(
     );
 }
 
-// State machine for PUT operations.
-//
-// State transitions:
-// - Originator (task-per-tx driver, operations/put/op_ctx_task.rs):
-//   drives the request directly; state enters at AwaitingResponse.
-// - Forwarder (legacy relay path): receives Request → AwaitingResponse →
-//   receives Response → done.
-// - Final node: receives Request → stores contract → sends Response → done.
-//
-// ── Type-state data structs ──────────────────────────────────────────────
-//
-// Each state is a named struct; transition methods encode compile-time
-// guarantees that invalid transitions are unrepresentable.
-
-/// Data for the AwaitingResponse state: waiting for downstream node's response.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct AwaitingResponseData {
-    /// If true, start a subscription after PUT completes (originator only)
-    pub subscribe: bool,
-    /// If true, the PUT response waits for the subscription to complete
-    pub blocking_subscribe: bool,
-    /// Next hop address for routing the outbound message
-    pub next_hop: Option<std::net::SocketAddr>,
-    /// Current HTL (remaining hops) for hop_count calculation.
-    pub current_htl: usize,
-}
-
-/// Data for the Finished state: PUT operation completed successfully.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub struct FinishedData {
-    pub key: ContractKey,
-}
-
-// ── State enum (wraps the typed structs) ─────────────────────────────────
-
-/// State machine for PUT operations.
-/// - Originator (task-per-tx): state enters at AwaitingResponse.
-/// - Forwarder (legacy relay): ReceivedRequest → AwaitingResponse → done.
-/// - Final node: receives Request → stores → sends Response → done.
-#[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
-#[allow(dead_code)]
-pub enum PutState {
-    /// Waiting for response from downstream node.
-    AwaitingResponse(AwaitingResponseData),
-    /// Operation completed successfully.
-    Finished(FinishedData),
-}
-
 /// Stores the contract state and returns (new_state, state_changed).
 /// `state_changed` is true if the stored state was actually modified
 /// (old state != new state), which is needed to trigger UPDATE propagation.
@@ -309,7 +99,6 @@ pub(super) async fn put_contract(
     related_contracts: RelatedContracts<'static>,
     contract: &ContractContainer,
 ) -> Result<(WrappedState, bool), OpError> {
-    // after the contract has been cached, push the update query
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::PutQuery {
             key,
@@ -323,9 +112,8 @@ pub(super) async fn put_contract(
             new_value: Ok(new_val),
             state_changed,
         }) => {
-            // Notify any waiters that this contract has been stored
             op_manager.notify_contract_stored(&key);
-            // Invariant: after a successful PUT, the stored state must be non-empty.
+            // Invariant: after a successful PUT the stored state must be non-empty.
             // A successful PutResponse with an empty value indicates a contract handler bug.
             debug_assert!(
                 new_val.size() > 0,
@@ -339,7 +127,6 @@ pub(super) async fn put_contract(
         }) => {
             tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
             Err(OpError::from(err))
-            // TODO: not a valid value update, notify back to requester
         }
         Err(err) => Err(err.into()),
         Ok(_) => Err(OpError::UnexpectedOpState),
@@ -520,123 +307,6 @@ mod tests {
     use crate::message::{InnerMessage, Transaction};
     use crate::operations::test_utils::make_contract_key;
 
-    fn make_put_op(state: Option<PutState>) -> PutOp {
-        PutOp {
-            id: Transaction::new::<PutMsg>(),
-            state,
-            upstream_addr: None,
-            stats: None,
-        }
-    }
-
-    // Tests for finalized() method
-    #[test]
-    fn put_op_finalized_when_state_is_none() {
-        let op = make_put_op(None);
-        assert!(
-            op.finalized(),
-            "PutOp should be finalized when state is None"
-        );
-    }
-
-    #[test]
-    fn put_op_finalized_when_state_is_finished() {
-        let op = make_put_op(Some(PutState::Finished(FinishedData {
-            key: make_contract_key(1),
-        })));
-        assert!(
-            op.finalized(),
-            "PutOp should be finalized when state is Finished"
-        );
-    }
-
-    #[test]
-    fn put_op_not_finalized_when_awaiting_response() {
-        let op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
-            subscribe: false,
-            blocking_subscribe: false,
-            next_hop: None,
-            current_htl: 10,
-        })));
-        assert!(
-            !op.finalized(),
-            "PutOp should not be finalized in AwaitingResponse state"
-        );
-    }
-
-    // Tests for to_host_result() method
-    #[test]
-    fn put_op_to_host_result_success_when_finished() {
-        let key = make_contract_key(1);
-        let op = make_put_op(Some(PutState::Finished(FinishedData { key })));
-        let result = op.to_host_result();
-        assert!(
-            result.is_ok(),
-            "to_host_result should return Ok for Finished state"
-        );
-
-        if let Ok(HostResponse::ContractResponse(
-            freenet_stdlib::client_api::ContractResponse::PutResponse { key: returned_key },
-        )) = result
-        {
-            assert_eq!(returned_key, key, "Returned key should match");
-        } else {
-            panic!("Expected PutResponse");
-        }
-    }
-
-    #[test]
-    fn put_op_to_host_result_error_when_not_finished() {
-        let op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
-            subscribe: false,
-            blocking_subscribe: false,
-            next_hop: None,
-            current_htl: 10,
-        })));
-        let result = op.to_host_result();
-        assert!(
-            result.is_err(),
-            "to_host_result should return Err for non-Finished state"
-        );
-    }
-
-    #[test]
-    fn put_op_to_host_result_error_when_none() {
-        let op = make_put_op(None);
-        let result = op.to_host_result();
-        assert!(
-            result.is_err(),
-            "to_host_result should return Err when state is None"
-        );
-    }
-
-    // Tests for is_completed() trait method
-    #[test]
-    fn put_op_is_completed_when_finished() {
-        let op = make_put_op(Some(PutState::Finished(FinishedData {
-            key: make_contract_key(1),
-        })));
-        assert!(
-            op.is_completed(),
-            "is_completed should return true for Finished state"
-        );
-    }
-
-    #[test]
-    fn put_op_is_not_completed_when_in_progress() {
-        let op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
-            subscribe: false,
-            blocking_subscribe: false,
-            next_hop: None,
-            current_htl: 10,
-        })));
-        assert!(
-            !op.is_completed(),
-            "is_completed should return false for AwaitingResponse state"
-        );
-    }
-
-    // Tests for PutMsg helper methods
     #[test]
     fn put_msg_id_returns_transaction() {
         let tx = Transaction::new::<PutMsg>();
@@ -661,312 +331,6 @@ mod tests {
         );
     }
 
-    // Tests for blocking_subscribe propagation on AwaitingResponse state.
-    //
-    // Replace deleted `start_op_*` constructor tests: since the
-    // task-per-tx driver (operations/put/op_ctx_task.rs) owns the
-    // originator path, the `PrepareRequest` state was removed and the
-    // first reachable PutState is AwaitingResponse. These tests lock
-    // the behavior the deleted tests covered (blocking_subscribe
-    // propagation, stats-none on fresh op) against the new shape.
-
-    fn awaiting_response_data(subscribe: bool, blocking_subscribe: bool) -> AwaitingResponseData {
-        AwaitingResponseData {
-            subscribe,
-            blocking_subscribe,
-            next_hop: None,
-            current_htl: 10,
-        }
-    }
-
-    #[test]
-    fn awaiting_response_carries_blocking_subscribe_true() {
-        let op = make_put_op(Some(PutState::AwaitingResponse(awaiting_response_data(
-            true, true,
-        ))));
-        match op.state {
-            Some(PutState::AwaitingResponse(data)) => assert!(
-                data.blocking_subscribe,
-                "blocking_subscribe should be true in AwaitingResponse"
-            ),
-            other => panic!("Expected AwaitingResponse state, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn awaiting_response_with_explicit_tx_carries_blocking_subscribe_true() {
-        // Covers the removed start_op_with_id_propagates_blocking_subscribe_true:
-        // verify an explicit tx is preserved on the originator-side state.
-        let tx = Transaction::new::<PutMsg>();
-        let op = PutOp {
-            id: tx,
-            state: Some(PutState::AwaitingResponse(awaiting_response_data(
-                true, true,
-            ))),
-            upstream_addr: None,
-            stats: None,
-        };
-        assert_eq!(op.id, tx, "explicit tx must round-trip into PutOp.id");
-        match op.state {
-            Some(PutState::AwaitingResponse(data)) => assert!(
-                data.blocking_subscribe,
-                "blocking_subscribe carries through AwaitingResponse when constructed with explicit tx"
-            ),
-            other => panic!("Expected AwaitingResponse state, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn awaiting_response_defaults_blocking_subscribe_false() {
-        // Covers the removed start_op_defaults_blocking_subscribe_false:
-        // subscribe=true + blocking_subscribe=false is a valid combo.
-        let op = make_put_op(Some(PutState::AwaitingResponse(awaiting_response_data(
-            true, false,
-        ))));
-        match op.state {
-            Some(PutState::AwaitingResponse(data)) => assert!(
-                !data.blocking_subscribe,
-                "blocking_subscribe should be false when unset, even if subscribe=true"
-            ),
-            other => panic!("Expected AwaitingResponse state, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn fresh_awaiting_response_op_has_no_stats() {
-        // Covers the removed start_op_creates_put_with_no_stats: a freshly
-        // spawned originator-side PutOp has stats=None until a target peer
-        // is chosen, so outcome() must be Incomplete.
-        let op = make_put_op(Some(PutState::AwaitingResponse(awaiting_response_data(
-            false, false,
-        ))));
-        assert!(
-            op.stats.is_none(),
-            "fresh AwaitingResponse PutOp should have stats=None"
-        );
-        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
-    }
-
-    // Tests for outcome() method
-    #[test]
-    fn put_op_outcome_success_untimed_when_finalized_with_stats() {
-        use crate::operations::OpOutcome;
-        use crate::ring::{Location, PeerKeyLocation};
-
-        let target_peer = PeerKeyLocation::random();
-        let contract_location = Location::random();
-        let op = PutOp {
-            id: Transaction::new::<PutMsg>(),
-            state: Some(PutState::Finished(FinishedData {
-                key: make_contract_key(1),
-            })),
-            upstream_addr: None,
-            stats: Some(PutStats {
-                target_peer: target_peer.clone(),
-                contract_location,
-            }),
-        };
-        match op.outcome() {
-            OpOutcome::ContractOpSuccessUntimed {
-                target_peer: peer,
-                contract_location: loc,
-            } => {
-                assert_eq!(*peer, target_peer);
-                assert_eq!(loc, contract_location);
-            }
-            OpOutcome::ContractOpSuccess { .. }
-            | OpOutcome::ContractOpFailure { .. }
-            | OpOutcome::Incomplete
-            | OpOutcome::Irrelevant => {
-                panic!("Expected ContractOpSuccessUntimed for finalized put with stats")
-            }
-        }
-    }
-
-    #[test]
-    fn put_op_outcome_irrelevant_when_finalized_without_stats() {
-        use crate::operations::OpOutcome;
-
-        let op = PutOp {
-            id: Transaction::new::<PutMsg>(),
-            state: Some(PutState::Finished(FinishedData {
-                key: make_contract_key(1),
-            })),
-            upstream_addr: None,
-            stats: None,
-        };
-        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
-    }
-
-    #[test]
-    fn put_op_outcome_failure_when_not_finalized_with_stats() {
-        use crate::operations::OpOutcome;
-        use crate::ring::{Location, PeerKeyLocation};
-
-        let target_peer = PeerKeyLocation::random();
-        let contract_location = Location::random();
-        let op = PutOp {
-            id: Transaction::new::<PutMsg>(),
-            state: Some(PutState::AwaitingResponse(AwaitingResponseData {
-                subscribe: false,
-                blocking_subscribe: false,
-                next_hop: None,
-                current_htl: 10,
-            })),
-            upstream_addr: None,
-            stats: Some(PutStats {
-                target_peer: target_peer.clone(),
-                contract_location,
-            }),
-        };
-        match op.outcome() {
-            OpOutcome::ContractOpFailure {
-                target_peer: peer,
-                contract_location: loc,
-            } => {
-                assert_eq!(*peer, target_peer);
-                assert_eq!(loc, contract_location);
-            }
-            OpOutcome::ContractOpSuccess { .. }
-            | OpOutcome::ContractOpSuccessUntimed { .. }
-            | OpOutcome::Incomplete
-            | OpOutcome::Irrelevant => {
-                panic!("Expected ContractOpFailure for non-finalized put with stats")
-            }
-        }
-    }
-
-    #[test]
-    fn put_op_outcome_incomplete_when_not_finalized_without_stats() {
-        use crate::operations::OpOutcome;
-
-        let op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
-            subscribe: false,
-            blocking_subscribe: false,
-            next_hop: None,
-            current_htl: 10,
-        })));
-        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
-    }
-
-    #[test]
-    fn put_op_failure_routing_info_with_stats() {
-        use crate::ring::{Location, PeerKeyLocation};
-
-        let target_peer = PeerKeyLocation::random();
-        let contract_location = Location::random();
-        let op = PutOp {
-            id: Transaction::new::<PutMsg>(),
-            state: None,
-            upstream_addr: None,
-            stats: Some(PutStats {
-                target_peer: target_peer.clone(),
-                contract_location,
-            }),
-        };
-        let info = op.failure_routing_info().expect("should have routing info");
-        assert_eq!(info.0, target_peer);
-        assert_eq!(info.1, contract_location);
-    }
-
-    #[test]
-    fn put_op_failure_routing_info_without_stats() {
-        let op = make_put_op(None);
-        assert!(op.failure_routing_info().is_none());
-    }
-
-    /// Simulate a put operation lifecycle: initially no stats (state=None),
-    /// then stats are set when forwarding, then state is Finished →
-    /// outcome should be SuccessUntimed.
-    #[test]
-    fn put_op_stats_lifecycle_from_initial_to_finished() {
-        use crate::ring::{Location, PeerKeyLocation};
-
-        let target_peer = PeerKeyLocation::random();
-        let contract_location = Location::random();
-
-        // Step 1: Initial state - in-flight AwaitingResponse, no stats yet
-        let mut op = make_put_op(Some(PutState::AwaitingResponse(AwaitingResponseData {
-            subscribe: false,
-            blocking_subscribe: false,
-            next_hop: None,
-            current_htl: 10,
-        })));
-        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
-        assert!(op.failure_routing_info().is_none());
-
-        // Step 2: Stats are set when forwarding to next peer
-        op.stats = Some(PutStats {
-            target_peer: target_peer.clone(),
-            contract_location,
-        });
-        // Not finalized yet, but has stats → failure
-        match op.outcome() {
-            OpOutcome::ContractOpFailure {
-                target_peer: peer, ..
-            } => assert_eq!(*peer, target_peer),
-            OpOutcome::ContractOpSuccess { .. }
-            | OpOutcome::ContractOpSuccessUntimed { .. }
-            | OpOutcome::Incomplete
-            | OpOutcome::Irrelevant => {
-                panic!("Expected ContractOpFailure for in-progress put with stats")
-            }
-        }
-        assert!(op.failure_routing_info().is_some());
-
-        // Step 3: Operation finishes successfully
-        op.state = Some(PutState::Finished(FinishedData {
-            key: make_contract_key(1),
-        }));
-        match op.outcome() {
-            OpOutcome::ContractOpSuccessUntimed {
-                target_peer: peer,
-                contract_location: loc,
-            } => {
-                assert_eq!(*peer, target_peer);
-                assert_eq!(loc, contract_location);
-            }
-            OpOutcome::ContractOpSuccess { .. }
-            | OpOutcome::ContractOpFailure { .. }
-            | OpOutcome::Incomplete
-            | OpOutcome::Irrelevant => {
-                panic!("Expected ContractOpSuccessUntimed for finished put with stats")
-            }
-        }
-    }
-
-    /// Verify that a forwarding node (state=None, stats=None) returns Irrelevant
-    /// since it is finalized (state is None) but has no routing decision to report.
-    #[test]
-    fn put_op_forwarding_node_outcome_is_irrelevant() {
-        let op = PutOp {
-            id: Transaction::new::<PutMsg>(),
-            state: None,
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-            stats: None,
-        };
-        // state=None → finalized, stats=None → Irrelevant
-        assert!(op.finalized());
-        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
-    }
-
-    #[test]
-    fn is_client_initiated_true_when_no_upstream() {
-        let op = make_put_op(None);
-        assert!(op.is_client_initiated());
-    }
-
-    #[test]
-    fn is_client_initiated_false_when_forwarded() {
-        let op = PutOp {
-            id: Transaction::new::<PutMsg>(),
-            state: None,
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-            stats: None,
-        };
-        assert!(!op.is_client_initiated());
-    }
-
     #[test]
     fn test_forwarding_ack_serde_roundtrip() {
         let tx = Transaction::new::<PutMsg>();
@@ -986,151 +350,6 @@ mod tests {
             }
             other => panic!("Expected ForwardingAck, got {other}"),
         }
-    }
-
-    // ── Intermediate node stats tracking tests (#3527) ─────────────────────
-
-    /// Non-finalized PUT with stats reports ContractOpFailure on timeout.
-    #[test]
-    fn test_put_failure_outcome_with_stats() {
-        use crate::operations::test_utils::make_peer;
-        let target = make_peer(9001);
-        let contract_key = make_contract_key(42);
-        let contract_location = Location::from(&contract_key);
-
-        let op = PutOp {
-            id: Transaction::new::<PutMsg>(),
-            state: Some(PutState::AwaitingResponse(AwaitingResponseData {
-                subscribe: false,
-                blocking_subscribe: false,
-                current_htl: 10,
-                next_hop: target.socket_addr(),
-            })),
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-            stats: Some(PutStats {
-                target_peer: target.clone(),
-                contract_location,
-            }),
-        };
-
-        assert!(!op.finalized());
-        match op.outcome() {
-            OpOutcome::ContractOpFailure {
-                target_peer,
-                contract_location: loc,
-            } => {
-                assert_eq!(target_peer, &target);
-                assert_eq!(loc, contract_location);
-            }
-            other => panic!("Expected ContractOpFailure, got {:?}", other),
-        }
-    }
-
-    /// Non-finalized PUT without stats reports Incomplete.
-    #[test]
-    fn test_put_failure_outcome_without_stats() {
-        let op = PutOp {
-            id: Transaction::new::<PutMsg>(),
-            state: Some(PutState::AwaitingResponse(AwaitingResponseData {
-                subscribe: false,
-                blocking_subscribe: false,
-                current_htl: 10,
-                next_hop: None,
-            })),
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-            stats: None,
-        };
-
-        assert!(!op.finalized());
-        assert!(
-            matches!(op.outcome(), OpOutcome::Incomplete),
-            "PUT without stats should return Incomplete"
-        );
-    }
-
-    // === Pins for retired PUT GC speculative retry surface (PR #3964) ===
-    //
-    // These pins catch accidental re-introduction of the retired
-    // ack-aware speculative retry mechanism. The surface was retired
-    // because PutOp entries no longer leak into `OpManager.ops.put`
-    // for completed task-per-tx originators (the leak was fixed by
-    // extending `OpManager::completed` to remove the per-type
-    // DashMap entry).
-
-    /// Pin: `PutOp` MUST NOT regrow `speculative_paths` / `ack_received`
-    /// fields. The GC speculative retry block (deleted in PR #3964) was
-    /// the only consumer; reintroducing the fields silently brings back
-    /// the dead-code surface.
-    #[test]
-    fn put_op_must_not_regrow_speculative_or_ack_fields() {
-        let src = include_str!("put.rs");
-        let struct_start = src
-            .find("pub(crate) struct PutOp {")
-            .expect("PutOp struct declaration not found");
-        let struct_end = src[struct_start..]
-            .find("\n}\n")
-            .expect("PutOp struct closing brace not found")
-            + struct_start;
-        let struct_body = &src[struct_start..struct_end];
-        assert!(
-            !struct_body.contains("speculative_paths"),
-            "PutOp must not regrow `speculative_paths` — retired in PR #3964"
-        );
-        assert!(
-            !struct_body.contains("ack_received"),
-            "PutOp must not regrow `ack_received` — retired in PR #3964"
-        );
-    }
-
-    /// Pin: `AwaitingResponseData` MUST NOT regrow the retry-related
-    /// fields (alternatives, tried_peers, attempts_at_hop, visited,
-    /// retry_payload, contract_key). They existed only to feed
-    /// `retry_with_next_alternative`, which was deleted with the GC
-    /// speculative retry block.
-    #[test]
-    fn awaiting_response_data_must_not_regrow_retry_fields() {
-        let src = include_str!("put.rs");
-        let struct_start = src
-            .find("pub struct AwaitingResponseData {")
-            .expect("AwaitingResponseData struct declaration not found");
-        let struct_end = src[struct_start..]
-            .find("\n}\n")
-            .expect("AwaitingResponseData closing brace not found")
-            + struct_start;
-        let body = &src[struct_start..struct_end];
-        for retired in [
-            "alternatives",
-            "tried_peers",
-            "attempts_at_hop",
-            "visited",
-            "retry_payload",
-            "contract_key",
-        ] {
-            assert!(
-                !body.contains(retired),
-                "AwaitingResponseData must not regrow `{retired}` — retired in PR #3964"
-            );
-        }
-    }
-
-    /// Pin: the retired retry-with-next-alternative impl method MUST
-    /// stay deleted. Reintroducing it implies regrowing the
-    /// retry-related fields (which the previous pin guards) and
-    /// bringing back the GC speculative retry block.
-    #[test]
-    fn retry_method_signature_must_stay_deleted() {
-        let src = include_str!("put.rs");
-        // Compose the needle at runtime so the pin's own source line
-        // does not contain the literal we're searching for.
-        let needle = format!(
-            "{vis} fn retry_with_next_{kind}",
-            vis = "pub(crate)",
-            kind = "alternative",
-        );
-        assert!(
-            !src.contains(&needle),
-            "retry method retired in PR #3964 — see PutOp pins"
-        );
     }
 
     /// Pin: PUT GC speculative retry block MUST NOT come back.
@@ -1166,15 +385,11 @@ mod tests {
             .expect("OpManager::completed closing brace not found")
             + fn_start;
         let body = &src[fn_start..fn_end];
-        // CONNECT is the only surviving DashMap with a task-per-tx
-        // leak risk after #1454 phase 5 final.
         assert!(
             body.contains("self.ops.connect.remove"),
             "OpManager::completed must call `self.ops.connect.remove(&id)` \
              to prevent the Phase 3a-style task-per-tx DashMap leak"
         );
-        // PUT removed in PUT slice of phase 5 final; GET in GET slice;
-        // SUBSCRIBE in SUBSCRIBE slice.
         for retired in ["self.ops.put", "self.ops.get", "self.ops.subscribe"] {
             assert!(
                 !body.contains(retired),
@@ -1191,8 +406,6 @@ mod tests {
     #[test]
     fn put_forwarding_ack_senders_must_stay_deleted() {
         let src = include_str!("put.rs");
-        // Compose the needle at runtime so the pin's own assert line
-        // does not contain the literal we're searching for.
         let needle = format!("NetMessage::from({}::ForwardingAck", "PutMsg",);
         assert!(
             !src.contains(&needle),
