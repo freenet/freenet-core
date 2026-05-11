@@ -4,7 +4,7 @@
 //! The local API server returns a "shell" page that holds the auth token and
 //! proxies WebSocket connections via postMessage, while the contract runs in an
 //! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals"
-//!         allow="clipboard-read; clipboard-write">`
+//!         allow="clipboard-read; clipboard-write; notifications; ...">`
 //! with an opaque origin that cannot access other contracts' data.
 //! Popups inherit the sandbox (no `allow-popups-to-escape-sandbox`); external links
 //! are opened via the `open_url` shell bridge message to avoid CORS issues. Sandbox content
@@ -30,6 +30,7 @@ use super::{
     app_packaging::{WebApp, WebContractError},
     client_api::HttpClientApiRequest,
     errors::WebSocketApiError,
+    web_permissions::{self, WebAppPermissionStore},
 };
 use tracing::{debug, instrument};
 
@@ -63,6 +64,7 @@ pub(super) async fn contract_home(
     assigned_token: AuthToken,
     api_version: ApiVersion,
     query_string: Option<String>,
+    permission_store: WebAppPermissionStore,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let instance_id = ContractInstanceId::from_bytes(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
@@ -81,10 +83,31 @@ pub(super) async fn contract_home(
     )
     .await?;
 
+    let contract_path = contract_web_path(&instance_id);
+    let manifest = web_permissions::load_manifest(&contract_path).await?;
+    let force_prompt = query_string
+        .as_ref()
+        .map(|qs| qs.split('&').any(|p| p == "permissions=retry"))
+        .unwrap_or(false);
+    let iframe_permissions = web_permissions::iframe_permissions(
+        &permission_store,
+        &instance_id,
+        &key,
+        manifest,
+        force_prompt,
+    )
+    .await;
+
     // Return the shell page instead of the contract HTML directly.
     // The shell page wraps the contract in a sandboxed iframe for
     // origin isolation (GHSA-824h-7x5x-wfmf).
-    match shell_page(&assigned_token, &key, api_version, query_string) {
+    match shell_page(
+        &assigned_token,
+        &key,
+        api_version,
+        query_string,
+        iframe_permissions,
+    ) {
         Ok(b) => Ok(b.into_response()),
         Err(err) => {
             tracing::error!("Failed to generate shell page: {err}");
@@ -414,7 +437,15 @@ fn shell_page(
     contract_key: &str,
     api_version: ApiVersion,
     query_string: Option<String>,
-) -> Result<impl IntoResponse, WebSocketApiError> {
+    iframe_permissions: web_permissions::IframePermissions,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    if let Some(prompt) = iframe_permissions.prompt {
+        return Ok(
+            web_permissions::prompt_html(&prompt, api_version, query_string.as_deref())
+                .into_response(),
+        );
+    }
+
     let version_prefix = api_version.prefix();
     let base_path = format!("/{version_prefix}/contract/web/{contract_key}/");
 
@@ -449,6 +480,8 @@ fn shell_page(
     // While browsers typically percent-encode special chars in URLs, we must not
     // rely on that for defense-in-depth.
     let iframe_src = html_escape_attr(&iframe_src_raw);
+    let sandbox_attr = html_escape_attr(&iframe_permissions.sandbox_attr);
+    let allow_attr = html_escape_attr(&iframe_permissions.allow_attr);
 
     // auth_token is base58 (alphanumeric only), safe for unescaped interpolation.
     let auth_token = auth_token.as_str();
@@ -471,7 +504,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write" data-src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="{sandbox_attr}" allow="{allow_attr}" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -480,7 +513,7 @@ fn shell_page(
 </html>"##
     );
 
-    Ok(Html(html))
+    Ok(Html(html).into_response())
 }
 
 /// Serves the contract's actual HTML content for display inside the sandboxed iframe.
@@ -1714,7 +1747,7 @@ fn webapp_cache_dir() -> PathBuf {
         .join("webapp_cache")
 }
 
-fn contract_web_path(instance_id: &ContractInstanceId) -> PathBuf {
+pub(super) fn contract_web_path(instance_id: &ContractInstanceId) -> PathBuf {
     webapp_cache_dir().join(instance_id.encode())
 }
 
@@ -1741,6 +1774,29 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel::<ClientConnection>(4);
         (HttpClientApiRequest::from_sender(tx), rx)
+    }
+
+    fn default_iframe_permissions() -> web_permissions::IframePermissions {
+        web_permissions::IframePermissions {
+            sandbox_attr: web_permissions::TIER1_SANDBOX.join(" "),
+            allow_attr: web_permissions::TIER1_ALLOW.join("; "),
+            prompt: None,
+        }
+    }
+
+    fn test_shell_page(
+        auth_token: &AuthToken,
+        contract_key: &str,
+        api_version: ApiVersion,
+        query_string: Option<String>,
+    ) -> Result<impl IntoResponse, WebSocketApiError> {
+        shell_page(
+            auth_token,
+            contract_key,
+            api_version,
+            query_string,
+            default_iframe_permissions(),
+        )
     }
 
     /// Clears any webapp cache state for `instance_id` on disk. `contract_web_path`
@@ -2083,7 +2139,8 @@ mod tests {
         // Lock the token in so a future refactor does not regress the fix.
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap())
+                .await;
         assert!(
             html.contains("allow-downloads"),
             "iframe sandbox missing `allow-downloads` — user-initiated \
@@ -2096,7 +2153,8 @@ mod tests {
     async fn shell_page_contains_iframe_and_bridge() {
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap())
+                .await;
 
         // Shell page must contain sandboxed iframe
         assert!(
@@ -2107,7 +2165,7 @@ mod tests {
         );
         // Iframe must grant clipboard via permissions-policy
         assert!(
-            html.contains(r#"allow="clipboard-read; clipboard-write""#),
+            html.contains(r#"allow="clipboard-read; clipboard-write; notifications"#),
             "iframe permissions-policy missing clipboard grants"
         );
         // Iframe src must include __sandbox=1
@@ -2170,7 +2228,8 @@ mod tests {
     async fn shell_page_permission_overlay_present_and_safe() {
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap())
+                .await;
 
         // Overlay root and accessibility attributes
         assert!(
@@ -2343,13 +2402,14 @@ mod tests {
     async fn shell_page_iframe_uses_data_src_for_deep_linking() {
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap())
+                .await;
 
         // The iframe must NOT have a src attribute (which would trigger an
         // immediate load before JS can append the hash fragment).
         assert!(
             !html.contains(
-                r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads" src="#
+                r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write; notifications; persistent-storage; fullscreen; autoplay; picture-in-picture" src="#
             ),
             "iframe must use data-src, not src, to avoid loading before JS appends the hash"
         );
@@ -2365,7 +2425,7 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("invitation=abc123&room=test".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
 
         // Query params should be forwarded to iframe src
         assert!(
@@ -2477,7 +2537,7 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("__sandbox_extra=evil&invitation=abc&__sandboxFoo=bar".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
 
         // __sandbox-prefixed params must be stripped
         assert!(
@@ -2509,7 +2569,7 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("authToken=attacker_value&invite=abc&authTokenExtra=x".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
         assert!(
             !html.contains("attacker_value"),
             "attacker-supplied authToken value must not reach iframe src"
@@ -2536,7 +2596,7 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("foo=\"><script>alert(1)</script>".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
 
         // The double quote and angle brackets must be escaped
         assert!(
