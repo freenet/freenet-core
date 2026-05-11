@@ -1151,10 +1151,10 @@ mod tests {
     }
 
     /// Pin: `OpManager::completed` MUST keep removing the per-type
-    /// DashMap entry for the remaining DashMap-backed ops (Connect,
-    /// Get, Subscribe). PUT and UPDATE no longer have DashMap entries
+    /// DashMap entry for the remaining DashMap-backed op (Connect).
+    /// GET, PUT, UPDATE and SUBSCRIBE no longer have DashMap entries
     /// post-#1454 phase 5 final. Without this the Phase 3a-style leak
-    /// comes back for the remaining ops.
+    /// comes back for the remaining op.
     #[test]
     fn completed_must_remove_per_type_dashmap_entry() {
         let src = include_str!("../node/op_state_manager.rs");
@@ -1166,15 +1166,16 @@ mod tests {
             .expect("OpManager::completed closing brace not found")
             + fn_start;
         let body = &src[fn_start..fn_end];
-        // SUBSCRIBE is the only surviving DashMap with a task-per-tx
-        // leak risk after #1454 phase 5 final (GET/PUT/UPDATE retired).
+        // CONNECT is the only surviving DashMap with a task-per-tx
+        // leak risk after #1454 phase 5 final.
         assert!(
-            body.contains("self.ops.subscribe.remove"),
-            "OpManager::completed must call `self.ops.subscribe.remove(&id)` \
+            body.contains("self.ops.connect.remove"),
+            "OpManager::completed must call `self.ops.connect.remove(&id)` \
              to prevent the Phase 3a-style task-per-tx DashMap leak"
         );
-        // PUT removed in PUT slice of phase 5 final; GET in GET slice.
-        for retired in ["self.ops.put", "self.ops.get"] {
+        // PUT removed in PUT slice of phase 5 final; GET in GET slice;
+        // SUBSCRIBE in SUBSCRIBE slice.
+        for retired in ["self.ops.put", "self.ops.get", "self.ops.subscribe"] {
             assert!(
                 !body.contains(retired),
                 "OpManager::completed must not reference `{retired}` after \

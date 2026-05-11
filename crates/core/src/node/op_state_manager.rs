@@ -33,7 +33,6 @@ use crate::{
         OpCtx, OpEnum, OpError,
         connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
         orphan_streams::OrphanStreamRegistry,
-        subscribe::SubscribeOp,
     },
     ring::{
         ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
@@ -68,15 +67,14 @@ pub(crate) enum OpNotAvailable {
 #[derive(Default)]
 struct Ops {
     connect: DashMap<Transaction, crate::operations::connect::ConnectOp>,
-    subscribe: DashMap<Transaction, SubscribeOp>,
-    // `get`, `put` and `update` DashMaps retired in #1454 phase 5 final
-    // (UPDATE slice, PUT slice, GET slice): every wire path
-    // (client + non-streaming relay + streaming relay) now runs on
-    // `op_ctx_task::*` task-per-tx drivers that own their state in
-    // task locals. The legacy `Operation` impl, the `request_*` /
-    // `start_op*` originator helpers, and the
-    // `OpEnum::{Get,Put,Update}` carriers were deleted in earlier
-    // commits.
+    // `get`, `put`, `update` and `subscribe` DashMaps retired in #1454
+    // phase 5 final (UPDATE slice, PUT slice, GET slice, SUBSCRIBE
+    // slice): every wire path (client + non-streaming relay + streaming
+    // relay) now runs on `op_ctx_task::*` task-per-tx drivers that own
+    // their state in task locals. The legacy `Operation` impls, the
+    // `request_*` / `start_op*` originator helpers, and the
+    // `OpEnum::{Get,Put,Update,Subscribe}` carriers were deleted in
+    // earlier commits.
     completed: DashSet<Transaction>,
     under_progress: DashSet<Transaction>,
 }
@@ -88,7 +86,6 @@ struct Ops {
 #[derive(Debug, Default)]
 struct OpsSizes {
     connect: usize,
-    subscribe: usize,
     completed: usize,
     under_progress: usize,
 }
@@ -97,7 +94,6 @@ impl Ops {
     fn sizes(&self) -> OpsSizes {
         OpsSizes {
             connect: self.connect.len(),
-            subscribe: self.subscribe.len(),
             completed: self.completed.len(),
             under_progress: self.under_progress.len(),
         }
@@ -305,7 +301,6 @@ impl OpManager {
                     result_router_tx.clone(),
                     request_router.clone(),
                     ring.clone(),
-                    ch_outbound.clone(),
                     contract_waiters.clone(),
                     pending_contract_fetches.clone(),
                     active_relay_get_txs.clone(),
@@ -432,97 +427,12 @@ impl OpManager {
     /// If the channel is full for this long, the event loop is stuck and sending will never succeed.
     const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// An early, fast path, return for communicating back changes of on-going operations
-    /// in the node to the main message handler, without any transmission in the network whatsoever.
-    ///
-    /// Useful when transitioning between states that do not require any network communication
-    /// with other nodes, like intermediate states before returning.
-    pub async fn notify_op_change(&self, msg: NetMessage, op: OpEnum) -> Result<(), OpError> {
-        let tx = *msg.id();
-        let peer_id = &self.ring.connection_manager.pub_key;
-        tracing::debug!(
-            tx = %tx,
-            msg_type = %msg,
-            peer = %peer_id,
-            "notify_op_change: Pushing operation and sending notification"
-        );
-
-        // push back the state to the stack
-        self.push(tx, op).await?;
-
-        tracing::debug!(
-            tx = %tx,
-            peer = %peer_id,
-            "notify_op_change: Operation pushed, sending to event listener"
-        );
-
-        match tokio::time::timeout(
-            Self::NOTIFICATION_SEND_TIMEOUT,
-            self.to_event_listener
-                .notifications_sender()
-                .send(Either::Left(msg)),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(OpError::NotificationError),
-            Err(_) => {
-                tracing::error!(
-                    tx = %tx,
-                    timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
-                    channel_pending = self.to_event_listener.notification_channel_pending(),
-                    channel_remaining = self.to_event_listener.notifications_sender().capacity(),
-                    "notify_op_change: Notification channel full for too long, event loop may be stuck"
-                );
-                return Err(OpError::NotificationChannelError(
-                    "notification channel send timed out — event loop is likely stuck".into(),
-                ));
-            }
-        }
-
-        tracing::debug!(
-            tx = %tx,
-            peer = %peer_id,
-            "notify_op_change: Notification sent successfully"
-        );
-
-        Ok(())
-    }
-
-    /// Non-blocking variant of [`notify_op_change`] that fails fast when the
-    /// notification channel is full instead of blocking for 30 seconds.
-    /// On failure the pushed operation is cleaned up so it does not leak.
-    pub async fn notify_op_change_nonblocking(
-        &self,
-        msg: NetMessage,
-        op: OpEnum,
-    ) -> Result<(), OpError> {
-        let tx = *msg.id();
-        self.push(tx, op).await?;
-
-        match self
-            .to_event_listener
-            .notifications_sender()
-            .try_send(Either::Left(msg))
-        {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    tx = %tx,
-                    channel_pending = self.to_event_listener.notification_channel_pending(),
-                    "notify_op_change_nonblocking: channel full, failing fast"
-                );
-                self.completed(tx);
-                Err(OpError::NotificationChannelError(
-                    "notification channel full (non-blocking send)".into(),
-                ))
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.completed(tx);
-                Err(OpError::NotificationError)
-            }
-        }
-    }
+    // `notify_op_change` was the legacy state-machine re-entry primitive
+    // (push to ops DashMap + send NetMessage on notifications channel).
+    // Retired in #1454 phase 5 final after all five ops (GET/PUT/UPDATE/
+    // SUBSCRIBE + CONNECT relay) migrated to task-per-tx drivers that
+    // route outbound messages through `op_execution_sender` and own
+    // their own state in task locals.
 
     // An early, fast path, return for communicating events in the node to the main message handler,
     // without any transmission in the network whatsoever and avoiding any state transition.
@@ -624,13 +534,16 @@ impl OpManager {
             instance_id,
         });
 
-        let op = OpEnum::Subscribe(crate::operations::subscribe::create_unsubscribe_op(
-            instance_id,
-            tx,
-            target_addr,
-        ));
-
-        match self.notify_op_change_nonblocking(msg, op).await {
+        // #1454 phase 5 final (SUBSCRIBE slice): fire-and-forget the
+        // Unsubscribe wire message through OpCtx. The legacy path pushed
+        // a synthetic SubscribeOp into `ops.subscribe` so the event
+        // loop's `peek_next_hop_addr` SUBSCRIBE arm could recover the
+        // target address; both that arm and the DashMap were retired in
+        // this slice. The op-execution channel routes directly to
+        // `OutboundMessageWithTarget` given `Some(target_addr)`, so no
+        // operation state is required (Unsubscribe has no reply).
+        let mut ctx = self.op_ctx(tx);
+        match ctx.send_fire_and_forget(target_addr, msg).await {
             Ok(()) => {
                 tracing::debug!(
                     contract = %contract,
@@ -710,11 +623,6 @@ impl OpManager {
                 check_id_op!(id.transaction_type(), TransactionType::Connect);
                 self.ops.connect.insert(id, *op);
             }
-            OpEnum::Subscribe(op) => {
-                #[cfg(debug_assertions)]
-                check_id_op!(id.transaction_type(), TransactionType::Subscribe);
-                self.ops.subscribe.insert(id, op);
-            }
         }
         Ok(())
     }
@@ -732,14 +640,13 @@ impl OpManager {
                 .connect
                 .get(id)
                 .and_then(|op| op.get_next_hop_addr()),
-            TransactionType::Subscribe => self
-                .ops
-                .subscribe
-                .get(id)
-                .and_then(|op| op.get_next_hop_addr()),
-            // GET, PUT and UPDATE have no DashMap entry post-#1454
-            // phase 5 final; task-per-tx drivers manage their own routing.
-            TransactionType::Get | TransactionType::Put | TransactionType::Update => None,
+            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
+            // post-#1454 phase 5 final; task-per-tx drivers manage
+            // their own routing.
+            TransactionType::Get
+            | TransactionType::Put
+            | TransactionType::Update
+            | TransactionType::Subscribe => None,
         }
     }
 
@@ -793,15 +700,12 @@ impl OpManager {
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(|op| OpEnum::Connect(Box::new(op))),
-            TransactionType::Subscribe => self
-                .ops
-                .subscribe
-                .remove(id)
-                .map(|(_k, v)| v)
-                .map(OpEnum::Subscribe),
-            // GET, PUT and UPDATE have no DashMap entry post-#1454
-            // phase 5 final.
-            TransactionType::Get | TransactionType::Put | TransactionType::Update => None,
+            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
+            // post-#1454 phase 5 final.
+            TransactionType::Get
+            | TransactionType::Put
+            | TransactionType::Update
+            | TransactionType::Subscribe => None,
         };
         self.ops.under_progress.insert(*id);
         Ok(op)
@@ -881,18 +785,14 @@ impl OpManager {
     // value. The dispatch sites in `node.rs` were simplified in
     // commit 3.
 
-    /// Returns `true` if a `SubscribeOp` is currently registered for this
-    /// transaction in `OpManager.ops.subscribe`.
-    ///
-    /// Same role as `has_get_op` but for the relay SUBSCRIBE dispatch gate
-    /// (#1454 phase 5 follow-up slice A). Used by `node.rs` to distinguish
-    /// a fresh inbound relay SUBSCRIBE (no existing op → spawn the
-    /// task-per-tx driver) from a renewal, PUT sub-op, or GC-spawned retry
-    /// (existing op → fall through to the legacy `handle_op_request`
-    /// path).
-    pub fn has_subscribe_op(&self, id: &Transaction) -> bool {
-        self.ops.subscribe.contains_key(id)
-    }
+    // `has_subscribe_op` was the relay SUBSCRIBE dispatch gate; retired
+    // in #1454 phase 5 final (SUBSCRIBE slice) together with the
+    // `ops.subscribe` DashMap. Every SUBSCRIBE wire variant now spawns
+    // its task-per-tx driver or runs through a dedicated inbound
+    // handler unconditionally (the legacy `handle_op_request<SubscribeOp>`
+    // fallthrough is gone), so the gate has no remaining decision value.
+    // The dispatch site in `node.rs::NetMessageV1::Subscribe` was
+    // simplified in this slice.
 
     /// Returns `true` if a `ConnectOp` is currently registered for this
     /// transaction in `OpManager.ops.connect`.
@@ -933,12 +833,12 @@ impl OpManager {
             TransactionType::Connect => {
                 self.ops.connect.remove(&id);
             }
-            TransactionType::Subscribe => {
-                self.ops.subscribe.remove(&id);
-            }
-            // GET, PUT and UPDATE have no DashMap entry post-#1454
-            // phase 5 final.
-            TransactionType::Get | TransactionType::Put | TransactionType::Update => {}
+            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
+            // post-#1454 phase 5 final.
+            TransactionType::Get
+            | TransactionType::Put
+            | TransactionType::Update
+            | TransactionType::Subscribe => {}
         }
 
         // Clean up request router to prevent stale entries from blocking subsequent requests
@@ -1000,18 +900,12 @@ impl OpManager {
     }
 
     /// Returns pending operation counts: [connect, put, get, subscribe, update].
-    /// GET, PUT and UPDATE slots are always 0 after #1454 phase 5 final
-    /// retired the `ops.{get,put,update}` DashMaps; kept in the array
-    /// for API stability with the home-page renderer / telemetry
+    /// GET, PUT, UPDATE and SUBSCRIBE slots are always 0 after #1454
+    /// phase 5 final retired the corresponding DashMaps; kept in the
+    /// array for API stability with the home-page renderer / telemetry
     /// consumers.
     pub fn pending_op_counts(&self) -> [u32; 5] {
-        [
-            self.ops.connect.len() as u32,
-            0,
-            0,
-            self.ops.subscribe.len() as u32,
-            0,
-        ]
+        [self.ops.connect.len() as u32, 0, 0, 0, 0]
     }
 
     /// Returns the number of entries in the contract_waiters map.
@@ -1181,61 +1075,13 @@ fn notify_transaction_timeout(
     }
 }
 
-/// Fire-and-forget notification that a subscription timed out.
-/// Spawns a task to avoid blocking the garbage cleanup loop on the contract handler response.
-fn notify_subscription_timeout(
-    ch_outbound: &Arc<crate::contract::ContractHandlerChannel<crate::contract::SenderHalve>>,
-    instance_id: ContractInstanceId,
-) {
-    let ch = Arc::clone(ch_outbound);
-    crate::config::GlobalExecutor::spawn(async move {
-        if let Err(e) = ch
-            .send_to_handler(ContractHandlerEvent::NotifySubscriptionError {
-                key: instance_id,
-                reason: format!("Subscription timed out for contract {}", instance_id),
-            })
-            .await
-        {
-            tracing::debug!(
-                contract = %instance_id,
-                error = %e,
-                "Failed to notify subscription timeout"
-            );
-        }
-    });
-}
-
-/// Reports a routing failure for a timed-out operation to the router's isotonic model.
-fn report_timeout_failure(
-    ring: &crate::ring::Ring,
-    tx: &Transaction,
-    peer: crate::ring::PeerKeyLocation,
-    contract_location: crate::ring::Location,
-) {
-    let op_type = match tx.transaction_type() {
-        crate::message::TransactionType::Get => Some(crate::node::network_status::OpType::Get),
-        crate::message::TransactionType::Put => Some(crate::node::network_status::OpType::Put),
-        crate::message::TransactionType::Update => {
-            Some(crate::node::network_status::OpType::Update)
-        }
-        crate::message::TransactionType::Subscribe => {
-            Some(crate::node::network_status::OpType::Subscribe)
-        }
-        crate::message::TransactionType::Connect => None,
-    };
-    ring.routing_finished(crate::router::RouteEvent {
-        peer: peer.clone(),
-        contract_location,
-        outcome: crate::router::RouteOutcome::Failure,
-        op_type,
-    });
-    tracing::info!(
-        tx = %tx,
-        peer = ?peer.socket_addr(),
-        %contract_location,
-        "Reported operation timeout as routing failure"
-    );
-}
+// `notify_subscription_timeout` and `report_timeout_failure` retired in
+// #1454 phase 5 final (SUBSCRIBE slice). They were called only from
+// `remove_subscribe_and_notify_timeout`, which was deleted in the same
+// commit. The task-per-tx subscribe driver owns its own timeout
+// reporting via `result_router_tx` publication, and relays route any
+// per-hop failure through their own per-tx drivers — neither needs a
+// GC-sweep notifier.
 
 // `remove_put_and_report_failure` and `remove_update_and_report_failure`
 // were retired in #1454 phase 5 final (PUT slice / UPDATE slice 1)
@@ -1245,43 +1091,14 @@ fn report_timeout_failure(
 // UPDATEs are owned by their per-tx drivers and have no client to
 // report to.
 
-/// Removes a subscribe operation from the ops map and notifies timeout if found.
-/// Returns `Some(())` if the operation was found and removed, `None` otherwise.
-///
-/// Note: For intermediate nodes, the subscribe times out silently without sending
-/// NotFound upstream. This is acceptable because the originator retries independently
-/// after SUBSCRIBE_RETRY_THRESHOLD (5s), so it doesn't depend on NotFound for fast
-/// failure detection. The intermediate node's stale op chain is harmless.
-fn remove_subscribe_and_notify_timeout(
-    ops: &Ops,
-    tx: &Transaction,
-    ch_outbound: &Arc<ContractHandlerChannel<SenderHalve>>,
-    ring: &crate::ring::Ring,
-) -> Option<()> {
-    let (_, sub_op) = ops.subscribe.remove(tx)?;
-    let is_originator = sub_op.is_originator();
-    if let Some((peer, contract_location)) = sub_op.failure_routing_info() {
-        report_timeout_failure(ring, tx, peer, contract_location);
-    }
-    let instance_id = sub_op.instance_id();
-    if let Some(instance_id) = instance_id {
-        notify_subscription_timeout(ch_outbound, instance_id);
-    }
-    // Emit telemetry so subscribe timeouts are visible in the dashboard (#3676).
-    // Without this, timed-out subscribes were invisible — only subscribe_request
-    // and subscribe_success were emitted, so timeouts looked like missing data.
-    if is_originator {
-        crate::tracing::telemetry::send_standalone_event(
-            "subscribe_timeout",
-            serde_json::json!({
-                "tx": tx.to_string(),
-                "instance_id": instance_id.map(|id| id.to_string()),
-                "elapsed_ms": tx.elapsed().as_millis() as u64,
-            }),
-        );
-    }
-    Some(())
-}
+// `remove_subscribe_and_notify_timeout` retired in #1454 phase 5 final
+// (SUBSCRIBE slice) together with the `ops.subscribe` DashMap. Client-,
+// renewal-, executor-, and sub-op-initiated SUBSCRIBEs now own their
+// timeout reporting in the task-per-tx driver
+// (`subscribe::op_ctx_task::*`); relay SUBSCRIBEs are owned by their
+// per-tx drivers (`start_relay_subscribe`) which expire their inflight
+// guards naturally. The Unsubscribe wire variant is fire-and-forget and
+// has no timeout reporter.
 
 // `remove_get_and_report_failure` retired in #1454 phase 5 final
 // (GET slice) together with the `ops.get` DashMap. Originator-side
@@ -1342,7 +1159,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     _result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
     ring: Arc<Ring>,
-    ch_outbound: Arc<crate::contract::ContractHandlerChannel<crate::contract::SenderHalve>>,
     contract_waiters: Arc<
         Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
     >,
@@ -1439,11 +1255,11 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         target: "memory_stats",
                         tick = tick_count,
                         ops_connect = ops_sizes.connect,
-                        // ops_get / ops_put / ops_update retired in
-                        // #1454 phase 5 final.
+                        // ops_get / ops_put / ops_update / ops_subscribe
+                        // retired in #1454 phase 5 final.
                         ops_put = 0,
                         ops_get = 0,
-                        ops_subscribe = ops_sizes.subscribe,
+                        ops_subscribe = 0,
                         ops_update = 0,
                         ops_completed = ops_sizes.completed,
                         ops_under_progress = ops_sizes.under_progress,
@@ -1515,22 +1331,15 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 }
 
                 // SUBSCRIBE speculative-retry GC block was retired in #1454
-                // Phase 5-final: every originator-side writer into
-                // `ops.subscribe` (client-initiated, executor auto-subscribe,
-                // renewal, PUT/GET sub-op) now runs on the task-per-tx
-                // driver in `operations/subscribe/op_ctx_task.rs`, which
-                // owns its own retry loop via `advance_to_next_peer` and
-                // never inserts a `SubscribeOp` into the DashMap. The
-                // remaining legacy entries (relay state during multi-hop
-                // forwarding, `create_unsubscribe_op` routing entries) are
-                // not retry candidates: relay entries fail
-                // `is_originator()` and unsubscribe entries fail
-                // `failure_routing_info().is_some()`. The DashMap, the
-                // `SubscribeOp::ack_received` / `speculative_paths` fields,
-                // and `SubscribeMsg::ForwardingAck` survive only as wire-
-                // and bookkeeping-compat for legacy relay traffic;
-                // they are not load-bearing for retry. Mirrors the GET
-                // Phase 5-final retirement in PR #3974.
+                // Phase 5-final. The `ops.subscribe` DashMap itself was
+                // then retired in the SUBSCRIBE slice (this PR): every
+                // SUBSCRIBE wire variant now runs on the task-per-tx
+                // driver in `operations/subscribe/op_ctx_task.rs`
+                // (Request) or a dedicated free function
+                // (`handle_unsubscribe_inbound` for Unsubscribe), and
+                // the surviving `send_unsubscribe_upstream` writer uses
+                // `OpCtx::send_fire_and_forget` directly. There is no
+                // longer a DashMap to GC-sweep.
 
                 let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing.drain(..) {
@@ -1556,13 +1365,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 true
                             }
                         }
-                        TransactionType::Subscribe => {
-                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_none()
-                        }
-                        // GET, PUT and UPDATE have no DashMap entry
-                        // post-#1454 phase 5 final; task-per-tx
+                        // GET, PUT, UPDATE and SUBSCRIBE have no DashMap
+                        // entry post-#1454 phase 5 final; task-per-tx
                         // drivers own their own timeout reporting.
-                        TransactionType::Get | TransactionType::Put | TransactionType::Update => false,
+                        TransactionType::Get
+                        | TransactionType::Put
+                        | TransactionType::Update
+                        | TransactionType::Subscribe => false,
                     };
                     if still_waiting {
                         delayed.push(tx);
@@ -1629,13 +1438,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 false
                             }
                         }
-                        TransactionType::Subscribe => {
-                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_some()
-                        }
-                        // GET, PUT and UPDATE have no DashMap entry
-                        // post-#1454 phase 5 final; task-per-tx drivers
-                        // own their own timeout reporting.
-                        TransactionType::Get | TransactionType::Put | TransactionType::Update => false,
+                        // GET, PUT, UPDATE and SUBSCRIBE have no DashMap
+                        // entry post-#1454 phase 5 final; task-per-tx
+                        // drivers own their own timeout reporting.
+                        TransactionType::Get
+                        | TransactionType::Put
+                        | TransactionType::Update
+                        | TransactionType::Subscribe => false,
                     };
                     if removed {
                         tracing::info!(

@@ -220,9 +220,6 @@ fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceI
         ContractHandlerEvent::GetQuery { instance_id, .. }
         | ContractHandlerEvent::RegisterSubscriberListener {
             key: instance_id, ..
-        }
-        | ContractHandlerEvent::NotifySubscriptionError {
-            key: instance_id, ..
         } => Some(*instance_id),
         // These events have no contract identity and are routed to the default queue.
         ContractHandlerEvent::DelegateRequest { .. }
@@ -236,7 +233,6 @@ fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceI
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
         | ContractHandlerEvent::GetDeltaResponse { .. }
-        | ContractHandlerEvent::NotifySubscriptionErrorResponse
         | ContractHandlerEvent::ClientDisconnect { .. } => None,
     }
 }
@@ -744,13 +740,6 @@ mod tests {
                     subscriber_listener: mpsc::channel(64).0,
                 },
             ),
-            (
-                "NotifySubscriptionError",
-                ContractHandlerEvent::NotifySubscriptionError {
-                    key: contract_id,
-                    reason: "test".to_string(),
-                },
-            ),
         ];
 
         for (name, event) in &contract_events {
@@ -837,10 +826,6 @@ mod tests {
                     key,
                     delta: Ok(freenet_stdlib::prelude::StateDelta::from(vec![])),
                 },
-            ),
-            (
-                "NotifySubscriptionErrorResponse",
-                ContractHandlerEvent::NotifySubscriptionErrorResponse,
             ),
             (
                 "QuerySubscriptions",

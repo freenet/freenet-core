@@ -141,11 +141,6 @@ where
     CB: NetworkBridge,
 {
     match result {
-        Err(OpError::StatePushed) => {
-            // do nothing and continue, the operation will just continue later on
-            tracing::debug!("entered in state pushed to continue with op");
-            return Ok(None);
-        }
         Err(OpError::OpNotPresent(tx)) => {
             // OpNotPresent is benign — it means a duplicate message arrived for an
             // operation that was already completed or claimed (e.g., duplicate metadata
@@ -299,19 +294,20 @@ async fn send_with_stream<CB: NetworkBridge>(
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum OpEnum {
     Connect(Box<connect::ConnectOp>),
-    Subscribe(subscribe::SubscribeOp),
     // `Get` variant retired in #1454 phase 5 final (GET slice) together
     // with the `ops.get` DashMap. GET wire flows now run on task-per-tx
     // drivers in `get::op_ctx_task::*` and never produce an
     // `OpEnum::Get`.
     // `Put` retired in the prior PUT slice; `Update` in the UPDATE slice.
+    // `Subscribe` retired in the SUBSCRIBE slice; SUBSCRIBE wire flows
+    // run on task-per-tx drivers in `subscribe::op_ctx_task::*` and the
+    // surviving Unsubscribe send-site goes through `OpCtx::send_fire_and_forget`.
 }
 
 impl OpEnum {
     delegate::delegate! {
         to match self {
             OpEnum::Connect(op) => op,
-            OpEnum::Subscribe(op) => op,
         } {
             pub fn id(&self) -> &Transaction;
             pub fn outcome(&self) -> OpOutcome<'_>;
@@ -319,37 +315,7 @@ impl OpEnum {
             pub fn to_host_result(&self) -> HostResult;
         }
     }
-
-    /// Returns true if this is a subscription renewal (node-internal operation
-    /// with no client waiting for the result).
-    pub fn is_subscription_renewal(&self) -> bool {
-        matches!(self, OpEnum::Subscribe(op) if op.is_renewal())
-    }
 }
-
-macro_rules! try_from_op_enum {
-    ($op_enum:path, $op_type:ty, $transaction_type:expr) => {
-        impl TryFrom<OpEnum> for $op_type {
-            type Error = OpError;
-
-            fn try_from(value: OpEnum) -> Result<Self, Self::Error> {
-                match value {
-                    $op_enum(op) => Ok(op),
-                    other => Err(OpError::IncorrectTxType(
-                        $transaction_type,
-                        other.id().transaction_type(),
-                    )),
-                }
-            }
-        }
-    };
-}
-
-try_from_op_enum!(
-    OpEnum::Subscribe,
-    subscribe::SubscribeOp,
-    TransactionType::Subscribe
-);
 
 #[derive(Debug)]
 pub(crate) enum OpOutcome<'a> {
@@ -420,12 +386,6 @@ pub(crate) enum OpError {
     StreamCancelled,
     #[error("failed to claim orphan stream")]
     OrphanStreamClaimFailed,
-
-    // used for control flow
-    /// This is used as an early interrumpt of an op update when an op
-    /// was sent throught the fast path back to the storage.
-    #[error("early push of state into the op stack")]
-    StatePushed,
 }
 
 impl OpError {
@@ -707,7 +667,7 @@ pub(super) fn start_subscription_request(
     child_tx
 }
 
-async fn has_contract(
+pub(crate) async fn has_contract(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,
 ) -> Result<Option<ContractKey>, OpError> {
@@ -739,8 +699,6 @@ async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
-        | crate::contract::ContractHandlerEvent::NotifySubscriptionError { .. }
-        | crate::contract::ContractHandlerEvent::NotifySubscriptionErrorResponse
         | crate::contract::ContractHandlerEvent::ClientDisconnect { .. } => Ok(None),
     }
 }

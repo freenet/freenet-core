@@ -1466,10 +1466,6 @@ impl Operation for ConnectOp {
                 op: *op,
                 source_addr,
             }),
-            Ok(Some(other)) => {
-                op_manager.push(tx, other).await?;
-                Err(OpError::OpNotPresent(tx))
-            }
             Ok(None) => {
                 let op = match (msg, source_addr) {
                     // Phase 2c slice 1 (#1454): the dispatch site at
