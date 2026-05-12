@@ -115,6 +115,12 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     /// Global bandwidth manager for fair sharing across connections.
     /// When Some, the token_bucket rate is periodically updated based on connection count.
     pub(super) global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    /// Shadow per-peer rolling RTT stats (issue #4074, Phase 1).
+    /// Auto-registers with the global shadow registry on construction
+    /// and removes itself on drop. Written here on each non-retransmitted
+    /// ACK; the cross-connection aggregator reads via the registry.
+    /// Does not feed back into congestion control.
+    pub(crate) rolling_rtt_stats: super::rolling_rtt_stats::RollingRttStatsHandle<T>,
     /// Time source for deterministic simulation support
     pub(super) time_source: T,
 }
@@ -876,6 +882,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     for (rtt_sample_opt, packet_size, token) in ack_info {
                         match rtt_sample_opt {
                             Some(rtt_sample) => {
+                                // Shadow telemetry (issue #4074): record the RTT sample
+                                // into the rolling per-peer window before feeding the
+                                // congestion controller. Recording is observation-only
+                                // and does not affect congestion control behavior.
+                                self.remote_conn.rolling_rtt_stats.record(rtt_sample);
                                 // Normal packet: full RTT processing + flightsize decrement
                                 // For BBR: token enables accurate delivery rate computation
                                 self.remote_conn.congestion_controller.on_ack_with_token(
@@ -2671,6 +2682,10 @@ mod tests {
             mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
         ));
 
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
         let remote_conn = RemoteConnection {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
@@ -2685,6 +2700,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            rolling_rtt_stats,
             time_source: time_source.clone(),
         };
 
@@ -2758,6 +2774,10 @@ mod tests {
             mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
         ));
 
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
         let remote_conn = RemoteConnection {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
@@ -2772,6 +2792,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            rolling_rtt_stats,
             time_source,
         };
 

@@ -1883,6 +1883,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 );
             }
 
+            let rolling_rtt_stats = super::rolling_rtt_stats::RollingRttStatsHandle::new(
+                remote_addr,
+                time_source.clone(),
+            );
             let remote_conn = RemoteConnection {
                 outbound_symmetric_key: outbound_key,
                 remote_addr,
@@ -1897,6 +1901,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 congestion_controller,
                 token_bucket,
                 socket,
+                rolling_rtt_stats,
                 time_source,
             };
 
@@ -2195,6 +2200,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 direction = "outbound",
                                                 "Outbound handshake completed (ack path)"
                                             );
+                                            let rolling_rtt_stats =
+                                                super::rolling_rtt_stats::RollingRttStatsHandle::new(
+                                                    remote_addr,
+                                                    time_source.clone(),
+                                                );
                                             return Ok((
                                                 RemoteConnection {
                                                     outbound_symmetric_key: outbound_sym_key,
@@ -2214,6 +2224,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     token_bucket,
                                                     socket: socket.clone(),
                                                     global_bandwidth: global_bandwidth.clone(),
+                                                    rolling_rtt_stats,
                                                     time_source: time_source.clone(),
                                                 },
                                                 InboundRemoteConnection {
@@ -2305,6 +2316,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     direction = "outbound",
                                     "Outbound handshake completed (inbound ack path)"
                                 );
+                                let rolling_rtt_stats =
+                                    super::rolling_rtt_stats::RollingRttStatsHandle::new(
+                                        remote_addr,
+                                        time_source.clone(),
+                                    );
                                 return Ok((
                                     RemoteConnection {
                                         outbound_symmetric_key: outbound_sym_key
@@ -2325,6 +2341,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         token_bucket,
                                         socket: socket.clone(),
                                         global_bandwidth: global_bandwidth.clone(),
+                                        rolling_rtt_stats,
                                         time_source: time_source.clone(),
                                     },
                                     InboundRemoteConnection {
