@@ -343,11 +343,7 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     let data = {
         let mut buf = vec![];
         File::open(&config.delta)?.read_to_end(&mut buf)?;
-        if config.as_state {
-            UpdateData::State(State::from(buf))
-        } else {
-            UpdateData::Delta(StateDelta::from(buf))
-        }
+        wrap_update_payload(buf, config.as_state)
     };
     let request = ContractRequest::Update { key, data }.into();
     let mut client = start_api_client(other).await?;
@@ -581,6 +577,17 @@ fn describe_update_variant(update: &UpdateData<'_>) -> &'static str {
     }
 }
 
+/// Wrap raw bytes read from the user-supplied file as either a full-state
+/// replacement or a delta payload. Pulled out of `update()` so the branching
+/// logic is unit-testable without spinning up the async client path.
+fn wrap_update_payload(buf: Vec<u8>, as_state: bool) -> UpdateData<'static> {
+    if as_state {
+        UpdateData::State(State::from(buf))
+    } else {
+        UpdateData::Delta(StateDelta::from(buf))
+    }
+}
+
 /// Write to a file atomically (write to temp, then rename) to prevent partial reads.
 fn atomic_write(path: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
@@ -608,5 +615,31 @@ pub(crate) async fn execute_command(
             tracing::error!("Server returned error: {}", e);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--as-state` flag toggles wrapping between `State` (full replacement,
+    /// required by facade-style contracts whose `update_state` only matches
+    /// `UpdateData::State`) and the default `Delta` variant.
+    #[test]
+    fn wrap_update_payload_state_variant() {
+        let bytes = vec![1u8, 2, 3, 4];
+        let wrapped = wrap_update_payload(bytes.clone(), true);
+        assert!(matches!(wrapped, UpdateData::State(_)));
+        assert_eq!(extract_update_bytes(&wrapped), bytes.as_slice());
+        assert_eq!(describe_update_variant(&wrapped), "state");
+    }
+
+    #[test]
+    fn wrap_update_payload_delta_variant_default() {
+        let bytes = vec![9u8, 8, 7];
+        let wrapped = wrap_update_payload(bytes.clone(), false);
+        assert!(matches!(wrapped, UpdateData::Delta(_)));
+        assert_eq!(extract_update_bytes(&wrapped), bytes.as_slice());
+        assert_eq!(describe_update_variant(&wrapped), "delta");
     }
 }
