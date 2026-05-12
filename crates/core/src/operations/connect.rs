@@ -1153,6 +1153,11 @@ impl ConnectOp {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // Retained for in-file unit tests + the legacy initiate_join_request
+    // wrapper; all production joiner-side initiation flows through the
+    // task-per-tx driver via prepare_join_request. Phase 5 final / PR-B
+    // deletes this along with the rest of impl Operation for ConnectOp.
+    #[allow(dead_code)]
     pub(crate) fn new_joiner(
         id: Transaction,
         desired_location: Location,
@@ -1266,6 +1271,12 @@ impl ConnectOp {
         self.first_hop.as_deref().cloned()
     }
 
+    // Retained for in-file unit tests; production callers (ring::acquire_new,
+    // join_ring_request, gateway_version_probe) build the wire message via the
+    // free `prepare_join_request` helper and skip the legacy ConnectOp carrier.
+    // Phase 5 final / PR-B deletes this along with the rest of
+    // impl Operation for ConnectOp.
+    #[allow(dead_code)]
     pub(crate) fn initiate_join_request(
         own: PeerKeyLocation,
         target: PeerKeyLocation,

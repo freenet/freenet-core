@@ -37,9 +37,8 @@ use crate::transport::TransportPublicKey;
 use crate::util::{Contains, time_source::InstantTimeSrc};
 use crate::{
     config::{GlobalExecutor, GlobalRng},
-    message::{NetMessage, NetMessageV1, Transaction},
+    message::Transaction,
     node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
-    operations::{OpEnum, connect::ConnectOp},
     router::Router,
 };
 
@@ -2667,52 +2666,55 @@ impl Ring {
             target_location = %ideal_location,
             "Sending connect request via connection_maintenance"
         );
-        let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
-        let target_connections = self.connection_manager.min_connections;
 
-        let failed_addrs = self.connection_manager.recently_failed_addrs();
-        let connected_addrs = self.connection_manager.connected_peer_addrs();
-        tracing::debug!(
-            failed = failed_addrs.len(),
-            connected = connected_addrs.len(),
-            "acquire_new: pre-populating bloom filter with excluded peer addresses"
-        );
-        let mut exclude_addrs = failed_addrs;
-        exclude_addrs.extend(connected_addrs);
-        let (tx, op, msg) = ConnectOp::initiate_join_request(
-            joiner.clone(),
-            query_target.clone(),
-            ideal_location,
-            ttl,
-            target_connections,
-            op_manager.connect_forward_estimator.clone(),
-            &exclude_addrs,
-        );
+        // Driver computes ttl / target_connections / exclude_addrs internally
+        // (see start_client_connect at op_ctx_task.rs). acquire_new only
+        // needs to allocate the joiner tx, register it with
+        // live_tx_tracker, and spawn the driver task.
+        let _ = notifier;
+        let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
 
-        // Emit telemetry for initial connect request sent
-        if let Some(event) = NetEventLog::connect_request_sent(
-            &tx,
-            self,
-            ideal_location,
-            joiner,
-            query_target.clone(),
-            ttl,
-            true, // is_initial
-        ) {
-            self.register_events(Either::Left(event)).await;
-        }
+        let gateway_addr = match query_target.socket_addr() {
+            Some(addr) => addr,
+            None => {
+                tracing::warn!(
+                    target_location = %ideal_location,
+                    "acquire_new: selected query target has no socket address, skipping spawn"
+                );
+                return Ok(None);
+            }
+        };
 
-        if let Some(addr) = query_target.socket_addr() {
-            live_tx_tracker.add_transaction(addr, tx);
-        }
-        op_manager
-            .push(tx, OpEnum::Connect(Box::new(op)))
+        // Register tx with the live transaction tracker BEFORE spawning the
+        // driver. Otherwise the driver's first Response could land on the
+        // bypass before the registration completes, breaking the
+        // active_connect_transaction_count gauge that connection_maintenance
+        // uses to throttle concurrent acquisitions.
+        live_tx_tracker.add_transaction(gateway_addr, tx);
+
+        let op_manager_spawn = op_manager.clone();
+        let gateway = query_target.clone();
+        let joiner_for_driver = joiner;
+        GlobalExecutor::spawn(async move {
+            if let Err(err) = crate::operations::connect::op_ctx_task::start_client_connect(
+                tx,
+                gateway,
+                gateway_addr,
+                &op_manager_spawn,
+                joiner_for_driver,
+                ideal_location,
+                None,
+            )
             .await
-            .map_err(|err| anyhow::anyhow!(err))?;
-        notifier
-            .notifications_sender
-            .send(Either::Left(NetMessage::V1(NetMessageV1::Connect(msg))))
-            .await?;
+            {
+                tracing::debug!(
+                    %tx,
+                    %err,
+                    "acquire_new: CONNECT driver completed with error"
+                );
+            }
+        });
+
         tracing::debug!(tx = %tx, "Connect request sent");
         Ok(Some(tx))
     }
