@@ -1,42 +1,47 @@
-// #1454 phase 5 final (SUBSCRIBE slice) — the legacy state-machine path
-// is retired but the type surface (SubscribeOp, SubscribeState,
-// SubscribeStats, AwaitingResponseData/PrepareRequestData/CompletedData)
-// is kept for test fixtures and operations-module re-exports. Module-
-// level allow-dead because the surviving types are still load-bearing
-// in tests and shared with `op_ctx_task::*`. Phase 6 retires the
-// surface entirely.
-#![allow(dead_code)]
-
-use std::collections::HashSet;
-use std::time::Instant;
+//! SUBSCRIBE operation: registers downstream interest in a contract and
+//! threads UPDATE broadcasts back through the subscription tree.
+//!
+//! #1454 phase 5 final (SUBSCRIBE slice) retired the legacy state machine.
+//! Every SUBSCRIBE wire variant now dispatches unconditionally:
+//!
+//! - `SubscribeMsg::Request` → `op_ctx_task::start_relay_subscribe`
+//! - `SubscribeMsg::Response` → bypass to originator's `pending_op_results`
+//!   waiter
+//! - `SubscribeMsg::Unsubscribe` → `handle_unsubscribe_inbound` (this module)
+//! - `SubscribeMsg::ForwardingAck` → no-op telemetry hook
+//!
+//! Phase 6 (#1454) retired the surviving `#[allow(dead_code)]` scaffolding
+//! `SubscribeOp`, `SubscribeState`, `SubscribeStats`, the type-state data
+//! structs, `start_op` / `start_op_with_id` test fixtures, and the inline
+//! pin tests they backed. The wire format types (`SubscribeMsg`,
+//! `SubscribeMsgResult`), the originator-shared helpers (`InitialRequest`,
+//! `prepare_initial_request`, `complete_local_subscription`,
+//! `wait_for_contract_with_timeout`), the inbound `Unsubscribe` handler,
+//! and `register_downstream_subscriber` all survive because the
+//! task-per-tx drivers still consume them.
 
 use either::Either;
 
 pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
-use super::{OpError, OpOutcome, OperationResult, get};
-use crate::node::IsOperationCompleted;
+use super::OpError;
 use crate::ring::PeerKeyLocation;
 use crate::tracing::NetEventLog;
 use crate::{
-    client_events::HostResult,
-    message::{InnerMessage, NetMessage, Transaction},
+    message::{InnerMessage, Transaction},
     node::OpManager,
-    ring::{Location, RingError},
+    ring::Location,
 };
-use freenet_stdlib::{
-    client_api::{ContractResponse, ErrorKind, HostResponse},
-    prelude::*,
-};
+use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 
 /// Maximum peers to try per hop (breadth search).
 /// Matches GET operation's DEFAULT_MAX_BREADTH; change both together.
-const MAX_BREADTH: usize = 3;
+pub(super) const MAX_BREADTH: usize = 3;
 
 /// Maximum retry rounds (each round queries k_closest for new candidates).
 /// Matches GET operation's MAX_RETRIES; change both together.
-const MAX_RETRIES: usize = 10;
+pub(super) const MAX_RETRIES: usize = 10;
 
 /// Timeout for waiting on contract storage notification.
 /// Used when a subscription arrives before the contract has been propagated via PUT.
@@ -79,205 +84,6 @@ pub(super) async fn wait_for_contract_with_timeout(
     super::has_contract(op_manager, instance_id).await
 }
 
-async fn fetch_contract_if_missing(
-    op_manager: &OpManager,
-    instance_id: ContractInstanceId,
-) -> Result<Option<ContractKey>, OpError> {
-    if let Some(key) = super::has_contract(op_manager, instance_id).await? {
-        return Ok(Some(key));
-    }
-
-    // Start a GET operation to fetch the contract via the task-per-tx
-    // sub-op driver. The receiver is dropped — caller relies on
-    // `wait_for_contract_with_timeout` (storage poll + timeout) to
-    // detect arrival, mirroring the legacy fire-and-forget shape.
-    let (_tx, _rx) = get::op_ctx_task::start_sub_op_get(
-        op_manager,
-        instance_id,
-        /* return_contract_code */ true,
-    );
-
-    // Wait for contract to arrive
-    wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
-}
-
-// ── Type-state data structs ──────────────────────────────────────────────
-//
-// Each state in the subscribe state machine is a named struct with typed
-// transition methods.  This gives compile-time guarantees:
-//
-//   PrepareRequest ──┬── into_awaiting_response() ──► AwaitingResponse
-//                    └── into_completed()          ──► Completed
-//   AwaitingResponse ── into_completed()           ──► Completed
-//
-// Invalid transitions (e.g. Completed → PrepareRequest) are unrepresentable
-// because the target type simply has no such method.
-
-/// Data for the PrepareRequest state: operation is being prepared for network dispatch.
-#[derive(Debug)]
-struct PrepareRequestData {
-    id: Transaction,
-    instance_id: ContractInstanceId,
-}
-
-impl PrepareRequestData {
-    /// Transition to AwaitingResponse after sending the subscribe request.
-    ///
-    /// Encodes valid transition: PrepareRequest → AwaitingResponse.
-    /// The instance_id is carried forward automatically.
-    #[allow(dead_code)] // Documents valid transition; see type-state pattern in AGENTS.md
-    fn into_awaiting_response(
-        self,
-        next_hop: Option<std::net::SocketAddr>,
-    ) -> AwaitingResponseData {
-        AwaitingResponseData {
-            next_hop,
-            instance_id: self.instance_id,
-            retries: 0,
-            current_hop: 0,
-            tried_peers: HashSet::new(),
-            alternatives: Vec::new(),
-            attempts_at_hop: 0,
-            visited: super::VisitedPeers::new(&self.id),
-        }
-    }
-
-    /// Transition directly to Completed when the contract is available locally
-    /// and no network forwarding is needed.
-    ///
-    /// Encodes valid transition: PrepareRequest → Completed (local-only path).
-    #[allow(dead_code)] // Documents valid transition; see type-state pattern in AGENTS.md
-    fn into_completed(self, key: ContractKey) -> CompletedData {
-        CompletedData { key }
-    }
-}
-
-/// Data for the AwaitingResponse state: request dispatched, waiting for peer response.
-#[derive(Debug)]
-struct AwaitingResponseData {
-    /// The target we're sending to (for hop-by-hop routing)
-    next_hop: Option<std::net::SocketAddr>,
-    /// The contract being subscribed to (needed for error notification on abort)
-    instance_id: ContractInstanceId,
-    /// Retry round counter (each round queries k_closest for new candidates)
-    retries: usize,
-    /// Current HTL value for the request
-    current_hop: usize,
-    /// Peers already tried at this hop level
-    tried_peers: HashSet<std::net::SocketAddr>,
-    /// Alternative peers from the same k_closest call, not yet tried
-    alternatives: Vec<PeerKeyLocation>,
-    /// How many of the breadth candidates have been tried at this hop
-    attempts_at_hop: usize,
-    /// Bloom filter tracking visited peers across all hops
-    visited: super::VisitedPeers,
-}
-
-impl AwaitingResponseData {
-    /// Transition to Completed on successful subscription response.
-    ///
-    /// Encodes valid transition: AwaitingResponse → Completed.
-    #[allow(dead_code)] // Documents valid transition; see type-state pattern in AGENTS.md
-    fn into_completed(self, key: ContractKey) -> CompletedData {
-        CompletedData { key }
-    }
-}
-
-/// Data for the Completed state: subscription was successfully established.
-#[derive(Debug, Clone, Copy)]
-struct CompletedData {
-    key: ContractKey,
-}
-
-// ── State enum (wraps the typed structs) ─────────────────────────────────
-
-#[derive(Debug)]
-enum SubscribeState {
-    /// Prepare the request to subscribe.
-    ///
-    /// Constructed only in test fixtures (`start_op` / `start_op_with_id`)
-    /// after #1454 SUBSCRIBE migrations: production callers (client,
-    /// renewal, executor, sub-op) drive subscribes through the
-    /// task-per-tx machinery in `op_ctx_task.rs` and never push a
-    /// `SubscribeOp` in the `PrepareRequest` state. Match arms in
-    /// `process_message` are retained as a structural safety net.
-    #[allow(dead_code)]
-    PrepareRequest(PrepareRequestData),
-    /// Awaiting response from downstream peer.
-    AwaitingResponse(AwaitingResponseData),
-    /// Subscription completed successfully.
-    Completed(CompletedData),
-    /// The operation failed — contract not found and not available locally.
-    Failed,
-}
-
-pub(crate) struct SubscribeResult {}
-
-impl TryFrom<SubscribeOp> for SubscribeResult {
-    type Error = OpError;
-
-    fn try_from(value: SubscribeOp) -> Result<Self, Self::Error> {
-        if let SubscribeState::Completed(_) = value.state {
-            Ok(SubscribeResult {})
-        } else {
-            Err(OpError::UnexpectedOpState)
-        }
-    }
-}
-
-/// Start a new subscription operation.
-///
-/// Test fixture only after #1454 SUBSCRIBE migrations: production
-/// callers (client, renewal, executor, sub-op) all go through the
-/// task-per-tx drivers in `op_ctx_task.rs` which build `SubscribeOp`s
-/// inline.
-#[cfg(test)]
-pub(crate) fn start_op(instance_id: ContractInstanceId, is_renewal: bool) -> SubscribeOp {
-    let id = Transaction::new::<SubscribeMsg>();
-    SubscribeOp {
-        id,
-        state: SubscribeState::PrepareRequest(PrepareRequestData { id, instance_id }),
-        requester_addr: None, // Local operation, we are the originator
-        requester_pub_key: None,
-        is_renewal,
-        stats: None,
-    }
-}
-
-/// Create a Subscribe operation with a specific transaction ID (for operation deduplication)
-///
-/// Test fixture only after #1454 SUBSCRIBE migrations.
-#[cfg(test)]
-pub(crate) fn start_op_with_id(
-    instance_id: ContractInstanceId,
-    id: Transaction,
-    is_renewal: bool,
-) -> SubscribeOp {
-    SubscribeOp {
-        id,
-        state: SubscribeState::PrepareRequest(PrepareRequestData { id, instance_id }),
-        requester_addr: None, // Local operation, we are the originator
-        requester_pub_key: None,
-        is_renewal,
-        stats: None,
-    }
-}
-
-// `request_subscribe` was the legacy state-machine entry point that
-// pushed a `SubscribeOp` into `OpManager.ops.subscribe` via
-// `notify_op_change(_nonblocking)`. It was retired by #1454:
-// client-initiated callers go through
-// `op_ctx_task::run_client_subscribe`, renewals go through
-// `op_ctx_task::run_renewal_subscribe`, and executor auto-subscribe
-// goes through `op_ctx_task::run_executor_subscribe`. None of these
-// push state into `ops.subscribe`. Relay-side intermediate-peer
-// SUBSCRIBE state still flows through the legacy path via
-// `process_message`, but no caller constructs a fresh `SubscribeOp`
-// for it — the relay state arrives as a `SubscribeMsg::Request` from
-// the wire and is handled by `start_relay_subscribe`.
-//
-// `start_op` and `start_op_with_id` remain for test fixtures.
-
 /// Outcome of [`prepare_initial_request`]: the decision about how to originate
 /// a subscribe request based on the node's current ring state and contract
 /// availability.
@@ -288,14 +94,13 @@ pub(crate) fn start_op_with_id(
 /// `op_ctx_task::run_executor_subscribe`) share the "which peer, or
 /// local-complete, or give up?" decision logic without duplicating
 /// `k_closest_potentially_hosting` + fallback + local-completion
-/// handling. The legacy state-machine path (`request_subscribe`) used
-/// the same helper before #1454 and is now retired.
+/// handling.
 ///
 /// The returned values describe what the caller should do; the helper does
 /// NOT mutate `op_manager` or push state. Any side-effects (emitting
 /// telemetry via `NetEventLog::subscribe_request`, calling
-/// `complete_local_subscription`, pushing state, sending the wire message)
-/// are the caller's responsibility.
+/// `complete_local_subscription`, sending the wire message) are the
+/// caller's responsibility.
 #[derive(Debug)]
 pub(super) enum InitialRequest {
     /// Contract is available locally and no network round-trip is required.
@@ -330,16 +135,14 @@ pub(super) enum InitialRequest {
 /// Compute the initial "where do we send this subscribe, or do we complete
 /// locally?" decision for a subscribe request.
 ///
-/// All task-per-tx subscribe entry points
-/// (`op_ctx_task::run_client_subscribe`, `run_renewal_subscribe`,
-/// `run_executor_subscribe`) reuse the same ring lookup / fallback /
-/// local-completion logic via this helper. The helper is pure modulo
-/// telemetry emission: it calls `NetEventLog::subscribe_request` on
-/// the `NetworkRequest` branch so all callers get identical event
-/// logs, but it does not mutate `op_manager` state and does not push
-/// any `SubscribeOp` into the per-op DashMap.
+/// All task-per-tx subscribe entry points (`op_ctx_task::run_client_subscribe`,
+/// `run_renewal_subscribe`, `run_executor_subscribe`) reuse the same ring
+/// lookup / fallback / local-completion logic via this helper. The helper is
+/// pure modulo telemetry emission: it calls `NetEventLog::subscribe_request`
+/// on the `NetworkRequest` branch so all callers get identical event logs,
+/// but it does not mutate `op_manager` state.
 ///
-/// The decision branches:
+/// Decision branches:
 ///
 /// 1. If the peer has no ring location (hasn't joined), check local contract
 ///    availability and either complete locally or return `PeerNotJoined`.
@@ -467,9 +270,9 @@ pub(super) async fn prepare_initial_request(
         "subscribe: forwarding Request to target peer"
     );
 
-    // Emit telemetry for subscribe request initiation. Placed inside the
-    // helper so both the legacy and task-per-tx paths produce identical
-    // `NetEventLog::subscribe_request` events.
+    // Emit telemetry for subscribe request initiation so both legacy and
+    // task-per-tx paths produce identical `NetEventLog::subscribe_request`
+    // events.
     if let Some(event) = NetEventLog::subscribe_request(
         &id,
         &op_manager.ring,
@@ -491,16 +294,16 @@ pub(super) async fn prepare_initial_request(
 
 /// Complete a **standalone** local subscription by notifying the client layer.
 ///
-/// **IMPORTANT:** This function is ONLY used when no remote peers are available (standalone node).
-/// For normal network subscriptions, the operation returns a `Completed` state and goes through
-/// `handle_op_result`, which sends results via `result_router_tx` directly.
+/// **IMPORTANT:** Only used when no remote peers are available (standalone
+/// node). For normal network subscriptions, the driver awaits the wire
+/// `Response` and publishes through `result_router_tx`.
 ///
 /// **Architecture Note (Issue #2075):**
 /// Local client subscriptions are deliberately kept separate from network subscriptions:
 /// - **Network subscriptions** are stored in `ring.hosting_manager.subscribers` and are used
-///   for peer-to-peer UPDATE propagation between nodes
+///   for peer-to-peer UPDATE propagation between nodes.
 /// - **Local subscriptions** are managed by the contract executor via `update_notifications`
-///   channels, which deliver `UpdateNotification` directly to WebSocket clients
+///   channels, which deliver `UpdateNotification` directly to WebSocket clients.
 async fn complete_local_subscription(
     op_manager: &OpManager,
     id: Transaction,
@@ -514,10 +317,10 @@ async fn complete_local_subscription(
         "Local subscription completed - client will receive updates via executor notification channel"
     );
 
-    // Register local interest so that ChangeInterests from peers get properly
-    // processed. This enables bidirectional interest discovery: when peers
-    // announce they seed this contract via ChangeInterests, our has_local_interest()
-    // check will pass, and we'll register their peer interest, enabling direct
+    // Register local interest so that ChangeInterests from peers get
+    // processed. Enables bidirectional interest discovery: when peers
+    // announce they seed this contract, our has_local_interest() check
+    // passes, and we register their peer interest, enabling direct
     // update broadcasts from them to us.
     if !is_renewal {
         let became_interested = op_manager.interest_manager.add_local_client(&key);
@@ -526,9 +329,9 @@ async fn complete_local_subscription(
         }
     }
 
-    // Notify client layer that subscription is complete.
-    // The actual update delivery happens through the executor's update_notifications
-    // when contract state changes, not through network broadcast targets.
+    // Notify client layer that subscription is complete. The actual update
+    // delivery happens through the executor's update_notifications when
+    // contract state changes, not through network broadcast targets.
     op_manager
         .notify_node_event(crate::message::NodeEvent::LocalSubscribeComplete {
             tx: id,
@@ -540,172 +343,6 @@ async fn complete_local_subscription(
 
     op_manager.completed(id);
     Ok(())
-}
-
-/// Routing stats for subscribe operations, used to report failures to the router.
-struct SubscribeStats {
-    target_peer: crate::ring::PeerKeyLocation,
-    contract_location: Location,
-    /// When the subscribe request was sent; used to compute response time.
-    request_sent_at: Instant,
-}
-
-pub(crate) struct SubscribeOp {
-    pub id: Transaction,
-    state: SubscribeState,
-    /// The address of the peer that requested this subscription.
-    /// Used for routing responses back and registering them as downstream subscribers.
-    requester_addr: Option<std::net::SocketAddr>,
-    /// The public key of the requesting peer, resolved at op init time.
-    /// Used for interest registration instead of addr-based lookup, which can fail
-    /// during NAT traversal timing windows when the ring layer hasn't mapped the
-    /// transport address yet. See #2886.
-    requester_pub_key: Option<crate::transport::TransportPublicKey>,
-    /// Whether this is a renewal (requester already has the contract).
-    /// Preserved across request/response to avoid sending state to renewals.
-    is_renewal: bool,
-    /// Routing stats for failure reporting.
-    stats: Option<SubscribeStats>,
-}
-
-impl SubscribeOp {
-    /// Extract the contract instance_id from the current state, if available.
-    pub(crate) fn instance_id(&self) -> Option<ContractInstanceId> {
-        match &self.state {
-            SubscribeState::PrepareRequest(data) => Some(data.instance_id),
-            SubscribeState::AwaitingResponse(data) => Some(data.instance_id),
-            SubscribeState::Completed(_) | SubscribeState::Failed => None,
-        }
-    }
-
-    /// Extract the contract key from a completed subscribe operation.
-    pub(crate) fn completed_key(&self) -> Option<ContractKey> {
-        match &self.state {
-            SubscribeState::Completed(data) => Some(data.key),
-            SubscribeState::PrepareRequest(_)
-            | SubscribeState::AwaitingResponse(_)
-            | SubscribeState::Failed => None,
-        }
-    }
-
-    /// Whether this is a subscription renewal (node-internal, no client waiting).
-    pub(crate) fn is_renewal(&self) -> bool {
-        self.is_renewal
-    }
-
-    pub(super) fn outcome(&self) -> OpOutcome<'_> {
-        if self.finalized() {
-            if let Some(ref stats) = self.stats {
-                let response_time = stats.request_sent_at.elapsed();
-                return OpOutcome::ContractOpSuccess {
-                    target_peer: &stats.target_peer,
-                    contract_location: stats.contract_location,
-                    first_response_time: response_time,
-                    payload_size: 0,
-                    payload_transfer_time: std::time::Duration::ZERO,
-                };
-            }
-            return OpOutcome::Irrelevant;
-        }
-        // Not completed — if we have stats, report as failure
-        if let Some(ref stats) = self.stats {
-            OpOutcome::ContractOpFailure {
-                target_peer: &stats.target_peer,
-                contract_location: stats.contract_location,
-            }
-        } else {
-            OpOutcome::Incomplete
-        }
-    }
-
-    /// Extract routing failure info for timeout reporting.
-    pub(crate) fn failure_routing_info(&self) -> Option<(crate::ring::PeerKeyLocation, Location)> {
-        self.stats
-            .as_ref()
-            .map(|s| (s.target_peer.clone(), s.contract_location))
-    }
-
-    pub(super) fn finalized(&self) -> bool {
-        matches!(self.state, SubscribeState::Completed(_))
-    }
-
-    pub(super) fn to_host_result(&self) -> HostResult {
-        if let SubscribeState::Completed(data) = &self.state {
-            Ok(HostResponse::ContractResponse(
-                ContractResponse::SubscribeResponse {
-                    key: data.key,
-                    subscribed: true,
-                },
-            ))
-        } else {
-            Err(ErrorKind::OperationError {
-                cause: "subscribe didn't finish successfully".into(),
-            }
-            .into())
-        }
-    }
-
-    /// Get the next hop address if this operation is in a state that needs to send
-    /// an outbound message. Used for hop-by-hop routing.
-    pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
-        match &self.state {
-            SubscribeState::AwaitingResponse(data) => data.next_hop,
-            SubscribeState::PrepareRequest(_)
-            | SubscribeState::Completed(_)
-            | SubscribeState::Failed => None,
-        }
-    }
-
-    /// Whether this node is the originator of this subscribe operation.
-    /// The originator has no `requester_addr` (no upstream peer to respond to).
-    pub(crate) fn is_originator(&self) -> bool {
-        self.requester_addr.is_none()
-    }
-
-    /// Build a NotFound result to send back to the requester, or fail locally if we're the originator.
-    ///
-    /// # Information disclosure note
-    /// Before this fix, subscribe failures caused a 60s timeout which provided implicit
-    /// rate limiting on network probing. Instant NotFound responses allow faster contract
-    /// hosting enumeration. The risk is low (contract locations are already somewhat
-    /// predictable from the DHT topology), but future hardening could add jitter or
-    /// rate-limit NotFound responses if probing becomes a practical concern.
-    fn not_found_result(
-        id: Transaction,
-        instance_id: ContractInstanceId,
-        requester_addr: Option<std::net::SocketAddr>,
-        reason: &str,
-    ) -> Result<OperationResult, OpError> {
-        if let Some(requester_addr) = requester_addr {
-            // We're an intermediate node — send NotFound back to the upstream requester
-            tracing::debug!(
-                tx = %id,
-                %instance_id,
-                requester = %requester_addr,
-                %reason,
-                "Sending NotFound response to requester"
-            );
-            Ok(OperationResult::SendAndComplete {
-                msg: NetMessage::from(SubscribeMsg::Response {
-                    id,
-                    instance_id,
-                    result: SubscribeMsgResult::NotFound,
-                }),
-                next_hop: Some(requester_addr),
-                stream_data: None,
-            })
-        } else {
-            // We're the originator — fail the operation directly
-            tracing::warn!(
-                tx = %id,
-                %instance_id,
-                %reason,
-                phase = "not_found",
-                "Subscribe failed at originator"
-            );
-            Err(RingError::NoHostingPeers(instance_id).into())
-        }
-    }
 }
 
 /// Register a downstream subscriber for a contract.
@@ -781,8 +418,7 @@ pub(crate) async fn register_downstream_subscriber(
 ///
 /// Replaces the legacy `process_message::SubscribeMsg::Unsubscribe` arm
 /// retired in #1454 phase 5 final (SUBSCRIBE slice). The node.rs dispatch
-/// site calls this directly for inbound Unsubscribe variants instead of
-/// routing through `handle_op_request<SubscribeOp>`.
+/// site calls this directly for inbound Unsubscribe variants.
 pub(crate) async fn handle_unsubscribe_inbound(
     op_manager: &OpManager,
     tx: Transaction,
@@ -860,12 +496,6 @@ pub(crate) async fn handle_unsubscribe_inbound(
             contract = %key,
             "Still have subscribers, not propagating unsubscribe"
         );
-    }
-}
-
-impl IsOperationCompleted for SubscribeOp {
-    fn is_completed(&self) -> bool {
-        matches!(self.state, SubscribeState::Completed(_))
     }
 }
 

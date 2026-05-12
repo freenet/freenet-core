@@ -318,6 +318,7 @@ impl OpEnum {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Surface kept for the CONNECT carrier + post-#1454 phase-5 final tests.
 pub(crate) enum OpOutcome<'a> {
     /// An op which involves a contract completed successfully.
     ContractOpSuccess {

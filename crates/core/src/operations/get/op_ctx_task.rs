@@ -1395,7 +1395,7 @@ async fn drive_sub_op_get(
 
     match loop_result {
         RetryLoopOutcome::Done(terminal) => {
-            let reply_key = match &terminal {
+            match &terminal {
                 Terminal::InlineFound {
                     key,
                     state,
@@ -1409,7 +1409,6 @@ async fn drive_sub_op_get(
                         false, // sub-op: not a client-originating GET
                     )
                     .await;
-                    *key
                 }
                 Terminal::Streaming {
                     key,
@@ -1447,15 +1446,9 @@ async fn drive_sub_op_get(
                              cannot claim orphan stream"
                         );
                     }
-                    *key
                 }
-                Terminal::LocalCompletion => {
-                    match lookup_stored_key(op_manager, &instance_id).await {
-                        Some(k) => k,
-                        None => synthetic_key(&instance_id),
-                    }
-                }
-            };
+                Terminal::LocalCompletion => {}
+            }
 
             // Resolve a GetResult by re-querying the local store. Mirrors
             // `build_host_response` but returns the raw `GetResult` shape
@@ -1477,7 +1470,6 @@ async fn drive_sub_op_get(
                 }) => {
                     let client_contract = if return_contract_code { contract } else { None };
                     SubOpGetOutcome::Found(crate::operations::get::GetResult::new(
-                        reply_key,
                         state,
                         client_contract,
                     ))
@@ -4115,14 +4107,11 @@ mod tests {
     /// constructor shape so future variant additions trip the test.
     #[test]
     fn sub_op_outcome_variants_constructible() {
-        use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, WrappedState};
+        use freenet_stdlib::prelude::WrappedState;
 
-        let id = ContractInstanceId::new([0u8; 32]);
-        let key =
-            ContractKey::from_id_and_code(id, freenet_stdlib::prelude::CodeHash::new([0u8; 32]));
         let state = WrappedState::from(vec![1u8, 2, 3]);
         let found =
-            super::SubOpGetOutcome::Found(crate::operations::get::GetResult::new(key, state, None));
+            super::SubOpGetOutcome::Found(crate::operations::get::GetResult::new(state, None));
         let not_found = super::SubOpGetOutcome::NotFound("exhausted".to_string());
         let infra = super::SubOpGetOutcome::Infra(crate::operations::OpError::UnexpectedOpState);
 
