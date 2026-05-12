@@ -2066,7 +2066,7 @@ dependencies = [
  "moka",
  "muda",
  "notify",
- "opentelemetry 0.31.0",
+ "opentelemetry 0.32.0",
  "opentelemetry-jaeger",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.31.0",
