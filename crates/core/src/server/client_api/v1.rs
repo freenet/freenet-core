@@ -2,7 +2,7 @@ use axum::{
     Extension, Router,
     extract::{Path, RawQuery},
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
 };
 
 use super::*;
@@ -20,10 +20,6 @@ pub(super) fn routes(config: Config) -> Router {
         // (freenet/freenet-core#4019)
         .route("/v1/contract/web/{key}", get(web_root_redirect_v1))
         .route("/v1/contract/web/{key}/", get(web_home_v1))
-        .route(
-            "/v1/contract/web/{key}/__permissions",
-            post(web_permissions_v1),
-        )
         .route("/v1/contract/web/{key}/{*path}", get(web_subpages_v1))
         .with_state(config)
 }
@@ -45,17 +41,6 @@ async fn web_subpages_v1(
     Extension(rs): Extension<HttpClientApiRequest>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     web_subpages(key, last_path, ApiVersion::V1, query, headers, rs).await
-}
-
-async fn web_permissions_v1(
-    key: Path<String>,
-    config: axum::extract::State<Config>,
-    query: RawQuery,
-    form: axum::Form<crate::server::web_permissions::PermissionForm>,
-) -> Result<axum::response::Response, WebSocketApiError> {
-    crate::server::web_permissions::permission_submit(key, config, ApiVersion::V1, query, form)
-        .await
-        .map(|response| response.into_response())
 }
 
 /// Redirect `/v1/contract/web/{key}` (no trailing slash) to
