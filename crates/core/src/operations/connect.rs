@@ -2611,7 +2611,9 @@ pub(crate) async fn join_ring_request(
         // Bootstrap mode: target own location with jitter after failures.
         apply_bootstrap_jitter(base_location)
     };
+    let tx = Transaction::new::<ConnectMsg>();
     op_ctx_task::start_client_connect(
+        tx,
         gateway.clone(),
         gateway_addr,
         op_manager,
@@ -2653,7 +2655,9 @@ pub(crate) async fn gateway_version_probe(
     let own = op_manager.ring.connection_manager.own_location();
     let desired_location = own.location().unwrap_or_else(Location::random);
 
+    let tx = Transaction::new::<ConnectMsg>();
     op_ctx_task::start_client_connect(
+        tx,
         gateway.clone(),
         gateway_addr,
         op_manager,

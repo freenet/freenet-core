@@ -46,7 +46,7 @@ use crate::ring::{ConnectionFailureReason, Location, PeerKeyLocation};
 use crate::tracing::NetEventLog;
 
 use super::{
-    ConnectMsg, ConnectOp, ConnectRequest, ForwardAttempt, RelayEnv, RelayState,
+    ConnectMsg, ConnectRequest, ForwardAttempt, RelayEnv, RelayState,
     dispatch_expect_connection_from,
 };
 
@@ -133,7 +133,15 @@ impl Drop for RelayConnectInflightGuard {
 /// to wrapping the future in `tokio::time::timeout`, which would
 /// cancel the future mid-flight and leak the
 /// `pending_op_results` slot until the 60s sweep (#3100).
+///
+/// `tx` is supplied by the caller so the joiner-side transaction id
+/// can be registered with `LiveTransactionTracker` before the driver
+/// task is spawned. Allocating tx inside the driver would race the
+/// caller's `add_transaction` registration against the first inbound
+/// Response, which can arrive before the spawn completes on a busy
+/// runtime.
 pub(crate) async fn start_client_connect(
+    tx: Transaction,
     gateway: PeerKeyLocation,
     gateway_addr: SocketAddr,
     op_manager: &OpManager,
@@ -165,21 +173,8 @@ pub(crate) async fn start_client_connect(
     let mut exclude_addrs = failed_addrs;
     exclude_addrs.extend(connected_addrs);
 
-    // ConnectOp::initiate_join_request still returns a legacy ConnectOp
-    // value; slice 2 originator does not push it into ops.connect (the
-    // driver owns state in task locals). Drop it. Future cleanup: split
-    // the bloom-filter / Request-message construction off into a free
-    // helper so the legacy ConnectOp allocation is avoided entirely.
-    // Tracked for follow-up — addressed alongside Phase 6 cleanup.
-    let (tx, _legacy_op, request_msg) = ConnectOp::initiate_join_request(
-        own.clone(),
-        gateway.clone(),
-        desired_location,
-        ttl,
-        target_connections,
-        op_manager.connect_forward_estimator.clone(),
-        &exclude_addrs,
-    );
+    let request_msg =
+        super::prepare_join_request(tx, &own, &gateway, desired_location, ttl, &exclude_addrs);
 
     if let Some(event) = NetEventLog::connect_request_sent(
         &tx,
