@@ -343,7 +343,11 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     let data = {
         let mut buf = vec![];
         File::open(&config.delta)?.read_to_end(&mut buf)?;
-        StateDelta::from(buf).into()
+        if config.as_state {
+            UpdateData::State(State::from(buf))
+        } else {
+            UpdateData::Delta(StateDelta::from(buf))
+        }
     };
     let request = ContractRequest::Update { key, data }.into();
     let mut client = start_api_client(other).await?;
