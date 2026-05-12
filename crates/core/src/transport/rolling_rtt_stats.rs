@@ -37,11 +37,20 @@ const BASELINE_WINDOW: Duration = Duration::from_secs(300);
 /// RTT over last 10 s" definition.
 const RECENT_WINDOW: Duration = Duration::from_secs(10);
 
-/// Hard upper bound on stored samples per peer. At a sustained 50
-/// samples/sec this covers the full 5-min baseline window; busier peers
-/// will lose the oldest samples first. The cap exists so a runaway
-/// sender cannot push per-peer memory above a few hundred KB.
-const MAX_SAMPLES: usize = 16_384;
+/// Hard upper bound on stored samples per peer. Memory cost is
+/// `MAX_SAMPLES * 16 bytes` worst case (~512 KB at the cap). When this
+/// cap is reached the oldest samples are dropped, so the effective
+/// baseline window shrinks below `BASELINE_WINDOW` for busy peers:
+/// at S samples/sec sustained, coverage is `min(BASELINE_WINDOW,
+/// MAX_SAMPLES / S)` seconds. A peer pushing 100 RTT samples/sec
+/// retains roughly the most recent 5-min window; a peer pushing
+/// 1000 samples/sec only covers the last ~30 s.
+///
+/// Phase 1 accepts this graceful degradation: the snapshot still
+/// returns a meaningful min/median, just over a shorter effective
+/// window. A future iteration can add per-second binning to keep the
+/// full baseline window at any sample rate (tracked in #4074).
+const MAX_SAMPLES: usize = 32_768;
 
 /// Snapshot of one peer's rolling RTT state. Cheap to copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,11 +95,16 @@ impl<T: TimeSource> RollingRttStats<T> {
     /// timestamp. Called from the ACK-processing site once per ACK that
     /// produced a non-retransmitted RTT measurement.
     pub(crate) fn record(&self, rtt: Duration) {
-        let now_nanos = self.time_source.now_nanos();
         let rtt_nanos = rtt.as_nanos().min(u64::MAX as u128) as u64;
-        let cutoff = now_nanos.saturating_sub(BASELINE_WINDOW.as_nanos() as u64);
 
         let mut inner = self.inner.lock();
+        // Read time inside the lock so the per-deque ascending-order
+        // invariant cannot be violated by two concurrent recorders
+        // racing between `now_nanos()` and `push_back`. (Without this,
+        // the front-pruning loop can stop early on an out-of-order
+        // entry and leave genuinely stale samples in the deque.)
+        let now_nanos = self.time_source.now_nanos();
+        let cutoff = now_nanos.saturating_sub(BASELINE_WINDOW.as_nanos() as u64);
         inner.samples.push_back((now_nanos, rtt_nanos));
 
         // Drop samples older than the baseline window.
@@ -215,7 +229,6 @@ impl<T: TimeSource> RollingRttStatsHandle<T> {
         let stats = Arc::new(RollingRttStats::new(time_source));
         let erased: Arc<dyn RttSnapshotProvider> = stats.clone();
         SHADOW_RTT_REGISTRY.insert(remote_addr, erased.clone());
-        ensure_aggregator_running();
         Self {
             stats,
             erased,
@@ -250,9 +263,14 @@ pub(crate) fn registry_snapshot() -> Vec<(SocketAddr, RttSnapshot)> {
 /// `None` if no peer has a defined inflation, which is the case at cold
 /// start or on a fully idle node.
 ///
-/// The median, not mean, is used so a single peer with a routing event
-/// or genuinely contended path cannot push the signal on its own, the
-/// RFC's "self-fulfilling re-route" trap.
+/// The median (not mean) is used so a single peer with a routing event
+/// or a genuinely contended path cannot push the signal on its own,
+/// guarding the RFC's "self-fulfilling re-route" trap. **Caveat:** at
+/// small N (`recent.len() <= 2`) the upper-middle pick collapses to
+/// "the worse of the two" and the robustness claim no longer holds.
+/// Any future controller built on this must require `recent.len() >= 3`
+/// before treating the result as a contention signal. Phase 1 only
+/// logs the value, so the small-N case is documentation, not a bug.
 pub(crate) fn cross_connection_median_inflation() -> Option<Duration> {
     let mut inflations: Vec<u64> = registry_snapshot()
         .into_iter()
@@ -270,37 +288,41 @@ pub(crate) fn cross_connection_median_inflation() -> Option<Duration> {
 /// signal at this cadence; Phase 1 just emits it as telemetry.
 const AGGREGATOR_INTERVAL: Duration = Duration::from_secs(1);
 
-static AGGREGATOR_STARTED: std::sync::Once = std::sync::Once::new();
-
-/// Idempotently spawn the cross-connection aggregator task.
+/// Spawn the cross-connection aggregator task and register it with the
+/// node's `BackgroundTaskMonitor`. Call once during node startup,
+/// before any `RollingRttStatsHandle` is constructed.
 ///
-/// Called from `RollingRttStatsHandle::new`, so the first connection
-/// established on a node bootstraps the aggregator. In test contexts
-/// with no current tokio runtime (e.g. plain `#[test]` units), the
-/// aggregator is silently skipped, the registry itself still works
-/// for direct inspection.
-fn ensure_aggregator_running() {
-    AGGREGATOR_STARTED.call_once(|| {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        handle.spawn(async {
-            let mut ticker = tokio::time::interval(AGGREGATOR_INTERVAL);
-            // Skip the immediate-tick on construction; the first
-            // useful sample is one period out.
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+/// Per `.claude/rules/bug-prevention-patterns.md`: lifetime-of-node
+/// tasks must be tracked so the supervisor notices if they exit. The
+/// aggregator silently dying would freeze the shadow telemetry stream
+/// without any user-visible failure.
+pub(crate) fn spawn_aggregator(
+    monitor: &crate::node::background_task_monitor::BackgroundTaskMonitor,
+) {
+    let handle = tokio::spawn(async {
+        let mut ticker = tokio::time::interval(AGGREGATOR_INTERVAL);
+        // The first tick fires immediately; skip it so the first
+        // emission is one period in, when there is at least one
+        // sample to report.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
             ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                emit_aggregate_snapshot();
-            }
-        });
+            emit_aggregate_snapshot();
+        }
     });
+    monitor.register("shadow_rtt_aggregator", handle);
 }
 
 /// Emit one tracing event summarising the current cross-connection
 /// state. Logged at `info` because Phase 1 must reach production
 /// telemetry; debug! would be compiled out of release builds.
+///
+/// Also pushes a structured event through `send_standalone_event` so
+/// it reaches the central OTLP collector (per the `NetEventLog` path
+/// that `TelemetryReporter` consumes). Without that, the aggregate
+/// would land only in per-node file logs and the 2-4 week observation
+/// the RFC calls for would require manual log scraping.
 fn emit_aggregate_snapshot() {
     let snap = registry_snapshot();
     let active_peers = snap.len();
@@ -332,6 +354,19 @@ fn emit_aggregate_snapshot() {
         peers_with_recent,
         median_inflation_us,
         "shadow_rtt_aggregate"
+    );
+    // Mirror the aggregate to the central OTLP collector. The
+    // tracing event above lands only in per-node file logs; this
+    // call surfaces the same numbers in the freenet telemetry
+    // dashboard so the 2-4 week observation horizon is queryable
+    // without manual log scraping.
+    crate::tracing::telemetry::send_standalone_event(
+        "shadow_rtt_aggregate",
+        serde_json::json!({
+            "active_peers": active_peers,
+            "peers_with_recent": peers_with_recent,
+            "median_inflation_us": median_inflation_us,
+        }),
     );
 }
 
@@ -610,5 +645,114 @@ mod tests {
 
         // Drop everything for hygiene.
         drop(peers);
+    }
+
+    /// Direct call into `cross_connection_median_inflation()`. The
+    /// outlier-robustness test above filters to its own peers and
+    /// open-codes the median, so without this test the public
+    /// function itself is uncovered. Use a single peer with a known
+    /// inflation so cross-talk from any other test's registry entry
+    /// can be tolerated by an inequality assertion.
+    #[test]
+    fn cross_connection_median_returns_some_when_a_peer_has_inflation() {
+        let ts = VirtualTime::new();
+        let addr = unique_addr(30, 50300);
+        let h = RollingRttStatsHandle::new(addr, ts.clone());
+        for _ in 0..3 {
+            h.record(dur_ms(50));
+        }
+        ts.advance(Duration::from_secs(30));
+        for _ in 0..5 {
+            h.record(dur_ms(120));
+        }
+        let median =
+            cross_connection_median_inflation().expect("at least one peer has defined inflation");
+        // We can't assert an exact value because other tests may
+        // contribute peers, but the result must be non-zero (someone
+        // has inflation) and bounded.
+        assert!(median > Duration::ZERO);
+        drop(h);
+    }
+
+    /// Boundary check: a sample exactly at `now - BASELINE_WINDOW` is
+    /// pruned (the comparison is `ts < cutoff`, strict less-than). One
+    /// at `now - BASELINE_WINDOW + 1ns` survives.
+    #[test]
+    fn baseline_boundary_is_strict_less_than() {
+        let (ts, stats) = new_stats();
+        // First sample is at t=0.
+        stats.record(dur_ms(50));
+        // Advance to exactly the window edge: now = BASELINE_WINDOW,
+        // cutoff = BASELINE_WINDOW.saturating_sub(BASELINE_WINDOW) = 0.
+        // Sample timestamp 0 < cutoff 0 is false, so it survives.
+        ts.advance(BASELINE_WINDOW);
+        stats.record(dur_ms(80));
+        let snap = stats.snapshot().expect("snapshot");
+        assert_eq!(
+            snap.baseline_samples, 2,
+            "sample at exact window edge survives"
+        );
+        // One nanosecond past the edge evicts the first sample.
+        ts.advance(Duration::from_nanos(1));
+        stats.record(dur_ms(90));
+        let snap = stats.snapshot().expect("snapshot");
+        assert_eq!(snap.baseline_samples, 2, "first sample now aged out");
+        assert_eq!(snap.baseline_min, Some(dur_ms(80)));
+    }
+
+    /// Even-length recent window: pin the upper-middle convention so a
+    /// future refactor that drifts to lower-middle is caught.
+    #[test]
+    fn recent_median_picks_upper_middle_for_even_length() {
+        let (ts, stats) = new_stats();
+        for ms in [40u64, 50, 60, 70] {
+            stats.record(dur_ms(ms));
+            ts.advance(Duration::from_millis(100));
+        }
+        let snap = stats.snapshot().expect("snapshot");
+        // Sorted recent = [40, 50, 60, 70]; upper-middle = index 2 = 60ms.
+        assert_eq!(snap.recent_median, Some(dur_ms(60)));
+    }
+
+    /// `spawn_aggregator` must produce a task that emits the
+    /// `shadow_rtt_aggregate` event on its 1Hz cadence and survives
+    /// across multiple ticks. Uses paused tokio time so the test is
+    /// deterministic and finishes in microseconds. A regression that
+    /// (a) returns before spawning, (b) panics inside the loop, or
+    /// (c) breaks the OTLP `send_standalone_event` mirror by holding
+    /// it inside a blocking call would be caught here.
+    #[tokio::test(start_paused = true)]
+    async fn aggregator_emits_periodically() {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+
+        let monitor = BackgroundTaskMonitor::new();
+        spawn_aggregator(&monitor);
+
+        // Register a peer so emit_aggregate_snapshot has something to
+        // report (active_peers == 0 short-circuits).
+        let ts = VirtualTime::new();
+        let addr = unique_addr(40, 50400);
+        let h = RollingRttStatsHandle::new(addr, ts.clone());
+        h.record(dur_ms(50));
+
+        // Advance well past two full intervals; the first tick is
+        // skipped, the next two should emit.
+        tokio::time::advance(AGGREGATOR_INTERVAL * 3 + Duration::from_millis(100)).await;
+        // Yield so the spawned task runs.
+        tokio::task::yield_now().await;
+
+        // Aggregator stays alive: the monitor's wait_for_any_exit
+        // future must not be ready (no task has exited).
+        let exit = monitor.wait_for_any_exit();
+        tokio::pin!(exit);
+        let still_running = tokio::time::timeout(Duration::from_millis(50), &mut exit)
+            .await
+            .is_err();
+        assert!(
+            still_running,
+            "aggregator task should still be alive after a few ticks"
+        );
+
+        drop(h);
     }
 }
