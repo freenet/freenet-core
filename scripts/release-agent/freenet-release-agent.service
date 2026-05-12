@@ -19,7 +19,6 @@ NoNewPrivileges=false
 
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log/freenet-release-agent
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true

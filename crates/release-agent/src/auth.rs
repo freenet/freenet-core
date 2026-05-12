@@ -1,9 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::http::HeaderName;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-pub const HEADER_SIGNATURE: &str = "x-signature";
+/// HTTP header carrying the request signature. `HeaderMap::get` is
+/// case-insensitive over the wire; using a `HeaderName` constant makes the
+/// contract explicit and avoids re-parsing on every lookup.
+pub const HEADER_SIGNATURE: HeaderName = HeaderName::from_static("x-signature");
 
 #[derive(thiserror::Error, Debug)]
 pub enum AuthError {
@@ -11,6 +15,8 @@ pub enum AuthError {
     BadSignatureHeader,
     #[error("signature mismatch")]
     BadSignature,
+    #[error("issued_at must be a positive Unix timestamp")]
+    NonPositiveIssuedAt,
     #[error("clock skew too large: |now - issued_at| = {0}s")]
     ClockSkew(i64),
     #[error("hmac key error: {0}")]
@@ -22,16 +28,28 @@ pub fn verify_signature(secret: &[u8], body: &[u8], header_value: &str) -> Resul
     let mut mac =
         <Hmac<Sha256>>::new_from_slice(secret).map_err(|e| AuthError::KeyError(e.to_string()))?;
     mac.update(body);
+    // `verify_slice` is constant-time on equal-length inputs and short-
+    // circuits on length mismatch. SHA-256 output is fixed-size, so the
+    // length-leak gives an attacker no useful information.
     mac.verify_slice(&expected)
         .map_err(|_| AuthError::BadSignature)
 }
 
+/// Reject requests whose `issued_at` is non-positive or outside ±tolerance
+/// of the agent's wall clock. Uses checked arithmetic so an attacker who
+/// produces a valid signature cannot panic the agent with `i64::MIN`.
 pub fn check_clock_skew(issued_at: i64, tolerance_seconds: i64) -> Result<(), AuthError> {
+    if issued_at <= 0 {
+        return Err(AuthError::NonPositiveIssuedAt);
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let delta = (now - issued_at).abs();
+    let delta = now
+        .checked_sub(issued_at)
+        .and_then(i64::checked_abs)
+        .unwrap_or(i64::MAX);
     if delta > tolerance_seconds {
         return Err(AuthError::ClockSkew(delta));
     }
@@ -88,7 +106,6 @@ mod tests {
 
     #[test]
     fn signature_rejects_wrong_length_hex() {
-        // valid hex, but wrong number of bytes for SHA-256 output
         assert!(matches!(
             verify_signature(b"k", b"body", "deadbeef"),
             Err(AuthError::BadSignature)
@@ -114,6 +131,31 @@ mod tests {
         assert!(matches!(
             check_clock_skew(now - 3600, 300),
             Err(AuthError::ClockSkew(_))
+        ));
+    }
+
+    #[test]
+    fn issued_at_zero_rejected() {
+        assert!(matches!(
+            check_clock_skew(0, 300),
+            Err(AuthError::NonPositiveIssuedAt)
+        ));
+    }
+
+    #[test]
+    fn issued_at_negative_rejected() {
+        assert!(matches!(
+            check_clock_skew(-1, 300),
+            Err(AuthError::NonPositiveIssuedAt)
+        ));
+    }
+
+    #[test]
+    fn issued_at_i64_min_does_not_panic() {
+        // Regression: previously `.abs()` on i64::MIN panicked.
+        assert!(matches!(
+            check_clock_skew(i64::MIN, 300),
+            Err(AuthError::NonPositiveIssuedAt)
         ));
     }
 }

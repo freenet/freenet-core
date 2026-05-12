@@ -60,3 +60,16 @@ curl -X POST https://update.<host>.locut.us/update \
 
 In dry-run mode the response will include `"dry_run": true` and the journal
 will show a `dry-run: would invoke …` line. No update is actually performed.
+
+## Response semantics
+
+`POST /update` returns:
+
+- **`200` + `no_op: true`** — the gateway is already on the requested version. The agent did NOT spawn the update script. Callers that poll `/version` to confirm the upgrade MUST inspect `no_op` to distinguish "already there" from "just kicked off".
+- **`200` + `no_op: false`** — dry-run mode; would have spawned.
+- **`202`** — live mode; update spawned, expected to complete within seconds. Poll `/version` (tolerating ~30s of connection-refused during systemd restart) to confirm the new binary.
+- **`401`** — missing/invalid signature, stale `issued_at`, or non-positive `issued_at`.
+- **`403`** — refusing to downgrade, or requested version doesn't match GitHub `latest`.
+- **`429`** — rate-limited (default: one update per 10 min per gateway).
+- **`502`** — GitHub `/releases/latest` lookup failed. Rate-limit window is NOT consumed in this case; retry once GitHub recovers.
+- **`500`** — `sudo` rejected or the script exited non-zero within 1 second. Rate-limit window also NOT consumed. Check `journalctl -u freenet-release-agent` for the script's stderr.

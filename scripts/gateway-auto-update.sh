@@ -33,6 +33,12 @@ CHECK_ONLY=false
 DRY_RUN=false
 VERBOSE=false
 ALL_INSTANCES=false
+# Optional explicit target version (semver, with or without `v` prefix). When
+# set, this overrides the `get_latest_version` GitHub fetch. Used by
+# freenet-release-agent so the version the agent signed for is the version
+# actually installed, even if a newer release is published between the
+# agent's GitHub check and this script's own fetch.
+TARGET_VERSION=""
 
 # Colors (disabled if not a terminal)
 if [[ -t 1 ]]; then
@@ -141,6 +147,14 @@ while [[ $# -gt 0 ]]; do
         --all-instances)
             ALL_INSTANCES=true
             shift
+            ;;
+        --target-version)
+            if [[ $# -lt 2 ]]; then
+                log ERROR "--target-version requires an argument"
+                exit 1
+            fi
+            TARGET_VERSION="${2#v}"
+            shift 2
             ;;
         --verbose|-v)
             VERBOSE=true
@@ -367,11 +381,16 @@ main() {
     log INFO "Current version: $current_version"
 
     local latest_version
-    if ! latest_version=$(get_latest_version); then
-        log ERROR "Failed to determine latest version"
-        exit 1
+    if [[ -n "$TARGET_VERSION" ]]; then
+        latest_version="$TARGET_VERSION"
+        log INFO "Target version:  $latest_version (pinned via --target-version)"
+    else
+        if ! latest_version=$(get_latest_version); then
+            log ERROR "Failed to determine latest version"
+            exit 1
+        fi
+        log INFO "Latest version:  $latest_version"
     fi
-    log INFO "Latest version:  $latest_version"
 
     # Compare versions
     local needs_update=false

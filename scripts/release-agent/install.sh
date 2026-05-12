@@ -36,9 +36,10 @@ if ! id -u freenet-update >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin freenet-update
 fi
 
-echo "==> Creating /etc and /var directories"
+echo "==> Creating config directory"
 install -d -m 0755 -o root -g root /etc/freenet-release-agent
-install -d -m 0755 -o freenet-update -g freenet-update /var/log/freenet-release-agent
+# Logs go to journald (StandardOutput=journal in the systemd unit); no
+# filesystem log dir needed.
 
 echo "==> Installing binary"
 install -m 0755 -o root -g root "$BINARY_SRC" /usr/local/bin/freenet-release-agent
@@ -61,6 +62,24 @@ if [[ ! -f /etc/freenet-release-agent/hmac.key ]]; then
     echo
     echo "  $(cat /etc/freenet-release-agent/hmac.key)"
     echo
+fi
+
+echo "==> Verifying gateway-auto-update.sh privilege boundary"
+GATEWAY_UPDATE_SCRIPT=/usr/local/bin/gateway-auto-update.sh
+if [[ -e "$GATEWAY_UPDATE_SCRIPT" ]]; then
+    script_owner=$(stat -c '%U' "$GATEWAY_UPDATE_SCRIPT")
+    script_perms=$(stat -c '%a' "$GATEWAY_UPDATE_SCRIPT")
+    if [[ "$script_owner" != "root" ]]; then
+        echo "ERROR: $GATEWAY_UPDATE_SCRIPT is owned by $script_owner, must be root" >&2
+        echo "  If freenet-update can write this script, the sudoers entry is meaningless." >&2
+        exit 1
+    fi
+    if [[ "$script_perms" -gt 755 ]]; then
+        echo "ERROR: $GATEWAY_UPDATE_SCRIPT has perms $script_perms; max safe is 755" >&2
+        exit 1
+    fi
+else
+    echo "WARNING: $GATEWAY_UPDATE_SCRIPT not found yet. Install it with the existing gateway-auto-update bootstrap before flipping dry_run=false." >&2
 fi
 
 echo "==> Installing sudoers entry"

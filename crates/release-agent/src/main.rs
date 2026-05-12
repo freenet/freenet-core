@@ -9,8 +9,10 @@ use tokio::sync::Mutex;
 
 use freenet_release_agent::{
     config::Config,
+    github::GitHubLatest,
     server::{AppState, build_router, serve},
     updater::Updater,
+    version::VersionCache,
 };
 
 #[derive(Parser)]
@@ -49,11 +51,16 @@ async fn main() -> Result<()> {
     };
 
     let listen_addr = config.listen_addr;
+    let latest_source = Arc::new(GitHubLatest {
+        client: http,
+        repo: config.github_repo.clone(),
+    });
     let state = AppState {
         config: Arc::new(config),
         secret: Arc::new(secret),
-        http,
+        latest_source,
         updater,
+        version_cache: VersionCache::new(),
         last_update_attempt: Arc::new(Mutex::new(None)),
     };
 
