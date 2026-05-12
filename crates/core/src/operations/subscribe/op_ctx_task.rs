@@ -1,73 +1,32 @@
-//! Task-per-transaction client-initiated SUBSCRIBE (#1454 Phase 2b).
+//! Task-per-transaction SUBSCRIBE drivers.
 //!
-//! This module hosts the first production consumer of [`OpCtx::send_and_await`][ocx],
-//! driving a client-initiated SUBSCRIBE end-to-end inside a single spawned
-//! task instead of the legacy re-entry loop through `handle_op_result` +
-//! `OpManager.ops.subscribe` DashMap.
-//!
-//! # Scope (Phase 2b)
-//!
-//! Only the **client-initiated** SUBSCRIBE entry point (via
-//! [`crate::node::subscribe_with_id`]) runs through this module. The other
-//! three entry points stay on the legacy path for reasons documented on
-//! issue #1454 Phase 2b:
-//!
-//! - **Renewals** (`ring.rs::connection_maintenance` loop) — their jitter
-//!   and spam-prevention in `can_request_subscription()` are load-bearing.
-//! - **PUT/GET sub-ops** (`start_subscription_request` and
-//!   `maybe_subscribe_child` in `put/op_ctx_task.rs` /
-//!   `get/op_ctx_task.rs`) — historically used `SubOperationTracker`
-//!   for blocking semantics; migrated to `run_client_subscribe` (PUT
-//!   in Phase 3a, GET in Phase 3b, the legacy
-//!   `auto_subscribe_on_get_response` fallback in the sub-op
-//!   SUBSCRIBE migration follow-up).
-//! - **Intermediate-peer forwarding** (`SubscribeOp::load_or_init` on
-//!   incoming `Request`) — server-side response role; migrated in Phase 5.
-//!
-//! Only the **client-initiated** path goes through `subscribe_with_id`;
-//! the three legacy paths never call it, so migrating the body of
-//! `subscribe_with_id` wholesale is sufficient to gate the new path.
+//! Each entry point — client-initiated, executor auto-subscribe,
+//! renewal, relay — owns its routing state in task locals. No
+//! `SubscribeOp` is pushed into `OpManager.ops.subscribe`.
 //!
 //! # Architecture
 //!
-//! The task owns all routing state in its locals — there is no
-//! `SubscribeOp` in the `OpManager.ops.subscribe` DashMap for any attempt
-//! this task makes. The task:
-//!
-//! 1. Calls [`super::prepare_initial_request`] to decide target peer vs
+//! 1. [`super::prepare_initial_request`] decides target peer vs
 //!    local-completion vs give-up.
-//! 2. If network target: loops, calling [`OpCtx::send_and_await`][ocx]
-//!    with a **fresh `Transaction` per attempt** (required by
-//!    `send_and_await`'s single-use-per-tx contract). Each attempt
-//!    inserts a capacity-1 reply channel into `p2p_protoc::pending_op_results`
-//!    keyed by the attempt tx; the pure-network-message handler routes
-//!    replies via the SUBSCRIBE bypass added in Phase 2b (see
-//!    `node::try_forward_task_per_tx_reply`).
-//! 3. On `Subscribed`: delivers via `result_router_tx` keyed by the
-//!    **client-visible** `Transaction` (the one returned to the caller
-//!    and registered with `ch_outbound.waiting_for_transaction_result`).
-//! 4. On `NotFound`: applies breadth retry → fresh k_closest round →
-//!    exhaustion, mirroring the legacy retry logic in
-//!    `subscribe::handle_op_response`.
-//! 5. On `send_and_await` timeout: treats the attempt as a peer timeout
-//!    and applies the same retry logic.
+//! 2. Network target: loop calls [`OpCtx::send_and_await`][ocx] with
+//!    a **fresh `Transaction` per attempt** (required by
+//!    `send_and_await`'s single-use-per-tx contract). Replies route
+//!    via the SUBSCRIBE bypass in `handle_pure_network_message_v1`.
+//! 3. `Subscribed` → delivers via `result_router_tx` keyed by
+//!    `client_tx`.
+//! 4. `NotFound` → breadth retry → fresh k_closest → exhaustion.
+//! 5. `send_and_await` timeout → treated as peer timeout.
 //!
 //! # Client-visible tx vs per-attempt tx
 //!
-//! Legacy SUBSCRIBE reuses one `Transaction` end-to-end. Phase 2b splits
-//! this into two tx lifetimes:
+//! - **`client_tx`**: allocated once by the WS handler, registered
+//!   with `ch_outbound.waiting_for_transaction_result`, delivered to
+//!   via `result_router_tx`. Never passed to `send_and_await`.
+//! - **`attempt_tx`**: fresh per retry. Used for the wire Request,
+//!   the `OpCtx`, and the `pending_op_results` callback slot.
 //!
-//! - **`client_tx`**: allocated once by the WS handler, registered with
-//!   `ch_outbound.waiting_for_transaction_result`, delivered to via
-//!   `result_router_tx`. Never passed to `send_and_await`.
-//! - **`attempt_tx`**: fresh per retry. Used for the wire Request, the
-//!   `OpCtx`, and the `pending_op_results` callback slot. Never surfaced
-//!   to the client.
-//!
-//! The split is mandatory: `OpCtx::send_and_await` can only fire once per
-//! Transaction (the `completed` / `under_progress` dedup sets in
-//! `OpManager` suppress second callbacks). Attempt isolation is the
-//! simplest reconciliation with that constraint.
+//! The split is mandatory: `OpCtx::send_and_await` fires once per
+//! Transaction.
 //!
 //! [ocx]: crate::operations::OpCtx::send_and_await
 
@@ -161,8 +120,8 @@ pub(crate) async fn start_client_subscribe(
 /// Runs inside a spawned task. Never panics — any error is converted into
 /// a `HostResult::Err` and delivered through `result_router_tx`.
 ///
-/// `pub(crate)` so PUT's task-per-tx driver (Phase 3a) can `.await` this
-/// inline for blocking-subscribe children without spawning a separate task.
+/// `pub(crate)` so PUT's driver can `.await` this inline for
+/// blocking-subscribe children without spawning a separate task.
 pub(crate) async fn run_client_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
@@ -903,9 +862,8 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
     }
 }
 
-/// Advance the task-local routing state to the next peer to try, mirroring
-/// the legacy `subscribe::handle_op_response` NotFound + alternatives-exhausted
-/// logic (`subscribe.rs` ~1675–1842 before Phase 2b).
+/// Advance the task-local routing state to the next peer to try
+/// (NotFound + alternatives-exhausted logic).
 ///
 /// Thin wrapper around [`advance_to_next_peer_impl`] that binds the
 /// `fresh_candidates` hook to `op_manager.ring.k_closest_potentially_hosting`.
@@ -1113,7 +1071,7 @@ fn deliver_outcome(
     }
 }
 
-// ── Relay SUBSCRIBE driver (#1454 phase 5 follow-up slice A) ─────────────────
+// ── Relay SUBSCRIBE driver ───────────────────────────────────────────────────
 
 /// Counter: relay SUBSCRIBE drivers currently in flight. Decremented in
 /// the RAII guard on driver exit. Diagnostic for `FREENET_MEMORY_STATS`.
@@ -1141,39 +1099,20 @@ pub static RELAY_SUBSCRIBE_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
 pub static RELAY_SUBSCRIBE_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Spawn a relay driver for a fresh inbound `SubscribeMsg::Request`.
+/// Spawn a relay driver for a fresh inbound
+/// `SubscribeMsg::Request`.
 ///
-/// Gated by the dispatch site in `node.rs::handle_pure_network_message_v1`
-/// on `source_addr.is_some() && !has_subscribe_op(id)`. The driver owns
-/// local-hit response + single downstream forward + upstream bubble-up
-/// in its task locals — no `SubscribeOp` is stored in
-/// `OpManager.ops.subscribe` for this transaction.
+/// The driver owns local-hit response + single downstream forward +
+/// upstream bubble-up in its task locals.
 ///
-/// # Slice A
+/// Notable omissions:
 ///
-/// Migrated:
-/// - `SubscribeMsg::Request` relay arm: has-contract check (including the
-///   brief wait-for-in-flight-PUT helper), `register_downstream_subscriber`
-///   on local hit, forward-and-await-Response on next hop, bubble
-///   `SubscribeMsg::Response` back upstream after registering the
-///   requester as a downstream subscriber.
-/// - `ForwardingAck` OMITTED deliberately — same reasoning as GET/PUT/
-///   UPDATE slice A: the ack shares `incoming_tx` with the reply and
-///   would satisfy upstream's capacity-1 `pending_op_results` waiter
-///   before the real `Response`.
-/// - Cross-peer retries OMITTED at the relay — legacy breadth/retry loop
-///   at relay hops is the phase-5 memory-explosion amplifier (see
-///   `project_1454_phase5_memory.md`). Originator-side driver (Phase 2b)
-///   owns cross-peer retry; relay forwards once.
-///
-/// NOT migrated (stays on legacy path):
-/// - `SubscribeMsg::Response` originator arm (Phase 2b driver handles it
-///   via `pending_op_results` bypass).
-/// - `SubscribeMsg::Unsubscribe` and `SubscribeMsg::ForwardingAck` — fire
-///   and forget fast-path, no op state needed.
-/// - Renewals, PUT sub-op subscribes, and intermediate-peer forwarding
-///   through renewal/executor entry points — no `source_addr` or
-///   pre-existing `SubscribeOp` makes them fall through.
+/// - `ForwardingAck` is NOT emitted — the ack shares `incoming_tx`
+///   with the reply and would satisfy upstream's capacity-1
+///   `pending_op_results` waiter before the real `Response`.
+/// - Cross-peer retries are NOT attempted at the relay — the relay
+///   breadth/retry loop was the memory-explosion amplifier (see
+///   `project_1454_phase5_memory.md`). Originator owns retry.
 pub(crate) async fn start_relay_subscribe(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
@@ -2042,10 +1981,9 @@ mod tests {
         assert!(alt_addrs.contains(&p3_addr));
     }
 
-    // ── Relay SUBSCRIBE driver structural pin tests (#1454 phase 5
-    // follow-up slice A). Anchor on the `start_relay_subscribe`
-    // entry-point fn so module-level docs referencing variant names
-    // don't contaminate the scan.
+    // ── Relay SUBSCRIBE driver structural pin tests. Anchor on
+    // the `start_relay_subscribe` entry-point fn so module-level
+    // docs referencing variant names don't contaminate the scan.
 
     fn relay_section(src: &str) -> &str {
         let start = src
@@ -2294,7 +2232,7 @@ mod tests {
         );
     }
 
-    // ── classify_renewal_result tests (#1454 SUBSCRIBE renewal slice) ────
+    // ── classify_renewal_result tests ────────────────────────────────────
     //
     // The renewal classifier is the load-bearing decision point for
     // backoff bookkeeping. Misclassification of a transient channel error
@@ -2413,8 +2351,7 @@ mod tests {
         ));
     }
 
-    // ── classify_executor_subscribe_result tests (#1454 SUBSCRIBE
-    //    executor migration) ───────────────────────────────────────────
+    // ── classify_executor_subscribe_result tests ─────────────────────
     //
     // Executor auto-subscribe delivers Result<(), OpError> directly.
     // These pin the mapping so a future `OpError` / `DriverOutcome`
@@ -2485,7 +2422,7 @@ mod tests {
         }
     }
 
-    // ── run_executor_subscribe body pin tests (#1454) ────────────────
+    // ── run_executor_subscribe body pin tests ─────────────────────────
     //
     // Behavioral end-to-end tests of `run_executor_subscribe` would
     // require spinning a full `OpManager` (no shared test fixture

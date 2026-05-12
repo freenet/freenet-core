@@ -4143,10 +4143,10 @@ impl P2pConnManager {
     /// Send an arbitrary `NetMessage` to a target peer without registering
     /// a `pending_op_results` callback for the message's transaction.
     ///
-    /// Mirrors `handle_send_interest_message` but accepts a fully-formed
-    /// `NetMessage`. Introduced for #1454 phase 2c (CONNECT originator
-    /// task-per-tx driver) so the joiner can emit `ConnectFailed` upstream
-    /// without disturbing its own multi-reply receiver slot.
+    /// Mirrors `handle_send_interest_message` but accepts a
+    /// fully-formed `NetMessage`. Used by the CONNECT joiner to
+    /// emit `ConnectFailed` upstream without disturbing its own
+    /// multi-reply receiver slot.
     async fn handle_send_net_message(
         &mut self,
         target: SocketAddr,

@@ -117,14 +117,11 @@ stateDiagram-v2
     Finished : stored successfully
 ```
 
-**Note:** Since #1454 Phase 3a, PUT originators no longer transition
-through a `PrepareRequest` state — the task-per-transaction driver
+**Note:** The originator driver
 (`operations/put/op_ctx_task.rs::start_client_put`) constructs the
-`Request` message and registers the op directly in `AwaitingResponse`.
-Relay PUTs (inbound `Request`/`RequestStreaming` from peers) are
-driven by `start_relay_put` / `start_relay_put_streaming` without
-materializing an `AwaitingResponse` state at all — the driver bubbles
-the upstream `Response` when the downstream ack arrives.
+`Request` directly; there is no `PrepareRequest` state. Relay PUTs
+(`start_relay_put` / `start_relay_put_streaming`) bubble the
+upstream `Response` when the downstream ack arrives.
 
 **Key features:**
 - Hop-by-hop routing toward contract location

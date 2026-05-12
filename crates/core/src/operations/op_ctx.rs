@@ -1,11 +1,9 @@
-//! Per-transaction execution context for the task-per-tx model (#1454).
+//! Per-transaction execution context for the task-per-tx model.
 //!
-//! This module ships the `OpCtx` struct and its `send_and_await` round-trip
-//! primitive. Phase 2a (PR #3803) landed `OpCtx` as dormant scaffolding
-//! with only unit-test callers; Phase 2b wires in the first production
-//! caller (client-initiated SUBSCRIBE, via
-//! [`crate::operations::subscribe::start_client_subscribe`]) so the
-//! `#[allow(dead_code)]` attributes from Phase 2a have been lifted.
+//! Ships the `OpCtx` struct and its `send_and_await` round-trip
+//! primitive. Each transaction is owned and driven by a single
+//! task; state lives in task locals rather than the legacy
+//! `OpManager.ops.*` DashMap.
 
 use std::net::SocketAddr;
 
@@ -15,22 +13,11 @@ use crate::message::{MessageStats, NetMessage, Transaction};
 use crate::node::OpExecutionPayload;
 use crate::operations::OpError;
 
-/// Per-transaction execution context for the task-per-tx model (#1454).
+/// Per-transaction execution context for the task-per-tx model.
 ///
-/// An `OpCtx` binds a single [`Transaction`] to the channel used to drive its
-/// network round-trip through the event loop. Each transaction is owned and
-/// driven by a single task; the context is [`Send`] but intentionally not
-/// [`Clone`].
-///
-/// # Phase 2a / 2b scope
-///
-/// Phase 2a (#1454) shipped this type with only the round-trip primitive
-/// `send_and_await`. The wider API sketched in the design doc
-/// (`spawn_sub`, per-tx WS fanout via `notify`, per-tx inbox,
-/// `OpRegistry`, and so on) is still deferred to later phases. Phase 2b
-/// activated the primitive by migrating SUBSCRIBE's client-initiated path
-/// onto it (see
-/// [`crate::operations::subscribe::start_client_subscribe`]).
+/// An `OpCtx` binds a single [`Transaction`] to the channel used to
+/// drive its network round-trip through the event loop. The context
+/// is [`Send`] but intentionally not [`Clone`].
 pub(crate) struct OpCtx {
     tx: Transaction,
     op_execution_sender: mpsc::Sender<OpExecutionPayload>,
@@ -53,105 +40,63 @@ impl OpCtx {
 
     /// The transaction this context is bound to.
     ///
-    /// Unused by the Phase 2b production caller (the task holds the
-    /// attempt tx in a local), but kept on the API because later phases
-    /// (per-tx inbox, `OpRegistry`) will need the identity accessor to
-    /// look up per-tx state owned by other components. Dropping and
-    /// re-adding the getter would churn the public surface of `OpCtx`
-    /// without benefit.
-    #[allow(dead_code)] // Kept as stable API surface for later task-per-tx phases (#1454).
+    /// Kept on the API for future per-tx inbox / `OpRegistry`
+    /// lookups; current production callers hold the attempt tx in a
+    /// local instead.
+    #[allow(dead_code)]
     pub fn tx(&self) -> Transaction {
         self.tx
     }
 
-    /// Send `msg` through the event loop and await a single reply keyed by
-    /// the same [`Transaction`]. This is the "round-trip primitive" for the
-    /// async sub-transaction refactor tracked in #1454.
+    /// Send `msg` through the event loop and await a single reply
+    /// keyed by the same [`Transaction`].
     ///
-    /// # Scaffolding reach
+    /// # Single-use per [`Transaction`]
     ///
-    /// As of Phase 1 (#1454, PR #3802), the reply callback inserted into
-    /// `p2p_protoc::pending_op_results` is fired for every network-terminating
-    /// op variant: PUT, GET, SUBSCRIBE, CONNECT, and UPDATE (see
-    /// `node::forward_pending_op_result_if_completed` and the branches of
-    /// `handle_pure_network_message_v1`). SUBSCRIBE's
-    /// `complete_local_subscription` path (`operations/subscribe.rs`) does
-    /// NOT pass through `handle_pure_network_message_v1`, so a caller
-    /// targeting a locally-completed subscribe would still hang on
-    /// `response_receiver.recv()` below. Closing that gap is Phase 2b work.
+    /// The reply callback fires exactly once per tx because the
+    /// `completed`/`under_progress` dedup sets suppress subsequent
+    /// dispatches. A second call with the same tx will hang on
+    /// `response_receiver.recv()`. Multi-attempt protocols (e.g.
+    /// SUBSCRIBE's fallback to alternative peers) must allocate a
+    /// fresh [`Transaction`] per attempt.
     ///
     /// # Deadlock risk
     ///
     /// `response_receiver.recv()` has no timeout. The reply side
-    /// (`node::forward_pending_op_result_if_completed`) uses `try_send`
-    /// against this capacity-1 channel so it can never block the
-    /// pure-network-message handler; the remaining risk is strictly on the
-    /// caller side (the task awaiting below). Phase 2b's author must
-    /// guarantee that the awaiting task is not the sole driver of completion,
-    /// or add an explicit timeout around `response_receiver.recv()`
-    /// (see `.claude/rules/channel-safety.md`).
-    ///
-    /// # Single-use per [`Transaction`]
-    ///
-    /// The Phase 1 helper fires exactly once per tx because the `completed` /
-    /// `under_progress` dedup sets suppress subsequent dispatches. Calling
-    /// `send_and_await` a second time on the same `OpCtx` (or a different
-    /// `OpCtx` sharing the same `Transaction`) will hang forever on
-    /// `response_receiver.recv()` because no second callback will fire.
-    /// Callers that need to retry a multi-attempt protocol (e.g.,
-    /// SUBSCRIBE's fallback to alternative peers) must use a fresh
-    /// [`Transaction`] per attempt. This is a known constraint; Phase 2b's
-    /// planner must work around it.
+    /// uses `try_send` so the pure-network-message handler cannot
+    /// block; the remaining risk is on the caller side. Callers
+    /// must guarantee the awaiting task is not the sole driver of
+    /// completion, or wrap the await in an explicit timeout (see
+    /// `.claude/rules/channel-safety.md`).
     ///
     /// # Where to call this
     ///
-    /// Must be called from an op task (e.g., one spawned via
-    /// [`crate::config::GlobalExecutor::spawn`]), not from within the main
-    /// event loop or a `priority_select` arm. The internal `.send().await`
-    /// on `op_execution_sender` is bounded and can block; spawned tasks are
-    /// OK, event loops are not. See `.claude/rules/channel-safety.md`.
+    /// Must be called from an op task (spawned via
+    /// [`crate::config::GlobalExecutor::spawn`]), not from the main
+    /// event loop. The internal `.send().await` on
+    /// `op_execution_sender` is bounded and can block; spawned tasks
+    /// are OK, event loops are not.
     ///
-    /// # Push-before-send
+    /// # Set up state, then send
     ///
-    /// `send_and_await` is the task-per-tx model's network send primitive,
-    /// so the push-before-send invariant from `.claude/rules/operations.md`
-    /// applies here directly: **any state the op will need when the reply
-    /// arrives must be in place before calling this method**. The exact
-    /// meaning of "in place" depends on which execution path the caller
-    /// sits on:
-    ///
-    /// - **Legacy path** (ops still using `handle_op_result` and
-    ///   `notify_op_change`): the caller must have already called
-    ///   `op_manager.push(tx, updated_state).await?` for the same `tx`
-    ///   before `send_and_await`, otherwise a fast response can race the
-    ///   push and hit `OpNotAvailable` when the pipeline tries to look up
-    ///   the op.
-    /// - **Task-per-tx path** (Phase 2b and later): the op state lives in
-    ///   task locals owned by the task that created this `OpCtx`. The
-    ///   invariant becomes "initialize task-local state before calling
-    ///   `send_and_await`": all fields the task will need when processing
-    ///   the reply (retry counters, `visited` peer filters, pending
-    ///   sub-operations, etc.) must be set before the `await` so that the
-    ///   reply handler reads consistent state. There is no `op_manager`
-    ///   DashMap race in this path because the state never leaves the
-    ///   task, but the conceptual ordering rule is the same.
-    ///
-    /// In both cases, the rule is simple: **set up state, then send**.
+    /// All task-local state the reply handler will read (retry
+    /// counters, visited-peer filters, pending sub-ops) must be
+    /// initialized before calling this method.
     ///
     /// # Terminal reply, not success reply
     ///
-    /// The returned [`NetMessage`] is whatever the op pipeline produced when
-    /// `is_operation_completed` flipped true, including non-success terminal
-    /// states (e.g., a `SubscribeMsg::Response::NotFound`). Callers inspect
-    /// the reply to decide what happened. `Ok(reply)` does NOT imply the
-    /// underlying protocol succeeded.
+    /// The returned [`NetMessage`] is whatever the pipeline produced
+    /// when `is_operation_completed` flipped true, including
+    /// non-success terminal states (e.g.
+    /// `SubscribeMsg::Response::NotFound`). `Ok(reply)` does NOT
+    /// imply protocol success — callers must inspect the reply.
     ///
     /// # Errors
     ///
-    /// Returns [`OpError::NotificationError`] if the executor channel is
-    /// closed (send failure) or the reply receiver is dropped (receiver
-    /// hang-up). Both indicate the round-trip could not complete.
-    #[allow(dead_code)] // Kept as stable API surface for later task-per-tx phases (#1454).
+    /// Returns [`OpError::NotificationError`] if the executor channel
+    /// is closed (send failure) or the reply receiver is dropped
+    /// (receiver hang-up).
+    #[allow(dead_code)]
     pub async fn send_and_await(&mut self, msg: NetMessage) -> Result<NetMessage, OpError> {
         self.send_and_await_inner(msg, None).await
     }
@@ -201,9 +146,9 @@ impl OpCtx {
     /// subsequent `send_client_result` emit `TransactionCompleted`, which
     /// runs after `handle_op_execution` has processed the outbound message.
     ///
-    /// This is the load-bearing primitive for UPDATE's task-per-tx driver,
-    /// which applies the update locally and fires a `RequestUpdate` to a
-    /// remote peer without waiting for acknowledgement (#1454 Phase 4).
+    /// Load-bearing primitive for UPDATE: applies the update locally
+    /// and fires a `RequestUpdate` to a remote peer without waiting
+    /// for acknowledgement.
     pub async fn send_fire_and_forget(
         &mut self,
         target_addr: SocketAddr,
@@ -230,16 +175,13 @@ impl OpCtx {
     /// as an `InboundMessage` (target=None semantics) without awaiting
     /// a reply.
     ///
-    /// Used by `relay_put_finalize_local` when the relay driver is
-    /// running on the originator's own node (originator-loopback PUT,
-    /// added in #1454 phase 5 final PUT slice). Sending a wire-bound
-    /// `PutMsg::Response` to `own_addr` fails — there's no
-    /// self-connection. Routing it through `InboundMessage` instead
+    /// Used by `relay_put_finalize_local` when the relay driver runs
+    /// on the originator's own node (originator-loopback PUT).
+    /// Sending a wire-bound `PutMsg::Response` to `own_addr` fails —
+    /// there's no self-connection. Routing it through `InboundMessage`
     /// lands at `handle_pure_network_message_v1`'s PUT bypass and
     /// forwards to the originator's `pending_op_results` waiter via
-    /// `try_forward_task_per_tx_reply`, mirroring the legacy
-    /// `LocalCompletion` echo semantics (where the looped-back Request
-    /// satisfied the driver as a terminal reply).
+    /// `try_forward_task_per_tx_reply`.
     pub async fn send_local_loopback(&mut self, msg: NetMessage) -> Result<(), OpError> {
         debug_assert_eq!(
             msg.id(),
@@ -309,14 +251,12 @@ impl OpCtx {
     /// Dispatch `msg` and return a multi-reply receiver. Caller drains
     /// the receiver until its own completion predicate fires.
     ///
-    /// This is the load-bearing primitive for ops with fan-in semantics:
-    /// CONNECT (#1454 Phase 2c) sends a single Request and expects up to
-    /// `target_connections` ConnectResponses arriving over time as relay
+    /// Load-bearing primitive for ops with fan-in semantics:
+    /// CONNECT sends a single Request and expects up to
+    /// `target_connections` ConnectResponses over time as relay
     /// branches accept the joiner. `send_and_await` and
-    /// `send_to_and_register_waiter` both use a capacity-1 channel that
-    /// is consumed-and-dropped after one reply, so they cannot model
-    /// fan-in. This primitive accepts a `capacity` argument so the caller
-    /// sizes the channel to the expected fan-in.
+    /// `send_to_and_register_waiter` use a capacity-1 channel and
+    /// cannot model fan-in.
     ///
     /// # When the bypass forwards multiple replies
     ///
@@ -341,7 +281,7 @@ impl OpCtx {
     /// Returns [`OpError::NotificationError`] if the event-loop
     /// `op_execution_sender` channel is closed (receiver dropped —
     /// typically only happens during node shutdown).
-    #[allow(dead_code)] // Phase 2c slice 0: dormant scaffolding for CONNECT originator (#1454).
+    #[allow(dead_code)]
     pub async fn send_and_collect_replies(
         &mut self,
         msg: NetMessage,
@@ -440,11 +380,10 @@ impl OpCtx {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Shared retry-loop driver (#3807).
+// Shared retry-loop driver.
 //
 // Encapsulates the tx-split + timeout + cleanup + classification
-// boilerplate that every task-per-tx op migration repeats. The
-// op-specific pieces are provided via the `RetryDriver` trait.
+// boilerplate. Op-specific pieces are provided via `RetryDriver`.
 // ─────────────────────────────────────────────────────────────────
 
 use crate::config::OPERATION_TTL;
@@ -516,7 +455,7 @@ pub(crate) trait RetryDriver {
     }
 }
 
-/// Drive a task-per-tx retry loop against the network.
+/// Drive a retry loop against the network.
 ///
 /// The first attempt reuses `client_tx` so telemetry correlates with the
 /// client-visible transaction. Subsequent attempts use
@@ -877,25 +816,13 @@ mod tests {
             .expect("executor task should complete without panicking");
     }
 
-    /// Regression for #1454 phase 5 final (PUT slice): the originator-
-    /// loopback PUT path uses `send_local_loopback` to deliver
-    /// `PutMsg::Response` back to the originator's `pending_op_results`
-    /// waiter when the relay driver runs on the originator's own node
-    /// (`upstream_addr == own_addr`). The contract of
-    /// `send_local_loopback` is "fire-and-forget with target=None" —
-    /// the executor sees `target_addr == None`, which causes
-    /// `handle_op_execution` to dispatch as `InboundMessage` rather
-    /// than try to ship over a non-existent self-connection. This
-    /// test pins that channel-level contract.
-    ///
-    /// Bug repro: `test_minimal_state_put_get` (and the rest of the
-    /// `edge_case_state_sizes` suite) failed with "put failed after 1
-    /// attempts (last error: failed notifying, channel closed)" because
-    /// the legacy `relay_put_send_response` used
-    /// `send_fire_and_forget(own_addr, ...)` which routed to
-    /// `OutboundMessageWithTarget` and tried to ship over a wire that
-    /// wasn't there. `send_local_loopback` fixes that by passing
-    /// `None` for the target.
+    /// Regression: the originator-loopback PUT path uses
+    /// `send_local_loopback` to deliver `PutMsg::Response` back to
+    /// the originator's `pending_op_results` waiter when the relay
+    /// driver runs on the originator's own node
+    /// (`upstream_addr == own_addr`). Contract: target=None so
+    /// `handle_op_execution` dispatches as `InboundMessage` rather
+    /// than trying to ship over a non-existent self-connection.
     #[tokio::test]
     async fn send_local_loopback_passes_none_target() {
         let (receiver, sender) = event_loop_notification_channel();
@@ -990,38 +917,17 @@ mod tests {
     }
 
     /// Documents the "single-use per `Transaction`" constraint on
-    /// [`OpCtx::send_and_await`]. The doc comment asserts that a second
-    /// call on the same context "will hang forever" because Phase 1's
-    /// reply helper fires exactly once per tx — this test drives that
-    /// scenario with a fake executor that replies to the first outbound
-    /// message and then **keeps the second `reply_sender` alive without
-    /// firing it**, which is exactly what Phase 1's real dedup
-    /// (`completed` / `under_progress` sets in `OpManager`) does at the
-    /// pipeline level: the second `send_and_await` call arrives, its
-    /// callback is registered in `pending_op_results`, and
-    /// `forward_pending_op_result_if_completed` never runs because the
-    /// op is already `completed`. From `send_and_await`'s perspective
-    /// the reply channel stays open forever with no message.
+    /// Pin the doc claim that a second `send_and_await` on the same
+    /// tx hangs forever. The reply helper fires exactly once per tx
+    /// (the `completed`/`under_progress` dedup sets short-circuit
+    /// subsequent dispatches in `OpManager`); the second
+    /// `send_and_await` call has its callback registered but
+    /// `forward_pending_op_result_if_completed` never runs.
     ///
-    /// The assertion wraps the second call in a short [`timeout`] and
-    /// asserts it elapses with `Err(Elapsed)` rather than resolving to
-    /// `Ok(_)` or `Err(NotificationError)`. A regression that made the
-    /// second call *fail fast* (e.g., by adding a runtime check or a
-    /// timeout inside `send_and_await`) would surface as `Ok(_)` from
-    /// the outer `timeout` and break this assertion — at which point
-    /// the doc comment on `send_and_await` must be updated to match.
-    ///
-    /// What this test does and does not guard against:
-    /// - **Does** guard against doc drift: if a future refactor adds a
-    ///   timeout or error path to the second call, the assertion shape
-    ///   breaks and the doc must be updated.
-    /// - **Does not** guard against the structural source of the hang
-    ///   (Phase 1's `completed` / `under_progress` dedup sets). Those
-    ///   live in `OpManager` and are not constructed here; this test
-    ///   simulates their effect directly by holding the reply sender
-    ///   alive without firing. A regression in the real dedup logic
-    ///   would not be caught here — it would be caught by integration
-    ///   tests that exercise the full pipeline.
+    /// The test simulates the dedup effect by holding the second
+    /// `reply_sender` alive without firing it. It does NOT guard the
+    /// real dedup logic — that lives in `OpManager` and is covered
+    /// by integration tests.
     #[tokio::test]
     async fn send_and_await_second_call_hangs_as_documented() {
         use tokio::sync::oneshot;
@@ -1052,14 +958,12 @@ mod tests {
                 .try_send(dummy_reply_with_tx(tx))
                 .expect("first reply accepted");
 
-            // Second outbound: hold `reply_sender_2` alive — do NOT drop
-            // it, do NOT fire it. This models what Phase 1's real dedup
+            // Second outbound: hold `reply_sender_2` alive — do NOT
+            // drop it, do NOT fire it. Models what the real dedup
             // does at the `OpManager` level: the reply callback is
             // installed, `forward_pending_op_result_if_completed`
-            // never runs again (because the op is already in the
-            // `completed` set), so the reply channel simply never
-            // produces a message or closes. From `send_and_await`'s
-            // viewpoint this is indistinguishable from a hang.
+            // never runs again (the op is already in `completed`),
+            // so the reply channel never produces a message.
             let (reply_sender_2, _second, _target_addr_2) = op_execution_receiver
                 .recv()
                 .await
@@ -1148,16 +1052,14 @@ mod tests {
         assert_eq!(d.attempt_timeout(), OPERATION_TTL);
     }
 
-    /// `send_and_collect_replies` returns a receiver that buffers multiple
-    /// inbound replies for the same tx. Phase 2c (#1454) needs this for
-    /// CONNECT joiners that fan-in N `ConnectResponse`s from distinct
-    /// relay branches against a single outbound `ConnectMsg::Request`.
+    /// `send_and_collect_replies` returns a receiver that buffers
+    /// multiple inbound replies for the same tx. Used by CONNECT
+    /// joiners that fan-in N `ConnectResponse`s from distinct relay
+    /// branches against a single outbound `ConnectMsg::Request`.
     ///
-    /// This test exercises the channel-level invariant only: the executor
-    /// fires three replies before the caller drains, all three must land
-    /// in the receiver in order. The full integration path (bypass
-    /// forwarding, capacity exhaustion behaviour, slot cleanup via
-    /// `release_pending_op_slot`) is covered by slice-1/slice-2 tests.
+    /// Channel-level invariant only: the executor fires three
+    /// replies before the caller drains, all three must land in
+    /// order.
     #[tokio::test]
     async fn send_and_collect_replies_buffers_multiple_inbound_replies() {
         let (receiver, sender) = event_loop_notification_channel();

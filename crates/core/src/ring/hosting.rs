@@ -315,10 +315,10 @@ impl HostingManager {
 
     /// Snapshot of every active subscription for the local-peer dashboard.
     ///
-    /// Reads directly from the canonical lease map (no parallel mirror).
-    /// The earlier `network_status::subscribed_contracts` mirror silently
-    /// drifted after SUBSCRIBE moved to the task-per-tx driver and lost
-    /// its recording hook.
+    /// Reads directly from the canonical lease map (no parallel
+    /// mirror). The earlier `network_status::subscribed_contracts`
+    /// mirror silently drifted when SUBSCRIBE migrated to its driver
+    /// and lost its recording hook.
     pub fn dashboard_subscription_snapshot(&self) -> Vec<SubscribedContractSnapshot> {
         let now = self.time_source.now();
         let mut snapshot: Vec<SubscribedContractSnapshot> = self
@@ -1500,11 +1500,10 @@ mod tests {
         assert!(subscribed.contains(&c3));
     }
 
-    /// Pins the dashboard contract: `subscribe(...)` must be visible in
-    /// `dashboard_subscription_snapshot()` immediately, with no separate
-    /// recording call. The previous parallel `network_status` mirror
-    /// silently drifted when SUBSCRIBE migrated to the task-per-tx driver
-    /// (PR #3806 → #3981); this test prevents the regression.
+    /// Pin: `subscribe(...)` must be visible in
+    /// `dashboard_subscription_snapshot()` immediately. The
+    /// previous parallel `network_status` mirror silently drifted
+    /// after the SUBSCRIBE migration (PR #3806 → #3981).
     #[tokio::test]
     async fn dashboard_snapshot_reflects_active_subscriptions() {
         let manager = HostingManager::new();

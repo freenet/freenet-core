@@ -1,15 +1,10 @@
-// #1454 phase 5 final (GET slice) retired the legacy GET state machine.
-// Every GET wire variant now dispatches unconditionally to a task-per-tx
-// driver — see `op_ctx_task::start_client_get`, `start_relay_get`,
-// `start_sub_op_get`, and `start_targeted_sub_op_get`.
-//
-// Phase 6 (#1454) retired the surviving `#[allow(dead_code)]` scaffolding
-// (`GetOp`, `GetState`, `GetStats`, `AwaitingResponseData`,
-// `PrepareRequestData`, `FinishedData`, the inline outcome / failure-routing
-// pin tests + the `apply_relay_cache_decision` self-test). The wire format
-// (`GetMsg`, `GetMsgResult`, `GetStreamingPayload`) and the originator-side
-// result envelope (`GetResult`) survive because both are still produced and
-// consumed by the task-per-tx drivers and by external crates.
+// Every GET wire variant dispatches to a task-per-tx driver —
+// `op_ctx_task::start_client_get`, `start_relay_get`,
+// `start_sub_op_get`, and `start_targeted_sub_op_get`. The
+// wire-format types (`GetMsg`, `GetMsgResult`,
+// `GetStreamingPayload`) and the originator result envelope
+// (`GetResult`) survive here because the drivers and external
+// crates consume them.
 
 pub(crate) mod op_ctx_task;
 

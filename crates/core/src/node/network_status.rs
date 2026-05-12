@@ -305,7 +305,7 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
 ///   and never publishes via `result_router_tx`).
 ///
 /// Audit: `grep -rn "record_op_result" crates/core/src/operations/`
-/// must show coverage for every op type that has a task-per-tx driver.
+/// must show coverage for every op type with a driver.
 pub fn record_op_result(op_type: OpType, success: bool) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
@@ -840,8 +840,8 @@ mod tests {
         record_op_result(OpType::Get, true);
         record_op_result(OpType::Get, false);
         record_op_result(OpType::Put, true);
-        // Issue #4010: SUBSCRIBE / UPDATE counters were stuck at zero
-        // because the task-per-tx drivers stopped recording outcomes.
+        // Issue #4010: SUBSCRIBE / UPDATE counters were stuck at
+        // zero because the drivers stopped recording outcomes.
         // Cover both op types and both outcomes (success + failure) so
         // the per-op tabulation is pinned end to end. The two
         // `OpType::Update, true` calls are intentional, not a copy
@@ -877,11 +877,11 @@ mod tests {
     /// registered and yields contracts, `get_snapshot().contracts`
     /// renders them with the same field shape (`key_short`, `key_full`,
     /// `subscribed_secs`, `last_updated_secs`) the dashboard template
-    /// expects. The bug this PR fixes was a silent break in this path
-    /// after SUBSCRIBE migrated to the task-per-tx driver and stopped
-    /// invoking the legacy mirror — without a test that exercises the
-    /// provider end-to-end, the same break could happen at the
-    /// `set_subscription_provider` seam in a future refactor.
+    /// expects. The bug this PR fixed was a silent break in this
+    /// path after the SUBSCRIBE migration stopped invoking the
+    /// legacy mirror — without an end-to-end test, the same break
+    /// could happen at the `set_subscription_provider` seam in a
+    /// future refactor.
     #[test]
     fn test_subscription_provider_wired_renders_contracts() {
         use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey};

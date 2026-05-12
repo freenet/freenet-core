@@ -1,57 +1,32 @@
-//! Task-per-transaction client-initiated GET (#1454 Phase 3b).
+//! Task-per-transaction GET drivers.
 //!
-//! Mirrors [`crate::operations::put::op_ctx_task`] — the Phase 3a
-//! production consumer of [`OpCtx::send_and_await`] for PUT, which in
-//! turn follows the Phase 2b SUBSCRIBE driver shape. This module
-//! applies the same pattern to client-initiated GET.
+//! Each entry point — client-initiated, relay, sub-op, targeted
+//! sub-op — owns routing state in task locals. No `GetOp` is pushed
+//! into `OpManager.ops.get`.
 //!
-//! # Scope (Phase 3b)
+//! # Client-initiated flow
 //!
-//! Only the **client-initiated originator** GET runs through this
-//! module. Relay GETs (non-terminal hops), GC-spawned retries, and
-//! `start_targeted_op()` (UPDATE-triggered auto-fetch) stay on the
-//! legacy re-entry loop. Relay migration is tracked in #3883.
-//!
-//! # Architecture
-//!
-//! The task owns all routing state in its locals — there is no `GetOp`
-//! in `OpManager.ops.get` for any attempt this task makes. The task:
-//!
-//! 1. Loops, calling [`OpCtx::send_and_await`] with a fresh
+//! 1. Loop calling [`OpCtx::send_and_await`] with a fresh
 //!    `Transaction` per attempt (single-use-per-tx constraint).
-//!    `process_message` handles routing/forwarding on remote hops and
-//!    the originator's own loop-back for the local-completion (cache
-//!    hit) case, which echoes the `GetMsg::Request` back as the
-//!    terminal "reply" via `forward_pending_op_result_if_completed`
-//!    (same mechanism PUT 3a relies on for `LocalCompletion`).
-//! 2. On terminal `Response{Found}`: the driver stores the returned
-//!    state into the local executor via `PutQuery`, runs hosting /
-//!    access-tracking / announce side effects, and publishes
-//!    `HostResponse::ContractResponse::GetResponse` to the client.
-//!    These side effects mirror what the legacy `process_message`
-//!    Response{Found} branch does at `get.rs:2329` — for task-per-tx
-//!    ops the bypass at `node.rs::handle_pure_network_message_v1`
-//!    intercepts the terminal reply before `process_message` runs on
-//!    the originator (because `load_or_init` would fail with
-//!    `OpNotPresent`), so the driver is the only place they can
+//! 2. Terminal `Response{Found}`: store the returned state into the
+//!    local executor via `PutQuery`, run hosting / access-tracking /
+//!    announce side effects, publish
+//!    `HostResponse::ContractResponse::GetResponse`. The reply
+//!    bypass intercepts before `process_message` would run on the
+//!    originator, so the driver is the only place these side effects
 //!    happen.
-//! 3. On terminal `ResponseStreaming`: Phase 3b delivers the final
-//!    payload via a store re-query using the contract key from the
-//!    envelope. Stream assembly and local caching for streamed
-//!    payloads remain on the legacy path for now — full migration is
-//!    tracked in #3883.
-//! 4. On terminal Request-echo: the pre-send local-cache shortcut in
-//!    `client_events.rs` already returned the state directly, so the
-//!    driver just resolves the ContractKey from the store for
-//!    telemetry and client delivery.
-//! 5. On `Response{NotFound}`: advance to the next peer.
-//! 6. On timeout / wire-error: advance to next peer or exhaust.
+//! 3. Terminal `ResponseStreaming`: deliver the final payload via a
+//!    store re-query using the contract key from the envelope.
+//! 4. Terminal Request-echo: the pre-send local-cache shortcut in
+//!    `client_events.rs` already returned the state; the driver
+//!    resolves the `ContractKey` for telemetry and client delivery.
+//! 5. `Response{NotFound}`: advance to next peer.
+//! 6. Timeout / wire-error: advance or exhaust.
 //!
-//! # Connection-drop latency (R6)
+//! # Connection-drop latency
 //!
-//! Legacy `handle_abort` detects disconnects in <1s. Task-per-tx
-//! relies on the `OPERATION_TTL` (60s) timeout. Accepted ceiling,
-//! matching Phase 2b/3a.
+//! Disconnect detection relies on `OPERATION_TTL` (60s) — accepted
+//! ceiling.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -320,10 +295,8 @@ async fn drive_client_get_inner(
             //
             // The bypass at `node.rs::handle_pure_network_message_v1`
             // intercepts the terminal reply BEFORE `process_message`
-            // runs on the originator (by design — process_message
-            // would fail with OpNotPresent for a task-per-tx op), so
-            // the driver is the only place these side effects can
-            // happen for Phase 3b.
+            // runs on the originator, so the driver is the only
+            // place these side effects can happen.
             // Payload accounting for the router's `transfer_rate_estimator`
             // (router.rs:443) and `response_start_time_estimator`
             // (router.rs:405). Set on the InlineFound/Streaming success
@@ -579,9 +552,7 @@ async fn drive_client_get_inner(
             // as `ContractResponse::NotFound` so client integrations
             // (`fdev`, `apps/freenet-ping`, integration tests) can
             // distinguish "contract genuinely absent" from "operation
-            // failed". Mirrors the legacy `process_message`
-            // Response{NotFound} terminal arm at `get.rs:2470-2496`
-            // (pre-#1454 phase 5 final).
+            // failed".
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
             ))))
@@ -706,17 +677,17 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
         // Explicit non-terminal `GetMsg` variants. These should never
         // reach the driver — the bypass at
         // `node.rs::handle_pure_network_message_v1` gates forwarding
-        // on terminal variants only — so their arrival here indicates
-        // a bug in the bypass gate (Phase 2b Bug 2 class).
+        // on terminal variants only — so their arrival here
+        // indicates a bug in the bypass gate.
         NetMessage::V1(NetMessageV1::Get(
             GetMsg::ForwardingAck { .. } | GetMsg::ResponseStreamingAck { .. },
         )) => AttemptOutcome::Unexpected,
         // Non-GET NetMessage variants (or any future `GetMsg` variant
         // added without updating this match) fall through to
         // Unexpected. If a new GetMsg variant is added, this arm must
-        // be audited — the Phase 3b GET driver has explicit handling
-        // for every variant above, and the bypass filter in node.rs
-        // must be extended in lockstep.
+        // be audited — this driver has explicit handling for every
+        // variant above, and the bypass filter in node.rs must be
+        // extended in lockstep.
         _ => AttemptOutcome::Unexpected,
     }
 }
@@ -1664,17 +1635,16 @@ async fn run_relay_get(
     // removes the entry immediately so `test_pending_op_results_bounded`
     // stays under its leak ceiling.
     //
-    // Originator-loopback exception (#1454 phase 5 final GET slice,
-    // mirrors PUT slice): when this driver runs on the originator's
-    // own node (`upstream_addr == own_addr`), the
+    // Originator-loopback exception: when this driver runs on the
+    // originator's own node (`upstream_addr == own_addr`), the
     // `pending_op_results` callback for `incoming_tx` is the
     // originator's `send_and_await` waiter — NOT one this driver
     // installed. Releasing it here would emit `TransactionCompleted`
     // and remove the originator's callback BEFORE the loopback
     // `GetMsg::Response` arrives at the bypass, racing the
-    // originator's wait. The originator's own driver completion path
-    // (via `ClientGetCompletionGuard` → `release_pending_op_slot`)
-    // cleans up the slot.
+    // originator's wait. The originator's own driver completion
+    // path (via `ClientGetCompletionGuard` →
+    // `release_pending_op_slot`) cleans up the slot.
     //
     // Yield first so any in-flight `send_fire_and_forget` has time to
     // run through the event loop's `handle_op_execution` and actually
@@ -1865,8 +1835,7 @@ async fn relay_send_not_found(
     // `send_local_loopback` to route as `InboundMessage` instead, so
     // the bypass at `handle_pure_network_message_v1` can forward the
     // terminal Response to the originator's `pending_op_results`
-    // waiter. Mirrors PUT slice's `relay_put_send_response` loopback
-    // branch (#1454 phase 5 final, GET slice fixup).
+    // waiter. Mirrors `relay_put_send_response`'s loopback branch.
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
     let send_result = if Some(upstream_addr) == own_addr {
         ctx.send_local_loopback(msg).await
@@ -1909,7 +1878,7 @@ async fn relay_send_found(
     let mut ctx = op_manager.op_ctx(tx);
     // Originator-loopback: route via `send_local_loopback` to avoid
     // the wire-bound self-connection failure. See `relay_send_not_found`
-    // for the full rationale (#1454 phase 5 final, GET slice fixup).
+    // for the full rationale.
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
     if Some(upstream_addr) == own_addr {
         ctx.send_local_loopback(msg)
@@ -2173,9 +2142,7 @@ async fn drive_relay_get_inner(
         // `handle_pure_network_message_v1` forwards it to the
         // originator's still-installed callback. The client driver
         // owns retry semantics; the relay driver has nothing to add.
-        // Mirrors PUT slice (#1454 phase 5 final, PUT slice) which
-        // uses the same fire-and-forget pattern in
-        // `drive_relay_put`'s originator-loopback branch.
+        // Mirrors `drive_relay_put`'s originator-loopback branch.
         let own_addr = op_manager.ring.connection_manager.get_own_addr();
         let originator_loopback = Some(upstream_addr) == own_addr;
         let mut ctx = op_manager.op_ctx(incoming_tx);
@@ -2445,7 +2412,7 @@ mod tests {
         }));
         assert!(
             matches!(classify(msg), AttemptOutcome::Unexpected),
-            "ForwardingAck must NOT be classified as terminal (Phase 2b bug 2)"
+            "ForwardingAck must NOT be classified as terminal"
         );
     }
 
@@ -3171,15 +3138,12 @@ mod tests {
     // already provided by `test_get_routing_coverage_low_htl` and
     // `test_get_reliability_*` (nightly).
 
-    // ── Dispatch shape pin (#1454 phase 5 final, GET slice) ───────────────
+    // ── Dispatch shape pin ────────────────────────────────────────────────
     //
-    // After the GET slice retired the legacy state machine, the GET arm
-    // in node.rs no longer falls through to `handle_op_request<GetOp>`
-    // and no longer gates relay dispatch on `has_get_op` /
-    // `source_addr.is_some()`. Originator-loopback (source_addr=None)
-    // is mapped to `upstream_addr=own_addr` so the same `start_relay_get`
-    // driver handles both true relay hops and originator-loopback. The
-    // structural guard for that shape lives at
+    // The GET arm in node.rs dispatches every wire variant
+    // unconditionally to a driver. Originator loopback
+    // (`source_addr=None`) is mapped to `upstream_addr=own_addr`.
+    // Structural guard lives at
     // `node::tests::callback_forward_tests::get_branch_dispatches_relay_driver`.
 
     #[test]
@@ -3603,13 +3567,12 @@ mod tests {
         );
     }
 
-    // ── Per-tx independence pin (#1454 phase 5 final, GET slice) ──────────
+    // ── Per-tx independence pin ───────────────────────────────────────────
     //
-    // The legacy `has_get_op(id)` dispatch gate is gone. Per-tx
-    // independence is now enforced by `active_relay_get_txs` —
+    // Per-tx independence is enforced by `active_relay_get_txs` —
     // `start_relay_get` rejects a duplicate inbound Request whose
     // `incoming_tx` already has a live driver via the
-    // `Relay*InflightGuard` RAII pattern. Dedup remains keyed on
+    // `Relay*InflightGuard` RAII pattern. Dedup is keyed on
     // transaction id (NOT contract instance id), so two concurrent
     // relay GETs for the *same* contract from different upstreams each
     // get their own driver task and their own upstream reply.
@@ -3644,8 +3607,8 @@ mod tests {
     /// `TransactionCompleted` and remove the originator's callback
     /// BEFORE the loopback `GetMsg::Response` reaches the bypass
     /// (notifications channel has higher priority than op_execution
-    /// in priority_select). Repro: `test_get_notfound_no_forwarding_targets`
-    /// (#1454 phase 5 final, GET slice follow-up commit 6cb3ca18).
+    /// in priority_select). Repro:
+    /// `test_get_notfound_no_forwarding_targets`.
     #[test]
     fn run_relay_get_skips_release_in_originator_loopback() {
         let src = include_str!("../get/op_ctx_task.rs");
@@ -3689,8 +3652,7 @@ mod tests {
     /// attempt a UDP self-connection that has no peer entry, failing
     /// silently. Routing as `InboundMessage` via `send_local_loopback`
     /// lands at the bypass in `handle_pure_network_message_v1` and
-    /// forwards to the originator's `pending_op_results` waiter
-    /// (#1454 phase 5 final, GET slice fixup commit 8107da8a).
+    /// forwards to the originator's `pending_op_results` waiter.
     #[test]
     fn relay_send_responses_use_local_loopback_on_own_addr() {
         let src = include_str!("../get/op_ctx_task.rs");
@@ -3730,9 +3692,8 @@ mod tests {
     /// callback and never reach the client driver. After loopback
     /// dispatch, the driver returns immediately so the client
     /// driver's still-installed callback receives the Response via
-    /// the bypass and owns retry semantics. Mirrors PUT slice's
-    /// `drive_relay_put` originator-loopback branch (#1454 phase 5
-    /// final, GET slice fixup commit 8107da8a).
+    /// the bypass and owns retry semantics. Mirrors
+    /// `drive_relay_put`'s originator-loopback branch.
     #[test]
     fn drive_relay_get_loopback_uses_fire_and_forget() {
         let src = include_str!("../get/op_ctx_task.rs");
@@ -3988,8 +3949,7 @@ mod tests {
 
     /// Pin: `start_sub_op_get` MUST exist as the sub-op GET entry
     /// point. Removing it would force legacy `get::start_op` +
-    /// `request_get` revival and re-leak GetOp into `ops.get` for
-    /// sub-op GETs. (#1454 phase 5 follow-up.)
+    /// `request_get` revival.
     #[test]
     fn start_sub_op_get_entry_must_exist() {
         let src = include_str!("op_ctx_task.rs");

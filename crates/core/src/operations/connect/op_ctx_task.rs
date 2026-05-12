@@ -1,34 +1,25 @@
-//! Task-per-transaction driver for client-initiated CONNECT (#1454 phase 2c slice 2).
+//! Task-per-transaction drivers for CONNECT.
 //!
-//! Replaces the legacy `WaitingForResponses` joiner state machine. Driver
-//! holds joiner state in task locals, sends a single `ConnectMsg::Request`
-//! to the first-hop gateway via `OpCtx::send_to_and_collect_replies`, and
-//! drains a multi-reply receiver until `target_connections` acceptances
-//! land or an overall timeout fires.
+//! The joiner driver holds state in task locals, sends a single
+//! `ConnectMsg::Request` to the first-hop gateway via
+//! `OpCtx::send_to_and_collect_replies`, and drains a multi-reply
+//! receiver until `target_connections` acceptances arrive or an
+//! overall timeout fires.
 //!
-//! Side effects mirrored from legacy `process_message::ConnectMsg::Response`:
+//! Side effects per reply variant:
 //!
-//! - `NetEventLog::connect_request_sent` before send
-//! - `NetEventLog::connect_response_received` per Response
-//! - `NodeEvent::ExpectPeerConnection { addr }` per new acceptor
-//! - `NodeEvent::ConnectPeer { peer, tx, callback, is_gw: false }` then
-//!   await callback (sequential per acceptor — matches legacy)
-//! - on hole-punch success: `record_acceptor_outcome(addr, true, now)`
-//! - on hole-punch failure: emit `ConnectMsg::ConnectFailed` to gateway,
-//!   stay in loop awaiting next Response (legacy behavior)
-//! - on `accepted >= target_connections`: reset jitter counter,
-//!   `gateway_backoff.record_success(gw_addr)`, `record_connection_success(target_loc)`
-//!
-//! `Rejected`: `record_connection_failure(desired_location, Rejected)`,
-//! `gateway_backoff.record_failure(gw_addr)`, exit driver.
-//!
-//! `ObservedAddress` stays on legacy `load_or_init` path — that path
-//! already does `set_own_addr` / `update_location` as a stateless side
-//! effect even when no op exists (connect.rs:1471-1488, 1498-1517).
-//!
-//! `ConnectFailed` is emitted by this driver but never received by it —
-//! it flows downstream toward the relay chain. Relay handling lands in
-//! slice 1.
+//! - `Response`: `NetEventLog::connect_response_received`,
+//!   `NodeEvent::ExpectPeerConnection`, `NodeEvent::ConnectPeer`,
+//!   then await the callback (sequential per acceptor). On
+//!   hole-punch success: `record_acceptor_outcome(addr, true, now)`.
+//!   On hole-punch failure: emit `ConnectMsg::ConnectFailed`
+//!   downstream; stay in loop awaiting more Responses. When
+//!   `accepted >= target_connections`: reset jitter, record gateway
+//!   + location success.
+//! - `Rejected`: record connection failure, exit driver.
+//! - `ObservedAddress`: handled by the joiner driver inbox —
+//!   `set_own_addr` / `update_location`.
+//! - `ConnectFailed`: emitted by this driver, never received by it.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -50,13 +41,9 @@ use super::{
     dispatch_expect_connection_from,
 };
 
-// ─── Relay CONNECT scaffolding (#1454 phase 2c slice 1, commit 1) ───
+// ─── Relay CONNECT scaffolding ───────────────────────────────────────
 //
-// Counters and RAII guard for the upcoming `start_relay_connect`
-// driver. Unused by this commit; the driver body and dispatch site
-// land in slice 1 commit 2. Defined now so the counter symbols are
-// stable across commits and the scaffolding lands as a single
-// reviewable unit before the larger semantic change.
+// Counters and RAII guard for `start_relay_connect`.
 
 /// Test-only counter incremented every time a relay-CONNECT driver is
 /// spawned. Used by test_relay_driver_calls_per_op-style guards to
@@ -476,14 +463,11 @@ async fn drive_client_connect_inner(
                 return Ok(());
             }
             ConnectMsg::ObservedAddress { address, .. } => {
-                // Phase 2c slice 1 (#1454): the bypass at node.rs forwards
-                // ObservedAddress to the joiner driver inbox. The joiner
-                // doesn't know its external IP behind NAT, so the gateway
-                // observes it from the UDP packet source and ships it back
-                // here. We update both `own_addr` (for diagnostics) and
-                // `own_location` (for routing) — mirrors legacy at
-                // connect.rs:1956-1974. Idempotent: subsequent observations
-                // for the same tx overwrite, which is the legacy semantic.
+                // The joiner doesn't know its external IP behind NAT;
+                // the gateway observes it from the UDP packet source
+                // and ships it back. Update both `own_addr` (for
+                // diagnostics) and `own_location` (for routing).
+                // Idempotent: subsequent observations overwrite.
                 let location = Location::from_address(&address);
                 op_manager.ring.connection_manager.set_own_addr(address);
                 op_manager
@@ -552,19 +536,16 @@ fn compute_reply_capacity(target_connections: usize) -> usize {
     target_connections.saturating_mul(2).max(2)
 }
 
-// ─── Relay CONNECT driver (#1454 phase 2c slice 1, commit 2) ─────────
+// ─── Relay CONNECT driver ────────────────────────────────────────────
 //
-// Mirrors the relay-side behaviour of the legacy
-// `connect.rs::process_message` for `Request → forward + observed +
-// (optional accept) + (optional reject)` plus the `Response /
-// Rejected / ObservedAddress / ConnectFailed` re-entries that arrive
-// for the same tx after the initial Request. State (`RelayState`,
-// `recency`, `forward_attempts`) lives in driver task locals; nothing
-// is pushed into `OpManager.ops.connect` for a relay-driven tx.
+// Owns the relay-side `Request → forward + observed + (optional
+// accept) + (optional reject)` flow plus the `Response / Rejected
+// / ObservedAddress / ConnectFailed` re-entries that arrive for the
+// same tx after the initial Request. State (`RelayState`, `recency`,
+// `forward_attempts`) lives in driver task locals.
 //
-// Re-entries land in the driver inbox via the bypass at
-// `node.rs::handle_pure_network_message_v1` (commit 1, this slice),
-// which forwards Response/Rejected/ObservedAddress/ConnectFailed
+// Re-entries arrive via the bypass at
+// `node.rs::handle_pure_network_message_v1`, which forwards them
 // into the per-tx multi-reply receiver registered by
 // `OpCtx::send_to_and_collect_replies`.
 

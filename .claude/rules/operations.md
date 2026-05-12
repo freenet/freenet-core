@@ -6,400 +6,73 @@ paths:
 
 # Operations Module Rules
 
-> **Path-scoped rule, legacy state-machine path.** As of #1454 Phase 2b
-> (PR #3806) SUBSCRIBE's client-initiated path was migrated to a
-> task-per-transaction driver in `operations/subscribe/op_ctx_task.rs`.
-> Phase 3a (PR #3843) migrated client-initiated PUT to
-> `operations/put/op_ctx_task.rs`, Phase 3b migrated client-initiated
-> GET to `operations/get/op_ctx_task.rs` (both using the shared
-> `RetryDriver` trait from `op_ctx.rs`), Phase 4 migrated
-> client-initiated UPDATE to `operations/update/op_ctx_task.rs` (using
-> the fire-and-forget `OpCtx::send_fire_and_forget` — no retry loop
-> needed since UPDATE has no response to await), and Phase 5 (#3883)
-> migrated fresh inbound relay GETs to the task-per-tx driver in
-> `operations/get/op_ctx_task.rs::start_relay_get`. On these paths,
-> op state lives in task locals and is never pushed into
-> `OpManager.ops.*`, so rules below that talk about "pushing state" /
-> `load_or_init` / `handle_op_result` apply only to the **legacy
-> state-machine path**, which now serves only:
-> CONNECT's joiner
-> branches reachable only from in-file unit tests + the legacy
-> stateless `ObservedAddress` path in `load_or_init` (relay CONNECT
-> fully migrated to `connect::op_ctx_task::start_relay_connect` in
-> Phase 2c slice 1 — fresh `Request`s with `source_addr.is_some()`
-> AND `!has_connect_op(id)` route to the task-per-tx driver, all four
-> non-Request `ConnectMsg` variants flow through the per-tx waiter
-> receiver via the bypass extension at `node.rs`), and SUBSCRIBE's
-> executor / intermediate-peer entry points (PUT-sub-op SUBSCRIBE
-> migrated in Phase 3a/3b; renewal migrated in the SUBSCRIBE renewal
-> slice — see below). Phase 5 follow-up slice A (PR #3910) migrated fresh
-> inbound non-streaming relay `UpdateMsg::RequestUpdate` and
-> `UpdateMsg::BroadcastTo` to
-> `operations/update/op_ctx_task.rs::start_relay_request_update` /
-> `start_relay_broadcast_to` (originally gated on
-> `source_addr.is_some()` AND `!has_update_op(id)`).
->
-> **#1454 phase 5 final (UPDATE slice) retired the entire legacy
-> UPDATE state-machine path.** `OpEnum::Update`, `OpManager.ops.update`
-> DashMap, `impl Operation for UpdateOp`, `request_update` /
-> `start_op` / `start_op_with_id`, `has_update_op`,
-> `remove_update_and_report_failure`, and the
-> `handle_op_request<UpdateOp>` fallthrough in node.rs are all gone.
-> Every UPDATE wire variant now dispatches unconditionally to a
-> task-per-tx driver — the `!has_update_op(id)` guard was redundant
-> because the DashMap could no longer be populated (every writer
-> lived inside the deleted `process_message`). The dead executor
-> network UPDATE path (`UpdateContract` /
-> `ComposeNetworkMessage<UpdateOp>` / network branch of
-> `perform_contract_update`) was retired in commit 1; it had been
-> unreachable in production because no `OperationMode::Network`
-> constructor exists in the tree. **Phase 6 (UPDATE slice)** deleted
-> the surviving `UpdateOp`, `UpdateState`, `UpdateStats`,
-> `FinishedData` scaffolding, the inline outcome / failure-routing
-> pin tests, and the two stale `process_message`-anchored pin tests
-> (driver-side pin tests in `update/op_ctx_task.rs:2063` / `:2345`
-> cover the same `send_summary_back_on_rejection` invariant). The
-> wire-format types, `BroadcastDedupCache`, `BroadcastTargetResult`,
-> `OpManager::try_auto_fetch_contract`, `update_contract` +
-> `UpdateExecution` + the log helpers, and the post-merge propagation
-> helpers + the `log_severity` regression suite (#3914) + the
-> `summary_back_helper_gates_on_summary_equality` pin remain because
-> the task-per-tx drivers consume them. Phase 5
-> follow-up slice A (PR #3917) migrated fresh inbound non-streaming
-> relay `PutMsg::Request` to
-> `operations/put/op_ctx_task.rs::start_relay_put` (originally gated on
-> `source_addr.is_some()` AND `!has_put_op(id)` AND the payload size
-> would not upgrade to streaming on forward). PUT GC speculative
-> retries and the per-op `ack_received` / `speculative_paths` fields
-> have since been retired (PR #3964) along with `PutMsg::ForwardingAck`
-> senders; the receiver was a no-op carried for backward-compat with
-> pre-#3964 peers. Phase 5 follow-up slice B migrated fresh inbound
-> streaming relay `PutMsg::RequestStreaming` to
-> `operations/put/op_ctx_task.rs::start_relay_put_streaming` (same
-> `source_addr.is_some()` AND `!has_put_op(id)` gate). The streaming
-> driver claims the inbound stream via
-> `orphan_stream_registry().claim_or_wait`, forks the handle for
-> downstream piping via `NetworkBridge::pipe_stream`, assembles
-> locally via the shared `relay_put_store_locally` helper, and
-> bubbles a non-streaming `PutMsg::Response` upstream (mirrors the
-> legacy downgrade at `put.rs:1517`). The dispatch site passes a
-> cloned `NetworkBridge` into the spawn so the driver can call
-> `pipe_stream` without a detour through `OpCtx`.
->
-> **Upgrade-on-forward (PR #4063):** `start_relay_put` (slice A's
-> driver) now performs the upgrade-on-forward decision itself:
-> after `relay_put_store_locally` it re-serializes the merged
-> payload, calls `should_use_streaming`, and conditionally builds
-> either `PutMsg::Request` or `PutMsg::RequestStreaming +
-> NetworkBridge::send_stream` for the forward. The streaming branch
-> uses `OpCtx::send_to_and_register_waiter` to install the reply
-> waiter BEFORE dispatching stream fragments (closes the race where
-> a fast downstream Response arrives before `pending_op_results` is
-> populated). The dispatch gate in node.rs no longer pre-checks
-> `should_use_streaming` — every fresh inbound non-streaming
-> Request dispatches via `start_relay_put`, which owns the upgrade
-> decision. This closed the legacy-only edge case (a non-streaming
-> `Request` that needs streaming on forward but has no inbound
-> `StreamId` to claim via `orphan_stream_registry`) and is the
-> prerequisite for PUT slice retirement of the legacy state machine.
->
-> **#1454 phase 5 final (PUT slice) retired the legacy PUT
-> state-machine path.** `OpEnum::Put`, `OpManager.ops.put` DashMap,
-> `impl Operation for PutOp`, `has_put_op`,
-> `remove_put_and_report_failure`, the `OpEnum::Put` arm in
-> `IsOperationCompleted for OpEnum`, the `OpEnum::Put` arm in the
-> abort handler, the `try_from_op_enum!(OpEnum::Put, ...)` macro
-> entry, and the `handle_op_request<PutOp>` fallthrough in node.rs
-> are all gone. Every PUT wire variant now dispatches unconditionally
-> to a task-per-tx driver — the `!has_put_op(id)` guard was redundant
-> because the DashMap could no longer be populated (every writer
-> lived inside the deleted `process_message`). **Phase 6 (PUT slice)**
-> deleted `PutOp`, `PutState`, `PutStats`, `AwaitingResponseData`,
-> `FinishedData`, the 22 inline outcome / failure-routing /
-> type-state pin tests, and the four anti-regression pins for the
-> retired speculative-retry fields (#3964). The wire-format types,
-> `op_state_manager.rs` GC pin tests, the
-> `put_forwarding_ack_senders` source-grep pin, and the originator
-> finalization helpers (`finalize_put_at_originator` /
-> `PutFinalizationData`) + the local-store helper (`put_contract`)
-> remain because the task-per-tx drivers consume them.
->
-> **Originator-loopback fix.** `start_client_put`'s
-> `send_and_await(target=None)` loops the Request back as
-> `InboundMessage` with `source_addr=None`. With the legacy
-> fallthrough gone, the dispatch site in node.rs maps
-> `source_addr=None` → `upstream_addr=own_addr` so the same
-> `start_relay_put` driver handles both true relay hops and
-> originator-loopback. The driver's local-store + forward-or-finalize
-> logic is identical for both: store, find next hop (excluding
-> own_addr → loopback skips itself), forward OR finalize and send
-> Response upstream (lands at the originator's `pending_op_results`
-> waiter via the bypass).
->
-> **#1454 phase 5 final (GET slice) retired the legacy GET
-> state-machine path.** `OpEnum::Get`, `OpManager.ops.get` DashMap,
-> `impl Operation for GetOp`, `start_op` / `start_op_with_id` /
-> `start_targeted_op`, `request_get`, `has_get_op`,
-> `remove_get_and_report_failure`, the `OpEnum::Get` arm in
-> `IsOperationCompleted for OpEnum`, the `OpEnum::Get` arm in the
-> abort handler, the `try_from_op_enum!(OpEnum::Get, ...)` macro
-> entry, and the `handle_op_request<GetOp>` fallthrough in node.rs
-> are all gone. Every GET wire variant now dispatches unconditionally
-> to a task-per-tx driver. The dispatch site in node.rs maps
-> `source_addr=None` → `upstream_addr=own_addr` (mirrors the PUT
-> originator-loopback fix) so the same `start_relay_get` driver
-> handles both true relay hops and originator-loopback. UPDATE
-> auto-fetch (`OpManager::try_auto_fetch_contract`) was migrated to
-> a new `start_targeted_sub_op_get` adapter that reuses the existing
-> `run_sub_op_get` body with an `initial_target` override — the
-> legacy `start_targeted_op` constructor and its
-> `notify_op_change(OpEnum::Get(...))` round-trip are gone.
-> **Phase 6 (GET slice)** deleted `GetOp`, `GetState`, `GetStats`,
-> `AwaitingResponseData`, `PrepareRequestData`, `FinishedData`,
-> `TryFrom<GetOp> for GetResult`, the inline outcome /
-> failure-routing / type-state / relay-cache-decision pin tests, and
-> the unused `GetResult.key` field. The wire-format types and the
-> originator result envelope `GetResult` (state + contract only)
-> remain because the task-per-tx drivers and the executor consume them.
->
-> **#1454 phase 5 final (SUBSCRIBE slice) retired the legacy SUBSCRIBE
-> state-machine path.** `OpEnum::Subscribe`, `OpManager.ops.subscribe`
-> DashMap, `impl Operation for SubscribeOp`, `has_subscribe_op`,
-> `remove_subscribe_and_notify_timeout`, the `OpEnum::Subscribe` arms in
-> `IsOperationCompleted for OpEnum` and the abort handler, the
-> `try_from_op_enum!(OpEnum::Subscribe, ...)` macro entry, the
-> `OpEnum::is_subscription_renewal` helper, `OpError::StatePushed`
-> (no remaining live constructor across all five ops), the
-> `ContractHandlerEvent::NotifySubscriptionError` /
-> `NotifySubscriptionErrorResponse` chain (executor trait method,
-> `bridged_notify_subscription_error`, `send_subscription_error_to_clients`),
-> and the `handle_op_request<SubscribeOp>` fallthrough in node.rs are
-> all gone. Every SUBSCRIBE wire variant now dispatches unconditionally:
->
-> - `SubscribeMsg::Request` → `start_relay_subscribe` (source_addr=None
->   loopback maps to `upstream_addr=own_addr`, mirroring the GET / PUT
->   originator-loopback fix; relay driver owns both true relay hops and
->   originator-loopback).
-> - `SubscribeMsg::Response` → bypass to originator's `pending_op_results`
->   waiter (terminal-reply fast path).
-> - `SubscribeMsg::Unsubscribe` → `handle_unsubscribe_inbound`
->   (free function: removes downstream subscriber tracking + chains
->   unsubscribe upstream when interest hits zero — replaces the legacy
->   `process_message::Unsubscribe` arm).
-> - `SubscribeMsg::ForwardingAck` → no-op (telemetry hook preserved for
->   pre-#3964 peer compatibility).
->
-> The surviving `OpManager::send_unsubscribe_upstream` writer sends
-> Unsubscribe through `OpCtx::send_fire_and_forget(target_addr, msg)`
-> directly, bypassing `ops.subscribe` entirely — no synthetic
-> `create_unsubscribe_op` push, no `notify_op_change_nonblocking`
-> round-trip. **Phase 6 (SUBSCRIBE slice)** deleted `SubscribeOp`,
-> `SubscribeState`, `SubscribeStats`, `AwaitingResponseData`,
-> `PrepareRequestData`, `CompletedData`, `SubscribeResult`, the
-> `start_op` / `start_op_with_id` test fixtures, the dead
-> `fetch_contract_if_missing` helper, and the inline state-machine /
-> retry / outcome / lifecycle pin tests. The wire-format types,
-> `handle_unsubscribe_inbound` (the post-#1454 inbound handler),
-> `register_downstream_subscriber`, `prepare_initial_request` /
-> `InitialRequest` (shared by all driver entry points), and
-> `complete_local_subscription` remain because the task-per-tx
-> drivers consume them.
->
-> Phase 5 follow-up slice A (PR
-> #3932) migrated fresh inbound relay `SubscribeMsg::Request` to
-> `operations/subscribe/op_ctx_task.rs::start_relay_subscribe`
-> (gated on `source_addr.is_some()` AND `!has_subscribe_op(id)`);
-> GC-spawned retries that pre-register a `SubscribeOp`,
-> `SubscribeMsg::Unsubscribe`, and `SubscribeMsg::ForwardingAck` all
-> stay on legacy. Executor auto-subscribe (the executor's
-> `SubscribeContract::resume_op` adapter) was the last legacy
-> originator-side writer into `ops.subscribe`; it has been migrated to
-> `subscribe::run_executor_subscribe` (reuses
-> `drive_client_subscribe_inner` with `is_renewal=false`, returns
-> `Result<(), OpError>` to the executor, bypasses the `op_request`
-> mediator path entirely). Renewals were
-> previously routed to legacy at this dispatch site so the relay
-> would emit `ForwardingAck` back to the renewal originator (the
-> originator's GC retry timer used `ack_received` for retry-base
-> selection); the SUBSCRIBE renewal migration moved the renewal
-> originator to the same task-per-tx driver as client-initiated
-> subscribe (`subscribe::run_renewal_subscribe` reuses
-> `drive_client_subscribe_inner` with `is_renewal=true`, returning
-> the outcome to the renewal task instead of through
-> `result_router_tx`), so renewals now flow through
-> `start_relay_subscribe` like any other Request. The driver caps relay-hop retries at 1 (originator
-> owns cross-peer retry), reuses `incoming_tx` end-to-end, omits
-> `ForwardingAck` emission, and calls `register_downstream_subscriber`
-> on BOTH local-hit and relayed-Subscribed paths — but DELIBERATELY
-> omits `ring.subscribe` / `complete_subscription_request` /
-> `announce_contract_hosted` on the relayed path (relay is not itself
-> a subscriber; prevents the #3763 subscription-storm feedback loop).
-> Slices B (streaming variants for GET/PUT/UPDATE) and C (legacy arm
-> cleanup) follow. Phase 5 follow-up slice C migrated fresh inbound
-> streaming relay `UpdateMsg::RequestUpdateStreaming` and
-> `UpdateMsg::BroadcastToStreaming` to
-> `operations/update/op_ctx_task.rs::start_relay_request_update_streaming`
-> / `start_relay_broadcast_to_streaming` (same
-> `source_addr.is_some()` AND `!has_update_op(id)` gate as slice A).
-> Streaming UPDATE relays are fire-and-forget — the drivers claim the
-> inbound stream via `orphan_stream_registry().claim_or_wait`,
-> assemble the payload, apply locally via `update_contract`, and rely
-> on `BroadcastStateChange` for network propagation. No downstream
-> `pipe_stream`, no upstream reply. The `BroadcastToStreaming` driver
-> reuses the shared `log_broadcast_to_streaming_failure` classifier
-> and triggers `try_auto_fetch_contract` / `send_summary_back_on_rejection`
-> on the same branches as the legacy handler. The deprecated
-> `UpdateMsg::Broadcasting` wire variant has been removed; the
-> `min-compatible-version` floor was bumped to 0.2.50 to gate the
-> incompatible bincode discriminant shift.
->
-> Task-per-tx drivers have their own invariants documented in the
-> `op_ctx_task.rs` module doc and in `OpCtx::send_and_await`'s rustdoc.
-> The spirit of push-before-send is preserved (initialize task-local
-> state before calling `send_and_await`), but the mechanical
-> `op_manager.push(...)` call is absent. Phase 6 of #1454 will rewrite
-> this rules file in full once all ops have migrated.
->
-> Sub-operation GETs (subscribe's `fetch_contract_if_missing` and
-> executor's `local_state_or_from_network`) now route through
-> `operations/get/op_ctx_task.rs::start_sub_op_get` — same retry
-> driver as `start_client_get` but skips auto-subscribe,
-> explicit-subscribe hand-off, telemetry route-events
-> (`NetEventLog::get_request` is intentionally not emitted on any
-> task-per-tx originator path — matches `start_client_get`), and
-> `result_router_tx` publication; outcome delivered through a
-> oneshot (`SubOpGetOutcome`). The legacy `request_get` driver and
-> `get::start_op` constructor were retired in this migration; the
-> executor's `GetContract` / `ComposeNetworkMessage<GetOp>` impl is
-> deleted. `start_targeted_op` (the GET legacy entry point that
-> UPDATE's auto-fetch spawns as a `OpEnum::Get`) remains on the
-> legacy GET path. The executor's `op_request` mediator path is
-> bypassed for GET; the spawned sub-op task can outlive its caller's
-> outer timeout (e.g., `RELATED_FETCH_TIMEOUT = 10s` wrapping
-> `local_state_or_from_network`'s 120 s receiver timeout) — receiver
-> drop is silent so no leak, just a longer-lived background task.
-> After this migration, no caller PURPOSEFULLY pushes a
-> client-initiated `GetOp` into `ops.get`, so the GC
-> speculative-retry block was provably dead for GET. Phase 5-final
-> retired that block, the `get_retried` per-tick HashMap, the
-> `GetOp::ack_received` / `GetOp::speculative_paths` fields, and the
-> 11 unit tests that simulated the GC retry decision.
->
-> **Loopback corner case (#4066):** the originator's first
-> `OpCtx::send_and_await(target=None)` loops back as an
-> `InboundMessage` with `source_addr=None`. The relay-driver
-> dispatch in `node.rs::handle_pure_network_message_v1` is gated on
-> `source_addr.is_some()`, so the loopback Request falls through to
-> legacy `process_message::GetMsg::Request` and incidentally pushes
-> a `GetOp` into `ops.get` keyed by `client_tx`. The entry's state
-> is never read (the bypass at the top of
-> `handle_pure_network_message_v1` intercepts terminal Responses
-> before `handle_op_request` runs), but the GC sweep at
-> `OPERATION_TTL=60s` still reaps it and used to emit a phantom
-> `phase=get_timeout` log + duplicate `OperationError`. Closed by
-> `ClientGetCompletionGuard` / `SubOpGetCompletionGuard` in
-> `get/op_ctx_task.rs`: a Drop guard on the driver task calls
-> `op_manager.completed(tx)` on every exit path including panics,
-> clearing the legacy entry before the GC sweep can race it. A
-> cleaner architectural fix would be a dedicated thin handler for
-> originator-loopback Requests that emits the Request-echo without
-> inserting into `ops.get` at all — phase 6 cleanup item.
->
-> The SUBSCRIBE GC speculative-retry block was retired in the same
-> Phase 5-final pass (slice 1 after GET): all four originator-side
-> writers into `ops.subscribe` (client-initiated, executor
-> auto-subscribe, renewal, PUT/GET sub-op) had migrated to the
-> task-per-tx driver in `operations/subscribe/op_ctx_task.rs` — which
-> owns its own retry loop via `advance_to_next_peer` and never inserts
-> a `SubscribeOp` into the DashMap. The remaining legacy entries in
-> `ops.subscribe` come from relay state during multi-hop forwarding
-> (slice A `start_relay_subscribe` does NOT register; entries arise
-> only when a relay re-enters `subscribe::process_message` for a tx
-> already in the DashMap, which now happens only for `Unsubscribe`
-> routing) and `create_unsubscribe_op` routing entries created by
-> `request_unsubscribe`. Neither is a retry candidate: relay entries
-> fail `is_originator()` and unsubscribe entries fail
-> `failure_routing_info().is_some()`. Slice 1 deletes the block, the
-> `subscribe_retried` per-tick HashMap, and the shared `ACK_TIMEOUT` /
-> `MAX_SPECULATIVE_PATHS` / `PROGRESS_TIMEOUT` constants (also
-> previously used by GET, now fully unreferenced). Slice 2 deleted
-> the `SubscribeOp::ack_received` / `speculative_paths` fields, the
-> `retry_with_next_alternative` helper, the `MIN_RETRY_HTL` constant,
-> and the unit tests that exercised the GC retry decision (the 11
-> `test_retry_*` cases in `subscribe/tests.rs` and the
-> `subscribe_retry_candidates_sorted_oldest_first` test in
-> `op_state_manager.rs`). The `SubscribeMsg::ForwardingAck` handler
-> on the legacy state-machine path was simplified to a no-op (mirrors
-> the GET treatment).
-> `GetMsg::ForwardingAck` and `SubscribeMsg::ForwardingAck` survive as
-> wire variants + telemetry hooks (#3570 diagnostics) but their
-> handlers return the operation unchanged.
->
-> Sub-operation SUBSCRIBE callers (legacy GET-originator
-> `auto_subscribe_on_get_response` fallback path; PUT/GET task-per-tx
-> drivers already routed via `maybe_subscribe_child`) spawn
-> `subscribe::run_client_subscribe` directly.
-> `start_subscription_request` keeps the `blocking` parameter for API
-> stability but it is no longer behaviorally distinct: blocking
-> semantics in the task-per-tx world are obtained by `await`ing
-> `run_client_subscribe` inline (see `maybe_subscribe_child` in
-> `put/op_ctx_task.rs` and `get/op_ctx_task.rs`);
-> `start_subscription_request` is a fire-and-forget spawner.
->
-> Phase 3c of #1454 has retired the `SubOperationTracker` entirely:
-> the struct, the OpManager methods (`expect_and_register_sub_operation`,
-> `sub_operation_failed`, `all_sub_operations_completed`,
-> `count_pending_sub_operations`, `root_ops_awaiting_sub_ops`,
-> `failed_parents`), the `parent_of` index, the GC parent-propagation
-> blocks, and the finalized-parent-parking branch in
-> `operations.rs::handle_op_result` are all gone. `OperationResult::ContinueOp`
-> with a finalized state now completes the op directly. Sub-operation
-> identity is structural (`Transaction::is_sub_operation()` via the
-> parent field set by `Transaction::new_child_of`); failure
-> propagation is via the task-per-tx driver's own `HostResult::Err`
-> publication, never through a tracker.
+## Execution Model
 
-## Critical Invariant: Push-Before-Send (legacy path)
+Every operation runs as a task-per-transaction driver: each `Transaction`
+is owned and driven by a single spawned task; state lives in task
+locals, never in `OpManager.ops.*`. The only exception is **CONNECT**,
+which still uses a `OpManager.ops.connect` DashMap + `Operation` impl
+for joiner-side branches reachable from in-file tests and the legacy
+stateless `ObservedAddress` side-effect path.
 
-**This is the most important rule for code on the legacy state-machine path.**
+Driver entry points:
+
+| Op | Entry points |
+|----|--------------|
+| CONNECT | `connect/op_ctx_task.rs::start_client_connect`, `start_relay_connect` |
+| GET | `get/op_ctx_task.rs::start_client_get`, `start_relay_get`, `start_sub_op_get`, `start_targeted_sub_op_get` |
+| PUT | `put/op_ctx_task.rs::start_client_put`, `start_relay_put`, `start_relay_put_streaming` |
+| UPDATE | `update/op_ctx_task.rs::start_client_update`, `start_relay_request_update`, `start_relay_broadcast_to`, `start_relay_request_update_streaming`, `start_relay_broadcast_to_streaming` |
+| SUBSCRIBE | `subscribe/op_ctx_task.rs::start_client_subscribe`, `run_executor_subscribe`, `run_renewal_subscribe`, `start_relay_subscribe`; `subscribe.rs::handle_unsubscribe_inbound` for `Unsubscribe` |
+
+The shared retry-loop driver lives in `op_ctx.rs` (`RetryDriver` trait
++ `drive_retry_loop`). UPDATE is fire-and-forget (no retry loop, no
+upstream reply); GET/PUT/SUBSCRIBE share the retry driver.
+
+## Wire-variant dispatch
+
+`node.rs::handle_pure_network_message_v1` is the single dispatch site
+for every inbound wire message. Pattern per op:
+
+1. **Reply bypass.** If a terminal reply variant arrives and a
+   `pending_op_results` callback is registered, forward it via
+   `try_forward_task_per_tx_reply` and return. For GET/PUT/SUBSCRIBE
+   the gate is `Response | ResponseStreaming` only. CONNECT forwards
+   all four non-`Request` variants (multi-reply fan-in).
+2. **Relay dispatch.** Spawn the matching `start_relay_*` driver.
+   Originator-loopback (`source_addr=None`) is mapped to
+   `upstream_addr=own_addr` for GET/PUT/SUBSCRIBE so the same driver
+   handles both relay hops and originator loopback. UPDATE has no
+   loopback (fire-and-forget end-to-end).
+3. **No legacy fallthrough** for GET/PUT/UPDATE/SUBSCRIBE — every wire
+   variant either bypasses to a waiter, dispatches a driver, or hits a
+   dedicated free-function handler (e.g. `handle_unsubscribe_inbound`,
+   `ForwardingAck` no-op). CONNECT still has a
+   `handle_op_request::<ConnectOp>` fallthrough for joiner-side legacy
+   re-entries.
+
+## OpEnum and DashMaps
+
+- `OpEnum::Connect` and `OpManager.ops.connect` are the only surviving
+  DashMap-backed op state. Used by joiner-side legacy paths.
+- `OpEnum::{Get,Put,Update,Subscribe}` are gone. `ops.{get,put,update,subscribe}`
+  DashMaps are gone. `has_{get,put,update,subscribe}_op` accessors are
+  gone.
+- `pending_op_counts()` returns `[connect, 0, 0, 0, 0]` — kept for
+  telemetry API stability.
+
+## Critical Invariant: Initialize-Before-Send
 
 ```
-ALWAYS save state BEFORE sending network message:
-
-CORRECT:
-  op_manager.push(tx, updated_state).await?;  // 1. SAVE FIRST
-  network_bridge.send(target, msg).await?;    // 2. THEN SEND
-
-WRONG:
-  network_bridge.send(target, msg).await?;    // NO! Race condition!
-  op_manager.push(tx, updated_state).await?;  // Response may arrive first
+All task-local state the reply handler will read (retry counters,
+visited-peers filter, routing state) MUST be initialized BEFORE
+calling `OpCtx::send_and_await`. The reply may arrive on the very
+next poll.
 ```
 
-**Why:** If response arrives before state is saved, `load_or_init` will fail because the operation doesn't exist in storage.
-
-**Task-per-tx equivalent (#1454 Phase 2b+):** callers of
-`OpCtx::send_and_await` must have all fields the reply handler will read
-(retry counters, visited-peers filter, routing state) set in task locals
-BEFORE calling `send_and_await`. State is never published to the
-`OpManager` DashMap; the conceptual ordering rule is the same. See the
-`OpCtx::send_and_await` docstring for the full reasoning.
-
-**GET-specific note (Phase 3b):** for client-initiated GETs the
-bypass at `node.rs::handle_pure_network_message_v1` returns BEFORE
-`handle_op_request` runs, so `process_message` does NOT execute on
-the originator for `GetMsg::Response` / `ResponseStreaming` replies.
-This is by design — there is no `GetOp` in `OpManager.ops.get` for a
-task-per-tx transaction, so `load_or_init` would return
-`OpNotPresent`. The driver (`operations/get/op_ctx_task.rs`) therefore
-owns the originator-side side effects that the legacy Response{Found}
-branch at `get.rs:2329` does: `PutQuery` to cache the state,
-`record_get_access`, `mark_local_client_access`,
-`announce_contract_hosted`, `register_local_hosting`, and
-`broadcast_change_interests`. If you add a new side effect to the
-legacy Response{Found} branch, mirror it in
-`op_ctx_task.rs::cache_contract_locally`. Relay GETs still go through
-`process_message` — the bypass only fires when the originator's
-`pending_op_results` callback is installed, which relays never have.
+For CONNECT's surviving legacy path: state MUST be pushed via
+`op_manager.push(tx, state)` before any `network_bridge.send(...)` —
+a fast response that beats the push would hit `OpNotPresent`.
 
 ## State Machine Rules
 
@@ -539,20 +212,10 @@ This is usually benign (duplicate message, already completed)
 → Do NOT treat as error
 ```
 
-**Note (#1454 Phase 2b/3a/3b):** For op kinds with a task-per-tx driver
-(SUBSCRIBE, PUT, and GET client-initiated), the pure-network-message
-handler checks `pending_op_results` FIRST and forwards the reply to
-the awaiting task via `node::try_forward_task_per_tx_reply` before
-reaching `load_or_init`. Do NOT "fix" `load_or_init`'s `OpNotPresent`
-handling by trying to look up a task-owned tx there — it will never
-find one, and it shouldn't. The bypass is the load-bearing piece;
-confirm by reading the SUBSCRIBE, PUT, and GET branches of
-`handle_pure_network_message_v1` in `node.rs`. For GET the bypass is
-gated on `GetMsg::Response | GetMsg::ResponseStreaming` only —
-non-terminal GetMsg variants (Request, ResponseStreamingAck,
-ForwardingAck) fall through to the legacy state machine, and relay
-nodes (which have no entry in `pending_op_results` for the tx)
-continue handling forwarded messages via `process_message`.
+Do NOT "fix" `load_or_init`'s `OpNotPresent` for non-CONNECT ops by
+trying to look up the tx there — the bypass at the top of
+`handle_pure_network_message_v1` already forwarded the reply to the
+driver's waiter, and `load_or_init` no longer runs for those ops.
 
 ### WHEN encountering InvalidStateTransition
 
@@ -575,7 +238,7 @@ continue handling forwarded messages via `process_message`.
 
 ## Common Patterns
 
-### Load or Initialize
+### Load or Initialize (CONNECT only)
 
 ```rust
 let init = Op::load_or_init(op_manager, msg, source_addr).await?;
@@ -585,7 +248,7 @@ match init {
 }
 ```
 
-### Handle Operation Result
+### Handle Operation Result (CONNECT only)
 
 ```rust
 let result = op.process_message(conn_manager, op_manager, msg, source_addr).await?;
@@ -607,3 +270,4 @@ if let Some(return_msg) = result.return_msg {
 - Architecture: `docs/architecture/operations/README.md`
 - OpManager: `crates/core/src/node/op_state_manager.rs`
 - Operation trait: `crates/core/src/operations.rs:32-56`
+- Round-trip primitive: `crates/core/src/operations/op_ctx.rs`
