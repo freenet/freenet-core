@@ -2,7 +2,7 @@ use axum::{
     Extension, Router,
     extract::{Path, RawQuery},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 
 use super::*;
@@ -17,6 +17,10 @@ pub(super) fn routes(config: Config) -> Router {
         // No-trailing-slash redirect — see v1.rs for the rationale.
         .route("/v2/contract/web/{key}", get(web_root_redirect_v2))
         .route("/v2/contract/web/{key}/", get(web_home_v2))
+        .route(
+            "/v2/contract/web/{key}/__permissions",
+            post(web_permissions_v2),
+        )
         .route("/v2/contract/web/{key}/{*path}", get(web_subpages_v2))
         .with_state(config)
 }
@@ -38,6 +42,17 @@ async fn web_subpages_v2(
     Extension(rs): Extension<HttpClientApiRequest>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     web_subpages(key, last_path, ApiVersion::V2, query, headers, rs).await
+}
+
+async fn web_permissions_v2(
+    key: Path<String>,
+    config: axum::extract::State<Config>,
+    query: RawQuery,
+    form: axum::Form<crate::server::web_permissions::PermissionForm>,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    crate::server::web_permissions::permission_submit(key, config, ApiVersion::V2, query, form)
+        .await
+        .map(|response| response.into_response())
 }
 
 /// Redirect `/v2/contract/web/{key}` (no trailing slash) to

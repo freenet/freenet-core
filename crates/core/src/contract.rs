@@ -777,8 +777,6 @@ async fn send_queue_full_response(
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
         | ContractHandlerEvent::GetDeltaResponse { .. }
-        | ContractHandlerEvent::NotifySubscriptionError { .. }
-        | ContractHandlerEvent::NotifySubscriptionErrorResponse
         | ContractHandlerEvent::ClientDisconnect { .. } => {
             channel.drop_waiting_response(rejected.id);
             return;
@@ -1341,22 +1339,6 @@ where
                 );
             }
         }
-        ContractHandlerEvent::NotifySubscriptionError { key, reason } => {
-            contract_handler
-                .executor()
-                .notify_subscription_error(key, reason);
-            if let Err(error) = contract_handler
-                .channel()
-                .send_to_sender(id, ContractHandlerEvent::NotifySubscriptionErrorResponse)
-                .await
-            {
-                tracing::debug!(
-                    error = %error,
-                    contract = %key,
-                    "Failed to send NotifySubscriptionError response"
-                );
-            }
-        }
         ContractHandlerEvent::QuerySubscriptions { callback } => {
             // Get subscription information from the executor and send it through the callback
             let subscriptions = contract_handler.executor().get_subscription_info();
@@ -1438,8 +1420,7 @@ where
         | ContractHandlerEvent::RegisterSubscriberListenerResponse
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
-        | ContractHandlerEvent::GetDeltaResponse { .. }
-        | ContractHandlerEvent::NotifySubscriptionErrorResponse => {
+        | ContractHandlerEvent::GetDeltaResponse { .. } => {
             unreachable!("response events should not be received by the handler")
         }
     }

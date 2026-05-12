@@ -40,10 +40,15 @@ jobs:
     # under this caller's secrets. Acceptable today because we control
     # crates.io publishing for that crate; if that changes, override
     # `freenet_git_version` here with a pinned semver.
-    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@4a4ab090c5591473f579ce2d1b626aba7b3a8ba3
+    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@a93179077a4175ac4de324fc37fe57a3679f6bc8
     with:
       freenet_repo: "3GEERif5ihbf/freenet-core"
       mode: snapshot
     secrets:
       FREENET_GIT_IDENTITY_BUNDLE_BASE64: ${{ secrets.FREENET_GIT_IDENTITY_BUNDLE_BASE64 }}
       FREENET_GIT_WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
+      # Optional in the reusable workflow; passed through here so a
+      # mirror failure pings the team Matrix room instead of going
+      # silent. Both are org-level secrets at freenet.
+      MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+      MATRIX_ROOM_ID: ${{ secrets.MATRIX_ROOM_ID }}

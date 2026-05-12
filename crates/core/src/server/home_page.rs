@@ -1816,52 +1816,49 @@ fn peer_detail_html(address_str: &str) -> String {
             if event_count == 0 && tab_name != "All" {
                 write!(
                     panel_content,
-                    r#"<div class="empty-chart">No routing events for {name} operations yet</div>"#,
+                    r#"<div class="empty-chart">No {name} operations have routed through this peer yet. The chart will populate as the network sends or relays {name}s through this connection.</div>"#,
                     name = tab_name,
                 )
                 .ok();
             } else {
-                // Only show charts that have data
-                if !f_curve.is_empty() {
-                    panel_content.push_str(&build_estimator_chart(
-                        "Failure Probability",
-                        f_curve,
-                        f_range,
-                        if tab_name == "All" { fail_adj } else { None },
-                        ploc,
-                        "0.0",
-                        "1.0",
-                    ));
-                }
-                if !rt_curve.is_empty() {
-                    panel_content.push_str(&build_estimator_chart(
-                        "Response Time (s)",
-                        rt_curve,
-                        rt_range,
-                        if tab_name == "All" { rt_adj } else { None },
-                        ploc,
-                        "0",
-                        "auto",
-                    ));
-                }
-                if !xfer_curve.is_empty() {
-                    panel_content.push_str(&build_estimator_chart(
-                        "Transfer Rate (B/s)",
-                        xfer_curve,
-                        xfer_range,
-                        if tab_name == "All" { xfer_adj } else { None },
-                        ploc,
-                        "auto",
-                        "0",
-                    ));
-                }
-                if panel_content.is_empty() {
-                    write!(
-                        panel_content,
-                        r#"<div class="empty-chart">Awaiting routing events</div>"#,
-                    )
-                    .ok();
-                }
+                // Always render all three prediction-component slots so the
+                // user can see every dimension the router models. Each slot
+                // either contains the rendered curve or a per-metric
+                // "awaiting data" placeholder — empty slots are NOT hidden,
+                // because hiding them silently rotted unobserved when the
+                // task-per-tx migration stopped feeding the response-time
+                // and transfer-rate estimators (the `Failure Probability`-only
+                // dashboard regression that surfaced this code path).
+                panel_content.push_str(&build_estimator_chart_or_placeholder(
+                    "Failure Probability",
+                    f_curve,
+                    f_range,
+                    if tab_name == "All" { fail_adj } else { None },
+                    ploc,
+                    "0.0",
+                    "1.0",
+                    "No success/failure observations have routed through this peer yet.",
+                ));
+                panel_content.push_str(&build_estimator_chart_or_placeholder(
+                    "Response Time (s)",
+                    rt_curve,
+                    rt_range,
+                    if tab_name == "All" { rt_adj } else { None },
+                    ploc,
+                    "0",
+                    "auto",
+                    "No timed responses have been observed from this peer yet.",
+                ));
+                panel_content.push_str(&build_estimator_chart_or_placeholder(
+                    "Transfer Rate (B/s)",
+                    xfer_curve,
+                    xfer_range,
+                    if tab_name == "All" { xfer_adj } else { None },
+                    ploc,
+                    "auto",
+                    "0",
+                    "No payload transfers have been observed from this peer yet.",
+                ));
             }
 
             let panel_active = if i == 0 { " tab-panel-active" } else { "" };
@@ -1926,7 +1923,7 @@ fn peer_detail_html(address_str: &str) -> String {
                 ts = fmt_prediction_speed(pred.transfer_speed_bps),
             )
         } else {
-            r#"<div class="card"><h2>Prediction</h2><p class="empty">Insufficient data for prediction at this peer's location</p></div>"#.to_string()
+            r#"<div class="card"><h2>Prediction</h2><p class="empty">Not enough routing data yet to predict this peer's behavior. The card fills in as operations are routed through it.</p></div>"#.to_string()
         }
     } else {
         String::new()
@@ -1983,6 +1980,42 @@ fn peer_detail_html(address_str: &str) -> String {
     )
 }
 
+/// Render the named estimator chart, or — when no data has been observed
+/// yet — a titled placeholder. The placeholder keeps the slot visible so
+/// users can always see every component of a routing prediction even when
+/// some estimators have not yet received feedback. Hiding empty charts
+/// masked the data-collection regression in the task-per-tx migration
+/// that fed only `failure_estimator` and left `response_start_time` and
+/// `transfer_rate` permanently empty.
+#[allow(clippy::too_many_arguments)]
+fn build_estimator_chart_or_placeholder(
+    title: &str,
+    curve_points: &[(f64, f64)],
+    data_range: (f64, f64),
+    peer_adjustment: Option<f64>,
+    peer_location: Option<f64>,
+    y_min_hint: &str,
+    y_max_hint: &str,
+    empty_message: &str,
+) -> String {
+    if curve_points.is_empty() {
+        return format!(
+            r#"<div class="chart-section"><h3>{title}</h3><div class="empty-chart">{msg}</div></div>"#,
+            title = title,
+            msg = empty_message,
+        );
+    }
+    build_estimator_chart(
+        title,
+        curve_points,
+        data_range,
+        peer_adjustment,
+        peer_location,
+        y_min_hint,
+        y_max_hint,
+    )
+}
+
 /// Build an SVG chart showing a PAV regression curve with optional per-peer adjustment.
 ///
 /// `data_range` is `(data_x_min, data_x_max)` -- the x-range of actual regression data.
@@ -1998,7 +2031,7 @@ fn build_estimator_chart(
 ) -> String {
     if curve_points.is_empty() {
         return format!(
-            r#"<div class="chart-section"><h3>{title}</h3><div class="empty-chart">Awaiting routing events</div></div>"#,
+            r#"<div class="chart-section"><h3>{title}</h3><div class="empty-chart">No data yet. Populates as operations route through this peer.</div></div>"#,
             title = title,
         );
     }
@@ -3143,6 +3176,109 @@ mod tests {
         assert_eq!(fmt_prediction_speed(f64::NAN), "N/A");
         assert_eq!(fmt_prediction_speed(f64::INFINITY), "N/A");
         assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
+    }
+
+    /// Regression: with no data the helper must still emit a titled
+    /// placeholder so all three prediction-component slots
+    /// (Failure Probability, Response Time, Transfer Rate) stay
+    /// visible on the peer dashboard. The previous behaviour hid the
+    /// chart entirely, which masked the task-per-tx data-collection
+    /// regression that left response-time/transfer-rate estimators
+    /// permanently empty (Failure-Probability-only dashboard).
+    #[test]
+    fn build_estimator_chart_or_placeholder_empty_renders_titled_placeholder() {
+        let html = build_estimator_chart_or_placeholder(
+            "Response Time (s)",
+            &[],
+            (0.0, 0.0),
+            None,
+            None,
+            "0",
+            "auto",
+            "No timed responses have been observed from this peer yet.",
+        );
+        assert!(
+            html.contains("<h3>Response Time (s)</h3>"),
+            "empty placeholder must still display the chart title so the user sees the slot is part of the model, got: {html}"
+        );
+        assert!(
+            html.contains("No timed responses have been observed"),
+            "empty placeholder must explain why no curve is shown, got: {html}"
+        );
+        assert!(
+            !html.contains("<svg"),
+            "empty placeholder must not render an SVG, got: {html}"
+        );
+    }
+
+    /// Regression: the per-tab "Routing Predictions" panel must call
+    /// `build_estimator_chart_or_placeholder` for all three
+    /// prediction-component slots (Failure Probability, Response Time,
+    /// Transfer Rate). Hiding empty slots previously masked the
+    /// task-per-tx data-collection regression for months — keeping every
+    /// slot visible makes future regressions detectable on sight.
+    /// Source-scrape rather than HTML-grep because the visible-when-empty
+    /// behaviour depends on a router_snapshot being present, and the
+    /// `home_page.rs::tests` module does not have a snapshot fixture
+    /// builder.
+    #[test]
+    fn peer_detail_panel_calls_estimator_helper_for_all_three_components() {
+        let src = include_str!("home_page.rs");
+        // Truncate at the test marker so the assertion below doesn't
+        // match against this very test's source.
+        let cutoff = src
+            .find("#[cfg(test)]")
+            .expect("home_page.rs must have a #[cfg(test)] section");
+        let prod = &src[..cutoff];
+        for title in [
+            "Failure Probability",
+            "Response Time (s)",
+            "Transfer Rate (B/s)",
+        ] {
+            // Find the helper call site and walk forward up to 200 bytes
+            // for the title literal. Whitespace-tolerant so rustfmt
+            // doesn't churn this pin.
+            let mut found = false;
+            let mut cursor = 0;
+            while let Some(call) = prod[cursor..].find("build_estimator_chart_or_placeholder(") {
+                let abs = cursor + call;
+                let tail_end = (abs + 400).min(prod.len());
+                let needle = format!("\"{title}\"");
+                if prod[abs..tail_end].contains(&needle) {
+                    found = true;
+                    break;
+                }
+                cursor = abs + 1;
+            }
+            assert!(
+                found,
+                "peer-detail panel builder must call \
+                 build_estimator_chart_or_placeholder with title {title:?} so the slot is \
+                 always visible. Without this every prediction-component \
+                 slot can silently disappear when its estimator has no \
+                 data — the original regression."
+            );
+        }
+    }
+
+    #[test]
+    fn build_estimator_chart_or_placeholder_renders_chart_when_data_present() {
+        let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
+        let html = build_estimator_chart_or_placeholder(
+            "Failure Probability",
+            &curve,
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "1.0",
+            "should not see this",
+        );
+        assert!(html.contains("<svg"), "non-empty curve must render an SVG");
+        assert!(
+            !html.contains("should not see this"),
+            "non-empty curve must not show the empty-message text"
+        );
     }
 
     #[test]

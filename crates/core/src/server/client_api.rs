@@ -20,6 +20,7 @@ use crate::server::HostCallbackResult;
 
 use super::{
     ApiVersion, AuthToken, ClientConnection, errors::WebSocketApiError, home_page, path_handlers,
+    web_permissions::WebAppPermissionStore,
 };
 
 /// Content-Security-Policy served with the shell (outer) page of any Freenet
@@ -110,6 +111,7 @@ impl HttpClientApi {
             socket,
             origin_contracts,
             crate::contract::user_input::pending_prompts(),
+            WebAppPermissionStore::new(std::env::temp_dir().join("freenet")),
         )
     }
 
@@ -120,6 +122,7 @@ impl HttpClientApi {
         socket: &SocketAddr,
         origin_contracts: OriginContractMap,
         pending_prompts: crate::contract::user_input::PendingPrompts,
+        permission_store: WebAppPermissionStore,
     ) -> (Self, Router) {
         // Controls the cookie Secure flag: when true, cookies are sent over HTTP
         // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
@@ -140,7 +143,10 @@ impl HttpClientApi {
 
         let (proxy_request_sender, request_to_server) = mpsc::channel(1);
 
-        let config = Config { localhost };
+        let config = Config {
+            localhost,
+            permission_store,
+        };
 
         let router = Router::new()
             .route("/", axum::routing::get(home_page::homepage))
@@ -173,8 +179,9 @@ impl HttpClientApi {
 }
 
 #[derive(Clone, Debug)]
-struct Config {
-    localhost: bool,
+pub(super) struct Config {
+    pub(super) localhost: bool,
+    pub(super) permission_store: WebAppPermissionStore,
 }
 
 #[instrument(level = "debug")]
@@ -218,8 +225,15 @@ async fn web_home(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_response =
-        path_handlers::contract_home(key, rs, token.clone(), api_version, query_string).await?;
+    let contract_response = path_handlers::contract_home(
+        key,
+        rs,
+        token.clone(),
+        api_version,
+        query_string,
+        config.permission_store.clone(),
+    )
+    .await?;
 
     let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);

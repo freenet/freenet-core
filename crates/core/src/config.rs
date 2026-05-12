@@ -674,6 +674,7 @@ impl ConfigArgs {
                     })
                     .transpose()?
                     .unwrap_or_default(),
+                webapp_permissions_dir: Some(config_paths.data_dir()),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -1459,6 +1460,10 @@ pub struct WebsocketApiConfig {
     /// Empty means only loopback + RFC1918 / IPv6 ULA are accepted.
     #[serde(default, rename = "allowed-source-cidrs")]
     pub allowed_source_cidrs: Vec<ipnet::IpNet>,
+
+    /// Runtime-only location for gateway webapp permission grants.
+    #[serde(skip)]
+    pub webapp_permissions_dir: Option<PathBuf>,
 }
 
 #[inline]
@@ -1480,6 +1485,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
+            webapp_permissions_dir: None,
         }
     }
 }
@@ -1494,6 +1500,7 @@ impl Default for WebsocketApiConfig {
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
+            webapp_permissions_dir: None,
         }
     }
 }

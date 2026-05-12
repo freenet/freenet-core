@@ -611,6 +611,15 @@ async fn drive_client_subscribe_inner(
         // never reach this peer. See issue #3838 and the doc comment on
         // `OpCtx::send_to_and_await`.
         let mut ctx = op_manager.op_ctx(attempt_tx);
+        // Capture wall-clock at send for routing-prediction telemetry. The
+        // winning attempt's `request_sent_at` paired with the time of
+        // terminal-reply arrival feeds the router's
+        // `response_start_time_estimator` via `RouteOutcome::Success`.
+        // `tokio::time::Instant` is auto-paused in test builds with
+        // `start_paused(true)`, so simulation tests see virtual elapsed
+        // time rather than wall-clock — matches the rest of
+        // `crates/core/`'s timing primitives.
+        let request_sent_at = tokio::time::Instant::now();
         let round_trip = tokio::time::timeout(
             OPERATION_TTL,
             ctx.send_to_and_await(current_target_addr, NetMessage::from(request)),
@@ -733,6 +742,7 @@ async fn drive_client_subscribe_inner(
         // Classify the terminal reply.
         match classify_reply(&reply) {
             ReplyClass::Subscribed { key } => {
+                let time_to_response_start = request_sent_at.elapsed();
                 tracing::info!(
                     tx = %client_tx,
                     attempt_tx = %attempt_tx,
@@ -743,6 +753,40 @@ async fn drive_client_subscribe_inner(
                     outcome = "subscribed",
                     "subscribe (task-per-tx): subscribed"
                 );
+
+                // Feed the routing-prediction model on the client-initiated
+                // SUBSCRIBE success path. The legacy `subscribe.rs::outcome()`
+                // emitted `ContractOpSuccess { first_response_time, payload_size: 0,
+                // payload_transfer_time: ZERO }` so the router's
+                // `response_start_time_estimator` learned from every successful
+                // subscribe (payload_size==0 deliberately skips
+                // `transfer_rate_estimator`). The task-per-tx migration of this
+                // path stopped emitting any RouteEvent at all, leaving the
+                // response-time estimator with zero observations from
+                // client-initiated subscribes. Restore that feedback so the
+                // peer dashboard's Response Time chart populates again.
+                let contract_location = crate::ring::Location::from(&key);
+                let route_event = crate::router::RouteEvent {
+                    peer: current_target.clone(),
+                    contract_location,
+                    outcome: crate::router::RouteOutcome::Success {
+                        time_to_response_start,
+                        payload_size: 0,
+                        payload_transfer_time: std::time::Duration::ZERO,
+                    },
+                    op_type: Some(crate::node::network_status::OpType::Subscribe),
+                };
+                if let Some(log_event) = crate::tracing::NetEventLog::route_event(
+                    &client_tx,
+                    &op_manager.ring,
+                    &route_event,
+                ) {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(log_event))
+                        .await;
+                }
+                op_manager.ring.routing_finished(route_event);
                 // Mirror the legacy Response-handler side effects from
                 // `subscribe.rs`'s `SubscribeMsg::Response` arm. The
                 // task-per-tx reply forwarding bypass in `node.rs` skips
@@ -1505,6 +1549,13 @@ async fn drive_relay_subscribe(
                 error = %err,
                 "SUBSCRIBE relay (task-per-tx): send_to_and_await failed"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_hop.clone(),
+                crate::ring::Location::from(&instance_id),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Subscribe,
+            );
             return relay_subscribe_send_response(
                 op_manager,
                 incoming_tx,
@@ -1522,6 +1573,13 @@ async fn drive_relay_subscribe(
                 timeout_secs = OPERATION_TTL.as_secs(),
                 "SUBSCRIBE relay (task-per-tx): downstream timed out"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_hop.clone(),
+                crate::ring::Location::from(&instance_id),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Subscribe,
+            );
             return relay_subscribe_send_response(
                 op_manager,
                 incoming_tx,
@@ -1534,6 +1592,10 @@ async fn drive_relay_subscribe(
     };
 
     // ── Step 4: Classify reply, register requester if Subscribed, bubble up ──
+    //
+    // Feed the relay's downstream-peer choice into the local Router so
+    // future routing decisions are informed by relay-observed outcomes
+    // (see operations.rs::record_relay_route_event).
     let result = match reply {
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
             result: SubscribeMsgResult::Subscribed { key },
@@ -1562,21 +1624,42 @@ async fn drive_relay_subscribe(
                 phase = "relay_subscribe_bubble",
                 "SUBSCRIBE relay (task-per-tx): downstream Subscribed; bubbling upstream"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_hop.clone(),
+                crate::ring::Location::from(&key),
+                crate::router::RouteOutcome::SuccessUntimed,
+                crate::node::network_status::OpType::Subscribe,
+            );
             SubscribeMsgResult::Subscribed { key }
         }
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
             result: SubscribeMsgResult::NotFound,
             ..
         })) => {
+            // Downstream peer correctly answered NotFound. The peer
+            // behaved well at the protocol level — it just doesn't host
+            // this contract. Record SuccessUntimed so the model treats
+            // this peer as healthy. See `record_relay_route_event` rustdoc.
             tracing::debug!(
                 tx = %incoming_tx,
                 %instance_id,
                 phase = "relay_subscribe_bubble_not_found",
                 "SUBSCRIBE relay (task-per-tx): downstream NotFound; bubbling upstream"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_hop.clone(),
+                crate::ring::Location::from(&instance_id),
+                crate::router::RouteOutcome::SuccessUntimed,
+                crate::node::network_status::OpType::Subscribe,
+            );
             SubscribeMsgResult::NotFound
         }
         other => {
+            // Unexpected reply variant: unclear whether it's a local
+            // bug or peer misbehaviour. Do NOT record a route event;
+            // the helper invariant is one event per unambiguous attribution.
             tracing::warn!(
                 tx = %incoming_tx,
                 %instance_id,
@@ -2611,6 +2694,60 @@ mod tests {
         assert!(!classify_subscribe_outcome_for_op_stats(&publish_err));
         assert!(classify_subscribe_outcome_for_op_stats(&skip));
         assert!(!classify_subscribe_outcome_for_op_stats(&infra));
+    }
+
+    /// Regression for the peer-dashboard prediction-graph data-collection
+    /// regression: the client-initiated SUBSCRIBE driver must emit a
+    /// `RouteEvent` carrying `RouteOutcome::Success { time_to_response_start,
+    /// payload_size: 0, payload_transfer_time: ZERO }` on the Subscribed
+    /// terminal branch. Before this fix the driver emitted NO route event
+    /// at all on the originator's success path (the relay branch did, but
+    /// the originator did not), so the router's
+    /// `response_start_time_estimator` saw zero observations from
+    /// client-initiated subscribes — contributing to the
+    /// Failure-Probability-only peer-dashboard regression.
+    #[test]
+    fn drive_client_subscribe_inner_emits_timed_success_on_subscribed() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "async fn drive_client_subscribe_inner(");
+
+        // Send-time capture must precede the round-trip await and MUST
+        // use `tokio::time::Instant` — `std::time::Instant` is banned in
+        // `crates/core/` by Rule Lint (see .claude/rules/code-style.md)
+        // and would not virtualize under `start_paused(true)` in DST
+        // simulation tests.
+        assert!(
+            body.contains("let request_sent_at = tokio::time::Instant::now();"),
+            "drive_client_subscribe_inner must capture request_sent_at via \
+             tokio::time::Instant::now() before send_to_and_await; without \
+             this the Subscribed branch has no time_to_response_start for \
+             the router."
+        );
+
+        // Subscribed branch must build a timed RouteOutcome::Success with
+        // payload_size=0 (matches the legacy `subscribe.rs::outcome()`
+        // semantics — SUBSCRIBE has no payload, so transfer_rate_estimator
+        // is intentionally not fed).
+        let subscribed_pos = body
+            .find("ReplyClass::Subscribed { key }")
+            .expect("Subscribed arm must exist");
+        let after = &body[subscribed_pos..];
+        assert!(
+            after.contains("RouteOutcome::Success")
+                && after.contains("time_to_response_start")
+                && after.contains("payload_size: 0")
+                && after.contains("payload_transfer_time: std::time::Duration::ZERO"),
+            "Subscribed branch must build RouteOutcome::Success with \
+             time_to_response_start + payload_size: 0 + payload_transfer_time: ZERO. \
+             Emitting nothing leaves the router's response-time estimator \
+             with zero observations from client-initiated subscribes."
+        );
+        assert!(
+            after.contains("op_manager.ring.routing_finished("),
+            "Subscribed branch must hand the RouteEvent to \
+             `routing_finished` so the router actually learns from it."
+        );
     }
 
     /// Truncate the source string at the `#[cfg(test)]` marker so the

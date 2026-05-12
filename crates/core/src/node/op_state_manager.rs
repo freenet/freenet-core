@@ -32,11 +32,7 @@ use crate::{
     operations::{
         OpCtx, OpEnum, OpError,
         connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
-        get::GetOp,
         orphan_streams::OrphanStreamRegistry,
-        put::PutOp,
-        subscribe::SubscribeOp,
-        update::UpdateOp,
     },
     ring::{
         ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
@@ -71,10 +67,14 @@ pub(crate) enum OpNotAvailable {
 #[derive(Default)]
 struct Ops {
     connect: DashMap<Transaction, crate::operations::connect::ConnectOp>,
-    put: DashMap<Transaction, PutOp>,
-    get: DashMap<Transaction, GetOp>,
-    subscribe: DashMap<Transaction, SubscribeOp>,
-    update: DashMap<Transaction, UpdateOp>,
+    // `get`, `put`, `update` and `subscribe` DashMaps retired in #1454
+    // phase 5 final (UPDATE slice, PUT slice, GET slice, SUBSCRIBE
+    // slice): every wire path (client + non-streaming relay + streaming
+    // relay) now runs on `op_ctx_task::*` task-per-tx drivers that own
+    // their state in task locals. The legacy `Operation` impls, the
+    // `request_*` / `start_op*` originator helpers, and the
+    // `OpEnum::{Get,Put,Update,Subscribe}` carriers were deleted in
+    // earlier commits.
     completed: DashSet<Transaction>,
     under_progress: DashSet<Transaction>,
 }
@@ -86,10 +86,6 @@ struct Ops {
 #[derive(Debug, Default)]
 struct OpsSizes {
     connect: usize,
-    put: usize,
-    get: usize,
-    subscribe: usize,
-    update: usize,
     completed: usize,
     under_progress: usize,
 }
@@ -98,10 +94,6 @@ impl Ops {
     fn sizes(&self) -> OpsSizes {
         OpsSizes {
             connect: self.connect.len(),
-            put: self.put.len(),
-            get: self.get.len(),
-            subscribe: self.subscribe.len(),
-            update: self.update.len(),
             completed: self.completed.len(),
             under_progress: self.under_progress.len(),
         }
@@ -309,7 +301,6 @@ impl OpManager {
                     result_router_tx.clone(),
                     request_router.clone(),
                     ring.clone(),
-                    ch_outbound.clone(),
                     contract_waiters.clone(),
                     pending_contract_fetches.clone(),
                     active_relay_get_txs.clone(),
@@ -436,97 +427,12 @@ impl OpManager {
     /// If the channel is full for this long, the event loop is stuck and sending will never succeed.
     const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// An early, fast path, return for communicating back changes of on-going operations
-    /// in the node to the main message handler, without any transmission in the network whatsoever.
-    ///
-    /// Useful when transitioning between states that do not require any network communication
-    /// with other nodes, like intermediate states before returning.
-    pub async fn notify_op_change(&self, msg: NetMessage, op: OpEnum) -> Result<(), OpError> {
-        let tx = *msg.id();
-        let peer_id = &self.ring.connection_manager.pub_key;
-        tracing::debug!(
-            tx = %tx,
-            msg_type = %msg,
-            peer = %peer_id,
-            "notify_op_change: Pushing operation and sending notification"
-        );
-
-        // push back the state to the stack
-        self.push(tx, op).await?;
-
-        tracing::debug!(
-            tx = %tx,
-            peer = %peer_id,
-            "notify_op_change: Operation pushed, sending to event listener"
-        );
-
-        match tokio::time::timeout(
-            Self::NOTIFICATION_SEND_TIMEOUT,
-            self.to_event_listener
-                .notifications_sender()
-                .send(Either::Left(msg)),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(OpError::NotificationError),
-            Err(_) => {
-                tracing::error!(
-                    tx = %tx,
-                    timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
-                    channel_pending = self.to_event_listener.notification_channel_pending(),
-                    channel_remaining = self.to_event_listener.notifications_sender().capacity(),
-                    "notify_op_change: Notification channel full for too long, event loop may be stuck"
-                );
-                return Err(OpError::NotificationChannelError(
-                    "notification channel send timed out — event loop is likely stuck".into(),
-                ));
-            }
-        }
-
-        tracing::debug!(
-            tx = %tx,
-            peer = %peer_id,
-            "notify_op_change: Notification sent successfully"
-        );
-
-        Ok(())
-    }
-
-    /// Non-blocking variant of [`notify_op_change`] that fails fast when the
-    /// notification channel is full instead of blocking for 30 seconds.
-    /// On failure the pushed operation is cleaned up so it does not leak.
-    pub async fn notify_op_change_nonblocking(
-        &self,
-        msg: NetMessage,
-        op: OpEnum,
-    ) -> Result<(), OpError> {
-        let tx = *msg.id();
-        self.push(tx, op).await?;
-
-        match self
-            .to_event_listener
-            .notifications_sender()
-            .try_send(Either::Left(msg))
-        {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    tx = %tx,
-                    channel_pending = self.to_event_listener.notification_channel_pending(),
-                    "notify_op_change_nonblocking: channel full, failing fast"
-                );
-                self.completed(tx);
-                Err(OpError::NotificationChannelError(
-                    "notification channel full (non-blocking send)".into(),
-                ))
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.completed(tx);
-                Err(OpError::NotificationError)
-            }
-        }
-    }
+    // `notify_op_change` was the legacy state-machine re-entry primitive
+    // (push to ops DashMap + send NetMessage on notifications channel).
+    // Retired in #1454 phase 5 final after all five ops (GET/PUT/UPDATE/
+    // SUBSCRIBE + CONNECT relay) migrated to task-per-tx drivers that
+    // route outbound messages through `op_execution_sender` and own
+    // their own state in task locals.
 
     // An early, fast path, return for communicating events in the node to the main message handler,
     // without any transmission in the network whatsoever and avoiding any state transition.
@@ -628,13 +534,16 @@ impl OpManager {
             instance_id,
         });
 
-        let op = OpEnum::Subscribe(crate::operations::subscribe::create_unsubscribe_op(
-            instance_id,
-            tx,
-            target_addr,
-        ));
-
-        match self.notify_op_change_nonblocking(msg, op).await {
+        // #1454 phase 5 final (SUBSCRIBE slice): fire-and-forget the
+        // Unsubscribe wire message through OpCtx. The legacy path pushed
+        // a synthetic SubscribeOp into `ops.subscribe` so the event
+        // loop's `peek_next_hop_addr` SUBSCRIBE arm could recover the
+        // target address; both that arm and the DashMap were retired in
+        // this slice. The op-execution channel routes directly to
+        // `OutboundMessageWithTarget` given `Some(target_addr)`, so no
+        // operation state is required (Unsubscribe has no reply).
+        let mut ctx = self.op_ctx(tx);
+        match ctx.send_fire_and_forget(target_addr, msg).await {
             Ok(()) => {
                 tracing::debug!(
                     contract = %contract,
@@ -714,26 +623,6 @@ impl OpManager {
                 check_id_op!(id.transaction_type(), TransactionType::Connect);
                 self.ops.connect.insert(id, *op);
             }
-            OpEnum::Put(op) => {
-                #[cfg(debug_assertions)]
-                check_id_op!(id.transaction_type(), TransactionType::Put);
-                self.ops.put.insert(id, op);
-            }
-            OpEnum::Get(op) => {
-                #[cfg(debug_assertions)]
-                check_id_op!(id.transaction_type(), TransactionType::Get);
-                self.ops.get.insert(id, op);
-            }
-            OpEnum::Subscribe(op) => {
-                #[cfg(debug_assertions)]
-                check_id_op!(id.transaction_type(), TransactionType::Subscribe);
-                self.ops.subscribe.insert(id, op);
-            }
-            OpEnum::Update(op) => {
-                #[cfg(debug_assertions)]
-                check_id_op!(id.transaction_type(), TransactionType::Update);
-                self.ops.update.insert(id, op);
-            }
         }
         Ok(())
     }
@@ -751,18 +640,13 @@ impl OpManager {
                 .connect
                 .get(id)
                 .and_then(|op| op.get_next_hop_addr()),
-            TransactionType::Put => self.ops.put.get(id).and_then(|op| op.get_next_hop_addr()),
-            TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_next_hop_addr()),
-            TransactionType::Subscribe => self
-                .ops
-                .subscribe
-                .get(id)
-                .and_then(|op| op.get_next_hop_addr()),
-            TransactionType::Update => self
-                .ops
-                .update
-                .get(id)
-                .and_then(|op| op.get_next_hop_addr()),
+            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
+            // post-#1454 phase 5 final; task-per-tx drivers manage
+            // their own routing.
+            TransactionType::Get
+            | TransactionType::Put
+            | TransactionType::Update
+            | TransactionType::Subscribe => None,
         }
     }
 
@@ -786,13 +670,16 @@ impl OpManager {
 
     /// Get the current hop count (remaining HTL) for an operation.
     /// Used for calculating hop_count in success/failure events.
-    pub fn get_current_hop(&self, id: &Transaction) -> Option<usize> {
-        match id.transaction_type() {
-            TransactionType::Get => self.ops.get.get(id).and_then(|op| op.get_current_hop()),
-            TransactionType::Put => self.ops.put.get(id).and_then(|op| op.get_current_htl()),
-            // TODO: Add support for Subscribe operations when they track HTL
-            TransactionType::Connect | TransactionType::Subscribe | TransactionType::Update => None,
-        }
+    pub fn get_current_hop(&self, _id: &Transaction) -> Option<usize> {
+        // GET, PUT and UPDATE have no DashMap entry post-#1454 phase 5
+        // final; SUBSCRIBE doesn't track HTL; CONNECT has no current
+        // hop concept exposed. The `get_current_hop` getter is kept for
+        // API compatibility with the tracing/telemetry consumer at
+        // `crates/core/src/tracing.rs:1266` (which uses it to decorate
+        // event logs with the operation's remaining HTL when known).
+        // Post-GET-slice retirement, no live operation reports a hop
+        // here — telemetry sites get `None` and skip the decoration.
+        None
     }
 
     pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
@@ -813,20 +700,12 @@ impl OpManager {
                 .remove(id)
                 .map(|(_k, v)| v)
                 .map(|op| OpEnum::Connect(Box::new(op))),
-            TransactionType::Put => self.ops.put.remove(id).map(|(_k, v)| v).map(OpEnum::Put),
-            TransactionType::Get => self.ops.get.remove(id).map(|(_k, v)| v).map(OpEnum::Get),
-            TransactionType::Subscribe => self
-                .ops
-                .subscribe
-                .remove(id)
-                .map(|(_k, v)| v)
-                .map(OpEnum::Subscribe),
-            TransactionType::Update => self
-                .ops
-                .update
-                .remove(id)
-                .map(|(_k, v)| v)
-                .map(OpEnum::Update),
+            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
+            // post-#1454 phase 5 final.
+            TransactionType::Get
+            | TransactionType::Put
+            | TransactionType::Update
+            | TransactionType::Subscribe => None,
         };
         self.ops.under_progress.insert(*id);
         Ok(op)
@@ -882,57 +761,38 @@ impl OpManager {
         .await
     }
 
-    /// Returns `true` if there is an active `GetOp` stored in `OpManager.ops.get`
-    /// for the given transaction.
-    ///
-    /// Used by the relay GET dispatch in `node.rs` to distinguish a fresh inbound
-    /// relay request (no existing op → spawn the task-per-tx driver) from a
-    /// GC-spawned retry or `start_targeted_op` (existing op → fall through to the
-    /// legacy `handle_op_request` path).
-    ///
-    /// Does **not** check `completed` or `under_progress` — those are covered by
-    /// `pop` / `load_or_init`. This is a lightweight existence check only.
-    pub fn has_get_op(&self, id: &Transaction) -> bool {
-        self.ops.get.contains_key(id)
-    }
+    // `has_get_op` was the relay GET dispatch gate; retired in
+    // #1454 phase 5 final (GET slice) together with the `ops.get`
+    // DashMap. Every GET wire variant now spawns its task-per-tx
+    // driver unconditionally (the legacy `handle_op_request<GetOp>`
+    // fallthrough is gone), so the gate has no remaining decision
+    // value. The dispatch site in `node.rs::NetMessageV1::Get` was
+    // simplified in this slice.
 
-    /// Returns `true` if an `UpdateOp` is currently registered for this
-    /// transaction in `OpManager.ops.update`.
-    ///
-    /// Same role as `has_get_op` but for the relay UPDATE dispatch gate
-    /// (#1454 phase 5 follow-up). Used by `node.rs` to distinguish a fresh
-    /// inbound relay update (no existing op → spawn the task-per-tx driver)
-    /// from a GC-spawned retry or `start_targeted_op`-style internal caller
-    /// (existing op → fall through to the legacy `handle_op_request` path).
-    pub fn has_update_op(&self, id: &Transaction) -> bool {
-        self.ops.update.contains_key(id)
-    }
+    // `has_update_op` was the relay UPDATE dispatch gate; retired in
+    // #1454 phase 5 final together with the `ops.update` DashMap.
+    // Every UPDATE wire variant now spawns its task-per-tx driver
+    // unconditionally (the legacy `handle_op_request<UpdateOp>`
+    // fallthrough is gone), so the gate has no remaining decision
+    // value. The dispatch sites in `node.rs` were simplified in
+    // commit 3.
 
-    /// Returns `true` if a `PutOp` is currently registered for this
-    /// transaction in `OpManager.ops.put`.
-    ///
-    /// Same role as `has_get_op` but for the relay PUT dispatch gate
-    /// (#1454 phase 5 follow-up slice A). Used by `node.rs` to
-    /// distinguish a fresh inbound relay PUT (no existing op → spawn
-    /// the task-per-tx driver) from a GC-spawned speculative retry or
-    /// client-initiated PUT loopback (existing op → fall through to the
-    /// legacy `handle_op_request` path).
-    pub fn has_put_op(&self, id: &Transaction) -> bool {
-        self.ops.put.contains_key(id)
-    }
+    // `has_put_op` was the relay PUT dispatch gate; retired in
+    // #1454 phase 5 final (PUT slice) together with the `ops.put`
+    // DashMap. Every PUT wire variant now spawns its task-per-tx
+    // driver unconditionally (the legacy `handle_op_request<PutOp>`
+    // fallthrough is gone), so the gate has no remaining decision
+    // value. The dispatch sites in `node.rs` were simplified in
+    // commit 3.
 
-    /// Returns `true` if a `SubscribeOp` is currently registered for this
-    /// transaction in `OpManager.ops.subscribe`.
-    ///
-    /// Same role as `has_get_op` but for the relay SUBSCRIBE dispatch gate
-    /// (#1454 phase 5 follow-up slice A). Used by `node.rs` to distinguish
-    /// a fresh inbound relay SUBSCRIBE (no existing op → spawn the
-    /// task-per-tx driver) from a renewal, PUT sub-op, or GC-spawned retry
-    /// (existing op → fall through to the legacy `handle_op_request`
-    /// path).
-    pub fn has_subscribe_op(&self, id: &Transaction) -> bool {
-        self.ops.subscribe.contains_key(id)
-    }
+    // `has_subscribe_op` was the relay SUBSCRIBE dispatch gate; retired
+    // in #1454 phase 5 final (SUBSCRIBE slice) together with the
+    // `ops.subscribe` DashMap. Every SUBSCRIBE wire variant now spawns
+    // its task-per-tx driver or runs through a dedicated inbound
+    // handler unconditionally (the legacy `handle_op_request<SubscribeOp>`
+    // fallthrough is gone), so the gate has no remaining decision value.
+    // The dispatch site in `node.rs::NetMessageV1::Subscribe` was
+    // simplified in this slice.
 
     /// Returns `true` if a `ConnectOp` is currently registered for this
     /// transaction in `OpManager.ops.connect`.
@@ -945,10 +805,6 @@ impl OpManager {
     /// already has a `ConnectOp` from a prior `process_message` call
     /// (existing op → fall through to the legacy `handle_op_request`
     /// path).
-    ///
-    /// `#[allow(dead_code)]` because the dispatch site lands in slice 1
-    /// commit 2; this commit only adds the scaffolding.
-    #[allow(dead_code)]
     pub fn has_connect_op(&self, id: &Transaction) -> bool {
         self.ops.connect.contains_key(id)
     }
@@ -977,18 +833,12 @@ impl OpManager {
             TransactionType::Connect => {
                 self.ops.connect.remove(&id);
             }
-            TransactionType::Put => {
-                self.ops.put.remove(&id);
-            }
-            TransactionType::Get => {
-                self.ops.get.remove(&id);
-            }
-            TransactionType::Subscribe => {
-                self.ops.subscribe.remove(&id);
-            }
-            TransactionType::Update => {
-                self.ops.update.remove(&id);
-            }
+            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
+            // post-#1454 phase 5 final.
+            TransactionType::Get
+            | TransactionType::Put
+            | TransactionType::Update
+            | TransactionType::Subscribe => {}
         }
 
         // Clean up request router to prevent stale entries from blocking subsequent requests
@@ -1050,14 +900,12 @@ impl OpManager {
     }
 
     /// Returns pending operation counts: [connect, put, get, subscribe, update].
+    /// GET, PUT, UPDATE and SUBSCRIBE slots are always 0 after #1454
+    /// phase 5 final retired the corresponding DashMaps; kept in the
+    /// array for API stability with the home-page renderer / telemetry
+    /// consumers.
     pub fn pending_op_counts(&self) -> [u32; 5] {
-        [
-            self.ops.connect.len() as u32,
-            self.ops.put.len() as u32,
-            self.ops.get.len() as u32,
-            self.ops.subscribe.len() as u32,
-            self.ops.update.len() as u32,
-        ]
+        [self.ops.connect.len() as u32, 0, 0, 0, 0]
     }
 
     /// Returns the number of entries in the contract_waiters map.
@@ -1227,224 +1075,37 @@ fn notify_transaction_timeout(
     }
 }
 
-/// Fire-and-forget notification that a subscription timed out.
-/// Spawns a task to avoid blocking the garbage cleanup loop on the contract handler response.
-fn notify_subscription_timeout(
-    ch_outbound: &Arc<crate::contract::ContractHandlerChannel<crate::contract::SenderHalve>>,
-    instance_id: ContractInstanceId,
-) {
-    let ch = Arc::clone(ch_outbound);
-    crate::config::GlobalExecutor::spawn(async move {
-        if let Err(e) = ch
-            .send_to_handler(ContractHandlerEvent::NotifySubscriptionError {
-                key: instance_id,
-                reason: format!("Subscription timed out for contract {}", instance_id),
-            })
-            .await
-        {
-            tracing::debug!(
-                contract = %instance_id,
-                error = %e,
-                "Failed to notify subscription timeout"
-            );
-        }
-    });
-}
+// `notify_subscription_timeout` and `report_timeout_failure` retired in
+// #1454 phase 5 final (SUBSCRIBE slice). They were called only from
+// `remove_subscribe_and_notify_timeout`, which was deleted in the same
+// commit. The task-per-tx subscribe driver owns its own timeout
+// reporting via `result_router_tx` publication, and relays route any
+// per-hop failure through their own per-tx drivers — neither needs a
+// GC-sweep notifier.
 
-/// Reports a routing failure for a timed-out operation to the router's isotonic model.
-fn report_timeout_failure(
-    ring: &crate::ring::Ring,
-    tx: &Transaction,
-    peer: crate::ring::PeerKeyLocation,
-    contract_location: crate::ring::Location,
-) {
-    let op_type = match tx.transaction_type() {
-        crate::message::TransactionType::Get => Some(crate::node::network_status::OpType::Get),
-        crate::message::TransactionType::Put => Some(crate::node::network_status::OpType::Put),
-        crate::message::TransactionType::Update => {
-            Some(crate::node::network_status::OpType::Update)
-        }
-        crate::message::TransactionType::Subscribe => {
-            Some(crate::node::network_status::OpType::Subscribe)
-        }
-        crate::message::TransactionType::Connect => None,
-    };
-    ring.routing_finished(crate::router::RouteEvent {
-        peer: peer.clone(),
-        contract_location,
-        outcome: crate::router::RouteOutcome::Failure,
-        op_type,
-    });
-    tracing::info!(
-        tx = %tx,
-        peer = ?peer.socket_addr(),
-        %contract_location,
-        "Reported operation timeout as routing failure"
-    );
-}
+// `remove_put_and_report_failure` and `remove_update_and_report_failure`
+// were retired in #1454 phase 5 final (PUT slice / UPDATE slice 1)
+// together with the `ops.put` / `ops.update` DashMaps. Client-initiated
+// PUTs and UPDATEs now own their timeout reporting in the task-per-tx
+// driver (`{put,update}::op_ctx_task::start_client_*`); relay PUTs and
+// UPDATEs are owned by their per-tx drivers and have no client to
+// report to.
 
-/// Removes a put operation from the ops map, reports timeout failure if stats are available,
-/// and notifies the client with an error so they don't wait silently until their own timeout.
-/// Returns `true` if the operation was found and removed, `false` otherwise.
-fn remove_put_and_report_failure(
-    ops: &Ops,
-    tx: &Transaction,
-    ring: &crate::ring::Ring,
-    result_router_tx: &mpsc::Sender<(Transaction, HostResult)>,
-) -> bool {
-    if let Some((_, put_op)) = ops.put.remove(tx) {
-        if let Some((peer, contract_location)) = put_op.failure_routing_info() {
-            report_timeout_failure(ring, tx, peer, contract_location);
-        }
-        tracing::warn!(
-            tx = %tx,
-            elapsed_ms = tx.elapsed().as_millis(),
-            phase = "put_timeout",
-            "PUT operation timed out without receiving a response"
-        );
-        // Notify client of timeout so they get an immediate error instead of
-        // waiting silently for their own client-side timeout (#3451).
-        if put_op.is_client_initiated() {
-            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: "PUT operation timed out".into(),
-            }
-            .into());
-            if let Err(e) = result_router_tx.try_send((*tx, error_result)) {
-                tracing::warn!(
-                    %tx,
-                    error = %e,
-                    "failed to send PUT timeout error to client"
-                );
-            }
-        }
-        true
-    } else {
-        false
-    }
-}
+// `remove_subscribe_and_notify_timeout` retired in #1454 phase 5 final
+// (SUBSCRIBE slice) together with the `ops.subscribe` DashMap. Client-,
+// renewal-, executor-, and sub-op-initiated SUBSCRIBEs now own their
+// timeout reporting in the task-per-tx driver
+// (`subscribe::op_ctx_task::*`); relay SUBSCRIBEs are owned by their
+// per-tx drivers (`start_relay_subscribe`) which expire their inflight
+// guards naturally. The Unsubscribe wire variant is fire-and-forget and
+// has no timeout reporter.
 
-/// Removes an update operation from the ops map, reports timeout failure if stats are available,
-/// and notifies the client with an error so they don't wait silently until their own timeout.
-/// Returns `true` if the operation was found and removed, `false` otherwise.
-fn remove_update_and_report_failure(
-    ops: &Ops,
-    tx: &Transaction,
-    ring: &crate::ring::Ring,
-    result_router_tx: &mpsc::Sender<(Transaction, HostResult)>,
-) -> bool {
-    if let Some((_, update_op)) = ops.update.remove(tx) {
-        if let Some((peer, contract_location)) = update_op.failure_routing_info() {
-            report_timeout_failure(ring, tx, peer, contract_location);
-        }
-        tracing::warn!(
-            tx = %tx,
-            elapsed_ms = tx.elapsed().as_millis(),
-            phase = "update_timeout",
-            "UPDATE operation timed out without receiving a response"
-        );
-        // Notify client of timeout so they get an immediate error instead of
-        // waiting silently for their own client-side timeout (#3451).
-        if update_op.is_client_initiated() {
-            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: "UPDATE operation timed out".into(),
-            }
-            .into());
-            if let Err(e) = result_router_tx.try_send((*tx, error_result)) {
-                tracing::warn!(
-                    %tx,
-                    error = %e,
-                    "failed to send UPDATE timeout error to client"
-                );
-            }
-        }
-        true
-    } else {
-        false
-    }
-}
-
-/// Removes a subscribe operation from the ops map and notifies timeout if found.
-/// Returns `Some(())` if the operation was found and removed, `None` otherwise.
-///
-/// Note: For intermediate nodes, the subscribe times out silently without sending
-/// NotFound upstream. This is acceptable because the originator retries independently
-/// after SUBSCRIBE_RETRY_THRESHOLD (5s), so it doesn't depend on NotFound for fast
-/// failure detection. The intermediate node's stale op chain is harmless.
-fn remove_subscribe_and_notify_timeout(
-    ops: &Ops,
-    tx: &Transaction,
-    ch_outbound: &Arc<ContractHandlerChannel<SenderHalve>>,
-    ring: &crate::ring::Ring,
-) -> Option<()> {
-    let (_, sub_op) = ops.subscribe.remove(tx)?;
-    let is_originator = sub_op.is_originator();
-    if let Some((peer, contract_location)) = sub_op.failure_routing_info() {
-        report_timeout_failure(ring, tx, peer, contract_location);
-    }
-    let instance_id = sub_op.instance_id();
-    if let Some(instance_id) = instance_id {
-        notify_subscription_timeout(ch_outbound, instance_id);
-    }
-    // Emit telemetry so subscribe timeouts are visible in the dashboard (#3676).
-    // Without this, timed-out subscribes were invisible — only subscribe_request
-    // and subscribe_success were emitted, so timeouts looked like missing data.
-    if is_originator {
-        crate::tracing::telemetry::send_standalone_event(
-            "subscribe_timeout",
-            serde_json::json!({
-                "tx": tx.to_string(),
-                "instance_id": instance_id.map(|id| id.to_string()),
-                "elapsed_ms": tx.elapsed().as_millis() as u64,
-            }),
-        );
-    }
-    Some(())
-}
-
-/// Removes a get operation from the ops map, reports timeout failure if stats are available,
-/// and notifies the client with an error so they don't wait silently until their own timeout.
-/// Returns `true` if the operation was found and removed, `false` otherwise.
-fn remove_get_and_report_failure(
-    ops: &Ops,
-    tx: &Transaction,
-    ring: &crate::ring::Ring,
-    result_router_tx: &mpsc::Sender<(Transaction, HostResult)>,
-) -> bool {
-    if let Some((_, get_op)) = ops.get.remove(tx) {
-        if let Some((peer, contract_location)) = get_op.failure_routing_info() {
-            report_timeout_failure(ring, tx, peer, contract_location);
-        }
-        // Log GET timeout so failures are visible in traces
-        let instance_id = get_op.instance_id();
-        tracing::warn!(
-            tx = %tx,
-            instance_id = ?instance_id,
-            elapsed_ms = tx.elapsed().as_millis(),
-            phase = "get_timeout",
-            "GET operation timed out without receiving a response"
-        );
-        // Notify client of timeout so they get an immediate error instead of
-        // waiting silently for their own client-side timeout (#3423).
-        // Only for client-initiated GETs (requester is None); forwarded GETs
-        // have no local client waiting.
-        if get_op.is_client_initiated() {
-            let error_result = Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: "GET operation timed out".into(),
-            }
-            .into());
-            if let Err(e) = result_router_tx.try_send((*tx, error_result)) {
-                tracing::warn!(
-                    %tx,
-                    error = %e,
-                    "failed to send GET timeout error to client"
-                );
-            }
-        }
-        true
-    } else {
-        false
-    }
-}
+// `remove_get_and_report_failure` retired in #1454 phase 5 final
+// (GET slice) together with the `ops.get` DashMap. Originator-side
+// timeout reporting is now owned by the task-per-tx driver via the
+// `RetryLoopOutcome::Exhausted` → `result_router_tx` publication
+// path. Relay drivers expire their inflight guards naturally; no GC
+// sweep is needed.
 
 /// Log when a connect operation in Relaying state with an outstanding uphill forward times out,
 /// and record the unresponsive peer as an acceptor failure for reliability scoring.
@@ -1495,10 +1156,9 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     live_tx_tracker: LiveTransactionTracker,
     event_loop_notifier: EventLoopNotificationsSender,
     mut event_register: ER,
-    result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
+    _result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
     ring: Arc<Ring>,
-    ch_outbound: Arc<crate::contract::ContractHandlerChannel<crate::contract::SenderHalve>>,
     contract_waiters: Arc<
         Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
     >,
@@ -1595,10 +1255,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         target: "memory_stats",
                         tick = tick_count,
                         ops_connect = ops_sizes.connect,
-                        ops_put = ops_sizes.put,
-                        ops_get = ops_sizes.get,
-                        ops_subscribe = ops_sizes.subscribe,
-                        ops_update = ops_sizes.update,
+                        // ops_get / ops_put / ops_update / ops_subscribe
+                        // retired in #1454 phase 5 final.
+                        ops_put = 0,
+                        ops_get = 0,
+                        ops_subscribe = 0,
+                        ops_update = 0,
                         ops_completed = ops_sizes.completed,
                         ops_under_progress = ops_sizes.under_progress,
                         pending_contract_fetches = pending_fetches,
@@ -1669,22 +1331,15 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                 }
 
                 // SUBSCRIBE speculative-retry GC block was retired in #1454
-                // Phase 5-final: every originator-side writer into
-                // `ops.subscribe` (client-initiated, executor auto-subscribe,
-                // renewal, PUT/GET sub-op) now runs on the task-per-tx
-                // driver in `operations/subscribe/op_ctx_task.rs`, which
-                // owns its own retry loop via `advance_to_next_peer` and
-                // never inserts a `SubscribeOp` into the DashMap. The
-                // remaining legacy entries (relay state during multi-hop
-                // forwarding, `create_unsubscribe_op` routing entries) are
-                // not retry candidates: relay entries fail
-                // `is_originator()` and unsubscribe entries fail
-                // `failure_routing_info().is_some()`. The DashMap, the
-                // `SubscribeOp::ack_received` / `speculative_paths` fields,
-                // and `SubscribeMsg::ForwardingAck` survive only as wire-
-                // and bookkeeping-compat for legacy relay traffic;
-                // they are not load-bearing for retry. Mirrors the GET
-                // Phase 5-final retirement in PR #3974.
+                // Phase 5-final. The `ops.subscribe` DashMap itself was
+                // then retired in the SUBSCRIBE slice (this PR): every
+                // SUBSCRIBE wire variant now runs on the task-per-tx
+                // driver in `operations/subscribe/op_ctx_task.rs`
+                // (Request) or a dedicated free function
+                // (`handle_unsubscribe_inbound` for Unsubscribe), and
+                // the surviving `send_unsubscribe_upstream` writer uses
+                // `OpCtx::send_fire_and_forget` directly. There is no
+                // longer a DashMap to GC-sweep.
 
                 let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing.drain(..) {
@@ -1710,12 +1365,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 true
                             }
                         }
-                        TransactionType::Put => !remove_put_and_report_failure(&ops, &tx, &ring, &result_router_tx),
-                        TransactionType::Get => !remove_get_and_report_failure(&ops, &tx, &ring, &result_router_tx),
-                        TransactionType::Subscribe => {
-                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_none()
-                        }
-                        TransactionType::Update => !remove_update_and_report_failure(&ops, &tx, &ring, &result_router_tx),
+                        // GET, PUT, UPDATE and SUBSCRIBE have no DashMap
+                        // entry post-#1454 phase 5 final; task-per-tx
+                        // drivers own their own timeout reporting.
+                        TransactionType::Get
+                        | TransactionType::Put
+                        | TransactionType::Update
+                        | TransactionType::Subscribe => false,
                     };
                     if still_waiting {
                         delayed.push(tx);
@@ -1782,12 +1438,13 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                                 false
                             }
                         }
-                        TransactionType::Put => remove_put_and_report_failure(&ops, &tx, &ring, &result_router_tx),
-                        TransactionType::Get => remove_get_and_report_failure(&ops, &tx, &ring, &result_router_tx),
-                        TransactionType::Subscribe => {
-                            remove_subscribe_and_notify_timeout(&ops, &tx, &ch_outbound, &ring).is_some()
-                        }
-                        TransactionType::Update => remove_update_and_report_failure(&ops, &tx, &ring, &result_router_tx),
+                        // GET, PUT, UPDATE and SUBSCRIBE have no DashMap
+                        // entry post-#1454 phase 5 final; task-per-tx
+                        // drivers own their own timeout reporting.
+                        TransactionType::Get
+                        | TransactionType::Put
+                        | TransactionType::Update
+                        | TransactionType::Subscribe => false,
                     };
                     if removed {
                         tracing::info!(
@@ -2170,106 +1827,9 @@ mod tests {
         }
     }
 
-    // ── has_get_op unit tests ─────────────────────────────────────────────
-    //
-    // `has_get_op` is a thin wrapper over `self.ops.get.contains_key`.
-    // Since `OpManager` requires complex infrastructure to construct in unit
-    // tests, we exercise the underlying `Ops::get` DashMap directly — the
-    // same pattern used by `remove_put_returns_false_for_missing_tx` above.
-    // The delegation in `has_get_op` is one line and trivially correct.
-
-    /// has_get_op returns false for an unknown transaction.
-    #[test]
-    fn has_get_op_returns_false_for_unknown_tx() {
-        let ops = Ops::default();
-        let tx = Transaction::new::<crate::operations::get::GetMsg>();
-        assert!(
-            !ops.get.contains_key(&tx),
-            "ops.get should not contain a never-inserted tx"
-        );
-    }
-
-    /// has_get_op returns true after a GetOp is inserted, and false once removed.
-    #[test]
-    fn has_get_op_returns_true_after_insert_false_after_remove() {
-        use freenet_stdlib::prelude::ContractInstanceId;
-
-        let ops = Ops::default();
-        let instance_id = ContractInstanceId::new([0u8; 32]);
-        let tx = Transaction::new::<crate::operations::get::GetMsg>();
-        let get_op = crate::operations::get::start_op_with_id(instance_id, false, false, false, tx);
-
-        // Before insert: absent
-        assert!(
-            !ops.get.contains_key(&tx),
-            "ops.get should not contain tx before insertion"
-        );
-
-        // After insert: present
-        ops.get.insert(tx, get_op);
-        assert!(
-            ops.get.contains_key(&tx),
-            "ops.get should contain tx after insertion"
-        );
-
-        // After remove: absent again
-        ops.get.remove(&tx);
-        assert!(
-            !ops.get.contains_key(&tx),
-            "ops.get should not contain tx after removal"
-        );
-    }
-
-    // ── has_update_op unit tests ──────────────────────────────────────────
-    //
-    // Same shape as has_get_op tests above. `has_update_op` is a one-line
-    // wrapper over `self.ops.update.contains_key`, so we exercise the
-    // underlying map directly.
-
-    /// has_update_op returns false for an unknown transaction.
-    #[test]
-    fn has_update_op_returns_false_for_unknown_tx() {
-        let ops = Ops::default();
-        let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
-        assert!(
-            !ops.update.contains_key(&tx),
-            "ops.update should not contain a never-inserted tx"
-        );
-    }
-
-    /// has_update_op returns true after an UpdateOp is inserted, and false
-    /// once removed.
-    #[test]
-    fn has_update_op_returns_true_after_insert_false_after_remove() {
-        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
-
-        let ops = Ops::default();
-        let instance_id = ContractInstanceId::new([0u8; 32]);
-        let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([1u8; 32]));
-        let update_op = crate::operations::update::start_op(
-            key,
-            freenet_stdlib::prelude::UpdateData::State(freenet_stdlib::prelude::State::from(vec![
-                1, 2, 3,
-            ])),
-            freenet_stdlib::prelude::RelatedContracts::default(),
-        );
-        let tx = update_op.id;
-
-        assert!(
-            !ops.update.contains_key(&tx),
-            "ops.update should not contain tx before insertion"
-        );
-
-        ops.update.insert(tx, update_op);
-        assert!(
-            ops.update.contains_key(&tx),
-            "ops.update should contain tx after insertion"
-        );
-
-        ops.update.remove(&tx);
-        assert!(
-            !ops.update.contains_key(&tx),
-            "ops.update should not contain tx after removal"
-        );
-    }
+    // `has_get_op_*`, `has_update_op_returns_*` and
+    // `has_put_op_returns_*` tests were retired in #1454 phase 5 final
+    // together with the corresponding APIs and DashMaps. Equivalent
+    // coverage for the surviving ops (CONNECT, SUBSCRIBE) lives in the
+    // relay-driver dedup tests under `op_ctx_task` modules.
 }

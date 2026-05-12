@@ -27,7 +27,6 @@
 //! | Merge strategy | Hash-based (largest hash wins) | Production validate→update pipeline |
 //! | `register_contract_notifier` | No-op | Tracks subscribers (production path) |
 //! | `get_subscription_info` | Returns `vec![]` | Returns real subscription data |
-//! | `notify_subscription_error` | No-op | Sends errors to subscribers |
 //! | `remove_client` | No-op (trait default) | Cleans up channels and summaries |
 //! | CRDT emulation | Supported (version-based LWW) | Not supported |
 //!

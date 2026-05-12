@@ -141,11 +141,6 @@ where
     CB: NetworkBridge,
 {
     match result {
-        Err(OpError::StatePushed) => {
-            // do nothing and continue, the operation will just continue later on
-            tracing::debug!("entered in state pushed to continue with op");
-            return Ok(None);
-        }
         Err(OpError::OpNotPresent(tx)) => {
             // OpNotPresent is benign — it means a duplicate message arrived for an
             // operation that was already completed or claimed (e.g., duplicate metadata
@@ -299,20 +294,20 @@ async fn send_with_stream<CB: NetworkBridge>(
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum OpEnum {
     Connect(Box<connect::ConnectOp>),
-    Put(put::PutOp),
-    Get(get::GetOp),
-    Subscribe(subscribe::SubscribeOp),
-    Update(update::UpdateOp),
+    // `Get` variant retired in #1454 phase 5 final (GET slice) together
+    // with the `ops.get` DashMap. GET wire flows now run on task-per-tx
+    // drivers in `get::op_ctx_task::*` and never produce an
+    // `OpEnum::Get`.
+    // `Put` retired in the prior PUT slice; `Update` in the UPDATE slice.
+    // `Subscribe` retired in the SUBSCRIBE slice; SUBSCRIBE wire flows
+    // run on task-per-tx drivers in `subscribe::op_ctx_task::*` and the
+    // surviving Unsubscribe send-site goes through `OpCtx::send_fire_and_forget`.
 }
 
 impl OpEnum {
     delegate::delegate! {
         to match self {
             OpEnum::Connect(op) => op,
-            OpEnum::Put(op) => op,
-            OpEnum::Get(op) => op,
-            OpEnum::Subscribe(op) => op,
-            OpEnum::Update(op) => op,
         } {
             pub fn id(&self) -> &Transaction;
             pub fn outcome(&self) -> OpOutcome<'_>;
@@ -320,40 +315,7 @@ impl OpEnum {
             pub fn to_host_result(&self) -> HostResult;
         }
     }
-
-    /// Returns true if this is a subscription renewal (node-internal operation
-    /// with no client waiting for the result).
-    pub fn is_subscription_renewal(&self) -> bool {
-        matches!(self, OpEnum::Subscribe(op) if op.is_renewal())
-    }
 }
-
-macro_rules! try_from_op_enum {
-    ($op_enum:path, $op_type:ty, $transaction_type:expr) => {
-        impl TryFrom<OpEnum> for $op_type {
-            type Error = OpError;
-
-            fn try_from(value: OpEnum) -> Result<Self, Self::Error> {
-                match value {
-                    $op_enum(op) => Ok(op),
-                    other => Err(OpError::IncorrectTxType(
-                        $transaction_type,
-                        other.id().transaction_type(),
-                    )),
-                }
-            }
-        }
-    };
-}
-
-try_from_op_enum!(OpEnum::Put, put::PutOp, TransactionType::Put);
-try_from_op_enum!(OpEnum::Get, get::GetOp, TransactionType::Get);
-try_from_op_enum!(
-    OpEnum::Subscribe,
-    subscribe::SubscribeOp,
-    TransactionType::Subscribe
-);
-try_from_op_enum!(OpEnum::Update, update::UpdateOp, TransactionType::Update);
 
 #[derive(Debug)]
 pub(crate) enum OpOutcome<'a> {
@@ -424,12 +386,6 @@ pub(crate) enum OpError {
     StreamCancelled,
     #[error("failed to claim orphan stream")]
     OrphanStreamClaimFailed,
-
-    // used for control flow
-    /// This is used as an early interrumpt of an op update when an op
-    /// was sent throught the fast path back to the storage.
-    #[error("early push of state into the op stack")]
-    StatePushed,
 }
 
 impl OpError {
@@ -438,23 +394,6 @@ impl OpError {
             tx,
             #[cfg(debug_assertions)]
             state: None,
-            #[cfg(debug_assertions)]
-            trace: StdTrace::force_capture(),
-        }
-    }
-
-    pub fn invalid_transition_with_state(
-        tx: Transaction,
-        state: Box<dyn std::fmt::Debug + Send + Sync>,
-    ) -> Self {
-        #[cfg(not(debug_assertions))]
-        {
-            drop(state);
-        }
-        Self::InvalidStateTransition {
-            tx,
-            #[cfg(debug_assertions)]
-            state: Some(state),
             #[cfg(debug_assertions)]
             trace: StdTrace::force_capture(),
         }
@@ -469,6 +408,14 @@ impl OpError {
     /// severity. See `ExecutorError::is_contract_exec_rejection`.
     pub fn is_contract_exec_rejection(&self) -> bool {
         matches!(self, Self::ExecutorError(e) if e.is_contract_exec_rejection())
+    }
+
+    /// Narrow predicate for the originator-side UPDATE auto-fetch
+    /// trigger: returns true only for "missing contract parameters"
+    /// from `runtime.rs::get_params`. See
+    /// `ExecutorError::is_missing_contract_parameters` for rationale.
+    pub fn is_missing_contract_parameters(&self) -> bool {
+        matches!(self, Self::ExecutorError(e) if e.is_missing_contract_parameters())
     }
 
     /// Returns true ONLY when the contract WASM merge function rejected the
@@ -520,6 +467,12 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
 /// Registers:
 /// 1. Upstream peer (response sender) as interest source for Unsubscribe routing
 /// 2. Downstream peer (GET requester) as downstream subscriber for UPDATE propagation
+// Sole caller (legacy GET relay `process_message::Response{Found}` branch)
+// retired in #1454 phase 5 final (GET slice). The task-per-tx GET relay
+// driver inlines its own subscription-forwarding side effect path. This
+// helper is kept for symmetry with similar relay-side helpers and as
+// reference for any future legacy-style relay reintroduction.
+#[allow(dead_code)]
 pub(crate) async fn setup_subscription_forwarding_at_relay(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -714,7 +667,7 @@ pub(super) fn start_subscription_request(
     child_tx
 }
 
-async fn has_contract(
+pub(crate) async fn has_contract(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,
 ) -> Result<Option<ContractKey>, OpError> {
@@ -746,8 +699,6 @@ async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
-        | crate::contract::ContractHandlerEvent::NotifySubscriptionError { .. }
-        | crate::contract::ContractHandlerEvent::NotifySubscriptionErrorResponse
         | crate::contract::ContractHandlerEvent::ClientDisconnect { .. } => Ok(None),
     }
 }
@@ -827,6 +778,125 @@ pub(crate) fn streaming_aware_attempt_timeout(
     let total = crate::config::OPERATION_TTL + std::time::Duration::from_secs(drain_secs);
     total.min(STREAMING_ATTEMPT_TIMEOUT_CAP)
 }
+
+/// Records a routing event observed by a relay/forwarding hop.
+///
+/// Without this hook, only the operation's originator feeds events into the
+/// router. `OpOutcome::ContractOp*` is only produced for ops where
+/// `upstream_addr.is_none()`, and relay hops return `SendAndComplete` without
+/// going through `outcome()`. On a relay-heavy node the router would see
+/// almost no per-peer data, leaving the failure-probability model untrained
+/// and the per-peer dashboard panels empty even when MB of traffic flowed
+/// through each connection.
+///
+/// Call this at the relay-side response sites in each operation when the
+/// downstream peer the relay chose returns success or failure. Timeout and
+/// disconnect paths are already covered by `report_timeout_failure` in
+/// `node/op_state_manager.rs` via `failure_routing_info`.
+///
+/// # Outcome attribution
+///
+/// The `outcome` argument matches the legacy originator-side semantics
+/// (see `OpOutcome::Contract*` and the per-op `outcome()` methods). In
+/// particular, **prompt `NotFound` from a downstream peer is recorded
+/// as `RouteOutcome::Failure`**, not Success. A peer that promptly
+/// answers "I don't host this contract" behaved correctly at the
+/// transport level, but the failure-probability model is asking "will
+/// this peer deliver the contract at this location?" and a `NotFound`
+/// reply means it won't — so for routing-decision purposes it's a
+/// negative signal for *that contract location*. The relay sites
+/// follow the same convention used by the originator's stalled-peer
+/// retry path (`get.rs:2686` and `report_timeout_failure` in
+/// `op_state_manager.rs`). Splitting transport-success from
+/// content-availability would require a new `RouteOutcome::NotHosted`
+/// variant and is out of scope here.
+///
+/// `LocalCompletion` and unexpected-reply variants are also recorded as
+/// `Failure` against the downstream peer; these are "shouldn't happen"
+/// paths and recording them as failures matches the relay's decision to
+/// abandon that peer and try another.
+///
+/// # UPDATE exclusion
+///
+/// **UPDATE is intentionally not covered by this helper at relay sites.**
+/// UPDATE relays use `send_fire_and_forget` for downstream forwarding
+/// (`drive_relay_request_update`, `drive_relay_broadcast_to`, and the
+/// streaming variants), so the relay never observes whether the downstream
+/// peer succeeded or failed. Recording only the local send-error path
+/// would bias the per-peer UPDATE failure rate to 100% by construction.
+/// `report_timeout_failure` in `op_state_manager.rs` still records UPDATE
+/// timeouts via `failure_routing_info` on the originator side; this is
+/// the same signal as for the other ops, just not augmented by relay
+/// observations.
+pub(crate) fn record_relay_route_event(
+    op_manager: &OpManager,
+    next_hop: PeerKeyLocation,
+    contract_location: Location,
+    outcome: crate::router::RouteOutcome,
+    op_type: crate::node::network_status::OpType,
+) {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        use std::sync::atomic::Ordering;
+        let counter = match op_type {
+            crate::node::network_status::OpType::Get => &RELAY_GET_ROUTE_EVENT_COUNT,
+            crate::node::network_status::OpType::Put => &RELAY_PUT_ROUTE_EVENT_COUNT,
+            crate::node::network_status::OpType::Update => &RELAY_UPDATE_ROUTE_EVENT_COUNT,
+            crate::node::network_status::OpType::Subscribe => &RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    // Feed only the routing model — NOT peer_health or topology_manager.
+    //
+    // `Ring::routing_finished` also updates `peer_health` (which uses
+    // `std::time::Instant::now()` in `connection_manager.rs::PeerHealthTracker`
+    // around lines 182-203, a pre-existing TimeSource rule violation)
+    // and the topology_manager's `request_density_tracker`. An earlier
+    // iteration of this branch routed relay events through
+    // `routing_finished` and broke three strict-determinism tests
+    // (`test_strict_determinism_*` / `test_direct_runner_determinism` /
+    // `test_thundering_herd_connect_storm`). Bypassing those side
+    // effects fixed all three.
+    //
+    // CAVEAT: `Router::add_event` itself transitively calls
+    // `RoutingPredictor::record` → `wall_clock_hours()` → `SystemTime::now()`
+    // (see `router/routing_predictor.rs:608-614`). So the router path is
+    // not strictly TimeSource-clean either; the determinism tests pass
+    // because the wall-clock variance there is well below the events
+    // each test counts. Migrating both `peer_health` and
+    // `routing_predictor` to `TimeSource` would let
+    // `record_relay_route_event` go back to calling `routing_finished`
+    // straightforwardly. Tracked as a follow-up.
+    op_manager
+        .ring
+        .router
+        .write()
+        .add_event(crate::router::RouteEvent {
+            peer: next_hop,
+            contract_location,
+            outcome,
+            op_type: Some(op_type),
+        });
+}
+
+/// Test hook: counter incremented every time `record_relay_route_event`
+/// fires for a relay-forwarded GET. Used by simulation tests to verify
+/// the per-op-type relay hooks are reached. See `dev_tool` re-export.
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_GET_ROUTE_EVENT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_PUT_ROUTE_EVENT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_UPDATE_ROUTE_EVENT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod ordering_invariant_tests {

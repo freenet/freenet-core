@@ -226,6 +226,35 @@ impl OpCtx {
             .map_err(|_| OpError::NotificationError)
     }
 
+    /// Fire-and-forget loopback: dispatch `msg` to the local event loop
+    /// as an `InboundMessage` (target=None semantics) without awaiting
+    /// a reply.
+    ///
+    /// Used by `relay_put_finalize_local` when the relay driver is
+    /// running on the originator's own node (originator-loopback PUT,
+    /// added in #1454 phase 5 final PUT slice). Sending a wire-bound
+    /// `PutMsg::Response` to `own_addr` fails — there's no
+    /// self-connection. Routing it through `InboundMessage` instead
+    /// lands at `handle_pure_network_message_v1`'s PUT bypass and
+    /// forwards to the originator's `pending_op_results` waiter via
+    /// `try_forward_task_per_tx_reply`, mirroring the legacy
+    /// `LocalCompletion` echo semantics (where the looped-back Request
+    /// satisfied the driver as a terminal reply).
+    pub async fn send_local_loopback(&mut self, msg: NetMessage) -> Result<(), OpError> {
+        debug_assert_eq!(
+            msg.id(),
+            &self.tx,
+            "OpCtx::send_local_loopback: msg.id must match ctx.tx"
+        );
+
+        let (response_sender, _response_receiver) = mpsc::channel::<NetMessage>(1);
+
+        self.op_execution_sender
+            .send((response_sender, msg, None))
+            .await
+            .map_err(|_| OpError::NotificationError)
+    }
+
     /// Dispatch `msg` to `target_addr` and return the reply receiver
     /// without awaiting the response.
     ///
@@ -846,6 +875,91 @@ mod tests {
         executor
             .await
             .expect("executor task should complete without panicking");
+    }
+
+    /// Regression for #1454 phase 5 final (PUT slice): the originator-
+    /// loopback PUT path uses `send_local_loopback` to deliver
+    /// `PutMsg::Response` back to the originator's `pending_op_results`
+    /// waiter when the relay driver runs on the originator's own node
+    /// (`upstream_addr == own_addr`). The contract of
+    /// `send_local_loopback` is "fire-and-forget with target=None" —
+    /// the executor sees `target_addr == None`, which causes
+    /// `handle_op_execution` to dispatch as `InboundMessage` rather
+    /// than try to ship over a non-existent self-connection. This
+    /// test pins that channel-level contract.
+    ///
+    /// Bug repro: `test_minimal_state_put_get` (and the rest of the
+    /// `edge_case_state_sizes` suite) failed with "put failed after 1
+    /// attempts (last error: failed notifying, channel closed)" because
+    /// the legacy `relay_put_send_response` used
+    /// `send_fire_and_forget(own_addr, ...)` which routed to
+    /// `OutboundMessageWithTarget` and tried to ship over a wire that
+    /// wasn't there. `send_local_loopback` fixes that by passing
+    /// `None` for the target.
+    #[tokio::test]
+    async fn send_local_loopback_passes_none_target() {
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut op_execution_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        let executor = tokio::spawn(async move {
+            let (reply_sender, outbound, target_addr) = op_execution_receiver
+                .recv()
+                .await
+                .expect("outbound msg should be delivered");
+            assert_eq!(outbound.id(), &tx, "outbound msg tx must match the ctx tx");
+            assert_eq!(
+                target_addr, None,
+                "send_local_loopback MUST pass target_addr=None so \
+                 handle_op_execution dispatches as InboundMessage"
+            );
+            // The response receiver was dropped by send_local_loopback,
+            // so the sender's is_closed() should be true. This is what
+            // tells `handle_op_execution` to skip the
+            // `pending_op_results` insert (its `if callback.is_closed()`
+            // branch).
+            assert!(
+                reply_sender.is_closed(),
+                "response receiver should be dropped so handle_op_execution \
+                 skips the pending_op_results insert (would otherwise \
+                 overwrite the originator's callback)"
+            );
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        timeout(Duration::from_secs(1), ctx.send_local_loopback(outbound))
+            .await
+            .expect("send_local_loopback should complete quickly")
+            .expect("send_local_loopback should return Ok");
+
+        executor
+            .await
+            .expect("executor task should complete without panicking");
+    }
+
+    /// `send_local_loopback` errors with `NotificationError` when the
+    /// executor channel is already closed (same contract as
+    /// `send_fire_and_forget` / `send_and_await`).
+    #[tokio::test]
+    async fn send_local_loopback_errors_on_closed_sender() {
+        let (receiver, sender) = event_loop_notification_channel();
+        drop(receiver);
+
+        let tx = Transaction::new::<ConnectMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        let outbound = dummy_reply_with_tx(tx);
+        let result = ctx.send_local_loopback(outbound).await;
+
+        assert!(
+            matches!(result, Err(OpError::NotificationError)),
+            "expected NotificationError on closed executor channel, got {result:?}"
+        );
     }
 
     /// `send_fire_and_forget` errors with `NotificationError` when the

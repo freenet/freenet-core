@@ -449,7 +449,7 @@ impl ConnectForwardEstimator {
         }
     }
 
-    fn record(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
+    pub(super) fn record(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
         if peer.location().is_none() {
             return;
         }
@@ -1181,6 +1181,20 @@ impl ConnectOp {
         }
     }
 
+    /// Construct a new relay-side `ConnectOp` from an inbound `Request`.
+    ///
+    /// **Phase 2c slice 1 (#1454):** this constructor is no longer called
+    /// from production. The relay-CONNECT dispatch site at
+    /// `node.rs::handle_pure_network_message_v1` routes fresh inbound
+    /// `Request`s through `op_ctx_task::start_relay_connect`, which
+    /// builds an equivalent `RelayState` in driver task locals and never
+    /// calls this constructor.
+    ///
+    /// Retained for in-file unit tests under `#[cfg(test)] mod tests`
+    /// that exercise `RelayState::handle_request` semantics inline.
+    /// Phase 6 cleanup will migrate those tests to drive the task-per-tx
+    /// driver and delete this constructor (along with `RelayState`,
+    /// `RelayState::handle_request`, and `RelayActions`).
     pub(crate) fn new_relay(
         id: Transaction,
         upstream_addr: SocketAddr,
@@ -1452,12 +1466,18 @@ impl Operation for ConnectOp {
                 op: *op,
                 source_addr,
             }),
-            Ok(Some(other)) => {
-                op_manager.push(tx, other).await?;
-                Err(OpError::OpNotPresent(tx))
-            }
             Ok(None) => {
                 let op = match (msg, source_addr) {
+                    // Phase 2c slice 1 (#1454): the dispatch site at
+                    // `node.rs::handle_pure_network_message_v1` already
+                    // routed fresh `Request`s with `source_addr.is_some()`
+                    // through `op_ctx_task::start_relay_connect`, so this
+                    // arm should be unreachable in production. It remains
+                    // as defense-in-depth and to keep `process_message`'s
+                    // joiner-side branches usable from in-file unit tests
+                    // that construct relay ops directly. Phase 6 cleanup
+                    // deletes this arm (along with `ConnectOp::new_relay`
+                    // and the relay arms of `process_message`).
                     (ConnectMsg::Request { payload, .. }, Some(upstream_addr)) => {
                         ConnectOp::new_relay(
                             tx,
@@ -1522,6 +1542,30 @@ impl Operation for ConnectOp {
         }
     }
 
+    /// **Phase 2c slice 1 (#1454):** the relay branches of this method
+    /// (`ConnectState::Relaying(_)` matches in each variant arm) are
+    /// dead from production after the dispatch site at
+    /// `node.rs::handle_pure_network_message_v1` started routing every
+    /// fresh inbound `ConnectMsg::Request` (with `source_addr.is_some()`
+    /// AND `!has_connect_op(id)`) through `op_ctx_task::start_relay_connect`.
+    ///
+    /// The legacy relay arms are preserved here for two reasons:
+    ///
+    /// 1. Unit tests in this file (`relay_accepts_when_policy_allows`,
+    ///    `relay_forwards_when_not_accepting`, etc.) construct
+    ///    `ConnectOp::new_relay` directly and exercise `handle_request`
+    ///    and `process_message` inline. Migrating those tests to drive
+    ///    the task-per-tx driver requires standing up a mock OpManager
+    ///    with a real `op_execution_sender` — out of scope for this
+    ///    slice; tracked for phase 6 cleanup.
+    /// 2. The joiner branches (`ConnectState::WaitingForResponses(_)`)
+    ///    of each arm remain LIVE for the legacy `load_or_init`
+    ///    stateless `ObservedAddress` side-effect path at
+    ///    connect.rs:1473-1490 (defensive belt-and-suspenders; the
+    ///    joiner driver also handles ObservedAddress).
+    ///
+    /// Phase 6 cleanup will delete the relay arms, `ConnectOp::new_relay`,
+    /// `RelayState`, `RelayState::handle_request`, and `RelayActions`.
     fn process_message<'a, NB: NetworkBridge>(
         mut self,
         network_bridge: &'a mut NB,
@@ -2379,7 +2423,7 @@ fn ring_distance(a: Option<Location>, b: Option<Location>) -> Option<f64> {
 /// call leaves the joiner stuck in `transient_connections` on the acceptor,
 /// so downstream lookups like `get_peer_by_addr` (used by subscribe interest
 /// registration, broadcast fan-out, etc.) never find the peer.
-async fn dispatch_expect_connection_from(
+pub(super) async fn dispatch_expect_connection_from(
     op_manager: &OpManager,
     tx: Transaction,
     peer: PeerKeyLocation,
