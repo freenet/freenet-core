@@ -405,7 +405,10 @@ mod tests {
         // but max_age=60s drops every one.
         let ts: Vec<_> = (0..5).map(|i| t(now, 3600 - i)).collect();
         let keep = p.select_keep(now, &ts);
-        assert!(keep.is_empty(), "max_age must trim stale entries even from keep_last");
+        assert!(
+            keep.is_empty(),
+            "max_age must trim stale entries even from keep_last"
+        );
     }
 
     /// Future-dated snapshots (clock skew) are not dropped by max_age:

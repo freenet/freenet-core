@@ -220,8 +220,14 @@ impl SecretsStore {
         // path still holds the old value (or is empty if it never existed)
         // and the new ciphertext sits in the tmp file for forensics.
         if let Err(err) = fs::rename(&tmp_path, &secret_file_path) {
-            // Best effort cleanup of the tmp file so we don't leave debris.
-            let _ = fs::remove_file(&tmp_path);
+            // Best-effort cleanup of the tmp file so we don't leave debris.
+            // A failure here is purely cosmetic; log and continue with the
+            // primary error from rename().
+            if let Err(rm_err) = fs::remove_file(&tmp_path) {
+                tracing::debug!(
+                    "failed to clean up tmp file {tmp_path:?} after rename failure: {rm_err}"
+                );
+            }
             return Err(err.into());
         }
 
