@@ -5,7 +5,9 @@
 //! moved into a `.snapshots/{secret_id}/{epoch_ms}` file. Retention is then
 //! thinned per the policy below: recent history stays dense, older history
 //! is sampled at progressively coarser intervals (minute / hour / day /
-//! week / month), bounded above by ~60 snapshots per secret in steady state.
+//! week / month), and an absolute `max_age` cap drops anything older
+//! regardless of which clause selected it. Worst case ~62 entries per
+//! secret in steady state.
 //!
 //! Snapshots are encrypted with whatever cipher the delegate had configured
 //! when the snapshot was taken; without that cipher the bytes are useless.
@@ -38,6 +40,136 @@ pub const SNAPSHOT_NAME_WIDTH: usize = 20;
 /// realistic delegate workload. Hitting the cap returns an error so the
 /// caller can log instead of silently overwriting an existing snapshot.
 const MAX_SNAPSHOT_COLLISION_SUFFIX: u32 = 1024;
+
+/// One tier of a [`RetentionPolicy`]: aim to keep one snapshot per
+/// `interval` of clock time, up to `max_count` snapshots in this tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionBucket {
+    pub interval: Duration,
+    pub max_count: usize,
+}
+
+/// Tiered retention policy. The first `keep_last` snapshots (by recency) are
+/// kept regardless of bucket coverage; each bucket independently selects
+/// representatives at its own granularity; and `max_age` is an absolute
+/// upper bound that drops snapshots older than the threshold even if a
+/// recency or bucket clause would otherwise keep them. The absolute cap
+/// satisfies the cleanup-exemption rule in AGENTS.md: every retained
+/// entry has a finite lifetime.
+#[derive(Debug, Clone)]
+pub struct RetentionPolicy {
+    pub keep_last: usize,
+    pub buckets: Vec<RetentionBucket>,
+    /// Absolute upper bound on how old a snapshot may be and still be
+    /// retained. `None` disables the cap (older snapshots may stick around
+    /// indefinitely if `keep_last` or a long-interval bucket selects them).
+    /// `Some(d)` drops snapshots older than `now - d` regardless of which
+    /// clause would have kept them.
+    pub max_age: Option<Duration>,
+}
+
+impl Default for RetentionPolicy {
+    /// Default: keep the last 5 snapshots, plus one per minute for the last
+    /// 10 minutes, one per hour for the last 24 hours, one per day for the
+    /// last week, one per week for the last 4 weeks, one per month for the
+    /// last 12 months, with an absolute 2-year ceiling so stale snapshots
+    /// from secrets that stopped being written eventually age out. Worst
+    /// case ~62 entries per secret in steady state.
+    fn default() -> Self {
+        const MIN: u64 = 60;
+        const HOUR: u64 = 60 * MIN;
+        const DAY: u64 = 24 * HOUR;
+        const WEEK: u64 = 7 * DAY;
+        const MONTH: u64 = 30 * DAY;
+        const YEAR: u64 = 365 * DAY;
+        Self {
+            keep_last: 5,
+            buckets: vec![
+                RetentionBucket {
+                    interval: Duration::from_secs(MIN),
+                    max_count: 10,
+                },
+                RetentionBucket {
+                    interval: Duration::from_secs(HOUR),
+                    max_count: 24,
+                },
+                RetentionBucket {
+                    interval: Duration::from_secs(DAY),
+                    max_count: 7,
+                },
+                RetentionBucket {
+                    interval: Duration::from_secs(WEEK),
+                    max_count: 4,
+                },
+                RetentionBucket {
+                    interval: Duration::from_secs(MONTH),
+                    max_count: 12,
+                },
+            ],
+            // Two years leaves clear headroom above the month bucket
+            // (12 months ≈ 1 year) so the default month tier always gets
+            // to keep its full 12 representatives. Beyond that, stale
+            // ciphertext from secrets the user stopped writing to ages
+            // out instead of lingering forever.
+            max_age: Some(Duration::from_secs(2 * YEAR)),
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// Given `timestamps` sorted ascending, return the indices to KEEP.
+    /// Indices not in the returned set should be deleted.
+    ///
+    /// Algorithm: walk newest-first. The first snapshot encountered in each
+    /// `interval`-wide age slot wins that slot; subsequent snapshots in the
+    /// same slot are eligible for deletion (unless covered by another tier
+    /// or `keep_last`). Per tier, stop after `max_count` distinct slots.
+    /// Finally, `max_age` filters: any otherwise-kept entry older than
+    /// `now - max_age` is dropped.
+    pub fn select_keep(&self, now: SystemTime, timestamps: &[SystemTime]) -> BTreeSet<usize> {
+        let mut keep = BTreeSet::new();
+        let n = timestamps.len();
+
+        for i in n.saturating_sub(self.keep_last)..n {
+            keep.insert(i);
+        }
+
+        for bucket in &self.buckets {
+            if bucket.max_count == 0 {
+                continue;
+            }
+            let secs = bucket.interval.as_secs().max(1);
+            let mut slots_seen: HashSet<u64> = HashSet::new();
+            for (i, ts) in timestamps.iter().enumerate().rev() {
+                let age = now.duration_since(*ts).unwrap_or_default().as_secs();
+                let slot = age / secs;
+                if slots_seen.insert(slot) {
+                    keep.insert(i);
+                    if slots_seen.len() >= bucket.max_count {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Absolute age cap. Applied as a final filter so it overrides
+        // every other clause. This is what satisfies AGENTS.md's rule
+        // that GC exemptions must be time-bounded: even `keep_last`
+        // entries are dropped once they cross `max_age`.
+        // `duration_since` returns Err when the timestamp is in the
+        // future (clock skew). We keep those rather than panic — they
+        // are by definition not stale.
+        if let Some(max_age) = self.max_age {
+            keep.retain(|&i| {
+                now.duration_since(timestamps[i])
+                    .map(|age| age <= max_age)
+                    .unwrap_or(true)
+            });
+        }
+
+        keep
+    }
+}
 
 /// Path to the snapshot directory for a particular `(delegate, secret_id)`
 /// pair. Snapshots are organized per secret so retention thinning of one
@@ -153,100 +285,6 @@ pub(crate) fn parse_snapshot_stamp(path: &Path) -> Option<u64> {
     stamp_part.parse().ok()
 }
 
-/// One tier of a [`RetentionPolicy`]: aim to keep one snapshot per
-/// `interval` of clock time, up to `max_count` snapshots in this tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetentionBucket {
-    pub interval: Duration,
-    pub max_count: usize,
-}
-
-/// Tiered retention policy. The first `keep_last` snapshots (by recency) are
-/// always kept regardless of age; on top of that, each bucket independently
-/// selects representatives at its own granularity.
-#[derive(Debug, Clone)]
-pub struct RetentionPolicy {
-    pub keep_last: usize,
-    pub buckets: Vec<RetentionBucket>,
-}
-
-impl Default for RetentionPolicy {
-    /// Default: keep the last 5 snapshots, plus one per minute for the last
-    /// 10 minutes, one per hour for the last 24 hours, one per day for the
-    /// last week, one per week for the last 4 weeks, one per month for the
-    /// last 12 months. Worst-case ~62 entries per secret in steady state.
-    fn default() -> Self {
-        const MIN: u64 = 60;
-        const HOUR: u64 = 60 * MIN;
-        const DAY: u64 = 24 * HOUR;
-        const WEEK: u64 = 7 * DAY;
-        const MONTH: u64 = 30 * DAY;
-        Self {
-            keep_last: 5,
-            buckets: vec![
-                RetentionBucket {
-                    interval: Duration::from_secs(MIN),
-                    max_count: 10,
-                },
-                RetentionBucket {
-                    interval: Duration::from_secs(HOUR),
-                    max_count: 24,
-                },
-                RetentionBucket {
-                    interval: Duration::from_secs(DAY),
-                    max_count: 7,
-                },
-                RetentionBucket {
-                    interval: Duration::from_secs(WEEK),
-                    max_count: 4,
-                },
-                RetentionBucket {
-                    interval: Duration::from_secs(MONTH),
-                    max_count: 12,
-                },
-            ],
-        }
-    }
-}
-
-impl RetentionPolicy {
-    /// Given `timestamps` sorted ascending, return the indices to KEEP.
-    /// Indices not in the returned set should be deleted.
-    ///
-    /// Algorithm: walk newest-first. The first snapshot encountered in each
-    /// `interval`-wide age slot wins that slot; subsequent snapshots in the
-    /// same slot are eligible for deletion (unless covered by another tier
-    /// or `keep_last`). Per tier, stop after `max_count` distinct slots.
-    pub fn select_keep(&self, now: SystemTime, timestamps: &[SystemTime]) -> BTreeSet<usize> {
-        let mut keep = BTreeSet::new();
-        let n = timestamps.len();
-
-        for i in n.saturating_sub(self.keep_last)..n {
-            keep.insert(i);
-        }
-
-        for bucket in &self.buckets {
-            if bucket.max_count == 0 {
-                continue;
-            }
-            let secs = bucket.interval.as_secs().max(1);
-            let mut slots_seen: HashSet<u64> = HashSet::new();
-            for (i, ts) in timestamps.iter().enumerate().rev() {
-                let age = now.duration_since(*ts).unwrap_or_default().as_secs();
-                let slot = age / secs;
-                if slots_seen.insert(slot) {
-                    keep.insert(i);
-                    if slots_seen.len() >= bucket.max_count {
-                        break;
-                    }
-                }
-            }
-        }
-
-        keep
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +305,7 @@ mod tests {
         let p = RetentionPolicy {
             keep_last: 3,
             buckets: vec![],
+            max_age: None,
         };
         let now = SystemTime::now();
         // Five very-old snapshots: only the trailing 3 should survive.
@@ -285,6 +324,7 @@ mod tests {
                 interval: Duration::from_secs(60),
                 max_count: 10,
             }],
+            max_age: None,
         };
         let now = SystemTime::now();
         let ts: Vec<_> = (0..600).map(|i| t(now, 599 - i)).collect();
@@ -301,6 +341,7 @@ mod tests {
                 interval: Duration::from_secs(60),
                 max_count: 10,
             }],
+            max_age: None,
         };
         let now = SystemTime::now();
         let ts: Vec<_> = (0..1000).map(|_| t(now, 5)).collect();
@@ -338,6 +379,7 @@ mod tests {
                 interval: Duration::from_secs(60),
                 max_count: 5,
             }],
+            max_age: None,
         };
         let now = SystemTime::now();
         let ts = vec![now + Duration::from_secs(120), t(now, 30)];
@@ -346,6 +388,67 @@ mod tests {
         // call-order not timestamp) wins, but the algorithm walks rev so the
         // last index wins the slot. Either way exactly one survives.
         assert_eq!(keep.len(), 1);
+    }
+
+    /// `max_age` MUST override every other retention clause, including
+    /// `keep_last`. AGENTS.md cleanup-exemption rule: time-bound it or
+    /// don't ship it.
+    #[test]
+    fn max_age_overrides_keep_last() {
+        let p = RetentionPolicy {
+            keep_last: 5,
+            buckets: vec![],
+            max_age: Some(Duration::from_secs(60)),
+        };
+        let now = SystemTime::now();
+        // 5 snapshots, all 1 hour old. keep_last=5 would normally keep all,
+        // but max_age=60s drops every one.
+        let ts: Vec<_> = (0..5).map(|i| t(now, 3600 - i)).collect();
+        let keep = p.select_keep(now, &ts);
+        assert!(keep.is_empty(), "max_age must trim stale entries even from keep_last");
+    }
+
+    /// Future-dated snapshots (clock skew) are not dropped by max_age:
+    /// `duration_since` returns Err, treated as "not stale".
+    #[test]
+    fn max_age_preserves_future_timestamps() {
+        let p = RetentionPolicy {
+            keep_last: 1,
+            buckets: vec![],
+            max_age: Some(Duration::from_secs(60)),
+        };
+        let now = SystemTime::now();
+        let ts = vec![now + Duration::from_secs(120)];
+        let keep = p.select_keep(now, &ts);
+        assert_eq!(keep.len(), 1, "future-dated snapshot must survive max_age");
+    }
+
+    /// Mix of fresh and stale entries: only the fresh ones survive even
+    /// when keep_last would have selected the stale ones too.
+    #[test]
+    fn max_age_drops_only_stale_entries() {
+        let p = RetentionPolicy {
+            keep_last: 10,
+            buckets: vec![],
+            max_age: Some(Duration::from_secs(120)),
+        };
+        let now = SystemTime::now();
+        // 3 fresh (within 2 min), 3 stale (> 2 min). keep_last=10 selects
+        // all 6, max_age=120s drops the stale half.
+        let ts = vec![
+            t(now, 1000), // stale
+            t(now, 500),  // stale
+            t(now, 200),  // stale
+            t(now, 60),   // fresh
+            t(now, 30),   // fresh
+            t(now, 5),    // fresh
+        ];
+        let keep = p.select_keep(now, &ts);
+        assert_eq!(
+            keep.into_iter().collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "only fresh entries should remain"
+        );
     }
 
     #[test]
@@ -427,6 +530,7 @@ mod tests {
                 interval: Duration::from_secs(60),
                 max_count: 0,
             }],
+            max_age: None,
         };
         let now = SystemTime::now();
         let ts: Vec<_> = (0..10).map(|i| t(now, i)).collect();

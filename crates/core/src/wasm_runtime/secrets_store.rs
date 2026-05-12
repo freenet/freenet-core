@@ -487,6 +487,7 @@ mod test {
                 interval: Duration::from_secs(60),
                 max_count: 1,
             }],
+            max_age: None,
         });
 
         let delegate = Delegate::from((&vec![2].into(), &vec![].into()));
