@@ -536,11 +536,6 @@ async fn report_result(
 
     match op_result {
         Ok(Some(op_res)) => {
-            // (UPDATE-specific completion log retired in #1454 phase 5
-            // final together with `OpEnum::Update`; client-initiated
-            // UPDATEs publish their own host result from
-            // `update::op_ctx_task::start_client_update`.)
-
             // Send to result router (skip for sub-operations and subscription renewals)
             if let Some(transaction) = tx {
                 // Sub-operations (e.g., Subscribe spawned by PUT) don't notify clients directly;
@@ -761,70 +756,32 @@ fn op_retry_backoff(attempt: usize) -> Duration {
     Duration::from_millis((5u64 << attempt.min(8)).min(1_000))
 }
 
-/// Route an inbound task-per-tx reply directly to an awaiting
-/// [`OpCtx::send_and_await`][ocxawait] caller, bypassing the legacy op
-/// state machine entirely.
+/// Forward an inbound reply directly to the awaiting
+/// [`OpCtx::send_and_await`][ocxawait] caller.
 ///
-/// Returns `true` if a callback was registered and the message was forwarded
-/// (or dropped due to a closed receiver, which is also a successful
-/// "bypass taken" from the pipeline's point of view — the legacy path must
-/// not run). Returns `false` if no callback is registered; the caller then
-/// falls through to the legacy `handle_op_request` path.
+/// Returns `true` if a callback was registered (message forwarded or
+/// dropped on a closed receiver — either way the caller must not fall
+/// through to other handling). Returns `false` if no callback is
+/// registered.
 ///
-/// # Why this exists
-///
-/// Phase 1 (#3802) wired [`forward_pending_op_result_if_completed`] to fire
-/// the callback after the legacy state machine classified the reply as
-/// completed. That only works when a [`crate::operations::OpEnum`] was
-/// previously pushed into [`crate::node::OpManager`]'s per-op DashMap:
-/// `load_or_init` pops it, `process_message` produces
-/// [`crate::operations::OperationResult::SendAndComplete`], and
-/// `is_operation_completed` returns `true`.
-///
-/// Phase 2b's task-per-tx callers (starting with client-initiated SUBSCRIBE,
-/// #1454) never push an op into that DashMap: state lives in the task's
-/// locals. When a reply arrives, `load_or_init` sees an empty slot and
-/// returns [`crate::operations::OpError::OpNotPresent`] (this is the
-/// legacy guard against stale responses arriving after GC cleanup, e.g.
-/// `operations/subscribe.rs:1181-1192`). `handle_op_result` swallows
-/// `OpNotPresent` as benign and returns `Ok(None)`, so
-/// `forward_pending_op_result_if_completed` short-circuits and the
-/// awaiting task hangs forever.
-///
-/// This helper is the fix: any branch of
-/// [`handle_pure_network_message_v1`] that wants to support a task-per-tx
-/// caller checks this first, and on a hit returns without ever touching
-/// `handle_op_request`. Phase 2b adds this guard to the SUBSCRIBE branch
-/// only; Phases 2c/3/4 will add it to their own branches when they
-/// introduce their first task-per-tx callers.
-///
-/// # Safety argument for the bypass
+/// # Safety argument
 ///
 /// `p2p_protoc::pending_op_results` is only populated via
-/// `p2p_protoc::handle_op_execution`, which is only driven by the
-/// `op_execution_sender` channel. The only way to obtain a clone of that
-/// sender is through [`crate::node::OpManager::op_ctx`] (production
-/// factory) or the in-module `OpCtx` unit tests — both of which construct
-/// an [`OpCtx`][ocx] whose only round-trip method is
+/// `p2p_protoc::handle_op_execution`, driven by `op_execution_sender`.
+/// The only way to obtain a clone of that sender is through
+/// [`crate::node::OpManager::op_ctx`], whose round-trip method is
 /// [`OpCtx::send_and_await`][ocxawait]. This is a **structural
-/// invariant**, not a convention: the sender field is `pub(crate)` and
-/// there is no other `pub` accessor on `EventLoopNotificationsSender`.
+/// invariant**: the sender field is `pub(crate)` and there is no other
+/// `pub` accessor on `EventLoopNotificationsSender`.
 ///
-/// Consequence: legacy paths (SUBSCRIBE renewals, PUT sub-op subscribes,
-/// contract-executor-initiated subscribes, intermediate-peer forwarding)
-/// never appear in `pending_op_results` for their own txs, so the bypass
-/// never triggers for them and their behavior is unchanged.
-///
-/// [ocx]: crate::operations::OpCtx
 /// [ocxawait]: crate::operations::OpCtx::send_and_await
 ///
 /// # Channel safety
 ///
 /// Uses `try_send` on the bounded capacity-1 channel created by
-/// [`OpCtx::send_and_await`][ocxawait]. On a closed receiver (e.g., caller
-/// timed out or was cancelled) the send fails and is logged; the
-/// pure-network-message handler still makes progress. See
-/// `.claude/rules/channel-safety.md`.
+/// `OpCtx::send_and_await`. On a closed receiver (caller cancelled or
+/// timed out) the send fails and is logged; the handler still makes
+/// progress. See `.claude/rules/channel-safety.md`.
 fn try_forward_task_per_tx_reply(
     pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
     reply: NetMessage,
@@ -845,16 +802,16 @@ fn try_forward_task_per_tx_reply(
     true
 }
 
-/// Mirror the legacy joiner-side fill at `connect.rs:1723-1745`: an
-/// acceptor behind NAT does not know its own external address, so when
-/// a `ConnectMsg::Response` arrives with `acceptor.peer_addr =
-/// Unknown`, the inbound transport's `source_addr` is used to backstop
-/// the missing address before the driver reads it. The task-per-tx
-/// driver does not see `source_addr`, so the rewrite must happen at
-/// the bypass site.
+/// Fill in an acceptor's external address from `source_addr` when the
+/// `ConnectMsg::Response` arrives with `acceptor.peer_addr = Unknown`.
 ///
-/// Non-`Response` variants pass through unchanged. `Response` with an
-/// already-`Known` acceptor address passes through unchanged.
+/// An acceptor behind NAT does not know its own external address; the
+/// inbound transport's `source_addr` is used to backstop the missing
+/// value before the driver reads it. The driver itself does not see
+/// `source_addr`, so the rewrite must happen at the dispatch site.
+///
+/// Non-`Response` variants and `Response` with an already-`Known`
+/// acceptor address pass through unchanged.
 fn fill_connect_response_acceptor_addr(
     op: connect::ConnectMsg,
     source_addr: Option<std::net::SocketAddr>,
@@ -883,47 +840,19 @@ fn fill_connect_response_acceptor_addr(
     }
 }
 
-/// If `op_result` indicates the operation completed and a `pending_op_result`
-/// callback is wired, forward `reply` to the awaiting caller of
-/// [`crate::operations::OpCtx::send_and_await`].
-///
-/// This is the reply side of the async sub-transaction round-trip primitive
-/// introduced by #1454. The caller side — [`OpCtx::send_and_await`][ocx] —
-/// installs a one-shot bounded [`tokio::sync::mpsc::Sender`] into
-/// `p2p_protoc::pending_op_results` keyed by its `Transaction`, and each
-/// branch of `handle_pure_network_message_v1` calls this helper after
-/// `handle_op_request` so the caller can `await` a single reply keyed by
-/// the same `Transaction`.
-///
-/// Wired for PUT and GET historically; extended to SUBSCRIBE, CONNECT, and
-/// UPDATE in Phase 1 of the async-transaction refactor (#1454) so every op
-/// kind can terminate an `OpCtx::send_and_await` round-trip without hanging.
-/// (Phase 1 predates `OpCtx`; the caller side used to live directly on
-/// `OpManager::notify_op_execution`, now deleted. Phase 2a moved the caller
-/// side into `OpCtx` behind an `OpManager::op_ctx` factory.)
-///
-/// [ocx]: crate::operations::OpCtx::send_and_await
+/// If `op_result` indicates the operation completed and a
+/// `pending_op_result` callback is wired, forward `reply` to the
+/// awaiting caller of [`crate::operations::OpCtx::send_and_await`].
 ///
 /// # Channel safety
 ///
-/// Uses `try_send` rather than `.send().await` on the bounded capacity-1
-/// mpsc channel created by `OpCtx::send_and_await`. This is sound because
-/// the callback is fired **at most once per transaction**: the
-/// `is_operation_completed` guard above combined with the `completed` /
-/// `under_progress` dedup sets in `OpManager` ensures that subsequent
-/// messages for the same tx short-circuit before reaching this code. So
-/// `try_send` on an empty capacity-1 channel cannot fail with `Full` —
-/// it can only fail with `Closed` when the `OpCtx` owner has dropped its
-/// receiver. Using `try_send` eliminates any risk of blocking the
-/// pure-network-message handler if a future consumer ever ends up unable
-/// to drain the reply, satisfying the preference for non-blocking sends
-/// in `.claude/rules/channel-safety.md`.
-///
-/// As of Phase 2a (#1454) this path is still dormant: `pending_op_result`
-/// is always `None` because no production caller of `OpCtx::send_and_await`
-/// exists yet. Phase 2b will introduce the first real caller (SUBSCRIBE
-/// client-initiated path); the `try_send` choice here means Phase 2b does
-/// not need to touch this function.
+/// Uses `try_send` on the bounded capacity-1 channel created by
+/// `OpCtx::send_and_await`. The callback fires at most once per
+/// transaction (the `is_operation_completed` guard plus the
+/// `completed`/`under_progress` dedup sets in `OpManager` short-circuit
+/// subsequent messages), so `try_send` cannot fail with `Full` — only
+/// `Closed` when the receiver was dropped. See
+/// `.claude/rules/channel-safety.md`.
 fn forward_pending_op_result_if_completed(
     op_result: &Result<Option<OpEnum>, OpError>,
     pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
@@ -970,44 +899,15 @@ where
 
         match msg {
             NetMessageV1::Connect(ref op) => {
-                // Phase 2c slice 0 (#1454): task-per-tx reply forwarding for
-                // CONNECT. Mirrors the SUBSCRIBE/PUT/GET bypass: when a
-                // task-per-tx CONNECT driver has registered a reply waiter
-                // in `pending_op_results`, forward terminal `ConnectMsg`
-                // variants to it.
+                // CONNECT reply forwarding: the joiner expects fan-in
+                // (up to `target_connections` `Response`s over time).
+                // The waiter (`OpCtx::send_and_collect_replies`) has a
+                // multi-reply receiver, so this bypass forwards every
+                // non-`Request` variant without short-circuiting after
+                // the first hit.
                 //
-                // CONNECT differs from the other ops in that the joiner
-                // expects fan-in: up to `target_connections` `Response`s
-                // arrive over time as relay branches accept the joiner.
-                // The waiter side uses `OpCtx::send_and_collect_replies`
-                // with capacity > 1 so multiple replies can buffer without
-                // dropping each other; the bypass below opts in to this
-                // multi-forward shape by NOT short-circuiting on the first
-                // forward — we still return `Ok(None)` (so the legacy
-                // pipeline does not re-process the message) but the next
-                // inbound reply for the same tx will hit this same code
-                // path and forward to the same channel.
-                //
-                // Phase 2c slice 1 (#1454): the bypass forwards every non-
-                // `Request` `ConnectMsg` variant to the per-tx driver inbox
-                // when a waiter is registered. The relay-CONNECT driver
-                // (`operations::connect::op_ctx_task::start_relay_connect`)
-                // owns the entire tx lifetime — Request handling, downstream
-                // forward, and re-entry processing for Response / Rejected /
-                // ObservedAddress / ConnectFailed — in task locals, so all
-                // four reply variants must reach the driver's
-                // `send_to_and_collect_replies` receiver.
-                //
-                // `Request` is NEVER forwarded here: it is the spawn signal
-                // handled by the dispatch gate below (commit 3) which
-                // checks `!has_connect_op(id) && !active_relay_connect_txs
-                // .contains(id)` to avoid spawning duplicate drivers.
-                //
-                // `ObservedAddress` was previously left on the legacy
-                // `load_or_init` stateless side-effect path
-                // (`connect.rs:1473-1490`); the joiner driver now handles
-                // it on its inbox match arm in `op_ctx_task.rs:481-499`,
-                // calling `set_own_addr` + `update_location` itself.
+                // `Request` is NEVER forwarded here: it spawns a relay
+                // driver via the dispatch gate below.
                 if matches!(
                     op,
                     connect::ConnectMsg::Response { .. }
@@ -1025,27 +925,16 @@ where
                     }
                 }
 
-                // Phase 2c slice 1 commit 3 (#1454): relay-CONNECT
-                // task-per-tx dispatch.
+                // Relay-CONNECT dispatch: fresh inbound `Request` with
+                // a real upstream address and no in-flight `ConnectOp`
+                // or running relay driver spawns `start_relay_connect`.
+                // The driver owns the entire transaction lifetime in
+                // task locals. Negative checks dedup against GC-spawned
+                // retries and duplicate Requests.
                 //
-                // Fresh inbound `ConnectMsg::Request` with a real
-                // upstream address (`source_addr.is_some()`) and no
-                // existing `ConnectOp` (`!has_connect_op(id)`) and no
-                // already-spawned relay driver (`!active_relay_connect_txs
-                // .contains(id)`) spawns `start_relay_connect`. The
-                // driver owns the entire transaction lifetime in
-                // task locals. The negative checks dedup against:
-                //   - GC-spawned retries that pre-register a `ConnectOp`
-                //   - already-running drivers from a duplicate Request
-                //
-                // `source_addr.is_none()` (originator loop-back from
-                // `start_client_connect`'s `send_to_and_collect_replies`)
-                // never reaches this branch — the bypass above handles
+                // `source_addr.is_none()` (originator loopback) cannot
+                // reach this branch — the reply bypass above handles
                 // joiner-side replies first.
-                //
-                // After commit 4 retires the relay branches of
-                // `connect::process_message`, this dispatch is the only
-                // entry point for relay CONNECT handling.
                 if let connect::ConnectMsg::Request { id, payload } = op {
                     if let Some(upstream_addr) = source_addr {
                         if !op_manager.has_connect_op(id)
@@ -1126,19 +1015,12 @@ where
                 .await;
             }
             NetMessageV1::Put(ref op) => {
-                // #1454 phase 5 final (PUT slice): every PUT wire variant
-                // routes to a task-per-tx driver. The legacy
-                // `OpManager.ops.put` DashMap, `Operation` impl, and
-                // legacy state-machine fallthrough were retired in this
-                // PR. The slice-A/B DashMap-existence dispatch gate is
-                // gone: the DashMap can no longer be populated.
-                //
-                // Only forward **terminal** Response/ResponseStreaming messages
-                // to the originator's awaiting task via the bypass.
-                // Non-terminal messages (Request, RequestStreaming,
-                // ForwardingAck) must NOT be forwarded: they would fill
-                // the capacity-1 reply channel and cause classify_reply
-                // to fail with Unexpected (Phase 2b bug 2).
+                // Forward only **terminal** Response/ResponseStreaming
+                // messages to the originator's awaiting task via the
+                // bypass. Non-terminal messages (Request,
+                // RequestStreaming, ForwardingAck) must NOT be
+                // forwarded: they would fill the capacity-1 reply
+                // channel and cause `classify_reply` to fail.
                 if matches!(
                     op,
                     put::PutMsg::Response { .. } | put::PutMsg::ResponseStreaming { .. }
@@ -1150,22 +1032,18 @@ where
                     return Ok(None);
                 }
 
-                // Relay PUT dispatch: spawn the appropriate task-per-tx
-                // driver. `start_relay_put` handles non-streaming
-                // Request (with upgrade-on-forward to streaming when
-                // payload > threshold, PR #4063);
+                // Relay PUT dispatch. `start_relay_put` handles
+                // non-streaming Request (with upgrade-on-forward to
+                // streaming when payload > threshold);
                 // `start_relay_put_streaming` handles direct
                 // `RequestStreaming` inbound. `ForwardingAck` is a
-                // no-op kept for backward compatibility with pre-#3964
-                // peers.
+                // no-op kept for backward compatibility.
                 //
-                // `start_client_put`'s `send_and_await(target=None)`
-                // loops the Request back into the local event loop as
-                // an InboundMessage with `source_addr=None`. Map that
-                // to `upstream_addr = own_addr` so the same
-                // `start_relay_put` driver handles both true relay hops
-                // and originator-loopback. The driver's local-store +
-                // forward-or-finalize logic is identical for both.
+                // Originator loopback: `start_client_put`'s
+                // `send_and_await(target=None)` arrives with
+                // `source_addr=None`. Map to `upstream_addr=own_addr`
+                // so the same driver handles both relay hops and
+                // originator loopback.
                 let effective_upstream =
                     source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
                 if let Some(upstream_addr) = effective_upstream {
@@ -1252,20 +1130,10 @@ where
                 return Ok(None);
             }
             NetMessageV1::Get(ref op) => {
-                // #1454 phase 5 final (GET slice): every GET wire variant
-                // routes to a task-per-tx driver. The legacy
-                // `OpManager.ops.get` DashMap, `Operation` impl, and
-                // legacy state-machine fallthrough were retired in this
-                // PR. The slice-A DashMap-existence dispatch gate is
-                // gone: the DashMap can no longer be populated.
-                //
-                // Only forward **terminal** Response/ResponseStreaming
-                // messages to the originator's awaiting task via the
-                // bypass. Non-terminal messages (Request,
-                // ResponseStreamingAck, ForwardingAck) must NOT be
-                // forwarded: they would fill the capacity-1 reply
-                // channel and cause classify_reply to fail with
-                // Unexpected (Phase 2b bug 2).
+                // Forward only **terminal** Response/ResponseStreaming
+                // messages to the originator's awaiting task. Other
+                // variants must NOT be forwarded — they would fill the
+                // capacity-1 reply channel.
                 if matches!(
                     op,
                     get::GetMsg::Response { .. } | get::GetMsg::ResponseStreaming { .. }
@@ -1277,15 +1145,10 @@ where
                     return Ok(None);
                 }
 
-                // Relay GET dispatch: spawn `start_relay_get`. Mirrors
-                // the PUT branch above. `start_client_get`'s
-                // `send_and_await(target=None)` loops the Request back
-                // into the local event loop as an InboundMessage with
-                // `source_addr=None`. Map that to
-                // `upstream_addr = own_addr` so the same
-                // `start_relay_get` driver handles both true relay hops
-                // and originator-loopback. The driver's local-cache +
-                // forward-or-finalize logic is identical for both.
+                // Relay GET dispatch. Originator loopback
+                // (`source_addr=None`) is mapped to
+                // `upstream_addr=own_addr` so the same `start_relay_get`
+                // driver handles both relay hops and loopback.
                 let effective_upstream =
                     source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
                 if let Some(upstream_addr) = effective_upstream {
@@ -1341,21 +1204,11 @@ where
                 return Ok(None);
             }
             NetMessageV1::Update(ref op) => {
-                // #1454 phase 5 final: every UPDATE wire variant routes
-                // to a task-per-tx driver. The legacy `OpManager.ops`
-                // DashMap, `Operation` impl, and re-entry fallthrough
-                // were retired in this PR (commits 1–4).
-                //
-                // For relay hops (source_addr.is_some()) we dispatch the
-                // matching driver and return. UPDATE is fire-and-forget
-                // end-to-end — there's no upstream reply to await. The
-                // dispatch gate from the slice-A/C era is gone: the
-                // DashMap can no longer be populated, so the gate always
-                // evaluated to false.
-                //
-                // source_addr.is_none() means the caller is internal.
-                // After the executor UPDATE path was retired in commit 1
-                // there are no remaining internal originators; the else
+                // UPDATE is fire-and-forget end-to-end — no upstream
+                // reply to await. For relay hops
+                // (`source_addr.is_some()`) dispatch the matching
+                // driver and return. `source_addr.is_none()` would
+                // mean an internal caller; there are none, so the else
                 // branch logs and drops.
                 if let Some(sender_addr) = source_addr {
                     #[allow(clippy::wildcard_enum_match_arm)]
@@ -1410,10 +1263,8 @@ where
                             }
                             return Ok(None);
                         }
-                        // #1454 phase 5 follow-up (slice C): streaming
-                        // relay UPDATE dispatch. Fire-and-forget:
-                        // claim stream → assemble → apply →
-                        // BroadcastStateChange fans out automatically.
+                        // Streaming relay UPDATE: claim stream → assemble
+                        // → apply → BroadcastStateChange fans out.
                         update::UpdateMsg::RequestUpdateStreaming {
                             id,
                             key,
@@ -1468,33 +1319,19 @@ where
                         }
                     }
                 } else {
-                    // source_addr.is_none() — internal caller. Phase 4
-                    // migrated client UPDATEs to `start_client_update`;
-                    // there are no other internal originators after the
-                    // executor UPDATE path was retired in commit 1.
                     tracing::debug!(
                         tx = %op.id(),
                         ?op,
-                        "UPDATE: internal-source variant ignored — no legacy \
-                         fallthrough after #1454 phase 5 final"
+                        "UPDATE: internal-source variant ignored"
                     );
                 }
                 return Ok(None);
             }
             NetMessageV1::Subscribe(ref op) => {
-                // #1454 phase 5 final (SUBSCRIBE slice): every SUBSCRIBE
-                // wire variant routes to a task-per-tx driver or a thin
-                // inbound handler. The legacy `OpManager.ops.subscribe`
-                // DashMap, `Operation` impl, and re-entry fallthrough
-                // were retired in this PR. The slice-A DashMap-existence
-                // dispatch gate is gone: the DashMap can no longer be
-                // populated.
-                //
-                // Only forward **terminal** Response messages to the
-                // originator's awaiting task via the bypass. Non-terminal
-                // messages (Request, ForwardingAck) must NOT be forwarded:
-                // they would fill the capacity-1 reply channel and cause
-                // classify_reply to fail with Unexpected.
+                // Forward only **terminal** Response messages to the
+                // originator's awaiting task. Other variants must NOT
+                // be forwarded — they would fill the capacity-1 reply
+                // channel.
                 if matches!(op, subscribe::SubscribeMsg::Response { .. })
                     && try_forward_task_per_tx_reply(
                         pending_op_result.as_ref(),
@@ -1505,14 +1342,10 @@ where
                     return Ok(None);
                 }
 
-                // Relay SUBSCRIBE dispatch: spawn `start_relay_subscribe`.
-                // Mirrors the GET / PUT / UPDATE branches above.
-                // `start_client_subscribe`'s `send_and_await(target=None)`
-                // loops the Request back as an InboundMessage with
-                // `source_addr=None`. Map that to
-                // `upstream_addr = own_addr` so the same
-                // `start_relay_subscribe` driver handles both true relay
-                // hops and originator-loopback.
+                // Relay SUBSCRIBE dispatch. Originator loopback
+                // (`source_addr=None`) is mapped to
+                // `upstream_addr=own_addr` so the same
+                // `start_relay_subscribe` driver handles both.
                 let effective_upstream =
                     source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
                 if let Some(upstream_addr) = effective_upstream {
@@ -1554,9 +1387,9 @@ where
                             .await;
                         }
                         _ => {
-                            // Response handled by bypass above; ForwardingAck
-                            // is a wire-only telemetry hook (#3570 diagnostics)
-                            // with no state mutation post-#1454 phase 5.
+                            // Response handled by bypass above;
+                            // ForwardingAck is a wire-only telemetry
+                            // hook (#3570) with no state mutation.
                             tracing::debug!(
                                 tx = %op.id(),
                                 ?op,
@@ -2331,44 +2164,24 @@ pub async fn subscribe(
     subscribe_with_id(op_manager, instance_id, client_id, None).await
 }
 
-/// Attempts to subscribe to a contract with a specific transaction ID (for deduplication).
+/// Subscribe to a contract with a specific transaction ID (for
+/// deduplication).
 ///
-/// Since #1454 Phase 2b, this function is the entry point for
-/// **client-initiated** SUBSCRIBE only — it spawns a task-per-tx driver via
-/// [`crate::operations::subscribe::start_client_subscribe`] rather than going
-/// through the legacy `request_subscribe` + `handle_op_result` re-entry loop.
-///
-/// The executor/WASM-initiated path (`executor::subscribe`) now goes
-/// through the task-per-tx executor driver
-/// (`subscribe::run_executor_subscribe`) — same retry loop as
-/// client-initiated subscribe, with the outcome returned to the
-/// executor as `Result<(), OpError>` rather than published via
-/// `result_router_tx` (the executor is an internal caller with no
-/// client waiter). Bypasses the `op_request` mediator entirely
-/// (mirrors `local_state_or_from_network` for GET).
-///
-/// The renewal-initiated path (`ring::connection_maintenance`) now goes
-/// through the task-per-tx renewal driver (`subscribe::run_renewal_subscribe`)
-/// — same retry loop as client-initiated subscribe, with the outcome
-/// returned to the renewal task for backoff bookkeeping rather than
-/// published via `result_router_tx`. Renewal jitter and spam-prevention
-/// remain owned by `ring::connection_maintenance` (above this layer).
-///
-/// PUT/GET sub-op fallback paths (`operations::start_subscription_request`,
-/// `maybe_subscribe_child`) route through `subscribe::run_client_subscribe`,
-/// which is hard-wired to `is_renewal=false`. Misrouting a renewal through
-/// any of those is a compile error: `start_client_subscribe` /
-/// `run_client_subscribe` no longer accept `is_renewal` — only
-/// `subscribe::run_renewal_subscribe` does.
+/// Entry point for **client-initiated** SUBSCRIBE only. Other callers
+/// (executor auto-subscribe, ring renewals, PUT/GET sub-op fallback)
+/// invoke their own drivers directly — `run_executor_subscribe`,
+/// `run_renewal_subscribe`, `run_client_subscribe`. `is_renewal` is
+/// accepted only by `run_renewal_subscribe`, so renewal misrouting is
+/// a compile error.
 ///
 /// # Parameters
 ///
-/// - `client_id`: If set, registers a legacy subscription-result waiter via
-///   `ch_outbound.waiting_for_subscription_result`. Both WS call sites in
-///   `client_events.rs` leave this `None` because they pre-register a
-///   transaction-result waiter via `waiting_for_transaction_result`.
-/// - `transaction_id`: The client-visible transaction id. If `None`, a fresh
-///   one is allocated — currently only the dead-code wrapper `subscribe()`
+/// - `client_id`: If set, registers a subscription-result waiter via
+///   `ch_outbound.waiting_for_subscription_result`. Both WS call sites
+///   in `client_events.rs` leave this `None` because they pre-register
+///   a transaction-result waiter via `waiting_for_transaction_result`.
+/// - `transaction_id`: Client-visible tx id. If `None`, a fresh one is
+///   allocated — currently only the dead-code wrapper `subscribe()`
 ///   does this.
 pub async fn subscribe_with_id(
     op_manager: Arc<OpManager>,
@@ -2397,16 +2210,9 @@ pub async fn subscribe_with_id(
         }
     }
 
-    // Task-per-tx: spawn the driver and return the client-visible tx
-    // immediately. The spawned task owns retries, peer selection, local
-    // completion, and result delivery via `result_router_tx`.
-    //
-    // Renewals do NOT come through here. `ring::connection_maintenance`
-    // calls `subscribe::run_renewal_subscribe` directly — same task-per-tx
-    // machinery (`drive_client_subscribe_inner`) with `is_renewal=true`
-    // and a custom delivery path that returns `RenewalOutcome` to the
-    // renewal task instead of publishing through `result_router_tx`
-    // (renewals have no client waiter to publish to).
+    // Spawn the driver and return the client-visible tx immediately.
+    // The driver owns retries, peer selection, local completion, and
+    // result delivery via `result_router_tx`.
     subscribe::start_client_subscribe(op_manager, instance_id, client_tx).await
 }
 
@@ -2507,11 +2313,9 @@ async fn handle_aborted_op(
         | TransactionType::Put
         | TransactionType::Update
         | TransactionType::Subscribe => {
-            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
-            // post-#1454 phase 5 final; the task-per-tx driver owns abort
-            // handling through its own cancellation surface (the
-            // `result_router_tx` publication path is the only externally
-            // observable result).
+            // No DashMap entry: each driver owns abort handling
+            // through its own cancellation surface. `result_router_tx`
+            // publication is the only externally observable result.
         }
     }
     Ok(())
@@ -3000,17 +2804,14 @@ mod tests {
         }
     }
 
-    // Phase 1 (#1454) tests for forward_pending_op_result_if_completed.
+    // Tests for `forward_pending_op_result_if_completed`.
     //
-    // These exercise the callback-forwarding helper used by every branch of
-    // `handle_pure_network_message_v1`. The helper is the only place that
-    // drives the `pending_op_result` oneshot channel from a completed op
-    // result back to a caller of `OpCtx::send_and_await`. Phase 1 extended
-    // the hook from PUT/GET only to cover SUBSCRIBE/CONNECT/UPDATE as well,
-    // so these tests verify the helper forwards correctly for every op
-    // variant and short-circuits in the negative cases. (The caller side
-    // used to live on `OpManager::notify_op_execution`, which Phase 2a
-    // replaced with `OpCtx::send_and_await` — see #1454.)
+    // Exercises the callback-forwarding helper used by every branch
+    // of `handle_pure_network_message_v1`. It drives the
+    // `pending_op_result` channel from a completed op result back to
+    // a caller of `OpCtx::send_and_await`. These tests verify the
+    // helper forwards for every op variant and short-circuits in the
+    // negative cases.
     mod callback_forward_tests {
         use super::super::{
             OpError, OpNotAvailable, forward_pending_op_result_if_completed,
@@ -3139,16 +2940,12 @@ mod tests {
         }
 
         // ───────────────────────────────────────────────────────────
-        // Phase 2b (#1454) task-per-tx bypass tests for
-        // `try_forward_task_per_tx_reply`.
+        // Tests for `try_forward_task_per_tx_reply`.
         //
         // The bypass routes a reply directly to an awaiting
-        // `OpCtx::send_and_await` caller, skipping the legacy
-        // `handle_op_request` path entirely. These tests cover the
-        // helper's contract; end-to-end "the SUBSCRIBE branch of
-        // `handle_pure_network_message_v1` actually invokes the helper"
-        // coverage comes from the `run_client_subscribe` tests added
-        // alongside the Phase 2b migration.
+        // `OpCtx::send_and_await` caller. These tests cover the
+        // helper's contract; end-to-end branch coverage lives in the
+        // per-driver tests.
         // ───────────────────────────────────────────────────────────
 
         #[tokio::test]
@@ -3247,12 +3044,10 @@ mod tests {
             //   (b) the branch was restructured (update this guard).
             assert!(
                 window.contains("try_forward_task_per_tx_reply("),
-                "SUBSCRIBE branch no longer calls try_forward_task_per_tx_reply \
-                 before handle_op_request. This is the bypass Phase 2b (#1454) \
-                 added to prevent task-per-tx callers from hanging on replies \
-                 that load_or_init would drop as OpNotPresent. Either restore \
-                 the bypass invocation or update this regression guard if the \
-                 branch has been legitimately refactored."
+                "SUBSCRIBE branch no longer calls \
+                 try_forward_task_per_tx_reply before relay dispatch. \
+                 Either restore the bypass or update this regression \
+                 guard if the branch was legitimately refactored."
             );
 
             // The bypass MUST be gated on Response-only. Without this
@@ -3270,15 +3065,10 @@ mod tests {
 
         #[tokio::test]
         async fn bypass_does_not_block_when_channel_already_full() {
-            // Defensive regression: `try_send` on a full channel must
-            // fail without blocking the pure-network-message handler.
-            // Although Phase 1's dedup guarantees the callback fires at
-            // most once per tx (so a "full" capacity-1 channel
-            // shouldn't happen in practice), this test pins the
-            // non-blocking contract so future refactors can't
-            // accidentally switch to `.send().await` and reintroduce
-            // the class of bug documented in
-            // `.claude/rules/channel-safety.md`.
+            // Pin the non-blocking contract: `try_send` on a full
+            // channel must fail without blocking the handler. Future
+            // refactors must not switch to `.send().await` (see
+            // `.claude/rules/channel-safety.md`).
             let (tx, _rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
             // Pre-fill the capacity-1 channel.
             tx.try_send(dummy_reply())
@@ -3443,9 +3233,8 @@ mod tests {
 
         // ───────────────────────────────────────────────────────────
         // Regression guard: PUT branch of handle_pure_network_message_v1
-        // must call try_forward_task_per_tx_reply before handle_op_request,
-        // gated on Response|ResponseStreaming only. Mirror of the SUBSCRIBE
-        // guard above. Added in Phase 3a (#1454).
+        // must call try_forward_task_per_tx_reply before relay dispatch,
+        // gated on Response|ResponseStreaming only.
         // ───────────────────────────────────────────────────────────
 
         #[test]
@@ -3470,8 +3259,7 @@ mod tests {
             assert!(
                 window.contains("try_forward_task_per_tx_reply("),
                 "PUT branch no longer calls try_forward_task_per_tx_reply. \
-                 This is the bypass Phase 3a (#1454) added to prevent \
-                 task-per-tx callers from hanging on replies."
+                 Restore the bypass or update this regression guard."
             );
 
             assert!(
@@ -3486,31 +3274,25 @@ mod tests {
                  Both terminal variants must be forwarded."
             );
 
-            // #1454 phase 5 final (PUT slice): legacy fallthrough is
-            // gone. The arm must NOT call handle_op_request<PutOp> and
-            // must NOT gate on the retired DashMap-existence check.
-            // Compose needles at runtime so the assert source itself
-            // does not contain them.
+            // The legacy fallthrough must NOT return. Compose needles
+            // at runtime so the assert source itself does not contain
+            // them.
             let legacy_dispatch_needle = format!("handle{}::<put::PutOp, _>", "_op_request");
             assert!(
                 !window.contains(&legacy_dispatch_needle),
-                "PUT branch must not call legacy state-machine dispatch — \
-                 retired in #1454 phase 5 final (PUT slice)"
+                "PUT branch must not call legacy state-machine dispatch"
             );
             let dashmap_gate_needle = format!("has{}_op", "_put");
             assert!(
                 !window.contains(&dashmap_gate_needle),
-                "PUT branch must not gate dispatch on the retired DashMap \
-                 existence check — gate retired in #1454 phase 5 final (PUT slice)"
+                "PUT branch must not gate dispatch on the retired DashMap existence check"
             );
         }
 
         // ───────────────────────────────────────────────────────────
         // Per-variant filter tests for the PUT branch bypass.
-        // Mirror of the subscribe filter tests above. Verifies that
-        // only Response and ResponseStreaming are forwarded to the
-        // task-per-tx channel; all other variants must fall through
-        // to handle_op_request.
+        // Only Response and ResponseStreaming may be forwarded; all
+        // other variants must fall through to relay dispatch.
         // ───────────────────────────────────────────────────────────
 
         use crate::operations::put::PutMsg;
@@ -3626,28 +3408,14 @@ mod tests {
         }
 
         // ───────────────────────────────────────────────────────────
-        // Regression guards for the GET branch of
-        // handle_pure_network_message_v1 added in #3883 (phase 5).
+        // Regression guards for the GET branch.
         //
-        // The GET branch has two distinct dispatch layers:
-        //
-        //   1. Phase-3b bypass: terminal Response/ResponseStreaming for an
-        //      active client driver → try_forward_task_per_tx_reply (unchanged).
-        //
-        //   2. Relay dispatch (new in commit 2): GetMsg::Request with
-        //      source_addr.is_some() and no existing GetOp in OpManager →
-        //      start_relay_get (task-per-tx relay driver).
-        //
-        // Layer 1 is the same as PUT/SUBSCRIBE; the guards below cover
-        // layer 2 (source-literal, not runtime dispatch).
+        // Two dispatch layers:
+        //   1. Reply bypass: terminal Response/ResponseStreaming for
+        //      an active client driver → `try_forward_task_per_tx_reply`.
+        //   2. Relay dispatch: `GetMsg::Request` →  `start_relay_get`,
+        //      with originator loopback mapped to `upstream=own_addr`.
         // ───────────────────────────────────────────────────────────
-
-        // Source-literal guard: verify the GET branch invokes
-        // try_forward_task_per_tx_reply before start_relay_get dispatch,
-        // gated on Response|ResponseStreaming only (phase-3b bypass).
-        // ── Relay GET dispatch structural pin tests
-        // (#1454 phase 5 final, GET slice). Mirror of the PUT/UPDATE
-        // tests below.
 
         #[test]
         fn get_branch_dispatches_relay_driver() {
@@ -3666,11 +3434,11 @@ mod tests {
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
 
-            // Phase-3b bypass must still be present (gated on terminal variants).
+            // Reply bypass must precede relay dispatch.
             assert!(
                 window.contains("try_forward_task_per_tx_reply("),
                 "GET branch no longer calls try_forward_task_per_tx_reply \
-                 before relay dispatch. Phase-3b (#1454) bypass removed — restore it."
+                 before relay dispatch. Restore the bypass."
             );
             assert!(
                 window.contains("get::GetMsg::Response { .. }"),
@@ -3689,11 +3457,9 @@ mod tests {
                 "GET branch no longer calls start_relay_get for relay dispatch."
             );
 
-            // After #1454 phase 5 final (GET slice), the originator-
-            // loopback case (source_addr=None) is mapped to
-            // upstream=own_addr instead of falling through to legacy.
-            // The dispatch is therefore conditional on an effective
-            // upstream rather than on source_addr.is_some() directly.
+            // Originator loopback (source_addr=None) is mapped to
+            // upstream=own_addr, so dispatch is conditional on an
+            // effective upstream rather than `source_addr.is_some()`.
             assert!(
                 window.contains("effective_upstream") || window.contains("upstream_addr"),
                 "GET relay dispatch must thread an effective upstream address \
@@ -3706,14 +3472,12 @@ mod tests {
             let legacy_dispatch_needle = format!("handle{}::<get::GetOp, _>", "_op_request");
             assert!(
                 !window.contains(&legacy_dispatch_needle),
-                "GET branch must NOT call legacy state-machine dispatch — \
-                 retired in #1454 phase 5 final (GET slice)"
+                "GET branch must NOT call legacy state-machine dispatch"
             );
             let dashmap_gate_needle = format!("has{}_op", "_get");
             assert!(
                 !window.contains(&dashmap_gate_needle),
-                "GET branch must NOT gate on the retired DashMap existence \
-                 check — retired in #1454 phase 5 final (GET slice)"
+                "GET branch must NOT gate on the retired DashMap existence check"
             );
 
             // Bypass must precede relay dispatch in source order
@@ -3726,27 +3490,24 @@ mod tests {
                 .expect("start_relay_get not found in GET branch");
             assert!(
                 bypass_pos < relay_pos,
-                "Phase-3b bypass (try_forward_task_per_tx_reply) must appear \
-                 BEFORE relay dispatch (start_relay_get) in the GET branch. \
-                 Swapping order would break the client-driver terminal-reply fast path."
+                "Reply bypass (try_forward_task_per_tx_reply) must \
+                 appear BEFORE relay dispatch (start_relay_get) — \
+                 swapping order would break the terminal-reply fast \
+                 path."
             );
         }
 
         // ───────────────────────────────────────────────────────────
-        // Regression guards for the UPDATE branch of
-        // handle_pure_network_message_v1 added in #1454 phase 5
-        // follow-up (slice A: relay UPDATE task-per-tx).
+        // Regression guards for the UPDATE branch.
         //
-        // UPDATE is fire-and-forget end-to-end — there is no
-        // upstream reply to await, so there is no phase-3b bypass
-        // (no reply channel to forward into). Only relay dispatch
+        // UPDATE is fire-and-forget end-to-end — no upstream reply
+        // to await, so no reply bypass exists. Only relay dispatch
         // is wired here.
         // ───────────────────────────────────────────────────────────
 
-        /// Pin: every UPDATE wire variant dispatches to a task-per-tx
-        /// relay driver. After #1454 phase 5 final there is no legacy
-        /// `handle_op_request::<UpdateOp>` fallthrough — every reachable
-        /// arm spawns a driver and returns Ok(None).
+        /// Pin: every UPDATE wire variant dispatches to a relay
+        /// driver. No legacy fallthrough remains — every reachable
+        /// arm spawns a driver and returns `Ok(None)`.
         #[test]
         fn update_branch_dispatches_all_relay_drivers() {
             const SOURCE: &str = include_str!("node.rs");
@@ -3774,8 +3535,7 @@ mod tests {
             ] {
                 assert!(
                     window.contains(driver),
-                    "UPDATE branch must call {driver} for relay dispatch \
-                     (#1454 phase 5 follow-up slice A/C)."
+                    "UPDATE branch must call {driver} for relay dispatch."
                 );
             }
 
@@ -3785,22 +3545,18 @@ mod tests {
             let legacy_call = ["handle_op_request::<update::", "UpdateOp", ", _>"].concat();
             assert!(
                 !window.contains(&legacy_call),
-                "UPDATE branch must NOT call handle_op_request — \
-                 retired in #1454 phase 5 final"
+                "UPDATE branch must NOT call handle_op_request"
             );
             let dispatch_gate = ["has_", "update_op"].concat();
             assert!(
                 !window.contains(&dispatch_gate),
-                "UPDATE relay dispatch must NOT consult has_update_op — \
-                 the gate was retired together with the ops.update DashMap \
-                 in #1454 phase 5 final"
+                "UPDATE relay dispatch must NOT consult has_update_op"
             );
         }
 
-        /// Pin: relay UPDATE dispatch is still gated on
-        /// `source_addr.is_some()` so internal callers do not spawn
-        /// drivers (the executor UPDATE path that used to land here was
-        /// retired in #1454 phase 5 final commit 1).
+        /// Pin: relay UPDATE dispatch is gated on
+        /// `source_addr.is_some()`; internal callers must not spawn
+        /// drivers.
         #[test]
         fn update_branch_dispatch_gates_on_source_addr() {
             const SOURCE: &str = include_str!("node.rs");
@@ -3821,9 +3577,7 @@ mod tests {
             );
         }
 
-        // ── Relay PUT dispatch structural pin tests
-        // (#1454 phase 5 final, PUT slice). Mirror of the UPDATE
-        // tests above.
+        // ── Relay PUT dispatch structural pin tests.
 
         #[test]
         fn put_branch_dispatches_relay_drivers() {
@@ -3849,11 +3603,9 @@ mod tests {
                 window.contains("start_relay_put_streaming("),
                 "PUT branch must call start_relay_put_streaming for streaming relay hops."
             );
-            // After #1454 phase 5 final (PUT slice), the originator-
-            // loopback case (source_addr=None) is mapped to
-            // upstream=own_addr instead of falling through to legacy.
-            // The dispatch is therefore conditional on an effective
-            // upstream rather than on source_addr.is_some() directly.
+            // Originator loopback (source_addr=None) is mapped to
+            // upstream=own_addr, so dispatch is conditional on an
+            // effective upstream rather than `source_addr.is_some()`.
             assert!(
                 window.contains("effective_upstream") || window.contains("upstream_addr"),
                 "PUT relay dispatch must thread an effective upstream address \
@@ -3865,14 +3617,12 @@ mod tests {
             let legacy_dispatch_needle = format!("handle{}::<put::PutOp, _>", "_op_request");
             assert!(
                 !window.contains(&legacy_dispatch_needle),
-                "PUT branch must NOT call legacy state-machine dispatch — \
-                 retired in #1454 phase 5 final (PUT slice)"
+                "PUT branch must NOT call legacy state-machine dispatch"
             );
             let dashmap_gate_needle = format!("has{}_op", "_put");
             assert!(
                 !window.contains(&dashmap_gate_needle),
-                "PUT branch must NOT gate on the retired DashMap existence \
-                 check — retired in #1454 phase 5 final (PUT slice)"
+                "PUT branch must NOT gate on the retired DashMap existence check"
             );
         }
 
@@ -3915,12 +3665,11 @@ mod tests {
             );
         }
 
-        // ── Relay SUBSCRIBE dispatch structural pin tests (#1454 phase 5
-        // final, SUBSCRIBE slice). After the legacy state-machine
-        // fallthrough was retired, every SUBSCRIBE wire variant routes
-        // either to the task-per-tx relay driver (Request) or to a
-        // dedicated inbound handler (Unsubscribe). Mirror the GET-slice
-        // pin pattern.
+        // ── Relay SUBSCRIBE dispatch structural pin tests.
+        //
+        // Every SUBSCRIBE wire variant routes either to the relay
+        // driver (Request) or to a dedicated inbound handler
+        // (Unsubscribe). Response is forwarded via the reply bypass.
 
         #[test]
         fn subscribe_branch_dispatches_relay_driver() {
@@ -3961,14 +3710,12 @@ mod tests {
             );
             assert!(
                 window.contains("handle_unsubscribe_inbound("),
-                "SUBSCRIBE branch must call handle_unsubscribe_inbound for \
-                 Unsubscribe wire messages — replaces the legacy state-machine \
-                 Unsubscribe arm retired in #1454 phase 5 final."
+                "SUBSCRIBE branch must call handle_unsubscribe_inbound \
+                 for Unsubscribe wire messages."
             );
 
-            // After #1454 phase 5 final (SUBSCRIBE slice), the
-            // originator-loopback case (source_addr=None) is mapped to
-            // upstream=own_addr instead of falling through to legacy.
+            // Originator loopback (source_addr=None) is mapped to
+            // upstream=own_addr.
             assert!(
                 window.contains("effective_upstream") || window.contains("upstream_addr"),
                 "SUBSCRIBE relay dispatch must thread an effective upstream address \
@@ -3982,14 +3729,12 @@ mod tests {
                 format!("handle{}::<subscribe::SubscribeOp, _>", "_op_request");
             assert!(
                 !window.contains(&legacy_dispatch_needle),
-                "SUBSCRIBE branch must NOT call legacy state-machine dispatch — \
-                 retired in #1454 phase 5 final (SUBSCRIBE slice)"
+                "SUBSCRIBE branch must NOT call legacy state-machine dispatch"
             );
             let dashmap_gate_needle = format!("has{}_op", "_subscribe");
             assert!(
                 !window.contains(&dashmap_gate_needle),
-                "SUBSCRIBE branch must NOT gate on the retired DashMap existence \
-                 check — retired in #1454 phase 5 final (SUBSCRIBE slice)"
+                "SUBSCRIBE branch must NOT gate on the retired DashMap existence check"
             );
 
             // Bypass must precede relay dispatch in source order
@@ -4009,10 +3754,9 @@ mod tests {
         }
     }
 
-    /// Tests for `fill_connect_response_acceptor_addr` (#1454 phase 2c
-    /// slice 2 review M1). Mirrors the legacy joiner-side fill at
-    /// `connect.rs:1723-1745`. The driver does not see `source_addr`,
-    /// so the bypass must rewrite the payload before forwarding.
+    /// Tests for `fill_connect_response_acceptor_addr`. The driver
+    /// does not see `source_addr`, so the dispatch site must rewrite
+    /// the payload before forwarding.
     mod fill_connect_response_acceptor_addr_tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -4134,13 +3878,13 @@ mod tests {
         }
     }
 
-    /// Regression guards for the CONNECT bypass `matches!` predicate
-    /// (#1454 phase 2c slice 1 commit 1). The relay-CONNECT driver
-    /// (`start_relay_connect`, commit 2) owns the entire tx lifetime
-    /// in task locals, so all four non-Request `ConnectMsg` variants
-    /// (Response, Rejected, ObservedAddress, ConnectFailed) must reach
-    /// the per-tx waiter receiver. `Request` is the spawn signal and
-    /// is handled by the dispatch gate, never the bypass forward.
+    /// Regression guards for the CONNECT bypass `matches!` predicate.
+    ///
+    /// The relay-CONNECT driver owns the entire tx lifetime in task
+    /// locals, so all four non-`Request` `ConnectMsg` variants
+    /// (Response, Rejected, ObservedAddress, ConnectFailed) must
+    /// reach the per-tx waiter receiver. `Request` is the spawn
+    /// signal and is handled by the dispatch gate.
     mod connect_bypass_coverage_guards {
         const SOURCE: &str = include_str!("node.rs");
 
@@ -4183,11 +3927,10 @@ mod tests {
         fn connect_branch_bypass_forwards_observed_address() {
             assert!(
                 connect_branch_window().contains("connect::ConnectMsg::ObservedAddress { .. }"),
-                "Connect bypass `matches!` no longer forwards ObservedAddress. \
-                 Phase 2c slice 1 (#1454) moved the set_own_addr / \
-                 update_location side effect into the joiner driver inbox; \
-                 dropping ObservedAddress here would prevent NAT-discovery \
-                 from completing."
+                "Connect bypass `matches!` no longer forwards \
+                 ObservedAddress. The joiner driver inbox owns the \
+                 set_own_addr / update_location side effect; dropping \
+                 ObservedAddress here breaks NAT discovery."
             );
         }
 
@@ -4195,10 +3938,10 @@ mod tests {
         fn connect_branch_bypass_forwards_connect_failed() {
             assert!(
                 connect_branch_window().contains("connect::ConnectMsg::ConnectFailed { .. }"),
-                "Connect bypass `matches!` no longer forwards ConnectFailed. \
-                 Phase 2c slice 1 (#1454) moved hole-punch failure re-route \
-                 into the relay driver inbox; dropping ConnectFailed here \
-                 would strand re-route attempts on legacy `process_message`."
+                "Connect bypass `matches!` no longer forwards \
+                 ConnectFailed. The relay driver inbox owns hole-punch \
+                 failure re-route; dropping ConnectFailed here strands \
+                 the re-route on legacy `process_message`."
             );
         }
 
@@ -4231,15 +3974,14 @@ mod tests {
             );
         }
 
-        /// Phase 2c slice 1 commit 3: the Connect branch MUST dispatch
-        /// to `start_relay_connect` for fresh inbound Requests.
+        /// The Connect branch MUST dispatch to `start_relay_connect`
+        /// for fresh inbound Requests.
         #[test]
         fn connect_branch_dispatches_start_relay_connect_for_fresh_request() {
             let window = connect_branch_window();
             assert!(
                 window.contains("start_relay_connect("),
-                "Connect branch no longer calls start_relay_connect for \
-                 relay dispatch. Slice 1 commit 3 (#1454) wired this; \
+                "Connect branch no longer calls start_relay_connect — \
                  removing it strands relay CONNECT on legacy."
             );
         }

@@ -1,43 +1,22 @@
-//! Task-per-transaction client-initiated PUT (#1454 Phase 3a).
+//! Task-per-transaction PUT drivers.
 //!
-//! Mirrors [`crate::operations::subscribe::op_ctx_task`] — the first
-//! production consumer of [`OpCtx::send_and_await`] for SUBSCRIBE.
-//! This module applies the same pattern to client-initiated PUT.
+//! Each entry point — client-initiated, relay non-streaming, relay
+//! streaming — owns routing state in task locals. No `PutOp` is
+//! pushed into `OpManager.ops.put`.
 //!
-//! # Scope (Phase 3a)
+//! # Client-initiated flow
 //!
-//! Only the **client-initiated originator** PUT runs through this module.
-//! Relay PUTs (with `upstream_addr: Some`), GC-spawned speculative retries,
-//! and streaming request setup stay on the legacy re-entry loop.
+//! 1. [`super::put_contract`] stores the contract locally.
+//! 2. Find k-closest peers to forward to.
+//! 3. No remote peers: deliver directly via `send_client_result`.
+//! 4. Loop: [`OpCtx::send_and_await`] with a fresh `Transaction`
+//!    per attempt (single-use-per-tx).
+//! 5. Terminal `Response`/`ResponseStreaming`:
+//!    [`super::finalize_put_at_originator`] + `send_client_result`.
+//! 6. Timeout/wire-error: advance to next peer or exhaust.
 //!
-//! # Architecture
-//!
-//! The task owns all routing state in its locals — there is no `PutOp` in
-//! `OpManager.ops.put` for any attempt this task makes. The task:
-//!
-//! 1. Calls [`super::put_contract`] to store the contract locally.
-//! 2. Finds the k-closest peers to forward the PUT to.
-//! 3. If no remote peers: delivers directly via `send_client_result`.
-//! 4. Otherwise: loops, calling [`OpCtx::send_and_await`] with a fresh
-//!    `Transaction` per attempt (single-use-per-tx constraint).
-//! 5. On terminal `Response`/`ResponseStreaming`: calls
-//!    [`super::finalize_put_at_originator`] for telemetry + subscription,
-//!    then delivers via `send_client_result`.
-//! 6. On timeout/wire-error: advances to next peer or exhausts.
-//!
-//! # Speculative retries (R2)
-//!
-//! The driver uses serial retries only. Speculative parallel paths
-//! (GC-spawned via `speculative_paths`) are not supported — the driver
-//! has no DashMap entry for the GC task to find. This is an accepted
-//! regression for Phase 3a; the driver's retry loop covers the same
-//! failure modes, just sequentially.
-//!
-//! # Connection-drop latency (R6)
-//!
-//! Legacy `handle_abort` detects disconnects in <1s. Task-per-tx relies
-//! on the `OPERATION_TTL` (60s) timeout. Accepted ceiling, matching
-//! Phase 2b's SUBSCRIBE driver.
+//! Retries are serial only. Connection-drop detection relies on
+//! `OPERATION_TTL` (60s).
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -547,7 +526,7 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
     }
 }
 
-// ── Relay PUT driver (#1454 phase 5 follow-up slice A) ──────────────────────
+// ── Relay PUT driver ─────────────────────────────────────────────────────────
 
 /// Counter: number of times `start_relay_put` was invoked. Incremented
 /// under test/testing feature only — used by structural pin tests to
@@ -731,14 +710,12 @@ async fn run_relay_put<CB>(
         );
     }
 
-    // Originator-loopback error path (#1454 phase 5 final PUT slice
-    // follow-up): when the relay driver runs on the originator's own
-    // node and fails (e.g., `put_contract` rejects an invalid state),
-    // the originator's `start_client_put` `send_and_await` waiter has
-    // no `PutMsg::Response` to consume — it would hang until the test
-    // / client times out. Mirror the legacy `report_result` Err arm
-    // (node.rs:636-651) by publishing a `HostResult::Err` to the
-    // originator's client transaction, then completing the tx.
+    // Originator-loopback error path: when the relay driver runs
+    // on the originator's own node and fails, the originator's
+    // `start_client_put` `send_and_await` waiter has no
+    // `PutMsg::Response` to consume — it would hang until timeout.
+    // Publish a `HostResult::Err` to the originator's client
+    // transaction and complete the tx.
     //
     // Safe in non-loopback mode because remote relays don't share
     // tx-space with a local client (the originator is on a different
@@ -762,8 +739,8 @@ async fn run_relay_put<CB>(
     // sender in the slot that only the 60s sweep would reclaim without
     // this explicit release.
     //
-    // Originator-loopback exception (#1454 phase 5 final PUT slice):
-    // when this driver runs on the originator's own node
+    // Originator-loopback exception: when this driver runs on the
+    // originator's own node
     // (`upstream_addr == own_addr`), the `pending_op_results` callback
     // for `incoming_tx` is the *originator's* `send_and_await` waiter,
     // NOT one this driver installed. Releasing it here would emit
@@ -897,9 +874,9 @@ where
         "PUT relay (task-per-tx): forwarding to next hop"
     );
 
-    // Originator-loopback mode (`upstream_addr == own_addr`, #1454
-    // phase 5 final PUT slice): the originator's `send_and_await`
-    // already installed a `pending_op_results` callback under
+    // Originator-loopback mode (`upstream_addr == own_addr`): the
+    // originator's `send_and_await` already installed a
+    // `pending_op_results` callback under
     // `incoming_tx`. Using `send_to_and_await` here would overwrite
     // that callback with the relay's own waiter, then the relay
     // consumes the reply and the originator's wait dangles forever.
@@ -914,11 +891,10 @@ where
     // Streaming upgrade on forward: serialize the payload, and if it
     // exceeds `streaming_threshold`, send a `RequestStreaming` metadata
     // message + raw stream fragments via `network_bridge.send_stream`.
-    // Mirrors legacy `put.rs:480-528` (pre-#1454 phase 5 final, PUT
-    // slice retirement). Different from `start_relay_put_streaming`'s
-    // `pipe_stream` path because there's no inbound stream handle to
-    // fork — the payload is materialized locally as `merged_value` and
-    // we send raw fragments.
+    // Different from `start_relay_put_streaming`'s `pipe_stream`
+    // path because there's no inbound stream handle to fork — the
+    // payload is materialized locally as `merged_value` and we send
+    // raw fragments.
     let payload = PutStreamingPayload {
         contract: contract.clone(),
         related_contracts: related_contracts.clone(),
@@ -1324,17 +1300,12 @@ async fn relay_put_finalize_local(
 /// Send `PutMsg::Response` upstream (fire-and-forget: upstream relay
 /// awaits via its own `send_to_and_await`, no reply expected).
 ///
-/// Originator-loopback case (`upstream_addr == own_addr`, added in
-/// #1454 phase 5 final PUT slice): when the relay driver is running
-/// on the originator's own node — because `start_client_put`'s
-/// `send_and_await(target=None)` looped the Request back into the
-/// local event loop and the dispatch site mapped `source_addr=None`
-/// to `upstream=own_addr` — the Response cannot ship over the wire
-/// (no self-connection). Route via `send_local_loopback` so the
-/// message lands as an `InboundMessage`, hits the PUT bypass in
-/// `handle_pure_network_message_v1`, and forwards to the originator's
-/// `pending_op_results` waiter. Mirrors the legacy `LocalCompletion`
-/// terminal-reply contract.
+/// Originator-loopback case (`upstream_addr == own_addr`): when
+/// the relay driver runs on the originator's own node, the
+/// Response cannot ship over the wire (no self-connection). Route
+/// via `send_local_loopback` so the message lands as an
+/// `InboundMessage`, hits the PUT bypass, and forwards to the
+/// originator's `pending_op_results` waiter.
 async fn relay_put_send_response(
     op_manager: &OpManager,
     incoming_tx: Transaction,
@@ -1358,7 +1329,7 @@ async fn relay_put_send_response(
     }
 }
 
-// ── Relay streaming PUT driver (#1454 phase 5 follow-up slice B) ────────────
+// ── Relay streaming PUT driver ───────────────────────────────────────────────
 
 /// Counter: number of times `start_relay_put_streaming` was invoked
 /// (BEFORE the dedup gate). Incremented under test/testing feature
@@ -1948,7 +1919,7 @@ mod tests {
         }));
         assert!(
             matches!(classify_reply(&msg), ReplyClass::Unexpected),
-            "ForwardingAck must NOT be classified as terminal (Phase 2b bug 2)"
+            "ForwardingAck must NOT be classified as terminal"
         );
     }
 
@@ -2164,10 +2135,9 @@ mod tests {
         ));
     }
 
-    // ── Relay PUT driver structural pin tests (#1454 phase 5 follow-up,
-    // slice A). Anchor the relay section on the entry-point fn so
-    // module-level doc comments (which reference variant names by
-    // design) don't enter scope.
+    // ── Relay PUT driver structural pin tests. Anchor the relay
+    // section on the entry-point fn so module-level doc comments
+    // (which reference variant names by design) don't enter scope.
 
     fn relay_section(src: &str) -> &str {
         let start = src
@@ -2293,8 +2263,8 @@ mod tests {
              Response bubbles back to the relay's waiter"
         );
         // The driver MAY use `send_fire_and_forget` in the
-        // originator-loopback branch (#1454 phase 5 final PUT slice):
-        // when `upstream_addr == own_addr`, installing a waiter would
+        // originator-loopback branch: when
+        // `upstream_addr == own_addr`, installing a waiter would
         // overwrite the originator's pending_op_results callback. The
         // fire-and-forget forward lets the downstream Response return
         // directly to the originator's still-installed callback. The
@@ -2313,7 +2283,7 @@ mod tests {
     /// non-existent self-connection and the originator-loopback PUT
     /// fails with "Cannot establish connection - peer not found".
     /// Repro: `test_minimal_state_put_get` and the rest of
-    /// `edge_case_state_sizes` (#1454 phase 5 final, PUT slice fixup).
+    /// `edge_case_state_sizes`.
     #[test]
     fn relay_put_send_response_uses_loopback_when_upstream_is_own_addr() {
         let src = include_str!("op_ctx_task.rs");
@@ -2599,10 +2569,10 @@ mod tests {
         );
     }
 
-    /// Bound the upgrade-on-forward analysis to the *relay-non-loopback*
-    /// branch of `drive_relay_put`. The originator-loopback branch
-    /// (added in #1454 phase 5 final PUT slice) intentionally does NOT
-    /// install a reply waiter — the originator's
+    /// Bound the upgrade-on-forward analysis to the
+    /// *relay-non-loopback* branch of `drive_relay_put`. The
+    /// originator-loopback branch intentionally does NOT install a
+    /// reply waiter — the originator's
     /// `pending_op_results` callback already exists and the loopback
     /// forward is fire-and-forget. The relay branch (`let round_trip =
     /// if upgrade_to_streaming`) is the one that must install a

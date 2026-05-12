@@ -1,19 +1,13 @@
-//! A contract is PUT within a location distance, this entails that all nodes within
-//! a given radius will cache a copy of the contract and it's current value,
-//! as well as will broadcast updates to the contract value to all subscribers.
+//! A contract is PUT within a location distance: all nodes within a
+//! given radius cache a copy of the contract and its current value,
+//! and broadcast updates to subscribers.
 //!
-//! #1454 phase 5 final (PUT slice) retired the legacy state machine.
-//! Every PUT wire variant now dispatches unconditionally to a task-per-tx
-//! driver — see `op_ctx_task::start_client_put`, `start_relay_put`, and
-//! `start_relay_put_streaming`.
-//!
-//! Phase 6 (#1454) retired the surviving `#[allow(dead_code)]` scaffolding
-//! (`PutOp`, `PutState`, `PutStats`, `AwaitingResponseData`,
-//! `FinishedData` + the inline outcome / failure-routing / type-state pin
-//! tests). The wire format types (`PutMsg`, `PutStreamingPayload`), the
-//! originator finalization helpers (`finalize_put_at_originator`,
-//! `PutFinalizationData`), and the local-store helper (`put_contract`) all
-//! survive because they are consumed by the task-per-tx drivers.
+//! Every PUT wire variant dispatches to a task-per-tx driver —
+//! `op_ctx_task::start_client_put`, `start_relay_put`, and
+//! `start_relay_put_streaming`. The wire-format types
+//! (`PutMsg`, `PutStreamingPayload`), the originator finalization
+//! helpers, and `put_contract` survive here because the drivers
+//! consume them.
 
 pub(crate) mod op_ctx_task;
 
@@ -37,8 +31,8 @@ pub(super) struct PutFinalizationData {
 
 /// Originator-side finalization after a PUT has been accepted by the network.
 ///
-/// Emits `put_success` telemetry and, if `subscribe` is true, starts a
-/// post-PUT subscription. Called by the task-per-tx driver (Phase 3a).
+/// Emits `put_success` telemetry and, if `subscribe` is true,
+/// starts a post-PUT subscription.
 pub(super) async fn finalize_put_at_originator(
     op_manager: &OpManager,
     id: Transaction,
@@ -371,9 +365,8 @@ mod tests {
 
     /// Pin: `OpManager::completed` MUST keep removing the per-type
     /// DashMap entry for the remaining DashMap-backed op (Connect).
-    /// GET, PUT, UPDATE and SUBSCRIBE no longer have DashMap entries
-    /// post-#1454 phase 5 final. Without this the Phase 3a-style leak
-    /// comes back for the remaining op.
+    /// GET, PUT, UPDATE and SUBSCRIBE no longer have DashMap entries.
+    /// Without this the per-tx DashMap leak comes back for Connect.
     #[test]
     fn completed_must_remove_per_type_dashmap_entry() {
         let src = include_str!("../node/op_state_manager.rs");
@@ -387,29 +380,28 @@ mod tests {
         let body = &src[fn_start..fn_end];
         assert!(
             body.contains("self.ops.connect.remove"),
-            "OpManager::completed must call `self.ops.connect.remove(&id)` \
-             to prevent the Phase 3a-style task-per-tx DashMap leak"
+            "OpManager::completed must call \
+             `self.ops.connect.remove(&id)` to prevent a per-tx \
+             DashMap leak"
         );
         for retired in ["self.ops.put", "self.ops.get", "self.ops.subscribe"] {
             assert!(
                 !body.contains(retired),
-                "OpManager::completed must not reference `{retired}` after \
-                 #1454 phase 5 final retired the corresponding DashMap"
+                "OpManager::completed must not reference `{retired}` — the corresponding DashMap was retired"
             );
         }
     }
 
-    /// Pin: legacy ForwardingAck senders MUST NOT come back at the
-    /// legacy relay forward sites. Slice A/B drivers omit them
-    /// (would race the capacity-1 task-per-tx waiter), and PR #3964
-    /// removed the legacy senders since the consumer is now a no-op.
+    /// Pin: legacy ForwardingAck senders MUST NOT come back. The
+    /// relay drivers omit them (would race the capacity-1 reply
+    /// waiter), and the consumer is a no-op (PR #3964).
     #[test]
     fn put_forwarding_ack_senders_must_stay_deleted() {
         let src = include_str!("put.rs");
         let needle = format!("NetMessage::from({}::ForwardingAck", "PutMsg",);
         assert!(
             !src.contains(&needle),
-            "ForwardingAck senders retired in PR #3964 — slice A/B drivers omit them"
+            "ForwardingAck senders retired in PR #3964"
         );
     }
 }

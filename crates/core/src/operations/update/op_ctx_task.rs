@@ -1,24 +1,14 @@
-//! Task-per-transaction client-initiated UPDATE (#1454 Phase 4).
+//! Task-per-transaction UPDATE drivers.
 //!
-//! UPDATE is fire-and-forget: the originator applies the update locally,
-//! optionally forwards a `RequestUpdate` to a remote peer, and delivers
-//! the result to the client immediately. There is no response to await
-//! and no retry loop.
+//! UPDATE is fire-and-forget end-to-end: the originator applies the
+//! update locally, optionally forwards a `RequestUpdate` to a remote
+//! peer, and delivers the result to the client immediately. No
+//! response is awaited, no retry loop.
 //!
-//! # Scope (Phase 4)
-//!
-//! Only the **client-initiated originator** UPDATE runs through this
-//! module. Relay UPDATEs (RequestUpdate arriving from network),
-//! BroadcastTo fan-out, and streaming variants stay on the legacy
-//! state-machine path.
-//!
-//! # Improvements over legacy path
-//!
-//! - Uses [`OpManager::send_client_result`] instead of raw
-//!   `result_router_tx.try_send`, ensuring [`NodeEvent::TransactionCompleted`]
-//!   is emitted for cleanup of `tx_to_client` and `pending_op_results`.
-//! - Never pushes to `OpManager.ops.update` DashMap, eliminating stale
-//!   entry retention between completion and GC timeout.
+//! Drivers use [`OpManager::send_client_result`] (which emits
+//! [`NodeEvent::TransactionCompleted`] for `tx_to_client` and
+//! `pending_op_results` cleanup) and never push state into a
+//! `OpManager.ops.*` DashMap.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,11 +30,10 @@ use super::{BroadcastStreamingPayload, UpdateExecution, UpdateMsg, UpdateStreami
 use crate::transport::peer_connection::StreamId;
 
 /// Counter: number of times `start_relay_request_update` or
-/// `start_relay_broadcast_to` was invoked. Incremented under test/testing
-/// feature only — used by structural pin tests in #1454 phase 5
-/// follow-up to prove the dispatch gate routes fresh inbound traffic
-/// through the task-per-tx driver rather than legacy
-/// `handle_op_request`.
+/// `start_relay_broadcast_to` was invoked. Incremented under
+/// test/testing feature only; used by structural pin tests to prove
+/// the dispatch gate routes fresh inbound traffic through the
+/// driver.
 #[cfg(any(test, feature = "testing"))]
 pub static RELAY_UPDATE_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -67,13 +56,12 @@ pub static RELAY_UPDATE_COMPLETED_TOTAL: std::sync::atomic::AtomicUsize =
 pub static RELAY_UPDATE_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-// ── Slice C streaming relay UPDATE counters (#1454 phase 5) ──────────────
+// ── Streaming relay UPDATE counters ──────────────────────────────────────
 //
-// Separate from slice A's `RELAY_UPDATE_*` counters so operators can
-// ramp-compare observability between non-streaming and streaming
-// relay drivers. The tx dedup set (`active_relay_update_txs`) is shared
-// across both slices since tx identity is unified; the
-// `RELAY_UPDATE_DEDUP_REJECTS` counter is also shared.
+// Separate from the non-streaming `RELAY_UPDATE_*` counters so
+// operators can ramp-compare observability between the two. The tx
+// dedup set (`active_relay_update_txs`) and
+// `RELAY_UPDATE_DEDUP_REJECTS` are shared.
 
 /// Counter: number of times `start_relay_request_update_streaming` or
 /// `start_relay_broadcast_to_streaming` was invoked. Used by dispatch
@@ -355,8 +343,8 @@ async fn drive_client_update(
                     //
                     // Why `target_addr` and not some other peer: the
                     // auto-fetch is a directed `start_targeted_sub_op_get`
-                    // GET (post-#1454 phase 5 final, GET slice) targeting
-                    // a SocketAddr, and `target_addr` is the only addr we
+                    // targeting a SocketAddr, and `target_addr` is the
+                    // only addr we
                     // have at this site that the routing layer just
                     // confirmed is reachable AND closer to the key than
                     // we are. It may not host the contract directly, but
@@ -515,41 +503,29 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
     op_manager.completed(client_tx);
 }
 
-// ── Relay UPDATE drivers (#1454 phase 5 follow-up — slice A) ────────────────
+// ── Relay UPDATE drivers (non-streaming) ─────────────────────────────────────
 //
-// UPDATE has no end-to-end response, so the relay drivers below are
-// strictly fire-and-forget: they apply state changes locally (or forward
-// once downstream) and exit.  No `send_and_await`, no
-// `pending_op_results` slot, no upstream reply.  This makes the relay
-// drivers immune to the four amplifiers that hit phase-5 GET (workflow
-// runs 24600168871 / 24600634908 / 24601267577 / 24601908758):
+// UPDATE has no end-to-end response, so the relay drivers are
+// strictly fire-and-forget: they apply state changes locally (or
+// forward once downstream) and exit. No `send_and_await`, no
+// `pending_op_results` slot, no upstream reply.
 //
+// Amplifier audit (vs GET relay):
 //   1. No retry loop at relay → no MAX_RELAY_RETRIES needed.
 //   2. No fresh `attempt_tx` → forwarding reuses `incoming_tx`.
 //   3. No `ForwardingAck` → never had one.
-//   4. Per-node dedup gate (`active_relay_update_txs`) drops duplicate
-//      inbound Requests for an in-flight tx, mirroring GET phase-5 even
-//      though the structural risk is lower.
+//   4. Per-node dedup gate (`active_relay_update_txs`) drops
+//      duplicate inbound Requests for an in-flight tx.
 //
-// # Scope
-//
-// Migrated:
-//   - `UpdateMsg::RequestUpdate` (non-streaming relay arm:
-//      `update.rs::process_message`, lines 347–594).
+// Migrated wire variants:
+//   - `UpdateMsg::RequestUpdate` (non-streaming relay arm).
 //   - `UpdateMsg::BroadcastTo`  (non-streaming relay arm:
 //      `update.rs::process_message`, lines 595–825).
 //
-// NOT migrated (stays on legacy path; see port plan §3 / §9):
-//   - `UpdateMsg::RequestUpdateStreaming` /
-//     `UpdateMsg::BroadcastToStreaming` — migrated in slice C.
-//
-// UPDATE auto-fetch (`OpManager::try_auto_fetch_contract`) used to
-// invoke the legacy `get::start_targeted_op` constructor. Phase 5
-// final (GET slice) migrated it to
-// `get::op_ctx_task::start_targeted_sub_op_get` (a directed
-// task-per-tx GET that pre-seeds the UPDATE sender as the first
-// hop and falls back to `k_closest_potentially_hosting` for
-// retries). The legacy `OpEnum::Get` carrier is gone.
+// UPDATE auto-fetch (`OpManager::try_auto_fetch_contract`)
+// dispatches `get::op_ctx_task::start_targeted_sub_op_get` (a
+// directed GET that pre-seeds the UPDATE sender as the first hop
+// and falls back to `k_closest_potentially_hosting` for retries).
 
 /// Spawn a relay driver for a fresh inbound `UpdateMsg::RequestUpdate`.
 ///
@@ -1186,7 +1162,7 @@ async fn drive_relay_broadcast_to(
     Ok(())
 }
 
-// ── Relay UPDATE streaming drivers (#1454 phase 5 — slice C) ────────────
+// ── Relay UPDATE streaming drivers ───────────────────────────────────────
 //
 // Streaming UPDATE relays are qualitatively simpler than streaming PUT
 // relays:
@@ -1897,9 +1873,9 @@ mod tests {
         );
     }
 
-    // ── Relay UPDATE driver structural pin tests (#1454 phase 5 follow-up,
-    // slice A scaffold). These pin the driver SOURCE against documented
-    // invariants; a future change that breaks any invariant should fail
+    // ── Relay UPDATE driver structural pin tests. These pin the
+    // driver SOURCE against documented invariants; a future change
+    // that breaks any invariant should fail
     // these before sim runs catch the consequence. Behavioral tests for
     // the dispatch gate live in commit 2.
 
@@ -2068,9 +2044,9 @@ mod tests {
         );
     }
 
-    /// Pin: both relay drivers MUST gate on `active_relay_update_txs` to
-    /// reject duplicate inbound messages for an in-flight tx (matches the
-    /// pattern that GET phase 5 needed to avoid amplification).
+    /// Pin: both relay drivers MUST gate on
+    /// `active_relay_update_txs` to reject duplicate inbound
+    /// messages for an in-flight tx (amplification guard).
     #[test]
     fn relay_drivers_use_per_node_dedup_gate() {
         let src = include_str!("op_ctx_task.rs");
@@ -2180,11 +2156,9 @@ mod tests {
         }
     }
 
-    // ── Slice C streaming relay driver structural pin tests ─────────────
-    // (#1454 phase 5) — pin the streaming drivers against their
-    // documented invariants.
+    // ── Streaming relay driver structural pin tests ─────────────────────
 
-    /// Pin: slice C streaming drivers must exist and be public at the
+    /// Pin: streaming drivers must exist and be public at the
     /// crate level.
     #[test]
     fn slice_c_streaming_drivers_exist() {
@@ -2395,19 +2369,17 @@ mod tests {
         );
     }
 
-    /// Pin: `log_broadcast_to_streaming_failure` must stay `pub(crate)`
-    /// so the slice C driver can reuse the shared classifier. If Phase 6
-    /// cleanup re-privatises it, the driver's failure branch breaks
-    /// silently — this pin trips at compile-ish time (source-level scan)
-    /// instead.
+    /// Pin: `log_broadcast_to_streaming_failure` must stay
+    /// `pub(crate)` so the streaming driver can reuse the shared
+    /// classifier. Re-privatising it would silently break the
+    /// driver's failure branch.
     #[test]
     fn log_broadcast_to_streaming_failure_is_pub_crate() {
         let src = include_str!("../update.rs");
         assert!(
             src.contains("pub(crate) fn log_broadcast_to_streaming_failure("),
             "log_broadcast_to_streaming_failure must remain pub(crate) — \
-             slice C driver reuses it for failure classification; \
-             re-privatising breaks drive_relay_broadcast_to_streaming"
+             reused by drive_relay_broadcast_to_streaming"
         );
     }
 

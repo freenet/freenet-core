@@ -1,24 +1,19 @@
-//! SUBSCRIBE operation: registers downstream interest in a contract and
-//! threads UPDATE broadcasts back through the subscription tree.
+//! SUBSCRIBE operation: registers downstream interest in a contract
+//! and threads UPDATE broadcasts back through the subscription tree.
 //!
-//! #1454 phase 5 final (SUBSCRIBE slice) retired the legacy state machine.
-//! Every SUBSCRIBE wire variant now dispatches unconditionally:
+//! Every SUBSCRIBE wire variant dispatches unconditionally:
 //!
 //! - `SubscribeMsg::Request` → `op_ctx_task::start_relay_subscribe`
-//! - `SubscribeMsg::Response` → bypass to originator's `pending_op_results`
-//!   waiter
-//! - `SubscribeMsg::Unsubscribe` → `handle_unsubscribe_inbound` (this module)
+//! - `SubscribeMsg::Response` → reply bypass to originator waiter
+//! - `SubscribeMsg::Unsubscribe` → `handle_unsubscribe_inbound`
 //! - `SubscribeMsg::ForwardingAck` → no-op telemetry hook
 //!
-//! Phase 6 (#1454) retired the surviving `#[allow(dead_code)]` scaffolding
-//! `SubscribeOp`, `SubscribeState`, `SubscribeStats`, the type-state data
-//! structs, `start_op` / `start_op_with_id` test fixtures, and the inline
-//! pin tests they backed. The wire format types (`SubscribeMsg`,
-//! `SubscribeMsgResult`), the originator-shared helpers (`InitialRequest`,
-//! `prepare_initial_request`, `complete_local_subscription`,
-//! `wait_for_contract_with_timeout`), the inbound `Unsubscribe` handler,
-//! and `register_downstream_subscriber` all survive because the
-//! task-per-tx drivers still consume them.
+//! The wire-format types, the originator-shared helpers
+//! (`InitialRequest`, `prepare_initial_request`,
+//! `complete_local_subscription`, `wait_for_contract_with_timeout`),
+//! the inbound `Unsubscribe` handler, and
+//! `register_downstream_subscriber` survive here because the
+//! task-per-tx drivers consume them.
 
 use either::Either;
 
@@ -416,9 +411,8 @@ pub(crate) async fn register_downstream_subscriber(
 /// Removes the sender's downstream subscriber tracking for the contract and
 /// chains the unsubscribe upstream if no remaining interest is present.
 ///
-/// Replaces the legacy `process_message::SubscribeMsg::Unsubscribe` arm
-/// retired in #1454 phase 5 final (SUBSCRIBE slice). The node.rs dispatch
-/// site calls this directly for inbound Unsubscribe variants.
+/// Called from the node.rs dispatch site for inbound Unsubscribe
+/// wire messages.
 pub(crate) async fn handle_unsubscribe_inbound(
     op_manager: &OpManager,
     tx: Transaction,
@@ -502,8 +496,7 @@ pub(crate) async fn handle_unsubscribe_inbound(
 #[cfg(test)]
 mod tests;
 
-/// Task-per-transaction client-initiated SUBSCRIBE path (#1454 Phase 2b).
-/// First production consumer of `OpCtx::send_and_await`.
+/// Task-per-transaction SUBSCRIBE drivers.
 pub(crate) mod op_ctx_task;
 
 pub(crate) use op_ctx_task::{

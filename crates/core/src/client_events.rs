@@ -660,11 +660,10 @@ async fn process_open_request(
 
                         let contract_key = contract.key();
 
-                        // Phase 3a (#1454): task-per-tx driver handles both
-                        // local-only and network PUTs. The driver calls
-                        // put_contract locally first, then finds peers and
-                        // sends the request. No request-router dedup needed
-                        // — each task owns its own operation lifecycle.
+                        // Driver handles both local-only and network
+                        // PUTs: calls put_contract locally, finds
+                        // peers, sends the request. Each task owns
+                        // its own operation lifecycle.
                         let client_tx = crate::message::Transaction::new::<put::PutMsg>();
 
                         op_manager
@@ -1160,11 +1159,9 @@ async fn process_open_request(
                             })));
                         }
 
-                        // Phase 3b (#1454): task-per-tx driver handles network
-                        // GETs. The driver owns its routing state in task locals
-                        // and calls notify_contract_handler locally as needed.
-                        // No request-router dedup — each task owns its own
-                        // operation lifecycle (matching PUT 3a's decision).
+                        // Driver owns its routing state in task
+                        // locals and calls notify_contract_handler
+                        // locally as needed.
                         tracing::debug!(
                             client_id = %client_id,
                             request_id = %request_id,
@@ -1174,7 +1171,7 @@ async fn process_open_request(
                             is_subscribed,
                             connection_count,
                             phase = "network_routing",
-                            "Routing GET request through network (task-per-tx driver)"
+                            "Routing GET request through network"
                         );
 
                         let client_tx = crate::message::Transaction::new::<get::GetMsg>();
@@ -1424,9 +1421,10 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            // Start dedicated operation for this client AFTER registration.
-                            // `subscribe_with_id` is client-initiated-only since #1454 Phase 2b;
-                            // no `is_renewal` parameter.
+                            // Start dedicated operation for this
+                            // client AFTER registration.
+                            // `subscribe_with_id` is
+                            // client-initiated-only; no `is_renewal`.
                             let _result_tx = crate::node::subscribe_with_id(
                                 op_manager.clone(),
                                 key,

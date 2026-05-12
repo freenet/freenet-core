@@ -88,47 +88,17 @@ pub mod dev_tool {
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
 
-    // #1454 Phase 3b — test hook to verify client-initiated GETs
-    // actually route through the task-per-tx driver rather than being
-    // satisfied by the `client_events.rs` local-cache shortcut.
+    // Test hooks: per-op driver call counters. Tests assert these
+    // increment to confirm wire variants dispatch through their
+    // task-per-tx driver (not a local-cache shortcut or legacy path).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::DRIVER_CALL_COUNT as GET_DRIVER_CALL_COUNT;
-
-    // #1454 Phase 5 / #3883 — test hook to verify the dispatch site in
-    // `handle_pure_network_message_v1` routes fresh inbound relay
-    // GETs through the task-per-tx driver. Phase 5 final (GET slice)
-    // retired the legacy `handle_op_request<GetOp>` fallthrough; every
-    // GET wire variant now dispatches unconditionally to a task-per-tx
-    // driver. The originator-loopback case (`source_addr=None`) is
-    // mapped to `upstream_addr=own_addr` at the dispatch site, so the
-    // same `start_relay_get` driver handles both true relay hops and
-    // originator-loopback. UPDATE auto-fetch was migrated to
-    // `start_targeted_sub_op_get` in the same slice.
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::RELAY_DRIVER_CALL_COUNT as GET_RELAY_DRIVER_CALL_COUNT;
-
-    // #1454 Phase 5 follow-up slice A (#3917) — test hook to verify
-    // the dispatch gate in `handle_pure_network_message_v1` actually
-    // routes fresh inbound relay PUTs through the task-per-tx driver
-    // (vs. the legacy `handle_op_request` fallthrough used for
-    // client-initiated loopback and GC-spawned retries).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_DRIVER_CALL_COUNT;
-
-    // #1454 Phase 5 follow-up slice B — test hook for streaming PUT
-    // relay dispatch. Fires when the streaming driver is spawned for
-    // a fresh inbound `PutMsg::RequestStreaming` (vs. legacy
-    // `handle_op_request` fallthrough for GC retries / loopback /
-    // variants that stay on the legacy path).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT;
-
-    // #1454 Phase 5 follow-up slice A (#3932) — test hook to verify
-    // the dispatch gate in `handle_pure_network_message_v1` actually
-    // routes fresh inbound relay SUBSCRIBEs through the task-per-tx
-    // driver (vs. the legacy `handle_op_request` fallthrough used
-    // for renewals, PUT sub-op subscribes, executor auto-subscribe,
-    // and GC-spawned retries).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DRIVER_CALL_COUNT;
 

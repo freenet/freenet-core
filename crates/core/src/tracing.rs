@@ -240,14 +240,10 @@ pub(crate) struct NetEventLog<'a> {
     kind: EventKind,
 }
 
-// `get_failure`, `get_success`, `get_forwarding_ack_*` constructors retired
-// alongside the legacy GET state machine in #1454 phase 5 final (GET
-// slice). The task-per-tx driver does not emit these `NetEventLog`
-// variants — telemetry has migrated to `record_get_access` /
-// `mark_local_client_access` and operator-facing tracing spans. The
-// constructors are kept for symmetry with the surviving PUT/UPDATE/
-// SUBSCRIBE/CONNECT counterparts and as reference for any future
-// re-introduction of GET-specific event-log variants.
+// GET telemetry migrated to `record_get_access` /
+// `mark_local_client_access` and operator-facing tracing spans;
+// these `NetEventLog` constructors are no longer emitted but kept
+// for symmetry with the surviving counterparts.
 #[allow(dead_code)]
 impl<'a> NetEventLog<'a> {
     /// Safely get the peer_id from the ring's connection manager.

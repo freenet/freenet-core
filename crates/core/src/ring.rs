@@ -1052,10 +1052,11 @@ impl Ring {
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
 
                         let instance_id = *contract_key.id();
-                        // Renewal driver (#1454): same task-per-tx machinery as
-                        // client-initiated SUBSCRIBE, with delivery returned to
-                        // this task instead of routed via `result_router_tx`.
-                        // `is_renewal=true` so the responder skips sending state.
+                        // Renewal driver: same machinery as
+                        // client-initiated SUBSCRIBE, with delivery
+                        // returned to this task instead of via
+                        // `result_router_tx`. `is_renewal=true` so
+                        // the responder skips sending state.
                         //
                         // Outer renewal-cycle timeout: cap each renewal task at
                         // a fraction of the renewal interval so a stuck driver
@@ -3316,9 +3317,7 @@ pub(crate) enum RingError {
     #[error(transparent)]
     ConnError(#[from] Box<node::ConnectionError>),
     /// Retained for completeness; client_events maps it to a stable
-    /// `ClientError::EmptyRing`. Currently unconstructed since the
-    /// `request_get` legacy path that produced it was retired in the
-    /// #1454 sub-op GET migration.
+    /// `ClientError::EmptyRing`. Currently unconstructed.
     #[error("No ring connections found")]
     #[allow(dead_code)]
     EmptyRing,

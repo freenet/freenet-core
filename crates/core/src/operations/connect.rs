@@ -1153,10 +1153,10 @@ impl ConnectOp {
     }
 
     #[allow(clippy::too_many_arguments)]
-    // Retained for in-file unit tests + the legacy initiate_join_request
-    // wrapper; all production joiner-side initiation flows through the
-    // task-per-tx driver via prepare_join_request. Phase 5 final / PR-B
-    // deletes this along with the rest of impl Operation for ConnectOp.
+    // Retained for in-file unit tests + the legacy
+    // `initiate_join_request` wrapper. Production joiner-side
+    // initiation flows through `prepare_join_request`. Pending
+    // deletion alongside the rest of `impl Operation for ConnectOp`.
     #[allow(dead_code)]
     pub(crate) fn new_joiner(
         id: Transaction,
@@ -1186,20 +1186,13 @@ impl ConnectOp {
         }
     }
 
-    /// Construct a new relay-side `ConnectOp` from an inbound `Request`.
+    /// Construct a new relay-side `ConnectOp` from an inbound
+    /// `Request`.
     ///
-    /// **Phase 2c slice 1 (#1454):** this constructor is no longer called
-    /// from production. The relay-CONNECT dispatch site at
-    /// `node.rs::handle_pure_network_message_v1` routes fresh inbound
-    /// `Request`s through `op_ctx_task::start_relay_connect`, which
-    /// builds an equivalent `RelayState` in driver task locals and never
-    /// calls this constructor.
-    ///
-    /// Retained for in-file unit tests under `#[cfg(test)] mod tests`
-    /// that exercise `RelayState::handle_request` semantics inline.
-    /// Phase 6 cleanup will migrate those tests to drive the task-per-tx
-    /// driver and delete this constructor (along with `RelayState`,
-    /// `RelayState::handle_request`, and `RelayActions`).
+    /// Not called from production: fresh inbound `Request`s route
+    /// through `op_ctx_task::start_relay_connect`. Retained for
+    /// in-file unit tests that exercise `RelayState::handle_request`
+    /// semantics inline.
     pub(crate) fn new_relay(
         id: Transaction,
         upstream_addr: SocketAddr,
@@ -1271,11 +1264,9 @@ impl ConnectOp {
         self.first_hop.as_deref().cloned()
     }
 
-    // Retained for in-file unit tests; production callers (ring::acquire_new,
-    // join_ring_request, gateway_version_probe) build the wire message via the
-    // free `prepare_join_request` helper and skip the legacy ConnectOp carrier.
-    // Phase 5 final / PR-B deletes this along with the rest of
-    // impl Operation for ConnectOp.
+    // Retained for in-file unit tests. Production callers build the
+    // wire message via the free `prepare_join_request` helper and
+    // skip the legacy `ConnectOp` carrier.
     #[allow(dead_code)]
     pub(crate) fn initiate_join_request(
         own: PeerKeyLocation,
@@ -1432,16 +1423,12 @@ impl Operation for ConnectOp {
             }),
             Ok(None) => {
                 let op = match (msg, source_addr) {
-                    // Phase 2c slice 1 (#1454): the dispatch site at
-                    // `node.rs::handle_pure_network_message_v1` already
-                    // routed fresh `Request`s with `source_addr.is_some()`
-                    // through `op_ctx_task::start_relay_connect`, so this
-                    // arm should be unreachable in production. It remains
-                    // as defense-in-depth and to keep `process_message`'s
-                    // joiner-side branches usable from in-file unit tests
-                    // that construct relay ops directly. Phase 6 cleanup
-                    // deletes this arm (along with `ConnectOp::new_relay`
-                    // and the relay arms of `process_message`).
+                    // Unreachable in production: fresh `Request`s
+                    // with `source_addr.is_some()` route through
+                    // `op_ctx_task::start_relay_connect`. Retained as
+                    // defense-in-depth and to keep
+                    // `process_message`'s joiner-side branches usable
+                    // from in-file unit tests.
                     (ConnectMsg::Request { payload, .. }, Some(upstream_addr)) => {
                         ConnectOp::new_relay(
                             tx,
@@ -1506,30 +1493,19 @@ impl Operation for ConnectOp {
         }
     }
 
-    /// **Phase 2c slice 1 (#1454):** the relay branches of this method
-    /// (`ConnectState::Relaying(_)` matches in each variant arm) are
-    /// dead from production after the dispatch site at
-    /// `node.rs::handle_pure_network_message_v1` started routing every
-    /// fresh inbound `ConnectMsg::Request` (with `source_addr.is_some()`
-    /// AND `!has_connect_op(id)`) through `op_ctx_task::start_relay_connect`.
+    /// The relay branches (`ConnectState::Relaying(_)`) are dead
+    /// from production: fresh inbound `ConnectMsg::Request`s route
+    /// through `op_ctx_task::start_relay_connect`. They are
+    /// preserved for:
     ///
-    /// The legacy relay arms are preserved here for two reasons:
-    ///
-    /// 1. Unit tests in this file (`relay_accepts_when_policy_allows`,
-    ///    `relay_forwards_when_not_accepting`, etc.) construct
-    ///    `ConnectOp::new_relay` directly and exercise `handle_request`
-    ///    and `process_message` inline. Migrating those tests to drive
-    ///    the task-per-tx driver requires standing up a mock OpManager
-    ///    with a real `op_execution_sender` — out of scope for this
-    ///    slice; tracked for phase 6 cleanup.
-    /// 2. The joiner branches (`ConnectState::WaitingForResponses(_)`)
-    ///    of each arm remain LIVE for the legacy `load_or_init`
-    ///    stateless `ObservedAddress` side-effect path at
-    ///    connect.rs:1473-1490 (defensive belt-and-suspenders; the
-    ///    joiner driver also handles ObservedAddress).
-    ///
-    /// Phase 6 cleanup will delete the relay arms, `ConnectOp::new_relay`,
-    /// `RelayState`, `RelayState::handle_request`, and `RelayActions`.
+    /// 1. Unit tests in this file that construct
+    ///    `ConnectOp::new_relay` directly and exercise
+    ///    `handle_request` / `process_message` inline.
+    /// 2. The joiner branches (`ConnectState::WaitingForResponses(_)`),
+    ///    which remain LIVE for the legacy `load_or_init` stateless
+    ///    `ObservedAddress` side-effect path (defensive
+    ///    belt-and-suspenders; the joiner driver also handles
+    ///    ObservedAddress).
     fn process_message<'a, NB: NetworkBridge>(
         mut self,
         network_bridge: &'a mut NB,
@@ -2452,11 +2428,10 @@ pub(super) async fn dispatch_expect_connection_from(
 
 /// Build a `ConnectMsg::Request` for a joiner-initiated CONNECT.
 ///
-/// Pure helper extracted from `ConnectOp::initiate_join_request` so the
-/// task-per-tx driver (`op_ctx_task::start_client_connect`) and
+/// Pure helper so `op_ctx_task::start_client_connect` and
 /// `ring::Ring::acquire_new` can construct the wire message without
-/// allocating a legacy `ConnectOp` carrier. The caller is responsible
-/// for the `Transaction`.
+/// allocating a legacy `ConnectOp` carrier. Caller owns the
+/// `Transaction`.
 ///
 /// Bloom filter saturation note: `VisitedPeers` uses a 512-bit filter
 /// with k=4 hash functions. Pre-loading N entries raises the false-positive

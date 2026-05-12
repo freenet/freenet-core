@@ -1,18 +1,15 @@
-//! Structural pin tests for the SUBSCRIBE module after #1454 phase 5/6
-//! cleanup. The legacy `SubscribeOp` state machine + state-transition /
-//! retry / outcome tests have been retired (the driver in
-//! `op_ctx_task.rs` owns these behaviors and is covered by its own tests).
-//! The pins below anchor the load-bearing invariants that survived the
-//! retirement: the unsubscribe inbound handler shape, the SUBSCRIBE
+//! Structural pin tests for the SUBSCRIBE module.
+//!
+//! Anchors: the unsubscribe inbound handler shape, the SUBSCRIBE
 //! dispatch site in `node.rs`, the wire-format compatibility of
 //! `SubscribeMsg::ForwardingAck`, and the sub-op GET migration.
 
 use super::*;
 
-/// Pin: `handle_unsubscribe_inbound` (the post-#1454 phase 5 final SUBSCRIBE
-/// inbound entry point) preserves the four behavioral branches inherited
-/// from the retired legacy `process_message::Unsubscribe` arm, plus the
-/// counter-symmetry guard on the global downstream counter.
+/// Pin: `handle_unsubscribe_inbound` preserves the four behavioral
+/// branches inherited from the legacy
+/// `process_message::Unsubscribe` arm, plus the counter-symmetry
+/// guard on the global downstream counter.
 #[test]
 fn handle_unsubscribe_inbound_preserves_legacy_branches() {
     const SOURCE: &str = include_str!("../subscribe.rs");

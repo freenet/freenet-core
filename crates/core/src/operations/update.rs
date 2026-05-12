@@ -1,20 +1,13 @@
-//! UPDATE operation: applies a state change to a contract and broadcasts to subscribers.
+//! UPDATE operation: applies a state change to a contract and
+//! broadcasts to subscribers.
 //!
-//! #1454 phase 5 final (UPDATE slice) retired the legacy state machine.
-//! Every UPDATE wire variant now dispatches unconditionally to a
-//! task-per-tx driver — see `op_ctx_task::start_client_update`,
-//! `start_relay_request_update`, `start_relay_broadcast_to`,
-//! `start_relay_request_update_streaming`, and
-//! `start_relay_broadcast_to_streaming`.
-//!
-//! Phase 6 (#1454) retired the surviving `#[allow(dead_code)]` scaffolding
-//! `UpdateOp`, `UpdateState`, `UpdateStats`, `FinishedData` and the inline
-//! outcome / failure-routing pin tests. The wire format types,
-//! `BroadcastDedupCache`, `BroadcastTargetResult`,
-//! `OpManager::try_auto_fetch_contract`, `update_contract`,
-//! `log_update_contract_failure`, `log_broadcast_to_streaming_failure`,
-//! `send_proactive_summary_notification`, and `send_summary_back_on_rejection`
-//! all survive because the task-per-tx drivers still consume them.
+//! Every UPDATE wire variant dispatches to a task-per-tx driver —
+//! `op_ctx_task::start_client_update`, `start_relay_request_update`,
+//! `start_relay_broadcast_to`, `start_relay_request_update_streaming`,
+//! and `start_relay_broadcast_to_streaming`. The wire-format types,
+//! `BroadcastDedupCache`, `update_contract`, the log helpers, and
+//! the post-merge propagation helpers survive here because the
+//! drivers consume them.
 
 pub(crate) mod op_ctx_task;
 
