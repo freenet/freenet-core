@@ -608,8 +608,9 @@ pub static RELAY_PUT_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
 /// - GC-spawned speculative retries (`speculative_paths`): no `PutOp`
 ///   in the DashMap for the GC to find, so they never enter this driver.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn start_relay_put(
+pub(crate) async fn start_relay_put<CB>(
     op_manager: Arc<OpManager>,
+    conn_manager: CB,
     incoming_tx: Transaction,
     contract: ContractContainer,
     related_contracts: RelatedContracts<'static>,
@@ -617,7 +618,10 @@ pub(crate) async fn start_relay_put(
     htl: usize,
     skip_list: HashSet<SocketAddr>,
     upstream_addr: SocketAddr,
-) -> Result<(), OpError> {
+) -> Result<(), OpError>
+where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
     #[cfg(any(test, feature = "testing"))]
     RELAY_PUT_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -658,6 +662,7 @@ pub(crate) async fn start_relay_put(
     GlobalExecutor::spawn(run_relay_put(
         guard,
         op_manager,
+        conn_manager,
         incoming_tx,
         contract,
         related_contracts,
@@ -688,9 +693,10 @@ impl Drop for RelayPutInflightGuard {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_relay_put(
+async fn run_relay_put<CB>(
     guard: RelayPutInflightGuard,
     op_manager: Arc<OpManager>,
+    conn_manager: CB,
     incoming_tx: Transaction,
     contract: ContractContainer,
     related_contracts: RelatedContracts<'static>,
@@ -698,11 +704,14 @@ async fn run_relay_put(
     htl: usize,
     skip_list: HashSet<SocketAddr>,
     upstream_addr: SocketAddr,
-) {
+) where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
     let _guard = guard;
 
-    if let Err(err) = drive_relay_put(
+    let drive_result = drive_relay_put(
         &op_manager,
+        &conn_manager,
         incoming_tx,
         contract,
         related_contracts,
@@ -711,8 +720,9 @@ async fn run_relay_put(
         skip_list,
         upstream_addr,
     )
-    .await
-    {
+    .await;
+
+    if let Err(err) = &drive_result {
         tracing::warn!(
             tx = %incoming_tx,
             error = %err,
@@ -721,17 +731,57 @@ async fn run_relay_put(
         );
     }
 
+    // Originator-loopback error path (#1454 phase 5 final PUT slice
+    // follow-up): when the relay driver runs on the originator's own
+    // node and fails (e.g., `put_contract` rejects an invalid state),
+    // the originator's `start_client_put` `send_and_await` waiter has
+    // no `PutMsg::Response` to consume — it would hang until the test
+    // / client times out. Mirror the legacy `report_result` Err arm
+    // (node.rs:636-651) by publishing a `HostResult::Err` to the
+    // originator's client transaction, then completing the tx.
+    //
+    // Safe in non-loopback mode because remote relays don't share
+    // tx-space with a local client (the originator is on a different
+    // node, so `incoming_tx` is not registered with our SessionActor).
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let originator_loopback = Some(upstream_addr) == own_addr;
+    if originator_loopback {
+        if let Err(err) = drive_result {
+            let client_error = freenet_stdlib::client_api::ClientError::from(
+                freenet_stdlib::client_api::ErrorKind::OperationError {
+                    cause: err.to_string().into(),
+                },
+            );
+            op_manager.send_client_result(incoming_tx, Err(client_error));
+            op_manager.completed(incoming_tx);
+        }
+    }
+
     // Release the per-tx `pending_op_results` slot at driver exit, same
     // rationale as GET relay — `send_to_and_await` leaves an is_closed
     // sender in the slot that only the 60s sweep would reclaim without
     // this explicit release.
+    //
+    // Originator-loopback exception (#1454 phase 5 final PUT slice):
+    // when this driver runs on the originator's own node
+    // (`upstream_addr == own_addr`), the `pending_op_results` callback
+    // for `incoming_tx` is the *originator's* `send_and_await` waiter,
+    // NOT one this driver installed. Releasing it here would emit
+    // `TransactionCompleted` and remove the originator's callback
+    // BEFORE the loopback `PutMsg::Response` arrives at the bypass —
+    // racing the originator's wait. The originator's own driver
+    // completion path (via `send_client_result` →
+    // `release_pending_op_slot`) cleans up the slot.
     tokio::task::yield_now().await;
-    op_manager.release_pending_op_slot(incoming_tx).await;
+    if !originator_loopback {
+        op_manager.release_pending_op_slot(incoming_tx).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn drive_relay_put(
+async fn drive_relay_put<CB>(
     op_manager: &Arc<OpManager>,
+    conn_manager: &CB,
     incoming_tx: Transaction,
     contract: ContractContainer,
     related_contracts: RelatedContracts<'static>,
@@ -739,7 +789,10 @@ async fn drive_relay_put(
     htl: usize,
     skip_list: HashSet<SocketAddr>,
     upstream_addr: SocketAddr,
-) -> Result<(), OpError> {
+) -> Result<(), OpError>
+where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
     let key = contract.key();
 
     tracing::info!(
@@ -844,25 +897,205 @@ async fn drive_relay_put(
         "PUT relay (task-per-tx): forwarding to next hop"
     );
 
-    // Slice A: streaming upgrade on forward (legacy put.rs:648-668
-    // re-checks `should_use_streaming` after serializing the payload)
-    // is deferred to slice B together with the streaming variant
-    // migration. The dispatch gate in node.rs filters out inbound
-    // streaming Requests and falls through to legacy if the forward
-    // would need streaming upgrade, so this arm only ever builds the
-    // non-streaming forward.
-    let forward = NetMessage::from(PutMsg::Request {
-        id: incoming_tx,
-        contract,
-        related_contracts,
-        value: merged_value,
-        htl: new_htl,
-        skip_list: new_skip_list,
-    });
+    // Originator-loopback mode (`upstream_addr == own_addr`, #1454
+    // phase 5 final PUT slice): the originator's `send_and_await`
+    // already installed a `pending_op_results` callback under
+    // `incoming_tx`. Using `send_to_and_await` here would overwrite
+    // that callback with the relay's own waiter, then the relay
+    // consumes the reply and the originator's wait dangles forever.
+    // Instead, fire-and-forget the forward — the downstream Response
+    // returns over the wire and the bypass forwards it directly to
+    // the originator's still-installed callback. The relay does not
+    // bubble up (skipping `relay_put_send_response`) because the
+    // originator IS the upstream and is already waiting.
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let originator_loopback = Some(upstream_addr) == own_addr;
+
+    // Streaming upgrade on forward: serialize the payload, and if it
+    // exceeds `streaming_threshold`, send a `RequestStreaming` metadata
+    // message + raw stream fragments via `network_bridge.send_stream`.
+    // Mirrors legacy `put.rs:480-528` (pre-#1454 phase 5 final, PUT
+    // slice retirement). Different from `start_relay_put_streaming`'s
+    // `pipe_stream` path because there's no inbound stream handle to
+    // fork — the payload is materialized locally as `merged_value` and
+    // we send raw fragments.
+    let payload = PutStreamingPayload {
+        contract: contract.clone(),
+        related_contracts: related_contracts.clone(),
+        value: merged_value.clone(),
+    };
+    let payload_bytes = match bincode::serialize(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(OpError::NotificationChannelError(format!(
+                "Failed to serialize PUT relay forward payload: {e}"
+            )));
+        }
+    };
+    let payload_size = payload_bytes.len();
+    let upgrade_to_streaming =
+        crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_size);
 
     let mut ctx = op_manager.op_ctx(incoming_tx);
-    let round_trip =
-        tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(next_addr, forward)).await;
+
+    if originator_loopback {
+        // Fire-and-forget forward; do NOT install a waiter (would
+        // overwrite the originator's pending_op_results callback).
+        // Response returns directly to the originator via the bypass.
+        if upgrade_to_streaming {
+            let stream_id = StreamId::next_operations();
+            let metadata_msg = NetMessage::from(PutMsg::RequestStreaming {
+                id: incoming_tx,
+                stream_id,
+                contract_key: key,
+                total_size: payload_size as u64,
+                htl: new_htl,
+                skip_list: new_skip_list.clone(),
+                subscribe: false,
+            });
+            if let Err(err) = ctx.send_fire_and_forget(next_addr, metadata_msg).await {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    target = %next_addr,
+                    error = %err,
+                    "PUT relay (task-per-tx, loopback): \
+                     streaming-upgrade send_fire_and_forget failed"
+                );
+                return Err(err);
+            }
+            if let Err(err) = conn_manager
+                .send_stream(
+                    next_addr,
+                    stream_id,
+                    bytes::Bytes::from(payload_bytes),
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    target = %next_addr,
+                    %stream_id,
+                    error = %err,
+                    "PUT relay (task-per-tx, loopback): send_stream failed"
+                );
+                return Err(OpError::NotificationChannelError(format!(
+                    "send_stream failed: {err}"
+                )));
+            }
+        } else {
+            let forward = NetMessage::from(PutMsg::Request {
+                id: incoming_tx,
+                contract,
+                related_contracts,
+                value: merged_value,
+                htl: new_htl,
+                skip_list: new_skip_list,
+            });
+            if let Err(err) = ctx.send_fire_and_forget(next_addr, forward).await {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    target = %next_addr,
+                    error = %err,
+                    "PUT relay (task-per-tx, loopback): send_fire_and_forget failed"
+                );
+                return Err(err);
+            }
+        }
+        // Originator is awaiting the Response on its own callback —
+        // exit the driver here. No bubble-up, no release_pending_op_slot
+        // (handled by the originator's completion path).
+        return Ok(());
+    }
+
+    let round_trip = if upgrade_to_streaming {
+        let stream_id = StreamId::next_operations();
+        tracing::info!(
+            tx = %incoming_tx,
+            contract = %key,
+            target = %next_addr,
+            payload_size,
+            %stream_id,
+            phase = "relay_put_forward_upgrade",
+            "PUT relay (task-per-tx): payload exceeds threshold, upgrading to streaming"
+        );
+        let metadata_msg = NetMessage::from(PutMsg::RequestStreaming {
+            id: incoming_tx,
+            stream_id,
+            contract_key: key,
+            total_size: payload_size as u64,
+            htl: new_htl,
+            skip_list: new_skip_list.clone(),
+            // Relay path never carries client subscribe intent; only the
+            // originator's `start_client_put` triggers post-PUT
+            // subscription.
+            subscribe: false,
+        });
+
+        // Install the reply waiter BEFORE dispatching stream fragments.
+        // A fast downstream Response could otherwise race the
+        // `pending_op_results` insertion and be dropped as
+        // OpNotPresent. Mirrors the metadata-first ordering used by
+        // `start_relay_put_streaming`.
+        let mut reply_rx = match ctx
+            .send_to_and_register_waiter(next_addr, metadata_msg)
+            .await
+        {
+            Ok(rx) => rx,
+            Err(err) => {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    target = %next_addr,
+                    error = %err,
+                    "PUT relay (task-per-tx): streaming-upgrade send_to_and_register_waiter failed"
+                );
+                op_manager.release_pending_op_slot(incoming_tx).await;
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = conn_manager
+            .send_stream(
+                next_addr,
+                stream_id,
+                bytes::Bytes::from(payload_bytes),
+                None,
+            )
+            .await
+        {
+            tracing::warn!(
+                tx = %incoming_tx,
+                contract = %key,
+                target = %next_addr,
+                %stream_id,
+                error = %err,
+                "PUT relay (task-per-tx): send_stream failed during streaming upgrade"
+            );
+            op_manager.release_pending_op_slot(incoming_tx).await;
+            return Err(OpError::NotificationChannelError(format!(
+                "send_stream failed: {err}"
+            )));
+        }
+
+        tokio::time::timeout(OPERATION_TTL, async move {
+            reply_rx.recv().await.ok_or(OpError::NotificationError)
+        })
+        .await
+    } else {
+        let forward = NetMessage::from(PutMsg::Request {
+            id: incoming_tx,
+            contract,
+            related_contracts,
+            value: merged_value,
+            htl: new_htl,
+            skip_list: new_skip_list,
+        });
+        tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(next_addr, forward)).await
+    };
 
     // Release the pending_op_results slot that send_to_and_await
     // installed. The downstream reply has already been delivered (or
@@ -885,6 +1118,13 @@ async fn drive_relay_put(
                 error = %err,
                 "PUT relay (task-per-tx): send_to_and_await failed"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&key),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Put,
+            );
             return Err(err);
         }
         Err(_elapsed) => {
@@ -895,11 +1135,21 @@ async fn drive_relay_put(
                 timeout_secs = OPERATION_TTL.as_secs(),
                 "PUT relay (task-per-tx): downstream timed out"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&key),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Put,
+            );
             return Err(OpError::UnexpectedOpState);
         }
     };
 
     // ── Step 4: Classify reply and bubble Response upstream ────────────────
+    // Feed the relay's downstream-peer choice into the local Router so
+    // future routing decisions are informed by relay-observed outcomes,
+    // not just events from ops this node originated.
     match reply {
         NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key: reply_key, .. })) => {
             tracing::info!(
@@ -907,6 +1157,13 @@ async fn drive_relay_put(
                 contract = %reply_key,
                 phase = "relay_put_bubble",
                 "PUT relay (task-per-tx): downstream returned Response; bubbling upstream"
+            );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&reply_key),
+                crate::router::RouteOutcome::SuccessUntimed,
+                crate::node::network_status::OpType::Put,
             );
             relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
         }
@@ -924,9 +1181,19 @@ async fn drive_relay_put(
                 "PUT relay (task-per-tx): downstream returned ResponseStreaming — \
                  synthesizing non-streaming Response upstream (slice A limitation)"
             );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&reply_key),
+                crate::router::RouteOutcome::SuccessUntimed,
+                crate::node::network_status::OpType::Put,
+            );
             relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
         }
         other => {
+            // Unexpected reply variant: unclear whether it's a local
+            // bug or peer misbehaviour. Do NOT record a route event;
+            // the helper invariant is one event per unambiguous attribution.
             tracing::warn!(
                 tx = %incoming_tx,
                 contract = %key,
@@ -1056,6 +1323,18 @@ async fn relay_put_finalize_local(
 
 /// Send `PutMsg::Response` upstream (fire-and-forget: upstream relay
 /// awaits via its own `send_to_and_await`, no reply expected).
+///
+/// Originator-loopback case (`upstream_addr == own_addr`, added in
+/// #1454 phase 5 final PUT slice): when the relay driver is running
+/// on the originator's own node — because `start_client_put`'s
+/// `send_and_await(target=None)` looped the Request back into the
+/// local event loop and the dispatch site mapped `source_addr=None`
+/// to `upstream=own_addr` — the Response cannot ship over the wire
+/// (no self-connection). Route via `send_local_loopback` so the
+/// message lands as an `InboundMessage`, hits the PUT bypass in
+/// `handle_pure_network_message_v1`, and forwards to the originator's
+/// `pending_op_results` waiter. Mirrors the legacy `LocalCompletion`
+/// terminal-reply contract.
 async fn relay_put_send_response(
     op_manager: &OpManager,
     incoming_tx: Transaction,
@@ -1067,9 +1346,16 @@ async fn relay_put_send_response(
         key,
     });
     let mut ctx = op_manager.op_ctx(incoming_tx);
-    ctx.send_fire_and_forget(upstream_addr, msg)
-        .await
-        .map_err(|_| OpError::NotificationError)
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    if Some(upstream_addr) == own_addr {
+        ctx.send_local_loopback(msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    } else {
+        ctx.send_fire_and_forget(upstream_addr, msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    }
 }
 
 // ── Relay streaming PUT driver (#1454 phase 5 follow-up slice B) ────────────
@@ -1529,6 +1815,11 @@ where
     .await?;
 
     // ── Step 7: Await downstream reply (if piping), then bubble upstream ──
+    //
+    // Per-relay routing-event recording: the relay's chosen `next_hop`
+    // either responded usefully (Success) or didn't (Failure). Feeding
+    // these into the local Router lets the failure-probability model
+    // learn from forwarded traffic, not just originator-side ops.
     if let Some((next_addr, mut rx)) = downstream_reply_rx {
         let reply = match tokio::time::timeout(OPERATION_TTL, rx.recv()).await {
             Ok(Some(reply)) => reply,
@@ -1538,6 +1829,15 @@ where
                     target = %next_addr,
                     "PUT streaming relay (task-per-tx): downstream reply channel closed before reply"
                 );
+                if let Some(ref peer) = next_hop {
+                    crate::operations::record_relay_route_event(
+                        op_manager,
+                        peer.clone(),
+                        crate::ring::Location::from(&key),
+                        crate::router::RouteOutcome::Failure,
+                        crate::node::network_status::OpType::Put,
+                    );
+                }
                 op_manager.release_pending_op_slot(incoming_tx).await;
                 return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
             }
@@ -1547,6 +1847,15 @@ where
                     target = %next_addr,
                     "PUT streaming relay (task-per-tx): downstream reply timed out"
                 );
+                if let Some(ref peer) = next_hop {
+                    crate::operations::record_relay_route_event(
+                        op_manager,
+                        peer.clone(),
+                        crate::ring::Location::from(&key),
+                        crate::router::RouteOutcome::Failure,
+                        crate::node::network_status::OpType::Put,
+                    );
+                }
                 op_manager.release_pending_op_slot(incoming_tx).await;
                 return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
             }
@@ -1564,9 +1873,21 @@ where
                     phase = "relay_put_streaming_bubble",
                     "PUT streaming relay (task-per-tx): downstream replied; bubbling Response upstream"
                 );
+                if let Some(ref peer) = next_hop {
+                    crate::operations::record_relay_route_event(
+                        op_manager,
+                        peer.clone(),
+                        crate::ring::Location::from(&reply_key),
+                        crate::router::RouteOutcome::SuccessUntimed,
+                        crate::node::network_status::OpType::Put,
+                    );
+                }
                 relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
             }
             other => {
+                // Unexpected reply variant: unclear attribution. Skip the
+                // route-event hook (matches the non-streaming relay's
+                // unexpected-variant arm).
                 tracing::warn!(
                     tx = %incoming_tx,
                     contract = %key,
@@ -1850,7 +2171,7 @@ mod tests {
 
     fn relay_section(src: &str) -> &str {
         let start = src
-            .find("pub(crate) async fn start_relay_put(")
+            .find("pub(crate) async fn start_relay_put<CB>(")
             .expect("start_relay_put not found");
         let end = src
             .find("\n#[cfg(test)]")
@@ -1864,7 +2185,7 @@ mod tests {
     /// false positives from slice B's legitimate references.
     fn relay_slice_a_section(src: &str) -> &str {
         let start = src
-            .find("pub(crate) async fn start_relay_put(")
+            .find("pub(crate) async fn start_relay_put<CB>(")
             .expect("start_relay_put not found");
         let end = src
             .find("// ── Relay streaming PUT driver")
@@ -1882,7 +2203,7 @@ mod tests {
         let src = include_str!("op_ctx_task.rs");
         let relay = relay_section(src);
         let window_start = relay
-            .find("pub(crate) async fn start_relay_put(")
+            .find("pub(crate) async fn start_relay_put<CB>(")
             .expect("entry-point not found");
         let spawn_pos = relay[window_start..]
             .find("GlobalExecutor::spawn(run_relay_put(")
@@ -1944,11 +2265,21 @@ mod tests {
     /// relay IS req/response (like GET), so we need the reply to bubble
     /// upstream. If this flips to `send_fire_and_forget`, downstream
     /// Response never makes it back to originator.
+    ///
+    /// As of PR #4063, the driver has two forward paths:
+    /// - non-streaming: `ctx.send_to_and_await(...)` — pinned here
+    /// - upgrade-to-streaming: `ctx.send_to_and_register_waiter(...) +
+    ///   conn_manager.send_stream(...)` — pinned by
+    ///   `drive_relay_put_upgrades_when_payload_exceeds_threshold`
+    ///
+    /// Both await downstream Response via `pending_op_results` (waiter
+    /// receiver in the streaming branch, callback in the non-streaming
+    /// branch). Neither uses `send_fire_and_forget`.
     #[test]
-    fn drive_relay_put_forwards_via_send_to_and_await() {
+    fn drive_relay_put_non_streaming_path_uses_send_to_and_await() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
-            .find("async fn drive_relay_put(")
+            .find("async fn drive_relay_put<CB>(")
             .expect("drive_relay_put not found");
         let driver_end = src[driver_start..]
             .find("\nasync fn relay_put_finalize_local(")
@@ -1957,13 +2288,137 @@ mod tests {
         let driver_src = &src[driver_start..driver_end];
         assert!(
             driver_src.contains("ctx.send_to_and_await("),
-            "drive_relay_put must forward downstream via send_to_and_await \
-             so the downstream Response bubbles back to this relay"
+            "drive_relay_put non-streaming relay path (not loopback) must \
+             forward downstream via send_to_and_await so the downstream \
+             Response bubbles back to the relay's waiter"
+        );
+        // The driver MAY use `send_fire_and_forget` in the
+        // originator-loopback branch (#1454 phase 5 final PUT slice):
+        // when `upstream_addr == own_addr`, installing a waiter would
+        // overwrite the originator's pending_op_results callback. The
+        // fire-and-forget forward lets the downstream Response return
+        // directly to the originator's still-installed callback. The
+        // pin verifies the loopback branch exists AND that the
+        // non-loopback branch still uses send_to_and_await.
+        assert!(
+            driver_src.contains("originator_loopback"),
+            "drive_relay_put must distinguish the originator-loopback \
+             branch from the true relay branch"
+        );
+    }
+
+    /// Pin: `relay_put_send_response` MUST switch to local-loopback
+    /// when `upstream_addr == own_addr`. Without this, the wire-bound
+    /// `send_fire_and_forget(own_addr, ...)` tries to ship over a
+    /// non-existent self-connection and the originator-loopback PUT
+    /// fails with "Cannot establish connection - peer not found".
+    /// Repro: `test_minimal_state_put_get` and the rest of
+    /// `edge_case_state_sizes` (#1454 phase 5 final, PUT slice fixup).
+    #[test]
+    fn relay_put_send_response_uses_loopback_when_upstream_is_own_addr() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn relay_put_send_response(")
+            .expect("relay_put_send_response not found");
+        let fn_end = src[fn_start..]
+            .find("\n// ── Relay streaming PUT driver")
+            .expect("end-of-relay-fn marker not found")
+            + fn_start;
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("send_local_loopback("),
+            "relay_put_send_response must call send_local_loopback for the \
+             upstream==own_addr branch (originator-loopback PUT path)"
         );
         assert!(
-            !driver_src.contains("send_fire_and_forget"),
-            "drive_relay_put must NOT fire-and-forget the downstream forward; \
-             PUT relay is req/response"
+            body.contains("get_own_addr()"),
+            "relay_put_send_response must compare upstream_addr to \
+             connection_manager.get_own_addr() to detect the loopback case"
+        );
+    }
+
+    /// Pin: `run_relay_put` MUST skip `release_pending_op_slot` when
+    /// running in originator-loopback mode (`upstream_addr ==
+    /// own_addr`). The `pending_op_results` callback for `incoming_tx`
+    /// in that mode is the originator's `send_and_await` waiter, not
+    /// one this driver installed; releasing it would emit
+    /// `TransactionCompleted` and remove the originator's callback
+    /// BEFORE the loopback `PutMsg::Response` reaches the bypass
+    /// (notifications channel has higher priority than op_execution
+    /// in priority_select). Repro: `test_minimal_state_put_get`.
+    #[test]
+    fn run_relay_put_skips_release_in_originator_loopback() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn run_relay_put<CB>(")
+            .expect("run_relay_put not found");
+        let fn_end = src[fn_start..]
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn drive_relay_put<CB>(")
+            .expect("end-of-run_relay_put marker not found")
+            + fn_start;
+        let body = &src[fn_start..fn_end];
+        // The release call must be guarded by an own_addr comparison.
+        let release_pos = body
+            .find("release_pending_op_slot(incoming_tx)")
+            .expect("release_pending_op_slot call not found in run_relay_put");
+        let preceding = &body[..release_pos];
+        assert!(
+            preceding.rfind("get_own_addr()").is_some(),
+            "run_relay_put must call get_own_addr() before \
+             release_pending_op_slot to gate the release on the \
+             upstream != own_addr case"
+        );
+        assert!(
+            preceding.rfind("Some(upstream_addr) != own_addr").is_some()
+                || preceding.rfind("upstream_addr) != own_addr").is_some()
+                || preceding.rfind("!originator_loopback").is_some(),
+            "run_relay_put must guard release_pending_op_slot with an \
+             upstream != own_addr check (originator-loopback exception)"
+        );
+    }
+
+    /// Pin: when `drive_relay_put` returns `Err` AND the driver is
+    /// running in originator-loopback mode (`upstream_addr ==
+    /// own_addr`), `run_relay_put` MUST publish a `HostResult::Err`
+    /// for `incoming_tx` via `send_client_result` and complete the
+    /// transaction. This mirrors the legacy `report_result` Err arm
+    /// (node.rs:636-651) — without this, an invalid-state PUT (e.g.,
+    /// `put_contract` rejection) leaves the originator's
+    /// `start_client_put` `send_and_await` waiter hanging until the
+    /// client times out. Repro: `test_put_error_notification` in
+    /// `crates/core/tests/error_notification.rs`.
+    #[test]
+    fn run_relay_put_publishes_error_on_loopback_failure() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn run_relay_put<CB>(")
+            .expect("run_relay_put not found");
+        let fn_end = src[fn_start..]
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn drive_relay_put<CB>(")
+            .expect("end-of-run_relay_put marker not found")
+            + fn_start;
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("originator_loopback"),
+            "run_relay_put must compute originator_loopback to gate the \
+             error-publication path"
+        );
+        assert!(
+            body.contains("send_client_result(incoming_tx"),
+            "run_relay_put must call send_client_result(incoming_tx, Err(_)) \
+             on driver failure in originator-loopback mode"
+        );
+        assert!(
+            body.contains("ErrorKind::OperationError"),
+            "run_relay_put must wrap the OpError in \
+             freenet_stdlib::client_api::ErrorKind::OperationError before \
+             publishing to the client"
+        );
+        assert!(
+            body.contains("op_manager.completed(incoming_tx)"),
+            "run_relay_put must call op_manager.completed(incoming_tx) \
+             after publishing the loopback-failure error so the tx is \
+             marked done"
         );
     }
 
@@ -1974,7 +2429,7 @@ mod tests {
     fn drive_relay_put_reuses_incoming_tx_on_forward() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
-            .find("async fn drive_relay_put(")
+            .find("async fn drive_relay_put<CB>(")
             .expect("drive_relay_put not found");
         let driver_end = src[driver_start..]
             .find("\nasync fn relay_put_finalize_local(")
@@ -2020,17 +2475,17 @@ mod tests {
         );
     }
 
-    /// Pin: slice A does NOT handle streaming variants. Dispatch gate
-    /// in node.rs filters them out; driver source must never reference
-    /// the streaming wire variants.
+    /// Pin: slice A handles inbound `Request` only, but MAY upgrade
+    /// the forward to `RequestStreaming` when the serialized payload
+    /// exceeds `streaming_threshold`. Inbound `RequestStreaming`
+    /// dispatch still belongs to slice B's
+    /// `start_relay_put_streaming`. Slice A must NOT build outbound
+    /// `ResponseStreaming` (relays bubble a non-streaming Response
+    /// upstream).
     #[test]
     fn slice_a_does_not_touch_put_streaming_variants() {
         let src = include_str!("op_ctx_task.rs");
         let relay = relay_slice_a_section(src);
-        assert!(
-            !relay.contains("PutMsg::RequestStreaming"),
-            "slice A must not handle PutMsg::RequestStreaming (belongs to slice B)"
-        );
         // ResponseStreaming IS referenced in one place: the downstream
         // reply classifier that synthesizes a non-streaming Response
         // upstream (documented limitation). Ensure NO branch BUILDS a
@@ -2056,7 +2511,7 @@ mod tests {
     fn drive_relay_put_stores_locally_before_forwarding() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
-            .find("async fn drive_relay_put(")
+            .find("async fn drive_relay_put<CB>(")
             .expect("drive_relay_put not found");
         let driver_end = src[driver_start..]
             .find("\nasync fn relay_put_store_locally(")
@@ -2094,6 +2549,144 @@ mod tests {
         assert!(
             helper_src.contains("announce_contract_hosted"),
             "helper MUST call announce_contract_hosted for first-time hosting"
+        );
+    }
+
+    // ── Upgrade-on-forward error paths (PR #4063) ─────────────────────
+    //
+    // The streaming branch of `drive_relay_put` introduces two error
+    // paths: (a) `send_to_and_register_waiter` fails, (b) `send_stream`
+    // fails. Each MUST release the per-tx `pending_op_results` slot
+    // BEFORE returning `Err`, otherwise the slot leaks until the 60 s
+    // periodic sweep and the test_pending_op_results_bounded regression
+    // guard in tests/simulation_integration.rs trips. These pins lock
+    // the slot-release ordering at the source level since the project's
+    // existing test pattern for relay-driver behaviour is structural
+    // (mock-runtime tests for the driver body would be a much bigger
+    // change — see drive_relay_put_streaming_* pins above for the same
+    // pattern in slice B).
+
+    fn drive_relay_put_body(src: &str) -> &str {
+        let start = src
+            .find("async fn drive_relay_put<CB>(")
+            .expect("drive_relay_put not found");
+        let end = src[start..]
+            .find("\nasync fn relay_put_store_locally(")
+            .expect("driver body end not found")
+            + start;
+        &src[start..end]
+    }
+
+    /// Pin: upgrade-on-forward branch MUST exist and contain both the
+    /// `RequestStreaming` build site and the `send_stream` raw fragment
+    /// dispatch.
+    #[test]
+    fn drive_relay_put_upgrades_when_payload_exceeds_threshold() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = drive_relay_put_body(src);
+        assert!(
+            body.contains("should_use_streaming("),
+            "drive_relay_put must call should_use_streaming on the merged payload"
+        );
+        assert!(
+            body.contains("PutMsg::RequestStreaming {"),
+            "drive_relay_put must build PutMsg::RequestStreaming on upgrade"
+        );
+        assert!(
+            body.contains("conn_manager\n            .send_stream(")
+                || body.contains("conn_manager.send_stream("),
+            "drive_relay_put must call NetworkBridge::send_stream after metadata send"
+        );
+    }
+
+    /// Bound the upgrade-on-forward analysis to the *relay-non-loopback*
+    /// branch of `drive_relay_put`. The originator-loopback branch
+    /// (added in #1454 phase 5 final PUT slice) intentionally does NOT
+    /// install a reply waiter — the originator's
+    /// `pending_op_results` callback already exists and the loopback
+    /// forward is fire-and-forget. The relay branch (`let round_trip =
+    /// if upgrade_to_streaming`) is the one that must install a
+    /// metadata-first waiter and release on error.
+    fn drive_relay_put_relay_branch(src: &str) -> &str {
+        let body = drive_relay_put_body(src);
+        let start = body
+            .find("let round_trip = if upgrade_to_streaming {")
+            .expect("relay-non-loopback round_trip branch not found");
+        let end = body[start..]
+            .find("};\n\n    // Release the pending_op_results slot")
+            .expect("relay branch end-marker not found")
+            + start;
+        &body[start..end]
+    }
+
+    /// Pin: `send_to_and_register_waiter` MUST install the reply waiter
+    /// BEFORE `send_stream` dispatches fragments in the relay-non-
+    /// loopback branch. Without this ordering, a fast downstream
+    /// Response arriving on the wire would race the
+    /// `pending_op_results` insertion and be dropped as OpNotPresent.
+    /// Mirrors the metadata-first ordering pinned for
+    /// `drive_relay_put_streaming`.
+    #[test]
+    fn drive_relay_put_upgrade_installs_waiter_before_send_stream() {
+        let src = include_str!("op_ctx_task.rs");
+        let branch = drive_relay_put_relay_branch(src);
+        let waiter_pos = branch
+            .find("send_to_and_register_waiter(")
+            .expect("send_to_and_register_waiter call missing in relay upgrade branch");
+        let stream_pos = branch
+            .find(".send_stream(")
+            .expect("send_stream call missing in relay upgrade branch");
+        assert!(
+            waiter_pos < stream_pos,
+            "send_to_and_register_waiter MUST run before send_stream so the \
+             reply waiter is installed before the first fragment lands"
+        );
+    }
+
+    /// Pin: BOTH error paths in the relay-non-loopback upgrade branch
+    /// MUST call `release_pending_op_slot(incoming_tx)` BEFORE
+    /// returning `Err`. Without the release, each failed upgrade leaks
+    /// one `pending_op_results` entry —
+    /// `test_pending_op_results_bounded` will flag the imbalance.
+    #[test]
+    fn drive_relay_put_upgrade_error_paths_release_slot() {
+        let src = include_str!("op_ctx_task.rs");
+        let branch = drive_relay_put_relay_branch(src);
+
+        // Find the `if upgrade_to_streaming {` opening (in this branch)
+        // and bound the window to the matching else.
+        let upgrade_start = branch
+            .find("if upgrade_to_streaming {")
+            .expect("upgrade_to_streaming branch not found in relay branch");
+        let upgrade_end = branch[upgrade_start..]
+            .find("} else {")
+            .expect("upgrade branch closing else not found")
+            + upgrade_start;
+        let upgrade = &branch[upgrade_start..upgrade_end];
+
+        // Each `return Err(` inside the upgrade branch must be
+        // preceded by a `release_pending_op_slot` call within a
+        // small window.
+        let mut search = 0;
+        let mut return_count = 0;
+        while let Some(pos) = upgrade[search..].find("return Err(") {
+            return_count += 1;
+            let abs = search + pos;
+            // Look back up to 400 chars (covers the tracing::warn!
+            // block + release call).
+            let window_start = abs.saturating_sub(400);
+            let window = &upgrade[window_start..abs];
+            assert!(
+                window.contains("release_pending_op_slot(incoming_tx)"),
+                "upgrade branch `return Err` at offset {abs} must be preceded by \
+                 release_pending_op_slot — leaks pending_op_results otherwise"
+            );
+            search = abs + "return Err(".len();
+        }
+        assert!(
+            return_count >= 2,
+            "expected at least 2 error-return paths in relay upgrade branch \
+             (send_to_and_register_waiter fail, send_stream fail); found {return_count}"
         );
     }
 
@@ -2301,7 +2894,10 @@ mod tests {
         let pos = b
             .find("downstream reply timed out")
             .expect("timeout arm not found");
-        let arm = &b[pos..pos + 400.min(b.len() - pos)];
+        // Window widened from 400 → 800 bytes to accommodate the
+        // record_relay_route_event hook inserted between the timeout
+        // log and the bubble-Response call.
+        let arm = &b[pos..pos + 800.min(b.len() - pos)];
         assert!(
             arm.contains("relay_put_send_response"),
             "timeout arm must still call relay_put_send_response so the \
@@ -2367,6 +2963,54 @@ mod tests {
             "send_to_and_register_waiter MUST precede pipe_stream so the \
              pending_op_results callback is installed before fragments \
              land downstream (otherwise a fast reply races past the waiter)"
+        );
+    }
+
+    /// Pin: each transport-failure arm of `drive_relay_put` records a
+    /// routing event for the chosen peer. Without these hooks, the
+    /// per-peer dashboard's failure-probability model is trained only
+    /// on originated PUT ops and the symptom this PR fixes reappears
+    /// for the relay path. Source-scrape because the behaviour is
+    /// positional inside the match and a deletion would not break any
+    /// unit-test assertion otherwise.
+    #[test]
+    fn drive_relay_put_records_route_events_on_transport_failure() {
+        let src = include_str!("op_ctx_task.rs");
+        // drive_relay_put body — non-streaming relay.
+        let body_start = src
+            .find("async fn drive_relay_put<CB>(")
+            .expect("drive_relay_put fn must exist");
+        let body_end = src[body_start..]
+            .find("/// Store a relayed PUT")
+            .map(|i| body_start + i)
+            .unwrap_or(src.len());
+        let body = &src[body_start..body_end];
+
+        for log_phrase in ["send_to_and_await failed", "downstream timed out"] {
+            let pos = body
+                .find(log_phrase)
+                .unwrap_or_else(|| panic!("expected `{log_phrase}` in drive_relay_put"));
+            let after = &body[pos..pos + 1500.min(body.len() - pos)];
+            assert!(
+                after.contains("record_relay_route_event")
+                    && after.contains("RouteOutcome::Failure"),
+                "drive_relay_put arm for `{log_phrase}` must call \
+                 record_relay_route_event with RouteOutcome::Failure. \
+                 Without this, transport failures from relay-forwarded \
+                 PUTs are dropped — the regression PR #4051 fixes."
+            );
+        }
+
+        // Success arms (Response and ResponseStreaming downgrade) must
+        // record SuccessUntimed.
+        let pos = body
+            .find("downstream returned Response; bubbling upstream")
+            .expect("Response success arm not found");
+        let after = &body[pos..pos + 1500.min(body.len() - pos)];
+        assert!(
+            after.contains("record_relay_route_event")
+                && after.contains("RouteOutcome::SuccessUntimed"),
+            "drive_relay_put Response arm must record SuccessUntimed."
         );
     }
 }

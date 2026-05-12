@@ -176,6 +176,14 @@ async fn run_client_get(
     subscribe: bool,
     blocking_subscribe: bool,
 ) {
+    // RAII guard: clears the ops.get entry that the originator
+    // loopback pushes via legacy process_message::GetMsg::Request
+    // (#4066; full rationale in .claude/rules/operations.md).
+    let _completion_guard = ClientGetCompletionGuard {
+        op_manager: op_manager.clone(),
+        client_tx,
+    };
+
     let outcome = drive_client_get(
         op_manager.clone(),
         client_tx,
@@ -186,6 +194,20 @@ async fn run_client_get(
     )
     .await;
     deliver_outcome(&op_manager, client_tx, outcome);
+}
+
+/// RAII guard that calls `op_manager.completed(client_tx)` on drop,
+/// covering every exit path including panics. Documented at the
+/// guard installation site in `run_client_get`.
+struct ClientGetCompletionGuard {
+    op_manager: Arc<OpManager>,
+    client_tx: Transaction,
+}
+
+impl Drop for ClientGetCompletionGuard {
+    fn drop(&mut self) {
+        self.op_manager.completed(self.client_tx);
+    }
 }
 
 /// GET driver has exactly two outcomes, matching PUT 3a.
@@ -266,17 +288,25 @@ async fn drive_client_get_inner(
         retries: 0,
         current_target,
         attempt_visited: VisitedPeers::new(&client_tx),
+        request_sent_at: None,
+        response_received_at: None,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "get", &mut driver).await;
 
+    // `op_manager.completed(client_tx)` runs from the
+    // `ClientGetCompletionGuard` in `run_client_get` AFTER this fn
+    // returns (and the side-effect block below has run). Do not add
+    // explicit `completed()` calls in the arms here — doing so would
+    // race the originator-side side effects (`cache_contract_locally`,
+    // `auto_subscribe_on_get_response`, `maybe_subscribe_child`)
+    // because once the tx is in `ops.completed`, any
+    // `op_manager.push(...)` for that tx is silently dropped (see
+    // `op_state_manager.rs::push` short-circuit on
+    // `ops.completed.contains`).
+
     match loop_result {
         RetryLoopOutcome::Done(terminal) => {
-            // Clean up any DashMap entry left behind. `op_manager.completed`
-            // is idempotent, so calling it even when the driver never
-            // pushed is harmless.
-            op_manager.completed(client_tx);
-
             // Mirror the originator-side side effects that the legacy
             // `process_message` Response{Found} branch does
             // (`get.rs:2218–2450`): PutQuery the fetched state into
@@ -294,12 +324,36 @@ async fn drive_client_get_inner(
             // would fail with OpNotPresent for a task-per-tx op), so
             // the driver is the only place these side effects can
             // happen for Phase 3b.
+            // Payload accounting for the router's `transfer_rate_estimator`
+            // (router.rs:443) and `response_start_time_estimator`
+            // (router.rs:405). Set on the InlineFound/Streaming success
+            // paths; `Terminal::LocalCompletion` is the loopback
+            // Request-echo with no network round-trip — both stay zero
+            // AND we explicitly null the captured per-attempt timing
+            // below (see `timed_outcome`) to avoid poisoning the
+            // response-time model with sub-millisecond loopback latency
+            // samples attributed to `driver.current_target`.
+            let mut payload_size: usize = 0;
+            let mut transfer_duration: std::time::Duration = std::time::Duration::ZERO;
+
             let reply_key = match &terminal {
                 Terminal::InlineFound {
                     key,
                     state,
                     contract,
                 } => {
+                    // InlineFound delivers state + optional contract in
+                    // the same envelope as the Response header, so the
+                    // payload transfer time is effectively zero — the
+                    // bytes arrived alongside the response. The router
+                    // deliberately skips `transfer_rate_estimator`
+                    // observations with `transfer_time.is_zero()`
+                    // (router.rs:443) so InlineFound feeds response-time
+                    // only; the legacy `GetStats` shape did the same
+                    // thing for the same reason (no measurable transfer
+                    // phase for an envelope-bundled payload).
+                    payload_size =
+                        state.size() + contract.as_ref().map(|c| c.data().len()).unwrap_or(0);
                     cache_contract_locally(
                         op_manager,
                         *key,
@@ -314,7 +368,18 @@ async fn drive_client_get_inner(
                     key,
                     stream_id,
                     includes_contract,
+                    total_size,
                 } => {
+                    // `total_size` is the wire-authoritative payload byte
+                    // count from the `ResponseStreaming` header. Using it
+                    // here (rather than re-querying the local store after
+                    // `cache_contract_locally`) prevents a TOCTOU race
+                    // where a concurrent UPDATE for the same contract
+                    // would mis-attribute a different payload's size to
+                    // this GET's transfer-rate observation, and side-steps
+                    // a separate "store evicted before re-query"
+                    // failure mode (the LRU has finite capacity).
+                    payload_size = *total_size as usize;
                     // Assemble the stream and cache locally. Mirrors
                     // the legacy `process_message` streaming branch
                     // at `get.rs:2721-3196`. Uses `current_target`
@@ -322,6 +387,16 @@ async fn drive_client_get_inner(
                     // single-hop response case where the responder
                     // equals the selected target.
                     if let Some(peer_addr) = driver.current_target.socket_addr() {
+                        // `transfer_duration` covers stream claim +
+                        // assemble + deserialize + local cache write —
+                        // the same composite measurement the legacy
+                        // `GetStats::record_transfer_end` captured at
+                        // `get.rs:1542`. For small payloads near the
+                        // streaming threshold the local-work component
+                        // is non-negligible, but keeping the metric
+                        // composite matches the existing router prior
+                        // built on the legacy code path.
+                        let stream_start = tokio::time::Instant::now();
                         if let Err(e) = assemble_and_cache_stream(
                             op_manager,
                             peer_addr,
@@ -337,6 +412,14 @@ async fn drive_client_get_inner(
                                 "get (task-per-tx): stream assembly failed — \
                                  state will not be cached locally"
                             );
+                            // Assembly failed → don't emit a transfer-rate
+                            // observation (transfer_duration stays ZERO,
+                            // which makes the router skip the rate sample
+                            // at router.rs:443). The response-time
+                            // observation still goes through because the
+                            // header DID arrive.
+                        } else {
+                            transfer_duration = stream_start.elapsed();
                         }
                     } else {
                         tracing::warn!(
@@ -400,16 +483,59 @@ async fn drive_client_get_inner(
             // intercepted the Response. Without this, the router's
             // prediction model never receives GET success feedback.
             //
-            // The success flag tracks the actual client-visible
-            // outcome (`host_result.is_ok()`), not the wire-level
-            // reply — if the store re-query returned nothing, the
-            // client sees OperationError and telemetry must agree.
+            // Prefer the timed `Success` variant so the router's
+            // `response_start_time_estimator` and
+            // `transfer_rate_estimator` receive observations. Fall back
+            // to `SuccessUntimed` only when the reply was a loopback
+            // Request-echo (`Terminal::LocalCompletion`) — there is no
+            // wire round-trip to measure, so the captured per-attempt
+            // timing reflects pure in-process latency and would poison
+            // the response-time model with sub-millisecond samples
+            // attributed to the selected target peer. The other paths
+            // (InlineFound + Streaming) do measure real wire round-trip
+            // time. Without timed Success on those paths the dashboard's
+            // Response Time and Transfer Rate charts stay permanently
+            // empty because those estimators are fed exclusively from
+            // `RouteOutcome::Success`. The success flag tracks the
+            // actual client-visible outcome (`host_result.is_ok()`), not
+            // the wire-level reply — if the store re-query returned
+            // nothing the client sees `OperationError` and telemetry
+            // must agree.
             let contract_location = Location::from(&reply_key);
+            let timed_outcome = if matches!(terminal, Terminal::LocalCompletion) {
+                None
+            } else {
+                match (driver.request_sent_at, driver.response_received_at) {
+                    (Some(sent), Some(received)) if received >= sent => {
+                        Some(RouteOutcome::Success {
+                            time_to_response_start: received.duration_since(sent),
+                            payload_size,
+                            payload_transfer_time: transfer_duration,
+                        })
+                    }
+                    (Some(sent), Some(received)) => {
+                        // `tokio::time::Instant` is monotonic, so this
+                        // arm should be unreachable on real hardware.
+                        // Logging instead of silently masking guards
+                        // against a clock-source regression slipping in
+                        // unnoticed.
+                        tracing::warn!(
+                            tx = %client_tx,
+                            sent_at_elapsed_secs = sent.elapsed().as_secs_f64(),
+                            received_at_elapsed_secs = received.elapsed().as_secs_f64(),
+                            "get (task-per-tx): received < sent on winning attempt; \
+                             falling back to SuccessUntimed"
+                        );
+                        None
+                    }
+                    _ => None,
+                }
+            };
             let route_event = RouteEvent {
                 peer: driver.current_target.clone(),
                 contract_location,
                 outcome: if host_result.is_ok() {
-                    RouteOutcome::SuccessUntimed
+                    timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed)
                 } else {
                     RouteOutcome::Failure
                 },
@@ -446,11 +572,19 @@ async fn drive_client_get_inner(
 
             Ok(DriverOutcome::Publish(host_result))
         }
-        RetryLoopOutcome::Exhausted(cause) => {
-            Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                cause: cause.into(),
-            }
-            .into())))
+        RetryLoopOutcome::Exhausted(_cause) => {
+            // Exhaustion after retry loop means every peer either responded
+            // NotFound or the operation could not be forwarded at all
+            // (e.g., isolated gateway with zero ring connections). Surface
+            // as `ContractResponse::NotFound` so client integrations
+            // (`fdev`, `apps/freenet-ping`, integration tests) can
+            // distinguish "contract genuinely absent" from "operation
+            // failed". Mirrors the legacy `process_message`
+            // Response{NotFound} terminal arm at `get.rs:2470-2496`
+            // (pre-#1454 phase 5 final).
+            Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
+            ))))
         }
         RetryLoopOutcome::Unexpected => Err(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => Err(err),
@@ -467,6 +601,19 @@ struct GetRetryDriver<'a> {
     retries: usize,
     current_target: PeerKeyLocation,
     attempt_visited: VisitedPeers,
+    /// Wall-clock at the start of the most recent `build_request` call.
+    /// Paired with `response_received_at` (captured in `classify`) to
+    /// feed `time_to_response_start` into the router's isotonic
+    /// regression. The winning attempt's values are used. `tokio::time::Instant`
+    /// is auto-paused in test builds with `start_paused(true)`, so
+    /// simulation tests see virtual elapsed time rather than wall-clock —
+    /// matches the rest of `crates/core/`'s timing primitives.
+    request_sent_at: Option<tokio::time::Instant>,
+    /// Wall-clock when `classify` last returned a `Terminal` outcome.
+    /// Reset to `None` until a terminal arrives; non-terminal classify
+    /// outcomes (Retry / Unexpected) leave it untouched and the next
+    /// `build_request` overwrites `request_sent_at`.
+    response_received_at: Option<tokio::time::Instant>,
 }
 
 /// Terminal value for the GET driver.
@@ -490,11 +637,15 @@ enum Terminal {
     /// driver claims the stream, awaits assembly, and caches the
     /// assembled state + contract locally — mirroring what the
     /// legacy `process_message` streaming branch does at
-    /// `get.rs:2721-3196`.
+    /// `get.rs:2721-3196`. `total_size` carries the wire-authoritative
+    /// payload byte count from the streaming header so the driver
+    /// doesn't have to re-query the store post-assembly (which would
+    /// race a concurrent UPDATE for the same contract).
     Streaming {
         key: ContractKey,
         stream_id: StreamId,
         includes_contract: bool,
+        total_size: u64,
     },
     /// Request-echo from `forward_pending_op_result_if_completed` —
     /// state was already in the local store (via the pre-send
@@ -541,11 +692,13 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
             key,
             stream_id,
             includes_contract,
+            total_size,
             ..
         })) => AttemptOutcome::Terminal(Terminal::Streaming {
             key,
             stream_id,
             includes_contract,
+            total_size,
         }),
         NetMessage::V1(NetMessageV1::Get(GetMsg::Request { .. })) => {
             AttemptOutcome::Terminal(Terminal::LocalCompletion)
@@ -578,6 +731,10 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 
     fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {
+        // Capture send time per attempt. The winning attempt's timestamp
+        // is read after the retry loop returns to compute
+        // `time_to_response_start` for routing-prediction telemetry.
+        self.request_sent_at = Some(tokio::time::Instant::now());
         NetMessage::from(GetMsg::Request {
             id: attempt_tx,
             instance_id: self.instance_id,
@@ -589,7 +746,13 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 
     fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Terminal> {
-        classify(reply)
+        let outcome = classify(reply);
+        if matches!(outcome, AttemptOutcome::Terminal(_)) {
+            // Only capture on Terminal so non-terminal Retry/Unexpected
+            // outcomes leave the field as None until a terminal arrives.
+            self.response_received_at = Some(tokio::time::Instant::now());
+        }
+        outcome
     }
 
     fn advance(&mut self) -> AdvanceOutcome {
@@ -1071,10 +1234,50 @@ pub(crate) fn start_sub_op_get(
         tx,
         instance_id,
         return_contract_code,
-        out_tx,
+        None,
+        Some(out_tx),
     ));
 
     (tx, out_rx)
+}
+
+/// Spawn a sub-operation GET that targets a specific peer for its
+/// first hop (the legacy `start_targeted_op` migration site for
+/// UPDATE's auto-fetch). Fire-and-forget — the outcome is logged and
+/// the caller relies on the side effect (contract cached locally).
+///
+/// Used by `OpManager::try_auto_fetch_contract` when an UPDATE
+/// broadcast fails because the recipient lacks the contract's
+/// parameters: the directed target is the UPDATE sender, who is
+/// known to host the contract. If the directed peer responds
+/// `NotFound`, the retry loop falls back to `k_closest_potentially_hosting`
+/// just like a regular sub-op GET.
+pub(crate) fn start_targeted_sub_op_get(
+    op_manager: &OpManager,
+    instance_id: ContractInstanceId,
+    target: PeerKeyLocation,
+) -> Transaction {
+    let op_manager = Arc::new(op_manager.clone());
+
+    let tx = Transaction::new::<GetMsg>();
+
+    tracing::debug!(
+        %tx,
+        contract = %instance_id,
+        ?target,
+        "get (task-per-tx): spawning targeted sub-op task (UPDATE auto-fetch)"
+    );
+
+    GlobalExecutor::spawn(run_sub_op_get(
+        op_manager,
+        tx,
+        instance_id,
+        true, // auto-fetch always wants the contract code
+        Some(target),
+        None,
+    ));
+
+    tx
 }
 
 async fn run_sub_op_get(
@@ -1082,12 +1285,64 @@ async fn run_sub_op_get(
     tx: Transaction,
     instance_id: ContractInstanceId,
     return_contract_code: bool,
-    out_tx: tokio::sync::oneshot::Sender<SubOpGetOutcome>,
+    initial_target: Option<PeerKeyLocation>,
+    out_tx: Option<tokio::sync::oneshot::Sender<SubOpGetOutcome>>,
 ) {
-    let outcome = drive_sub_op_get(&op_manager, tx, instance_id, return_contract_code).await;
-    // Receiver drop is acceptable — fire-and-forget callers expect this.
-    #[allow(clippy::let_underscore_must_use)]
-    let _ = out_tx.send(outcome);
+    // RAII guard: same loopback-cleanup as ClientGetCompletionGuard (#4066).
+    let _completion_guard = SubOpGetCompletionGuard {
+        op_manager: op_manager.clone(),
+        tx,
+    };
+
+    let outcome = drive_sub_op_get(
+        &op_manager,
+        tx,
+        instance_id,
+        return_contract_code,
+        initial_target,
+    )
+    .await;
+
+    if let Some(out_tx) = out_tx {
+        // Receiver drop is acceptable — fire-and-forget callers expect this.
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = out_tx.send(outcome);
+    } else {
+        // Fire-and-forget targeted auto-fetch. Log the outcome so operators
+        // can correlate UPDATE auto-fetch attempts to success/failure.
+        match outcome {
+            SubOpGetOutcome::Found(_) => tracing::info!(
+                %tx,
+                contract = %instance_id,
+                "get (task-per-tx targeted sub-op): UPDATE auto-fetch succeeded"
+            ),
+            SubOpGetOutcome::NotFound(cause) => tracing::warn!(
+                %tx,
+                contract = %instance_id,
+                cause,
+                "get (task-per-tx targeted sub-op): UPDATE auto-fetch did not find state"
+            ),
+            SubOpGetOutcome::Infra(err) => tracing::warn!(
+                %tx,
+                contract = %instance_id,
+                error = %err,
+                "get (task-per-tx targeted sub-op): UPDATE auto-fetch hit infra error"
+            ),
+        }
+    }
+}
+
+/// RAII guard counterpart to `ClientGetCompletionGuard` for sub-op
+/// GET drivers.
+struct SubOpGetCompletionGuard {
+    op_manager: Arc<OpManager>,
+    tx: Transaction,
+}
+
+impl Drop for SubOpGetCompletionGuard {
+    fn drop(&mut self) {
+        self.op_manager.completed(self.tx);
+    }
 }
 
 async fn drive_sub_op_get(
@@ -1095,6 +1350,7 @@ async fn drive_sub_op_get(
     tx: Transaction,
     instance_id: ContractInstanceId,
     return_contract_code: bool,
+    initial_target: Option<PeerKeyLocation>,
 ) -> SubOpGetOutcome {
     let htl = op_manager.ring.max_hops_to_live;
 
@@ -1102,11 +1358,13 @@ async fn drive_sub_op_get(
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
         tried.push(own_addr);
     }
-    let initial_target = op_manager
-        .ring
-        .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
-        .into_iter()
-        .next();
+    let initial_target = initial_target.or_else(|| {
+        op_manager
+            .ring
+            .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
+            .into_iter()
+            .next()
+    });
     let current_target = match initial_target {
         Some(peer) => {
             if let Some(addr) = peer.socket_addr() {
@@ -1125,15 +1383,19 @@ async fn drive_sub_op_get(
         retries: 0,
         current_target,
         attempt_visited: VisitedPeers::new(&tx),
+        request_sent_at: None,
+        response_received_at: None,
     };
 
     let loop_result = drive_retry_loop(op_manager, tx, "get-subop", &mut driver).await;
 
+    // `op_manager.completed(tx)` runs from the
+    // `SubOpGetCompletionGuard` in `run_sub_op_get` AFTER this fn
+    // returns. See the matching comment in `drive_client_get_inner`.
+
     match loop_result {
         RetryLoopOutcome::Done(terminal) => {
-            op_manager.completed(tx);
-
-            let reply_key = match &terminal {
+            match &terminal {
                 Terminal::InlineFound {
                     key,
                     state,
@@ -1147,12 +1409,15 @@ async fn drive_sub_op_get(
                         false, // sub-op: not a client-originating GET
                     )
                     .await;
-                    *key
                 }
                 Terminal::Streaming {
                     key,
                     stream_id,
                     includes_contract,
+                    // Sub-op GETs don't feed the router (no RouteEvent
+                    // is emitted on the sub-op path), so payload size
+                    // attribution is irrelevant here.
+                    total_size: _,
                 } => {
                     if let Some(peer_addr) = driver.current_target.socket_addr() {
                         if let Err(e) = assemble_and_cache_stream(
@@ -1181,15 +1446,9 @@ async fn drive_sub_op_get(
                              cannot claim orphan stream"
                         );
                     }
-                    *key
                 }
-                Terminal::LocalCompletion => {
-                    match lookup_stored_key(op_manager, &instance_id).await {
-                        Some(k) => k,
-                        None => synthetic_key(&instance_id),
-                    }
-                }
-            };
+                Terminal::LocalCompletion => {}
+            }
 
             // Resolve a GetResult by re-querying the local store. Mirrors
             // `build_host_response` but returns the raw `GetResult` shape
@@ -1211,7 +1470,6 @@ async fn drive_sub_op_get(
                 }) => {
                     let client_contract = if return_contract_code { contract } else { None };
                     SubOpGetOutcome::Found(crate::operations::get::GetResult::new(
-                        reply_key,
                         state,
                         client_contract,
                     ))
@@ -1376,7 +1634,7 @@ async fn run_relay_get(
         incoming_tx,
     };
 
-    if let Err(err) = drive_relay_get(
+    let drive_result = drive_relay_get(
         &op_manager,
         incoming_tx,
         instance_id,
@@ -1386,8 +1644,9 @@ async fn run_relay_get(
         fetch_contract,
         subscribe,
     )
-    .await
-    {
+    .await;
+
+    if let Err(err) = &drive_result {
         tracing::warn!(
             tx = %incoming_tx,
             %instance_id,
@@ -1405,6 +1664,18 @@ async fn run_relay_get(
     // removes the entry immediately so `test_pending_op_results_bounded`
     // stays under its leak ceiling.
     //
+    // Originator-loopback exception (#1454 phase 5 final GET slice,
+    // mirrors PUT slice): when this driver runs on the originator's
+    // own node (`upstream_addr == own_addr`), the
+    // `pending_op_results` callback for `incoming_tx` is the
+    // originator's `send_and_await` waiter — NOT one this driver
+    // installed. Releasing it here would emit `TransactionCompleted`
+    // and remove the originator's callback BEFORE the loopback
+    // `GetMsg::Response` arrives at the bypass, racing the
+    // originator's wait. The originator's own driver completion path
+    // (via `ClientGetCompletionGuard` → `release_pending_op_slot`)
+    // cleans up the slot.
+    //
     // Yield first so any in-flight `send_fire_and_forget` has time to
     // run through the event loop's `handle_op_execution` and actually
     // INSERT into `pending_op_results`. `release_pending_op_slot` uses
@@ -1412,8 +1683,12 @@ async fn run_relay_get(
     // the TransactionCompleted arrives before the insert and the
     // cleanup is a no-op (per the caveat in `OpCtx::send_fire_and_forget`
     // docs).
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let originator_loopback = Some(upstream_addr) == own_addr;
     tokio::task::yield_now().await;
-    op_manager.release_pending_op_slot(incoming_tx).await;
+    if !originator_loopback {
+        op_manager.release_pending_op_slot(incoming_tx).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1583,8 +1858,22 @@ async fn relay_send_not_found(
         result: GetMsgResult::NotFound,
     });
     let mut ctx = op_manager.op_ctx(tx);
-    // Fire-and-forget — relay doesn't await the upstream's ack.
-    if let Err(err) = ctx.send_fire_and_forget(upstream_addr, msg).await {
+    // Originator-loopback: when this driver runs on the originator's
+    // own node (`upstream_addr == own_addr`), routing the wire-bound
+    // `send_fire_and_forget(own_addr, ...)` would attempt a
+    // self-connection (no peer entry exists for own_addr). Use
+    // `send_local_loopback` to route as `InboundMessage` instead, so
+    // the bypass at `handle_pure_network_message_v1` can forward the
+    // terminal Response to the originator's `pending_op_results`
+    // waiter. Mirrors PUT slice's `relay_put_send_response` loopback
+    // branch (#1454 phase 5 final, GET slice fixup).
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let send_result = if Some(upstream_addr) == own_addr {
+        ctx.send_local_loopback(msg).await
+    } else {
+        ctx.send_fire_and_forget(upstream_addr, msg).await
+    };
+    if let Err(err) = send_result {
         tracing::warn!(
             tx = %tx,
             %instance_id,
@@ -1618,10 +1907,19 @@ async fn relay_send_found(
         },
     });
     let mut ctx = op_manager.op_ctx(tx);
-    // Fire-and-forget toward upstream — relay doesn't await upstream's ack.
-    ctx.send_fire_and_forget(upstream_addr, msg)
-        .await
-        .map_err(|_| OpError::NotificationError)
+    // Originator-loopback: route via `send_local_loopback` to avoid
+    // the wire-bound self-connection failure. See `relay_send_not_found`
+    // for the full rationale (#1454 phase 5 final, GET slice fixup).
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    if Some(upstream_addr) == own_addr {
+        ctx.send_local_loopback(msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    } else {
+        ctx.send_fire_and_forget(upstream_addr, msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1857,8 +2155,47 @@ async fn drive_relay_get_inner(
             subscribe,
         });
 
-        // Send to downstream peer and await reply (keyed on incoming_tx).
+        // Originator-loopback: when the relay driver runs on the
+        // originator's own node, `incoming_tx == client_tx`. Calling
+        // `send_to_and_await(peer_addr, ...)` would install a NEW
+        // `pending_op_results[client_tx]` callback OVERWRITING the
+        // originator's `start_client_get` waiter (`handle_op_execution`
+        // calls `state.pending_op_results.insert(...)` which overwrites).
+        // The peer's downstream Response would then land in the
+        // relay-driver's callback and never reach the client driver.
+        //
+        // Fix: in originator-loopback, fire-and-forget the downstream
+        // Request and exit without awaiting — `send_fire_and_forget`
+        // dispatches a callback whose receiver is dropped, so
+        // `handle_op_execution` skips the insert (closed-callback
+        // guard at p2p_protoc.rs). The peer's eventual Response
+        // returns over the wire, and the bypass at
+        // `handle_pure_network_message_v1` forwards it to the
+        // originator's still-installed callback. The client driver
+        // owns retry semantics; the relay driver has nothing to add.
+        // Mirrors PUT slice (#1454 phase 5 final, PUT slice) which
+        // uses the same fire-and-forget pattern in
+        // `drive_relay_put`'s originator-loopback branch.
+        let own_addr = op_manager.ring.connection_manager.get_own_addr();
+        let originator_loopback = Some(upstream_addr) == own_addr;
         let mut ctx = op_manager.op_ctx(incoming_tx);
+        if originator_loopback {
+            if let Err(err) = ctx.send_fire_and_forget(peer_addr, request).await {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    target = %peer,
+                    error = %err,
+                    "GET relay (task-per-tx, loopback): \
+                     send_fire_and_forget failed"
+                );
+                // Fall through to NotFound — client driver waiter
+                // owns the retry decision.
+                return Err(err);
+            }
+            // Exit driver: client driver owns the response handling.
+            return Ok(());
+        }
+
         let round_trip =
             tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(peer_addr, request)).await;
 
@@ -1874,6 +2211,17 @@ async fn drive_relay_get_inner(
                     error = %err,
                     "GET relay (task-per-tx): send_to_and_await failed; advancing to next peer"
                 );
+                // Feed the relay's failed peer choice into the local Router
+                // so future routing decisions de-prioritize this peer. Without
+                // this hook, only originator-side failures train the router
+                // and per-peer dashboard panels stay empty on relay-heavy nodes.
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
+                );
                 // Continue loop to try next peer.
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -1884,6 +2232,13 @@ async fn drive_relay_get_inner(
                     target = %peer,
                     timeout_secs = OPERATION_TTL.as_secs(),
                     "GET relay (task-per-tx): attempt timed out; advancing to next peer"
+                );
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::Failure,
+                    crate::node::network_status::OpType::Get,
                 );
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -1917,6 +2272,18 @@ async fn drive_relay_get_inner(
                 cache_contract_locally(op_manager, key, state.clone(), contract.clone(), false)
                     .await;
 
+                // Feed the relay's successful peer choice into the local
+                // Router. Without this hook, only originator-side successes
+                // train the failure-probability model and per-peer dashboard
+                // panels stay empty on relay-heavy nodes.
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::SuccessUntimed,
+                    crate::node::network_status::OpType::Get,
+                );
+
                 // Bubble up to upstream.
                 relay_send_found(
                     op_manager,
@@ -1932,8 +2299,12 @@ async fn drive_relay_get_inner(
             }
             AttemptOutcome::Terminal(Terminal::Streaming { .. }) => {
                 // Streaming relay forwarding is out of scope for #3883 commit 1.
-                // Log and fall through to next peer (treat as NotFound for now).
-                // A follow-up PR will add proper chunk pipe-through.
+                // The downstream peer answered correctly with a streaming
+                // response; the relay's inability to forward streams is a
+                // local implementation gap, not a peer-routing failure. Do
+                // NOT record a route event here — penalising the peer for
+                // a relay-side limitation would systematically de-prioritise
+                // peers that happen to host large contracts.
                 tracing::warn!(
                     tx = %incoming_tx,
                     %instance_id,
@@ -1947,8 +2318,9 @@ async fn drive_relay_get_inner(
             }
             AttemptOutcome::Terminal(Terminal::LocalCompletion) => {
                 // A relay driver should never receive a Request-echo because
-                // `send_to_and_await` targets a specific remote peer (not loopback).
-                // If this arrives, treat it as Unexpected.
+                // `send_to_and_await` targets a specific remote peer (not
+                // loopback). If this arrives, it is a local protocol bug —
+                // not a peer-routing failure. Do NOT record a route event.
                 tracing::warn!(
                     tx = %incoming_tx,
                     %instance_id,
@@ -1958,10 +2330,23 @@ async fn drive_relay_get_inner(
                 continue;
             }
             AttemptOutcome::Retry => {
+                // Downstream peer correctly answered NotFound. The peer
+                // behaved well at the protocol level — it just doesn't host
+                // this contract. Record `SuccessUntimed`: the failure-
+                // probability model should treat this peer as healthy, even
+                // though the relay tries another candidate for *this*
+                // contract location.
                 tracing::debug!(
                     tx = %incoming_tx,
                     target = %peer,
                     "GET relay (task-per-tx): downstream returned NotFound; advancing to next peer"
+                );
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::SuccessUntimed,
+                    crate::node::network_status::OpType::Get,
                 );
                 // Mark the failed peer so future iterations don't re-select it.
                 new_visited.mark_visited(peer_addr);
@@ -1969,6 +2354,10 @@ async fn drive_relay_get_inner(
                 continue;
             }
             AttemptOutcome::Unexpected => {
+                // Unexpected reply variant — could be a local bug or a peer
+                // misbehaviour. Without knowing which, do NOT record a route
+                // event; the helper's invariant is one event per
+                // unambiguously-attributable observation.
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %peer,
@@ -2129,6 +2518,113 @@ mod tests {
         assert!(
             retries >= MAX_RETRIES,
             "should exhaust at MAX_RETRIES={MAX_RETRIES}"
+        );
+    }
+
+    /// Regression for the peer-dashboard prediction-graph data-collection
+    /// regression: the client GET driver must emit a TIMED
+    /// `RouteOutcome::Success { time_to_response_start, payload_size,
+    /// payload_transfer_time }` on the success path so the router's
+    /// `response_start_time_estimator` and `transfer_rate_estimator`
+    /// receive observations. Before this fix the driver always emitted
+    /// `RouteOutcome::SuccessUntimed`, leaving the Response Time and
+    /// Transfer Rate charts on the peer dashboard permanently empty.
+    #[test]
+    fn drive_client_get_inner_emits_timed_success_on_success_path() {
+        let src = production_source();
+        let inner_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        let build_body =
+            extract_fn_body(src, "fn build_request(&mut self, attempt_tx: Transaction)");
+        let classify_body = extract_fn_body(src, "fn classify(&mut self, reply: NetMessage)");
+
+        // Driver must capture send time at attempt construction. The
+        // body must use `tokio::time::Instant::now()` — `std::time::Instant::now()`
+        // is banned in `crates/core/` by Rule Lint (see
+        // .claude/rules/code-style.md) AND would not virtualize under
+        // `start_paused(true)` in DST simulation tests.
+        assert!(
+            build_body.contains("self.request_sent_at = Some(tokio::time::Instant::now())"),
+            "GetRetryDriver::build_request must capture request_sent_at via \
+             tokio::time::Instant::now(); without this the Done branch has \
+             no `time_to_response_start`."
+        );
+        // Driver must capture receive time on Terminal classification.
+        assert!(
+            classify_body.contains("self.response_received_at = Some(tokio::time::Instant::now())"),
+            "GetRetryDriver::classify must capture response_received_at on \
+             Terminal via tokio::time::Instant::now(); without this the Done \
+             branch has no `time_to_response_start`."
+        );
+        // Done branch must construct a timed Success with all three fields.
+        assert!(
+            inner_body.contains("RouteOutcome::Success {")
+                && inner_body.contains("time_to_response_start")
+                && inner_body.contains("payload_size")
+                && inner_body.contains("payload_transfer_time"),
+            "drive_client_get_inner Done branch must build RouteOutcome::Success \
+             with time_to_response_start + payload_size + payload_transfer_time. \
+             Emitting SuccessUntimed instead leaves the router's response-time \
+             and transfer-rate estimators with zero observations forever \
+             (Failure-Probability-only peer-dashboard regression)."
+        );
+        // SuccessUntimed remains as a fallback when timing was not captured
+        // (e.g., Request-echo / LocalCompletion paths).
+        assert!(
+            inner_body.contains("RouteOutcome::SuccessUntimed"),
+            "Done branch must keep a SuccessUntimed fallback for paths \
+             without timing capture."
+        );
+        // The streaming path must use the wire-authoritative `total_size`
+        // rather than re-querying the store after assembly. Re-querying
+        // races a concurrent UPDATE on the same contract and can also
+        // return 0 if the LRU evicted the entry under cache pressure —
+        // both failure modes silently zero out the transfer-rate sample.
+        assert!(
+            inner_body.contains("payload_size = *total_size as usize"),
+            "Streaming branch must use wire-authoritative total_size for \
+             payload_size, not a post-assembly store re-query."
+        );
+        // The `Terminal::LocalCompletion` arm is a loopback Request-echo
+        // with no wire round-trip. Emitting timed Success there would
+        // poison the response-time model with sub-millisecond loopback
+        // samples attributed to the selected target peer.
+        assert!(
+            inner_body.contains("matches!(terminal, Terminal::LocalCompletion)"),
+            "Done branch must skip timed Success for Terminal::LocalCompletion \
+             (loopback Request-echo — no network round-trip to measure)."
+        );
+    }
+
+    /// Regression: when the GET retry loop exhausts all peers without a
+    /// Terminal classification, no `RouteOutcome::Success` is emitted.
+    /// A future "always emit a final route-event" refactor would silently
+    /// poison the success estimator with timed entries from peers that
+    /// returned NotFound for the whole retry chain.
+    #[test]
+    fn drive_client_get_inner_exhausted_does_not_emit_success() {
+        let src = production_source();
+        let inner_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        let exhausted_pos = inner_body
+            .find("RetryLoopOutcome::Exhausted(")
+            .expect("Done/Exhausted match must exist");
+        let exhausted_arm = &inner_body[exhausted_pos..];
+        // Bound the arm to the next match-arm by clipping at the next
+        // top-level `RetryLoopOutcome::` token.
+        let arm_end = exhausted_arm[1..]
+            .find("RetryLoopOutcome::")
+            .map(|p| p + 1)
+            .unwrap_or(exhausted_arm.len());
+        let arm_body = &exhausted_arm[..arm_end];
+        assert!(
+            !arm_body.contains("RouteOutcome::Success {"),
+            "Exhausted arm must NOT emit a timed RouteOutcome::Success — \
+             that would poison the response-time/transfer-rate estimators \
+             with synthetic data for peers that never produced a Terminal."
+        );
+        assert!(
+            !arm_body.contains("routing_finished("),
+            "Exhausted arm must NOT call routing_finished — no wire success \
+             attribution is appropriate for a peer set that returned NotFound."
         );
     }
 
@@ -2675,91 +3171,32 @@ mod tests {
     // already provided by `test_get_routing_coverage_low_htl` and
     // `test_get_reliability_*` (nightly).
 
-    // ── G1/G2: Dispatch gates live in node.rs ────────────────────────────
+    // ── Dispatch shape pin (#1454 phase 5 final, GET slice) ───────────────
+    //
+    // After the GET slice retired the legacy state machine, the GET arm
+    // in node.rs no longer falls through to `handle_op_request<GetOp>`
+    // and no longer gates relay dispatch on `has_get_op` /
+    // `source_addr.is_some()`. Originator-loopback (source_addr=None)
+    // is mapped to `upstream_addr=own_addr` so the same `start_relay_get`
+    // driver handles both true relay hops and originator-loopback. The
+    // structural guard for that shape lives at
+    // `node::tests::callback_forward_tests::get_branch_dispatches_relay_driver`.
 
-    /// G1: `source_addr.is_none()` (originator loopback from the phase-3b
-    /// client driver's `send_and_await(target=None)`) MUST NOT be routed
-    /// to the relay driver. The dispatch site in `node.rs` must check
-    /// `source_addr.is_some()` before calling `start_relay_get`; otherwise
-    /// the client driver's `Terminal::LocalCompletion` Request-echo contract
-    /// breaks and client-initiated GETs either hang or deadlock.
     #[test]
-    fn dispatch_gate_loopback_source_addr_none_uses_legacy() {
+    fn relay_dispatch_target_is_start_relay_get() {
         const NODE_RS: &str = include_str!("../../node.rs");
-        let dispatch_start = NODE_RS
-            .find("// #1454 phase 5 / #3883: relay GET task-per-tx dispatch.")
-            .expect("relay dispatch comment anchor must exist in node.rs");
-        let dispatch_end = NODE_RS[dispatch_start..]
-            .find("let op_result = handle_op_request::<get::GetOp, _>")
-            .expect("legacy fallthrough anchor must follow relay dispatch");
-        let block = &NODE_RS[dispatch_start..dispatch_start + dispatch_end];
-        assert!(
-            block.contains("if let Some(upstream_addr) = source_addr"),
-            "Relay dispatch block must gate on `source_addr.is_some()` so that \
-             originator loopback (source_addr=None from phase-3b client driver) \
-             falls through to the legacy `handle_op_request` path. Without this \
-             gate, the Request-echo contract `drive_client_get_inner::classify` \
-             relies on for Terminal::LocalCompletion breaks. See port plan §2."
-        );
-    }
-
-    /// G2: `has_get_op(id) == true` (GC-spawned retries, `start_targeted_op`
-    /// UPDATE auto-fetch) MUST NOT be routed to the relay driver. Those
-    /// callers register a `GetOp` in `OpManager.ops.get` BEFORE the
-    /// Request hits the wire and rely on the legacy `process_message`
-    /// re-entry loop for their state machine. The dispatch site in
-    /// `node.rs` must check `!op_manager.has_get_op(id)` before calling
-    /// `start_relay_get`.
-    #[test]
-    fn dispatch_gate_existing_get_op_uses_legacy() {
-        const NODE_RS: &str = include_str!("../../node.rs");
-        let dispatch_start = NODE_RS
-            .find("// #1454 phase 5 / #3883: relay GET task-per-tx dispatch.")
-            .expect("relay dispatch comment anchor must exist in node.rs");
-        let dispatch_end = NODE_RS[dispatch_start..]
-            .find("let op_result = handle_op_request::<get::GetOp, _>")
-            .expect("legacy fallthrough anchor must follow relay dispatch");
-        let block = &NODE_RS[dispatch_start..dispatch_start + dispatch_end];
-        assert!(
-            block.contains("!op_manager.has_get_op(id)"),
-            "Relay dispatch block must gate on `!op_manager.has_get_op(id)` so that \
-             GC-spawned retries and `start_targeted_op` (UPDATE auto-fetch) continue \
-             through the legacy `handle_op_request` path. Without this gate, the \
-             relay driver would hijack transactions the legacy state machine owns."
-        );
-    }
-
-    /// G3 (companion): the dispatch block must sit AFTER the
-    /// `try_forward_task_per_tx_reply` bypass (phase-3b terminal forward)
-    /// and BEFORE the legacy `handle_op_request` call, so that:
-    ///   - terminal Response/ResponseStreaming from phase-3b client driver
-    ///     get forwarded to its pending callback, NOT handed to the relay
-    ///     driver (which would spawn a spurious task);
-    ///   - legacy handling still runs for the loopback / has_get_op gated
-    ///     fall-through cases.
-    #[test]
-    fn dispatch_gate_ordering_bypass_before_relay_before_legacy() {
-        const NODE_RS: &str = include_str!("../../node.rs");
-        let get_arm = NODE_RS
+        let arm_start = NODE_RS
             .find("NetMessageV1::Get(ref op) => {")
             .expect("Get arm must exist in handle_pure_network_message_v1");
-        let tail = &NODE_RS[get_arm..];
-        let bypass_pos = tail
-            .find("try_forward_task_per_tx_reply")
-            .expect("phase-3b bypass must exist in Get arm");
-        let relay_pos = tail
-            .find("get::op_ctx_task::start_relay_get")
-            .expect("phase-5 relay dispatch must exist in Get arm");
-        let legacy_pos = tail
-            .find("handle_op_request::<get::GetOp, _>")
-            .expect("legacy fallthrough must exist in Get arm");
+        let next_variant = NODE_RS[arm_start..]
+            .find("NetMessageV1::Update(ref op) => {")
+            .expect("Update arm must follow Get arm")
+            + arm_start;
+        let arm = &NODE_RS[arm_start..next_variant];
         assert!(
-            bypass_pos < relay_pos && relay_pos < legacy_pos,
-            "Dispatch ordering in the Get arm must be: \
-             try_forward_task_per_tx_reply (phase-3b terminal bypass) \
-             THEN start_relay_get (phase-5 relay dispatch) \
-             THEN handle_op_request (legacy loopback + has_get_op fallthrough). \
-             Got bypass={bypass_pos}, relay={relay_pos}, legacy={legacy_pos}."
+            arm.contains("get::op_ctx_task::start_relay_get("),
+            "GET arm must dispatch fresh inbound Request to \
+             `get::op_ctx_task::start_relay_get`."
         );
     }
 
@@ -3166,41 +3603,161 @@ mod tests {
         );
     }
 
-    // ── N: Concurrent same-key GET — dispatch gate is per-tx, not per-key ──
-
-    /// The dispatch gate in `node.rs` is `!op_manager.has_get_op(id)` —
-    /// keyed on the transaction id, NOT the contract key/instance. This
-    /// means two concurrent relay GETs for the *same* contract (from
-    /// different upstreams) each get their own driver task, each its
-    /// own `incoming_tx`. This is intentional: each upstream expects a
-    /// reply on its own tx, so per-tx independence preserves the
-    /// upstream-reply invariant. Per-key dedup would break it.
-    ///
-    /// This test pins the documented semantic so a well-meaning "add
-    /// per-key dedup" refactor can't silently land.
+    // ── Per-tx independence pin (#1454 phase 5 final, GET slice) ──────────
+    //
+    // The legacy `has_get_op(id)` dispatch gate is gone. Per-tx
+    // independence is now enforced by `active_relay_get_txs` —
+    // `start_relay_get` rejects a duplicate inbound Request whose
+    // `incoming_tx` already has a live driver via the
+    // `Relay*InflightGuard` RAII pattern. Dedup remains keyed on
+    // transaction id (NOT contract instance id), so two concurrent
+    // relay GETs for the *same* contract from different upstreams each
+    // get their own driver task and their own upstream reply.
     #[test]
-    fn dispatch_gate_is_per_transaction_not_per_contract() {
-        const NODE_RS: &str = include_str!("../../node.rs");
-        let dispatch_start = NODE_RS
-            .find("// #1454 phase 5 / #3883: relay GET task-per-tx dispatch.")
-            .expect("relay dispatch comment anchor must exist in node.rs");
-        let dispatch_end = NODE_RS[dispatch_start..]
-            .find("let op_result = handle_op_request::<get::GetOp, _>")
-            .expect("legacy fallthrough anchor must follow relay dispatch");
-        let block = &NODE_RS[dispatch_start..dispatch_start + dispatch_end];
+    fn relay_inflight_dedup_is_per_transaction_not_per_contract() {
+        const SRC: &str = include_str!("../get/op_ctx_task.rs");
+        let guard_start = SRC
+            .find("RelayGetInflightGuard")
+            .expect("RelayGetInflightGuard must exist");
+        let window = &SRC[guard_start..(guard_start + 4000).min(SRC.len())];
         assert!(
-            block.contains("has_get_op(id)"),
-            "Dispatch gate must be keyed on `has_get_op(id)` (per-transaction), \
-             not `instance_id` / contract key (per-key). Per-key dedup would \
-             break the upstream-reply invariant: two upstreams GETting the \
-             same contract need independent replies, each on its own tx."
+            window.contains("active_relay_get_txs"),
+            "Relay GET inflight dedup must use `active_relay_get_txs` \
+             (per-transaction DashSet)."
         );
-        // Negative: no contract-key dedup construct in the dispatch block.
+        // Compose the negative-match needles at runtime so this test's
+        // own source doesn't match against `include_str!`.
+        let per_key_needle_a = format!("active_relay_get_{}", "keys");
+        let per_key_needle_b = format!("active_relay_get_{}", "instance_ids");
         assert!(
-            !block.contains("has_get_op(instance_id)")
-                && !block.contains("has_get_op(contract_id)"),
-            "Dispatch block must not gate on contract key (per-key dedup). \
-             Found a suspicious has_get_op variant: {block}"
+            !window.contains(&per_key_needle_a) && !window.contains(&per_key_needle_b),
+            "Inflight dedup must NOT key on contract instance id; per-key \
+             dedup would break the upstream-reply invariant."
+        );
+    }
+
+    /// Pin: `run_relay_get` MUST skip `release_pending_op_slot` when
+    /// running in originator-loopback mode (`upstream_addr ==
+    /// own_addr`). The `pending_op_results` callback for `incoming_tx`
+    /// in that mode is the originator's `send_and_await` waiter, not
+    /// one this driver installed; releasing it would emit
+    /// `TransactionCompleted` and remove the originator's callback
+    /// BEFORE the loopback `GetMsg::Response` reaches the bypass
+    /// (notifications channel has higher priority than op_execution
+    /// in priority_select). Repro: `test_get_notfound_no_forwarding_targets`
+    /// (#1454 phase 5 final, GET slice follow-up commit 6cb3ca18).
+    #[test]
+    fn run_relay_get_skips_release_in_originator_loopback() {
+        let src = include_str!("../get/op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn run_relay_get(")
+            .expect("run_relay_get not found");
+        // Bound the search window: `drive_relay_get` follows
+        // `run_relay_get` in source order, gated by the
+        // `clippy::too_many_arguments` attr.
+        let fn_end = src[fn_start..]
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn drive_relay_get(")
+            .expect("end-of-run_relay_get marker not found")
+            + fn_start;
+        let body = &src[fn_start..fn_end];
+        // The release call must be guarded by an own_addr comparison.
+        let release_pos = body
+            .find("release_pending_op_slot(incoming_tx)")
+            .expect("release_pending_op_slot call not found in run_relay_get");
+        let preceding = &body[..release_pos];
+        assert!(
+            preceding.rfind("get_own_addr()").is_some(),
+            "run_relay_get must call get_own_addr() before \
+             release_pending_op_slot to gate the release on the \
+             upstream != own_addr case"
+        );
+        assert!(
+            preceding.rfind("!originator_loopback").is_some(),
+            "run_relay_get must guard release_pending_op_slot with the \
+             `!originator_loopback` check (originator-loopback exception)"
+        );
+        assert!(
+            body.contains("originator_loopback"),
+            "run_relay_get must compute originator_loopback to gate the \
+             release path"
+        );
+    }
+
+    /// Pin: `relay_send_not_found` and `relay_send_found` MUST use
+    /// `send_local_loopback` when `upstream_addr == own_addr`.
+    /// Sending wire-bound `send_fire_and_forget(own_addr, ...)` would
+    /// attempt a UDP self-connection that has no peer entry, failing
+    /// silently. Routing as `InboundMessage` via `send_local_loopback`
+    /// lands at the bypass in `handle_pure_network_message_v1` and
+    /// forwards to the originator's `pending_op_results` waiter
+    /// (#1454 phase 5 final, GET slice fixup commit 8107da8a).
+    #[test]
+    fn relay_send_responses_use_local_loopback_on_own_addr() {
+        let src = include_str!("../get/op_ctx_task.rs");
+        for fn_name in [
+            "async fn relay_send_not_found(",
+            "async fn relay_send_found(",
+        ] {
+            let fn_start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("{fn_name} not found"));
+            // Bound the search at the next async fn declaration.
+            let fn_end = src[fn_start + fn_name.len()..]
+                .find("\nasync fn ")
+                .map(|idx| idx + fn_start + fn_name.len())
+                .unwrap_or(src.len());
+            let body = &src[fn_start..fn_end];
+            assert!(
+                body.contains("send_local_loopback("),
+                "{fn_name} must call send_local_loopback for \
+                 upstream==own_addr (originator-loopback path)"
+            );
+            assert!(
+                body.contains("get_own_addr()"),
+                "{fn_name} must compare upstream_addr to \
+                 connection_manager.get_own_addr() to detect loopback"
+            );
+        }
+    }
+
+    /// Pin: `drive_relay_get_inner`'s retry loop MUST switch to
+    /// `send_fire_and_forget` (no waiter install) when the relay
+    /// driver runs in originator-loopback. `send_to_and_await`
+    /// would `state.pending_op_results.insert(*tx, callback)`,
+    /// silently OVERWRITING the originator's `start_client_get`
+    /// waiter (`incoming_tx == client_tx` in loopback). The peer's
+    /// downstream Response would then land in the relay-driver's
+    /// callback and never reach the client driver. After loopback
+    /// dispatch, the driver returns immediately so the client
+    /// driver's still-installed callback receives the Response via
+    /// the bypass and owns retry semantics. Mirrors PUT slice's
+    /// `drive_relay_put` originator-loopback branch (#1454 phase 5
+    /// final, GET slice fixup commit 8107da8a).
+    #[test]
+    fn drive_relay_get_loopback_uses_fire_and_forget() {
+        let src = include_str!("../get/op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn drive_relay_get_inner(")
+            .expect("drive_relay_get_inner not found");
+        let fn_end = src[fn_start + "async fn drive_relay_get_inner(".len()..]
+            .find("\nasync fn ")
+            .map(|idx| idx + fn_start + "async fn drive_relay_get_inner(".len())
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("originator_loopback"),
+            "drive_relay_get_inner must compute originator_loopback \
+             in the retry loop to gate the waiter-install branch"
+        );
+        // `send_fire_and_forget(peer_addr` must appear in the loopback
+        // branch (compose at runtime so this test's own source doesn't
+        // match the negative-grep).
+        let needle = format!("send_fire_and_{}(peer_addr,", "forget");
+        assert!(
+            body.contains(&needle),
+            "drive_relay_get_inner loopback branch must use \
+             send_fire_and_forget(peer_addr, ...) to avoid overwriting \
+             the originator's pending_op_results waiter"
         );
     }
 
@@ -3550,19 +4107,189 @@ mod tests {
     /// constructor shape so future variant additions trip the test.
     #[test]
     fn sub_op_outcome_variants_constructible() {
-        use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, WrappedState};
+        use freenet_stdlib::prelude::WrappedState;
 
-        let id = ContractInstanceId::new([0u8; 32]);
-        let key =
-            ContractKey::from_id_and_code(id, freenet_stdlib::prelude::CodeHash::new([0u8; 32]));
         let state = WrappedState::from(vec![1u8, 2, 3]);
         let found =
-            super::SubOpGetOutcome::Found(crate::operations::get::GetResult::new(key, state, None));
+            super::SubOpGetOutcome::Found(crate::operations::get::GetResult::new(state, None));
         let not_found = super::SubOpGetOutcome::NotFound("exhausted".to_string());
         let infra = super::SubOpGetOutcome::Infra(crate::operations::OpError::UnexpectedOpState);
 
         assert!(matches!(found, super::SubOpGetOutcome::Found(_)));
         assert!(matches!(not_found, super::SubOpGetOutcome::NotFound(_)));
         assert!(matches!(infra, super::SubOpGetOutcome::Infra(_)));
+    }
+
+    /// Pin: each transport-level failure arm of `drive_relay_get_inner`
+    /// records a routing event for the failing peer. Without these
+    /// hooks, the per-peer dashboard's failure-probability model is
+    /// trained only on originated ops and the symptom this PR fixes
+    /// reappears for the relay path. Source-scrape because the
+    /// behaviour is positional inside the retry loop and a deletion
+    /// would not break any unit-test assertion otherwise.
+    #[test]
+    fn drive_relay_get_inner_records_route_events_on_transport_failure() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+
+        // The send_to_and_await error arm and the timeout arm must
+        // record `Failure` for the chosen peer. Identify each by its
+        // log-message phrase, then check the arm's body up to the
+        // `continue` for the helper call.
+        for log_phrase in [
+            "send_to_and_await failed; advancing to next peer",
+            "attempt timed out; advancing to next peer",
+        ] {
+            let pos = body.unwrap_or_default_pos(log_phrase);
+            let after = &body[pos..pos + 1500.min(body.len() - pos)];
+            assert!(
+                after.contains("record_relay_route_event")
+                    && after.contains("RouteOutcome::Failure"),
+                "drive_relay_get_inner arm for `{log_phrase}` must call \
+                 record_relay_route_event with RouteOutcome::Failure. \
+                 Without this, transport failures from relay-forwarded \
+                 GETs are dropped and the per-peer failure-probability \
+                 model regresses to the originator-only state that \
+                 motivated PR #4051."
+            );
+        }
+
+        // The InlineFound success arm must record SuccessUntimed.
+        let pos = body.unwrap_or_default_pos("downstream returned Found");
+        let after = &body[pos..pos + 1500.min(body.len() - pos)];
+        assert!(
+            after.contains("record_relay_route_event")
+                && after.contains("RouteOutcome::SuccessUntimed"),
+            "drive_relay_get_inner InlineFound arm must call \
+             record_relay_route_event with RouteOutcome::SuccessUntimed."
+        );
+
+        // The Retry/NotFound arm must record SuccessUntimed too — see
+        // the outcome-attribution rationale in operations.rs::record_relay_route_event
+        // rustdoc. A peer answering NotFound has not failed.
+        let pos = body.unwrap_or_default_pos("downstream returned NotFound; advancing");
+        let after = &body[pos..pos + 1500.min(body.len() - pos)];
+        assert!(
+            after.contains("record_relay_route_event")
+                && after.contains("RouteOutcome::SuccessUntimed"),
+            "drive_relay_get_inner Retry (NotFound) arm must call \
+             record_relay_route_event with RouteOutcome::SuccessUntimed \
+             (NotFound is a correct protocol response, not a routing \
+             failure). Recording it as Failure would systematically \
+             de-prioritise peers that don't host the queried contract."
+        );
+    }
+
+    /// Regression for #4066: the originator's first
+    /// `send_and_await(target=None)` loops back as an InboundMessage
+    /// with `source_addr=None`, which falls through to legacy
+    /// `process_message` (the relay-driver dispatch is gated on
+    /// `source_addr.is_some()`) and pushes a `GetOp` into
+    /// `OpManager.ops.get` keyed by `client_tx`. If the driver task
+    /// exits without `op_manager.completed()` having been called for
+    /// `client_tx`, the legacy entry lingers until the periodic GC
+    /// sweep at OPERATION_TTL=60s (which races the driver's
+    /// per-attempt timeout, also 60s) and emits a misleading
+    /// `phase=get_timeout` log + duplicate `OperationError` to the
+    /// client.
+    ///
+    /// Implemented via an RAII guard installed at the top of
+    /// `run_client_get` so cleanup runs on every exit path —
+    /// including a panic inside the driver loop, which the previous
+    /// per-arm `completed()` calls did not cover (skeptical-reviewer
+    /// callout on PR #4070, "panic / abort path still leaks").
+    /// Pin both the guard installation and the Drop impl that clears
+    /// the legacy entry.
+    #[test]
+    fn run_client_get_installs_completion_guard() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn run_client_get(");
+        assert!(
+            body.contains("ClientGetCompletionGuard {"),
+            "run_client_get must install a ClientGetCompletionGuard so the \
+             legacy ops.get entry created by the originator-loopback Request \
+             is cleared on every exit path including a driver panic (#4066). \
+             Per-arm completed() calls in drive_client_get_inner are NOT \
+             enough — a panic inside drive_retry_loop or any of its awaits \
+             aborts the task before reaching the match block, leaving the \
+             entry to be reaped by the GC sweep that emits phantom \
+             phase=get_timeout."
+        );
+        assert!(
+            body.contains("let _completion_guard = ClientGetCompletionGuard"),
+            "ClientGetCompletionGuard must be bound to a guard binding \
+             (`let _completion_guard = ...`) so it lives for the full \
+             function scope. A bare `let _ = ...` would drop it immediately."
+        );
+
+        // The guard's Drop must call op_manager.completed.
+        let drop_impl = src
+            .split("impl Drop for ClientGetCompletionGuard")
+            .nth(1)
+            .expect("ClientGetCompletionGuard must have an explicit Drop impl");
+        let drop_body = drop_impl
+            .split("fn drop")
+            .nth(1)
+            .expect("ClientGetCompletionGuard Drop impl must define fn drop");
+        // Bound the search to the body of fn drop — the next `}` after
+        // the opening `{` belongs to the inner block; we just need to
+        // confirm `completed(` appears somewhere inside the impl block.
+        assert!(
+            drop_body.contains(".completed(self.client_tx)"),
+            "ClientGetCompletionGuard::drop must call \
+             op_manager.completed(self.client_tx) — see #4066"
+        );
+    }
+
+    /// Same invariant for the sub-op driver: callers (executor's
+    /// `local_state_or_from_network`, subscribe's
+    /// `fetch_contract_if_missing`) feed the sub-op outcome into their
+    /// own logic, but the originator-loopback path that creates the
+    /// legacy `ops.get` entry runs on the SAME node, keyed by the
+    /// sub-op `tx`. Without the guard, the sub-op's caller observes a
+    /// clean failure but the node still emits `phase=get_timeout` 60s
+    /// later for the orphaned entry.
+    #[test]
+    fn run_sub_op_get_installs_completion_guard() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn run_sub_op_get(");
+        assert!(
+            body.contains("SubOpGetCompletionGuard {"),
+            "run_sub_op_get must install a SubOpGetCompletionGuard so the \
+             legacy ops.get entry created by the originator-loopback Request \
+             is cleared on every exit path — see \
+             run_client_get_installs_completion_guard for the failure mode \
+             (#4066)"
+        );
+        assert!(
+            body.contains("let _completion_guard = SubOpGetCompletionGuard"),
+            "SubOpGetCompletionGuard must be bound to a guard binding so it \
+             lives for the full function scope"
+        );
+
+        let drop_impl = src
+            .split("impl Drop for SubOpGetCompletionGuard")
+            .nth(1)
+            .expect("SubOpGetCompletionGuard must have an explicit Drop impl");
+        let drop_body = drop_impl
+            .split("fn drop")
+            .nth(1)
+            .expect("SubOpGetCompletionGuard Drop impl must define fn drop");
+        assert!(
+            drop_body.contains(".completed(self.tx)"),
+            "SubOpGetCompletionGuard::drop must call \
+             op_manager.completed(self.tx) — see #4066"
+        );
+    }
+
+    trait FindOrPanic {
+        fn unwrap_or_default_pos(&self, needle: &str) -> usize;
+    }
+    impl FindOrPanic for str {
+        fn unwrap_or_default_pos(&self, needle: &str) -> usize {
+            self.find(needle).unwrap_or_else(|| {
+                panic!("expected `{needle}` to appear in drive_relay_get_inner body")
+            })
+        }
     }
 }

@@ -4,7 +4,7 @@
 //! The local API server returns a "shell" page that holds the auth token and
 //! proxies WebSocket connections via postMessage, while the contract runs in an
 //! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals"
-//!         allow="clipboard-read; clipboard-write">`
+//!         allow="clipboard-read; clipboard-write; notifications; ...">`
 //! with an opaque origin that cannot access other contracts' data.
 //! Popups inherit the sandbox (no `allow-popups-to-escape-sandbox`); external links
 //! are opened via the `open_url` shell bridge message to avoid CORS issues. Sandbox content
@@ -30,6 +30,7 @@ use super::{
     app_packaging::{WebApp, WebContractError},
     client_api::HttpClientApiRequest,
     errors::WebSocketApiError,
+    web_permissions::{self, WebAppPermissionStore},
 };
 use tracing::{debug, instrument};
 
@@ -63,6 +64,7 @@ pub(super) async fn contract_home(
     assigned_token: AuthToken,
     api_version: ApiVersion,
     query_string: Option<String>,
+    permission_store: WebAppPermissionStore,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let instance_id = ContractInstanceId::from_bytes(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
@@ -81,10 +83,31 @@ pub(super) async fn contract_home(
     )
     .await?;
 
+    let contract_path = contract_web_path(&instance_id);
+    let manifest = web_permissions::load_manifest(&contract_path).await?;
+    let force_prompt = query_string
+        .as_ref()
+        .map(|qs| qs.split('&').any(|p| p == "permissions=retry"))
+        .unwrap_or(false);
+    let iframe_permissions = web_permissions::iframe_permissions(
+        &permission_store,
+        &instance_id,
+        &key,
+        manifest,
+        force_prompt,
+    )
+    .await;
+
     // Return the shell page instead of the contract HTML directly.
     // The shell page wraps the contract in a sandboxed iframe for
     // origin isolation (GHSA-824h-7x5x-wfmf).
-    match shell_page(&assigned_token, &key, api_version, query_string) {
+    match shell_page(
+        &assigned_token,
+        &key,
+        api_version,
+        query_string,
+        iframe_permissions,
+    ) {
         Ok(b) => Ok(b.into_response()),
         Err(err) => {
             tracing::error!("Failed to generate shell page: {err}");
@@ -414,7 +437,15 @@ fn shell_page(
     contract_key: &str,
     api_version: ApiVersion,
     query_string: Option<String>,
-) -> Result<impl IntoResponse, WebSocketApiError> {
+    iframe_permissions: web_permissions::IframePermissions,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    if let Some(prompt) = iframe_permissions.prompt {
+        return Ok(
+            web_permissions::prompt_html(&prompt, api_version, query_string.as_deref())
+                .into_response(),
+        );
+    }
+
     let version_prefix = api_version.prefix();
     let base_path = format!("/{version_prefix}/contract/web/{contract_key}/");
 
@@ -449,6 +480,8 @@ fn shell_page(
     // While browsers typically percent-encode special chars in URLs, we must not
     // rely on that for defense-in-depth.
     let iframe_src = html_escape_attr(&iframe_src_raw);
+    let sandbox_attr = html_escape_attr(&iframe_permissions.sandbox_attr);
+    let allow_attr = html_escape_attr(&iframe_permissions.allow_attr);
 
     // auth_token is base58 (alphanumeric only), safe for unescaped interpolation.
     let auth_token = auth_token.as_str();
@@ -471,7 +504,7 @@ fn shell_page(
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write" data-src="{iframe_src}"></iframe>
+<iframe id="app" sandbox="{sandbox_attr}" allow="{allow_attr}" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -480,7 +513,7 @@ fn shell_page(
 </html>"##
     );
 
-    Ok(Html(html))
+    Ok(Html(html).into_response())
 }
 
 /// Serves the contract's actual HTML content for display inside the sandboxed iframe.
@@ -617,6 +650,7 @@ function freenetBridge(authToken) {
   var iframe = document.getElementById('app');
   var connections = new Map();
   var lastClipboard = 0;
+  var lastDownload = 0;
 
   // Build iframe src from data-src, appending any URL hash for deep
   // linking. Using data-src (not src) in the HTML means the iframe
@@ -706,6 +740,99 @@ function freenetBridge(authToken) {
           lastClipboard = now;
           try { navigator.clipboard.writeText(msg.text.slice(0, 2048)); } catch(e) {}
         }
+      } else if (msg.type === 'download' &&
+                 typeof msg.filename === 'string' &&
+                 typeof msg.base64 === 'string') {
+        // Download proxy: contracts inside the sandboxed (null-origin)
+        // iframe can't reliably trigger file downloads — `<a download>`
+        // either silently fails (Firefox) or saves to an inaccessible
+        // location (Chrome). The shell runs in the real origin and
+        // can do it normally.
+        //
+        // Validation:
+        //  - filename: stripped of path separators and leading dots,
+        //    capped at 128 chars, no nulls
+        //  - mimeType: only a small allowlist (data URLs from arbitrary
+        //    types could be exploited by malicious contracts)
+        //  - base64: capped at ~10 MiB raw bytes
+        //  - rate-limit: 1 download per 2s, same reasoning as clipboard
+        var now2 = Date.now();
+        if (now2 - lastDownload < 2000) {
+          console.warn('[freenet] download rate-limited (>1 per 2s)');
+          return;
+        }
+        // Charge the rate-limit budget for *every* attempt (even rejected
+        // ones) so a malicious iframe can't burn host CPU by spamming
+        // invalid payloads at high frequency.
+        lastDownload = now2;
+        var rawName = msg.filename;
+        if (rawName.indexOf('\0') !== -1) {
+          console.warn('[freenet] download rejected: null byte in filename');
+          return;
+        }
+        // Strip path components — keep only the basename. Normalise
+        // both `/` and `\` so a malicious contract can't smuggle in a
+        // backslash on POSIX.
+        var slash = rawName.lastIndexOf('/');
+        if (slash >= 0) rawName = rawName.slice(slash + 1);
+        var bslash = rawName.lastIndexOf('\\');
+        if (bslash >= 0) rawName = rawName.slice(bslash + 1);
+        // Strip leading dots so a contract can't write a dotfile.
+        while (rawName.charAt(0) === '.') rawName = rawName.slice(1);
+        rawName = rawName.slice(0, 128);
+        if (rawName.length === 0) {
+          console.warn('[freenet] download rejected: empty filename after sanitisation');
+          return;
+        }
+        var mime = typeof msg.mimeType === 'string' ? msg.mimeType : 'application/octet-stream';
+        var ALLOWED_MIME = {
+          'application/json': 1,
+          'application/octet-stream': 1,
+          'text/plain': 1,
+          'text/csv': 1
+        };
+        // Disallowed MIMEs are downgraded to octet-stream rather than
+        // rejected, so callers always get *some* download — but log it
+        // so the contract author can fix the mismatch.
+        if (!ALLOWED_MIME[mime]) {
+          console.warn('[freenet] download MIME ' + mime + ' downgraded to application/octet-stream');
+          mime = 'application/octet-stream';
+        }
+        // base64 max length ≈ 4/3 * raw size; 10 MiB raw → ~13.4 MiB b64.
+        // Round up to 14 MiB for a small safety margin.
+        if (msg.base64.length > 14 * 1024 * 1024) {
+          console.warn('[freenet] download rejected: payload exceeds 14 MiB base64 cap');
+          return;
+        }
+        var raw;
+        try {
+          raw = atob(msg.base64);
+        } catch (e) {
+          console.warn('[freenet] download rejected: base64 decode failed');
+          return;
+        }
+        var len = raw.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) bytes[i] = raw.charCodeAt(i) & 0xff;
+        var blob;
+        try { blob = new Blob([bytes], { type: mime }); } catch (e) {
+          console.warn('[freenet] download rejected: Blob construction failed');
+          return;
+        }
+        var url;
+        try { url = URL.createObjectURL(blob); } catch (e) {
+          console.warn('[freenet] download rejected: createObjectURL failed');
+          return;
+        }
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = rawName;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        try { a.click(); } catch (e) {}
+        document.body.removeChild(a);
+        // Defer revoke so the browser has time to start the download.
+        setTimeout(function() { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
       } else if (msg.type === 'navigate' && typeof msg.href === 'string') {
         // Navigation from the sandboxed iframe. The iframe cannot navigate
         // the top window itself, so it postMessages the shell, which does
@@ -1017,6 +1144,9 @@ function freenetBridge(authToken) {
     '#__freenet_perm_overlay .fn-msg{font-size:15px;line-height:1.5;margin:0 0 22px 0;' +
     'padding:14px 16px;background:var(--bg);border-left:3px solid var(--warn);' +
     'border-radius:4px;white-space:pre-wrap;word-wrap:break-word;color:var(--fg);}' +
+    '#__freenet_perm_overlay .fn-msg-pre{font-family:ui-monospace,SFMono-Regular,' +
+    'Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.45;' +
+    'max-height:300px;overflow:auto;}' +
     '#__freenet_perm_overlay .fn-btns{display:flex;gap:10px;flex-wrap:wrap;}' +
     '#__freenet_perm_overlay .fn-btn{padding:10px 20px;border-radius:8px;' +
     'font-size:14px;cursor:pointer;flex:1;min-width:100px;font-weight:500;' +
@@ -1132,10 +1262,47 @@ function freenetBridge(authToken) {
     msgLabel.className = 'fn-msg-label';
     msgLabel.textContent = 'Delegate says:';
     card.appendChild(msgLabel);
-    var msg = document.createElement('p');
-    msg.className = 'fn-msg';
-    setText(msg, p.message || 'A delegate is requesting permission.');
-    card.appendChild(msg);
+    // Try to render the delegate-supplied message as pretty-printed JSON
+    // when it parses as JSON. Falls back to a plain paragraph for plain
+    // text. The pretty form makes structured token requests legible
+    // (#190) — users routinely see one-line blobs like
+    //   {"token":{"max_age":"31536000 seconds","tier":"Min10"},...}
+    // and have to mentally parse them to make a security decision.
+    //
+    // Security: still rendered via textContent (setText), so no HTML
+    // interpretation. Long values are wrapped via CSS (white-space:
+    // pre-wrap on .fn-msg-pre). Render is best-effort: any parse error
+    // falls back to the original raw string in a <p>.
+    var rawMsg = p.message || 'A delegate is requesting permission.';
+    var pretty = null;
+    if (typeof rawMsg === 'string' && rawMsg.length > 0) {
+      var trimmed = rawMsg.trim();
+      if (trimmed.length <= 64 * 1024 &&
+          (trimmed.charAt(0) === '{' || trimmed.charAt(0) === '[')) {
+        try {
+          var parsed = JSON.parse(trimmed);
+          pretty = JSON.stringify(parsed, null, 2);
+          // Cap rendered output at 16 KiB after pretty-printing so a
+          // hostile delegate can't force a multi-MiB layout pass.
+          if (pretty.length > 16 * 1024) {
+            pretty = pretty.slice(0, 16 * 1024) + '\n…';
+          }
+        } catch (e) {
+          pretty = null;
+        }
+      }
+    }
+    if (pretty !== null) {
+      var msgPre = document.createElement('pre');
+      msgPre.className = 'fn-msg fn-msg-pre';
+      setText(msgPre, pretty);
+      card.appendChild(msgPre);
+    } else {
+      var msg = document.createElement('p');
+      msg.className = 'fn-msg';
+      setText(msg, rawMsg);
+      card.appendChild(msg);
+    }
 
     var buttons = document.createElement('div');
     buttons.className = 'fn-btns';
@@ -1580,7 +1747,7 @@ fn webapp_cache_dir() -> PathBuf {
         .join("webapp_cache")
 }
 
-fn contract_web_path(instance_id: &ContractInstanceId) -> PathBuf {
+pub(super) fn contract_web_path(instance_id: &ContractInstanceId) -> PathBuf {
     webapp_cache_dir().join(instance_id.encode())
 }
 
@@ -1607,6 +1774,29 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel::<ClientConnection>(4);
         (HttpClientApiRequest::from_sender(tx), rx)
+    }
+
+    fn default_iframe_permissions() -> web_permissions::IframePermissions {
+        web_permissions::IframePermissions {
+            sandbox_attr: web_permissions::TIER1_SANDBOX.join(" "),
+            allow_attr: web_permissions::TIER1_ALLOW.join("; "),
+            prompt: None,
+        }
+    }
+
+    fn test_shell_page(
+        auth_token: &AuthToken,
+        contract_key: &str,
+        api_version: ApiVersion,
+        query_string: Option<String>,
+    ) -> Result<impl IntoResponse, WebSocketApiError> {
+        shell_page(
+            auth_token,
+            contract_key,
+            api_version,
+            query_string,
+            default_iframe_permissions(),
+        )
     }
 
     /// Clears any webapp cache state for `instance_id` on disk. `contract_web_path`
@@ -1949,7 +2139,8 @@ mod tests {
         // Lock the token in so a future refactor does not regress the fix.
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap())
+                .await;
         assert!(
             html.contains("allow-downloads"),
             "iframe sandbox missing `allow-downloads` — user-initiated \
@@ -1962,7 +2153,8 @@ mod tests {
     async fn shell_page_contains_iframe_and_bridge() {
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap())
+                .await;
 
         // Shell page must contain sandboxed iframe
         assert!(
@@ -1973,7 +2165,7 @@ mod tests {
         );
         // Iframe must grant clipboard via permissions-policy
         assert!(
-            html.contains(r#"allow="clipboard-read; clipboard-write""#),
+            html.contains(r#"allow="clipboard-read; clipboard-write; notifications"#),
             "iframe permissions-policy missing clipboard grants"
         );
         // Iframe src must include __sandbox=1
@@ -2036,7 +2228,8 @@ mod tests {
     async fn shell_page_permission_overlay_present_and_safe() {
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap())
+                .await;
 
         // Overlay root and accessibility attributes
         assert!(
@@ -2209,13 +2402,14 @@ mod tests {
     async fn shell_page_iframe_uses_data_src_for_deep_linking() {
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap())
+                .await;
 
         // The iframe must NOT have a src attribute (which would trigger an
         // immediate load before JS can append the hash fragment).
         assert!(
             !html.contains(
-                r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads" src="#
+                r#"<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write; notifications; persistent-storage; fullscreen; autoplay; picture-in-picture" src="#
             ),
             "iframe must use data-src, not src, to avoid loading before JS appends the hash"
         );
@@ -2231,7 +2425,7 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("invitation=abc123&room=test".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
 
         // Query params should be forwarded to iframe src
         assert!(
@@ -2343,7 +2537,7 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("__sandbox_extra=evil&invitation=abc&__sandboxFoo=bar".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
 
         // __sandbox-prefixed params must be stripped
         assert!(
@@ -2375,7 +2569,7 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("authToken=attacker_value&invite=abc&authTokenExtra=x".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
         assert!(
             !html.contains("attacker_value"),
             "attacker-supplied authToken value must not reach iframe src"
@@ -2402,7 +2596,7 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("foo=\"><script>alert(1)</script>".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(test_shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
 
         // The double quote and angle brackets must be escaped
         assert!(

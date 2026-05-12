@@ -258,10 +258,6 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         self.get_subscription_info()
     }
 
-    fn notify_subscription_error(&self, key: ContractInstanceId, reason: String) {
-        self.bridged_notify_subscription_error(key, reason)
-    }
-
     async fn summarize_contract_state(
         &mut self,
         key: ContractKey,

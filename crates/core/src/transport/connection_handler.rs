@@ -428,6 +428,13 @@ impl<S: Socket> OutboundConnectionHandler<S> {
 pub struct ExpectedInboundTracker(Arc<DashSet<IpAddr>>);
 
 impl ExpectedInboundTracker {
+    /// Construct an empty tracker. Test-only; production code obtains one via
+    /// `OutboundConnectionHandler::expected_inbound_tracker`.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        ExpectedInboundTracker(Arc::new(DashSet::new()))
+    }
+
     /// Register an expected inbound connection from the given address.
     pub fn expect_incoming(&self, remote_addr: SocketAddr) {
         if self.0.insert(remote_addr.ip()) {

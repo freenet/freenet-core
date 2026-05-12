@@ -53,39 +53,6 @@ fn subscriber_limit_error(instance_id: ContractInstanceId, cause: &str) -> Box<R
     }))
 }
 
-/// Send a subscription error to all clients registered for a contract.
-/// Takes a snapshot of the channels to avoid holding any lock during sends.
-fn send_subscription_error_to_clients(
-    channels: &[(ClientId, tokio::sync::mpsc::Sender<HostResult>)],
-    key: ContractInstanceId,
-    reason: String,
-) {
-    let error: freenet_stdlib::client_api::ClientError =
-        freenet_stdlib::client_api::ErrorKind::OperationError {
-            cause: reason.into(),
-        }
-        .into();
-    for (client_id, sender) in channels {
-        match sender.try_send(Err(error.clone())) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    client = %client_id,
-                    contract = %key,
-                    "Subscriber notification channel full — subscription error dropped"
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::debug!(
-                    client = %client_id,
-                    contract = %key,
-                    "Failed to send subscription error notification (channel closed)"
-                );
-            }
-        }
-    }
-}
-
 // ============================================================================
 // RuntimePool - Pool of executors for concurrent contract execution
 // ============================================================================
@@ -182,8 +149,8 @@ pub struct RuntimePool {
     /// `summarize_contract_state`, `get_contract_state_delta`.
     /// Intentionally NOT tracked in: `execute_delegate_request` (no contract key),
     /// `register_contract_notifier` (synchronous, no executor checkout),
-    /// `lookup_key`, `get_subscription_info`, `notify_subscription_error`,
-    /// `remove_client` (read-only / no executor checkout).
+    /// `lookup_key`, `get_subscription_info`, `remove_client`
+    /// (read-only / no executor checkout).
     in_flight_contracts: HashMap<ContractKey, usize>,
 }
 
@@ -694,16 +661,6 @@ impl ContractExecutor for RuntimePool {
             .collect()
     }
 
-    fn notify_subscription_error(&self, key: ContractInstanceId, reason: String) {
-        let channels = self
-            .shared_notifications
-            .get(&key)
-            .map(|e| e.value().clone());
-        if let Some(channels) = channels {
-            send_subscription_error_to_clients(&channels, key, reason);
-        }
-    }
-
     /// Remove all subscriptions for a disconnected client.
     ///
     /// Cleans up both notification channels and stored summaries across all contracts.
@@ -781,18 +738,10 @@ impl ContractExecutor for RuntimePool {
 // Single Executor Implementation
 // ============================================================================
 
-/// Result of computing a state update without committing.
-/// Used in network mode to separate state computation from commit,
-/// allowing the network operation to handle the commit and properly
-/// detect changes for broadcasting.
-enum ComputedStateUpdate {
-    /// State changed - contains the new state to commit
-    Changed(WrappedState),
-    /// No change detected - contains the current state
-    NoChange(WrappedState),
-    /// Missing related contracts - contains the list of required contracts
-    MissingRelated(Vec<RelatedContract>),
-}
+// `ComputedStateUpdate` and `compute_state_update` were retired together
+// with the network branch of `perform_contract_update` in #1454 phase 5;
+// that branch was unreachable in production because no
+// `OperationMode::Network` constructor exists.
 
 // ============================================================================
 // Bridged methods - shared production logic for Runtime and MockWasmRuntime
@@ -1406,35 +1355,57 @@ where
                     }));
                 }
 
+                // Parallel fetch: each related contract goes through its
+                // own GET sub-op concurrently. Previously this loop ran
+                // serially under a single 10s wall-clock budget, so a
+                // contract requesting N>1 related ids could time out at
+                // ~10s/N effective per fetch. Fan-out via `join_all`
+                // turns the budget back into 10s _per id_ in the common
+                // case (network bandwidth, not CPU, is the constraint).
+                // See freenet/freenet-core#4077.
                 let mut fetched_updates = updates.clone();
-                let mut failed_id: Option<ContractInstanceId> = None;
-                for id in &unique_ids {
-                    let mut got: Option<State<'static>> = None;
-                    if let Some(full_key) = self.bridged_lookup_key(id) {
-                        if let Ok(state) = self.state_store.get(&full_key).await {
-                            got = Some(State::from(state.as_ref().to_vec()));
-                        }
-                    }
-                    if got.is_none() {
-                        match fetch_related_via_network(self.op_manager.as_ref(), id).await {
-                            Ok(state) => got = Some(State::from(state.as_ref().to_vec())),
-                            Err(err) => {
-                                tracing::warn!(
-                                    contract = %key,
-                                    related_id = %id,
-                                    error = %err,
-                                    "Failed to fetch related contract for update_state requires()"
-                                );
-                                failed_id = Some(*id);
-                                break;
+                let fetch_results: Vec<(
+                    ContractInstanceId,
+                    Result<State<'static>, ExecutorError>,
+                )> = {
+                    // Reborrow as `&Self` so the per-id futures all share
+                    // an immutable borrow; this releases the outer
+                    // `&mut self` only for the duration of `fetch_all`,
+                    // which is fully awaited before the next `&mut self`
+                    // call (`attempt_state_update` below).
+                    let this: &Self = &*self;
+                    futures::future::join_all(unique_ids.iter().map(|id| {
+                        let id = *id;
+                        async move {
+                            if let Some(full_key) = this.bridged_lookup_key(&id) {
+                                if let Ok(state) = this.state_store.get(&full_key).await {
+                                    return (id, Ok(State::from(state.as_ref().to_vec())));
+                                }
                             }
+                            let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
+                                .await
+                                .map(|state| State::from(state.as_ref().to_vec()));
+                            (id, outcome)
                         }
-                    }
-                    if let Some(state) = got {
-                        fetched_updates.push(UpdateData::RelatedState {
-                            related_to: *id,
+                    }))
+                    .await
+                };
+                let mut failed_id: Option<ContractInstanceId> = None;
+                for (id, res) in fetch_results {
+                    match res {
+                        Ok(state) => fetched_updates.push(UpdateData::RelatedState {
+                            related_to: id,
                             state,
-                        });
+                        }),
+                        Err(err) => {
+                            tracing::warn!(
+                                contract = %key,
+                                related_id = %id,
+                                error = %err,
+                                "Failed to fetch related contract for update_state requires()"
+                            );
+                            failed_id.get_or_insert(id);
+                        }
                     }
                 }
                 if let Some(id) = failed_id {
@@ -1663,16 +1634,6 @@ where
             );
         }
         Ok(())
-    }
-
-    pub(super) fn bridged_notify_subscription_error(
-        &self,
-        key: ContractInstanceId,
-        reason: String,
-    ) {
-        if let Some(channels) = self.update_notifications.get(&key) {
-            send_subscription_error_to_clients(channels, key, reason);
-        }
     }
 
     pub(super) async fn bridged_summarize_contract_state(
@@ -2123,20 +2084,39 @@ where
         let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
             HashMap::with_capacity(unique_ids.len());
 
+        // Parallel fetch via `join_all`: previously serial under a single
+        // 10s wall-clock budget, so N related ids each got ~10s/N
+        // effective. Each id now races its own sub-op GET, so the budget
+        // is per-id in the common case. See freenet/freenet-core#4077.
+        //
+        // Reborrow as `&Self` so the per-id futures share an immutable
+        // borrow; the outer `&mut self` is reclaimed once `fetch_all`
+        // is awaited.
+        let this: &Self = &*self;
         let fetch_all = async {
-            for id in &unique_ids {
-                if let Some(full_key) = self.bridged_lookup_key(id) {
-                    if let Ok(state) = self.state_store.get(&full_key).await {
-                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
-                        continue;
+            let results: Vec<(ContractInstanceId, Result<State<'static>, ExecutorError>)> =
+                futures::future::join_all(unique_ids.iter().map(|id| {
+                    let id = *id;
+                    async move {
+                        if let Some(full_key) = this.bridged_lookup_key(&id) {
+                            if let Ok(state) = this.state_store.get(&full_key).await {
+                                return (id, Ok(State::from(state.as_ref().to_vec())));
+                            }
+                        }
+                        // Local lookup miss → escalate via the
+                        // network-fallback helper (factored out so the
+                        // per-id branch logic is testable with a stubbed
+                        // fetcher). Mock executors that lack an
+                        // `op_manager` get the legacy MissingRelated.
+                        let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
+                            .await
+                            .map(|state| State::from(state.as_ref().to_vec()));
+                        (id, outcome)
                     }
-                }
-                // Local lookup miss → escalate via the network-fallback
-                // helper (factored out so the per-id branch logic is
-                // testable with a stubbed fetcher). Mock executors that
-                // lack an `op_manager` get the legacy MissingRelated.
-                let fetched = fetch_related_via_network(self.op_manager.as_ref(), id).await?;
-                related_map.insert(*id, Some(State::from(fetched.as_ref().to_vec())));
+                }))
+                .await;
+            for (id, res) in results {
+                related_map.insert(id, Some(res?));
             }
             Ok::<(), ExecutorError>(())
         };
@@ -2541,10 +2521,6 @@ impl ContractExecutor for Executor<Runtime> {
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         self.get_subscription_info()
-    }
-
-    fn notify_subscription_error(&self, key: ContractInstanceId, reason: String) {
-        self.bridged_notify_subscription_error(key, reason)
     }
 
     async fn summarize_contract_state(
@@ -3092,7 +3068,19 @@ impl Executor<Runtime> {
 
         let updates = vec![update];
 
-        // In local mode, we handle the full update locally (compute, commit, notify)
+        // `Executor::contract_requests` is only invoked from `run_local_node`
+        // (HTTP/WS local-only entry points); network-mode UPDATEs from clients
+        // arrive through `client_event_handling` → `start_client_update`
+        // (#1454 phase 4) and never reach this function. The
+        // `OperationMode::Local` short-circuit therefore covers every
+        // production caller.
+        //
+        // Phase 5 final (#1454) deleted the executor-initiated network
+        // UPDATE path (`UpdateContract`, `op_request(UpdateContract)`,
+        // `request_update`, `start_op`) because no `OperationMode::Network`
+        // constructor exists in the tree. The remaining branch returns
+        // an internal error if a future caller flips the mode without
+        // restoring a task-per-tx executor UPDATE driver.
         if self.mode == OperationMode::Local {
             let new_state = self
                 .get_updated_state(&parameters, current_state, key, updates)
@@ -3104,205 +3092,10 @@ impl Executor<Runtime> {
             return Ok(ContractResponse::UpdateResponse { key, summary }.into());
         }
 
-        // In network mode, compute the state WITHOUT committing.
-        // The network operation will handle the commit and broadcast.
-        // This fixes issue #2301: previously we committed here, causing the network
-        // operation to see no change and skip broadcasting.
-        //
-        // If related contracts are needed, we fetch them and retry compute_state_update
-        // in a loop (similar to get_updated_state, but without committing).
-        let mut updates = updates;
-        let start = Instant::now();
-        let new_state = loop {
-            let computed = self
-                .compute_state_update(&parameters, &current_state, &key, &updates)
-                .await?;
-
-            match computed {
-                ComputedStateUpdate::NoChange(state) => {
-                    // No change detected, return early without starting network operation
-                    tracing::debug!(
-                        contract = %key,
-                        phase = "update_no_change",
-                        "Update resulted in no change, skipping network operation"
-                    );
-                    let summary = self
-                        .runtime
-                        .summarize_state(&key, &parameters, &state)
-                        .map_err(|e| ExecutorError::execution(e, None))?;
-                    return Ok(ContractResponse::UpdateResponse { key, summary }.into());
-                }
-                ComputedStateUpdate::MissingRelated(missing) => {
-                    // Fetch missing related contracts WITHOUT committing.
-                    // This mirrors the logic in get_updated_state but avoids the commit
-                    // that would cause the network operation to see NoChange.
-                    tracing::debug!(
-                        contract = %key,
-                        missing_count = missing.len(),
-                        phase = "update_fetching_related",
-                        "Fetching missing related contracts"
-                    );
-
-                    let required_contracts = missing.len() + 1;
-                    for RelatedContract {
-                        contract_instance_id: id,
-                        mode,
-                    } in missing
-                    {
-                        // Try to look up the full key; if not found, treat as missing
-                        let local_state = if let Some(related_key) = self.lookup_key(&id) {
-                            self.state_store.get(&related_key).await.ok()
-                        } else {
-                            None
-                        };
-
-                        match local_state {
-                            Some(state) => {
-                                // Already have this contract locally
-                                updates.push(UpdateData::RelatedState {
-                                    related_to: id,
-                                    state: state.into(),
-                                });
-                            }
-                            None => {
-                                // Fetch from network
-                                let state =
-                                    match self.local_state_or_from_network(&id, false).await? {
-                                        Either::Left(state) => state,
-                                        Either::Right(GetResult {
-                                            state, contract, ..
-                                        }) => {
-                                            let Some(contract) = contract else {
-                                                return Err(ExecutorError::request(
-                                                    RequestError::ContractError(
-                                                        StdContractError::Get {
-                                                            key,
-                                                            cause: "Missing contract".into(),
-                                                        },
-                                                    ),
-                                                ));
-                                            };
-                                            // Store the related contract (this is necessary for future lookups)
-                                            // but does NOT commit the main contract's state update
-                                            self.verify_and_store_contract(
-                                                state.clone(),
-                                                contract.clone(),
-                                                RelatedContracts::default(),
-                                            )
-                                            .await?;
-                                            state
-                                        }
-                                    };
-                                updates.push(UpdateData::State(state.into()));
-                                match mode {
-                                    RelatedMode::StateOnce => {}
-                                    RelatedMode::StateThenSubscribe => {
-                                        // After storing, we should be able to look up the key
-                                        if let Some(related_key) = self.lookup_key(&id) {
-                                            self.subscribe(related_key).await?;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Check if we have enough related contracts to retry
-                    if updates.len() + 1 >= required_contracts {
-                        // Retry with related contracts
-                        continue;
-                    } else if start.elapsed() > Duration::from_secs(10) {
-                        tracing::error!(
-                            contract = %key,
-                            elapsed_secs = start.elapsed().as_secs(),
-                            phase = "update_timeout",
-                            "Timeout fetching related contracts for update"
-                        );
-                        return Err(ExecutorError::request(RequestError::Timeout));
-                    }
-                }
-                ComputedStateUpdate::Changed(new_state) => {
-                    break new_state;
-                }
-            }
-        };
-
-        // State changed - start network operation which will commit and broadcast.
-        // We pass the computed new_state so the network operation can detect the change.
-        //
-        // Notification flow in this path:
-        // 1. compute_state_update does NOT send notifications (by design)
-        // 2. Network operation calls update_contract -> UpdateQuery -> upsert_contract_state
-        // 3. upsert_contract_state validates, then commit_state_update sends the notification
-        tracing::debug!(
-            contract = %key,
-            new_size_bytes = new_state.as_ref().len(),
-            phase = "update_starting_network_op",
-            "State changed, starting network operation for commit and broadcast"
-        );
-        let summary = self
-            .runtime
-            .summarize_state(&key, &parameters, &new_state)
-            .map_err(|e| ExecutorError::execution(e, None))?;
-        let request = UpdateContract { key, new_state };
-        let _op: operations::update::UpdateResult = self.op_request(request).await?;
-        Ok(ContractResponse::UpdateResponse { key, summary }.into())
-    }
-
-    /// Computes the updated state WITHOUT committing it to storage.
-    ///
-    /// This is used in network mode to prepare the state for the network operation
-    /// which will handle the commit. This separation fixes issue #2301 where
-    /// committing before the network operation caused change detection to fail.
-    async fn compute_state_update(
-        &mut self,
-        parameters: &Parameters<'_>,
-        current_state: &WrappedState,
-        key: &ContractKey,
-        updates: &[UpdateData<'_>],
-    ) -> Result<ComputedStateUpdate, ExecutorError> {
-        let update_modification =
-            match self
-                .runtime
-                .update_state(key, parameters, current_state, updates)
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    return Err(ExecutorError::execution(
-                        err,
-                        Some(InnerOpError::Upsert(*key)),
-                    ));
-                }
-            };
-
-        let UpdateModification {
-            new_state, related, ..
-        } = update_modification;
-
-        let Some(new_state) = new_state else {
-            if related.is_empty() {
-                // No updates were made, return current state
-                return Ok(ComputedStateUpdate::NoChange(current_state.clone()));
-            } else {
-                // Missing related contracts
-                return Ok(ComputedStateUpdate::MissingRelated(related));
-            }
-        };
-
-        let new_state = WrappedState::new(new_state.into_bytes());
-
-        // Compare bytes to determine if state actually changed.
-        // Note: Even though runtime.update_state returned Some(new_state), we still check bytes
-        // because the contract may have "processed" the update but produced identical output
-        // (e.g., idempotent merge operations in CRDTs). In such cases, we should NOT broadcast
-        // since nothing actually changed from the subscribers' perspective.
-        let changed = new_state.as_ref() != current_state.as_ref();
-
-        if changed {
-            Ok(ComputedStateUpdate::Changed(new_state))
-        } else {
-            Ok(ComputedStateUpdate::NoChange(current_state.clone()))
-        }
+        Err(ExecutorError::other(anyhow::anyhow!(
+            "executor-initiated network UPDATE path was retired in #1454 phase 5; \
+             clients must dispatch UPDATEs via `start_client_update` (client_events.rs)"
+        )))
     }
 
     /// Given a contract and a series of delta updates, it will try to perform an update
@@ -3592,17 +3385,37 @@ impl Executor<Runtime> {
         let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
             HashMap::with_capacity(unique_ids.len());
 
+        // Parallel fetch — see fetch_related_for_validation for rationale
+        // (freenet/freenet-core#4077). The serial loop here had the same
+        // 10s/N effective per fetch problem.
+        //
+        // We can't reuse the `&mut self` `local_state_or_from_network`
+        // helper across multiple concurrent futures, so the per-id body
+        // is inlined: try the local state_store first, escalate to
+        // `fetch_related_via_network` (which only borrows
+        // `&Option<Arc<OpManager>>`). Reborrow as `&Self` so the
+        // per-id futures share an immutable borrow; the outer
+        // `&mut self` is reclaimed once `fetch_all` is awaited.
+        let this: &Self = &*self;
         let fetch_all = async {
-            for id in &unique_ids {
-                match self.local_state_or_from_network(id, false).await? {
-                    Either::Left(state) => {
-                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+            let results: Vec<(ContractInstanceId, Result<State<'static>, ExecutorError>)> =
+                futures::future::join_all(unique_ids.iter().map(|id| {
+                    let id = *id;
+                    async move {
+                        if let Some(full_key) = this.lookup_key(&id) {
+                            if let Ok(state) = this.state_store.get(&full_key).await {
+                                return (id, Ok(State::from(state.as_ref().to_vec())));
+                            }
+                        }
+                        let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
+                            .await
+                            .map(|state| State::from(state.as_ref().to_vec()));
+                        (id, outcome)
                     }
-                    Either::Right(get_result) => {
-                        related_map
-                            .insert(*id, Some(State::from(get_result.state.as_ref().to_vec())));
-                    }
-                }
+                }))
+                .await;
+            for (id, res) in results {
+                related_map.insert(id, Some(res?));
             }
             Ok::<(), ExecutorError>(())
         };
@@ -4013,6 +3826,121 @@ mod sub_op_get_migration_pin_tests {
             "executor::subscribe must NOT call self.op_request — \
              SUBSCRIBE executor migration bypasses the legacy mediator \
              path"
+        );
+    }
+
+    /// Pin: `perform_contract_update` MUST NOT construct an
+    /// `UpdateContract` or call `self.op_request` for the network
+    /// branch. Regression: the legacy path went through the executor
+    /// mediator + `request_update`, pushing `UpdateOp` into
+    /// `ops.update` and keeping the legacy state-machine alive even
+    /// though the network branch was unreachable in production
+    /// (no `OperationMode::Network` constructor exists in the tree).
+    /// Retired in #1454 phase 5 final (UPDATE slice).
+    #[test]
+    fn perform_contract_update_does_not_use_legacy_network_path() {
+        let src = include_str!("runtime.rs");
+        let body = src
+            .split("async fn perform_contract_update(")
+            .nth(1)
+            .expect("perform_contract_update must exist")
+            .split(
+                "
+    }",
+            )
+            .next()
+            .expect("closing brace");
+        let update_contract_needle = ["Update", "Contract", " {"].concat();
+        assert!(
+            !body.contains(&update_contract_needle),
+            "perform_contract_update must NOT construct legacy \
+             UpdateContract — retired in #1454 phase 5 final"
+        );
+        let op_request_needle = ["self.", "op_request"].concat();
+        assert!(
+            !body.contains(&op_request_needle),
+            "perform_contract_update must NOT call self.op_request — \
+             phase 5 final bypassed the legacy mediator path; \
+             network-mode UPDATEs flow through start_client_update"
+        );
+        let request_update_needle = ["request_", "update("].concat();
+        assert!(
+            !body.contains(&request_update_needle),
+            "perform_contract_update must NOT call legacy request_update — \
+             retired in #1454 phase 5 final"
+        );
+    }
+
+    /// Pin: the three sites that resolve a contract's `requires(...)`
+    /// related-list MUST fan out via `join_all`, not iterate serially
+    /// inside a `for` loop. Regression: the previous serial loops shared
+    /// a single 10s wall-clock budget (`RELATED_FETCH_TIMEOUT`), so for
+    /// N>1 ids the per-fetch budget was ~10s/N. On real networks where
+    /// AFT-style related contracts are far in keyspace, this pinned
+    /// receivers' inboxes at empty state forever — see
+    /// `freenet/freenet-core#4077` and `freenet/mail#198 / mail#202`
+    /// for the production trace and the app-side workaround.
+    ///
+    /// We can't unit-test the parallelism timing directly: the
+    /// `TEST_NETWORK_FETCH_OVERRIDE` stub is sync (`Rc<dyn Fn>`), so a
+    /// per-id artificial delay would block the executor thread rather
+    /// than yield. A source-string pin ensures none of the three sites
+    /// silently regresses to a `for id in &unique_ids { ... await ... }`
+    /// loop, which is the exact failure mode #4077 documents.
+    #[test]
+    fn related_contract_fetch_sites_use_join_all() {
+        let src = include_str!("runtime.rs");
+
+        // Each entry: (function name, exact split needle for body extraction).
+        let sites: &[(&str, &str)] = &[
+            (
+                "fetch_related_for_validation",
+                "async fn fetch_related_for_validation(",
+            ),
+            (
+                "fetch_related_for_validation_network",
+                "async fn fetch_related_for_validation_network(",
+            ),
+        ];
+
+        for (name, needle) in sites {
+            let body = src
+                .split(needle)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must exist in runtime.rs"))
+                .split("\n    }\n")
+                .next()
+                .unwrap_or_else(|| panic!("{name} closing brace not found"));
+            assert!(
+                body.contains("join_all"),
+                "{name} must call futures::future::join_all — serial fetch \
+                 regressed in freenet/freenet-core#4077; do not revert"
+            );
+            // Spot-check the loop construct doesn't reappear: a plain
+            // `for id in &unique_ids` inside the function body almost
+            // certainly means the parallel fan-out is gone.
+            let serial_needle = ["for ", "id in &unique_ids"].concat();
+            assert!(
+                !body.contains(&serial_needle),
+                "{name} must not iterate serially over &unique_ids — \
+                 regressed to pre-#4077 behavior"
+            );
+        }
+
+        // The third site is inline inside `upsert_contract_state`, not
+        // its own function. Pin it by confirming the comment marker
+        // that frames the parallel-fetch block is present and that the
+        // block contains `join_all`. Brittle by design: a refactor that
+        // moves the comment also has to move the assertion.
+        let inline_marker = "Parallel fetch: each related contract goes through its";
+        let after_marker = src.split(inline_marker).nth(1).expect(
+            "inline UPDATE-side parallel-fetch marker missing — \
+                 #4077 regressed",
+        );
+        assert!(
+            after_marker[..2_000].contains("join_all"),
+            "UPDATE-side inline related fetch must call \
+             futures::future::join_all (#4077)"
         );
     }
 }

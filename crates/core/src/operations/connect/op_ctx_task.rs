@@ -30,11 +30,14 @@
 //! it flows downstream toward the relay chain. Relay handling lands in
 //! slice 1.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use either::Either;
 use freenet_stdlib::prelude::*;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::OpManager;
@@ -42,7 +45,10 @@ use crate::operations::OpError;
 use crate::ring::{ConnectionFailureReason, Location, PeerKeyLocation};
 use crate::tracing::NetEventLog;
 
-use super::{ConnectMsg, ConnectOp};
+use super::{
+    ConnectMsg, ConnectRequest, ForwardAttempt, RelayEnv, RelayState,
+    dispatch_expect_connection_from,
+};
 
 // ─── Relay CONNECT scaffolding (#1454 phase 2c slice 1, commit 1) ───
 //
@@ -91,10 +97,6 @@ pub static RELAY_CONNECT_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
 /// `incoming_tx` from `active_relay_connect_txs` on drop. Mirrors
 /// `RelaySubscribeInflightGuard` / `RelayInflightGuard` patterns for
 /// the other relay drivers.
-///
-/// Defined now (slice 1 commit 1) so the lifecycle is locked even
-/// before `start_relay_connect` lands in commit 2.
-#[allow(dead_code)]
 pub(crate) struct RelayConnectInflightGuard {
     pub(crate) op_manager: std::sync::Arc<OpManager>,
     pub(crate) incoming_tx: Transaction,
@@ -131,7 +133,15 @@ impl Drop for RelayConnectInflightGuard {
 /// to wrapping the future in `tokio::time::timeout`, which would
 /// cancel the future mid-flight and leak the
 /// `pending_op_results` slot until the 60s sweep (#3100).
+///
+/// `tx` is supplied by the caller so the joiner-side transaction id
+/// can be registered with `LiveTransactionTracker` before the driver
+/// task is spawned. Allocating tx inside the driver would race the
+/// caller's `add_transaction` registration against the first inbound
+/// Response, which can arrive before the spawn completes on a busy
+/// runtime.
 pub(crate) async fn start_client_connect(
+    tx: Transaction,
     gateway: PeerKeyLocation,
     gateway_addr: SocketAddr,
     op_manager: &OpManager,
@@ -163,21 +173,8 @@ pub(crate) async fn start_client_connect(
     let mut exclude_addrs = failed_addrs;
     exclude_addrs.extend(connected_addrs);
 
-    // ConnectOp::initiate_join_request still returns a legacy ConnectOp
-    // value; slice 2 originator does not push it into ops.connect (the
-    // driver owns state in task locals). Drop it. Future cleanup: split
-    // the bloom-filter / Request-message construction off into a free
-    // helper so the legacy ConnectOp allocation is avoided entirely.
-    // Tracked for follow-up — addressed alongside Phase 6 cleanup.
-    let (tx, _legacy_op, request_msg) = ConnectOp::initiate_join_request(
-        own.clone(),
-        gateway.clone(),
-        desired_location,
-        ttl,
-        target_connections,
-        op_manager.connect_forward_estimator.clone(),
-        &exclude_addrs,
-    );
+    let request_msg =
+        super::prepare_join_request(tx, &own, &gateway, desired_location, ttl, &exclude_addrs);
 
     if let Some(event) = NetEventLog::connect_request_sent(
         &tx,
@@ -478,19 +475,44 @@ async fn drive_client_connect_inner(
                 }
                 return Ok(());
             }
-            other @ ConnectMsg::Request { .. }
-            | other @ ConnectMsg::ObservedAddress { .. }
-            | other @ ConnectMsg::ConnectFailed { .. } => {
-                // Driver bypass at node.rs:976-985 forwards only Response
-                // and Rejected variants. Reaching this arm means a future
-                // change to the bypass `matches!` started routing one of
-                // these variants without expanding driver semantics; log
-                // and drop. Specifically:
-                //   Request          — joiner does not receive Requests
-                //   ObservedAddress  — handled by legacy load_or_init
-                //                      stateless side effect
-                //   ConnectFailed    — emitted by this driver, never
-                //                      received by it
+            ConnectMsg::ObservedAddress { address, .. } => {
+                // Phase 2c slice 1 (#1454): the bypass at node.rs forwards
+                // ObservedAddress to the joiner driver inbox. The joiner
+                // doesn't know its external IP behind NAT, so the gateway
+                // observes it from the UDP packet source and ships it back
+                // here. We update both `own_addr` (for diagnostics) and
+                // `own_location` (for routing) — mirrors legacy at
+                // connect.rs:1956-1974. Idempotent: subsequent observations
+                // for the same tx overwrite, which is the legacy semantic.
+                let location = Location::from_address(&address);
+                op_manager.ring.connection_manager.set_own_addr(address);
+                op_manager
+                    .ring
+                    .connection_manager
+                    .update_location(Some(location));
+                tracing::info!(
+                    tx = %tx,
+                    observed_address = %address,
+                    location = %location,
+                    "connect driver: updated own_addr and location from ObservedAddress"
+                );
+            }
+            other @ ConnectMsg::Request { .. } | other @ ConnectMsg::ConnectFailed { .. } => {
+                // Bypass at node.rs forwards Response/Rejected/
+                // ObservedAddress/ConnectFailed. ConnectFailed is
+                // forwarded for the relay driver's inbox — but the
+                // joiner driver also subscribes to the same per-tx
+                // waiter, so it can receive ConnectFailed too. The
+                // joiner emitted ConnectFailed on hole-punch failure
+                // (line 398-427 above) and would not normally receive
+                // its own emission, but a relay could theoretically
+                // bounce it back. Drop with a debug log — joiner-side
+                // semantic is "the originator already learned of the
+                // failure when it emitted the message".
+                //
+                // Request is the spawn signal handled by the dispatch
+                // gate before reaching the bypass forward; reaching
+                // this arm would mean a routing bug.
                 tracing::debug!(
                     tx = %tx,
                     "connect driver: ignoring unexpected variant on bypass: {}",
@@ -528,6 +550,655 @@ async fn drive_client_connect_inner(
 /// follow-up but acceptable here because the driver re-issues nothing.
 fn compute_reply_capacity(target_connections: usize) -> usize {
     target_connections.saturating_mul(2).max(2)
+}
+
+// ─── Relay CONNECT driver (#1454 phase 2c slice 1, commit 2) ─────────
+//
+// Mirrors the relay-side behaviour of the legacy
+// `connect.rs::process_message` for `Request → forward + observed +
+// (optional accept) + (optional reject)` plus the `Response /
+// Rejected / ObservedAddress / ConnectFailed` re-entries that arrive
+// for the same tx after the initial Request. State (`RelayState`,
+// `recency`, `forward_attempts`) lives in driver task locals; nothing
+// is pushed into `OpManager.ops.connect` for a relay-driven tx.
+//
+// Re-entries land in the driver inbox via the bypass at
+// `node.rs::handle_pure_network_message_v1` (commit 1, this slice),
+// which forwards Response/Rejected/ObservedAddress/ConnectFailed
+// into the per-tx multi-reply receiver registered by
+// `OpCtx::send_to_and_collect_replies`.
+
+const RELAY_RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Spawn a relay driver for a fresh inbound `ConnectMsg::Request`.
+///
+/// Gated by the dispatch site in `node.rs::handle_pure_network_message_v1`
+/// (commit 3) on `source_addr.is_some() && !has_connect_op(id) &&
+/// !active_relay_connect_txs.contains(id)`. The driver owns the entire
+/// transaction lifetime in task locals — initial `handle_request`
+/// decision, downstream forward, upstream emits (ObservedAddress,
+/// Response, Rejected), and re-entry processing (Response, Rejected,
+/// ObservedAddress, ConnectFailed) — and exits when:
+///
+/// 1. A successful Response is forwarded upstream (joiner satisfied
+///    on this branch),
+/// 2. A `Rejected` is forwarded upstream after retries exhausted,
+/// 3. The transaction TTL expires (`should_exit_for_ttl`),
+/// 4. Or the bypass receiver closes (executor shutdown).
+///
+/// Returns immediately after spawning. All side effects publish from
+/// the spawned task.
+///
+/// # Dedup gate
+///
+/// `active_relay_connect_txs.insert(incoming_tx)` returns `false` if
+/// a driver for the same tx is already in flight on this node (e.g.
+/// gateway retransmit, multi-path Request arriving via two distinct
+/// hops). The duplicate is dropped silently — no `Rejected` upstream,
+/// because the in-flight driver will service the original. The
+/// telemetry counter `RELAY_CONNECT_DEDUP_REJECTS` increments so
+/// re-entry storms are visible.
+pub(crate) async fn start_relay_connect(
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    payload: ConnectRequest,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError> {
+    #[cfg(any(test, feature = "testing"))]
+    RELAY_CONNECT_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    if !op_manager.active_relay_connect_txs.insert(incoming_tx) {
+        RELAY_CONNECT_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            tx = %incoming_tx,
+            %upstream_addr,
+            phase = "relay_connect_dedup_reject",
+            "CONNECT relay (task-per-tx): duplicate Request for in-flight tx, dropping"
+        );
+        return Ok(());
+    }
+
+    tracing::debug!(
+        tx = %incoming_tx,
+        desired_location = %payload.desired_location,
+        ttl = payload.ttl,
+        %upstream_addr,
+        phase = "relay_connect_start",
+        "CONNECT relay (task-per-tx): spawning driver"
+    );
+
+    // Construct guard + bump counters BEFORE spawn so the dedup-set
+    // entry is paired with a Drop even if the spawned future is dropped
+    // before its first poll. Same pattern as PUT/SUBSCRIBE relay.
+    RELAY_CONNECT_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RELAY_CONNECT_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guard = RelayConnectInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
+    crate::operations::GlobalExecutor::spawn(run_relay_connect(
+        guard,
+        op_manager,
+        incoming_tx,
+        payload,
+        upstream_addr,
+    ));
+    Ok(())
+}
+
+async fn run_relay_connect(
+    guard: RelayConnectInflightGuard,
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    payload: ConnectRequest,
+    upstream_addr: SocketAddr,
+) {
+    let _guard = guard;
+
+    if let Err(err) = drive_relay_connect(&op_manager, incoming_tx, payload, upstream_addr).await {
+        tracing::warn!(
+            tx = %incoming_tx,
+            error = %err,
+            phase = "relay_connect_error",
+            "CONNECT relay (task-per-tx): driver returned error"
+        );
+    }
+
+    // Release the per-tx pending_op_results slot at driver exit. The
+    // multi-reply waiter installed by send_to_and_collect_replies stays
+    // in the slot until the 60s sweep otherwise; explicit release is
+    // the same pattern used by PUT/SUBSCRIBE/UPDATE relay drivers.
+    tokio::task::yield_now().await;
+    op_manager.release_pending_op_slot(incoming_tx).await;
+}
+
+async fn drive_relay_connect(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    payload: ConnectRequest,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError> {
+    let desired_location = payload.desired_location;
+
+    // Build relay state in task locals. Mirrors `ConnectOp::new_relay`
+    // at connect.rs:1184, but the state never leaves this task.
+    //
+    // Bloom-filter rekeying: incoming `payload.visited.hash_keys` are
+    // zeroed (`#[serde(skip)]` over the wire). Re-key against the
+    // transaction id so subsequent `mark_visited` / `probably_visited`
+    // checks operate on a properly-keyed bloom — same step
+    // `new_relay` performs at connect.rs:1193.
+    let mut request = payload;
+    request.visited = request.visited.with_transaction(&incoming_tx);
+
+    let mut state = RelayState {
+        upstream_addr,
+        request,
+        forwarded_to: None,
+        forwarded_at: None,
+        observed_sent: false,
+        accepted_locally: false,
+        response_forwarded: false,
+    };
+    let mut recency: HashMap<PeerKeyLocation, Instant> = HashMap::new();
+    let mut forward_attempts: HashMap<PeerKeyLocation, ForwardAttempt> = HashMap::new();
+
+    // Snapshot the estimator so the driver works on a stable read; the
+    // `record_forward_outcome`-equivalent below writes back via the
+    // RwLock, matching legacy semantics at connect.rs:1545.
+    let estimator = op_manager.connect_forward_estimator.read().clone();
+
+    // Initial Request handling. Admission RAII guard scope is held only
+    // across the decision (handle_request + initial outbound emits) so
+    // the slot count tracks "concurrent admissions" not "in-flight
+    // relay drivers" — the receive loop below runs without the guard.
+    let initial_actions = {
+        let _admission = match op_manager.ring.connection_manager.try_admit_connect() {
+            Some(g) => g,
+            None => {
+                tracing::info!(
+                    tx = %incoming_tx,
+                    desired_location = %state.request.desired_location,
+                    %upstream_addr,
+                    "CONNECT relay (task-per-tx): gateway overloaded, rejecting request"
+                );
+                if let Some(event) = NetEventLog::connect_rejected(
+                    &incoming_tx,
+                    &op_manager.ring,
+                    state.request.desired_location,
+                    "gateway overloaded",
+                ) {
+                    op_manager.ring.register_events(Either::Left(event)).await;
+                }
+                let mut ctx = op_manager.op_ctx(incoming_tx);
+                ctx.send_fire_and_forget(
+                    upstream_addr,
+                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Rejected {
+                        id: incoming_tx,
+                        desired_location: state.request.desired_location,
+                    })),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let env = RelayEnv::new(op_manager);
+        let now = Instant::now();
+        state.handle_request(&env, &recency, &mut forward_attempts, &estimator, now)
+    };
+
+    // Telemetry: connect_request_received (mirrors connect.rs:1595)
+    if let Some(event) = NetEventLog::connect_request_received(
+        &incoming_tx,
+        &op_manager.ring,
+        state.request.desired_location,
+        state.request.joiner.clone(),
+        upstream_addr,
+        initial_actions
+            .forward
+            .as_ref()
+            .map(|(peer, _)| peer.clone()),
+        initial_actions.accept.is_some(),
+        state.request.ttl,
+    ) {
+        op_manager.ring.register_events(Either::Left(event)).await;
+    }
+
+    // ObservedAddress: emit toward upstream/joiner (legacy connect.rs:1608).
+    if let Some((_target, address)) = initial_actions.observed_address {
+        tracing::debug!(
+            tx = %incoming_tx,
+            observed_address = %address,
+            sending_to = %upstream_addr,
+            "Sending ObservedAddress to joiner"
+        );
+        let mut ctx = op_manager.op_ctx(incoming_tx);
+        ctx.send_fire_and_forget(
+            upstream_addr,
+            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::ObservedAddress {
+                id: incoming_tx,
+                address,
+            })),
+        )
+        .await?;
+    }
+
+    // Local accept (promote joiner BEFORE sending Response upstream;
+    // legacy connect.rs:1636).
+    if let Some(ref accept) = initial_actions.accept {
+        dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner.clone()).await?;
+    }
+
+    // Forward downstream (legacy connect.rs:1641). The forward decision
+    // populates `state.forwarded_to` via `RelayState::forward_to_peer`.
+    // The downstream waiter is registered via `send_to_and_collect_replies`
+    // BEFORE the request hits the wire, so any inbound reply for this tx
+    // lands in `receiver` once the bypass at node.rs forwards it.
+    let downstream_receiver = match initial_actions.forward {
+        Some((next, request)) => {
+            recency.insert(next.clone(), Instant::now());
+            match next.socket_addr() {
+                Some(addr) => {
+                    let mut ctx = op_manager.op_ctx(incoming_tx);
+                    let capacity =
+                        compute_reply_capacity(op_manager.ring.connection_manager.min_connections);
+                    match ctx
+                        .send_to_and_collect_replies(
+                            addr,
+                            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                                id: incoming_tx,
+                                payload: request,
+                            })),
+                            capacity,
+                        )
+                        .await
+                    {
+                        Ok(rx) => Some(rx),
+                        Err(e) => {
+                            tracing::warn!(
+                                tx = %incoming_tx,
+                                target = %addr,
+                                error = %e,
+                                "CONNECT relay (task-per-tx): failed to dispatch downstream Request"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        tx = %incoming_tx,
+                        next_peer = %next.pub_key(),
+                        "CONNECT relay (task-per-tx): next hop has no socket address; skipping forward"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Local emit Response upstream after the forward (legacy connect.rs:1689).
+    if let Some(accept) = initial_actions.accept {
+        if let Some(event) = NetEventLog::connect_response_sent(
+            &incoming_tx,
+            &op_manager.ring,
+            accept.response.acceptor.clone(),
+            state.request.joiner.clone(),
+        ) {
+            op_manager.ring.register_events(Either::Left(event)).await;
+        }
+        let mut ctx = op_manager.op_ctx(incoming_tx);
+        ctx.send_fire_and_forget(
+            upstream_addr,
+            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                id: incoming_tx,
+                payload: accept.response,
+            })),
+        )
+        .await?;
+    }
+
+    if initial_actions.rejected {
+        if let Some(event) = NetEventLog::connect_rejected(
+            &incoming_tx,
+            &op_manager.ring,
+            state.request.desired_location,
+            "rejected by handle_request",
+        ) {
+            op_manager.ring.register_events(Either::Left(event)).await;
+        }
+        let mut ctx = op_manager.op_ctx(incoming_tx);
+        ctx.send_fire_and_forget(
+            upstream_addr,
+            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Rejected {
+                id: incoming_tx,
+                desired_location: state.request.desired_location,
+            })),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // No downstream waiter installed (forward target had no socket
+    // address, or no forward branch was selected and no accept either).
+    // The driver has nothing more to do.
+    let Some(mut receiver) = downstream_receiver else {
+        return Ok(());
+    };
+
+    // Drain re-entry replies until terminal-or-TTL.
+    loop {
+        if should_exit_for_ttl(&incoming_tx) {
+            tracing::debug!(
+                tx = %incoming_tx,
+                phase = "relay_connect_ttl_exit",
+                "CONNECT relay (task-per-tx): transaction timed out; exiting"
+            );
+            return Ok(());
+        }
+
+        let msg = match tokio::time::timeout(RELAY_RECV_POLL_INTERVAL, receiver.recv()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Ok(()),
+            Err(_) => continue,
+        };
+
+        let connect_msg = match msg {
+            NetMessage::V1(NetMessageV1::Connect(c)) => c,
+            other => {
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    "CONNECT relay (task-per-tx): unexpected message kind: {:?}",
+                    other
+                );
+                continue;
+            }
+        };
+
+        match connect_msg {
+            ConnectMsg::Response { payload, .. } => {
+                // Forward Response toward upstream (joiner side); record
+                // forward outcome for the downstream peer that produced it.
+                if let Some(ref fwd) = state.forwarded_to.clone() {
+                    op_manager.connect_forward_estimator.write().record(
+                        fwd,
+                        desired_location,
+                        true,
+                    );
+                }
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    %upstream_addr,
+                    acceptor_pub_key = %payload.acceptor.pub_key(),
+                    forwarded_from = ?state.forwarded_to,
+                    "CONNECT relay (task-per-tx): forwarding Response upstream"
+                );
+                let mut ctx = op_manager.op_ctx(incoming_tx);
+                ctx.send_fire_and_forget(
+                    upstream_addr,
+                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                        id: incoming_tx,
+                        payload,
+                    })),
+                )
+                .await?;
+                state.response_forwarded = true;
+                // Stay in the loop so a subsequent `ConnectFailed` can
+                // be re-routed downstream (legacy semantic). The driver
+                // exits naturally on TTL or channel closure.
+            }
+            ConnectMsg::Rejected {
+                desired_location: dl,
+                ..
+            } => {
+                // Mirror connect.rs:2002-2114. Record forward failure;
+                // re-run handle_request for retry (different uphill peer
+                // OR accept locally OR forward Rejected upstream).
+                let failed_peer = state.forwarded_to.take();
+                state.forwarded_at = None;
+                if let Some(ref fwd) = failed_peer {
+                    op_manager
+                        .connect_forward_estimator
+                        .write()
+                        .record(fwd, dl, false);
+                    forward_attempts.remove(fwd);
+                }
+
+                let now = Instant::now();
+                let env = RelayEnv::new(op_manager);
+                let estimator = op_manager.connect_forward_estimator.read().clone();
+                let retry =
+                    state.handle_request(&env, &recency, &mut forward_attempts, &estimator, now);
+
+                if let Some((peer, forward_req)) = retry.forward {
+                    recency.insert(peer.clone(), now);
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        failed_peer = ?failed_peer,
+                        retry_peer = %peer.pub_key(),
+                        "CONNECT relay (task-per-tx): retrying with different uphill peer after rejection"
+                    );
+                    if let Some(addr) = peer.socket_addr() {
+                        let mut ctx = op_manager.op_ctx(incoming_tx);
+                        ctx.send_fire_and_forget(
+                            addr,
+                            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                                id: incoming_tx,
+                                payload: forward_req,
+                            })),
+                        )
+                        .await?;
+                    }
+                } else if let Some(accept) = retry.accept {
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        failed_peer = ?failed_peer,
+                        acceptor = %accept.response.acceptor.pub_key(),
+                        "CONNECT relay (task-per-tx): accepting locally after uphill rejection"
+                    );
+                    if let Some(event) = NetEventLog::connect_response_sent(
+                        &incoming_tx,
+                        &op_manager.ring,
+                        accept.response.acceptor.clone(),
+                        accept.joiner.clone(),
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+                    dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    let mut ctx = op_manager.op_ctx(incoming_tx);
+                    ctx.send_fire_and_forget(
+                        upstream_addr,
+                        NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                            id: incoming_tx,
+                            payload: accept.response,
+                        })),
+                    )
+                    .await?;
+                } else {
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        %upstream_addr,
+                        failed_peer = ?failed_peer,
+                        "CONNECT relay (task-per-tx): forwarding rejection upstream (no retry peers)"
+                    );
+                    if let Some(event) = NetEventLog::connect_rejected(
+                        &incoming_tx,
+                        &op_manager.ring,
+                        dl,
+                        "relay no retry peers available",
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+                    let mut ctx = op_manager.op_ctx(incoming_tx);
+                    ctx.send_fire_and_forget(
+                        upstream_addr,
+                        NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Rejected {
+                            id: incoming_tx,
+                            desired_location: dl,
+                        })),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            ConnectMsg::ObservedAddress { address, .. } => {
+                // Joiner-bound, forward upstream unchanged. The relay
+                // never updates its own_addr from a downstream
+                // ObservedAddress — that's the joiner's role.
+                let mut ctx = op_manager.op_ctx(incoming_tx);
+                ctx.send_fire_and_forget(
+                    upstream_addr,
+                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::ObservedAddress {
+                        id: incoming_tx,
+                        address,
+                    })),
+                )
+                .await?;
+            }
+            ConnectMsg::ConnectFailed {
+                failed_acceptor_addr,
+                ..
+            } => {
+                // Mirror connect.rs:2125-2273. Two routing modes:
+                //   (a) response_forwarded == true: forward downstream
+                //       to forwarded_to so the closer relay can re-route
+                //       with its local knowledge; clear response_forwarded.
+                //   (b) Otherwise: try local re-route via handle_request
+                //       (mark failed acceptor visited, retry forward,
+                //       accept locally, or propagate ConnectFailed upstream).
+                let now = Instant::now();
+                if state.response_forwarded {
+                    if let Some(ref fwd) = state.forwarded_to {
+                        if let Some(fwd_addr) = fwd.socket_addr() {
+                            op_manager.ring.connection_manager.record_acceptor_outcome(
+                                failed_acceptor_addr,
+                                false,
+                                now,
+                            );
+                            tracing::debug!(
+                                tx = %incoming_tx,
+                                forwarded_to_addr = %fwd_addr,
+                                failed_acceptor = %failed_acceptor_addr,
+                                "CONNECT relay (task-per-tx): forwarding ConnectFailed downstream"
+                            );
+                            let mut ctx = op_manager.op_ctx(incoming_tx);
+                            ctx.send_fire_and_forget(
+                                fwd_addr,
+                                NetMessage::V1(NetMessageV1::Connect(ConnectMsg::ConnectFailed {
+                                    id: incoming_tx,
+                                    failed_acceptor_addr,
+                                })),
+                            )
+                            .await?;
+                            state.response_forwarded = false;
+                            continue;
+                        }
+                    }
+                }
+
+                let failed_peer = state.forwarded_to.clone();
+                op_manager.ring.connection_manager.record_acceptor_outcome(
+                    failed_acceptor_addr,
+                    false,
+                    now,
+                );
+                if let Some(ref fwd) = failed_peer {
+                    op_manager.connect_forward_estimator.write().record(
+                        fwd,
+                        desired_location,
+                        false,
+                    );
+                    forward_attempts.remove(fwd);
+                }
+
+                state.request.visited.mark_visited(failed_acceptor_addr);
+                state.forwarded_to = None;
+                state.forwarded_at = None;
+                state.response_forwarded = false;
+
+                let env = RelayEnv::new(op_manager);
+                let estimator = op_manager.connect_forward_estimator.read().clone();
+                let retry =
+                    state.handle_request(&env, &recency, &mut forward_attempts, &estimator, now);
+
+                if let Some((peer, forward_req)) = retry.forward {
+                    recency.insert(peer.clone(), now);
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        failed_acceptor = %failed_acceptor_addr,
+                        retry_peer = %peer.pub_key(),
+                        "CONNECT relay (task-per-tx): re-routing to different peer after ConnectFailed"
+                    );
+                    if let Some(addr) = peer.socket_addr() {
+                        let mut ctx = op_manager.op_ctx(incoming_tx);
+                        ctx.send_fire_and_forget(
+                            addr,
+                            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                                id: incoming_tx,
+                                payload: forward_req,
+                            })),
+                        )
+                        .await?;
+                    }
+                } else if let Some(accept) = retry.accept {
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        failed_acceptor = %failed_acceptor_addr,
+                        acceptor = %accept.response.acceptor.pub_key(),
+                        "CONNECT relay (task-per-tx): accepting locally after ConnectFailed"
+                    );
+                    if let Some(event) = NetEventLog::connect_response_sent(
+                        &incoming_tx,
+                        &op_manager.ring,
+                        accept.response.acceptor.clone(),
+                        accept.joiner.clone(),
+                    ) {
+                        op_manager.ring.register_events(Either::Left(event)).await;
+                    }
+                    dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    let mut ctx = op_manager.op_ctx(incoming_tx);
+                    ctx.send_fire_and_forget(
+                        upstream_addr,
+                        NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {
+                            id: incoming_tx,
+                            payload: accept.response,
+                        })),
+                    )
+                    .await?;
+                } else {
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        %upstream_addr,
+                        failed_acceptor = %failed_acceptor_addr,
+                        "CONNECT relay (task-per-tx): propagating ConnectFailed upstream (no re-route)"
+                    );
+                    let mut ctx = op_manager.op_ctx(incoming_tx);
+                    ctx.send_fire_and_forget(
+                        upstream_addr,
+                        NetMessage::V1(NetMessageV1::Connect(ConnectMsg::ConnectFailed {
+                            id: incoming_tx,
+                            failed_acceptor_addr,
+                        })),
+                    )
+                    .await?;
+                }
+            }
+            ConnectMsg::Request { .. } => {
+                // Driver bypass at node.rs filters Request — the
+                // dispatch gate handles it as the spawn signal. If a
+                // Request reaches the driver inbox the bypass logic
+                // has regressed. Drop with a warning so future
+                // refactors notice.
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    "CONNECT relay (task-per-tx): unexpected Request on driver inbox; bypass logic regressed"
+                );
+            }
+        }
+    }
 }
 
 /// Decide whether the driver loop should exit because the transaction
@@ -631,5 +1302,107 @@ mod tests {
             }
             other => panic!("expected ConnectFailed, got {other:?}"),
         }
+    }
+
+    /// Source-literal regression guard: `start_relay_connect` MUST
+    /// insert into `active_relay_connect_txs` before any work happens,
+    /// so `RelayConnectInflightGuard` can clean it up on driver exit.
+    /// Mirrors the pattern enforced for PUT/SUBSCRIBE/UPDATE relay
+    /// drivers (`start_relay_subscribe_checks_dedup_gate` family).
+    #[test]
+    fn start_relay_connect_inserts_into_dedup_set() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let fn_start = SOURCE
+            .find("pub(crate) async fn start_relay_connect(")
+            .expect("start_relay_connect not found — driver removed or renamed");
+        let fn_end = SOURCE[fn_start..]
+            .find("\n}\n")
+            .expect("start_relay_connect has no closing brace");
+        let body = &SOURCE[fn_start..fn_start + fn_end];
+        assert!(
+            body.contains("active_relay_connect_txs.insert(incoming_tx)"),
+            "start_relay_connect MUST insert(incoming_tx) into the dedup \
+             set before spawning. Without this, racing duplicate Requests \
+             spawn N drivers and leak `RelayConnectInflightGuard`s."
+        );
+        assert!(
+            body.contains("RELAY_CONNECT_DEDUP_REJECTS"),
+            "start_relay_connect MUST increment RELAY_CONNECT_DEDUP_REJECTS \
+             when the dedup gate fires; without it, dedup storms are \
+             invisible to telemetry."
+        );
+    }
+
+    /// Source-literal guard: relay driver runs the full re-entry
+    /// state machine (Response/Rejected/ObservedAddress/ConnectFailed)
+    /// on its inbox receiver. Removing any of these branches would
+    /// strand the corresponding re-entry on legacy `process_message`,
+    /// which is being retired in commit 4.
+    #[test]
+    fn drive_relay_connect_handles_all_reentry_variants() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let fn_start = SOURCE
+            .find("async fn drive_relay_connect(")
+            .expect("drive_relay_connect not found");
+        // Window ends at `should_exit_for_ttl` definition.
+        let fn_end = SOURCE[fn_start..]
+            .find("/// Decide whether the driver loop should exit")
+            .expect("drive_relay_connect has no successor function — guard outdated")
+            + fn_start;
+        let body = &SOURCE[fn_start..fn_end];
+
+        for variant in &[
+            "ConnectMsg::Response { payload, .. }",
+            "ConnectMsg::Rejected {",
+            "ConnectMsg::ObservedAddress { address, .. }",
+            "ConnectMsg::ConnectFailed {",
+        ] {
+            assert!(
+                body.contains(variant),
+                "drive_relay_connect MUST match `{variant}`. \
+                 Removing this arm strands the variant on legacy \
+                 process_message after commit 4 retires it."
+            );
+        }
+
+        assert!(
+            body.contains("should_exit_for_ttl(&incoming_tx)"),
+            "drive_relay_connect MUST poll should_exit_for_ttl in the \
+             receive loop; without it a wedged tx leaks the \
+             pending_op_results slot until the 60s sweep."
+        );
+    }
+
+    /// Source-literal guard: the relay driver's admission RAII guard
+    /// MUST be dropped before entering the receive loop. Holding the
+    /// guard for the full driver lifetime would starve the gateway
+    /// admission slot under load (driver lifetimes >> handle_request
+    /// decision latencies). See plan risk #4.
+    #[test]
+    fn relay_driver_admission_guard_scoped_to_initial_actions() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let fn_start = SOURCE
+            .find("async fn drive_relay_connect(")
+            .expect("drive_relay_connect not found");
+        let body = &SOURCE[fn_start..];
+
+        let guard_decl_pos = body
+            .find("let _admission = match op_manager.ring.connection_manager.try_admit_connect()")
+            .expect(
+                "driver no longer binds admission guard as `let _admission = match ... try_admit_connect()`. \
+                 The RAII guard MUST be bound to `_admission` (drops at end of initial-actions scope) \
+                 — not held across the recv loop. See plan risk #4 (admission slot starvation)."
+            );
+        let receive_loop_pos = body
+            .find("loop {\n        if should_exit_for_ttl")
+            .expect("driver no longer has the recv loop with TTL exit");
+
+        assert!(
+            guard_decl_pos < receive_loop_pos,
+            "admission gate (`let _admission = match ... try_admit_connect()`) \
+             must appear BEFORE the recv loop with TTL exit, so the guard \
+             drops at the end of its block scope and does not span the \
+             receive loop."
+        );
     }
 }

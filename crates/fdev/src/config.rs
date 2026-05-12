@@ -142,8 +142,15 @@ pub struct UpdateConfig {
     /// The default value is `127.0.0.1`
     #[arg(short, long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub(crate) address: IpAddr,
-    /// A path to the update/delta being pushed to the contract.
+    /// Path to the file being pushed to the contract. Interpreted as a
+    /// `UpdateData::Delta` by default, or as a full-state replacement
+    /// (`UpdateData::State`) when `--as-state` is set.
     pub(crate) delta: PathBuf,
+    /// Send the file contents as a full state replacement (`UpdateData::State`)
+    /// instead of the default delta (`UpdateData::Delta`). Use this when the
+    /// contract's `update_state` only accepts full-state replacements.
+    #[arg(long)]
+    pub(crate) as_state: bool,
     /// Whether this contract will be updated in the network or is just a dry run
     /// to be executed in local mode only. By default puts are performed in local.
     pub(crate) release: bool,

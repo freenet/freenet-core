@@ -53,7 +53,8 @@ fn homepage_html() -> String {
             <img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo">
             <span class="header-title">FREENET</span>
             <span class="header-scope">Local Peer</span>
-            <span class="badge">v{version}</span>
+            <span class="badge" id="version-badge" data-version="{version}">v{version}</span>
+            <a class="update-badge" id="update-badge" href="https://github.com/freenet/freenet-core/releases/latest" target="_blank" rel="noopener noreferrer" hidden>Update available</a>
         </div>
         <div class="header-right">
             <span class="uptime">Up {uptime}</span>
@@ -470,6 +471,7 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
     let mut rows = String::new();
     for p in &snap.peers {
         let peer_type = if p.is_gateway { "Gateway" } else { "Peer" };
+        let loc_sort = p.location.map(|l| l.to_string()).unwrap_or_default();
         let loc = p
             .location
             .map(|l| format!("{:.4}", l))
@@ -485,13 +487,17 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
             "—".to_string()
         };
         rows.push_str(&format!(
-            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'"><td><code>{addr}</code></td><td>{loc}</td><td>{ptype}</td><td>{sent}</td><td>{recv}</td><td>{connected}</td></tr>"#,
+            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'"><td data-sort="{addr_enc}"><code>{addr}</code></td><td data-sort="{loc_sort}">{loc}</td><td data-sort="{ptype}">{ptype}</td><td data-sort="{bytes_sent}">{sent}</td><td data-sort="{bytes_recv}">{recv}</td><td data-sort="{conn_secs}">{connected}</td></tr>"#,
             addr_enc = html_escape(&p.address.to_string()),
             addr = p.address,
+            loc_sort = loc_sort,
             loc = loc,
             ptype = peer_type,
+            bytes_sent = p.bytes_sent,
             sent = sent,
+            bytes_recv = p.bytes_received,
             recv = recv,
+            conn_secs = p.connected_secs,
             connected = format_duration(p.connected_secs),
         ));
     }
@@ -501,8 +507,8 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
             <div class="card-header"><h2>Network Peers</h2>{own_loc}</div>
             {ring_svg}
             <div class="table-wrap">
-                <table>
-                    <thead><tr><th>Address</th><th>Location</th><th>Type</th><th>Sent</th><th>Recv</th><th>Connected</th></tr></thead>
+                <table class="sortable" data-table-id="peers">
+                    <thead><tr><th data-sort-type="text">Address</th><th data-sort-type="num">Location</th><th data-sort-type="text">Type</th><th data-sort-type="num">Sent</th><th data-sort-type="num">Recv</th><th data-sort-type="num">Connected</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>
@@ -561,25 +567,32 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
         }
     }
 
-    // Peer dots
+    // Peer dots — each wrapped in an <a> link to its detail page so the
+    // SVG ring stays in sync with the table rows below it.
     for p in peers {
         if let Some(loc) = p.location {
             let (px, py) = loc_to_xy(loc);
             let fill = if p.is_gateway { "#fbbf24" } else { "#007FFF" };
+            let kind = if p.is_gateway { "Gateway" } else { "Peer" };
+            let addr = p.address.to_string();
+            let title = format!("{kind} {addr} (loc {loc:.4})");
             write!(
                 svg,
-                "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"5\" fill=\"{fill}\"/>"
+                "<a href=\"/peer/{href}\" class=\"ring-peer-link\"><title>{title}</title><circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"5\" fill=\"{fill}\"/></a>",
+                href = html_escape(&addr),
+                title = html_escape(&title),
             )
             .ok();
         }
     }
 
-    // Own location (drawn last so it's on top)
+    // Own location (drawn last so it's on top). Not a link — there is no
+    // detail page for the local node.
     if let Some(own_loc) = own_location {
         let (ox, oy) = loc_to_xy(own_loc);
         write!(
             svg,
-            "<circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"7\" fill=\"#34d399\" stroke=\"#fff\" stroke-width=\"2\"/>"
+            "<g class=\"ring-self\"><title>You (loc {own_loc:.4})</title><circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"7\" fill=\"#34d399\" stroke=\"#fff\" stroke-width=\"2\"/></g>"
         )
         .ok();
     }
@@ -619,11 +632,17 @@ fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
             .last_updated_secs
             .map(format_ago)
             .unwrap_or_else(|| "—".to_string());
+        // last_updated_secs absent → never updated. Sort it as the
+        // largest possible "ago", so it lands at the bottom in ascending
+        // order (i.e. "never" is treated as the oldest activity).
+        let last_update_sort = c.last_updated_secs.unwrap_or(u64::MAX);
         rows.push_str(&format!(
-            r#"<tr><td title="{full}"><code>{short}</code></td><td>{subscribed}</td><td>{last_update}</td></tr>"#,
+            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button></td><td data-sort="{sub_secs}">{subscribed}</td><td data-sort="{last_sort}">{last_update}</td></tr>"#,
             full = html_escape(&c.key_full),
             short = html_escape(&c.key_short),
+            sub_secs = c.subscribed_secs,
             subscribed = format_ago(c.subscribed_secs),
+            last_sort = last_update_sort,
             last_update = last_update,
         ));
     }
@@ -632,8 +651,8 @@ fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
         r#"<div class="card">
             <h2>Subscribed Contracts</h2>
             <div class="table-wrap">
-                <table>
-                    <thead><tr><th>Contract</th><th>Subscribed</th><th>Last Update</th></tr></thead>
+                <table class="sortable" data-table-id="contracts">
+                    <thead><tr><th data-sort-type="text">Contract</th><th data-sort-type="num">Subscribed</th><th data-sort-type="num">Last Update</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>
@@ -1197,6 +1216,98 @@ p:last-child { margin-bottom: 0; }
     main { margin: 1rem auto; }
     .ring-svg { width: 180px; height: 180px; }
 }
+/* ── Ring SVG peer links ── */
+.ring-svg a.ring-peer-link { cursor: pointer; }
+.ring-svg a.ring-peer-link circle {
+    transition: r 0.12s ease, stroke-width 0.12s ease;
+}
+.ring-svg a.ring-peer-link:hover circle,
+.ring-svg a.ring-peer-link:focus circle {
+    r: 7;
+    stroke: var(--text-primary);
+    stroke-width: 1.5;
+}
+.ring-svg a.ring-peer-link:focus { outline: none; }
+/* ── Sortable tables ── */
+table.sortable thead th {
+    cursor: pointer;
+    user-select: none;
+    position: relative;
+    padding-right: 1.1rem;
+}
+table.sortable thead th:hover { color: var(--text-primary); }
+table.sortable thead th::after {
+    content: "";
+    position: absolute;
+    right: 0.4rem;
+    top: 50%;
+    transform: translateY(-50%);
+    opacity: 0.35;
+    font-size: 0.7rem;
+}
+table.sortable thead th.sort-asc::after { content: "▲"; opacity: 1; color: var(--accent-light); }
+table.sortable thead th.sort-desc::after { content: "▼"; opacity: 1; color: var(--accent-light); }
+/* ── Copy-to-clipboard contract button ── */
+.copy-key {
+    background: none;
+    border: none;
+    padding: 0 0.25rem;
+    margin-left: 0.35rem;
+    cursor: copy;
+    font: inherit;
+    font-size: 0.85em;
+    color: var(--text-muted);
+    transition: color 0.15s;
+}
+.copy-key:hover { color: var(--accent-light); }
+.copy-key:focus { outline: 1px dashed var(--accent-light); outline-offset: 2px; }
+.copy-key.copied { color: #34d399; }
+[data-theme="light"] .copy-key.copied { color: #059669; }
+/* ── Update-available badge in header ── */
+.update-badge {
+    background: rgba(52, 211, 153, 0.15);
+    color: #34d399;
+    border: 1px solid rgba(52, 211, 153, 0.35);
+    padding: 0.15rem 0.5rem;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    font-family: var(--font-mono);
+    text-decoration: none;
+    margin-left: 0.25rem;
+}
+.update-badge:hover { background: rgba(52, 211, 153, 0.25); text-decoration: none; }
+[data-theme="light"] .update-badge { color: #059669; }
+.update-badge[hidden] { display: none; }
+/* ── Toast (clipboard feedback) ── */
+.toast-container {
+    position: fixed;
+    bottom: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    pointer-events: none;
+}
+.toast {
+    background: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 0.5rem 0.9rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-family: var(--font-mono);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+    animation: toast-in 0.18s ease-out;
+}
+.toast.toast-error { color: #f87171; border-color: rgba(248, 113, 113, 0.4); }
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
 "##;
 
 /// Inline JavaScript for the dark/light mode toggle.
@@ -1226,6 +1337,173 @@ function toggleTheme() {
         if (icon) icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
         try { localStorage.setItem('theme', 'light'); } catch (e) {}
     }
+}
+
+/* ── Toast notifications ── */
+function showToast(msg, opts) {
+    var container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        container.className = 'toast-container';
+        document.body.appendChild(container);
+    }
+    var t = document.createElement('div');
+    t.className = 'toast' + ((opts && opts.error) ? ' toast-error' : '');
+    t.textContent = msg;
+    container.appendChild(t);
+    setTimeout(function() {
+        t.style.transition = 'opacity 0.25s';
+        t.style.opacity = '0';
+        setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 260);
+    }, (opts && opts.duration) || 1600);
+}
+
+/* ── Copy contract key to clipboard ── */
+function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text);
+    }
+    /* Fallback for older browsers / non-secure contexts */
+    return new Promise(function(resolve, reject) {
+        try {
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            var ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            ok ? resolve() : reject(new Error('execCommand failed'));
+        } catch (e) { reject(e); }
+    });
+}
+
+/* ── Sortable tables ── */
+function compareCells(a, b, type) {
+    if (type === 'num') {
+        var na = parseFloat(a);
+        var nb = parseFloat(b);
+        var aBad = isNaN(na), bBad = isNaN(nb);
+        if (aBad && bBad) return 0;
+        if (aBad) return 1;   /* missing values sort to bottom */
+        if (bBad) return -1;
+        return na - nb;
+    }
+    return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function applySort(table, colIndex, dir) {
+    var tbody = table.querySelector('tbody');
+    if (!tbody) return;
+    var ths = table.querySelectorAll('thead th');
+    var th = ths[colIndex];
+    if (!th) return;
+    var type = th.getAttribute('data-sort-type') || 'text';
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+    rows.sort(function(r1, r2) {
+        var c1 = r1.children[colIndex];
+        var c2 = r2.children[colIndex];
+        var v1 = c1 ? (c1.getAttribute('data-sort') || c1.textContent) : '';
+        var v2 = c2 ? (c2.getAttribute('data-sort') || c2.textContent) : '';
+        var cmp = compareCells(v1, v2, type);
+        return dir === 'desc' ? -cmp : cmp;
+    });
+    rows.forEach(function(r) { tbody.appendChild(r); });
+    ths.forEach(function(h) { h.classList.remove('sort-asc', 'sort-desc'); });
+    th.classList.add(dir === 'desc' ? 'sort-desc' : 'sort-asc');
+}
+
+function sortKey(table) {
+    return 'sort:' + (table.getAttribute('data-table-id') || 'tbl');
+}
+
+function handleHeaderClick(th) {
+    var table = th.closest('table.sortable');
+    if (!table) return;
+    var ths = Array.prototype.slice.call(table.querySelectorAll('thead th'));
+    var idx = ths.indexOf(th);
+    if (idx < 0) return;
+    var current = th.classList.contains('sort-asc') ? 'asc'
+                : th.classList.contains('sort-desc') ? 'desc'
+                : null;
+    var dir = current === 'asc' ? 'desc' : 'asc';
+    applySort(table, idx, dir);
+    try { sessionStorage.setItem(sortKey(table), idx + ':' + dir); } catch (e) {}
+}
+
+function restoreSort() {
+    document.querySelectorAll('table.sortable').forEach(function(table) {
+        try {
+            var saved = sessionStorage.getItem(sortKey(table));
+            if (!saved) return;
+            var parts = saved.split(':');
+            var idx = parseInt(parts[0], 10);
+            var dir = parts[1] === 'desc' ? 'desc' : 'asc';
+            if (!isNaN(idx)) applySort(table, idx, dir);
+        } catch (e) {}
+    });
+}
+
+/* ── Update-available check (GitHub releases, cached 12h) ── */
+function compareSemver(a, b) {
+    var pa = String(a).replace(/^v/, '').split(/[.\-+]/);
+    var pb = String(b).replace(/^v/, '').split(/[.\-+]/);
+    var n = Math.max(pa.length, pb.length);
+    for (var i = 0; i < n; i++) {
+        var na = parseInt(pa[i], 10);
+        var nb = parseInt(pb[i], 10);
+        if (isNaN(na) && isNaN(nb)) {
+            var s = (pa[i] || '').localeCompare(pb[i] || '');
+            if (s !== 0) return s;
+            continue;
+        }
+        if (isNaN(na)) return -1;
+        if (isNaN(nb)) return 1;
+        if (na !== nb) return na - nb;
+    }
+    return 0;
+}
+
+function showUpdateBadge(latestTag) {
+    var el = document.getElementById('update-badge');
+    if (!el) return;
+    el.textContent = 'Update: v' + String(latestTag).replace(/^v/, '');
+    el.title = 'A newer Freenet release is available — click to view release notes';
+    el.hidden = false;
+}
+
+function checkForUpdate() {
+    var badge = document.getElementById('version-badge');
+    if (!badge) return;
+    var current = badge.getAttribute('data-version') || '';
+    if (!current || current === '?') return;
+    var TTL_MS = 12 * 60 * 60 * 1000;
+    var now = Date.now();
+    var cached = null;
+    try {
+        var raw = localStorage.getItem('freenet-update-check');
+        if (raw) cached = JSON.parse(raw);
+    } catch (e) {}
+    if (cached && cached.tag && cached.checkedAt && (now - cached.checkedAt) < TTL_MS) {
+        if (compareSemver(cached.tag, current) > 0) showUpdateBadge(cached.tag);
+        return;
+    }
+    fetch('https://api.github.com/repos/freenet/freenet-core/releases/latest', {
+        headers: { 'Accept': 'application/vnd.github+json' },
+    }).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+    }).then(function(data) {
+        var tag = data && data.tag_name;
+        if (!tag) return;
+        try { localStorage.setItem('freenet-update-check', JSON.stringify({ tag: tag, checkedAt: now })); } catch (e) {}
+        if (compareSemver(tag, current) > 0) showUpdateBadge(tag);
+    }).catch(function(e) {
+        /* Network blocked / GitHub rate-limited — silently skip */
+        console.debug('Update check failed:', e);
+    });
 }
 
 /* Tab switching for per-operation-type charts */
@@ -1261,6 +1539,29 @@ document.addEventListener('DOMContentLoaded', function() {
         } catch(e) {}
     }
     restoreTab();
+    restoreSort();
+    checkForUpdate();
+
+    /* Delegated click handler \u2014 survives <main> innerHTML swaps from auto-refresh,
+       so we don't need to re-bind after each refresh. */
+    document.addEventListener('click', function(ev) {
+        var copy = ev.target.closest && ev.target.closest('.copy-key');
+        if (copy) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            var text = copy.getAttribute('data-copy') || copy.textContent.trim();
+            copyToClipboard(text).then(function() {
+                showToast('Contract key copied');
+                copy.classList.add('copied');
+                setTimeout(function() { copy.classList.remove('copied'); }, 900);
+            }).catch(function() {
+                showToast('Copy failed', { error: true });
+            });
+            return;
+        }
+        var th = ev.target.closest && ev.target.closest('table.sortable thead th');
+        if (th) { handleHeaderClick(th); return; }
+    });
 
     /* Auto-refresh: fetch the page and swap dynamic content without a full reload.
        Uses setTimeout chaining (not setInterval) so slow responses don't overlap. */
@@ -1276,14 +1577,19 @@ document.addEventListener('DOMContentLoaded', function() {
                 var newUp = doc.querySelector('.uptime');
                 var oldUp = document.querySelector('.uptime');
                 if (newUp && oldUp) oldUp.textContent = newUp.textContent;
-                var newBadge = doc.querySelector('.badge');
-                var oldBadge = document.querySelector('.badge');
-                if (newBadge && oldBadge) oldBadge.textContent = newBadge.textContent;
+                var newBadge = doc.querySelector('#version-badge');
+                var oldBadge = document.getElementById('version-badge');
+                if (newBadge && oldBadge) {
+                    oldBadge.textContent = newBadge.textContent;
+                    var nv = newBadge.getAttribute('data-version');
+                    if (nv) oldBadge.setAttribute('data-version', nv);
+                }
                 var newIcon = doc.querySelector('link[rel="icon"]');
                 var oldIcon = document.querySelector('link[rel="icon"]');
                 if (newIcon && oldIcon) oldIcon.setAttribute('href', newIcon.getAttribute('href'));
-                /* Restore tab selection after content swap */
+                /* Restore tab selection and table sort after content swap */
                 restoreTab();
+                restoreSort();
             }).catch(function(e) { console.warn('Dashboard refresh failed:', e); })
               .finally(scheduleRefresh);
         }, 5000);
@@ -1510,52 +1816,49 @@ fn peer_detail_html(address_str: &str) -> String {
             if event_count == 0 && tab_name != "All" {
                 write!(
                     panel_content,
-                    r#"<div class="empty-chart">No routing events for {name} operations yet</div>"#,
+                    r#"<div class="empty-chart">No {name} operations have routed through this peer yet. The chart will populate as the network sends or relays {name}s through this connection.</div>"#,
                     name = tab_name,
                 )
                 .ok();
             } else {
-                // Only show charts that have data
-                if !f_curve.is_empty() {
-                    panel_content.push_str(&build_estimator_chart(
-                        "Failure Probability",
-                        f_curve,
-                        f_range,
-                        if tab_name == "All" { fail_adj } else { None },
-                        ploc,
-                        "0.0",
-                        "1.0",
-                    ));
-                }
-                if !rt_curve.is_empty() {
-                    panel_content.push_str(&build_estimator_chart(
-                        "Response Time (s)",
-                        rt_curve,
-                        rt_range,
-                        if tab_name == "All" { rt_adj } else { None },
-                        ploc,
-                        "0",
-                        "auto",
-                    ));
-                }
-                if !xfer_curve.is_empty() {
-                    panel_content.push_str(&build_estimator_chart(
-                        "Transfer Rate (B/s)",
-                        xfer_curve,
-                        xfer_range,
-                        if tab_name == "All" { xfer_adj } else { None },
-                        ploc,
-                        "auto",
-                        "0",
-                    ));
-                }
-                if panel_content.is_empty() {
-                    write!(
-                        panel_content,
-                        r#"<div class="empty-chart">Awaiting routing events</div>"#,
-                    )
-                    .ok();
-                }
+                // Always render all three prediction-component slots so the
+                // user can see every dimension the router models. Each slot
+                // either contains the rendered curve or a per-metric
+                // "awaiting data" placeholder — empty slots are NOT hidden,
+                // because hiding them silently rotted unobserved when the
+                // task-per-tx migration stopped feeding the response-time
+                // and transfer-rate estimators (the `Failure Probability`-only
+                // dashboard regression that surfaced this code path).
+                panel_content.push_str(&build_estimator_chart_or_placeholder(
+                    "Failure Probability",
+                    f_curve,
+                    f_range,
+                    if tab_name == "All" { fail_adj } else { None },
+                    ploc,
+                    "0.0",
+                    "1.0",
+                    "No success/failure observations have routed through this peer yet.",
+                ));
+                panel_content.push_str(&build_estimator_chart_or_placeholder(
+                    "Response Time (s)",
+                    rt_curve,
+                    rt_range,
+                    if tab_name == "All" { rt_adj } else { None },
+                    ploc,
+                    "0",
+                    "auto",
+                    "No timed responses have been observed from this peer yet.",
+                ));
+                panel_content.push_str(&build_estimator_chart_or_placeholder(
+                    "Transfer Rate (B/s)",
+                    xfer_curve,
+                    xfer_range,
+                    if tab_name == "All" { xfer_adj } else { None },
+                    ploc,
+                    "auto",
+                    "0",
+                    "No payload transfers have been observed from this peer yet.",
+                ));
             }
 
             let panel_active = if i == 0 { " tab-panel-active" } else { "" };
@@ -1620,7 +1923,7 @@ fn peer_detail_html(address_str: &str) -> String {
                 ts = fmt_prediction_speed(pred.transfer_speed_bps),
             )
         } else {
-            r#"<div class="card"><h2>Prediction</h2><p class="empty">Insufficient data for prediction at this peer's location</p></div>"#.to_string()
+            r#"<div class="card"><h2>Prediction</h2><p class="empty">Not enough routing data yet to predict this peer's behavior. The card fills in as operations are routed through it.</p></div>"#.to_string()
         }
     } else {
         String::new()
@@ -1677,6 +1980,42 @@ fn peer_detail_html(address_str: &str) -> String {
     )
 }
 
+/// Render the named estimator chart, or — when no data has been observed
+/// yet — a titled placeholder. The placeholder keeps the slot visible so
+/// users can always see every component of a routing prediction even when
+/// some estimators have not yet received feedback. Hiding empty charts
+/// masked the data-collection regression in the task-per-tx migration
+/// that fed only `failure_estimator` and left `response_start_time` and
+/// `transfer_rate` permanently empty.
+#[allow(clippy::too_many_arguments)]
+fn build_estimator_chart_or_placeholder(
+    title: &str,
+    curve_points: &[(f64, f64)],
+    data_range: (f64, f64),
+    peer_adjustment: Option<f64>,
+    peer_location: Option<f64>,
+    y_min_hint: &str,
+    y_max_hint: &str,
+    empty_message: &str,
+) -> String {
+    if curve_points.is_empty() {
+        return format!(
+            r#"<div class="chart-section"><h3>{title}</h3><div class="empty-chart">{msg}</div></div>"#,
+            title = title,
+            msg = empty_message,
+        );
+    }
+    build_estimator_chart(
+        title,
+        curve_points,
+        data_range,
+        peer_adjustment,
+        peer_location,
+        y_min_hint,
+        y_max_hint,
+    )
+}
+
 /// Build an SVG chart showing a PAV regression curve with optional per-peer adjustment.
 ///
 /// `data_range` is `(data_x_min, data_x_max)` -- the x-range of actual regression data.
@@ -1692,7 +2031,7 @@ fn build_estimator_chart(
 ) -> String {
     if curve_points.is_empty() {
         return format!(
-            r#"<div class="chart-section"><h3>{title}</h3><div class="empty-chart">Awaiting routing events</div></div>"#,
+            r#"<div class="chart-section"><h3>{title}</h3><div class="empty-chart">No data yet. Populates as operations route through this peer.</div></div>"#,
             title = title,
         );
     }
@@ -2839,6 +3178,109 @@ mod tests {
         assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
     }
 
+    /// Regression: with no data the helper must still emit a titled
+    /// placeholder so all three prediction-component slots
+    /// (Failure Probability, Response Time, Transfer Rate) stay
+    /// visible on the peer dashboard. The previous behaviour hid the
+    /// chart entirely, which masked the task-per-tx data-collection
+    /// regression that left response-time/transfer-rate estimators
+    /// permanently empty (Failure-Probability-only dashboard).
+    #[test]
+    fn build_estimator_chart_or_placeholder_empty_renders_titled_placeholder() {
+        let html = build_estimator_chart_or_placeholder(
+            "Response Time (s)",
+            &[],
+            (0.0, 0.0),
+            None,
+            None,
+            "0",
+            "auto",
+            "No timed responses have been observed from this peer yet.",
+        );
+        assert!(
+            html.contains("<h3>Response Time (s)</h3>"),
+            "empty placeholder must still display the chart title so the user sees the slot is part of the model, got: {html}"
+        );
+        assert!(
+            html.contains("No timed responses have been observed"),
+            "empty placeholder must explain why no curve is shown, got: {html}"
+        );
+        assert!(
+            !html.contains("<svg"),
+            "empty placeholder must not render an SVG, got: {html}"
+        );
+    }
+
+    /// Regression: the per-tab "Routing Predictions" panel must call
+    /// `build_estimator_chart_or_placeholder` for all three
+    /// prediction-component slots (Failure Probability, Response Time,
+    /// Transfer Rate). Hiding empty slots previously masked the
+    /// task-per-tx data-collection regression for months — keeping every
+    /// slot visible makes future regressions detectable on sight.
+    /// Source-scrape rather than HTML-grep because the visible-when-empty
+    /// behaviour depends on a router_snapshot being present, and the
+    /// `home_page.rs::tests` module does not have a snapshot fixture
+    /// builder.
+    #[test]
+    fn peer_detail_panel_calls_estimator_helper_for_all_three_components() {
+        let src = include_str!("home_page.rs");
+        // Truncate at the test marker so the assertion below doesn't
+        // match against this very test's source.
+        let cutoff = src
+            .find("#[cfg(test)]")
+            .expect("home_page.rs must have a #[cfg(test)] section");
+        let prod = &src[..cutoff];
+        for title in [
+            "Failure Probability",
+            "Response Time (s)",
+            "Transfer Rate (B/s)",
+        ] {
+            // Find the helper call site and walk forward up to 200 bytes
+            // for the title literal. Whitespace-tolerant so rustfmt
+            // doesn't churn this pin.
+            let mut found = false;
+            let mut cursor = 0;
+            while let Some(call) = prod[cursor..].find("build_estimator_chart_or_placeholder(") {
+                let abs = cursor + call;
+                let tail_end = (abs + 400).min(prod.len());
+                let needle = format!("\"{title}\"");
+                if prod[abs..tail_end].contains(&needle) {
+                    found = true;
+                    break;
+                }
+                cursor = abs + 1;
+            }
+            assert!(
+                found,
+                "peer-detail panel builder must call \
+                 build_estimator_chart_or_placeholder with title {title:?} so the slot is \
+                 always visible. Without this every prediction-component \
+                 slot can silently disappear when its estimator has no \
+                 data — the original regression."
+            );
+        }
+    }
+
+    #[test]
+    fn build_estimator_chart_or_placeholder_renders_chart_when_data_present() {
+        let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
+        let html = build_estimator_chart_or_placeholder(
+            "Failure Probability",
+            &curve,
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "1.0",
+            "should not see this",
+        );
+        assert!(html.contains("<svg"), "non-empty curve must render an SVG");
+        assert!(
+            !html.contains("should not see this"),
+            "non-empty curve must not show the empty-message text"
+        );
+    }
+
     #[test]
     fn fmt_prediction_prob_sentinel_values() {
         assert_eq!(fmt_prediction_prob(f64::NAN), "N/A");
@@ -2848,5 +3290,381 @@ mod tests {
         assert_eq!(fmt_prediction_prob(0.0), "0.0000");
         assert_eq!(fmt_prediction_prob(1.0), "1.0000");
         assert_eq!(fmt_prediction_prob(0.5), "0.5000");
+    }
+
+    fn sample_peer(addr: &str, location: f64) -> crate::node::network_status::PeerSnapshot {
+        use crate::node::network_status::PeerSnapshot;
+        PeerSnapshot {
+            address: addr.parse().unwrap(),
+            is_gateway: false,
+            location: Some(location),
+            connected_secs: 60,
+            peer_key_location: None,
+            bytes_sent: 1024,
+            bytes_received: 2048,
+        }
+    }
+
+    #[test]
+    fn ring_svg_dots_link_to_peer_pages() {
+        let peers = vec![sample_peer("127.0.0.1:31337", 0.25)];
+        let svg = build_ring_svg(Some(0.5), &peers);
+        assert!(
+            svg.contains("<a href=\"/peer/127.0.0.1:31337\""),
+            "ring peer dot must be wrapped in a link to /peer/{{addr}}, got: {svg}"
+        );
+        assert!(
+            svg.contains("<title>"),
+            "ring peer dot must include a <title> tooltip, got: {svg}"
+        );
+    }
+
+    #[test]
+    fn peers_table_is_sortable_with_raw_sort_values() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.peers = vec![sample_peer("127.0.0.1:31337", 0.25)];
+        let html = build_peers_card(&Some(snap));
+        assert!(
+            html.contains("class=\"sortable\""),
+            "peers table must be sortable"
+        );
+        assert!(
+            html.contains("data-sort-type=\"num\""),
+            "peers table must declare numeric sort columns"
+        );
+        // Bytes are formatted (e.g. "1.0 KB") but must sort by raw byte counts.
+        assert!(
+            html.contains("data-sort=\"1024\""),
+            "sent bytes cell must carry raw byte count for sorting"
+        );
+        assert!(
+            html.contains("data-sort=\"2048\""),
+            "recv bytes cell must carry raw byte count for sorting"
+        );
+    }
+
+    #[test]
+    fn contracts_table_has_copy_button() {
+        use crate::node::network_status::ContractSnapshot;
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.contracts = vec![ContractSnapshot {
+            key_short: "ABC1...".to_string(),
+            key_full: "ABC123XYZ".to_string(),
+            subscribed_secs: 100,
+            last_updated_secs: Some(5),
+        }];
+        let html = build_contracts_card(&Some(snap));
+        assert!(
+            html.contains("class=\"copy-key\""),
+            "contract cell must render a copy button"
+        );
+        assert!(
+            html.contains("data-copy=\"ABC123XYZ\""),
+            "copy button must carry the full contract key, got: {html}"
+        );
+        assert!(
+            html.contains("class=\"sortable\""),
+            "contracts table must be sortable"
+        );
+    }
+
+    #[test]
+    fn header_includes_update_badge() {
+        let html = homepage_html();
+        assert!(
+            html.contains("id=\"update-badge\""),
+            "homepage header must expose an update-badge slot for the JS update check"
+        );
+        assert!(
+            html.contains("id=\"version-badge\""),
+            "homepage header must tag the version badge with an id so the JS check can read data-version"
+        );
+        assert!(
+            html.contains("data-version="),
+            "version badge must expose data-version for the update comparison"
+        );
+    }
+
+    #[test]
+    fn js_contains_update_check_and_sort() {
+        // Lightweight contract: the dashboard JS must keep the new
+        // helpers wired up. If you rename them, update both sides.
+        assert!(
+            JS.contains("checkForUpdate"),
+            "JS must include the update check function"
+        );
+        assert!(
+            JS.contains("applySort"),
+            "JS must include the table sort function"
+        );
+        assert!(
+            JS.contains("copyToClipboard"),
+            "JS must include the clipboard copy helper"
+        );
+    }
+
+    // ── Edge cases for the ring SVG ─────────────────────────────────────────
+
+    #[test]
+    fn ring_svg_self_dot_has_title_but_no_link() {
+        // The local node has no /peer/{addr} page, so the self circle
+        // must NOT be wrapped in an <a>, but it should still expose a
+        // <title> for parity with the peer dots.
+        let svg = build_ring_svg(Some(0.42), &[]);
+        assert!(svg.contains("<svg"), "ring SVG should still render");
+        assert!(
+            !svg.contains("<a "),
+            "self-only ring must not contain any <a> wrappers, got: {svg}"
+        );
+        assert!(
+            svg.contains("<g class=\"ring-self\">"),
+            "self dot must be wrapped in a <g> with the ring-self class"
+        );
+        assert!(
+            svg.contains("<title>You "),
+            "self dot must include a 'You' title, got: {svg}"
+        );
+    }
+
+    #[test]
+    fn ring_svg_distinguishes_gateway_in_link_title() {
+        // Gateway peers and regular peers route to the same /peer/{addr}
+        // page, but the SVG <title> tooltip should label them differently
+        // so users can identify gateways without hovering each one.
+        use crate::node::network_status::PeerSnapshot;
+        let gw = PeerSnapshot {
+            address: "10.0.0.1:31337".parse().unwrap(),
+            is_gateway: true,
+            location: Some(0.10),
+            connected_secs: 0,
+            peer_key_location: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+        };
+        let peer = sample_peer("10.0.0.2:31338", 0.90);
+        let svg = build_ring_svg(Some(0.5), &[gw, peer]);
+        assert!(
+            svg.contains("<title>Gateway 10.0.0.1:31337"),
+            "gateway dot title must say 'Gateway', got: {svg}"
+        );
+        assert!(
+            svg.contains("<title>Peer 10.0.0.2:31338"),
+            "regular peer title must say 'Peer', got: {svg}"
+        );
+        assert!(
+            svg.contains("href=\"/peer/10.0.0.1:31337\""),
+            "gateway dot must still link to /peer/{{addr}}"
+        );
+    }
+
+    #[test]
+    fn ring_svg_omitted_when_no_locations() {
+        // If neither own_location nor any peer has a location, there's
+        // nothing to plot — return empty so the card just shows the table.
+        use crate::node::network_status::PeerSnapshot;
+        let no_loc_peer = PeerSnapshot {
+            address: "10.0.0.3:1".parse().unwrap(),
+            is_gateway: false,
+            location: None,
+            connected_secs: 0,
+            peer_key_location: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+        };
+        assert!(build_ring_svg(None, &[no_loc_peer]).is_empty());
+        assert!(build_ring_svg(None, &[]).is_empty());
+    }
+
+    // ── Sort attribute coverage for both tables ─────────────────────────────
+
+    #[test]
+    fn peers_table_handles_missing_location_in_sort() {
+        // A peer with no known location should still be sortable: emit
+        // an empty data-sort so the JS comparator treats it as the
+        // largest value (sinks to the bottom in ascending order).
+        use crate::node::network_status::PeerSnapshot;
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.peers = vec![PeerSnapshot {
+            address: "10.0.0.4:1".parse().unwrap(),
+            is_gateway: false,
+            location: None,
+            connected_secs: 5,
+            peer_key_location: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+        }];
+        let html = build_peers_card(&Some(snap));
+        assert!(
+            html.contains("data-sort=\"\">—"),
+            "peer row with unknown location must emit empty data-sort, got: {html}"
+        );
+    }
+
+    #[test]
+    fn contracts_table_preserves_full_key_tooltip_and_code_markup() {
+        // The full-key tooltip on the cell predates the copy button and
+        // must NOT be lost when we add the button — that tooltip is
+        // still useful for hover-only users (e.g. read-only screenshots).
+        // Likewise, <code>{short}</code> must stay outside the button so
+        // the abbreviated key keeps its monospace styling without a
+        // hover state on the contract text itself.
+        use crate::node::network_status::ContractSnapshot;
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.contracts = vec![ContractSnapshot {
+            key_short: "DEAD...".to_string(),
+            key_full: "DEADBEEF".to_string(),
+            subscribed_secs: 60,
+            last_updated_secs: Some(2),
+        }];
+        let html = build_contracts_card(&Some(snap));
+        assert!(
+            html.contains("title=\"DEADBEEF\""),
+            "the original full-key cell tooltip must be preserved, got: {html}"
+        );
+        assert!(
+            html.contains("<code>DEAD...</code>"),
+            "the abbreviated key must stay as a plain <code> sibling of the button, got: {html}"
+        );
+        // Lock in the simplified markup: the <code> element is a sibling
+        // of the button, NOT wrapped inside it.
+        assert!(
+            !html.contains("class=\"copy-key\" data-copy=\"DEADBEEF\" title=\"Copy contract key\" aria-label=\"Copy contract key\">⧉</button><code>"),
+            "<code> must come BEFORE the copy button"
+        );
+        assert!(
+            html.contains("</code><button type=\"button\" class=\"copy-key\""),
+            "<code> must directly precede the <button> sibling, got: {html}"
+        );
+    }
+
+    #[test]
+    fn contracts_table_never_updated_sorts_last() {
+        // Contracts that have never been updated (last_updated_secs = None)
+        // should sink to the bottom in ascending order — represented as
+        // u64::MAX in the data-sort attribute. If we emitted "—" or 0,
+        // the row would jump to the top and look "freshest".
+        use crate::node::network_status::ContractSnapshot;
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.contracts = vec![
+            ContractSnapshot {
+                key_short: "FRESH..".to_string(),
+                key_full: "FRESH".to_string(),
+                subscribed_secs: 1,
+                last_updated_secs: Some(1),
+            },
+            ContractSnapshot {
+                key_short: "NEVER..".to_string(),
+                key_full: "NEVER".to_string(),
+                subscribed_secs: 1,
+                last_updated_secs: None,
+            },
+        ];
+        let html = build_contracts_card(&Some(snap));
+        let sentinel = format!("data-sort=\"{}\">—", u64::MAX);
+        assert!(
+            html.contains(&sentinel),
+            "never-updated contract must emit data-sort=\"{}\" so it sorts last in ascending order, got: {html}",
+            u64::MAX
+        );
+    }
+
+    // ── Header / version badge guarantees ───────────────────────────────────
+
+    /// Helper for header-element tests: pull a specific HTML element line
+    /// out of the rendered homepage. We can't just take the first line
+    /// containing the id, because the CSS block and JS bundle also
+    /// reference these ids by name.
+    fn extract_element_line(html: &str, anchor: &str) -> String {
+        html.lines()
+            .find(|l| l.contains(anchor) && l.trim_start().starts_with('<'))
+            .unwrap_or_else(|| panic!("no HTML line containing {anchor:?} in homepage"))
+            .to_string()
+    }
+
+    #[test]
+    fn version_badge_data_attribute_matches_visible_text() {
+        // The JS update check reads `data-version` and compares it
+        // against the GitHub `tag_name`. If the attribute drifted away
+        // from the visible "v{version}" text, the user would see one
+        // version on the chip and the comparator would use another —
+        // so lock that they always agree.
+        //
+        // Note: in unit tests there is no live NetworkStatusSnapshot,
+        // so the rendered version is the "?" placeholder; the contract
+        // we want is "attribute == visible text minus the leading v",
+        // which holds for both the placeholder and the runtime value.
+        let html = homepage_html();
+        let line = extract_element_line(&html, "id=\"version-badge\"");
+        let data_ver = line
+            .split("data-version=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("version badge must declare data-version");
+        let visible = line
+            .split('>')
+            .nth(1)
+            .and_then(|s| s.split('<').next())
+            .expect("version badge must contain visible text");
+        assert!(
+            visible.starts_with('v'),
+            "version chip text must start with 'v', got: {visible:?}"
+        );
+        assert_eq!(
+            &visible[1..],
+            data_ver,
+            "data-version ({data_ver:?}) must equal the visible chip text without the leading 'v' ({visible:?})"
+        );
+    }
+
+    #[test]
+    fn update_badge_links_to_releases_and_starts_hidden() {
+        // The badge must:
+        //   1. Link to the GitHub releases page (so users land somewhere
+        //      sensible when they click it).
+        //   2. Open in a new tab with rel=noopener (we don't want the
+        //      release page to navigate the dashboard frame).
+        //   3. Start hidden — we surface it only after the JS update
+        //      check confirms a newer version exists.
+        let html = homepage_html();
+        let line = extract_element_line(&html, "id=\"update-badge\"");
+        assert!(
+            line.contains("href=\"https://github.com/freenet/freenet-core/releases/latest\""),
+            "update badge must link to the releases page, got: {line}"
+        );
+        assert!(
+            line.contains("target=\"_blank\""),
+            "update badge must open in a new tab"
+        );
+        assert!(
+            line.contains("rel=\"noopener noreferrer\""),
+            "update badge must use rel=noopener noreferrer for safety"
+        );
+        assert!(
+            line.contains(" hidden"),
+            "update badge must start hidden — JS unhides it only when an update is found"
+        );
+    }
+
+    #[test]
+    fn js_update_check_uses_localstorage_cache() {
+        // Two guarantees the JS check makes about resource use:
+        //   1. We compare semver, not string equality — otherwise
+        //      "0.2.10" would look "older" than "0.2.9".
+        //   2. We cache the GitHub response in localStorage so we don't
+        //      hit the api.github.com rate limit on every refresh.
+        // Pin both as substrings.
+        assert!(
+            JS.contains("compareSemver"),
+            "JS must include the semver comparator the update check relies on"
+        );
+        assert!(
+            JS.contains("localStorage") && JS.contains("freenet-update-check"),
+            "JS must persist the update check in localStorage under the freenet-update-check key"
+        );
     }
 }

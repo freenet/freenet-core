@@ -86,10 +86,10 @@ chrono = { version = "0.4", default-features = true }
 rand = "0.9"
 
 # Observability
-opentelemetry = "0.31"
+opentelemetry = "0.32"
 opentelemetry-jaeger = "0.22"
-opentelemetry-otlp = "0.31.1"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.32.0"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-opentelemetry = "0.32.1"
@@ -144,7 +144,7 @@ winapi = "0.3"
 tao = { version = "0.35", default-features = false, features = ["rwh_06"] }
 wry = { version = "0.55", default-features = false, features = ["os-webview"] }
 winreg = "0.56"
-tray-icon = "0.23"
+tray-icon = "0.24"
 muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
