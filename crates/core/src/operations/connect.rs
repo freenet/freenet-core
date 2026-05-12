@@ -1153,6 +1153,11 @@ impl ConnectOp {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // Retained for in-file unit tests + the legacy initiate_join_request
+    // wrapper; all production joiner-side initiation flows through the
+    // task-per-tx driver via prepare_join_request. Phase 5 final / PR-B
+    // deletes this along with the rest of impl Operation for ConnectOp.
+    #[allow(dead_code)]
     pub(crate) fn new_joiner(
         id: Transaction,
         desired_location: Location,
@@ -1266,6 +1271,12 @@ impl ConnectOp {
         self.first_hop.as_deref().cloned()
     }
 
+    // Retained for in-file unit tests; production callers (ring::acquire_new,
+    // join_ring_request, gateway_version_probe) build the wire message via the
+    // free `prepare_join_request` helper and skip the legacy ConnectOp carrier.
+    // Phase 5 final / PR-B deletes this along with the rest of
+    // impl Operation for ConnectOp.
+    #[allow(dead_code)]
     pub(crate) fn initiate_join_request(
         own: PeerKeyLocation,
         target: PeerKeyLocation,
@@ -1276,49 +1287,7 @@ impl ConnectOp {
         exclude_addrs: &[SocketAddr],
     ) -> (Transaction, Self, ConnectMsg) {
         let tx = Transaction::new::<ConnectMsg>();
-
-        // Initialize bloom filter with transaction-specific hash keys.
-        // Mark ourself and the target gateway as visited.
-        let mut visited = VisitedPeers::new(&tx);
-        if let Some(own_addr) = own.socket_addr() {
-            visited.mark_visited(own_addr);
-        }
-        if let Some(target_addr) = target.socket_addr() {
-            visited.mark_visited(target_addr);
-        }
-
-        // Exclude already-connected peers and recently-failed NAT addresses so routing
-        // nodes don't forward back to peers we already have a ring connection with.
-        //
-        // Bloom filter saturation note: VisitedPeers uses a 512-bit filter with k=4 hash
-        // functions. Pre-loading N entries raises the false-positive rate; at typical
-        // network sizes (≤ 20 connections in current deployments) the FP rate is negligible
-        // (~0.01%). At DEFAULT_MAX_CONNECTIONS (200), the rate reaches ~39%, which would
-        // cause routing to occasionally skip reachable peers. This is an accepted trade-off
-        // for current network sizes. If production nodes routinely reach high connection
-        // counts, consider capping pre-populated entries to the N closest connected peers
-        // (since greedy routing preferentially selects nearby peers anyway).
-        for addr in exclude_addrs {
-            visited.mark_visited(*addr);
-        }
-        if !exclude_addrs.is_empty() {
-            tracing::debug!(
-                excluded_addrs = exclude_addrs.len(),
-                "connect: pre-populated visited filter with excluded peer addresses (failed + connected)"
-            );
-        }
-
-        // Create joiner with PeerAddr::Unknown - the joiner doesn't know their own
-        // external address (especially behind NAT). The first recipient (gateway)
-        // will fill this in from the packet source address.
-        let joiner = PeerKeyLocation::with_unknown_addr(own.pub_key.clone());
-        let request = ConnectRequest {
-            desired_location,
-            joiner,
-            ttl,
-            visited,
-            uphill_budget: DEFAULT_UPHILL_BUDGET,
-        };
+        let msg = prepare_join_request(tx, &own, &target, desired_location, ttl, exclude_addrs);
 
         let op = ConnectOp::new_joiner(
             tx,
@@ -1328,11 +1297,6 @@ impl ConnectOp {
             Some(target.clone()),
             connect_forward_estimator,
         );
-
-        let msg = ConnectMsg::Request {
-            id: tx,
-            payload: request,
-        };
 
         (tx, op, msg)
     }
@@ -2486,6 +2450,63 @@ pub(super) async fn dispatch_expect_connection_from(
     Ok(())
 }
 
+/// Build a `ConnectMsg::Request` for a joiner-initiated CONNECT.
+///
+/// Pure helper extracted from `ConnectOp::initiate_join_request` so the
+/// task-per-tx driver (`op_ctx_task::start_client_connect`) and
+/// `ring::Ring::acquire_new` can construct the wire message without
+/// allocating a legacy `ConnectOp` carrier. The caller is responsible
+/// for the `Transaction`.
+///
+/// Bloom filter saturation note: `VisitedPeers` uses a 512-bit filter
+/// with k=4 hash functions. Pre-loading N entries raises the false-positive
+/// rate; at typical network sizes (≤ 20 connections in current deployments)
+/// the FP rate is negligible (~0.01%). At DEFAULT_MAX_CONNECTIONS (200),
+/// the rate reaches ~39%, which would cause routing to occasionally skip
+/// reachable peers. This is an accepted trade-off for current network sizes.
+pub(crate) fn prepare_join_request(
+    tx: Transaction,
+    own: &PeerKeyLocation,
+    target: &PeerKeyLocation,
+    desired_location: Location,
+    ttl: u8,
+    exclude_addrs: &[SocketAddr],
+) -> ConnectMsg {
+    let mut visited = VisitedPeers::new(&tx);
+    if let Some(own_addr) = own.socket_addr() {
+        visited.mark_visited(own_addr);
+    }
+    if let Some(target_addr) = target.socket_addr() {
+        visited.mark_visited(target_addr);
+    }
+    for addr in exclude_addrs {
+        visited.mark_visited(*addr);
+    }
+    if !exclude_addrs.is_empty() {
+        tracing::debug!(
+            excluded_addrs = exclude_addrs.len(),
+            "connect: pre-populated visited filter with excluded peer addresses (failed + connected)"
+        );
+    }
+
+    // Create joiner with PeerAddr::Unknown - the joiner doesn't know their own
+    // external address (especially behind NAT). The first recipient (gateway)
+    // will fill this in from the packet source address.
+    let joiner = PeerKeyLocation::with_unknown_addr(own.pub_key.clone());
+    let request = ConnectRequest {
+        desired_location,
+        joiner,
+        ttl,
+        visited,
+        uphill_budget: DEFAULT_UPHILL_BUDGET,
+    };
+
+    ConnectMsg::Request {
+        id: tx,
+        payload: request,
+    }
+}
+
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
 pub(crate) async fn join_ring_request(
     gateway: &PeerKeyLocation,
@@ -2601,7 +2622,9 @@ pub(crate) async fn join_ring_request(
         // Bootstrap mode: target own location with jitter after failures.
         apply_bootstrap_jitter(base_location)
     };
+    let tx = Transaction::new::<ConnectMsg>();
     op_ctx_task::start_client_connect(
+        tx,
         gateway.clone(),
         gateway_addr,
         op_manager,
@@ -2643,7 +2666,9 @@ pub(crate) async fn gateway_version_probe(
     let own = op_manager.ring.connection_manager.own_location();
     let desired_location = own.location().unwrap_or_else(Location::random);
 
+    let tx = Transaction::new::<ConnectMsg>();
     op_ctx_task::start_client_connect(
+        tx,
         gateway.clone(),
         gateway_addr,
         op_manager,
