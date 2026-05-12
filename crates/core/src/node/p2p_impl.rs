@@ -353,6 +353,10 @@ impl NodeP2P {
         tracing::info!("Actor-based client management infrastructure installed with result router");
 
         let background_task_monitor = BackgroundTaskMonitor::new();
+        // Phase 1 of the outer-loop rate-controller RFC (#4074):
+        // start the cross-connection RTT shadow aggregator. Pure
+        // observation; never read by the production data path.
+        crate::transport::rolling_rtt_stats::spawn_aggregator(&background_task_monitor);
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,

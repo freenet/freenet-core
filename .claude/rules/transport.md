@@ -83,6 +83,26 @@ BEFORE changing LEDBAT++ parameters:
   4. Document reasoning in commit message
 ```
 
+### Shadow per-peer RTT registry (issue #4074, Phase 1)
+
+`transport/rolling_rtt_stats.rs` maintains a process-wide
+`SHADOW_RTT_REGISTRY` (`DashMap<SocketAddr, Arc<dyn RttSnapshotProvider>>`)
+populated by `RollingRttStatsHandle` in every `RemoteConnection`. A
+1Hz aggregator spawned from `p2p_impl.rs` (registered with
+`BackgroundTaskMonitor` as `shadow_rtt_aggregator`) emits a
+`shadow_rtt_aggregate` event both as `tracing::info!` and via
+`send_standalone_event` so it reaches the OTLP collector.
+
+```
+NEVER read SHADOW_RTT_REGISTRY or cross_connection_median_inflation
+from the production data path (rate limiter, retry, congestion
+control). It exists only for the staged rollout in #4074:
+  Phase 1 → observation only (current)
+  Phase 2 → shadow controller, still no behaviour change
+  Phase 3 → opt-in flag
+  Phase 4 → default switch only after Phase 3 shows improvement
+```
+
 ## Connection Lifecycle Rules
 
 ### WHEN establishing connections
