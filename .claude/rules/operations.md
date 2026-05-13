@@ -11,10 +11,12 @@ paths:
 Every operation runs as a task-per-transaction driver: each `Transaction`
 is owned and driven by a single spawned task; state lives in task
 locals. The `Operation` trait and the legacy `process_message` /
-`load_or_init` / `handle_op_request` / `handle_op_result` mediator path
-are all gone. `OpManager.ops.connect` remains as a (now-empty) DashMap
-along with its `OpEnum::Connect` carrier; both are retained until the
-follow-up slice that also retires the `ConnectOp` in-file test surface.
+`load_or_init` / `handle_op_request` / `handle_op_result` mediator
+path are all gone. `OpEnum`, every per-op DashMap (`ops.connect`,
+`ops.get`, `ops.put`, `ops.update`, `ops.subscribe`) and the
+`OpManager::push` / `pop` / `has_*_op` accessors that fed them are
+gone too. Drivers publish their own `HostResult` via
+`result_router_tx` and own routing/retry state in task locals.
 
 Driver entry points:
 
@@ -54,14 +56,15 @@ for every inbound wire message. Pattern per op:
 
 ## OpEnum and DashMaps
 
-- `OpEnum::Connect` and `OpManager.ops.connect` are the last
-  DashMap-backed carrier. No production code path writes to the
-  DashMap anymore; both will be removed in the follow-up slice that
-  also retires the `ConnectOp` in-file test surface.
-- `OpEnum::{Get,Put,Update,Subscribe}` and the matching DashMaps and
-  `has_*_op` accessors are gone.
-- `pending_op_counts()` returns `[connect, 0, 0, 0, 0]` — kept for
-  telemetry API stability; the connect slot is currently always 0.
+- `OpEnum` and every per-op DashMap (`ops.{connect,get,put,update,
+  subscribe}`) are gone. No production code path writes to them.
+- `OpManager::push` / `pop` / `has_*_op` / `OpNotAvailable` are all
+  retired.
+- `pending_op_counts()` returns `[0; 5]` — kept for telemetry API
+  stability; every slot is always 0.
+- `ConnectOp` itself survives as a test-only fixture (the
+  `handle_request` state-machine helper backs the relay driver's
+  decision logic). It has no central carrier.
 
 ## Critical Invariant: Initialize-Before-Send
 
