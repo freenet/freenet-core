@@ -25,18 +25,13 @@ use crate::{
     client_events::HostResult,
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
-    message::{
-        InterestMessage, MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction,
-        TransactionType,
-    },
+    message::{InterestMessage, MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction},
     operations::{
-        OpCtx, OpEnum, OpError,
-        connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
-        orphan_streams::OrphanStreamRegistry,
+        OpCtx, OpError, connect::ConnectForwardEstimator, orphan_streams::OrphanStreamRegistry,
     },
     ring::{
-        ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
-        PeerKey, PeerKeyLocation, Ring,
+        ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff, PeerKey, PeerKeyLocation,
+        Ring,
     },
     transport::TransportPublicKey,
     util::time_source::InstantTimeSrc,
@@ -47,30 +42,12 @@ use super::{
     network_bridge::EventLoopNotificationsSender,
 };
 
-#[cfg(debug_assertions)]
-macro_rules! check_id_op {
-    ($get_ty:expr, $var:path) => {
-        if !matches!($get_ty, $var) {
-            return Err(OpError::IncorrectTxType($var, $get_ty));
-        }
-    };
-}
-
-#[derive(Debug, thiserror::Error)]
-#[allow(dead_code)] // Removed alongside `OpManager::pop` in the follow-up DashMap slice.
-pub(crate) enum OpNotAvailable {
-    #[error("operation running")]
-    Running,
-    #[error("operation completed")]
-    Completed,
-}
-
 #[derive(Default)]
 struct Ops {
-    connect: DashMap<Transaction, crate::operations::connect::ConnectOp>,
-    // GET, PUT, UPDATE, and SUBSCRIBE have no DashMap here — every
-    // wire path for those ops runs on `op_ctx_task::*` drivers that
-    // own their state in task locals.
+    // No per-op DashMaps remain. CONNECT, GET, PUT, UPDATE, and
+    // SUBSCRIBE all run on task-per-tx drivers that own state in task
+    // locals; the only state retained here is the global completed /
+    // under_progress sets used by the GC sweep.
     completed: DashSet<Transaction>,
     under_progress: DashSet<Transaction>,
 }
@@ -81,7 +58,6 @@ struct Ops {
 /// run.
 #[derive(Debug, Default)]
 struct OpsSizes {
-    connect: usize,
     completed: usize,
     under_progress: usize,
 }
@@ -89,7 +65,6 @@ struct OpsSizes {
 impl Ops {
     fn sizes(&self) -> OpsSizes {
         OpsSizes {
-            connect: self.connect.len(),
             completed: self.completed.len(),
             under_progress: self.under_progress.len(),
         }
@@ -281,7 +256,6 @@ impl OpManager {
                     event_register,
                     result_router_tx.clone(),
                     request_router.clone(),
-                    ring.clone(),
                     contract_waiters.clone(),
                     pending_contract_fetches.clone(),
                     active_relay_get_txs.clone(),
@@ -572,76 +546,28 @@ impl OpManager {
             .await
     }
 
-    // Orphan after #1454 phase 6 (CONNECT impl Operation retirement).
-    // No production caller after the legacy mediator was deleted; kept
-    // alongside `Ops::connect` / `has_connect_op` until the DashMap is
-    // also removed in the follow-up slice.
-    #[allow(dead_code)]
-    pub async fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
-        // Check if operation is already completed - don't push back to HashMap
-        if self.ops.completed.contains(&id) {
-            tracing::debug!(
-                tx = %id,
-                "OpManager: Ignoring push for already completed operation"
-            );
-            return Ok(());
-        }
-
-        if let Some(tx) = self.ops.under_progress.remove(&id) {
-            if tx.timed_out() {
-                self.ops.completed.insert(tx);
-                return Ok(());
-            }
-        }
-        self.new_transactions.send(id).await?;
-        match op {
-            OpEnum::Connect(op) => {
-                #[cfg(debug_assertions)]
-                check_id_op!(id.transaction_type(), TransactionType::Connect);
-                self.ops.connect.insert(id, *op);
-            }
-        }
-        Ok(())
+    /// Peek at the next hop address for an outbound initial request.
+    ///
+    /// Always returns `None` — every op now runs on a task-per-tx
+    /// driver that owns routing decisions in task locals, so there is
+    /// no DashMap entry to consult here. Retained as a stable API
+    /// surface for `p2p_protoc::handle_notification_msg`, which falls
+    /// back to the connection-manager lookup chain when this returns
+    /// `None`.
+    pub fn peek_next_hop_addr(&self, _id: &Transaction) -> Option<std::net::SocketAddr> {
+        None
     }
 
-    /// Peek at the next hop address for an operation without removing it.
-    /// Used by hop-by-hop routing to determine where to send initial outbound messages.
-    /// Returns None if the operation doesn't exist or doesn't have a next hop address.
-    pub fn peek_next_hop_addr(&self, id: &Transaction) -> Option<std::net::SocketAddr> {
-        if self.ops.completed.contains(id) || self.ops.under_progress.contains(id) {
-            return None;
-        }
-        match id.transaction_type() {
-            TransactionType::Connect => self
-                .ops
-                .connect
-                .get(id)
-                .and_then(|op| op.get_next_hop_addr()),
-            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry;
-            // their drivers manage routing in task locals.
-            TransactionType::Get
-            | TransactionType::Put
-            | TransactionType::Update
-            | TransactionType::Subscribe => None,
-        }
-    }
-
-    /// Peek at the full target peer (including public key) without removing the operation.
-    /// Used when establishing new connections where we need the public key for handshake.
-    pub fn peek_target_peer(&self, id: &Transaction) -> Option<PeerKeyLocation> {
-        if self.ops.completed.contains(id) || self.ops.under_progress.contains(id) {
-            return None;
-        }
-        match id.transaction_type() {
-            TransactionType::Connect => {
-                self.ops.connect.get(id).and_then(|op| op.get_target_peer())
-            }
-            // Other operations only store addresses, not full peer info
-            TransactionType::Put
-            | TransactionType::Get
-            | TransactionType::Subscribe
-            | TransactionType::Update => None,
-        }
+    /// Peek at the full target peer (including public key) for an
+    /// outbound initial request.
+    ///
+    /// Always returns `None` — same rationale as
+    /// [`Self::peek_next_hop_addr`]. The caller in `p2p_protoc` falls
+    /// back to `connection_manager.get_peer_location_by_addr` and the
+    /// configured-gateway list to recover the public key needed for
+    /// the handshake.
+    pub fn peek_target_peer(&self, _id: &Transaction) -> Option<PeerKeyLocation> {
+        None
     }
 
     /// Get the current hop count (remaining HTL) for an operation.
@@ -650,38 +576,6 @@ impl OpManager {
     /// `crates/core/src/tracing.rs:1266`.
     pub fn get_current_hop(&self, _id: &Transaction) -> Option<usize> {
         None
-    }
-
-    // Orphan after #1454 phase 6; only producer (the legacy
-    // `load_or_init` path) is gone. Removed alongside `Ops::connect`
-    // in the follow-up DashMap slice.
-    #[allow(dead_code)]
-    pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
-        if self.ops.completed.contains(id) {
-            return Err(OpNotAvailable::Completed);
-        }
-        if self.ops.under_progress.contains(id) {
-            if id.timed_out() {
-                self.ops.completed.insert(*id);
-                return Err(OpNotAvailable::Completed);
-            }
-            return Err(OpNotAvailable::Running);
-        }
-        let op = match id.transaction_type() {
-            TransactionType::Connect => self
-                .ops
-                .connect
-                .remove(id)
-                .map(|(_k, v)| v)
-                .map(|op| OpEnum::Connect(Box::new(op))),
-            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry.
-            TransactionType::Get
-            | TransactionType::Put
-            | TransactionType::Update
-            | TransactionType::Subscribe => None,
-        };
-        self.ops.under_progress.insert(*id);
-        Ok(op)
     }
 
     /// Emit a `NodeEvent::TransactionCompleted(tx)` to the event loop,
@@ -732,49 +626,15 @@ impl OpManager {
         .await
     }
 
-    // `has_{get,update,put,subscribe}_op` were the legacy relay
-    // dispatch gates; gone with their DashMaps. Every wire variant
-    // for those ops now spawns a driver unconditionally.
-
-    // Orphan after the CONNECT legacy mediator was retired in #1454
-    // phase 6; the relay dispatch gate now relies solely on
-    // `active_relay_connect_txs`. Kept alongside `Ops::connect` until
-    // the DashMap is also removed in the follow-up slice.
-    #[allow(dead_code)]
-    pub fn has_connect_op(&self, id: &Transaction) -> bool {
-        self.ops.connect.contains_key(id)
-    }
+    // `has_{connect,get,update,put,subscribe}_op` were the legacy
+    // relay dispatch gates; all gone with their DashMaps. Every wire
+    // variant now spawns its driver unconditionally and the dedup
+    // gate lives in `active_relay_{op}_txs`.
 
     pub fn completed(&self, id: Transaction) {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.under_progress.remove(&id);
         self.ops.completed.insert(id);
-
-        // Remove the per-type DashMap entry for this transaction.
-        //
-        // Legacy state-machine paths reach `completed` after `pop` already
-        // removed the entry, so the remove below is a no-op for them.
-        //
-        // Task-per-tx drivers use `OpCtx::send_and_await`, which loops the
-        // outbound message back through the event loop as an InboundMessage
-        // with `source_addr=None`. The originator's multi-hop branch in
-        // `process_message` (e.g. put.rs SendAndContinue when forwarding)
-        // returns a non-finalized state that `handle_op_result` pushes into
-        // `ops.<type>`. The bypass in `handle_pure_network_message_v1` then
-        // routes the terminal Response directly to the driver task, so the
-        // entry never re-enters `handle_op_request` and never gets popped.
-        // Without this remove, the entry leaks for OPERATION_TTL (60s) and
-        // pollutes `has_<type>_op` checks until the GC sweep clears it.
-        match id.transaction_type() {
-            TransactionType::Connect => {
-                self.ops.connect.remove(&id);
-            }
-            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry.
-            TransactionType::Get
-            | TransactionType::Put
-            | TransactionType::Update
-            | TransactionType::Subscribe => {}
-        }
 
         // Clean up request router to prevent stale entries from blocking subsequent requests
         if let Some(router) = self.request_router.get() {
@@ -835,11 +695,12 @@ impl OpManager {
     }
 
     /// Returns pending operation counts: [connect, put, get,
-    /// subscribe, update]. Non-connect slots are always 0 (their
-    /// DashMaps are gone); kept for API stability with the
-    /// home-page renderer and telemetry consumers.
+    /// subscribe, update]. All slots are always 0 — every op runs on
+    /// task-per-tx drivers and the per-type DashMaps have been
+    /// retired. Retained for API stability with the home-page
+    /// renderer and telemetry consumers.
     pub fn pending_op_counts(&self) -> [u32; 5] {
-        [self.ops.connect.len() as u32, 0, 0, 0, 0]
+        [0; 5]
     }
 
     /// Returns the number of entries in the contract_waiters map.
@@ -1014,47 +875,11 @@ fn notify_transaction_timeout(
 // `RetryLoopOutcome::Exhausted` → `result_router_tx`, and relay
 // drivers expire their inflight guards naturally.
 
-/// Log when a connect operation in Relaying state with an outstanding uphill forward times out,
-/// and record the unresponsive peer as an acceptor failure for reliability scoring.
-fn record_connect_uphill_timeout(
-    tx: &Transaction,
-    op: &ConnectOp,
-    conn_manager: &ConnectionManager,
-) {
-    let Some(ConnectState::Relaying(state)) = &op.state else {
-        return;
-    };
-    // Don't record timeout for relays that already forwarded a ConnectResponse —
-    // forwarded_to is preserved for ConnectFailed propagation, not because
-    // we're still waiting for a response.
-    if state.response_forwarded {
-        return;
-    }
-    let Some(ref peer) = state.forwarded_to else {
-        return;
-    };
-    let pending_secs = if let Some(ref fwd_at) = state.forwarded_at {
-        fwd_at.elapsed().as_secs()
-    } else {
-        tx.elapsed().as_secs()
-    };
-    tracing::warn!(
-        tx = %tx,
-        forwarded_to = %peer.pub_key(),
-        forwarded_to_addr = ?peer.socket_addr(),
-        pending_secs,
-        "connect: uphill route timed out with no response"
-    );
-    if let Some(addr) = peer.socket_addr() {
-        let now = tokio::time::Instant::now();
-        conn_manager.record_acceptor_outcome(addr, false, now);
-        tracing::info!(
-            tx = %tx,
-            addr = %addr,
-            "recorded GC timeout as acceptor failure"
-        );
-    }
-}
+// `record_connect_uphill_timeout` and the per-op GC-sweep CONNECT
+// branch are gone with `ops.connect`. The CONNECT task-per-tx driver
+// (`start_relay_connect`) now owns its own uphill-timeout reporting
+// via the `Relay*InflightGuard` failure path; the GC sweep no longer
+// has a `ConnectOp` to inspect.
 
 #[allow(clippy::too_many_arguments)]
 async fn garbage_cleanup_task<ER: NetEventRegister>(
@@ -1065,7 +890,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut event_register: ER,
     _result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
-    ring: Arc<Ring>,
     contract_waiters: Arc<
         Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
     >,
@@ -1161,9 +985,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     tracing::info!(
                         target: "memory_stats",
                         tick = tick_count,
-                        ops_connect = ops_sizes.connect,
-                        // No DashMaps for ops_get / ops_put /
-                        // ops_update / ops_subscribe — always 0.
+                        // No DashMaps for ops_connect / ops_get /
+                        // ops_put / ops_update / ops_subscribe —
+                        // always 0.
+                        ops_connect = 0,
                         ops_put = 0,
                         ops_get = 0,
                         ops_subscribe = 0,
@@ -1241,27 +1066,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         }
                         continue;
                     }
-                    let still_waiting = match tx.transaction_type() {
-                        TransactionType::Connect => {
-                            if let Some((_, mut op)) = ops.connect.remove(&tx) {
-                                op.expire_forward_attempts(tokio::time::Instant::now());
-                                record_connect_uphill_timeout(&tx, &op, &ring.connection_manager);
-                                if let Some(target_loc) = op.desired_location {
-                                    ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
-                                }
-                                false
-                            } else {
-                                true
-                            }
-                        }
-                        // GET, PUT, UPDATE and SUBSCRIBE have no
-                        // DashMap entry; drivers own their own
-                        // timeout reporting.
-                        TransactionType::Get
-                        | TransactionType::Put
-                        | TransactionType::Update
-                        | TransactionType::Subscribe => false,
-                    };
+                    // Every op runs on a task-per-tx driver and owns
+                    // its own timeout reporting (via
+                    // `Relay*InflightGuard` failure paths or
+                    // `RetryLoopOutcome::Exhausted`). Nothing for the
+                    // GC sweep to remove per-op anymore.
+                    let still_waiting = false;
                     if still_waiting {
                         delayed.push(tx);
                     } else {
@@ -1314,27 +1124,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             _ = tx;
                         }
                     }
-                    let removed = match tx.transaction_type() {
-                        TransactionType::Connect => {
-                            if let Some((_, mut op)) = ops.connect.remove(&tx) {
-                                op.expire_forward_attempts(tokio::time::Instant::now());
-                                record_connect_uphill_timeout(&tx, &op, &ring.connection_manager);
-                                if let Some(target_loc) = op.desired_location {
-                                    ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
-                                }
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        // GET, PUT, UPDATE and SUBSCRIBE have no
-                        // DashMap entry; drivers own their own
-                        // timeout reporting.
-                        TransactionType::Get
-                        | TransactionType::Put
-                        | TransactionType::Update
-                        | TransactionType::Subscribe => false,
-                    };
+                    // Same as above: every op owns its own timeout
+                    // reporting; the GC sweep has nothing per-op to
+                    // remove.
+                    let removed = false;
                     if removed {
                         tracing::info!(
                             tx = %tx,
@@ -1602,120 +1395,8 @@ mod tests {
         assert_eq!(waiters[&id1].len(), 1);
     }
 
-    mod record_connect_uphill_timeout_tests {
-        use super::super::record_connect_uphill_timeout;
-        use crate::message::Transaction;
-        use crate::operations::VisitedPeers;
-        use crate::operations::connect::{
-            ConnectMsg, ConnectOp, ConnectRequest, ConnectState, DEFAULT_UPHILL_BUDGET, RelayState,
-        };
-        use crate::ring::{ConnectionManager, Location, PeerKeyLocation};
-        use crate::transport::TransportKeypair;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        fn make_peer(port: u16) -> PeerKeyLocation {
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-            let keypair = TransportKeypair::new();
-            PeerKeyLocation::new(keypair.public().clone(), addr)
-        }
-
-        fn make_relay_state(
-            forwarded_to: Option<PeerKeyLocation>,
-            response_forwarded: bool,
-        ) -> ConnectState {
-            ConnectState::Relaying(Box::new(RelayState {
-                upstream_addr: "10.0.0.1:5000".parse().unwrap(),
-                request: ConnectRequest {
-                    desired_location: Location::new(0.3),
-                    joiner: make_peer(5002),
-                    ttl: 5,
-                    visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
-                    uphill_budget: DEFAULT_UPHILL_BUDGET,
-                },
-                forwarded_to,
-                forwarded_at: Some(tokio::time::Instant::now()),
-                observed_sent: false,
-                accepted_locally: false,
-                response_forwarded,
-            }))
-        }
-
-        /// Regression test for #3392: GC-expired CONNECT forwards to unresponsive
-        /// peers must be recorded as acceptor failures so the peer gets a low
-        /// reliability score for future routing decisions.
-        #[test]
-        fn records_failure_for_unresponsive_relay() {
-            let peer = make_peer(5001);
-            let peer_addr = peer.socket_addr().unwrap();
-            let op = ConnectOp::with_state(make_relay_state(Some(peer), false));
-            let tx = Transaction::new::<ConnectMsg>();
-            let cm = ConnectionManager::test_default();
-
-            let now = tokio::time::Instant::now();
-            // Initially unknown → 0.5 prior
-            let initial = cm.peer_acceptor_reliability(peer_addr, now);
-            assert!(
-                (initial - 0.5).abs() < f64::EPSILON,
-                "unknown peer should start at 0.5"
-            );
-
-            // Three GC timeouts should lower reliability
-            for _ in 0..3 {
-                record_connect_uphill_timeout(&tx, &op, &cm);
-            }
-
-            let after = cm.peer_acceptor_reliability(peer_addr, now);
-            assert!(
-                after < initial,
-                "peer reliability should decrease after 3 GC timeouts: {} vs {}",
-                after,
-                initial
-            );
-            // (0+1)/(3+2) = 0.2
-            assert!(
-                (after - 0.2).abs() < 0.01,
-                "expected ~0.2 after 3 failures, got {}",
-                after
-            );
-        }
-
-        /// response_forwarded=true must NOT record a failure — the forwarded_to
-        /// field is kept for ConnectFailed propagation, not because the peer is
-        /// unresponsive.
-        #[test]
-        fn skips_when_response_already_forwarded() {
-            let peer = make_peer(5001);
-            let peer_addr = peer.socket_addr().unwrap();
-            let op = ConnectOp::with_state(make_relay_state(Some(peer), true));
-            let tx = Transaction::new::<ConnectMsg>();
-            let cm = ConnectionManager::test_default();
-
-            for _ in 0..5 {
-                record_connect_uphill_timeout(&tx, &op, &cm);
-            }
-
-            let now = tokio::time::Instant::now();
-            let score = cm.peer_acceptor_reliability(peer_addr, now);
-            assert!(
-                (score - 0.5).abs() < f64::EPSILON,
-                "peer should still have 0.5 reliability when response was already forwarded, got {}",
-                score
-            );
-        }
-
-        /// Non-Relaying state (e.g., Completed) must not record any failure.
-        #[test]
-        fn skips_for_non_relay_state() {
-            let op = ConnectOp::with_state(ConnectState::Completed);
-            let tx = Transaction::new::<ConnectMsg>();
-            let cm = ConnectionManager::test_default();
-
-            // Should not panic or record anything
-            record_connect_uphill_timeout(&tx, &op, &cm);
-        }
-    }
-
-    // Equivalent coverage for the surviving DashMap-backed op
-    // (CONNECT) lives in the relay-driver dedup tests under
-    // `op_ctx_task` modules.
+    // `record_connect_uphill_timeout_tests` retired in the
+    // ops.connect DashMap removal slice — the helper no longer
+    // exists (driver-owned acceptor outcome reporting in
+    // `start_relay_connect` replaces the GC-side hook).
 }

@@ -10,7 +10,7 @@ use crate::{
     config::GlobalExecutor,
     contract::{ContractError, ExecutorError},
     message::{Transaction, TransactionType},
-    node::{ConnectionError, OpManager, OpNotAvailable},
+    node::{ConnectionError, OpManager},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -123,8 +123,6 @@ pub(crate) enum OpError {
     #[allow(dead_code)]
     #[error("op not present: {0}")]
     OpNotPresent(Transaction),
-    #[error("op not available")]
-    OpNotAvailable(#[from] OpNotAvailable),
 
     // Streaming-related errors
     #[error("stream was cancelled")]

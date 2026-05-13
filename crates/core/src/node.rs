@@ -60,7 +60,7 @@ pub use network_bridge::{EventLoopExitReason, NetworkStats, reset_channel_id_cou
 
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
-pub(crate) use op_state_manager::{OpManager, OpNotAvailable};
+pub(crate) use op_state_manager::OpManager;
 
 mod network_bridge;
 
