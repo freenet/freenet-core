@@ -529,8 +529,9 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 
 /// Spawn a relay driver for a fresh inbound `UpdateMsg::RequestUpdate`.
 ///
-/// Caller-side gates (in `node.rs`): `source_addr.is_some()` AND no
-/// existing `UpdateOp` in `OpManager.ops.update` for `incoming_tx`.
+/// Caller-side gates (in `node.rs`): `source_addr.is_some()`. Per-node
+/// dedup against concurrent inbound retries is enforced by
+/// `OpManager.active_relay_update_txs` inside this driver.
 ///
 /// Returns immediately after spawning. Driver publishes its own side
 /// effects (local merge → BroadcastStateChange via the executor, OR a
@@ -1208,8 +1209,9 @@ async fn drive_relay_broadcast_to(
 /// Spawn a relay driver for a fresh inbound
 /// `UpdateMsg::RequestUpdateStreaming`.
 ///
-/// Caller-side gates (in `node.rs`): `source_addr.is_some()` AND no
-/// existing `UpdateOp` in `OpManager.ops.update` for `incoming_tx`.
+/// Caller-side gates (in `node.rs`): `source_addr.is_some()`. Per-node
+/// dedup against concurrent inbound retries is enforced by
+/// `OpManager.active_relay_update_txs` inside this driver.
 pub(crate) async fn start_relay_request_update_streaming(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,

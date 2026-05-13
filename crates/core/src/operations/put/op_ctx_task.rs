@@ -1,8 +1,9 @@
 //! Task-per-transaction PUT drivers.
 //!
 //! Each entry point — client-initiated, relay non-streaming, relay
-//! streaming — owns routing state in task locals. No `PutOp` is
-//! pushed into `OpManager.ops.put`.
+//! streaming — owns routing state in task locals. There is no
+//! `ops.put` DashMap; per-node dedup is enforced via
+//! `OpManager.active_relay_put_txs`.
 //!
 //! # Client-initiated flow
 //!
@@ -557,10 +558,9 @@ pub static RELAY_PUT_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
 /// Spawn a relay driver for a fresh inbound non-streaming `PutMsg::Request`.
 ///
 /// Gated by the dispatch site in `node.rs::handle_pure_network_message_v1`
-/// on `source_addr.is_some() && !has_put_op(id)`. The driver owns local
-/// store + optional downstream forward + upstream bubble-up in its task
-/// locals — no `PutOp` is stored in `OpManager.ops.put` for this
-/// transaction.
+/// on `source_addr.is_some()`. Per-node dedup against concurrent inbound
+/// retries is enforced by `OpManager.active_relay_put_txs` inside the
+/// driver. State lives in task locals.
 ///
 /// Returns immediately after spawning. Driver publishes its own side
 /// effects (local put_contract / host_contract / interest broadcast,
@@ -2392,9 +2392,10 @@ mod tests {
         );
     }
 
-    /// Pin: driver forward must reuse `incoming_tx` — legacy PUT relay
+    /// Pin: driver forward must reuse `incoming_tx` — the PUT relay
     /// uses the same tx end-to-end. Minting a fresh tx per hop breaks
-    /// the dispatch gate's has_put_op check at the downstream peer.
+    /// the downstream peer's `active_relay_put_txs` dedup gate and
+    /// detaches the response from the originator's waiter.
     #[test]
     fn drive_relay_put_reuses_incoming_tx_on_forward() {
         let src = include_str!("op_ctx_task.rs");
@@ -2415,7 +2416,7 @@ mod tests {
         assert!(
             forward_window.contains("id: incoming_tx"),
             "relay forward must reuse incoming_tx; minting a fresh tx per hop \
-             breaks the downstream dispatch gate's has_put_op check"
+             breaks the downstream `active_relay_put_txs` dedup gate"
         );
         assert!(
             !forward_window.contains("Transaction::new::<PutMsg>()"),
