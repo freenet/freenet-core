@@ -1,0 +1,158 @@
+# Release announcement fan-out.
+#
+# Triggers on release.published — after release.yml has finished its
+# cargo publish + GitHub Release creation. Posts to:
+#
+#   1. Matrix room !ygHfYcXtXmivTbOwjX:matrix.org via the Matrix
+#      client-server API (one curl). Needs MATRIX_HOMESERVER_URL and
+#      MATRIX_ACCESS_TOKEN secrets.
+#
+#   2. The Freenet Official River room, by HMAC-signing a request to
+#      nova's release-agent at https://update.nova.locut.us/announce/river.
+#      The agent invokes `riverctl` locally as the user who owns the
+#      room signing key. Needs RELEASE_AGENT_HMAC_NOVA secret.
+#
+# Each announcement runs in its own job and the workflow does NOT
+# fail-fast: a Matrix outage shouldn't block the River post (or vice
+# versa). Both are non-critical in the sense that the release itself
+# is already published — these are just notifications.
+
+name: Release Announcements
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 0.2.57, no leading v)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-announce-${{ github.event.release.tag_name || inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve version + message
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release_url: ${{ steps.v.outputs.release_url }}
+      message: ${{ steps.v.outputs.message }}
+    steps:
+      - name: Resolve version
+        id: v
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            RAW="${{ github.event.release.tag_name }}"
+          else
+            RAW="${{ inputs.version }}"
+          fi
+          VERSION="${RAW#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must be X.Y.Z. Got: $VERSION (raw: $RAW)"
+            exit 1
+          fi
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/v${VERSION}"
+          MESSAGE="Freenet v${VERSION} released: ${RELEASE_URL}"
+          {
+            echo "version=$VERSION"
+            echo "release_url=$RELEASE_URL"
+            echo "message<<EOF"
+            echo "$MESSAGE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved: $MESSAGE"
+
+  matrix:
+    name: Post to Matrix
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Matrix message
+        env:
+          HOMESERVER: ${{ secrets.MATRIX_HOMESERVER_URL }}
+          TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+          MESSAGE: ${{ needs.resolve.outputs.message }}
+        run: |
+          set -euo pipefail
+          # Room: #freenet-locutus:matrix.org. Use the room ID rather
+          # than the alias for reliability.
+          ROOM_ID='!ygHfYcXtXmivTbOwjX:matrix.org'
+          if [[ -z "$HOMESERVER" ]]; then
+            echo "::warning::MATRIX_HOMESERVER_URL not set; skipping Matrix announcement"
+            exit 0
+          fi
+          if [[ -z "$TOKEN" ]]; then
+            echo "::warning::MATRIX_ACCESS_TOKEN not set; skipping Matrix announcement"
+            exit 0
+          fi
+          # Random txn ID so retries don't get deduped (Matrix client-server
+          # API treats identical txn IDs as the same message).
+          TXN_ID="freenet-release-$(date +%s)-$RANDOM"
+          BODY=$(jq -nc \
+            --arg msg "$MESSAGE" \
+            '{msgtype: "m.text", body: $msg}')
+          # URL-encode the room ID. ! and : are reserved chars.
+          ROOM_ENC=$(printf '%s' "$ROOM_ID" | jq -sRr @uri)
+          URL="${HOMESERVER%/}/_matrix/client/v3/rooms/${ROOM_ENC}/send/m.room.message/${TXN_ID}"
+          HTTP_STATUS=$(curl -sS -o /tmp/matrix-response.json -w '%{http_code}' \
+            -X PUT "$URL" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data-raw "$BODY")
+          echo "HTTP $HTTP_STATUS"
+          cat /tmp/matrix-response.json || true
+          echo
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+            echo "::error::Matrix returned HTTP $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✓ Matrix announcement posted."
+
+  river:
+    name: Post to River (via nova webhook)
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sign and POST /announce/river
+        env:
+          SECRET: ${{ secrets.RELEASE_AGENT_HMAC_NOVA }}
+          MESSAGE: ${{ needs.resolve.outputs.message }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SECRET" ]]; then
+            echo "::warning::RELEASE_AGENT_HMAC_NOVA not set; skipping River announcement"
+            exit 0
+          fi
+          ISSUED_AT=$(date +%s)
+          BODY=$(jq -nc \
+            --arg msg "$MESSAGE" \
+            --argjson t "$ISSUED_AT" \
+            '{message: $msg, issued_at: $t}')
+          SIG=$(printf '%s' "$BODY" \
+            | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SECRET" \
+            | awk '{print $NF}')
+          echo "Posting to https://update.nova.locut.us/announce/river"
+          # riverctl can take up to ~180s on a cold cargo run; the agent's
+          # internal probe is 1s and it returns 202 before the script
+          # completes. The HTTP request itself returns fast.
+          HTTP_STATUS=$(curl -sS -o /tmp/river-response.json -w '%{http_code}' \
+            --connect-timeout 30 --max-time 30 \
+            -X POST 'https://update.nova.locut.us/announce/river' \
+            -H 'Content-Type: application/json' \
+            -H "X-Signature: $SIG" \
+            --data-raw "$BODY")
+          echo "HTTP $HTTP_STATUS"
+          cat /tmp/river-response.json || true
+          echo
+          if [[ "$HTTP_STATUS" != "200" && "$HTTP_STATUS" != "202" ]]; then
+            echo "::error::nova /announce/river returned HTTP $HTTP_STATUS"
+            exit 1
+          fi
+          echo "✓ River announcement dispatched to nova."

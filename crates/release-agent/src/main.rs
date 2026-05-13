@@ -8,6 +8,7 @@ use reqwest::Client as HttpClient;
 use tokio::sync::Mutex;
 
 use freenet_release_agent::{
+    announcer::Announcer,
     config::Config,
     github::GitHubLatest,
     server::{AppState, build_router, serve},
@@ -46,6 +47,11 @@ async fn main() -> Result<()> {
         .context("build reqwest client")?;
 
     let updater = Updater::new_with_sudo(config.update_command.clone(), config.dry_run);
+    let announcer = Announcer::new_with_sudo(
+        config.river_announce_command.clone(),
+        config.dry_run,
+        config.river_announce_user.clone(),
+    );
 
     let listen_addr = config.listen_addr;
     let latest_source = Arc::new(GitHubLatest {
@@ -57,8 +63,10 @@ async fn main() -> Result<()> {
         secret: Arc::new(secret),
         latest_source,
         updater,
+        announcer,
         version_cache: VersionCache::new(),
         last_update_attempt: Arc::new(Mutex::new(None)),
+        last_announce_attempt: Arc::new(Mutex::new(None)),
     };
 
     serve(listen_addr, build_router(state)).await

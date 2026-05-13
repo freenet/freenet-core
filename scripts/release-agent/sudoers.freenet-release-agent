@@ -24,3 +24,14 @@
 # Install path: /etc/sudoers.d/freenet-release-agent (mode 0440, owner root:root).
 # Validate with: visudo -c -f /etc/sudoers.d/freenet-release-agent
 freenet-update ALL=(root) NOPASSWD: /usr/local/bin/gateway-auto-update.sh --force --target-version *
+
+# Allow the release-agent to invoke the River announcement script as the
+# user who owns the room signing key + Freenet node (typically `ian` on
+# nova; absent on vega — that install simply omits this entry).
+#
+# The `*` after the script path is a sudoers wildcard matching the
+# entire message argv. As with --target-version above, the safety comes
+# from the agent's validation (length cap + NUL rejection in
+# server.rs::announce_river_handler) plus the script's own length check;
+# not from sudoers.
+freenet-update ALL=(ian) NOPASSWD: /usr/local/bin/announce-to-river.sh *
