@@ -30,8 +30,8 @@ use freenet_stdlib::prelude::*;
 use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::message::{NetMessage, NetMessageV1, Transaction};
+use crate::node::NetworkBridge;
 use crate::node::OpManager;
-use crate::operations::NetworkBridge;
 use crate::operations::OpError;
 use crate::operations::op_ctx::{
     AdvanceOutcome, AttemptOutcome, RetryDriver, RetryLoopOutcome, drive_retry_loop,
