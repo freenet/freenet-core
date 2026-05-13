@@ -281,13 +281,16 @@ pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime
 ///
 /// Filenames that don't parse as `{digits}` or `{digits}.{digits}` and
 /// non-regular-file entries are silently skipped (same rule that
-/// [`thin_snapshots`] applies). I/O errors reading the directory or any
-/// individual file are returned to the caller; this is a read-only
-/// operation and the caller (CLI, restore) needs to know if the disk
-/// is misbehaving.
+/// [`thin_snapshots`] applies).
 ///
-/// Returns an empty vector if `snap_dir` does not exist — a never-written
+/// Returns an empty vector if `snap_dir` does not exist: a never-written
 /// secret simply has no history, which is not an error.
+///
+/// # Errors
+/// Surfaces every I/O error from enumerating the directory or stat'ing
+/// individual entries. This is a read-only operation and the caller
+/// (CLI, restore) needs to know if the disk is misbehaving rather than
+/// silently truncating the listing.
 pub fn list_snapshots(snap_dir: &Path) -> std::io::Result<Vec<SnapshotMetadata>> {
     let read_dir = match fs::read_dir(snap_dir) {
         Ok(rd) => rd,

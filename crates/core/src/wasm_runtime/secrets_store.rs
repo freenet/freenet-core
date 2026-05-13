@@ -42,6 +42,11 @@ pub enum SecretStoreError {
     MissingCipher,
     #[error("missing secret: {0}")]
     MissingSecret(SecretsId),
+    /// No snapshot file matched the requested `timestamp_ms` in the
+    /// secret's `.snapshots/{secret_id}/` directory. Distinct from
+    /// `IO`/`MissingSecret` so the CLI (issue #4036) can surface a
+    /// "no such snapshot, try `list_snapshots` first" message instead
+    /// of a generic filesystem error.
     #[error("no snapshot for secret {key} at timestamp_ms {timestamp_ms}")]
     SnapshotNotFound { key: SecretsId, timestamp_ms: u64 },
 }
@@ -441,7 +446,6 @@ impl SecretsStore {
                 timestamp_ms,
             })?;
         let chosen_path = chosen.path.clone();
-
         // Snapshot the value currently at the active path so the restore
         // operation is itself reversible. Mirrors store_secret's
         // best-effort logging — the primary operation (restore) must
@@ -506,7 +510,6 @@ impl SecretsStore {
         if self.snapshots_enabled && snap_dir.exists() {
             thin_snapshots(&snap_dir, &self.retention, SystemTime::now());
         }
-
         Ok(())
     }
 }
@@ -1110,10 +1113,92 @@ mod test {
             "in-memory map must re-include the restored secret"
         );
         // The snapshot was taken when "overwrite" was written, but it
-        // holds the PRIOR active value at that point — "keep".
+        // holds the PRIOR active value at that point: "keep".
         assert_eq!(
             store.get_secret(delegate.key(), &secret_id)?,
             b"keep".to_vec()
+        );
+        Ok(())
+    }
+
+    /// When multiple snapshots share `timestamp_ms` (collision suffixes
+    /// from same-millisecond writes), `restore_snapshot` MUST pick the
+    /// unsuffixed file first, then the lowest-numbered suffix. Documented
+    /// as a behavioral contract on the public method, so pin it directly
+    /// rather than relying on the list-side ordering test.
+    #[tokio::test]
+    async fn restore_snapshot_prefers_unsuffixed_collision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::wasm_runtime::secret_snapshots::SNAPSHOT_NAME_WIDTH;
+
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        // Permissive retention so thin_snapshots doesn't drop the
+        // hand-crafted ancient-timestamped files between restore calls.
+        store.set_retention_policy(RetentionPolicy {
+            keep_last: 100,
+            buckets: vec![],
+            max_age: None,
+        });
+
+        let delegate = Delegate::from((&vec![70].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![71]);
+
+        // Seed an active value so restore has something to overwrite (and
+        // can take its own pre-restore snapshot). The plaintext doesn't
+        // matter for this test; we compare ciphertext after restore.
+        store.store_secret(delegate.key(), &secret_id, b"active".to_vec())?;
+
+        // Hand-craft three "same timestamp" snapshot files with distinct
+        // ciphertexts, so we can identify which one wins. We do the file
+        // surgery directly instead of going through store_secret because
+        // we need the collision case, which the natural-write path only
+        // hits under extreme contention.
+        let snap_dir = secrets_dir
+            .join(delegate.key().encode())
+            .join(".snapshots")
+            .join(secret_id.encode());
+        std::fs::create_dir_all(&snap_dir)?;
+        let stamp = 1_700_000_000_000u64;
+        let base = format!("{stamp:0width$}", width = SNAPSHOT_NAME_WIDTH);
+        // Encrypt three distinguishable plaintexts with the registered
+        // cipher and write the ciphertexts as the three "collision"
+        // snapshots. After restore + get_secret we identify the winner
+        // by the recovered plaintext.
+        let encryption = store
+            .ciphers
+            .get(delegate.key())
+            .expect("cipher registered");
+        let mk = |pt: &[u8]| -> Vec<u8> {
+            encryption
+                .cipher
+                .encrypt(&encryption.nonce, pt)
+                .expect("encrypt")
+        };
+        std::fs::write(snap_dir.join(&base), mk(b"unsuffixed-winner"))?;
+        std::fs::write(snap_dir.join(format!("{base}.0")), mk(b"suffix-0"))?;
+        std::fs::write(snap_dir.join(format!("{base}.1")), mk(b"suffix-1"))?;
+
+        store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
+        assert_eq!(
+            store.get_secret(delegate.key(), &secret_id)?,
+            b"unsuffixed-winner".to_vec(),
+            "unsuffixed file must win the collision tiebreak"
+        );
+
+        // Now remove the unsuffixed entry and restore again: lowest
+        // surviving suffix wins.
+        std::fs::remove_file(snap_dir.join(&base))?;
+        store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
+        assert_eq!(
+            store.get_secret(delegate.key(), &secret_id)?,
+            b"suffix-0".to_vec(),
+            "with the unsuffixed entry gone, lowest-numbered suffix wins"
         );
         Ok(())
     }
