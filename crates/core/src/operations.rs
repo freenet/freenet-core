@@ -31,6 +31,7 @@ pub(crate) use visited_peers::VisitedPeers;
 #[must_use]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum OpEnum {
+    #[allow(dead_code)] // No constructor after #1454 phase 6; removed alongside ops.connect.
     Connect(Box<connect::ConnectOp>),
     // `Get` variant retired in #1454 phase 5 final (GET slice) together
     // with the `ops.get` DashMap. GET wire flows now run on task-per-tx

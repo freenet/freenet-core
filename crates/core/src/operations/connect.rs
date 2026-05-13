@@ -1,13 +1,3 @@
-// `ConnectOp`, its `impl Operation`-era state machine helpers, and
-// `JoinerState`/`AcceptedPeer`/`JoinerAcceptance`/some `ConnectState`
-// variants are retained for in-file unit tests of the relay/joiner
-// state machine. Production CONNECT runs entirely on the task-per-tx
-// drivers in `op_ctx_task.rs`. The `ops.connect` DashMap on `OpManager`
-// is the last legacy field; it is kept in this PR to avoid churning
-// unrelated structures and will be removed in the follow-up slice that
-// also retires the `ConnectOp` test surface.
-#![allow(dead_code)]
-
 //! # Connect Protocol
 //!
 //! This module implements the connect protocol for establishing peer connections in the Freenet
@@ -314,25 +304,26 @@ pub(crate) struct ConnectResponse {
     pub acceptor: PeerKeyLocation,
 }
 
-/// New minimal state machine the joiner tracks.
+/// State machine retained for in-file relay/joiner unit tests
+/// (`tests::*` in this file). Production CONNECT runs entirely on the
+/// task-per-tx drivers in `op_ctx_task.rs` and rebuilds `RelayState`
+/// in task locals; nothing constructs `ConnectState::Relaying` or
+/// `Completed` outside the test module.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) enum ConnectState {
-    /// Joiner waiting for acceptances.
     WaitingForResponses(JoinerState),
-    /// Intermediate peer evaluating and forwarding requests.
     Relaying(Box<RelayState>),
-    /// Joiner obtained the required neighbours.
     Completed,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields only read by in-file unit tests.
 pub(crate) struct JoinerState {
     pub target_connections: usize,
     pub observed_address: Option<SocketAddr>,
     pub accepted: HashSet<PeerKeyLocation>,
     pub last_progress: Instant,
-    /// True if the joiner started without knowing their external address.
-    /// Used for invariant checking: if true, we must receive ObservedAddress.
     pub started_without_address: bool,
 }
 
@@ -1055,17 +1046,20 @@ impl RelayContext for RelayEnv<'_> {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Constructed only by in-file unit tests.
 pub struct AcceptedPeer {
     pub peer: PeerKeyLocation,
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)] // Constructed only by in-file unit tests.
 pub struct JoinerAcceptance {
     pub new_acceptor: Option<AcceptedPeer>,
     pub satisfied: bool,
     pub assigned_location: bool,
 }
 
+#[allow(dead_code)] // Methods used only by in-file unit tests.
 impl JoinerState {
     pub(crate) fn register_acceptance(
         &mut self,
@@ -1090,28 +1084,25 @@ impl JoinerState {
     }
 }
 
-/// Placeholder operation wrapper so we can exercise the logic in isolation in
-/// forthcoming commits. For now this simply captures the shared state we will
-/// migrate to.
+/// Operation wrapper retained for in-file unit tests of the
+/// relay/joiner state machine. Production CONNECT runs entirely on the
+/// task-per-tx drivers in `op_ctx_task.rs` and stores routing state in
+/// task locals. The `ops.connect` DashMap still references this type
+/// as its value, but nothing writes to it after #1454 phase 6.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // `recency` / `time_source` are seeded by `new_*` (test-only constructors).
 pub(crate) struct ConnectOp {
     pub(crate) id: Transaction,
     pub(crate) state: Option<ConnectState>,
-    /// The peer we sent/forwarded the connect request to (first hop from joiner's perspective).
     pub(crate) first_hop: Option<Box<PeerKeyLocation>>,
     pub(crate) desired_location: Option<Location>,
-    /// Tracks when we last forwarded this connect to a peer, to avoid hammering the same
-    /// neighbors when no acceptors are available. Peers without an entry are treated as
-    /// immediately eligible.
     recency: HashMap<PeerKeyLocation, Instant>,
     forward_attempts: HashMap<PeerKeyLocation, ForwardAttempt>,
     connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
-    /// Injectable time source. Using `util::TimeSource` (which returns `tokio::time::Instant`)
-    /// lets tests supply `SharedMockTimeSource` for fine-grained time control without needing
-    /// to pause the entire tokio runtime.
     time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
 }
 
+#[allow(dead_code)] // Constructors + getters used only by in-file unit tests.
 impl ConnectOp {
     /// Creates a ConnectOp with just a state, for unit-testing GC timeout logic.
     #[cfg(test)]

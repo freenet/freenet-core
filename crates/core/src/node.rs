@@ -1448,21 +1448,18 @@ where
             return Ok(None);
         }
         NetMessageV1::Aborted(tx) => {
+            // No-op after #1454 phase 6 retired the legacy mediator:
+            // CONNECT abort retry depended on `pop`-ing `OpEnum::Connect`
+            // from a DashMap that no production code writes to anymore.
+            // GET/PUT/UPDATE/SUBSCRIBE drivers own their own cancellation
+            // surface (`result_router_tx` publication is the externally
+            // observable result). Senders of `Aborted` come only from
+            // drivers themselves and are handled in-driver via the bypass.
             tracing::debug!(
                 %tx,
                 tx_type = ?tx.transaction_type(),
-                "Received Aborted message, delegating to handle_aborted_op"
+                "Received Aborted message — driver owns cancellation, ignoring"
             );
-            // Empty gateways: Aborted messages arrive over p2p connections, not
-            // from the gateway join path. The gateways list is only used by
-            // Connect retries; other operation types ignore it entirely.
-            if let Err(err) = handle_aborted_op(tx, &op_manager, &[]).await {
-                tracing::error!(
-                    %tx,
-                    error = %err,
-                    "Error handling aborted operation"
-                );
-            }
             Ok(None)
         }
     }
@@ -2064,108 +2061,28 @@ pub async fn subscribe_with_id(
     subscribe::start_client_subscribe(op_manager, instance_id, client_tx).await
 }
 
-async fn handle_aborted_op(
+/// Handle a transaction whose work is being abandoned (transport
+/// handshake failure, orphaned-on-peer-prune, or a peer-sent `Aborted`
+/// wire message). After #1454 phase 6 retired the legacy `Operation`
+/// mediator the function has no work to do: every op type owns its own
+/// cancellation surface in the task-per-tx driver, and the CONNECT
+/// retry-via-gateway branch is driven by `start_client_connect` /
+/// `initial_join_procedure` rather than by a DashMap entry.
+///
+/// Retained as a no-op so the call sites in `p2p_protoc.rs`
+/// (orphaned-on-prune + transport handshake failure) keep compiling
+/// while the centralised abort path is unwired. Will be deleted in
+/// the follow-up slice once those call sites are removed.
+pub(crate) async fn handle_aborted_op(
     tx: Transaction,
-    op_manager: &OpManager,
-    gateways: &[PeerKeyLocation],
+    _op_manager: &OpManager,
+    _gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError> {
-    use crate::util::IterExt;
-    match tx.transaction_type() {
-        TransactionType::Connect => {
-            // attempt to establish a connection failed, this could be a fatal error since the node
-            // is useless without connecting to the network, we will retry with exponential backoff
-            match op_manager.pop(&tx) {
-                Ok(Some(OpEnum::Connect(op)))
-                    if op_manager.ring.open_connections()
-                        < op_manager.ring.connection_manager.min_connections =>
-                {
-                    let gateway = op.gateway().cloned();
-                    if let Some(gateway) = gateway {
-                        // Clean up phantom location_for_peer entry left by should_accept's
-                        // record_pending_location (#3088). Without this, the gateway appears
-                        // permanently connected and initial_join_procedure never retries it.
-                        if let Some(peer_addr) = gateway.peer_addr.as_known() {
-                            op_manager
-                                .ring
-                                .connection_manager
-                                .prune_in_transit_connection(*peer_addr);
-
-                            let backoff_duration = {
-                                let mut backoff = op_manager.gateway_backoff.lock();
-                                backoff.record_failure(*peer_addr);
-                                backoff.remaining_backoff(*peer_addr)
-                            };
-
-                            if let Some(duration) = backoff_duration {
-                                // Cap the wait at GATEWAY_BACKOFF_POLL_CAP when the
-                                // node already has ring connections, matching the
-                                // policy in initial_join_procedure (issue #3304).
-                                // ±20% jitter to prevent thundering herd.
-                                let open_conns = op_manager.ring.open_connections();
-                                let effective = if open_conns > 0 {
-                                    let jitter_ms = crate::config::GlobalRng::random_range(
-                                        0u64..(connect::GATEWAY_BACKOFF_POLL_CAP.as_millis() / 5)
-                                            as u64,
-                                    );
-                                    let cap = connect::GATEWAY_BACKOFF_POLL_CAP.mul_f64(0.8)
-                                        + Duration::from_millis(jitter_ms);
-                                    duration.min(cap)
-                                } else {
-                                    duration
-                                };
-                                tracing::info!(
-                                    gateway = %gateway,
-                                    backoff_secs = duration.as_secs(),
-                                    effective_wait_secs = effective.as_secs(),
-                                    open_connections = open_conns,
-                                    "Gateway connection failed, waiting before retry"
-                                );
-                                // Use select! so suspend/isolation recovery can
-                                // wake us immediately via gateway_backoff_cleared,
-                                // matching the pattern in initial_join_procedure.
-                                tokio::select! {
-                                    _ = tokio::time::sleep(effective) => {},
-                                    _ = op_manager.gateway_backoff_cleared.notified() => {
-                                        tracing::info!(
-                                            gateway = %gateway,
-                                            "Gateway backoff cleared externally, retrying immediately"
-                                        );
-                                    },
-                                }
-                            }
-                        }
-
-                        tracing::debug!("Retrying connection to gateway {}", gateway);
-                        connect::join_ring_request(&gateway, op_manager, None).await?;
-                    }
-                }
-                Ok(Some(OpEnum::Connect(op))) => {
-                    // Clean up phantom location_for_peer entry (#3088)
-                    if let Some(peer_addr) = op.get_next_hop_addr() {
-                        op_manager
-                            .ring
-                            .connection_manager
-                            .prune_in_transit_connection(peer_addr);
-                    }
-                    if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
-                        tracing::warn!("Retrying joining the ring with an other gateway");
-                        if let Some(gateway) = gateways.iter().shuffle().next() {
-                            connect::join_ring_request(gateway, op_manager, None).await?
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        TransactionType::Get
-        | TransactionType::Put
-        | TransactionType::Update
-        | TransactionType::Subscribe => {
-            // No DashMap entry: each driver owns abort handling
-            // through its own cancellation surface. `result_router_tx`
-            // publication is the only externally observable result.
-        }
-    }
+    tracing::debug!(
+        %tx,
+        tx_type = ?tx.transaction_type(),
+        "handle_aborted_op: no-op after #1454 phase 6 (driver-owned cancellation)"
+    );
     Ok(())
 }
 
@@ -2717,22 +2634,28 @@ mod tests {
             const SOURCE: &str = include_str!("node.rs");
 
             // Locate the SUBSCRIBE branch of handle_pure_network_message_v1.
-            let subscribe_branch_anchor = "NetMessageV1::Subscribe(ref op) => {";
-            let branch_start = SOURCE.find(subscribe_branch_anchor).expect(
+            // Use a runtime-built needle so this test cannot self-match
+            // its own anchor string in the test source below.
+            let subscribe_branch_anchor: String =
+                ["NetMessageV1::", "Subscribe(ref op)", " => {"].concat();
+            let branch_start = SOURCE.find(&subscribe_branch_anchor).expect(
                 "SUBSCRIBE branch of handle_pure_network_message_v1 not found; \
                          the match arm has been renamed or moved — update this regression guard",
             );
 
-            // Slice a window large enough to contain the branch body up
-            // to (and including) the first `handle_op_request` call.
+            // Bound the window at the end-of-SUBSCRIBE-arm sentinel
+            // ("Non-transactional message types:" header that precedes
+            // the next match arm). After #1454 phase 6 there is no
+            // more `handle_op_request` to anchor against.
+            let next_variant_anchor: String = ["// Non-transactional", " message types:"].concat();
             let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<subscribe::SubscribeOp, _>")
-                .expect("SUBSCRIBE branch no longer calls handle_op_request — update guard")
+                .find(&next_variant_anchor)
+                .expect("end of SUBSCRIBE branch not found — update guard")
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
 
-            // The bypass helper MUST be invoked BEFORE the legacy
-            // handle_op_request call. If this assertion fails, either:
+            // The bypass helper MUST be invoked in the SUBSCRIBE branch.
+            // If this assertion fails, either:
             //   (a) the bypass was removed (regression — re-add it), or
             //   (b) the branch was restructured (update this guard).
             assert!(
@@ -2747,8 +2670,14 @@ mod tests {
             // filter, non-terminal messages like ForwardingAck fill the
             // capacity-1 reply channel and cause UnexpectedOpState
             // (commit 5cb6f37c).
+            let response_gate: String = [
+                "matches!(op, ",
+                "subscribe::SubscribeMsg::Response { .. }",
+                ")",
+            ]
+            .concat();
             assert!(
-                window.contains("matches!(op, subscribe::SubscribeMsg::Response { .. })"),
+                window.contains(&response_gate),
                 "SUBSCRIBE branch bypass is not gated on Response-only. \
                  Non-terminal messages (ForwardingAck, Unsubscribe) must NOT \
                  be forwarded to the task-per-tx channel — they would fill \

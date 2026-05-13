@@ -57,6 +57,7 @@ macro_rules! check_id_op {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)] // Removed alongside `OpManager::pop` in the follow-up DashMap slice.
 pub(crate) enum OpNotAvailable {
     #[error("operation running")]
     Running,
@@ -651,6 +652,10 @@ impl OpManager {
         None
     }
 
+    // Orphan after #1454 phase 6; only producer (the legacy
+    // `load_or_init` path) is gone. Removed alongside `Ops::connect`
+    // in the follow-up DashMap slice.
+    #[allow(dead_code)]
     pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
         if self.ops.completed.contains(id) {
             return Err(OpNotAvailable::Completed);
