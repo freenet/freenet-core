@@ -1,8 +1,9 @@
 //! Task-per-transaction SUBSCRIBE drivers.
 //!
 //! Each entry point — client-initiated, executor auto-subscribe,
-//! renewal, relay — owns its routing state in task locals. No
-//! `SubscribeOp` is pushed into `OpManager.ops.subscribe`.
+//! renewal, relay — owns its routing state in task locals. There is
+//! no `ops.subscribe` DashMap; per-node dedup is enforced via
+//! `OpManager.active_relay_subscribe_txs`.
 //!
 //! # Architecture
 //!
