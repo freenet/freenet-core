@@ -8,7 +8,7 @@ mod error;
 pub(crate) mod mock_state_storage;
 mod native_api;
 mod runtime;
-mod secret_snapshots;
+pub mod secret_snapshots;
 mod secrets_store;
 pub(crate) mod simulation_runtime;
 mod state_store;
@@ -27,8 +27,7 @@ pub(crate) use native_api::{
 };
 pub use runtime::{ContractExecError, DEFAULT_MODULE_CACHE_CAPACITY, Runtime};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
-pub(crate) use secrets_store::SecretStoreError;
-pub use secrets_store::SecretsStore;
+pub use secrets_store::{SecretStoreError, SecretsStore};
 // NOTE: InMemoryContractStore and SimulationStores are available but currently unused
 // They provide infrastructure for more sophisticated simulation scenarios
 #[allow(unused_imports)]

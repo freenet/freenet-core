@@ -125,8 +125,10 @@ pub mod dev_tool {
         register_topology_snapshot, set_current_network_name, validate_topology,
         validate_topology_from_snapshots,
     };
+    pub use wasm_runtime::secret_snapshots::SnapshotMetadata;
     pub use wasm_runtime::{
-        ContractStore, DelegateStore, MockStateStorage, Runtime, SecretsStore, StateStore,
+        ContractStore, DelegateStore, MockStateStorage, Runtime, SecretStoreError, SecretsStore,
+        StateStore,
     };
 
     // Re-export simulation types for test infrastructure

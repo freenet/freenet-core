@@ -49,6 +49,19 @@ pub struct RetentionBucket {
     pub max_count: usize,
 }
 
+/// On-disk descriptor for a single snapshot, surfaced through the
+/// list/restore API. The pair `(timestamp_ms, suffix)` is unique within
+/// a snapshot directory and is what `SecretsStore::restore_snapshot`
+/// matches against. `path` and `size_bytes` are advisory metadata for
+/// callers (CLI display, sanity checks).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMetadata {
+    pub timestamp_ms: u64,
+    pub suffix: Option<u32>,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+}
+
 /// Tiered retention policy. The first `keep_last` snapshots (by recency) are
 /// kept regardless of bucket coverage; each bucket independently selects
 /// representatives at its own granularity; and `max_age` is an absolute
@@ -264,11 +277,69 @@ pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime
     }
 }
 
+/// Enumerate snapshots in `snap_dir`, sorted oldest-first.
+///
+/// Filenames that don't parse as `{digits}` or `{digits}.{digits}` and
+/// non-regular-file entries are silently skipped (same rule that
+/// [`thin_snapshots`] applies). I/O errors reading the directory or any
+/// individual file are returned to the caller; this is a read-only
+/// operation and the caller (CLI, restore) needs to know if the disk
+/// is misbehaving.
+///
+/// Returns an empty vector if `snap_dir` does not exist — a never-written
+/// secret simply has no history, which is not an error.
+pub fn list_snapshots(snap_dir: &Path) -> std::io::Result<Vec<SnapshotMetadata>> {
+    let read_dir = match fs::read_dir(snap_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out: Vec<SnapshotMetadata> = Vec::new();
+    for entry in read_dir {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some((timestamp_ms, suffix)) = parse_snapshot_name(&path) else {
+            continue;
+        };
+        let size_bytes = entry.metadata()?.len();
+        out.push(SnapshotMetadata {
+            timestamp_ms,
+            suffix,
+            path,
+            size_bytes,
+        });
+    }
+    // Sort key: `None` sorts before `Some(_)` (unsuffixed file came first
+    // chronologically — it's the write that landed on a fresh stamp; the
+    // suffixed variants came from later same-millisecond collisions).
+    out.sort_by_key(|m| {
+        (
+            m.timestamp_ms,
+            match m.suffix {
+                None => (0u8, 0u32),
+                Some(s) => (1, s),
+            },
+        )
+    });
+    Ok(out)
+}
+
 /// Parse a snapshot file name back into its epoch-millis timestamp.
 /// Accepts only `{digits}` or `{digits}.{digits}`; any other shape
 /// (including `42.tmp`, `foo`, `1.2.3`, etc.) returns `None` so stray
 /// files in the snapshot directory are not mistaken for snapshots.
 pub(crate) fn parse_snapshot_stamp(path: &Path) -> Option<u64> {
+    parse_snapshot_name(path).map(|(ts, _)| ts)
+}
+
+/// Like [`parse_snapshot_stamp`] but also returns the optional numeric
+/// collision suffix. Surfaced through [`SnapshotMetadata`] so callers
+/// can disambiguate multiple writes that landed in the same millisecond.
+pub(crate) fn parse_snapshot_name(path: &Path) -> Option<(u64, Option<u32>)> {
     let name = path.file_name()?.to_str()?;
     let (stamp_part, suffix_part) = match name.split_once('.') {
         Some((s, t)) => (s, Some(t)),
@@ -277,12 +348,16 @@ pub(crate) fn parse_snapshot_stamp(path: &Path) -> Option<u64> {
     if stamp_part.is_empty() || !stamp_part.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    if let Some(suffix) = suffix_part
-        && (suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return None;
-    }
-    stamp_part.parse().ok()
+    let suffix = match suffix_part {
+        Some(s) => {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some(s.parse().ok()?)
+        }
+        None => None,
+    };
+    Some((stamp_part.parse().ok()?, suffix))
 }
 
 #[cfg(test)]
@@ -538,5 +613,80 @@ mod tests {
         let now = SystemTime::now();
         let ts: Vec<_> = (0..10).map(|i| t(now, i)).collect();
         assert!(p.select_keep(now, &ts).is_empty());
+    }
+
+    #[test]
+    fn parse_snapshot_name_returns_suffix() {
+        use std::path::PathBuf;
+        assert_eq!(
+            parse_snapshot_name(&PathBuf::from("00000000000001234567")),
+            Some((1_234_567, None))
+        );
+        assert_eq!(
+            parse_snapshot_name(&PathBuf::from("00000000000001234567.42")),
+            Some((1_234_567, Some(42)))
+        );
+        // Same garbage cases as parse_snapshot_stamp must still reject.
+        assert_eq!(parse_snapshot_name(&PathBuf::from("foo")), None);
+        assert_eq!(parse_snapshot_name(&PathBuf::from("123.tmp")), None);
+        assert_eq!(parse_snapshot_name(&PathBuf::from("123.4.5")), None);
+        // Suffix that overflows u32 must be rejected (the on-disk format
+        // caps at MAX_SNAPSHOT_COLLISION_SUFFIX, so a 12-digit suffix is
+        // never a snapshot we wrote).
+        assert_eq!(
+            parse_snapshot_name(&PathBuf::from("123.999999999999")),
+            None
+        );
+    }
+
+    #[test]
+    fn list_snapshots_returns_sorted_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Write three snapshots out of order and a couple of stray files
+        // that must be filtered out.
+        for (stamp, body) in [
+            (20u64, &b"newest"[..]),
+            (5, &b"older"[..]),
+            (10, &b"mid"[..]),
+        ] {
+            std::fs::write(
+                dir.path()
+                    .join(format!("{stamp:0width$}", width = SNAPSHOT_NAME_WIDTH)),
+                body,
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("README"), b"not a snapshot").unwrap();
+        std::fs::write(dir.path().join("123.tmp"), b"not a snapshot").unwrap();
+
+        let entries = list_snapshots(dir.path()).expect("list");
+        let stamps: Vec<u64> = entries.iter().map(|m| m.timestamp_ms).collect();
+        assert_eq!(stamps, vec![5, 10, 20], "must be sorted oldest-first");
+        assert_eq!(entries[0].size_bytes, 5, "size_bytes wired up");
+        assert!(entries.iter().all(|m| m.suffix.is_none()));
+    }
+
+    #[test]
+    fn list_snapshots_orders_collision_suffixes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stamp = 42u64;
+        let base = format!("{stamp:0width$}", width = SNAPSHOT_NAME_WIDTH);
+        // Unsuffixed and two collision suffixes — must come out in
+        // (timestamp, suffix) order with `None` first.
+        std::fs::write(dir.path().join(&base), b"a").unwrap();
+        std::fs::write(dir.path().join(format!("{base}.1")), b"bb").unwrap();
+        std::fs::write(dir.path().join(format!("{base}.0")), b"ccc").unwrap();
+
+        let entries = list_snapshots(dir.path()).expect("list");
+        let suffixes: Vec<Option<u32>> = entries.iter().map(|m| m.suffix).collect();
+        assert_eq!(suffixes, vec![None, Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn list_snapshots_missing_dir_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("never-existed");
+        let entries = list_snapshots(&missing).expect("missing dir is not an error");
+        assert!(entries.is_empty());
     }
 }

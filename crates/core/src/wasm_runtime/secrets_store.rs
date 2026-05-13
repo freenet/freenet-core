@@ -21,7 +21,8 @@ use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
 use super::secret_snapshots::{
-    RetentionPolicy, next_snapshot_path, snapshot_dir_for, thin_snapshots,
+    RetentionPolicy, SnapshotMetadata, list_snapshots, next_snapshot_path, snapshot_dir_for,
+    thin_snapshots,
 };
 
 /// Environment variable that disables snapshot-on-write for delegate secrets.
@@ -41,6 +42,8 @@ pub enum SecretStoreError {
     MissingCipher,
     #[error("missing secret: {0}")]
     MissingSecret(SecretsId),
+    #[error("no snapshot for secret {key} at timestamp_ms {timestamp_ms}")]
+    SnapshotNotFound { key: SecretsId, timestamp_ms: u64 },
 }
 
 #[derive(Clone)]
@@ -368,6 +371,143 @@ impl SecretsStore {
                 }
             })?;
         Ok(plaintext)
+    }
+
+    /// Enumerate the snapshot history for a given `(delegate, secret_id)`
+    /// pair, oldest-first. Returns an empty vector if the secret was never
+    /// overwritten (no snapshot directory exists). Does not decrypt;
+    /// callers that want the plaintext can `restore_snapshot` and then
+    /// `get_secret`.
+    pub fn list_snapshots(
+        &self,
+        delegate: &DelegateKey,
+        key: &SecretsId,
+    ) -> Result<Vec<SnapshotMetadata>, SecretStoreError> {
+        let delegate_path = self.base_path.join(delegate.encode());
+        let snap_dir = snapshot_dir_for(&delegate_path, key);
+        Ok(list_snapshots(&snap_dir)?)
+    }
+
+    /// Promote a previously-captured snapshot back to the active path.
+    ///
+    /// Mirrors the durability discipline of `store_secret`: the current
+    /// active value (if any) is snapshotted first (so restore is itself
+    /// reversible), then the chosen snapshot is copied to a `.tmp` file,
+    /// fsynced, and atomically renamed onto the active path. The ReDb
+    /// index and in-memory cache are updated last so a crash between the
+    /// rename and the index update still leaves the active value
+    /// readable on the next `get_secret`.
+    ///
+    /// If multiple snapshots share `timestamp_ms` (collision suffixes
+    /// from same-millisecond writes), the unsuffixed file wins; absent
+    /// that, the lowest-numbered suffix wins. To restore a specific
+    /// collision-suffix entry, callers can use [`list_snapshots`] and
+    /// pick the entry's `path` directly (a future API may take
+    /// `SnapshotMetadata` directly).
+    ///
+    /// Does NOT require the delegate's cipher to be registered — restore
+    /// is byte-level copy, not re-encryption. The restored ciphertext
+    /// remains decryptable by whatever cipher wrote it.
+    ///
+    /// # Errors
+    /// - `SnapshotNotFound` if no snapshot matches `timestamp_ms`
+    /// - `IO` for filesystem errors during the copy / rename / fsync
+    pub fn restore_snapshot(
+        &mut self,
+        delegate: &DelegateKey,
+        key: &SecretsId,
+        timestamp_ms: u64,
+    ) -> Result<(), SecretStoreError> {
+        let delegate_path = self.base_path.join(delegate.encode());
+        let secret_file_path = delegate_path.join(key.encode());
+        let snap_dir = snapshot_dir_for(&delegate_path, key);
+
+        // Find the requested snapshot. Disambiguation rule: unsuffixed
+        // file wins, then lowest-numbered suffix. `list_snapshots`
+        // already sorts by (timestamp_ms, suffix.unwrap_or(0)), and
+        // `None` < `Some(_)` is encoded via that 0-default — fine because
+        // collision suffixes start at 0, so the unsuffixed entry sorts
+        // alongside `.0`; we explicitly prefer unsuffixed below.
+        let entries = list_snapshots(&snap_dir)?;
+        let chosen = entries
+            .iter()
+            .filter(|m| m.timestamp_ms == timestamp_ms)
+            .min_by_key(|m| match m.suffix {
+                None => (0u32, 0u32),
+                Some(s) => (1, s),
+            })
+            .ok_or_else(|| SecretStoreError::SnapshotNotFound {
+                key: key.clone(),
+                timestamp_ms,
+            })?;
+        let chosen_path = chosen.path.clone();
+
+        // Snapshot the value currently at the active path so the restore
+        // operation is itself reversible. Mirrors store_secret's
+        // best-effort logging — the primary operation (restore) must
+        // not fail just because we couldn't preserve the value being
+        // replaced.
+        if self.snapshots_enabled
+            && secret_file_path.exists()
+            && let Err(e) = self.snapshot_prior_value(&delegate_path, key, &secret_file_path)
+        {
+            tracing::warn!(
+                "failed to snapshot active value before restore for delegate {}: {e}",
+                delegate.encode()
+            );
+        }
+
+        // Read snapshot ciphertext, write through a sibling tmp file with
+        // an atomic rename so the active path never tears. `&mut self`
+        // makes concurrent in-process restore impossible; a stale `.tmp`
+        // from a prior crashed run gets overwritten harmlessly here.
+        let ciphertext = fs::read(&chosen_path)?;
+        fs::create_dir_all(&delegate_path)?;
+        let tmp_path = secret_file_path.with_extension("tmp");
+        {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&ciphertext)?;
+            file.sync_all()?;
+        }
+        if let Err(err) = fs::rename(&tmp_path, &secret_file_path) {
+            if let Err(rm_err) = fs::remove_file(&tmp_path) {
+                tracing::debug!(
+                    "failed to clean up tmp file {tmp_path:?} after rename failure: {rm_err}"
+                );
+            }
+            return Err(err.into());
+        }
+
+        // Index update: only needed if the entry was previously removed
+        // (e.g. user called `remove_secret` then realized they wanted a
+        // value back). In the common case the secret is already in the
+        // index and the write below is idempotent.
+        let secret_key = *key.hash();
+        let mut current_secrets: Vec<[u8; 32]> = self
+            .key_to_secret_part
+            .get(delegate)
+            .map(|entry| entry.value().iter().copied().collect())
+            .unwrap_or_default();
+        if !current_secrets.contains(&secret_key) {
+            current_secrets.push(secret_key);
+            self.db
+                .store_secrets_index(delegate, &current_secrets)
+                .map_err(|e| {
+                    std::io::Error::other(format!("Failed to update secrets index: {e}"))
+                })?;
+            let secret_set: HashSet<SecretKey> = current_secrets.into_iter().collect();
+            self.key_to_secret_part.insert(delegate.clone(), secret_set);
+        }
+
+        // Best-effort thin: we may have just doubled the snapshot count
+        // (active-value snapshot above). Failures here only mean we keep
+        // more snapshots than the policy targets, self-correcting on the
+        // next write.
+        if self.snapshots_enabled && snap_dir.exists() {
+            thin_snapshots(&snap_dir, &self.retention, SystemTime::now());
+        }
+
+        Ok(())
     }
 }
 
@@ -751,6 +891,229 @@ mod test {
         assert!(
             !snap_dir.exists(),
             "no snapshot should exist after a single write"
+        );
+        Ok(())
+    }
+
+    /// list_snapshots on a never-written secret returns an empty Vec (not an
+    /// error). This mirrors `next_snapshot_path` + the missing-dir branch of
+    /// `list_snapshots` in secret_snapshots.rs.
+    #[tokio::test]
+    async fn list_snapshots_on_unwritten_secret_is_empty() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![20].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![21]);
+
+        let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
+        assert!(snaps.is_empty(), "no writes → no snapshots");
+        Ok(())
+    }
+
+    /// list_snapshots returns each snapshot, oldest-first, with the right
+    /// timestamp_ms. After two overwrites we should see two snapshots
+    /// (the v1 cipher → snapshot from the v2 write, and the v2 cipher →
+    /// snapshot from the v3 write).
+    #[tokio::test]
+    async fn list_snapshots_returns_history() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![30].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![31]);
+
+        store.store_secret(delegate.key(), &secret_id, b"v1".to_vec())?;
+        std::thread::sleep(Duration::from_millis(5));
+        store.store_secret(delegate.key(), &secret_id, b"v2".to_vec())?;
+        std::thread::sleep(Duration::from_millis(5));
+        store.store_secret(delegate.key(), &secret_id, b"v3".to_vec())?;
+
+        let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
+        assert_eq!(snaps.len(), 2, "expected two snapshots after 3 writes");
+        assert!(
+            snaps[0].timestamp_ms <= snaps[1].timestamp_ms,
+            "must be oldest-first"
+        );
+        Ok(())
+    }
+
+    /// Happy-path restore: after writing v1 and v2, restoring v1's snapshot
+    /// must put v1 back at the active path. The snapshot taken before the
+    /// restore preserves v2 so the operation is reversible.
+    #[tokio::test]
+    async fn restore_snapshot_replaces_active_value() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![40].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![41]);
+
+        store.store_secret(delegate.key(), &secret_id, b"v1".to_vec())?;
+        std::thread::sleep(Duration::from_millis(5));
+        store.store_secret(delegate.key(), &secret_id, b"v2".to_vec())?;
+
+        // Confirm active = v2.
+        assert_eq!(
+            store.get_secret(delegate.key(), &secret_id)?,
+            b"v2".to_vec()
+        );
+
+        // Pick the (only) snapshot — it holds the v1 ciphertext.
+        let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
+        assert_eq!(snaps.len(), 1);
+        let v1_ts = snaps[0].timestamp_ms;
+
+        store.restore_snapshot(delegate.key(), &secret_id, v1_ts)?;
+
+        assert_eq!(
+            store.get_secret(delegate.key(), &secret_id)?,
+            b"v1".to_vec(),
+            "restore must put the v1 plaintext back"
+        );
+
+        // After restore there must be a snapshot of v2 (the value that was
+        // replaced) so the operation is reversible.
+        let snaps_after = store.list_snapshots(delegate.key(), &secret_id)?;
+        assert!(
+            !snaps_after.is_empty(),
+            "restore must snapshot the prior active value; got {} snapshots",
+            snaps_after.len()
+        );
+        Ok(())
+    }
+
+    /// Restoring an unknown timestamp must return SnapshotNotFound, not a
+    /// generic IO error, so the CLI can give a precise message.
+    #[tokio::test]
+    async fn restore_snapshot_unknown_timestamp_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![50].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![51]);
+
+        store.store_secret(delegate.key(), &secret_id, b"a".to_vec())?;
+        std::thread::sleep(Duration::from_millis(5));
+        store.store_secret(delegate.key(), &secret_id, b"b".to_vec())?;
+
+        let err = store
+            .restore_snapshot(delegate.key(), &secret_id, 0)
+            .expect_err("timestamp 0 should not exist");
+        match err {
+            SecretStoreError::SnapshotNotFound { timestamp_ms, .. } => {
+                assert_eq!(timestamp_ms, 0);
+            }
+            SecretStoreError::Encryption(_)
+            | SecretStoreError::IO(_)
+            | SecretStoreError::MissingCipher
+            | SecretStoreError::MissingSecret(_) => {
+                panic!("expected SnapshotNotFound, got {err:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore after remove_secret must re-add the entry to the ReDb index
+    /// and the in-memory map. Without this, `get_secret` would return the
+    /// restored value but the secret would be invisible to delegate code
+    /// that iterates the index.
+    #[tokio::test]
+    async fn restore_after_remove_repopulates_index() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![60].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![61]);
+
+        store.store_secret(delegate.key(), &secret_id, b"keep".to_vec())?;
+        std::thread::sleep(Duration::from_millis(5));
+        store.store_secret(delegate.key(), &secret_id, b"overwrite".to_vec())?;
+
+        // Grab the snapshot stamp BEFORE removing the secret. `remove_secret`
+        // also deletes the snapshot directory, so we need the timestamp now.
+        let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
+        assert_eq!(snaps.len(), 1);
+        let prior_ts = snaps[0].timestamp_ms;
+
+        // Now copy the snapshot ciphertext aside so we can replay it after
+        // `remove_secret` wipes the .snapshots dir. This simulates an
+        // operator backing up the snapshot file before deletion.
+        let snap_src = snaps[0].path.clone();
+        let snap_backup = temp_dir.path().join("backup-snapshot");
+        std::fs::copy(&snap_src, &snap_backup)?;
+
+        store.remove_secret(delegate.key(), &secret_id)?;
+
+        // Re-stage the saved snapshot at the same on-disk location so the
+        // restore code can find it.
+        let snap_dir = secrets_dir
+            .join(delegate.key().encode())
+            .join(".snapshots")
+            .join(secret_id.encode());
+        std::fs::create_dir_all(&snap_dir)?;
+        std::fs::copy(&snap_backup, snap_src)?;
+
+        // Confirm pre-condition: index does NOT contain the secret yet.
+        let secret_hash = *secret_id.hash();
+        let in_mem_before = store
+            .key_to_secret_part
+            .get(delegate.key())
+            .map(|e| e.value().contains(&secret_hash))
+            .unwrap_or(false);
+        assert!(!in_mem_before, "index should be empty after remove_secret");
+
+        store.restore_snapshot(delegate.key(), &secret_id, prior_ts)?;
+
+        // Post-condition: index contains the secret again AND get_secret
+        // returns the restored value.
+        let post_index = store
+            .db
+            .get_secrets_index(delegate.key())
+            .expect("index lookup")
+            .unwrap_or_default();
+        assert!(
+            post_index.contains(&secret_hash),
+            "ReDb index must re-include the restored secret"
+        );
+        let in_mem_after = store
+            .key_to_secret_part
+            .get(delegate.key())
+            .map(|e| e.value().contains(&secret_hash))
+            .unwrap_or(false);
+        assert!(
+            in_mem_after,
+            "in-memory map must re-include the restored secret"
+        );
+        // The snapshot was taken when "overwrite" was written, but it
+        // holds the PRIOR active value at that point — "keep".
+        assert_eq!(
+            store.get_secret(delegate.key(), &secret_id)?,
+            b"keep".to_vec()
         );
         Ok(())
     }
