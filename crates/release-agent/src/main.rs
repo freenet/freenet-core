@@ -45,10 +45,7 @@ async fn main() -> Result<()> {
         .build()
         .context("build reqwest client")?;
 
-    let updater = Updater {
-        command: config.update_command.clone(),
-        dry_run: config.dry_run,
-    };
+    let updater = Updater::new_with_sudo(config.update_command.clone(), config.dry_run);
 
     let listen_addr = config.listen_addr;
     let latest_source = Arc::new(GitHubLatest {

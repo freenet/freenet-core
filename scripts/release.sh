@@ -1127,6 +1127,12 @@ trigger_gateway_updates() {
     # Trigger immediate update on all known gateways by running gateway-auto-update.sh --force
     # This avoids the 10-minute polling delay, ensuring gateways are updated before users
     # install the new version (version mismatch = failed connections).
+    #
+    # Future: this stage will be replaced by .github/workflows/gateway-update.yml,
+    # which signs an HTTP request to each gateway's `freenet-release-agent`
+    # instead of SSH'ing. Tracked in #4073 (Phase 1 currently shipping). The
+    # SSH path remains the production trigger until the new workflow has been
+    # validated against 1-2 real releases on nova.
 
     if is_step_completed "GATEWAYS_UPDATED"; then
         echo "  ✓ [GATEWAYS_UPDATED] Gateways already updated (skipping)"

@@ -107,9 +107,12 @@ jobs:
     runs-on: ubuntu-latest
     # Serialize so a failure on the first gateway aborts the rest.
     # Phase 3 may parallelize this — for now, blast-radius control wins.
-    max-parallel: 1
+    # On partial failure (e.g. nova upgraded, vega 5xx) the fleet is left
+    # split-version; agent refuses downgrades, so recovery requires either
+    # re-running with the failing gateway only or a manual emergency path.
     strategy:
       fail-fast: true
+      max-parallel: 1
       matrix:
         gateway: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:

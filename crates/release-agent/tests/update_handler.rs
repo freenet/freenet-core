@@ -77,10 +77,90 @@ impl Harness {
             config: Arc::new(config.clone()),
             secret: Arc::new(secret.clone()),
             latest_source,
-            updater: Updater {
-                command: config.update_command.clone(),
-                dry_run: true,
-            },
+            updater: Updater::new_with_sudo(config.update_command.clone(), true),
+            version_cache: VersionCache::new(),
+            last_update_attempt: Arc::new(Mutex::new(None)),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        Self {
+            base: format!("http://{addr}"),
+            secret,
+            _tmp: tmp,
+        }
+    }
+
+    /// Live-spawn variant: `dry_run = false`, fake-sudo script captures
+    /// argv to `record_file`, real `update_command` is the user-supplied
+    /// `update_script`. Lets tests exercise the spawn pipeline without
+    /// needing real root/sudoers.
+    async fn build_live(
+        current_binary_version: &str,
+        latest_on_github: Version,
+        rate_limit_seconds: u64,
+        update_script: &str,
+        record_file: &Path,
+    ) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary_path = write_stub_freenet(tmp.path(), current_binary_version);
+
+        let secret: Vec<u8> = (0..32).map(|i| i as u8).collect();
+        let secret_path = tmp.path().join("hmac.key");
+        std::fs::write(&secret_path, hex::encode(&secret)).unwrap();
+
+        // The "real" update script the agent is told to invoke.
+        let update_command = tmp.path().join("update.sh");
+        std::fs::write(&update_command, update_script).unwrap();
+        let mut perms = std::fs::metadata(&update_command).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&update_command, perms).unwrap();
+
+        // Fake-sudo: records exact argv (after the --non-interactive that
+        // the agent always prepends), then either passes through to the
+        // update script or short-circuits — depends on the script's exit.
+        let fake_sudo = tmp.path().join("fake-sudo");
+        let sudo_script = format!(
+            "#!/bin/sh\n\
+             # First arg is --non-interactive, then the real command + its argv.\n\
+             shift\n\
+             echo \"$@\" > {record}\n\
+             # Exec the rest so the test stub's exit code surfaces.\n\
+             exec \"$@\"\n",
+            record = record_file.display()
+        );
+        std::fs::write(&fake_sudo, sudo_script).unwrap();
+        let mut perms = std::fs::metadata(&fake_sudo).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_sudo, perms).unwrap();
+
+        let config = Config {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            binary_path: binary_path.clone(),
+            update_command: update_command.clone(),
+            hmac_secret_path: secret_path,
+            github_repo: "freenet/freenet-core".into(),
+            dry_run: false,
+            rate_limit_seconds,
+            clock_skew_tolerance_seconds: 300,
+        };
+
+        let latest_source: Arc<dyn LatestSource> = Arc::new(StaticLatest(latest_on_github));
+        let updater = freenet_release_agent::updater::Updater {
+            command: update_command,
+            dry_run: false,
+            sudo_command: fake_sudo,
+        };
+        let state = AppState {
+            config: Arc::new(config),
+            secret: Arc::new(secret.clone()),
+            latest_source,
+            updater,
             version_cache: VersionCache::new(),
             last_update_attempt: Arc::new(Mutex::new(None)),
         };
@@ -285,4 +365,116 @@ async fn healthz_is_ok() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn spawn_failure_does_not_consume_rate_limit_window() {
+    // Security-critical contract: an immediate sudo rejection or script
+    // failure within the 1s probe window must NOT mark the rate-limit
+    // window consumed — otherwise an attacker (or a transient sudoers
+    // misconfig) could lock out legitimate retries for the full window.
+    let tmp = tempfile::tempdir().unwrap();
+    let argv_record = tmp.path().join("argv.log");
+    // Update script exits 1 immediately. Surface as 500 to the caller.
+    let h = Harness::build_live(
+        "0.2.55",
+        Version::new(0, 2, 56),
+        600, // 10 min window — long enough that a second successful spawn
+        // within seconds proves the window WAS NOT consumed.
+        "#!/bin/sh\nexit 1\n",
+        &argv_record,
+    )
+    .await;
+
+    let (body, sig) = h.signed_body("0.2.56", now_secs());
+    let r1 = reqwest::Client::new()
+        .post(format!("{}/update", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 500, "spawn failure should surface as 500");
+
+    // Immediately retry. Should NOT be 429 — window must not have
+    // been consumed by the failed spawn.
+    let (body2, sig2) = h.signed_body("0.2.56", now_secs());
+    let r2 = reqwest::Client::new()
+        .post(format!("{}/update", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig2)
+        .body(body2)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        r2.status(),
+        429,
+        "rate-limit window must not be consumed by a failed spawn"
+    );
+}
+
+#[tokio::test]
+async fn sudoers_argv_matches_allowlist() {
+    // Pins the exact argv shape the sudoers entry must match:
+    //   /usr/local/bin/gateway-auto-update.sh --force --target-version *
+    // A refactor that reorders --force/--target-version or adds another
+    // flag would silently break every production invocation when sudoers
+    // rejects it. This test records the actual argv via a fake-sudo
+    // wrapper and asserts it lines up with the sudoers allowlist.
+    let tmp = tempfile::tempdir().unwrap();
+    let argv_record = tmp.path().join("argv.log");
+    // Update script does nothing; we only care about the argv sudo sees.
+    let h = Harness::build_live(
+        "0.2.55",
+        Version::new(0, 2, 56),
+        600,
+        "#!/bin/sh\n# noop — wait long enough that the 1s probe times out\nsleep 5\n",
+        &argv_record,
+    )
+    .await;
+
+    let (body, sig) = h.signed_body("0.2.56", now_secs());
+    let r = reqwest::Client::new()
+        .post(format!("{}/update", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.status() == 202 || r.status() == 200,
+        "expected 200/202, got {}",
+        r.status()
+    );
+
+    let recorded =
+        std::fs::read_to_string(&argv_record).expect("fake-sudo should have recorded argv");
+    let argv = recorded.trim();
+    // Expected: <update_script_path> --force --target-version v0.2.56
+    assert!(
+        argv.ends_with("--force --target-version v0.2.56"),
+        "argv suffix must match sudoers allowlist (got: {argv:?})"
+    );
+}
+
+#[tokio::test]
+async fn oversized_body_rejected() {
+    // Defense against a flood of authenticated megabyte bodies — the
+    // 4 KiB ceiling rejects them before HMAC verify allocates.
+    let h = Harness::build("0.2.55", Version::new(0, 2, 56), 600).await;
+    let big = "x".repeat(5 * 1024);
+    let body = json!({"version": "0.2.56", "issued_at": now_secs(), "pad": big}).to_string();
+    let sig = sign(&h.secret, body.as_bytes());
+    let resp = reqwest::Client::new()
+        .post(format!("{}/update", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status() == 413 || resp.status() == 400,
+        "oversized body must be rejected before HMAC, got {}",
+        resp.status()
+    );
 }

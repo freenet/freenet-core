@@ -1,10 +1,21 @@
 # Allow the release-agent to invoke the update script as root.
 #
-# The trailing `*` matches any single non-whitespace argument (sudoers glob
-# semantics) — that's the `vX.Y.Z` value passed by the agent via
-# `--target-version`. The agent verifies that the version matches GitHub's
-# `latest` release before invoking, so the value here is constrained even
-# though sudoers itself doesn't validate it.
+# IMPORTANT: per sudoers(5), the trailing `*` matches ANY characters
+# including whitespace — it is NOT restricted to a single non-whitespace
+# argument. The agent and script BOTH enforce that the version is a
+# strict `vX.Y.Z` semver string:
+#
+#   1. The agent parses the target with `semver::Version::parse` before
+#      forwarding (rejects whitespace, shell metacharacters, etc.) and
+#      passes it via `Command::arg` (separate execve slot, no shell).
+#   2. `gateway-auto-update.sh` re-validates the `--target-version`
+#      argument against a strict regex before using it (defense in depth
+#      for the case where the value is somehow attacker-controlled).
+#
+# Do NOT loosen either validation site without coordinating with this
+# sudoers entry. The `*` is here because sudoers globs don't support
+# regex; if a future sudo (>=1.9.10) lets us pin to a regex on the
+# argument, tighten it here.
 #
 # Relies on the default `secure_path` to prevent PATH-based shenanigans.
 # The `gateway-auto-update.sh` script MUST be owned by root and NOT

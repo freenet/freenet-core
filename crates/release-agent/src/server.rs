@@ -181,7 +181,27 @@ async fn update_handler(
     //    the spawn serialises concurrent requests, and we only mark the
     //    window consumed on actual spawn-success — so a transient GitHub
     //    5xx or an immediate sudo failure does NOT consume the window.
-    let mut guard = state.last_update_attempt.lock().await;
+    //
+    //    Acquire with a timeout so a stuck spawn doesn't deadlock all
+    //    future requests forever. The probe duration in Updater::run is
+    //    1s; allowing 5s here gives 5× headroom while still bounding the
+    //    blast radius of a flood of authenticated requests.
+    let mut guard = match tokio::time::timeout(
+        Duration::from_secs(5),
+        state.last_update_attempt.lock(),
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::warn!("update mutex acquire timed out; spawn likely in progress");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "update in progress; retry shortly",
+            )
+                .into_response();
+        }
+    };
     if let Some(prev) = *guard {
         let since = prev.elapsed();
         let limit = Duration::from_secs(state.config.rate_limit_seconds);

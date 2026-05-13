@@ -27,15 +27,23 @@ freenet-release-agent (as freenet-update user)
         │  cross-check target == GitHub /releases/latest
         ▼
 sudo -n /usr/local/bin/gateway-auto-update.sh --force --target-version vX.Y.Z
-        │  (sudoers entry NOPASSWD-allows ONLY this exact arg pattern)
+        │  (sudoers entry NOPASSWD-allows this exact prefix; the
+        │   trailing `*` is a sudoers wildcard for the version value)
         ▼
 fetches release binary, replaces /usr/local/bin/freenet, restarts service
 ```
 
 The privilege boundary is the sudoers entry, not the agent. Even if the
 agent is fully compromised, it can only invoke
-`gateway-auto-update.sh --force --target-version <one-arg>` — no arbitrary
-commands.
+`gateway-auto-update.sh --force --target-version <value>` where `<value>`
+is constrained by **two independent regex checks**: the agent parses it
+via `semver::Version::parse` before forwarding, and the script
+re-validates with a strict `^[0-9]+\.[0-9]+\.[0-9]+...$` regex on entry.
+
+Note: the sudoers `*` wildcard matches *any* characters including
+whitespace (per `man 5 sudoers`); the safety comes from the dual regex
+validation in the agent and script, not from sudoers alone. Do NOT
+loosen either validation site.
 
 ## Prerequisites per gateway
 
@@ -103,9 +111,11 @@ SSH key.
 - Echoed once at install time; **copy it immediately** into the matching
   GitHub Actions secret (suggested name: `RELEASE_AGENT_HMAC_<HOST>`,
   e.g. `RELEASE_AGENT_HMAC_NOVA`).
-- The agent reads the secret as hex on every request (no in-memory cache).
-  Rotation is `cat new-key > /etc/freenet-release-agent/hmac.key`; no
-  restart needed.
+- The agent reads the secret **once at startup** and holds it in process
+  memory for its lifetime. Rotation therefore requires a `systemctl
+  restart freenet-release-agent` after writing the new key — without
+  the restart, the next GitHub Actions run will 401 with the new secret
+  while the agent still verifies against the old one.
 
 ### Rotating the HMAC secret
 
@@ -113,9 +123,12 @@ SSH key.
    /etc/freenet-release-agent/hmac.key`. Re-set perms if `tee` widened
    them: `sudo chmod 0640 /etc/freenet-release-agent/hmac.key && sudo
    chown root:freenet-update /etc/freenet-release-agent/hmac.key`.
-2. Update the GitHub Actions secret immediately — between step 1 and 2,
+2. `sudo systemctl restart freenet-release-agent` to pick up the new key.
+   The agent reads the secret at startup, so the rotation does not take
+   effect until restart.
+3. Update the GitHub Actions secret immediately. Between steps 2 and 3,
    the next workflow run will 401.
-3. Smoke-test with the signing snippet from
+4. Smoke-test with the signing snippet from
    [`scripts/release-agent/README.md`](../scripts/release-agent/README.md).
 
 ## Firewall notes per host

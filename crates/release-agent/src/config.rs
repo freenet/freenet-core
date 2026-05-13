@@ -22,7 +22,7 @@ pub struct Config {
     #[serde(default = "default_rate_limit")]
     pub rate_limit_seconds: u64,
     #[serde(default = "default_skew")]
-    pub clock_skew_tolerance_seconds: i64,
+    pub clock_skew_tolerance_seconds: u32,
 }
 
 fn default_repo() -> String {
@@ -34,7 +34,7 @@ fn default_true() -> bool {
 fn default_rate_limit() -> u64 {
     600
 }
-fn default_skew() -> i64 {
+fn default_skew() -> u32 {
     300
 }
 

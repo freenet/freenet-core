@@ -10,6 +10,21 @@ use tokio::process::Command;
 pub struct Updater {
     pub command: PathBuf,
     pub dry_run: bool,
+    /// The privilege-escalation prefix. In production this is `"sudo"`
+    /// (resolved via PATH and constrained by sudoers). Tests can point
+    /// this at a fake-sudo script under the test's tempdir to exercise
+    /// the spawn pipeline without needing real root.
+    pub sudo_command: PathBuf,
+}
+
+impl Updater {
+    pub fn new_with_sudo(command: PathBuf, dry_run: bool) -> Self {
+        Self {
+            command,
+            dry_run,
+            sudo_command: PathBuf::from("sudo"),
+        }
+    }
 }
 
 /// How long to wait synchronously after spawning the update script before
@@ -51,7 +66,7 @@ impl Updater {
         // at journald — so the script's logs end up in the agent's journal
         // unit. Previously they went to /dev/null, which was a debugging
         // blind spot when the script failed.
-        let mut child = Command::new("sudo")
+        let mut child = Command::new(&self.sudo_command)
             .arg("--non-interactive")
             .arg(&self.command)
             .arg("--force")
@@ -118,10 +133,10 @@ mod tests {
         // Point at a file that doesn't exist. If dry_run is honoured, run()
         // succeeds without touching the filesystem; if not, spawn() would
         // fail and the test would catch the regression.
-        let updater = Updater {
-            command: PathBuf::from("/nonexistent/path/that/should/never/exist"),
-            dry_run: true,
-        };
+        let updater = Updater::new_with_sudo(
+            PathBuf::from("/nonexistent/path/that/should/never/exist"),
+            true,
+        );
         updater
             .run(&Version::new(0, 2, 56))
             .await

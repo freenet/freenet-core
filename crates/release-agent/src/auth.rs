@@ -38,7 +38,10 @@ pub fn verify_signature(secret: &[u8], body: &[u8], header_value: &str) -> Resul
 /// Reject requests whose `issued_at` is non-positive or outside ±tolerance
 /// of the agent's wall clock. Uses checked arithmetic so an attacker who
 /// produces a valid signature cannot panic the agent with `i64::MIN`.
-pub fn check_clock_skew(issued_at: i64, tolerance_seconds: i64) -> Result<(), AuthError> {
+///
+/// `tolerance_seconds` is unsigned so a misconfigured negative value
+/// can't accidentally reject every request.
+pub fn check_clock_skew(issued_at: i64, tolerance_seconds: u32) -> Result<(), AuthError> {
     if issued_at <= 0 {
         return Err(AuthError::NonPositiveIssuedAt);
     }
@@ -50,7 +53,7 @@ pub fn check_clock_skew(issued_at: i64, tolerance_seconds: i64) -> Result<(), Au
         .checked_sub(issued_at)
         .and_then(i64::checked_abs)
         .unwrap_or(i64::MAX);
-    if delta > tolerance_seconds {
+    if delta > tolerance_seconds as i64 {
         return Err(AuthError::ClockSkew(delta));
     }
     Ok(())
