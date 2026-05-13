@@ -33,6 +33,12 @@ CHECK_ONLY=false
 DRY_RUN=false
 VERBOSE=false
 ALL_INSTANCES=false
+# Optional explicit target version (semver, with or without `v` prefix). When
+# set, this overrides the `get_latest_version` GitHub fetch. Used by
+# freenet-release-agent so the version the agent signed for is the version
+# actually installed, even if a newer release is published between the
+# agent's GitHub check and this script's own fetch.
+TARGET_VERSION=""
 
 # Colors (disabled if not a terminal)
 if [[ -t 1 ]]; then
@@ -79,12 +85,18 @@ Checks for new Freenet releases and updates the gateway automatically.
 Usage: $(basename "$0") [options]
 
 Options:
-  --force           Force update even if current version matches latest
-  --check           Only check for updates, don't install
-  --dry-run         Show what would be done without making changes
-  --all-instances   Update all instances (gateway + peers), not just gateway
-  --verbose, -v     Show verbose output
-  --help, -h        Show this help message
+  --force                 Force update even if current version matches latest
+  --check                 Only check for updates, don't install
+  --dry-run               Show what would be done without making changes
+  --all-instances         Update all instances (gateway + peers), not just gateway
+  --target-version vX.Y.Z Install this exact release rather than GitHub latest.
+                          Used by freenet-release-agent so the version the agent
+                          signed for is the version actually installed, even if
+                          a newer release lands between sign and install.
+                          Must be strict semver; whitespace and shell metachars
+                          rejected (paired with sudoers wildcard for the agent).
+  --verbose, -v           Show verbose output
+  --help, -h              Show this help message
 
 Environment Variables:
   INSTALL_PATH      Path to installed freenet binary (default: /usr/local/bin/freenet)
@@ -141,6 +153,24 @@ while [[ $# -gt 0 ]]; do
         --all-instances)
             ALL_INSTANCES=true
             shift
+            ;;
+        --target-version)
+            if [[ $# -lt 2 ]]; then
+                log ERROR "--target-version requires an argument"
+                exit 1
+            fi
+            TARGET_VERSION="${2#v}"
+            # Defense in depth: the sudoers `*` wildcard matches arbitrary
+            # characters, so even though the release-agent only forwards
+            # values it parsed with `semver::Version::parse`, validate the
+            # shape here. Rejects empty strings, shell metacharacters,
+            # whitespace, and anything that isn't strict semver
+            # (optionally with a prerelease/build identifier).
+            if [[ ! "$TARGET_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?(\+[A-Za-z0-9.-]+)?$ ]]; then
+                log ERROR "--target-version must be strict semver vX.Y.Z (got: $TARGET_VERSION)"
+                exit 1
+            fi
+            shift 2
             ;;
         --verbose|-v)
             VERBOSE=true
@@ -367,11 +397,16 @@ main() {
     log INFO "Current version: $current_version"
 
     local latest_version
-    if ! latest_version=$(get_latest_version); then
-        log ERROR "Failed to determine latest version"
-        exit 1
+    if [[ -n "$TARGET_VERSION" ]]; then
+        latest_version="$TARGET_VERSION"
+        log INFO "Target version:  $latest_version (pinned via --target-version)"
+    else
+        if ! latest_version=$(get_latest_version); then
+            log ERROR "Failed to determine latest version"
+            exit 1
+        fi
+        log INFO "Latest version:  $latest_version"
     fi
-    log INFO "Latest version:  $latest_version"
 
     # Compare versions
     local needs_update=false

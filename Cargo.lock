@@ -2206,6 +2206,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-release-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "clap",
+ "hex",
+ "hmac",
+ "reqwest 0.12.28",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "freenet-stdlib"
 version = "0.1.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"

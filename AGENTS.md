@@ -112,11 +112,13 @@ cargo fmt && cargo clippy -- -D warnings  # Lint (must match CI)
 
 ```
 crates/
-├── core/           # Runtime (node, transport, contracts, operations)
-├── fdev/           # Developer CLI
-└── freenet-macros/ # Test macros
-apps/               # Example applications
-docs/architecture/  # Design docs
+├── core/             # Runtime (node, transport, contracts, operations)
+├── fdev/             # Developer CLI
+├── freenet-macros/   # Test macros
+└── release-agent/    # HTTP service on each gateway for triggering
+                      # auto-updates from the release workflow (#4073)
+apps/                 # Example applications
+docs/architecture/    # Design docs
 ```
 
 ### Core Modules (`crates/core/src/`)

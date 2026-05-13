@@ -1,0 +1,47 @@
+[Unit]
+Description=Freenet release agent (HTTP trigger for gateway updates)
+Documentation=https://github.com/freenet/freenet-core/issues/4073
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=freenet-update
+Group=freenet-update
+ExecStart=/usr/local/bin/freenet-release-agent --config /etc/freenet-release-agent/config.toml
+Restart=on-failure
+RestartSec=5s
+
+# `NoNewPrivileges` must remain *false*: the agent execs `sudo` to invoke
+# `gateway-auto-update.sh`. The narrow sudoers entry in
+# /etc/sudoers.d/freenet-release-agent is the privilege boundary, not the
+# systemd sandbox.
+NoNewPrivileges=false
+
+# `ProtectSystem` must NOT be `strict` here. The sudo'd update child
+# inherits this unit's mount namespace, so a strict overlay would mark
+# /usr, /etc, /boot read-only for the upgrade script — which legitimately
+# writes /usr/local/bin/freenet and runs `systemctl restart freenet`
+# (touching /etc/systemd, /run/systemd). The agent itself is unprivileged
+# and does not need filesystem-write protection beyond Unix perms.
+ProtectSystem=off
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+# `RestrictNamespaces` must NOT be true: `systemctl` inside the sudo'd
+# update script uses namespace ops on some distros; blocking them at the
+# parent unit would break legitimate `systemctl restart freenet`.
+RestrictNamespaces=false
+RestrictSUIDSGID=false
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
