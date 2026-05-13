@@ -1,27 +1,18 @@
-# Gateway update workflow (Phase 2 — manual trigger only)
+# Gateway update workflow.
 #
-# Status: draft. This workflow is `workflow_dispatch` only and intentionally
-# NOT wired into release.yml or cross-compile.yml. Before flipping to
-# automatic triggering on `release: { types: [published] }`, the following
-# must be true:
+# Auto-triggers on `release.published` — once a release is published on
+# GitHub (after release.yml runs cargo publish + creates the release with
+# binaries attached), this workflow signs HMAC-authed `POST /update`
+# requests to each gateway's `freenet-release-agent`.
 #
-#   - freenet-release-agent deployed on each gateway in dry_run mode and
-#     validated per docs/release-agent-deployment.md
-#   - RELEASE_AGENT_HMAC_NOVA and RELEASE_AGENT_HMAC_VEGA secrets set
-#   - Gateway URLs reachable from GitHub Actions runners
-#   - At least one manual run completed end-to-end without errors
-#
-# When all of the above is true, add a second `on:` trigger:
-#
-#   release:
-#     types: [published]
-#
-# and remove the `workflow_dispatch.inputs.version` field (the release tag
-# becomes the version).
+# `workflow_dispatch` is kept for manual re-rollouts and for the smoke
+# test (`dry_run_workflow: true`).
 
-name: Gateway Update (Phase 2 draft)
+name: Gateway Update
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       version:
@@ -43,7 +34,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: gateway-update-${{ inputs.version }}
+  # On release-trigger the version is in github.event.release.tag_name;
+  # on workflow_dispatch it's in inputs.version. The `||` coalesces.
+  group: gateway-update-${{ github.event.release.tag_name || inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -52,29 +45,43 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      version: ${{ steps.ver.outputs.version }}
     steps:
-      - name: Validate version
+      - name: Resolve version
+        id: ver
+        # Pass values via env: rather than ${{ }} interpolation — a tag
+        # name like `1.2.3"; curl evil; "` would otherwise template into
+        # the script at expression-eval time, before the regex below
+        # could reject it. Env binding makes it a regular shell string.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${{ inputs.version }}"
-          if [[ "$VERSION" == v* ]]; then
-            echo "::error::Version must not have a leading 'v'. Got: $VERSION"
-            exit 1
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            RAW="$TAG_NAME"
+          else
+            RAW="$DISPATCH_VERSION"
           fi
+          VERSION="${RAW#v}"
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Version must be X.Y.Z. Got: $VERSION"
+            echo "::error::Version must be X.Y.Z. Got: $VERSION (raw: $RAW)"
             exit 1
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
 
       - name: Verify GitHub release exists and is latest
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${{ inputs.version }}"
+          VERSION="${{ steps.ver.outputs.version }}"
           LATEST=$(gh api repos/${{ github.repository }}/releases/latest --jq .tag_name)
           LATEST="${LATEST#v}"
           if [[ "$LATEST" != "$VERSION" ]]; then
-            echo "::error::Requested version $VERSION is not the GitHub 'latest' release ($LATEST). Refusing to roll out."
+            echo "::error::Version $VERSION is not the GitHub 'latest' release ($LATEST). Refusing to roll out."
             echo "::error::The agent will reject this anyway (403 not_github_latest); failing fast here."
+            echo "::error::Note: when triggered by release.published, the freshly-created release is normally already 'latest'."
             exit 1
           fi
           echo "GitHub /releases/latest confirms $VERSION is current."
@@ -82,7 +89,9 @@ jobs:
       - name: Build matrix
         id: plan
         run: |
-          REQUESTED="${{ inputs.gateways }}"
+          # Default to all gateways when triggered by release.published
+          # (no inputs available); honor explicit subset on workflow_dispatch.
+          REQUESTED="${{ inputs.gateways || 'all' }}"
           if [[ "$REQUESTED" == "all" ]]; then
             MATRIX='[{"name":"nova","url":"https://update.nova.locut.us"},{"name":"vega","url":"https://update.vega.locut.us"}]'
           else
@@ -140,7 +149,7 @@ jobs:
         env:
           SECRET: ${{ steps.secret.outputs.secret }}
           GATEWAY_URL: ${{ matrix.gateway.url }}
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.plan.outputs.version }}
           DRY_RUN_WORKFLOW: ${{ inputs.dry_run_workflow }}
         run: |
           set -euo pipefail
@@ -190,7 +199,7 @@ jobs:
         if: ${{ inputs.dry_run_workflow != true }}
         env:
           GATEWAY_URL: ${{ matrix.gateway.url }}
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
           # The agent restarts the freenet service after the script

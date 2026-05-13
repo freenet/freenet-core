@@ -21,3 +21,13 @@ rate_limit_seconds = 600
 # Reject requests whose `issued_at` timestamp is more than this many seconds
 # from the agent's clock. Defends against replay attacks.
 clock_skew_tolerance_seconds = 300
+
+# River announcement endpoint. Set both to enable `POST /announce/river`.
+# Leave blank (default) on gateways that don't have a Freenet node + room
+# signing key (e.g. vega) — the endpoint will return 503 there.
+#
+# `river_announce_user` is the local user under which `riverctl` runs;
+# they own the signing key and rooms.json. The sudoers entry must
+# authorize `freenet-update` to `sudo -u <user>` to this script.
+river_announce_command = ""
+river_announce_user = ""

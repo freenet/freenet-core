@@ -45,6 +45,47 @@ whitespace (per `man 5 sudoers`); the safety comes from the dual regex
 validation in the agent and script, not from sudoers alone. Do NOT
 loosen either validation site.
 
+### River announcement path (nova only)
+
+```
+GitHub Actions runner (release-announce.yml)
+        │  HTTPS POST /announce/river
+        │  X-Signature: HMAC-SHA256(body, secret)
+        ▼
+update.nova.locut.us → Caddy → 127.0.0.1:9876
+        │
+        ▼
+freenet-release-agent (as freenet-update)
+        │  verify HMAC, clock-skew; length+NUL check on message
+        │  rate-limit: 1 announcement / minute
+        ▼
+sudo -n -u ian /usr/local/bin/announce-to-river.sh "<message>"
+        │  (sudoers: `freenet-update ALL=(ian) NOPASSWD: ...`)
+        ▼
+cargo run -p riverctl message send <ROOM_VK> "<message>"
+   via local Freenet node at http://127.0.0.1:7509/
+```
+
+This endpoint is **opt-in via config** (`river_announce_command` and
+`river_announce_user` in `config.toml`). Gateways without a local
+Freenet node + room signing key (e.g. vega) leave both fields blank;
+`POST /announce/river` returns 503 there.
+
+## GitHub Actions secrets
+
+The end-to-end pipeline needs these repository secrets (set with
+`gh secret set <name> --repo freenet/freenet-core`):
+
+| Secret | Used by | Source |
+|---|---|---|
+| `RELEASE_AGENT_HMAC_NOVA` | `gateway-update.yml` + `release-announce.yml` | nova's `/etc/freenet-release-agent/hmac.key` (echoed once by `install.sh`) |
+| `RELEASE_AGENT_HMAC_VEGA` | `gateway-update.yml` | vega's `/etc/freenet-release-agent/hmac.key` |
+| `MATRIX_HOMESERVER_URL` | `release-announce.yml` | e.g. `https://matrix.org` |
+| `MATRIX_ACCESS_TOKEN` | `release-announce.yml` | Matrix bot user's access token (from `Settings → Help & About → Advanced → Access Token`) |
+
+The Matrix announcement job is a no-op (with a workflow warning) if
+the Matrix secrets are absent — useful while bootstrapping.
+
 ## Prerequisites per gateway
 
 1. **`gateway-auto-update.sh` installed at `/usr/local/bin/`** (or wherever

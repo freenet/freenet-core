@@ -1134,6 +1134,15 @@ trigger_gateway_updates() {
     # SSH path remains the production trigger until the new workflow has been
     # validated against 1-2 real releases on nova.
 
+    # The gateway-update.yml workflow auto-rolls out updates on
+    # release.published. Setting FREENET_RELEASE_SKIP_GATEWAY_SSH=1
+    # opts the local script out so we don't double-update.
+    if [[ "${FREENET_RELEASE_SKIP_GATEWAY_SSH:-0}" == "1" ]]; then
+        echo "  ⏭  Skipping SSH-based gateway update (FREENET_RELEASE_SKIP_GATEWAY_SSH=1 — workflow handles it)"
+        mark_completed "GATEWAYS_UPDATED"
+        return 0
+    fi
+
     if is_step_completed "GATEWAYS_UPDATED"; then
         echo "  ✓ [GATEWAYS_UPDATED] Gateways already updated (skipping)"
         return 0
@@ -1331,6 +1340,18 @@ wait_for_binaries() {
 announce_to_matrix() {
     echo "Announcing release to Matrix:"
 
+    # If the GitHub workflow path is wired up (release-announce.yml has
+    # been merged and the gateway has the Matrix secret), the workflow
+    # will post automatically when the release is undrafted. Skip here
+    # to avoid a duplicate Matrix message. Setting
+    # FREENET_RELEASE_SKIP_ANNOUNCEMENTS=1 in your env (or sourcing it
+    # from .freenet-release-rc) opts out of the local announcements.
+    if [[ "${FREENET_RELEASE_SKIP_ANNOUNCEMENTS:-0}" == "1" ]]; then
+        echo "  ⏭  Skipping (FREENET_RELEASE_SKIP_ANNOUNCEMENTS=1 — workflow handles announcements)"
+        mark_completed "MATRIX_ANNOUNCED"
+        return 0
+    fi
+
     # Skip if already announced
     if is_step_completed "MATRIX_ANNOUNCED"; then
         echo "  ✓ [MATRIX_ANNOUNCED] Matrix announcement already sent (skipping)"
@@ -1365,6 +1386,15 @@ Published to crates.io (freenet v$VERSION, fdev v$FDEV_VERSION)"
 
 announce_to_river() {
     echo "Announcing release to River (Freenet Official room):"
+
+    # Same workflow-handoff gate as announce_to_matrix. When the
+    # release-announce.yml workflow is wired up, it posts via nova's
+    # /announce/river endpoint. Local riverctl post would duplicate.
+    if [[ "${FREENET_RELEASE_SKIP_ANNOUNCEMENTS:-0}" == "1" ]]; then
+        echo "  ⏭  Skipping (FREENET_RELEASE_SKIP_ANNOUNCEMENTS=1 — workflow handles announcements)"
+        mark_completed "RIVER_ANNOUNCED"
+        return 0
+    fi
 
     # Skip if already announced
     if is_step_completed "RIVER_ANNOUNCED"; then
