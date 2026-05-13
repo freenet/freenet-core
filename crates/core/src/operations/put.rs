@@ -367,8 +367,16 @@ mod tests {
     /// DashMap entry for the remaining DashMap-backed op (Connect).
     /// GET, PUT, UPDATE and SUBSCRIBE no longer have DashMap entries.
     /// Without this the per-tx DashMap leak comes back for Connect.
+    /// Pin: `OpManager::completed` must not touch any per-op
+    /// DashMap. The legacy `self.ops.{connect,get,put,update,subscribe}`
+    /// maps were retired across the #1454 phases; the surviving
+    /// completion side effects are limited to the global
+    /// `under_progress` / `completed` sets and the `request_router`.
+    /// Reintroducing a per-op map here is a regression that would
+    /// resurrect the per-tx DashMap leak this test originally
+    /// guarded against.
     #[test]
-    fn completed_must_remove_per_type_dashmap_entry() {
+    fn completed_must_not_touch_per_op_dashmaps() {
         let src = include_str!("../node/op_state_manager.rs");
         let fn_start = src
             .find("pub fn completed(&self, id: Transaction)")
@@ -378,13 +386,13 @@ mod tests {
             .expect("OpManager::completed closing brace not found")
             + fn_start;
         let body = &src[fn_start..fn_end];
-        assert!(
-            body.contains("self.ops.connect.remove"),
-            "OpManager::completed must call \
-             `self.ops.connect.remove(&id)` to prevent a per-tx \
-             DashMap leak"
-        );
-        for retired in ["self.ops.put", "self.ops.get", "self.ops.subscribe"] {
+        for retired in [
+            "self.ops.connect",
+            "self.ops.put",
+            "self.ops.get",
+            "self.ops.subscribe",
+            "self.ops.update",
+        ] {
             assert!(
                 !body.contains(retired),
                 "OpManager::completed must not reference `{retired}` — the corresponding DashMap was retired"

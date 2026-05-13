@@ -1,8 +1,7 @@
 use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
-    OpRequestSender, RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
-    StateStoreError, now_nanos,
+    RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, StateStoreError, now_nanos,
 };
 
 /// Maximum number of related contracts a single validation can request.
@@ -106,8 +105,6 @@ pub struct RuntimePool {
     available: Semaphore,
     /// Configuration for creating new executors
     config: Arc<Config>,
-    /// Channel to send operation requests to the event loop (cloneable, shared by all executors)
-    op_sender: OpRequestSender,
     /// Reference to the operation manager (cloneable, shared by all executors)
     op_manager: Arc<OpManager>,
     /// Total pool size (for health checking)
@@ -159,12 +156,10 @@ impl RuntimePool {
     ///
     /// # Arguments
     /// * `config` - Configuration for executors
-    /// * `op_sender` - Channel to send operation requests to the event loop (cloneable)
     /// * `op_manager` - Reference to the operation manager
     /// * `pool_size` - Number of executors to create (typically CPU count)
     pub async fn new(
         config: Arc<Config>,
-        op_sender: OpRequestSender,
         op_manager: Arc<OpManager>,
         pool_size: NonZeroUsize,
     ) -> anyhow::Result<Self> {
@@ -206,7 +201,6 @@ impl RuntimePool {
         let mut first_executor = Executor::from_config_with_shared_modules(
             config.clone(),
             shared_state_store.clone(),
-            Some(op_sender.clone()),
             Some(op_manager.clone()),
             shared_contract_modules.clone(),
             shared_delegate_modules.clone(),
@@ -227,7 +221,6 @@ impl RuntimePool {
             let mut executor = Executor::from_config_with_shared_modules(
                 config.clone(),
                 shared_state_store.clone(),
-                Some(op_sender.clone()),
                 Some(op_manager.clone()),
                 shared_contract_modules.clone(),
                 shared_delegate_modules.clone(),
@@ -258,7 +251,6 @@ impl RuntimePool {
             runtimes,
             available: Semaphore::new(pool_size_usize),
             config,
-            op_sender,
             op_manager,
             pool_size: pool_size_usize,
             checked_out: AtomicUsize::new(0),
@@ -415,7 +407,6 @@ impl RuntimePool {
         let mut executor = Executor::from_config_with_shared_modules(
             self.config.clone(),
             self.shared_state_store.clone(),
-            Some(self.op_sender.clone()),
             Some(self.op_manager.clone()),
             self.shared_contract_modules.clone(),
             self.shared_delegate_modules.clone(),
@@ -2544,14 +2535,13 @@ impl Executor<Runtime> {
     /// Create an Executor for local-only mode (no network operations).
     /// Use this from the binary for local mode execution.
     pub async fn from_config_local(config: Arc<Config>) -> anyhow::Result<Self> {
-        Self::from_config(config, None, None).await
+        Self::from_config(config, None).await
     }
 
     /// Create an Executor with optional network operation support.
     /// This is `pub(crate)` because the parameters involve crate-internal types.
     pub(crate) async fn from_config(
         config: Arc<Config>,
-        op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
@@ -2569,7 +2559,6 @@ impl Executor<Runtime> {
             },
             OperationMode::Local,
             rt,
-            op_sender,
             op_manager,
         )
         .await
@@ -2584,7 +2573,6 @@ impl Executor<Runtime> {
     pub(crate) async fn from_config_with_shared_modules(
         config: Arc<Config>,
         shared_state_store: StateStore<Storage>,
-        op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
         contract_modules: SharedModuleCache<ContractKey>,
         delegate_modules: SharedModuleCache<DelegateKey>,
@@ -2616,7 +2604,6 @@ impl Executor<Runtime> {
             || Ok(()),
             OperationMode::Local,
             rt,
-            op_sender,
             op_manager,
         )
         .await

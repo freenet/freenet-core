@@ -32,6 +32,7 @@ pub enum ConnectionFailureReason {
     /// Routing failed - no peer available to route through
     RoutingFailed,
     /// Connect operation timed out waiting for response
+    #[allow(dead_code)]
     Timeout,
     /// Remote peer explicitly rejected connection (at capacity, etc.)
     Rejected,

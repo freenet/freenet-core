@@ -280,7 +280,6 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
         _identifier: &str,
         shared_storage: MockStateStorage,
         contract_store: Option<InMemoryContractStore>,
-        op_sender: Option<OpRequestSender>,
         op_manager: Option<std::sync::Arc<crate::node::OpManager>>,
     ) -> anyhow::Result<Self> {
         let state_store =
@@ -297,7 +296,6 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             || Ok(()),
             OperationMode::Local,
             runtime,
-            op_sender,
             op_manager,
         )
         .await

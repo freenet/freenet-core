@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::ExecutorError;
-use super::executor::{OpRequestSender, RuntimePool};
+use super::executor::RuntimePool;
 use super::{ContractError, executor::ContractExecutor};
 use crate::client_events::ClientId;
 use crate::client_events::{AuthToken, HostResult, RequestId};
@@ -70,7 +70,6 @@ pub(crate) trait ContractHandler {
 
     fn build(
         contract_handler_channel: ContractHandlerChannel<ContractHandlerHalve>,
-        op_sender: OpRequestSender,
         op_manager: Arc<OpManager>,
         builder: Self::Builder,
     ) -> impl Future<Output = anyhow::Result<Self>> + Send
@@ -93,7 +92,6 @@ impl ContractHandler for NetworkContractHandler {
 
     async fn build(
         channel: ContractHandlerChannel<ContractHandlerHalve>,
-        op_sender: OpRequestSender,
         op_manager: Arc<OpManager>,
         config: Self::Builder,
     ) -> anyhow::Result<Self>
@@ -119,8 +117,7 @@ impl ContractHandler for NetworkContractHandler {
 
         tracing::info!(pool_size = %pool_size, "Creating RuntimePool");
 
-        let executor =
-            RuntimePool::new(config.clone(), op_sender, op_manager.clone(), pool_size).await?;
+        let executor = RuntimePool::new(config.clone(), op_manager.clone(), pool_size).await?;
 
         // Set up hosting storage reference for eviction cleanup
         // This must be done before loading the cache so evictions work correctly
@@ -1116,9 +1113,7 @@ pub mod test {
 pub(super) mod in_memory {
     use super::{
         super::{
-            Executor, MockRuntime,
-            executor::{OpRequestSender, mock_wasm_runtime::MockWasmRuntime},
-            storages::Storage,
+            Executor, MockRuntime, executor::mock_wasm_runtime::MockWasmRuntime, storages::Storage,
         },
         ContractHandler, ContractHandlerChannel, ContractHandlerHalve,
     };
@@ -1136,13 +1131,12 @@ pub(super) mod in_memory {
         /// Create a new handler with disk-based storage (default, for backward compatibility).
         pub async fn new(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
-            op_sender: Option<OpRequestSender>,
             op_manager: Option<Arc<OpManager>>,
             identifier: &str,
         ) -> Self {
             MemoryContractHandler {
                 channel,
-                runtime: Executor::new_mock(identifier, op_sender, op_manager)
+                runtime: Executor::new_mock(identifier, op_manager)
                     .await
                     .expect("should start mock executor"),
             }
@@ -1166,21 +1160,15 @@ pub(super) mod in_memory {
         /// Clone the same `MockStateStorage` instance to share state between restarts.
         pub async fn new(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
-            op_sender: Option<OpRequestSender>,
             op_manager: Option<Arc<OpManager>>,
             identifier: &str,
             shared_storage: MockStateStorage,
         ) -> Self {
             SimulationContractHandler {
                 channel,
-                runtime: Executor::new_mock_in_memory(
-                    identifier,
-                    shared_storage,
-                    op_sender,
-                    op_manager,
-                )
-                .await
-                .expect("should start mock in-memory executor"),
+                runtime: Executor::new_mock_in_memory(identifier, shared_storage, op_manager)
+                    .await
+                    .expect("should start mock in-memory executor"),
             }
         }
     }
@@ -1191,17 +1179,13 @@ pub(super) mod in_memory {
 
         async fn build(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
-            op_sender: OpRequestSender,
             op_manager: Arc<OpManager>,
             identifier: Self::Builder,
         ) -> anyhow::Result<Self>
         where
             Self: Sized + 'static,
         {
-            Ok(
-                MemoryContractHandler::new(channel, Some(op_sender), Some(op_manager), &identifier)
-                    .await,
-            )
+            Ok(MemoryContractHandler::new(channel, Some(op_manager), &identifier).await)
         }
 
         fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
@@ -1225,7 +1209,6 @@ pub(super) mod in_memory {
 
         async fn build(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
-            op_sender: OpRequestSender,
             op_manager: Arc<OpManager>,
             builder: Self::Builder,
         ) -> anyhow::Result<Self>
@@ -1234,7 +1217,6 @@ pub(super) mod in_memory {
         {
             Ok(SimulationContractHandler::new(
                 channel,
-                Some(op_sender),
                 Some(op_manager),
                 &builder.identifier,
                 builder.shared_storage,
@@ -1275,7 +1257,6 @@ pub(super) mod in_memory {
 
         async fn build(
             channel: ContractHandlerChannel<ContractHandlerHalve>,
-            op_sender: OpRequestSender,
             op_manager: Arc<OpManager>,
             builder: Self::Builder,
         ) -> anyhow::Result<Self>
@@ -1286,7 +1267,6 @@ pub(super) mod in_memory {
                 &builder.identifier,
                 builder.shared_storage,
                 builder.contract_store,
-                Some(op_sender),
                 Some(op_manager),
             )
             .await?;

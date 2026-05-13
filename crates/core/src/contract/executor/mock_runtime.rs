@@ -165,7 +165,6 @@ impl Executor<MockRuntime, Storage> {
     /// `new_mock_in_memory`.
     pub async fn new_mock(
         identifier: &str,
-        op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         let data_dir = Self::test_data_dir(identifier);
@@ -183,7 +182,6 @@ impl Executor<MockRuntime, Storage> {
             || Ok(()),
             OperationMode::Local,
             MockRuntime { contract_store },
-            op_sender,
             op_manager,
         )
         .await?;
@@ -204,12 +202,10 @@ impl Executor<MockRuntime, MockStateStorage> {
     /// # Arguments
     /// * `_identifier` - Unused (kept for API compatibility)
     /// * `shared_storage` - A MockStateStorage instance (clone it to share across restarts)
-    /// * `op_sender` - Optional channel for network operations
     /// * `op_manager` - Optional reference to the operation manager
     pub async fn new_mock_in_memory(
         _identifier: &str,
         shared_storage: MockStateStorage,
-        op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         // Use fully in-memory storage with no caching for deterministic simulation:
@@ -224,7 +220,6 @@ impl Executor<MockRuntime, MockStateStorage> {
             || Ok(()),
             OperationMode::Local,
             MockRuntime { contract_store },
-            op_sender,
             op_manager,
         )
         .await?;
@@ -816,7 +811,6 @@ pub(crate) mod test {
             OperationMode::Local,
             MockRuntime { contract_store },
             None,
-            None,
         )
         .await
         .expect("local node with handle");
@@ -828,7 +822,7 @@ pub(crate) mod test {
     /// Helper to create a mock executor with in-memory storage for testing
     async fn create_test_executor() -> Executor<MockRuntime, MockStateStorage> {
         let shared_storage = MockStateStorage::new();
-        Executor::new_mock_in_memory("test", shared_storage, None, None)
+        Executor::new_mock_in_memory("test", shared_storage, None)
             .await
             .expect("create test executor")
     }

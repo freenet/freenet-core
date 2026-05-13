@@ -7,13 +7,9 @@ use std::fmt::Display;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Instant;
-
-use futures::Stream;
 
 use either::Either;
 use freenet_stdlib::client_api::{
@@ -25,13 +21,11 @@ use freenet_stdlib::client_api::{
 use freenet_stdlib::prelude::*;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::storages::Storage;
 use crate::config::Config;
-use crate::message::Transaction;
 use crate::node::OpManager;
-use crate::operations::OpEnum;
 use crate::operations::get::GetResult;
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
@@ -104,49 +98,6 @@ pub(crate) use init_tracker::{
     MAX_QUEUED_OPS_PER_CONTRACT, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, now_nanos,
 };
 pub(crate) use runtime::RuntimePool;
-
-/// Type alias for the channel used to send operation requests from executors to the event loop.
-/// Each request includes a transaction ID and a oneshot sender for the response.
-/// This sender is cloneable, allowing multiple executors to share access to the event loop.
-pub(crate) type OpRequestSender =
-    mpsc::Sender<(Transaction, oneshot::Sender<Result<OpEnum, OpRequestError>>)>;
-
-/// Type alias for the receiver side of the operation request channel.
-/// This is held by the event loop to receive requests from all executors.
-pub(crate) type OpRequestReceiver =
-    mpsc::Receiver<(Transaction, oneshot::Sender<Result<OpEnum, OpRequestError>>)>;
-
-/// Create a channel pair for operation requests from executors to the event loop.
-///
-/// Returns:
-/// - `OpRequestReceiver`: Held by the event loop to receive operation requests
-/// - `OpRequestSender`: Cloneable sender given to executors to send requests
-pub(crate) fn op_request_channel() -> (OpRequestReceiver, OpRequestSender) {
-    // Buffer size matches the old executor_channel for consistency
-    let (tx, rx) = mpsc::channel(1000);
-    tracing::debug!(buffer_size = 1000, "Created op_request channel");
-    (rx, tx)
-}
-
-/// Error type for operation requests that can be sent over channels.
-#[derive(Debug, Clone)]
-pub enum OpRequestError {
-    /// The operation failed with an error message
-    Failed(String),
-    /// The channel was closed before a response was received
-    ChannelClosed,
-}
-
-impl std::fmt::Display for OpRequestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OpRequestError::Failed(msg) => write!(f, "Operation failed: {}", msg),
-            OpRequestError::ChannelClosed => write!(f, "Channel closed"),
-        }
-    }
-}
-
-impl std::error::Error for OpRequestError {}
 
 #[derive(Debug)]
 pub struct ExecutorError {
@@ -392,334 +343,54 @@ impl Display for OperationMode {
     }
 }
 
-pub struct ExecutorToEventLoopChannel<End: sealed::ChannelHalve> {
-    #[allow(dead_code)] // Used for reference in callback pattern
-    op_manager: Arc<OpManager>,
-    end: End,
+// `ComposeNetworkMessage`, `op_request`, `UpdateContract`,
+// `SubscribeContract`, and the executor → event-loop mediator
+// (`op_request_channel`/`run_op_request_mediator`/`OpRequestSender`)
+// are all retired. Executor auto-subscribe now calls
+// `subscribe::run_executor_subscribe` directly; UPDATEs flow through
+// `start_client_update`. No executor ever writes to the event loop
+// through the legacy mediator path.
+
+/// Empty stub for the now-retired executor → event-loop mediator
+/// channel. Retained as a generic-param placeholder for
+/// `priority_select::PrioritySelectStream` so the event loop's
+/// `executor_transaction_handler` slot keeps the same shape; the
+/// inner channel is never written to and the `Stream` impl yields
+/// `Pending` forever.
+pub(crate) struct ExecutorToEventLoopChannel<End: sealed::ChannelHalve> {
+    _end: End,
 }
 
-/// Creates channels for the mediator that bridges between the new OpRequest channel
-/// (used by pooled executors) and the old ExecutorToEventLoop channel (used by the event loop).
-///
-/// Returns:
-/// - `ExecutorToEventLoopChannel<NetworkEventListenerHalve>`: For the event loop
-/// - `mpsc::Sender<Transaction>`: For the mediator to send transactions to the event loop
-/// - `mpsc::Receiver<OpEnum>`: For the mediator to receive responses from the event loop
 pub(crate) fn mediator_channels(
-    op_manager: Arc<OpManager>,
-) -> (
-    ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
-    mpsc::Sender<Transaction>,
-    mpsc::Receiver<OpEnum>,
-) {
-    let (waiting_for_op_tx, waiting_for_op_rx) = mpsc::channel(1000);
-    let (response_for_tx, response_for_rx) = mpsc::channel(1000);
-
-    tracing::debug!(buffer_size = 1000, "Created mediator channels");
-
-    let listener_halve = ExecutorToEventLoopChannel {
-        op_manager,
-        end: NetworkEventListenerHalve {
-            waiting_for_op_rx,
-            response_for_tx,
-        },
-    };
-
-    (listener_halve, waiting_for_op_tx, response_for_rx)
-}
-
-/// Maximum number of pending requests before the mediator starts rejecting new ones.
-/// This prevents unbounded memory growth if the event loop is slow or unresponsive.
-const MAX_PENDING_REQUESTS: usize = 10_000;
-
-/// How long to wait before cleaning up stale pending requests.
-/// This should be longer than OP_REQUEST_TIMEOUT to allow normal timeout handling.
-const STALE_REQUEST_THRESHOLD: Duration = Duration::from_secs(180);
-
-/// How often to run the stale request cleanup.
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Entry in the pending responses map, tracking when the request was added.
-struct PendingRequest {
-    response_tx: oneshot::Sender<Result<OpEnum, OpRequestError>>,
-    created_at: Instant,
-}
-
-/// Mediator task that bridges between the new `OpRequestReceiver` (from pooled executors)
-/// and the old event loop channels.
-///
-/// This allows multiple executors to share access to the event loop through a cloneable
-/// `OpRequestSender`, while the event loop continues to use the existing
-/// `ExecutorToEventLoopChannel<NetworkEventListenerHalve>` interface.
-///
-/// # Architecture
-///
-/// ```text
-/// ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-/// │  Executor 1  │────┐    │              │    ┌────│  Event Loop  │
-/// ├──────────────┤    │    │   Mediator   │    │    ├──────────────┤
-/// │  Executor 2  │────┼───▶│              │────┼───▶│  Operations  │
-/// ├──────────────┤    │    │  (pending    │    │    │  Processing  │
-/// │  Executor N  │────┘    │   HashMap)   │◀───┘    └──────────────┘
-/// └──────────────┘         └──────────────┘
-/// ```
-///
-/// # Workflow
-///
-/// 1. Receives (Transaction, oneshot::Sender) from executors via `op_request_receiver`
-/// 2. Forwards the Transaction to the event loop via `to_event_loop_tx`
-/// 3. Stores the oneshot sender keyed by transaction in `pending_responses`
-/// 4. Receives responses from the event loop via `from_event_loop_rx`
-/// 5. Routes responses back to the correct executor via the stored oneshot sender
-/// 6. Periodically cleans up stale pending requests to prevent memory leaks
-///
-/// # Failure Scenarios and Recovery
-///
-/// ## Executor Drops Before Response
-///
-/// **Scenario**: An executor times out or is dropped before receiving its response.
-/// **Detection**: The `oneshot::Sender::send()` returns `Err` when the receiver is dropped.
-/// **Recovery**: The mediator logs a debug message and continues. No cleanup needed since
-/// the entry is removed from `pending_responses` when the response arrives.
-///
-/// ## Event Loop Channel Closes
-///
-/// **Scenario**: The event loop crashes or its receiving channel is dropped.
-/// **Detection**: `to_event_loop_tx.send()` returns `SendError`.
-/// **Recovery**: The mediator removes the pending request and notifies the executor
-/// with `OpRequestError::ChannelClosed`. The mediator continues running to handle
-/// cleanup of remaining pending requests.
-///
-/// ## Mediator Capacity Exceeded
-///
-/// **Scenario**: More than `MAX_PENDING_REQUESTS` (10,000) concurrent requests.
-/// **Detection**: `pending_responses.len() >= MAX_PENDING_REQUESTS`
-/// **Recovery**: New requests are immediately rejected with an error. This provides
-/// backpressure to prevent unbounded memory growth. Existing requests continue processing.
-///
-/// ## Stale Request Cleanup
-///
-/// **Scenario**: Requests that have been pending longer than `STALE_REQUEST_THRESHOLD` (180s).
-/// **Detection**: Periodic cleanup runs every `CLEANUP_INTERVAL` (30s) and checks timestamps.
-/// **Recovery**: Stale entries are removed from `pending_responses` and their executors are
-/// notified with an error. This handles edge cases where responses are never received
-/// (e.g., network partitions, event loop bugs).
-///
-/// ## Unknown Transaction Response
-///
-/// **Scenario**: Response received for a transaction not in `pending_responses`.
-/// **Detection**: `pending_responses.remove()` returns `None`.
-/// **Recovery**: The mediator logs a warning. This can happen legitimately when an executor
-/// times out and its response arrives later. No action needed.
-///
-/// ## All Channels Close
-///
-/// **Scenario**: Both the executor channel and event loop channel are closed.
-/// **Detection**: `tokio::select!` returns from the `else` branch.
-/// **Recovery**: The mediator notifies all remaining pending executors with `ChannelClosed`
-/// error, then exits gracefully.
-///
-/// # Thread Safety
-///
-/// The mediator is designed to be run as a single task. It is not `Sync` because
-/// it holds mutable state (`pending_responses`). The `OpRequestSender` is cloneable
-/// and can be shared across multiple executor tasks.
-pub(crate) async fn run_op_request_mediator(
-    mut op_request_receiver: OpRequestReceiver,
-    to_event_loop_tx: mpsc::Sender<Transaction>,
-    mut from_event_loop_rx: mpsc::Receiver<OpEnum>,
-) {
-    use std::collections::BTreeMap;
-
-    let mut pending_responses: BTreeMap<Transaction, PendingRequest> = BTreeMap::new();
-    let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
-    cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    tracing::info!("Op request mediator starting");
-
-    loop {
-        tokio::select! {
-            // DST: biased; ensures deterministic branch selection order
-            biased;
-
-            // Receive new operation requests from executors
-            Some((transaction, response_tx)) = op_request_receiver.recv() => {
-                tracing::trace!(
-                    tx = %transaction,
-                    pending_count = pending_responses.len(),
-                    "Mediator received operation request"
-                );
-
-                // Check if we're at capacity
-                if pending_responses.len() >= MAX_PENDING_REQUESTS {
-                    tracing::warn!(
-                        tx = %transaction,
-                        max = MAX_PENDING_REQUESTS,
-                        "Mediator at capacity, rejecting request"
-                    );
-                    // Executor may have timed out; send is best-effort
-                    #[allow(clippy::let_underscore_must_use)]
-                    let _ = response_tx.send(Err(OpRequestError::Failed(
-                        "mediator at capacity".to_string()
-                    )));
-                    continue;
-                }
-
-                // Store the response channel with timestamp
-                pending_responses.insert(transaction, PendingRequest {
-                    response_tx,
-                    created_at: Instant::now(),
-                });
-
-                // Forward transaction to event loop
-                if let Err(e) = to_event_loop_tx.send(transaction).await {
-                    tracing::error!(
-                        tx = %transaction,
-                        error = %e,
-                        "Failed to forward transaction to event loop - channel closed"
-                    );
-                    // Remove and notify the waiting executor
-                    if let Some(pending) = pending_responses.remove(&transaction) {
-                        // Executor may have timed out; send is best-effort
-                        #[allow(clippy::let_underscore_must_use)]
-                        let _ = pending.response_tx.send(Err(OpRequestError::ChannelClosed));
-                    }
-                }
-            }
-
-            // Receive responses from event loop
-            Some(op_result) = from_event_loop_rx.recv() => {
-                let transaction = *op_result.id();
-                tracing::trace!(
-                    tx = %transaction,
-                    pending_count = pending_responses.len(),
-                    "Mediator received response from event loop"
-                );
-
-                // Route response to the waiting executor
-                if let Some(pending) = pending_responses.remove(&transaction) {
-                    if pending.response_tx.send(Ok(op_result)).is_err() {
-                        tracing::debug!(
-                            tx = %transaction,
-                            "Executor dropped before receiving response"
-                        );
-                    }
-                } else {
-                    tracing::warn!(
-                        tx = %transaction,
-                        "Received response for unknown transaction - executor may have timed out"
-                    );
-                }
-            }
-
-            // Periodic cleanup of stale requests
-            _ = cleanup_interval.tick() => {
-                let now = Instant::now();
-                let stale_threshold = STALE_REQUEST_THRESHOLD;
-
-                // Collect stale transaction IDs
-                let stale_txs: Vec<Transaction> = pending_responses
-                    .iter()
-                    .filter(|(_, pending)| now.duration_since(pending.created_at) > stale_threshold)
-                    .map(|(tx, _)| *tx)
-                    .collect();
-
-                if !stale_txs.is_empty() {
-                    tracing::warn!(
-                        stale_count = stale_txs.len(),
-                        pending_count = pending_responses.len(),
-                        threshold_secs = stale_threshold.as_secs(),
-                        "Cleaning up stale pending requests"
-                    );
-
-                    for tx in stale_txs {
-                        if let Some(pending) = pending_responses.remove(&tx) {
-                            tracing::debug!(
-                                tx = %tx,
-                                age_secs = now.duration_since(pending.created_at).as_secs(),
-                                "Removing stale pending request"
-                            );
-                            // Executor likely already timed out; send is best-effort
-                            #[allow(clippy::let_underscore_must_use)]
-                            let _ = pending.response_tx.send(Err(OpRequestError::Failed(
-                                "request exceeded stale threshold".to_string()
-                            )));
-                        }
-                    }
-                }
-            }
-
-            // Both channels closed - exit
-            else => {
-                tracing::info!(
-                    pending_count = pending_responses.len(),
-                    "Mediator channels closed, shutting down"
-                );
-                // Notify any remaining waiters
-                for (tx, pending) in std::mem::take(&mut pending_responses) {
-                    tracing::debug!(tx = %tx, "Notifying orphaned waiter of shutdown");
-                    // Executor may have timed out; send is best-effort
-                    #[allow(clippy::let_underscore_must_use)]
-                    let _ = pending.response_tx.send(Err(OpRequestError::ChannelClosed));
-                }
-                break;
-            }
-        }
-    }
-
-    tracing::info!("Op request mediator stopped");
-}
-
-impl Stream for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
-    type Item = Transaction;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.end.waiting_for_op_rx).poll_recv(cx)
+    _op_manager: Arc<OpManager>,
+) -> ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
+    ExecutorToEventLoopChannel {
+        _end: NetworkEventListenerHalve {},
     }
 }
 
-impl ExecutorToEventLoopChannel<Callback> {
-    pub async fn response(&mut self, result: OpEnum) {
-        let tx_id = *result.id();
-        if self.end.response_for_tx.send(result).await.is_err() {
-            tracing::debug!(
-                tx = %tx_id,
-                "Failed to send response to executor - channel closed"
-            );
-        }
-    }
-}
-
-pub(crate) struct Callback {
-    /// sends the callback response to the executor
-    response_for_tx: mpsc::Sender<OpEnum>,
-}
-
-#[allow(dead_code)] // Used via callback pattern
-pub(crate) struct NetworkEventListenerHalve {
-    /// this is the receiver end of the Executor halve, which will be sent from the executor
-    /// when a callback is expected for a given transaction
-    waiting_for_op_rx: mpsc::Receiver<Transaction>,
-    /// this is the sender end of the Executor halve receiver, which will communicate
-    /// back responses to the executor, it's cloned each tiome a new callback halve is created
-    response_for_tx: mpsc::Sender<OpEnum>,
-}
+#[allow(dead_code)]
+pub(crate) struct NetworkEventListenerHalve {}
 
 mod sealed {
-    use super::{Callback, NetworkEventListenerHalve};
+    use super::NetworkEventListenerHalve;
     pub trait ChannelHalve {}
     impl ChannelHalve for NetworkEventListenerHalve {}
-    impl ChannelHalve for Callback {}
 }
 
-// `ComposeNetworkMessage`, `op_request`, `UpdateContract`,
-// `SubscribeContract`: legacy executor → event-loop adapters retired in
-// #1454. Executor auto-subscribe now calls
-// `subscribe::run_executor_subscribe` directly; UPDATEs flow through
-// `start_client_update`. The mediator-channel plumbing
-// (`op_request_channel`/`run_op_request_mediator`/`OpRequestSender`)
-// remains because RuntimePool and Executor::new still thread the
-// channel; with no producers it is effectively a no-op.
+impl futures::Stream for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
+    type Item = crate::message::Transaction;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // No writer ever sends through this channel; stay Pending so
+        // the priority-select stream never fires the executor-transaction
+        // arm.
+        std::task::Poll::Pending
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum UpsertResult {
@@ -867,12 +538,6 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     /// Tracks contracts that are being initialized and operations queued for them
     init_tracker: ContractInitTracker,
 
-    /// Channel to send operation requests to the event loop (cloneable).
-    /// Orphan after #1454 phase 5; kept threaded through pool builders to
-    /// minimize churn in this slice. See `ComposeNetworkMessage` comment
-    /// above for the planned phase 6 cleanup.
-    #[allow(dead_code)]
-    op_sender: Option<OpRequestSender>,
     /// Reference to the operation manager for initiating operations.
     op_manager: Option<Arc<OpManager>>,
 
@@ -916,7 +581,6 @@ where
         ctrl_handler: impl FnOnce() -> anyhow::Result<()>,
         mode: OperationMode,
         runtime: R,
-        op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         ctrl_handler()?;
@@ -930,7 +594,6 @@ where
             subscriber_summaries: HashMap::default(),
             delegate_origin_ids: HashMap::default(),
             init_tracker: ContractInitTracker::new(),
-            op_sender,
             op_manager,
             shared_notifications: None,
             shared_summaries: None,
