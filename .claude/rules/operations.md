@@ -92,7 +92,7 @@ CORRECT:
       (State::B, Msg::Y) => State::C,
       _ => {
           tracing::warn!("unexpected message in state");
-          return Ok(OperationResult::default());
+          return Ok(());
       }
   };
 
