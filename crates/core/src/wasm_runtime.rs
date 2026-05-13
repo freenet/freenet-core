@@ -8,6 +8,7 @@ mod error;
 pub(crate) mod mock_state_storage;
 mod native_api;
 mod runtime;
+mod secret_snapshots;
 mod secrets_store;
 pub(crate) mod simulation_runtime;
 mod state_store;
