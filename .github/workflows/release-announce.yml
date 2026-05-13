@@ -102,15 +102,16 @@ jobs:
             echo "::warning::MATRIX_ACCESS_TOKEN not set; skipping Matrix announcement"
             exit 0
           fi
-          # Random txn ID so retries don't get deduped (Matrix client-server
-          # API treats identical txn IDs as the same message). Prefer
-          # uuidgen for collision-resistance vs $RANDOM + 1s clock; fall
-          # back to date+$RANDOM if uuidgen isn't present on the runner.
-          if command -v uuidgen >/dev/null 2>&1; then
-            TXN_ID="freenet-release-$(uuidgen)"
-          else
-            TXN_ID="freenet-release-$(date +%s%N)-${RANDOM}-${RANDOM}"
-          fi
+          # Deterministic txn ID per release version. Matrix's
+          # client-server API treats identical txn IDs as the same
+          # message, so re-running this workflow against the same
+          # release (e.g. after fixing a transient River failure) is
+          # idempotent — Matrix won't double-post. Trade-off accepted:
+          # a transient Matrix failure on the first attempt can't be
+          # retried with a different message; the workflow re-run will
+          # be deduped if Matrix successfully recorded the original.
+          VERSION="$(echo "$MESSAGE" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          TXN_ID="freenet-release-v${VERSION:-unknown}"
           BODY=$(jq -nc \
             --arg msg "$MESSAGE" \
             '{msgtype: "m.text", body: $msg}')

@@ -217,17 +217,30 @@ token with at minimum:
 Add it under
 **Settings → Secrets and variables → Actions → Repository secrets**
 as `RELEASE_PAT`. Both `release.yml` and `cross-compile.yml`
-already coalesce on it:
+coalesce on it. The coalesce appears in two forms:
 
 ```yaml
-token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+# for actions/checkout (controls what `git push` uses later):
+- uses: actions/checkout@v6
+  with:
+    token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+# for `gh` CLI steps:
+env:
+  GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 ```
 
-so the workflows degrade gracefully when the secret is missing: they
-still complete, but the bump-PR CI and the release-published cascade
-won't auto-fire and a human has to intervene. `release.yml` emits a
-GitHub `::warning::` on every run that's missing the secret, so the
-gap is visible early.
+When the secret is missing the workflows degrade gracefully: they
+still complete, but the bump-PR CI, the tag-push → cross-compile
+trigger, and the release-published cascade won't auto-fire and a
+human has to intervene. `release.yml` emits a GitHub `::warning::`
+on every run that's missing the secret, so the gap is visible
+early.
+
+`.github/workflows/check-token-coalesce.yml` runs on every PR and
+fails if any new event-emitting step regresses to bare
+`GITHUB_TOKEN` / `github.token` — see issue #4118 for the regression
+class this guard prevents.
 
 ### Maintenance
 

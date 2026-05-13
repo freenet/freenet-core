@@ -1,0 +1,83 @@
+# Guard against the regression in issue #4118.
+#
+# GitHub Actions suppresses workflow-triggering events (push, tag,
+# release.published, etc.) when the triggering action was authenticated
+# with GITHUB_TOKEN. This anti-recursion safeguard broke the v0.2.57
+# release cascade and required manual workflow_dispatch.
+#
+# Every workflow step that emits one of those events (e.g. pushes a tag,
+# undrafts a release, creates a non-draft release, opens a PR that should
+# fire CI) MUST coalesce on RELEASE_PAT:
+#
+#   token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+#   GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+#
+# This workflow grep-checks every PR's workflow file changes for new
+# event-emitting steps that regressed to bare GITHUB_TOKEN.
+
+name: Check Token Coalesce
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**.yml'
+      - '.github/workflows/**.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Workflow steps that trigger downstream events must use RELEASE_PAT coalesce
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Grep workflow files for unsafe GITHUB_TOKEN usage
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Files changed in this PR that are workflow YAMLs.
+          CHANGED=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA" -- '.github/workflows/*.yml' '.github/workflows/*.yaml')
+          if [[ -z "$CHANGED" ]]; then
+            echo "No workflow file changes — nothing to check."
+            exit 0
+          fi
+
+          # Tokens lines that emit downstream-triggering events MUST coalesce
+          # on RELEASE_PAT. Detect candidates: any `gh release edit`,
+          # `gh release create` (without --draft on the same line), `git push`
+          # of a tag, `gh pr create`, `gh pr reopen`, or `gh workflow run` —
+          # in jobs/steps that reference `${{ secrets.GITHUB_TOKEN }}` or
+          # `${{ github.token }}` without the coalesce.
+          ERRORS=()
+          for f in $CHANGED; do
+            # Skip if file was deleted.
+            [[ -f "$f" ]] || continue
+
+            # Look for the bad pattern: `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}`
+            # or `token: ${{ github.token }}` near an event-emitting verb.
+            # We're permissive: any new occurrence of bare GITHUB_TOKEN in a
+            # workflow file is flagged for review. Suppress via inline comment
+            # `# coalesce-exempt: <reason>` on the same line.
+            ADDED=$(git diff "$BASE_SHA"..."$HEAD_SHA" -- "$f" | grep -E '^\+' | grep -v '^\+\+\+' | grep -vE 'coalesce-exempt' || true)
+            if echo "$ADDED" | grep -qE 'GH_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN'; then
+              ERRORS+=("$f: new step uses bare \`secrets.GITHUB_TOKEN\` — should coalesce on \`RELEASE_PAT\` (see AGENTS.md → Release Workflow). Add `# coalesce-exempt: <reason>` on the line if intentionally read-only and event-quiet.")
+            fi
+            if echo "$ADDED" | grep -qE 'token:\s*\$\{\{\s*github\.token'; then
+              ERRORS+=("$f: new actions/checkout uses bare \`github.token\` — same coalesce rule applies for any subsequent \`git push\`.")
+            fi
+          done
+
+          if (( ${#ERRORS[@]} > 0 )); then
+            echo "::error::Token-coalesce check failed. New workflow steps regressed to bare GITHUB_TOKEN; see issue #4118."
+            for e in "${ERRORS[@]}"; do echo "  - $e"; done
+            exit 1
+          fi
+          echo "Token-coalesce check passed."
