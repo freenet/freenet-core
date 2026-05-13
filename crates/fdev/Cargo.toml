@@ -58,7 +58,7 @@ ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 hex = { workspace = true }
 
 # internal
-freenet = { path = "../core", version = "0.2.56", features = ["testing"] }
+freenet = { path = "../core", version = "0.2.57", features = ["testing"] }
 freenet-stdlib = { workspace = true }
 
 [dev-dependencies]
