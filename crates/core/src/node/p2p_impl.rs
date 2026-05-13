@@ -19,7 +19,7 @@ use crate::{
     config::GlobalExecutor,
     contract::{
         self, ContractHandler, ContractHandlerChannel, ExecutorToEventLoopChannel,
-        NetworkEventListenerHalve, WaitingResolution, mediator_channels, run_op_request_mediator,
+        NetworkEventListenerHalve, WaitingResolution, mediator_channels,
     },
     message::NodeEvent,
     node::NodeConfig,
@@ -45,7 +45,6 @@ pub(crate) struct NodeP2P {
     initial_join_task: Option<JoinHandle<()>>,
     session_actor_task: JoinHandle<()>,
     result_router_task: JoinHandle<()>,
-    op_mediator_task: JoinHandle<()>,
     /// Monitor for background tasks spawned during node construction (Ring, OpManager, etc.)
     background_task_monitor: BackgroundTaskMonitor,
 }
@@ -202,17 +201,15 @@ impl NodeP2P {
             self.node_controller,
         );
 
-        // Monitor spawned infrastructure tasks (session actor, result router, op mediator).
+        // Monitor spawned infrastructure tasks (session actor, result router).
         // If any of these panics or exits unexpectedly, the node runs degraded with no
         // logs or detection. Combine into a single future that produces an error.
         // Keep AbortHandles for cleanup since the JoinHandles are moved into the future.
         let session_abort = self.session_actor_task.abort_handle();
         let router_abort = self.result_router_task.abort_handle();
-        let mediator_abort = self.op_mediator_task.abort_handle();
         let infra_monitor = {
             let mut session_handle = self.session_actor_task;
             let mut router_handle = self.result_router_task;
-            let mut mediator_handle = self.op_mediator_task;
             async move {
                 fn join_result_to_error(
                     name: &str,
@@ -228,7 +225,6 @@ impl NodeP2P {
                     biased;
                     r = &mut session_handle => join_result_to_error("Session actor", r),
                     r = &mut router_handle => join_result_to_error("Result router", r),
-                    r = &mut mediator_handle => join_result_to_error("Op mediator", r),
                 };
                 e
             }
@@ -276,7 +272,6 @@ impl NodeP2P {
         }
         session_abort.abort();
         router_abort.abort();
-        mediator_abort.abort();
 
         // Emit peer shutdown event
         let (graceful, reason) = match &result {
@@ -369,21 +364,7 @@ impl NodeP2P {
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
 
-        // Create channels for the mediator pattern:
-        // - op_request_channel: executors send (Transaction, oneshot::Sender) to mediator
-        // - mediator_channels: mediator forwards Transaction to event loop and routes responses back
-        let (op_request_receiver, op_sender) = contract::op_request_channel();
-        let (executor_listener, to_event_loop_tx, from_event_loop_rx) =
-            mediator_channels(op_manager.clone());
-
-        // Spawn the mediator task that bridges between the pooled executors and the event loop
-        let op_mediator_task = GlobalExecutor::spawn({
-            let mediator_task =
-                run_op_request_mediator(op_request_receiver, to_event_loop_tx, from_event_loop_rx);
-            mediator_task.instrument(tracing::info_span!("op_request_mediator"))
-        });
-
-        let contract_handler = CH::build(ch_inbound, op_sender, op_manager.clone(), ch_builder)
+        let contract_handler = CH::build(ch_inbound, op_manager.clone(), ch_builder)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -443,6 +424,7 @@ impl NodeP2P {
         })
         .boxed();
 
+        let executor_listener = mediator_channels(op_manager.clone());
         Ok((
             NodeP2P {
                 conn_manager,
@@ -460,7 +442,6 @@ impl NodeP2P {
                 initial_join_task: None,
                 session_actor_task,
                 result_router_task,
-                op_mediator_task,
                 background_task_monitor,
             },
             shutdown_tx,

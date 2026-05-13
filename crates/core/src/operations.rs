@@ -6,7 +6,6 @@ use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use tokio::sync::mpsc::error::SendError;
 
 use crate::{
-    client_events::HostResult,
     config::GlobalExecutor,
     contract::{ContractError, ExecutorError},
     message::{Transaction, TransactionType},
@@ -28,36 +27,14 @@ pub(crate) mod visited_peers;
 pub(crate) use op_ctx::OpCtx;
 pub(crate) use visited_peers::VisitedPeers;
 
-#[must_use]
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum OpEnum {
-    #[allow(dead_code)] // No constructor after #1454 phase 6; removed alongside ops.connect.
-    Connect(Box<connect::ConnectOp>),
-    // `Get` variant retired in #1454 phase 5 final (GET slice) together
-    // with the `ops.get` DashMap. GET wire flows now run on task-per-tx
-    // drivers in `get::op_ctx_task::*` and never produce an
-    // `OpEnum::Get`.
-    // `Put` retired in the prior PUT slice; `Update` in the UPDATE slice.
-    // `Subscribe` retired in the SUBSCRIBE slice; SUBSCRIBE wire flows
-    // run on task-per-tx drivers in `subscribe::op_ctx_task::*` and the
-    // surviving Unsubscribe send-site goes through `OpCtx::send_fire_and_forget`.
-}
-
-impl OpEnum {
-    delegate::delegate! {
-        to match self {
-            OpEnum::Connect(op) => op,
-        } {
-            pub fn id(&self) -> &Transaction;
-            #[allow(dead_code)] // Pending removal alongside `OpEnum` itself in the mediator-retirement slice.
-            pub fn outcome(&self) -> OpOutcome<'_>;
-            #[allow(dead_code)]
-            pub fn finalized(&self) -> bool;
-            #[allow(dead_code)]
-            pub fn to_host_result(&self) -> HostResult;
-        }
-    }
-}
+// `OpEnum` and its delegate-dispatch surface are retired:
+//   - `Connect`: no producer after `OpManager::pop` was removed in
+//     the `ops.connect` DashMap slice.
+//   - `Get`/`Put`/`Update`/`Subscribe`: retired alongside their
+//     respective DashMaps in earlier #1454 slices.
+// Driver finalization paths publish `HostResult` directly via
+// `result_router_tx` (see `op_ctx_task::*`); no central carrier
+// is required.
 
 #[derive(Debug)]
 #[allow(dead_code)] // Surface kept for the CONNECT carrier + post-#1454 phase-5 final tests.

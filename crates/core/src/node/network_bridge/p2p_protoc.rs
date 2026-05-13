@@ -2475,7 +2475,7 @@ impl P2pConnManager {
                 handle_aborted_op(tx, op_manager, &self.gateways).await?;
             }
             msg => {
-                self.process_message(msg, source_addr, op_manager, None, state)
+                self.process_message(msg, source_addr, op_manager, state)
                     .await;
             }
         }
@@ -2487,7 +2487,6 @@ impl P2pConnManager {
         msg: NetMessage,
         source_addr: Option<SocketAddr>,
         op_manager: &Arc<OpManager>,
-        executor_callback_opt: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
         state: &mut EventListenerState,
     ) {
         tracing::debug!(
@@ -2498,13 +2497,6 @@ impl P2pConnManager {
             peer = ?op_manager.ring.connection_manager.get_own_addr(),
             "process_message called - processing network message"
         );
-
-        // Only use the callback if this message was initiated by the executor
-        let executor_callback_opt = if state.pending_from_executor.remove(msg.id()) {
-            executor_callback_opt
-        } else {
-            None
-        };
 
         let span = tracing::info_span!(
             "process_network_message",
@@ -2521,7 +2513,6 @@ impl P2pConnManager {
                 op_manager.clone(),
                 self.bridge.clone(),
                 self.event_listener.trait_clone(),
-                executor_callback_opt,
                 pending_op_result,
             )
             .instrument(span),

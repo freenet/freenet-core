@@ -34,7 +34,7 @@ use self::p2p_impl::NodeP2P;
 use crate::{
     client_events::{BoxedClient, ClientEventsProxy, ClientId, OpenRequest},
     config::{Address, GatewayConfig, WebsocketApiConfig},
-    contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
+    contract::{ExecutorError, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
     operations::{OpError, connect, get, put, subscribe, update},
@@ -516,7 +516,6 @@ async fn report_result(
     tx: Option<Transaction>,
     op_result: Result<(), OpError>,
     op_manager: &OpManager,
-    _executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
     _event_listener: &mut dyn NetEventRegister,
 ) {
     // Add UPDATE-specific debug logging at the start
@@ -609,7 +608,6 @@ pub(crate) async fn process_message_decoupled<CB>(
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
-    executor_callback: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) where
     CB: NetworkBridge + Clone + 'static,
@@ -628,14 +626,7 @@ pub(crate) async fn process_message_decoupled<CB>(
 
     // Report result and deliver to clients via the single canonical path:
     // report_result → send_client_result → ResultRouter → SessionActor
-    report_result(
-        Some(tx),
-        op_result,
-        &op_manager,
-        executor_callback,
-        &mut *event_listener,
-    )
-    .await;
+    report_result(Some(tx), op_result, &op_manager, &mut *event_listener).await;
 }
 
 /// Pure network message handling (no client concerns)

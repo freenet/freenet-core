@@ -43,7 +43,7 @@ use crate::wasm_runtime::MockStateStorage;
 /// Helper to create a MockRuntime executor.
 async fn create_mock_runtime_executor() -> Executor<MockRuntime, MockStateStorage> {
     let storage = MockStateStorage::new();
-    Executor::new_mock_in_memory("conformance_mock", storage, None, None)
+    Executor::new_mock_in_memory("conformance_mock", storage, None)
         .await
         .expect("create MockRuntime executor")
 }
@@ -51,7 +51,7 @@ async fn create_mock_runtime_executor() -> Executor<MockRuntime, MockStateStorag
 /// Helper to create a MockWasmRuntime executor.
 async fn create_mock_wasm_executor() -> Executor<MockWasmRuntime, MockStateStorage> {
     let storage = MockStateStorage::new();
-    Executor::new_mock_wasm("conformance_wasm", storage, None, None, None)
+    Executor::new_mock_wasm("conformance_wasm", storage, None, None)
         .await
         .expect("create MockWasmRuntime executor")
 }

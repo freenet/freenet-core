@@ -14,10 +14,10 @@ pub mod storages;
 pub(crate) mod user_input;
 
 pub(crate) use executor::{
-    Callback, ContractExecutor, ExecutorToEventLoopChannel, MAX_CREATED_DELEGATES_PER_NODE,
+    ContractExecutor, ExecutorToEventLoopChannel, MAX_CREATED_DELEGATES_PER_NODE,
     MAX_DELEGATE_CREATION_DEPTH, MAX_DELEGATE_CREATIONS_PER_CALL, NetworkEventListenerHalve,
     SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, UpsertResult, mediator_channels,
-    mock_runtime::MockRuntime, op_request_channel, run_op_request_mediator,
+    mock_runtime::MockRuntime,
 };
 
 // Re-export CRDT emulation functions for testing
