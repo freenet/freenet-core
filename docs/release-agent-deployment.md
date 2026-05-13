@@ -184,10 +184,32 @@ narrowing the SG creates more breakage than it prevents.
 
 ### vega (AWS EC2)
 
-Open inbound TCP/443 on the instance's security group from `0.0.0.0/0`,
-relying on HMAC for authentication. The agent's defense-in-depth layers
-(clock-skew window, rate-limit, version-pin, GitHub-latest cross-check)
-mean the endpoint can be public-Internet-reachable safely.
+Vega differs from nova: `ghostkey-api` (gkapi.freenet.org) already owns
+:80 and :443 on this host, so the release-agent uses a **non-standard
+port and a per-host vhost**.
+
+- AWS Security Group `sg-0f4b9b9b5bf2a8cbb`: open inbound **TCP/8443**
+  from `0.0.0.0/0`. (No need to open :443; Caddy doesn't listen there
+  on vega.) Rely on HMAC for authentication; the agent's defense-in-
+  depth layers (clock-skew window, rate-limit, version-pin, GitHub-
+  latest cross-check) make a public endpoint safe.
+- Caddy config: install
+  [`scripts/release-agent/Caddyfile.vega.snippet`](../scripts/release-agent/Caddyfile.vega.snippet)
+  as `/etc/caddy/Caddyfile`. It uses `auto_https off` so Caddy doesn't
+  try to bind :80/:443, and an explicit `tls` directive pointing at
+  the dedicated `vega.locut.us` Let's Encrypt cert at
+  `/etc/letsencrypt/live/vega.locut.us/{fullchain,privkey}.pem`.
+- Cert permissions: the `caddy` system user must be in the `ssl-cert`
+  group; the cert files in `/etc/letsencrypt/archive/vega.locut.us/`
+  must be chgrp'd to `ssl-cert` with mode `0640` (privkey) / `0644`
+  (the rest). Install
+  [`scripts/release-agent/reload-caddy.sh`](../scripts/release-agent/reload-caddy.sh)
+  as `/etc/letsencrypt/renewal-hooks/deploy/reload-caddy.sh` (mode
+  0755) so certbot re-applies the group ownership and reloads Caddy
+  after each renewal.
+- Smoke test URL: `https://vega.locut.us:8443/release-agent/healthz`
+  (not `update.vega.locut.us`). The workflow's vega matrix entry
+  matches this.
 
 If you want a tighter SG, the alternative is a fronting Caddy on a
 known-IP host that the SG allows in, with the agent's port only

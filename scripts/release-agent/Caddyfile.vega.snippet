@@ -1,4 +1,4 @@
-# vega.locut.us — TLS termination for the release-agent on port 8443.
+# vega.locut.us: TLS termination for the release-agent on port 8443.
 #
 # Background: vega already hosts ghostkey-api (gkapi.freenet.org) bound
 # to :80 and :443. Caddy cannot also own those ports, so the release-
@@ -10,8 +10,9 @@
 
 {
     # Disable automatic HTTP→HTTPS redirects and the implicit :80
-    # listener — ghostkey-api owns :80 (for the ACME http-01 challenge
-    # on gkapi.freenet.org) and :443 on this host.
+    # listener. ghostkey-api owns :80 (for the ACME http-01 challenge
+    # on gkapi.freenet.org) and :443 on this host, so Caddy must not
+    # try to bind either.
     auto_https off
 }
 

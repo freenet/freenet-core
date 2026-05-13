@@ -1,5 +1,5 @@
 #!/bin/sh
-# Certbot deploy hook for vega.locut.us — fix up cert permissions for the
+# Certbot deploy hook for vega.locut.us. Fixes up cert permissions for the
 # `ssl-cert` group (Caddy reads the cert as the `caddy` user, which is in
 # that group) and tell Caddy to pick up the renewed cert without dropping
 # the listening socket on :8443.
