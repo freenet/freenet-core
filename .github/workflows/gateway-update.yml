@@ -1,0 +1,208 @@
+# Gateway update workflow (Phase 2 — manual trigger only)
+#
+# Status: draft. This workflow is `workflow_dispatch` only and intentionally
+# NOT wired into release.yml or cross-compile.yml. Before flipping to
+# automatic triggering on `release: { types: [published] }`, the following
+# must be true:
+#
+#   - freenet-release-agent deployed on each gateway in dry_run mode and
+#     validated per docs/release-agent-deployment.md
+#   - RELEASE_AGENT_HMAC_NOVA and RELEASE_AGENT_HMAC_VEGA secrets set
+#   - Gateway URLs reachable from GitHub Actions runners
+#   - At least one manual run completed end-to-end without errors
+#
+# When all of the above is true, add a second `on:` trigger:
+#
+#   release:
+#     types: [published]
+#
+# and remove the `workflow_dispatch.inputs.version` field (the release tag
+# becomes the version).
+
+name: Gateway Update (Phase 2 draft)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to roll out (e.g. 0.2.56, no leading v)'
+        required: true
+        type: string
+      gateways:
+        description: 'Comma-separated subset (nova,vega) or "all"'
+        required: false
+        type: string
+        default: 'all'
+      dry_run_workflow:
+        description: 'Skip the actual POST, just compute and log the payload'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gateway-update-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan rollout
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Validate version
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [[ "$VERSION" == v* ]]; then
+            echo "::error::Version must not have a leading 'v'. Got: $VERSION"
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must be X.Y.Z. Got: $VERSION"
+            exit 1
+          fi
+
+      - name: Verify GitHub release exists and is latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          LATEST=$(gh api repos/${{ github.repository }}/releases/latest --jq .tag_name)
+          LATEST="${LATEST#v}"
+          if [[ "$LATEST" != "$VERSION" ]]; then
+            echo "::error::Requested version $VERSION is not the GitHub 'latest' release ($LATEST). Refusing to roll out."
+            echo "::error::The agent will reject this anyway (403 not_github_latest); failing fast here."
+            exit 1
+          fi
+          echo "GitHub /releases/latest confirms $VERSION is current."
+
+      - name: Build matrix
+        id: plan
+        run: |
+          REQUESTED="${{ inputs.gateways }}"
+          if [[ "$REQUESTED" == "all" ]]; then
+            MATRIX='[{"name":"nova","url":"https://update.nova.locut.us"},{"name":"vega","url":"https://update.vega.locut.us"}]'
+          else
+            # Build the array by filtering the full list. Cheap, transparent,
+            # easy to read in workflow logs.
+            ITEMS="[]"
+            for tag in $(echo "$REQUESTED" | tr ',' ' '); do
+              case "$tag" in
+                nova) ITEMS=$(echo "$ITEMS" | jq -c '. + [{"name":"nova","url":"https://update.nova.locut.us"}]') ;;
+                vega) ITEMS=$(echo "$ITEMS" | jq -c '. + [{"name":"vega","url":"https://update.vega.locut.us"}]') ;;
+                *) echo "::error::Unknown gateway tag: $tag"; exit 1 ;;
+              esac
+            done
+            MATRIX="$ITEMS"
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Rollout plan: $MATRIX"
+
+  rollout:
+    name: Update ${{ matrix.gateway.name }}
+    needs: plan
+    runs-on: ubuntu-latest
+    # Serialize so a failure on the first gateway aborts the rest.
+    # Phase 3 may parallelize this — for now, blast-radius control wins.
+    max-parallel: 1
+    strategy:
+      fail-fast: true
+      matrix:
+        gateway: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Resolve secret
+        id: secret
+        env:
+          NOVA_SECRET: ${{ secrets.RELEASE_AGENT_HMAC_NOVA }}
+          VEGA_SECRET: ${{ secrets.RELEASE_AGENT_HMAC_VEGA }}
+        run: |
+          case "${{ matrix.gateway.name }}" in
+            nova) SECRET="$NOVA_SECRET" ;;
+            vega) SECRET="$VEGA_SECRET" ;;
+            *) echo "::error::No secret mapping for ${{ matrix.gateway.name }}"; exit 1 ;;
+          esac
+          if [[ -z "$SECRET" ]]; then
+            echo "::error::Secret RELEASE_AGENT_HMAC_${{ matrix.gateway.name }} is not set"
+            exit 1
+          fi
+          # Mask immediately so any accidental subsequent echo redacts.
+          echo "::add-mask::$SECRET"
+          # Pass via env file, not stdout, so it never appears in logs.
+          echo "secret=$SECRET" >> "$GITHUB_OUTPUT"
+
+      - name: Sign and POST /update
+        env:
+          SECRET: ${{ steps.secret.outputs.secret }}
+          GATEWAY_URL: ${{ matrix.gateway.url }}
+          VERSION: ${{ inputs.version }}
+          DRY_RUN_WORKFLOW: ${{ inputs.dry_run_workflow }}
+        run: |
+          set -euo pipefail
+
+          ISSUED_AT=$(date +%s)
+          BODY=$(jq -nc \
+            --arg v "$VERSION" \
+            --argjson t "$ISSUED_AT" \
+            '{version: $v, issued_at: $t}')
+
+          SIG=$(printf '%s' "$BODY" \
+            | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SECRET" \
+            | awk '{print $NF}')
+
+          echo "Target: $GATEWAY_URL"
+          echo "Body:   $BODY"
+          echo "Sig:    ${SIG:0:8}…(truncated)"
+
+          if [[ "$DRY_RUN_WORKFLOW" == "true" ]]; then
+            echo "::notice::dry_run_workflow=true; skipping actual POST"
+            exit 0
+          fi
+
+          # 30s connect timeout, 30s total. The agent returns within
+          # ~1s on the happy path (it spawns sudo and returns 202
+          # before the script finishes).
+          HTTP_STATUS=$(curl -sS -o /tmp/agent-response.json -w '%{http_code}' \
+            --connect-timeout 30 --max-time 30 \
+            -X POST "$GATEWAY_URL/update" \
+            -H 'Content-Type: application/json' \
+            -H "X-Signature: $SIG" \
+            --data-raw "$BODY")
+
+          echo "HTTP $HTTP_STATUS"
+          cat /tmp/agent-response.json
+          echo
+
+          case "$HTTP_STATUS" in
+            200|202) ;;
+            *)
+              echo "::error::Gateway ${{ matrix.gateway.name }} rejected update: HTTP $HTTP_STATUS"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify version after update
+        if: ${{ inputs.dry_run_workflow != true }}
+        env:
+          GATEWAY_URL: ${{ matrix.gateway.url }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # The agent restarts the freenet service after the script
+          # finishes; /version will briefly 502/connection-refused while
+          # the systemd unit cycles. Poll for up to 120s.
+          DEADLINE=$(( $(date +%s) + 120 ))
+          while (( $(date +%s) < DEADLINE )); do
+            RESPONSE=$(curl -sS --max-time 5 "$GATEWAY_URL/version" || true)
+            INSTALLED=$(echo "$RESPONSE" | jq -r '.version // empty')
+            if [[ "$INSTALLED" == "$VERSION" ]]; then
+              echo "✓ Gateway ${{ matrix.gateway.name }} now reports version $INSTALLED"
+              exit 0
+            fi
+            echo "Waiting for ${{ matrix.gateway.name }} to report $VERSION (current: ${INSTALLED:-unreachable})…"
+            sleep 5
+          done
+          echo "::error::Gateway ${{ matrix.gateway.name }} did not converge on $VERSION within 120s"
+          exit 1
