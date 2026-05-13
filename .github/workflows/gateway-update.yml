@@ -49,13 +49,19 @@ jobs:
     steps:
       - name: Resolve version
         id: ver
+        # Pass values via env: rather than ${{ }} interpolation — a tag
+        # name like `1.2.3"; curl evil; "` would otherwise template into
+        # the script at expression-eval time, before the regex below
+        # could reject it. Env binding makes it a regular shell string.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
         run: |
-          # On release-trigger, version comes from the tag; on
-          # workflow_dispatch, from the user input. Strip leading `v`.
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            RAW="${{ github.event.release.tag_name }}"
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            RAW="$TAG_NAME"
           else
-            RAW="${{ inputs.version }}"
+            RAW="$DISPATCH_VERSION"
           fi
           VERSION="${RAW#v}"
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then

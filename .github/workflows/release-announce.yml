@@ -47,18 +47,28 @@ jobs:
     steps:
       - name: Resolve version
         id: v
+        # Pass the raw values via env: rather than ${{ }} interpolation
+        # into the shell. A tag name like `1.2.3"; curl evil; "` would
+        # otherwise template directly into the script at expression-eval
+        # time, before the regex check below could reject it. Env-var
+        # binding makes the variable a regular string in the shell.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
         run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            RAW="${{ github.event.release.tag_name }}"
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            RAW="$TAG_NAME"
           else
-            RAW="${{ inputs.version }}"
+            RAW="$DISPATCH_VERSION"
           fi
           VERSION="${RAW#v}"
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Version must be X.Y.Z. Got: $VERSION (raw: $RAW)"
             exit 1
           fi
-          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/v${VERSION}"
+          RELEASE_URL="https://github.com/${REPO}/releases/tag/v${VERSION}"
           MESSAGE="Freenet v${VERSION} released: ${RELEASE_URL}"
           {
             echo "version=$VERSION"
@@ -93,8 +103,14 @@ jobs:
             exit 0
           fi
           # Random txn ID so retries don't get deduped (Matrix client-server
-          # API treats identical txn IDs as the same message).
-          TXN_ID="freenet-release-$(date +%s)-$RANDOM"
+          # API treats identical txn IDs as the same message). Prefer
+          # uuidgen for collision-resistance vs $RANDOM + 1s clock; fall
+          # back to date+$RANDOM if uuidgen isn't present on the runner.
+          if command -v uuidgen >/dev/null 2>&1; then
+            TXN_ID="freenet-release-$(uuidgen)"
+          else
+            TXN_ID="freenet-release-$(date +%s%N)-${RANDOM}-${RANDOM}"
+          fi
           BODY=$(jq -nc \
             --arg msg "$MESSAGE" \
             '{msgtype: "m.text", body: $msg}')
@@ -154,5 +170,14 @@ jobs:
           if [[ "$HTTP_STATUS" != "200" && "$HTTP_STATUS" != "202" ]]; then
             echo "::error::nova /announce/river returned HTTP $HTTP_STATUS"
             exit 1
+          fi
+          # 200 means the agent was in dry-run mode and DID NOT post to
+          # River. Surface a warning so the operator notices that the
+          # workflow "succeeded" but the announcement never went out.
+          if [[ "$HTTP_STATUS" == "200" ]]; then
+            DRY_RUN=$(jq -r '.dry_run // false' < /tmp/river-response.json 2>/dev/null || echo "false")
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "::warning::nova returned 200 with dry_run=true — River was NOT posted. Flip dry_run=false on the agent if this was intended to be live."
+            fi
           fi
           echo "✓ River announcement dispatched to nova."

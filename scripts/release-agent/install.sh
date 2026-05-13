@@ -82,12 +82,17 @@ else
     echo "WARNING: $GATEWAY_UPDATE_SCRIPT not found yet. Install it with the existing gateway-auto-update bootstrap before flipping dry_run=false." >&2
 fi
 
-echo "==> Installing announce-to-river.sh (gateways without a Freenet node + signing key should omit this)"
+echo "==> Installing announce-to-river.sh"
+# Always install the script — it's harmless when the agent's config
+# leaves `river_announce_command` blank (the endpoint returns 503 in
+# that case). Set `river_announce_command = "/usr/local/bin/announce-to-river.sh"`
+# in config.toml AND make sure ~/.config/freenet-river-official/ +
+# the local Freenet node are present on this gateway before enabling.
 ANNOUNCE_SCRIPT=/usr/local/bin/announce-to-river.sh
 install -m 0755 -o root -g root \
     "$SCRIPT_DIR/announce-to-river.sh" \
     "$ANNOUNCE_SCRIPT"
-echo "  Installed $ANNOUNCE_SCRIPT (no-op on gateways without river_announce_command set in config)"
+echo "  Installed $ANNOUNCE_SCRIPT (endpoint disabled until config opts in)"
 
 echo "==> Installing sudoers entry"
 install -m 0440 -o root -g root \

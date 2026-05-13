@@ -290,19 +290,11 @@ async fn announce_river_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Endpoint is opt-in via config. Off-by-default means a vega-style
-    // install (no Freenet node, no signing key) returns 503 instead of
-    // pretending to succeed.
-    if !state.announcer.is_configured() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "river announcements not configured on this gateway",
-        )
-            .into_response();
-    }
-
-    // 1. HMAC over raw body (same secret as /update for now; separation
-    //    can come later if the operator wants per-endpoint secrets).
+    // 1. HMAC over raw body. We verify FIRST so an unauthenticated
+    //    caller can't distinguish "endpoint disabled" (503) from
+    //    "endpoint enabled, wrong key" (401) — both look the same.
+    //    Otherwise an attacker can fingerprint which gateway runs
+    //    `/announce/river` without proving knowledge of the secret.
     let sig = match headers.get(&HEADER_SIGNATURE).and_then(|v| v.to_str().ok()) {
         Some(s) => s,
         None => return (StatusCode::UNAUTHORIZED, "missing X-Signature").into_response(),
@@ -310,6 +302,17 @@ async fn announce_river_handler(
     if let Err(e) = verify_signature(&state.secret, &body, sig) {
         tracing::warn!(error = %e, "announce signature verification failed");
         return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+    }
+
+    // 2. Endpoint is opt-in via config. Off-by-default means a vega-style
+    //    install (no Freenet node, no signing key) returns 503 instead of
+    //    pretending to succeed.
+    if !state.announcer.is_configured() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "river announcements not configured on this gateway",
+        )
+            .into_response();
     }
 
     // 2. Parse body

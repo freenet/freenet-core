@@ -85,23 +85,42 @@ fi
 # Ensure the room owner signing key in rooms.json matches the on-disk
 # key. This mirrors the equivalent block in scripts/release.sh — without
 # it, posting fails if the local rooms.json drifted.
-python3 - <<PY 2>/dev/null || true
-import json, sys
+#
+# Failure modes are logged and abort (no `|| true` swallowing): if the
+# rooms.json schema drifted, posting with a stale key would be confusing
+# at best and identity-impersonation at worst. We'd rather fail loud.
+#
+# Writes are atomic (temp file + os.replace) so a crash mid-rewrite
+# can't leave rooms.json half-written for the human user.
+if ! python3 - <<PY; then
+import json, os, sys
 signing_key_file = "$SIGNING_KEY_FILE"
 rooms_file = "$ROOMS_JSON"
 room_vk = "$ROOM_OWNER_VK"
-with open(signing_key_file, 'rb') as f:
-    key_bytes = list(f.read())
-with open(rooms_file, 'r') as f:
-    data = json.load(f)
-if room_vk not in data.get('rooms', {}):
-    sys.exit(0)
-current_key = data['rooms'][room_vk].get('signing_key_bytes', [])
-if current_key != key_bytes:
-    data['rooms'][room_vk]['signing_key_bytes'] = key_bytes
-    with open(rooms_file, 'w') as f:
-        json.dump(data, f)
+try:
+    with open(signing_key_file, 'rb') as f:
+        key_bytes = list(f.read())
+    with open(rooms_file, 'r') as f:
+        data = json.load(f)
+    if room_vk not in data.get('rooms', {}):
+        # No-op if the room isn't in local storage — riverctl will
+        # itself fail with a clear error in that case.
+        sys.exit(0)
+    current_key = data['rooms'][room_vk].get('signing_key_bytes', [])
+    if current_key != key_bytes:
+        data['rooms'][room_vk]['signing_key_bytes'] = key_bytes
+        tmp = rooms_file + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp, rooms_file)
+        print("rooms.json signing key resynced", file=sys.stderr)
+except Exception as e:
+    print(f"rooms.json sync failed: {e}", file=sys.stderr)
+    sys.exit(1)
 PY
+    log "ERROR: rooms.json signing-key sync failed (see above)"
+    exit 1
+fi
 
 log "posting to River room $ROOM_OWNER_VK (msg ${#MESSAGE} bytes)"
 
