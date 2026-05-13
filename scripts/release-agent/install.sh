@@ -82,6 +82,13 @@ else
     echo "WARNING: $GATEWAY_UPDATE_SCRIPT not found yet. Install it with the existing gateway-auto-update bootstrap before flipping dry_run=false." >&2
 fi
 
+echo "==> Installing announce-to-river.sh (gateways without a Freenet node + signing key should omit this)"
+ANNOUNCE_SCRIPT=/usr/local/bin/announce-to-river.sh
+install -m 0755 -o root -g root \
+    "$SCRIPT_DIR/announce-to-river.sh" \
+    "$ANNOUNCE_SCRIPT"
+echo "  Installed $ANNOUNCE_SCRIPT (no-op on gateways without river_announce_command set in config)"
+
 echo "==> Installing sudoers entry"
 install -m 0440 -o root -g root \
     "$SCRIPT_DIR/sudoers.freenet-release-agent" \

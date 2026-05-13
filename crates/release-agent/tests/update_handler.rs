@@ -70,6 +70,8 @@ impl Harness {
             dry_run: true,
             rate_limit_seconds,
             clock_skew_tolerance_seconds: 300,
+            river_announce_command: std::path::PathBuf::new(),
+            river_announce_user: String::new(),
         };
 
         let latest_source: Arc<dyn LatestSource> = Arc::new(StaticLatest(latest_on_github));
@@ -78,8 +80,14 @@ impl Harness {
             secret: Arc::new(secret.clone()),
             latest_source,
             updater: Updater::new_with_sudo(config.update_command.clone(), true),
+            announcer: freenet_release_agent::announcer::Announcer::new_with_sudo(
+                std::path::PathBuf::new(),
+                true,
+                String::new(),
+            ),
             version_cache: VersionCache::new(),
             last_update_attempt: Arc::new(Mutex::new(None)),
+            last_announce_attempt: Arc::new(Mutex::new(None)),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -148,6 +156,8 @@ impl Harness {
             dry_run: false,
             rate_limit_seconds,
             clock_skew_tolerance_seconds: 300,
+            river_announce_command: std::path::PathBuf::new(),
+            river_announce_user: String::new(),
         };
 
         let latest_source: Arc<dyn LatestSource> = Arc::new(StaticLatest(latest_on_github));
@@ -161,8 +171,14 @@ impl Harness {
             secret: Arc::new(secret.clone()),
             latest_source,
             updater,
+            announcer: freenet_release_agent::announcer::Announcer::new_with_sudo(
+                std::path::PathBuf::new(),
+                true,
+                String::new(),
+            ),
             version_cache: VersionCache::new(),
             last_update_attempt: Arc::new(Mutex::new(None)),
+            last_announce_attempt: Arc::new(Mutex::new(None)),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -454,6 +470,214 @@ async fn sudoers_argv_matches_allowlist() {
     assert!(
         argv.ends_with("--force --target-version v0.2.56"),
         "argv suffix must match sudoers allowlist (got: {argv:?})"
+    );
+}
+
+/// Build a Harness whose announcer points at a stub announce script.
+/// Used by the /announce/river tests below.
+async fn build_with_announcer(announce_script: &str, record_file: &Path) -> Harness {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary_path = write_stub_freenet(tmp.path(), "0.2.56");
+    let secret: Vec<u8> = (0..32).map(|i| i as u8).collect();
+    let secret_path = tmp.path().join("hmac.key");
+    std::fs::write(&secret_path, hex::encode(&secret)).unwrap();
+
+    let announce_command = tmp.path().join("announce.sh");
+    std::fs::write(&announce_command, announce_script).unwrap();
+    let mut perms = std::fs::metadata(&announce_command).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&announce_command, perms).unwrap();
+
+    let fake_sudo = tmp.path().join("fake-sudo");
+    // The agent invokes `sudo -n -u <user> <command> <message>`.
+    // Our stub: shift past `-n -u <user>`, record the rest, then exec.
+    let sudo_script = format!(
+        "#!/bin/sh\n\
+         shift # --non-interactive\n\
+         shift # -u\n\
+         shift # <user>\n\
+         echo \"$@\" > {record}\n\
+         exec \"$@\"\n",
+        record = record_file.display()
+    );
+    std::fs::write(&fake_sudo, sudo_script).unwrap();
+    let mut perms = std::fs::metadata(&fake_sudo).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_sudo, perms).unwrap();
+
+    let config = Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        binary_path,
+        update_command: tmp.path().join("unused.sh"),
+        hmac_secret_path: secret_path,
+        github_repo: "freenet/freenet-core".into(),
+        dry_run: false,
+        rate_limit_seconds: 600,
+        clock_skew_tolerance_seconds: 300,
+        river_announce_command: announce_command.clone(),
+        river_announce_user: "nobody".into(),
+    };
+    let latest_source: Arc<dyn LatestSource> = Arc::new(StaticLatest(Version::new(0, 2, 56)));
+    let announcer = freenet_release_agent::announcer::Announcer {
+        command: announce_command,
+        dry_run: false,
+        sudo_command: fake_sudo,
+        run_as_user: "nobody".into(),
+    };
+    let state = AppState {
+        config: Arc::new(config),
+        secret: Arc::new(secret.clone()),
+        latest_source,
+        updater: Updater::new_with_sudo(std::path::PathBuf::from("/bin/true"), true),
+        announcer,
+        version_cache: VersionCache::new(),
+        last_update_attempt: Arc::new(Mutex::new(None)),
+        last_announce_attempt: Arc::new(Mutex::new(None)),
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    Harness {
+        base: format!("http://{addr}"),
+        secret,
+        _tmp: tmp,
+    }
+}
+
+fn signed_announce(secret: &[u8], message: &str, issued_at: i64) -> (String, String) {
+    let body = serde_json::to_string(&json!({
+        "message": message,
+        "issued_at": issued_at,
+    }))
+    .unwrap();
+    let sig = sign(secret, body.as_bytes());
+    (body, sig)
+}
+
+#[tokio::test]
+async fn announce_disabled_returns_503() {
+    // The default-built Harness has an unconfigured announcer (empty
+    // command path) — that gateway can't post to River.
+    let h = Harness::build("0.2.55", Version::new(0, 2, 56), 600).await;
+    let (body, sig) = signed_announce(&h.secret, "hello", now_secs());
+    let resp = reqwest::Client::new()
+        .post(format!("{}/announce/river", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn announce_happy_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let record = tmp.path().join("argv.log");
+    let h = build_with_announcer("#!/bin/sh\nsleep 5\n", &record).await;
+    let (body, sig) = signed_announce(&h.secret, "Freenet v0.2.57 released", now_secs());
+    let resp = reqwest::Client::new()
+        .post(format!("{}/announce/river", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status() == 200 || resp.status() == 202,
+        "got {}",
+        resp.status()
+    );
+    let recorded = std::fs::read_to_string(&record).expect("fake-sudo recorded argv");
+    assert!(
+        recorded.contains("Freenet v0.2.57 released"),
+        "argv should contain the message, got: {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn announce_missing_signature_is_401() {
+    let tmp = tempfile::tempdir().unwrap();
+    let record = tmp.path().join("argv.log");
+    let h = build_with_announcer("#!/bin/sh\nexit 0\n", &record).await;
+    let (body, _) = signed_announce(&h.secret, "x", now_secs());
+    let resp = reqwest::Client::new()
+        .post(format!("{}/announce/river", h.base))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn announce_empty_message_is_400() {
+    let tmp = tempfile::tempdir().unwrap();
+    let record = tmp.path().join("argv.log");
+    let h = build_with_announcer("#!/bin/sh\nexit 0\n", &record).await;
+    let (body, sig) = signed_announce(&h.secret, "", now_secs());
+    let resp = reqwest::Client::new()
+        .post(format!("{}/announce/river", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn announce_oversize_message_is_413() {
+    let tmp = tempfile::tempdir().unwrap();
+    let record = tmp.path().join("argv.log");
+    let h = build_with_announcer("#!/bin/sh\nexit 0\n", &record).await;
+    // Just over the 4 KiB message cap — but under the 8 KiB HTTP body cap
+    // so we hit the message-len check, not the body-limit middleware.
+    let big = "x".repeat(4 * 1024 + 50);
+    let (body, sig) = signed_announce(&h.secret, &big, now_secs());
+    let resp = reqwest::Client::new()
+        .post(format!("{}/announce/river", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+}
+
+#[tokio::test]
+async fn announce_spawn_failure_does_not_consume_rate_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let record = tmp.path().join("argv.log");
+    // Script exits 1 immediately → 500 + window NOT consumed.
+    let h = build_with_announcer("#!/bin/sh\nexit 1\n", &record).await;
+    let (body, sig) = signed_announce(&h.secret, "first", now_secs());
+    let r1 = reqwest::Client::new()
+        .post(format!("{}/announce/river", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 500);
+
+    let (body2, sig2) = signed_announce(&h.secret, "second", now_secs());
+    let r2 = reqwest::Client::new()
+        .post(format!("{}/announce/river", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig2)
+        .body(body2)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        r2.status(),
+        429,
+        "failed spawn must not consume the announce rate-limit window"
     );
 }
 

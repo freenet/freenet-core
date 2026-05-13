@@ -23,6 +23,19 @@ pub struct Config {
     pub rate_limit_seconds: u64,
     #[serde(default = "default_skew")]
     pub clock_skew_tolerance_seconds: u32,
+
+    /// Path to the `announce-to-river.sh` script. Empty (default) disables
+    /// the `POST /announce/river` endpoint; the endpoint returns 503.
+    /// Only nova has this configured today — vega has no Freenet node /
+    /// signing key, so it can't post to River.
+    #[serde(default)]
+    pub river_announce_command: PathBuf,
+
+    /// User under which `riverctl` runs (typically `ian` on nova). The
+    /// agent itself runs as `freenet-update`; it `sudo -u <user>`s to
+    /// the owner of `~/.config/freenet-river-official/`. Default empty.
+    #[serde(default)]
+    pub river_announce_user: String,
 }
 
 fn default_repo() -> String {
@@ -170,6 +183,8 @@ dry-run = false
             dry_run: true,
             rate_limit_seconds: 0,
             clock_skew_tolerance_seconds: 0,
+            river_announce_command: PathBuf::new(),
+            river_announce_user: String::new(),
         }
     }
 }
