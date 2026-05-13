@@ -31,15 +31,15 @@ use super::storages::Storage;
 use crate::config::Config;
 use crate::message::Transaction;
 use crate::node::OpManager;
+use crate::operations::OpEnum;
 use crate::operations::get::GetResult;
-use crate::operations::{OpEnum, OpError};
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
     SecretsStore, StateStorage, StateStore, StateStoreError,
 };
 use crate::{
     client_events::{ClientId, HostResult},
-    operations::{self, Operation},
+    operations,
 };
 
 pub(super) mod init_tracker;
@@ -712,37 +712,14 @@ mod sealed {
     impl ChannelHalve for Callback {}
 }
 
-// `ComposeNetworkMessage` was the executor → event-loop adapter trait
-// for op_request mediator dispatch. Its last implementor (UpdateContract)
-// was retired in #1454 phase 5. The trait, `op_request` method, and
-// `op_request_channel`/`run_op_request_mediator` plumbing remain in the
-// tree as orphan scaffolding pending a phase 6 cleanup PR (their removal
-// cascades through Executor::new, RuntimePool, and p2p_impl wiring).
-#[allow(dead_code)]
-trait ComposeNetworkMessage<Op>
-where
-    Self: Sized,
-    Op: Operation + Send + 'static,
-{
-    fn initiate_op(self, op_manager: &OpManager) -> Op;
-
-    fn resume_op(
-        op: Op,
-        op_manager: &OpManager,
-    ) -> impl Future<Output = Result<(), OpError>> + Send;
-}
-
-// `SubscribeContract` was the legacy `ComposeNetworkMessage` adapter
-// for executor auto-subscribe. Retired by #1454: `executor::subscribe`
-// now bypasses the `op_request` mediator path and calls
-// `subscribe::run_executor_subscribe` directly (mirrors
-// `local_state_or_from_network` for GET).
-
-// `UpdateContract` and its `ComposeNetworkMessage<UpdateOp>` impl were
-// retired in #1454 phase 5: the only callsite (the network branch of
-// `perform_contract_update` in runtime.rs) was unreachable because no
-// production code constructs `OperationMode::Network`. Network-mode
-// UPDATEs flow through `start_client_update` (client_events.rs).
+// `ComposeNetworkMessage`, `op_request`, `UpdateContract`,
+// `SubscribeContract`: legacy executor → event-loop adapters retired in
+// #1454. Executor auto-subscribe now calls
+// `subscribe::run_executor_subscribe` directly; UPDATEs flow through
+// `start_client_update`. The mediator-channel plumbing
+// (`op_request_channel`/`run_op_request_mediator`/`OpRequestSender`)
+// remains because RuntimePool and Executor::new still thread the
+// channel; with no producers it is effectively a no-op.
 
 #[derive(Debug)]
 pub(crate) enum UpsertResult {
@@ -1037,95 +1014,6 @@ where
         let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone(), db)?;
 
         Ok((contract_store, delegate_store, secret_store))
-    }
-
-    // Orphan after #1454 phase 5; see `ComposeNetworkMessage` comment.
-    #[allow(dead_code)]
-    async fn op_request<Op, M>(&mut self, request: M) -> Result<Op::Result, ExecutorError>
-    where
-        Op: Operation + Send + TryFrom<OpEnum, Error = OpError> + 'static,
-        <Op as Operation>::Result: TryFrom<Op, Error = OpError>,
-        M: ComposeNetworkMessage<Op>,
-    {
-        let (op_sender, op_manager) = match (&self.op_sender, &self.op_manager) {
-            (Some(sender), Some(manager)) => (sender.clone(), manager.clone()),
-            _ => {
-                return Err(ExecutorError::other(anyhow::anyhow!(
-                    "missing op_sender or op_manager"
-                )));
-            }
-        };
-
-        // Create the operation and get its transaction ID
-        let op = request.initiate_op(&op_manager);
-        let transaction = *op.id();
-
-        // Create a oneshot channel for this specific request's response
-        let (response_tx, response_rx) = oneshot::channel();
-
-        // Send the transaction and response channel to the event loop
-        op_sender
-            .send((transaction, response_tx))
-            .await
-            .map_err(|_| ExecutorError::other(anyhow::anyhow!("event loop channel closed")))?;
-
-        // Start the network operation
-        <M as ComposeNetworkMessage<Op>>::resume_op(op, &op_manager)
-            .await
-            .map_err(|e| {
-                tracing::debug!(
-                    tx = %transaction,
-                    error = %e,
-                    "Failed to resume operation"
-                );
-                ExecutorError::other(e)
-            })?;
-
-        // Wait for the response on our oneshot channel with timeout
-        const OP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-        let op_result = tokio::time::timeout(OP_REQUEST_TIMEOUT, response_rx)
-            .await
-            .map_err(|_| {
-                tracing::warn!(
-                    tx = %transaction,
-                    timeout_secs = OP_REQUEST_TIMEOUT.as_secs(),
-                    "Network operation timed out waiting for response"
-                );
-                ExecutorError::other(anyhow::anyhow!(
-                    "network operation timed out after {} seconds",
-                    OP_REQUEST_TIMEOUT.as_secs()
-                ))
-            })?
-            .map_err(|_| {
-                ExecutorError::other(anyhow::anyhow!(
-                    "response channel closed before receiving result"
-                ))
-            })?;
-
-        // Handle the result
-        let op_enum = op_result.map_err(|e| ExecutorError::other(anyhow::anyhow!("{}", e)))?;
-
-        // Convert to the specific operation type
-        let op: Op = op_enum.try_into().map_err(|err: OpError| {
-            tracing::error!(
-                tx = %transaction,
-                error = %err,
-                "Expected message of one type but got another"
-            );
-            ExecutorError::other(err)
-        })?;
-
-        // Convert to the result type
-        let result = <Op::Result>::try_from(op).map_err(|err| {
-            tracing::debug!(
-                tx = %transaction,
-                error = %err,
-                "Failed to convert operation result"
-            );
-            ExecutorError::other(err)
-        })?;
-
-        Ok(result)
     }
 
     pub fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {

@@ -10,10 +10,11 @@ paths:
 
 Every operation runs as a task-per-transaction driver: each `Transaction`
 is owned and driven by a single spawned task; state lives in task
-locals, never in `OpManager.ops.*`. The only exception is **CONNECT**,
-which still uses a `OpManager.ops.connect` DashMap + `Operation` impl
-for joiner-side branches reachable from in-file tests and the legacy
-stateless `ObservedAddress` side-effect path.
+locals. The `Operation` trait and the legacy `process_message` /
+`load_or_init` / `handle_op_request` / `handle_op_result` mediator path
+are all gone. `OpManager.ops.connect` remains as a (now-empty) DashMap
+along with its `OpEnum::Connect` carrier; both are retained until the
+follow-up slice that also retires the `ConnectOp` in-file test surface.
 
 Driver entry points:
 
@@ -44,22 +45,23 @@ for every inbound wire message. Pattern per op:
    `upstream_addr=own_addr` for GET/PUT/SUBSCRIBE so the same driver
    handles both relay hops and originator loopback. UPDATE has no
    loopback (fire-and-forget end-to-end).
-3. **No legacy fallthrough** for GET/PUT/UPDATE/SUBSCRIBE — every wire
-   variant either bypasses to a waiter, dispatches a driver, or hits a
-   dedicated free-function handler (e.g. `handle_unsubscribe_inbound`,
-   `ForwardingAck` no-op). CONNECT still has a
-   `handle_op_request::<ConnectOp>` fallthrough for joiner-side legacy
-   re-entries.
+3. **No legacy fallthrough.** Every wire variant either bypasses to a
+   waiter, dispatches a driver, or hits a dedicated free-function
+   handler (e.g. `handle_unsubscribe_inbound`, `ForwardingAck` no-op).
+   The legacy `handle_op_request` mediator was deleted in the CONNECT
+   phase 6 slice — any inbound message that does not match a bypass or
+   relay-dispatch rule is dropped with a debug log.
 
 ## OpEnum and DashMaps
 
-- `OpEnum::Connect` and `OpManager.ops.connect` are the only surviving
-  DashMap-backed op state. Used by joiner-side legacy paths.
-- `OpEnum::{Get,Put,Update,Subscribe}` are gone. `ops.{get,put,update,subscribe}`
-  DashMaps are gone. `has_{get,put,update,subscribe}_op` accessors are
-  gone.
+- `OpEnum::Connect` and `OpManager.ops.connect` are the last
+  DashMap-backed carrier. No production code path writes to the
+  DashMap anymore; both will be removed in the follow-up slice that
+  also retires the `ConnectOp` in-file test surface.
+- `OpEnum::{Get,Put,Update,Subscribe}` and the matching DashMaps and
+  `has_*_op` accessors are gone.
 - `pending_op_counts()` returns `[connect, 0, 0, 0, 0]` — kept for
-  telemetry API stability.
+  telemetry API stability; the connect slot is currently always 0.
 
 ## Critical Invariant: Initialize-Before-Send
 
@@ -69,10 +71,6 @@ visited-peers filter, routing state) MUST be initialized BEFORE
 calling `OpCtx::send_and_await`. The reply may arrive on the very
 next poll.
 ```
-
-For CONNECT's surviving legacy path: state MUST be pushed via
-`op_manager.push(tx, state)` before any `network_bridge.send(...)` —
-a fast response that beats the push would hit `OpNotPresent`.
 
 ## State Machine Rules
 
@@ -94,7 +92,7 @@ CORRECT:
       (State::B, Msg::Y) => State::C,
       _ => {
           tracing::warn!("unexpected message in state");
-          return Ok(OperationResult::default());
+          return Ok(());
       }
   };
 
@@ -212,10 +210,9 @@ This is usually benign (duplicate message, already completed)
 → Do NOT treat as error
 ```
 
-Do NOT "fix" `load_or_init`'s `OpNotPresent` for non-CONNECT ops by
-trying to look up the tx there — the bypass at the top of
-`handle_pure_network_message_v1` already forwarded the reply to the
-driver's waiter, and `load_or_init` no longer runs for those ops.
+`load_or_init` is gone. Any reply that does not match a bypass or a
+relay-dispatch rule is dropped silently in the dispatch site — that is
+the new equivalent of the old `OpNotPresent` outcome.
 
 ### WHEN encountering InvalidStateTransition
 
@@ -236,38 +233,8 @@ driver's waiter, and `load_or_init` no longer runs for those ops.
 □ Test race conditions (fast responses)
 ```
 
-## Common Patterns
-
-### Load or Initialize (CONNECT only)
-
-```rust
-let init = Op::load_or_init(op_manager, msg, source_addr).await?;
-match init {
-    OpInitialization::Existing { op } => /* existing operation */,
-    OpInitialization::New { op } => /* new operation */,
-}
-```
-
-### Handle Operation Result (CONNECT only)
-
-```rust
-let result = op.process_message(conn_manager, op_manager, msg, source_addr).await?;
-
-if let Some(return_msg) = result.return_msg {
-    // Push state BEFORE sending
-    if let Some(state) = result.state {
-        op_manager.push(tx, state).await?;
-    }
-    conn_manager.send(result.next_hop.unwrap(), return_msg).await?;
-} else if result.state.is_none() {
-    // Operation finished
-    op_manager.completed(tx);
-}
-```
-
 ## Documentation
 
 - Architecture: `docs/architecture/operations/README.md`
 - OpManager: `crates/core/src/node/op_state_manager.rs`
-- Operation trait: `crates/core/src/operations.rs:32-56`
 - Round-trip primitive: `crates/core/src/operations/op_ctx.rs`

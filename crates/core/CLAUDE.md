@@ -45,9 +45,11 @@ Key decision points:
 
 ```
 Each op has wire-format types + helpers in `<op>.rs` and one or more
-task-per-transaction drivers under `<op>/op_ctx_task.rs`. CONNECT
-also retains a legacy `Operation` state machine in `connect.rs` for
-joiner-side branches reachable from in-file tests.
+task-per-transaction drivers under `<op>/op_ctx_task.rs`. The legacy
+`Operation` trait / `process_message` / `load_or_init` / `handle_op_request`
+mediator path is gone; `connect.rs` still carries the relay/joiner
+state-machine helpers (`handle_request`, `new_joiner`, `new_relay`) as
+test-only fixtures.
 
 Driver entry points:
 

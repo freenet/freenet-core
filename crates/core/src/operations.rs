@@ -1,19 +1,16 @@
 #[cfg(debug_assertions)]
 use std::backtrace::Backtrace as StdTrace;
-use std::{pin::Pin, time::Duration};
+use std::time::Duration;
 
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
-use futures::Future;
 use tokio::sync::mpsc::error::SendError;
-
-use std::net::SocketAddr;
 
 use crate::{
     client_events::HostResult,
     config::GlobalExecutor,
     contract::{ContractError, ExecutorError},
-    message::{InnerMessage, MessageStats, NetMessage, NetMessageV1, Transaction, TransactionType},
-    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable},
+    message::{Transaction, TransactionType},
+    node::{ConnectionError, OpManager, OpNotAvailable},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -31,268 +28,10 @@ pub(crate) mod visited_peers;
 pub(crate) use op_ctx::OpCtx;
 pub(crate) use visited_peers::VisitedPeers;
 
-pub(crate) trait Operation
-where
-    Self: Sized,
-{
-    type Message: InnerMessage + std::fmt::Display;
-
-    type Result;
-
-    fn load_or_init<'a>(
-        op_manager: &'a OpManager,
-        msg: &'a Self::Message,
-        source_addr: Option<SocketAddr>,
-    ) -> impl Future<Output = Result<OpInitialization<Self>, OpError>> + 'a;
-
-    fn id(&self) -> &Transaction;
-
-    #[allow(clippy::type_complexity)]
-    fn process_message<'a, CB: NetworkBridge>(
-        self,
-        conn_manager: &'a mut CB,
-        op_manager: &'a OpManager,
-        input: &'a Self::Message,
-        source_addr: Option<SocketAddr>,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
-}
-
-/// Result of processing an operation message.
-///
-/// This enum encodes the *only* valid result combinations at the type level,
-/// replacing the previous struct-of-Options where illegal combinations (e.g.
-/// `stream_data: Some` but `return_msg: None`) were representable but
-/// meaningless. Each variant documents exactly what the operation layer
-/// expects the caller to do next.
-///
-/// See `handle_op_result` for how each variant is dispatched.
-#[must_use]
-#[allow(clippy::large_enum_variant)] // Hot path — boxing `OpEnum` would add indirection overhead
-pub(crate) enum OperationResult {
-    /// Operation is fully complete on this node — nothing to send, no state to keep.
-    Completed,
-
-    /// Keep processing: save state but don't send any message to peers.
-    /// Used for intermediate states and locally-finalized operations.
-    ContinueOp(OpEnum),
-
-    /// Send a message to a peer AND keep the operation state.
-    /// Used for forwarding requests and sending responses while the operation
-    /// continues (e.g., awaiting sub-operations).
-    SendAndContinue {
-        msg: NetMessage,
-        /// Target peer. `None` for operations that handle their own routing
-        /// (connect) or that re-queue locally (update broadcasting).
-        next_hop: Option<SocketAddr>,
-        state: OpEnum,
-        /// Optional stream payload to send alongside the message.
-        stream_data: Option<(crate::transport::peer_connection::StreamId, bytes::Bytes)>,
-    },
-
-    /// Send a final message and complete the operation on this node.
-    /// Used for sending responses upstream when this node is done.
-    SendAndComplete {
-        msg: NetMessage,
-        /// Target peer. `None` for operations that handle their own routing.
-        next_hop: Option<SocketAddr>,
-        /// Optional stream payload to send alongside the message.
-        stream_data: Option<(crate::transport::peer_connection::StreamId, bytes::Bytes)>,
-    },
-}
-
-pub(crate) struct OpInitialization<Op> {
-    /// The source address of the peer that sent this message.
-    /// Used for sending error responses (Aborted) and as upstream_addr.
-    #[allow(dead_code)]
-    pub source_addr: Option<SocketAddr>,
-    pub op: Op,
-}
-
-pub(crate) async fn handle_op_request<Op, NB>(
-    op_manager: &OpManager,
-    network_bridge: &mut NB,
-    msg: &Op::Message,
-    source_addr: Option<SocketAddr>,
-) -> Result<Option<OpEnum>, OpError>
-where
-    Op: Operation,
-    NB: NetworkBridge,
-{
-    let tx = *msg.id();
-    let result = {
-        let OpInitialization { source_addr: _, op } =
-            Op::load_or_init(op_manager, msg, source_addr).await?;
-        op.process_message(network_bridge, op_manager, msg, source_addr)
-            .await
-    };
-
-    handle_op_result(op_manager, network_bridge, result, tx, source_addr).await
-}
-
-#[inline(always)]
-async fn handle_op_result<CB>(
-    op_manager: &OpManager,
-    network_bridge: &mut CB,
-    result: Result<OperationResult, OpError>,
-    tx_id: Transaction,
-    source_addr: Option<SocketAddr>,
-) -> Result<Option<OpEnum>, OpError>
-where
-    CB: NetworkBridge,
-{
-    match result {
-        Err(OpError::OpNotPresent(tx)) => {
-            // OpNotPresent is benign — it means a duplicate message arrived for an
-            // operation that was already completed or claimed (e.g., duplicate metadata
-            // from embedded fragment #1 + separate message). Do NOT send Aborted, as
-            // the primary processing path is still active and will complete normally.
-            tracing::debug!(
-                tx = %tx,
-                "Ignoring duplicate message for already-handled operation"
-            );
-            return Ok(None);
-        }
-        Err(err) => {
-            tracing::error!(
-                tx = %tx_id,
-                error = %err,
-                error_debug = ?err,
-                source = ?source_addr,
-                "handle_op_result: sending Aborted due to operation error"
-            );
-            if let Some(addr) = source_addr {
-                network_bridge
-                    .send(addr, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
-                    .await?;
-            }
-            return Err(err);
-        }
-
-        // ── No message, no state → fully done ──────────────────────────
-        Ok(OperationResult::Completed) => {
-            op_manager.completed(tx_id);
-        }
-
-        // ── No message, has state → keep processing ────────────────────
-        Ok(OperationResult::ContinueOp(state)) => {
-            if state.finalized() {
-                tracing::debug!(%tx_id, "operation complete");
-                op_manager.completed(tx_id);
-                return Ok(Some(state));
-            } else {
-                // Non-finalized: push state for later processing.
-                let id = *state.id();
-                op_manager.push(id, state).await?;
-            }
-        }
-
-        // ── Has message + state → send and keep processing ─────────────
-        Ok(OperationResult::SendAndContinue {
-            msg,
-            next_hop,
-            state: updated_state,
-            stream_data,
-        }) => {
-            if updated_state.finalized() {
-                let id = *msg.id();
-                tracing::debug!(%id, "operation finalized with outgoing message");
-                op_manager.completed(id);
-                if let Some(target) = next_hop {
-                    tracing::debug!(%id, ?target, "sending final message to target");
-                    send_with_stream(network_bridge, target, msg, stream_data).await?;
-                }
-                return Ok(Some(updated_state));
-            } else {
-                let id = *msg.id();
-                tracing::debug!(%id, "operation in progress");
-                let target = next_hop.ok_or_else(|| {
-                    // Only UPDATE's deprecated `Broadcasting` variant produced
-                    // SendAndContinue without a next_hop, and it has been
-                    // removed. Reaching this branch indicates a bug in an
-                    // operation's process_message implementation.
-                    OpError::UnexpectedOpState
-                })?;
-                tracing::debug!(%id, ?target, "sending updated op state");
-                // IMPORTANT: Push state BEFORE sending message to avoid race condition.
-                // If we send first, a fast response might arrive before the state is saved,
-                // causing load_or_init to fail to find the operation.
-                op_manager.push(id, updated_state).await?;
-                send_with_stream(network_bridge, target, msg, stream_data).await?;
-            }
-        }
-
-        // ── Has message, no state → send final response and complete ───
-        // Complete AFTER send to avoid response-lost: if send fails (peer
-        // disconnected), the op stays in under_progress for GC retry (#3590).
-        Ok(OperationResult::SendAndComplete {
-            msg,
-            next_hop,
-            stream_data,
-        }) => {
-            if let Some(target) = next_hop {
-                tracing::debug!(%tx_id, ?target, "sending back message to target");
-                match send_with_stream(network_bridge, target, msg, stream_data).await {
-                    Ok(()) => {
-                        op_manager.completed(tx_id);
-                    }
-                    Err(e) => {
-                        // Return directly — bypasses the Aborted-sending error
-                        // handler at the top of this function intentionally.
-                        // For relay nodes: the op state was already consumed by
-                        // process_message, so the tx sits in under_progress until
-                        // the 5× TTL cutoff cleans it up. The originator recovers
-                        // independently via its own speculative retry (ACK_TIMEOUT
-                        // or PROGRESS_TIMEOUT in the GC task).
-                        tracing::warn!(
-                            %tx_id, %target, error = %e,
-                            "Response send failed — originator will retry via speculative path"
-                        );
-                        return Err(e);
-                    }
-                }
-            } else {
-                op_manager.completed(tx_id);
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Send a message to a peer, optionally followed by stream data.
-///
-/// Extracts the repeated send-with-optional-stream pattern from `handle_op_result`.
-async fn send_with_stream<CB: NetworkBridge>(
-    network_bridge: &mut CB,
-    target: SocketAddr,
-    msg: NetMessage,
-    stream_data: Option<(crate::transport::peer_connection::StreamId, bytes::Bytes)>,
-) -> Result<(), OpError> {
-    let id = *msg.id();
-    // Serialize metadata for embedding in fragment #1 (fix #2757)
-    let metadata = if stream_data.is_some() {
-        match bincode::serialize(&msg) {
-            Ok(bytes) => Some(bytes::Bytes::from(bytes)),
-            Err(e) => {
-                tracing::warn!(%id, error = %e, "Failed to serialize metadata for embedding");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    network_bridge.send(target, msg).await?;
-    if let Some((stream_id, data)) = stream_data {
-        tracing::debug!(%id, %stream_id, ?target, "sending stream data");
-        network_bridge
-            .send_stream(target, stream_id, data, metadata)
-            .await?;
-    }
-    Ok(())
-}
-
 #[must_use]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum OpEnum {
+    #[allow(dead_code)] // No constructor after #1454 phase 6; removed alongside ops.connect.
     Connect(Box<connect::ConnectOp>),
     // `Get` variant retired in #1454 phase 5 final (GET slice) together
     // with the `ops.get` DashMap. GET wire flows now run on task-per-tx
@@ -311,6 +50,7 @@ impl OpEnum {
         } {
             pub fn id(&self) -> &Transaction;
             pub fn outcome(&self) -> OpOutcome<'_>;
+            #[allow(dead_code)] // Removed alongside `OpEnum::Connect` in the follow-up DashMap slice.
             pub fn finalized(&self) -> bool;
             pub fn to_host_result(&self) -> HostResult;
         }
@@ -375,8 +115,12 @@ pub(crate) enum OpError {
     NotificationError,
     #[error("notification channel error: {0}")]
     NotificationChannelError(String),
+    // Orphan after #1454 phase 6 (no remaining producers); kept in
+    // case a future re-introduction of an Op trait wants them back.
+    #[allow(dead_code)]
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
+    #[allow(dead_code)]
     #[error("op not present: {0}")]
     OpNotPresent(Transaction),
     #[error("op not available")]

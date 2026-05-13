@@ -38,11 +38,7 @@ use crate::{
     contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
-    operations::{
-        OpEnum, OpError, OpOutcome,
-        connect::{self, ConnectOp},
-        get, put, subscribe, update,
-    },
+    operations::{OpEnum, OpError, OpOutcome, connect, get, put, subscribe, update},
     ring::{Location, PeerKeyLocation},
     router::{RouteEvent, RouteOutcome},
     tracing::{EventRegister, NetEventLog, NetEventRegister},
@@ -53,9 +49,7 @@ use crate::{
 };
 use freenet_stdlib::client_api::DelegateRequest;
 use serde::{Deserialize, Serialize};
-use tracing::Instrument;
 
-use crate::operations::handle_op_request;
 pub(crate) use network_bridge::{
     ConnectionError, EventLoopNotificationsSender, NetworkBridge, OpExecutionPayload,
 };
@@ -749,13 +743,6 @@ where
     }
 }
 
-/// Returns the exponential backoff delay for the given retry attempt.
-///
-/// Starts at 5ms and doubles each attempt, capped at 1000ms.
-fn op_retry_backoff(attempt: usize) -> Duration {
-    Duration::from_millis((5u64 << attempt.min(8)).min(1_000))
-}
-
 /// Forward an inbound reply directly to the awaiting
 /// [`OpCtx::send_and_await`][ocxawait] caller.
 ///
@@ -840,43 +827,13 @@ fn fill_connect_response_acceptor_addr(
     }
 }
 
-/// If `op_result` indicates the operation completed and a
-/// `pending_op_result` callback is wired, forward `reply` to the
-/// awaiting caller of [`crate::operations::OpCtx::send_and_await`].
-///
-/// # Channel safety
-///
-/// Uses `try_send` on the bounded capacity-1 channel created by
-/// `OpCtx::send_and_await`. The callback fires at most once per
-/// transaction (the `is_operation_completed` guard plus the
-/// `completed`/`under_progress` dedup sets in `OpManager` short-circuit
-/// subsequent messages), so `try_send` cannot fail with `Full` — only
-/// `Closed` when the receiver was dropped. See
-/// `.claude/rules/channel-safety.md`.
-fn forward_pending_op_result_if_completed(
-    op_result: &Result<Option<OpEnum>, OpError>,
-    pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
-    reply: NetMessage,
-) {
-    if !is_operation_completed(op_result) {
-        return;
-    }
-    let Some(callback) = pending_op_result else {
-        return;
-    };
-    let tx_id = *reply.id();
-    if let Err(err) = callback.try_send(reply) {
-        tracing::error!(%err, %tx_id, "Failed to send message to executor");
-    }
-}
-
 /// Pure network message processing for V1 messages (no client concerns)
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_return)]
 async fn handle_pure_network_message_v1<CB>(
     msg: NetMessageV1,
     source_addr: Option<std::net::SocketAddr>,
     op_manager: Arc<OpManager>,
-    mut conn_manager: CB,
+    conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
 ) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
@@ -892,732 +849,620 @@ where
         ))
         .await;
 
-    const MAX_RETRIES: usize = 15usize;
-    for i in 0..MAX_RETRIES {
-        let tx = Some(*msg.id());
-        tracing::debug!(?tx, "Processing pure network operation, iteration: {i}");
+    let tx = Some(*msg.id());
+    tracing::debug!(?tx, "Processing pure network operation");
 
-        match msg {
-            NetMessageV1::Connect(ref op) => {
-                // CONNECT reply forwarding: the joiner expects fan-in
-                // (up to `target_connections` `Response`s over time).
-                // The waiter (`OpCtx::send_and_collect_replies`) has a
-                // multi-reply receiver, so this bypass forwards every
-                // non-`Request` variant without short-circuiting after
-                // the first hit.
-                //
-                // `Request` is NEVER forwarded here: it spawns a relay
-                // driver via the dispatch gate below.
-                if matches!(
-                    op,
-                    connect::ConnectMsg::Response { .. }
-                        | connect::ConnectMsg::Rejected { .. }
-                        | connect::ConnectMsg::ObservedAddress { .. }
-                        | connect::ConnectMsg::ConnectFailed { .. }
+    match msg {
+        NetMessageV1::Connect(ref op) => {
+            // CONNECT reply forwarding: the joiner expects fan-in
+            // (up to `target_connections` `Response`s over time).
+            // The waiter (`OpCtx::send_and_collect_replies`) has a
+            // multi-reply receiver, so this bypass forwards every
+            // non-`Request` variant without short-circuiting after
+            // the first hit.
+            //
+            // `Request` is NEVER forwarded here: it spawns a relay
+            // driver via the dispatch gate below.
+            if matches!(
+                op,
+                connect::ConnectMsg::Response { .. }
+                    | connect::ConnectMsg::Rejected { .. }
+                    | connect::ConnectMsg::ObservedAddress { .. }
+                    | connect::ConnectMsg::ConnectFailed { .. }
+            ) {
+                let forwarded_op = fill_connect_response_acceptor_addr(op.clone(), source_addr);
+                if try_forward_task_per_tx_reply(
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Connect(forwarded_op)),
+                    "connect",
                 ) {
-                    let forwarded_op = fill_connect_response_acceptor_addr(op.clone(), source_addr);
-                    if try_forward_task_per_tx_reply(
-                        pending_op_result.as_ref(),
-                        NetMessage::V1(NetMessageV1::Connect(forwarded_op)),
-                        "connect",
-                    ) {
+                    return Ok(None);
+                }
+            }
+
+            // Relay-CONNECT dispatch: fresh inbound `Request` with
+            // a real upstream address and no running relay driver
+            // spawns `start_relay_connect`. The driver owns the
+            // entire transaction lifetime in task locals. The
+            // `active_relay_connect_txs` check dedups against
+            // GC-spawned retries and duplicate Requests.
+            //
+            // `source_addr.is_none()` (originator loopback) cannot
+            // reach this branch — the reply bypass above handles
+            // joiner-side replies first. Originator state lives in
+            // `start_client_connect` task locals; there is no
+            // joiner-side legacy state machine.
+            if let connect::ConnectMsg::Request { id, payload } = op {
+                if let Some(upstream_addr) = source_addr {
+                    if !op_manager.active_relay_connect_txs.contains(id) {
+                        if let Err(err) = connect::op_ctx_task::start_relay_connect(
+                            op_manager.clone(),
+                            *id,
+                            payload.clone(),
+                            upstream_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %upstream_addr,
+                                error = %err,
+                                "CONNECT relay dispatch: start_relay_connect failed"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            tx = %id,
+                            %upstream_addr,
+                            "CONNECT: duplicate Request, relay driver already running"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        tx = %id,
+                        "CONNECT: Request without source_addr ignored (no legacy joiner path)"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    tx = %op.id(),
+                    ?op,
+                    "CONNECT: non-Request variant ignored \
+                     (Response/Rejected/ObservedAddress/ConnectFailed already handled by bypass)"
+                );
+            }
+            return Ok(None);
+        }
+        NetMessageV1::Put(ref op) => {
+            // Forward only **terminal** Response/ResponseStreaming
+            // messages to the originator's awaiting task via the
+            // bypass. Non-terminal messages (Request,
+            // RequestStreaming, ForwardingAck) must NOT be
+            // forwarded: they would fill the capacity-1 reply
+            // channel and cause `classify_reply` to fail.
+            if matches!(
+                op,
+                put::PutMsg::Response { .. } | put::PutMsg::ResponseStreaming { .. }
+            ) && try_forward_task_per_tx_reply(
+                pending_op_result.as_ref(),
+                NetMessage::V1(NetMessageV1::Put((*op).clone())),
+                "put",
+            ) {
+                return Ok(None);
+            }
+
+            // Relay PUT dispatch. `start_relay_put` handles
+            // non-streaming Request (with upgrade-on-forward to
+            // streaming when payload > threshold);
+            // `start_relay_put_streaming` handles direct
+            // `RequestStreaming` inbound. `ForwardingAck` is a
+            // no-op kept for backward compatibility.
+            //
+            // Originator loopback: `start_client_put`'s
+            // `send_and_await(target=None)` arrives with
+            // `source_addr=None`. Map to `upstream_addr=own_addr`
+            // so the same driver handles both relay hops and
+            // originator loopback.
+            let effective_upstream =
+                source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
+            if let Some(upstream_addr) = effective_upstream {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match op {
+                    put::PutMsg::Request {
+                        id,
+                        contract,
+                        related_contracts,
+                        value,
+                        htl,
+                        skip_list,
+                    } => {
+                        if let Err(err) = put::op_ctx_task::start_relay_put(
+                            op_manager.clone(),
+                            conn_manager.clone(),
+                            *id,
+                            contract.clone(),
+                            related_contracts.clone(),
+                            value.clone(),
+                            *htl,
+                            skip_list.clone(),
+                            upstream_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                contract = %contract.key(),
+                                error = %err,
+                                "PUT relay dispatch: start_relay_put failed"
+                            );
+                        }
+                    }
+                    put::PutMsg::RequestStreaming {
+                        id,
+                        stream_id,
+                        contract_key,
+                        total_size,
+                        htl,
+                        skip_list,
+                        subscribe,
+                    } => {
+                        if let Err(err) = put::op_ctx_task::start_relay_put_streaming(
+                            op_manager.clone(),
+                            conn_manager.clone(),
+                            *id,
+                            *stream_id,
+                            *contract_key,
+                            *total_size,
+                            *htl,
+                            skip_list.clone(),
+                            *subscribe,
+                            upstream_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                contract = %contract_key,
+                                error = %err,
+                                "PUT relay dispatch: start_relay_put_streaming failed"
+                            );
+                        }
+                    }
+                    _ => {
+                        tracing::debug!(
+                            tx = %op.id(),
+                            ?op,
+                            "PUT: non-dispatch variant ignored \
+                             (Response/ResponseStreaming already handled \
+                             by bypass; ForwardingAck is no-op)"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    tx = %op.id(),
+                    ?op,
+                    "PUT: no own_addr available — pre-handshake \
+                     message ignored"
+                );
+            }
+            return Ok(None);
+        }
+        NetMessageV1::Get(ref op) => {
+            // Forward only **terminal** Response/ResponseStreaming
+            // messages to the originator's awaiting task. Other
+            // variants must NOT be forwarded — they would fill the
+            // capacity-1 reply channel.
+            if matches!(
+                op,
+                get::GetMsg::Response { .. } | get::GetMsg::ResponseStreaming { .. }
+            ) && try_forward_task_per_tx_reply(
+                pending_op_result.as_ref(),
+                NetMessage::V1(NetMessageV1::Get((*op).clone())),
+                "get",
+            ) {
+                return Ok(None);
+            }
+
+            // Relay GET dispatch. Originator loopback
+            // (`source_addr=None`) is mapped to
+            // `upstream_addr=own_addr` so the same `start_relay_get`
+            // driver handles both relay hops and loopback.
+            let effective_upstream =
+                source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
+            if let Some(upstream_addr) = effective_upstream {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match op {
+                    get::GetMsg::Request {
+                        id,
+                        instance_id,
+                        fetch_contract,
+                        htl,
+                        visited,
+                        subscribe,
+                    } => {
+                        if let Err(err) = get::op_ctx_task::start_relay_get(
+                            op_manager.clone(),
+                            *id,
+                            *instance_id,
+                            *htl,
+                            upstream_addr,
+                            visited.clone(),
+                            *fetch_contract,
+                            *subscribe,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %instance_id,
+                                error = %err,
+                                "GET relay dispatch: start_relay_get failed"
+                            );
+                        }
+                    }
+                    _ => {
+                        tracing::debug!(
+                            tx = %op.id(),
+                            ?op,
+                            "GET: non-dispatch variant ignored \
+                             (Response/ResponseStreaming already handled \
+                             by bypass; ForwardingAck is no-op; \
+                             ResponseStreamingAck handled by stream layer)"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    tx = %op.id(),
+                    ?op,
+                    "GET: no own_addr available — pre-handshake \
+                     message ignored"
+                );
+            }
+            return Ok(None);
+        }
+        NetMessageV1::Update(ref op) => {
+            // UPDATE is fire-and-forget end-to-end — no upstream
+            // reply to await. For relay hops
+            // (`source_addr.is_some()`) dispatch the matching
+            // driver and return. `source_addr.is_none()` would
+            // mean an internal caller; there are none, so the else
+            // branch logs and drops.
+            if let Some(sender_addr) = source_addr {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match op {
+                    update::UpdateMsg::RequestUpdate {
+                        id,
+                        key,
+                        related_contracts,
+                        value,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_request_update(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            related_contracts.clone(),
+                            value.clone(),
+                            sender_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_request_update failed"
+                            );
+                        }
+                        return Ok(None);
+                    }
+                    update::UpdateMsg::BroadcastTo {
+                        id,
+                        key,
+                        payload,
+                        sender_summary_bytes,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_broadcast_to(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            payload.clone(),
+                            sender_summary_bytes.clone(),
+                            sender_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_broadcast_to failed"
+                            );
+                        }
+                        return Ok(None);
+                    }
+                    // Streaming relay UPDATE: claim stream → assemble
+                    // → apply → BroadcastStateChange fans out.
+                    update::UpdateMsg::RequestUpdateStreaming {
+                        id,
+                        key,
+                        stream_id,
+                        total_size,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_request_update_streaming(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            *stream_id,
+                            *total_size,
+                            sender_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_request_update_streaming failed"
+                            );
+                        }
+                        return Ok(None);
+                    }
+                    update::UpdateMsg::BroadcastToStreaming {
+                        id,
+                        key,
+                        stream_id,
+                        total_size,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_broadcast_to_streaming(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            *stream_id,
+                            *total_size,
+                            sender_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_broadcast_to_streaming failed"
+                            );
+                        }
                         return Ok(None);
                     }
                 }
-
-                // Relay-CONNECT dispatch: fresh inbound `Request` with
-                // a real upstream address and no in-flight `ConnectOp`
-                // or running relay driver spawns `start_relay_connect`.
-                // The driver owns the entire transaction lifetime in
-                // task locals. Negative checks dedup against GC-spawned
-                // retries and duplicate Requests.
-                //
-                // `source_addr.is_none()` (originator loopback) cannot
-                // reach this branch — the reply bypass above handles
-                // joiner-side replies first.
-                if let connect::ConnectMsg::Request { id, payload } = op {
-                    if let Some(upstream_addr) = source_addr {
-                        if !op_manager.has_connect_op(id)
-                            && !op_manager.active_relay_connect_txs.contains(id)
-                        {
-                            if let Err(err) = connect::op_ctx_task::start_relay_connect(
-                                op_manager.clone(),
-                                *id,
-                                payload.clone(),
-                                upstream_addr,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    %upstream_addr,
-                                    error = %err,
-                                    "CONNECT relay dispatch: start_relay_connect failed"
-                                );
-                            }
-                            return Ok(None);
-                        }
-                    }
-                }
-
-                let parent_span = tracing::Span::current();
-                let span = tracing::info_span!(
-                    parent: parent_span,
-                    "handle_connect_op_request",
-                    transaction = %msg.id(),
-                    tx_type = %msg.id().transaction_type()
-                );
-                let op_result = handle_op_request::<ConnectOp, _>(
-                    &op_manager,
-                    &mut conn_manager,
-                    op,
-                    source_addr,
-                )
-                .instrument(span)
-                .await;
-
-                // Handle pending operation results (network concern)
-                forward_pending_op_result_if_completed(
-                    &op_result,
-                    pending_op_result.as_ref(),
-                    NetMessage::V1(NetMessageV1::Connect((*op).clone())),
-                );
-
-                if let Err(OpError::OpNotAvailable(state)) = &op_result {
-                    match state {
-                        OpNotAvailable::Running => {
-                            let delay = op_retry_backoff(i);
-                            tracing::debug!(
-                                delay_ms = delay.as_millis() as u64,
-                                attempt = i,
-                                "Pure network: Operation still running, backing off"
-                            );
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        OpNotAvailable::Completed => {
-                            tracing::debug!(
-                                tx = %msg.id(),
-                                tx_type = ?msg.id().transaction_type(),
-                                "Pure network: Operation already completed"
-                            );
-                            return Ok(None);
-                        }
-                    }
-                }
-
-                return handle_pure_network_result(
-                    tx,
-                    op_result,
-                    &op_manager,
-                    &mut *event_listener,
-                )
-                .await;
-            }
-            NetMessageV1::Put(ref op) => {
-                // Forward only **terminal** Response/ResponseStreaming
-                // messages to the originator's awaiting task via the
-                // bypass. Non-terminal messages (Request,
-                // RequestStreaming, ForwardingAck) must NOT be
-                // forwarded: they would fill the capacity-1 reply
-                // channel and cause `classify_reply` to fail.
-                if matches!(
-                    op,
-                    put::PutMsg::Response { .. } | put::PutMsg::ResponseStreaming { .. }
-                ) && try_forward_task_per_tx_reply(
-                    pending_op_result.as_ref(),
-                    NetMessage::V1(NetMessageV1::Put((*op).clone())),
-                    "put",
-                ) {
-                    return Ok(None);
-                }
-
-                // Relay PUT dispatch. `start_relay_put` handles
-                // non-streaming Request (with upgrade-on-forward to
-                // streaming when payload > threshold);
-                // `start_relay_put_streaming` handles direct
-                // `RequestStreaming` inbound. `ForwardingAck` is a
-                // no-op kept for backward compatibility.
-                //
-                // Originator loopback: `start_client_put`'s
-                // `send_and_await(target=None)` arrives with
-                // `source_addr=None`. Map to `upstream_addr=own_addr`
-                // so the same driver handles both relay hops and
-                // originator loopback.
-                let effective_upstream =
-                    source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
-                if let Some(upstream_addr) = effective_upstream {
-                    #[allow(clippy::wildcard_enum_match_arm)]
-                    match op {
-                        put::PutMsg::Request {
-                            id,
-                            contract,
-                            related_contracts,
-                            value,
-                            htl,
-                            skip_list,
-                        } => {
-                            if let Err(err) = put::op_ctx_task::start_relay_put(
-                                op_manager.clone(),
-                                conn_manager.clone(),
-                                *id,
-                                contract.clone(),
-                                related_contracts.clone(),
-                                value.clone(),
-                                *htl,
-                                skip_list.clone(),
-                                upstream_addr,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    contract = %contract.key(),
-                                    error = %err,
-                                    "PUT relay dispatch: start_relay_put failed"
-                                );
-                            }
-                        }
-                        put::PutMsg::RequestStreaming {
-                            id,
-                            stream_id,
-                            contract_key,
-                            total_size,
-                            htl,
-                            skip_list,
-                            subscribe,
-                        } => {
-                            if let Err(err) = put::op_ctx_task::start_relay_put_streaming(
-                                op_manager.clone(),
-                                conn_manager.clone(),
-                                *id,
-                                *stream_id,
-                                *contract_key,
-                                *total_size,
-                                *htl,
-                                skip_list.clone(),
-                                *subscribe,
-                                upstream_addr,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    contract = %contract_key,
-                                    error = %err,
-                                    "PUT relay dispatch: start_relay_put_streaming failed"
-                                );
-                            }
-                        }
-                        _ => {
-                            tracing::debug!(
-                                tx = %op.id(),
-                                ?op,
-                                "PUT: non-dispatch variant ignored \
-                                 (Response/ResponseStreaming already handled \
-                                 by bypass; ForwardingAck is no-op)"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::debug!(
-                        tx = %op.id(),
-                        ?op,
-                        "PUT: no own_addr available — pre-handshake \
-                         message ignored"
-                    );
-                }
-                return Ok(None);
-            }
-            NetMessageV1::Get(ref op) => {
-                // Forward only **terminal** Response/ResponseStreaming
-                // messages to the originator's awaiting task. Other
-                // variants must NOT be forwarded — they would fill the
-                // capacity-1 reply channel.
-                if matches!(
-                    op,
-                    get::GetMsg::Response { .. } | get::GetMsg::ResponseStreaming { .. }
-                ) && try_forward_task_per_tx_reply(
-                    pending_op_result.as_ref(),
-                    NetMessage::V1(NetMessageV1::Get((*op).clone())),
-                    "get",
-                ) {
-                    return Ok(None);
-                }
-
-                // Relay GET dispatch. Originator loopback
-                // (`source_addr=None`) is mapped to
-                // `upstream_addr=own_addr` so the same `start_relay_get`
-                // driver handles both relay hops and loopback.
-                let effective_upstream =
-                    source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
-                if let Some(upstream_addr) = effective_upstream {
-                    #[allow(clippy::wildcard_enum_match_arm)]
-                    match op {
-                        get::GetMsg::Request {
-                            id,
-                            instance_id,
-                            fetch_contract,
-                            htl,
-                            visited,
-                            subscribe,
-                        } => {
-                            if let Err(err) = get::op_ctx_task::start_relay_get(
-                                op_manager.clone(),
-                                *id,
-                                *instance_id,
-                                *htl,
-                                upstream_addr,
-                                visited.clone(),
-                                *fetch_contract,
-                                *subscribe,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    %instance_id,
-                                    error = %err,
-                                    "GET relay dispatch: start_relay_get failed"
-                                );
-                            }
-                        }
-                        _ => {
-                            tracing::debug!(
-                                tx = %op.id(),
-                                ?op,
-                                "GET: non-dispatch variant ignored \
-                                 (Response/ResponseStreaming already handled \
-                                 by bypass; ForwardingAck is no-op; \
-                                 ResponseStreamingAck handled by stream layer)"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::debug!(
-                        tx = %op.id(),
-                        ?op,
-                        "GET: no own_addr available — pre-handshake \
-                         message ignored"
-                    );
-                }
-                return Ok(None);
-            }
-            NetMessageV1::Update(ref op) => {
-                // UPDATE is fire-and-forget end-to-end — no upstream
-                // reply to await. For relay hops
-                // (`source_addr.is_some()`) dispatch the matching
-                // driver and return. `source_addr.is_none()` would
-                // mean an internal caller; there are none, so the else
-                // branch logs and drops.
-                if let Some(sender_addr) = source_addr {
-                    #[allow(clippy::wildcard_enum_match_arm)]
-                    match op {
-                        update::UpdateMsg::RequestUpdate {
-                            id,
-                            key,
-                            related_contracts,
-                            value,
-                        } => {
-                            if let Err(err) = update::op_ctx_task::start_relay_request_update(
-                                op_manager.clone(),
-                                *id,
-                                *key,
-                                related_contracts.clone(),
-                                value.clone(),
-                                sender_addr,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    %key,
-                                    error = %err,
-                                    "UPDATE relay dispatch: start_relay_request_update failed"
-                                );
-                            }
-                            return Ok(None);
-                        }
-                        update::UpdateMsg::BroadcastTo {
-                            id,
-                            key,
-                            payload,
-                            sender_summary_bytes,
-                        } => {
-                            if let Err(err) = update::op_ctx_task::start_relay_broadcast_to(
-                                op_manager.clone(),
-                                *id,
-                                *key,
-                                payload.clone(),
-                                sender_summary_bytes.clone(),
-                                sender_addr,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    %key,
-                                    error = %err,
-                                    "UPDATE relay dispatch: start_relay_broadcast_to failed"
-                                );
-                            }
-                            return Ok(None);
-                        }
-                        // Streaming relay UPDATE: claim stream → assemble
-                        // → apply → BroadcastStateChange fans out.
-                        update::UpdateMsg::RequestUpdateStreaming {
-                            id,
-                            key,
-                            stream_id,
-                            total_size,
-                        } => {
-                            if let Err(err) =
-                                update::op_ctx_task::start_relay_request_update_streaming(
-                                    op_manager.clone(),
-                                    *id,
-                                    *key,
-                                    *stream_id,
-                                    *total_size,
-                                    sender_addr,
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    %key,
-                                    error = %err,
-                                    "UPDATE relay dispatch: start_relay_request_update_streaming failed"
-                                );
-                            }
-                            return Ok(None);
-                        }
-                        update::UpdateMsg::BroadcastToStreaming {
-                            id,
-                            key,
-                            stream_id,
-                            total_size,
-                        } => {
-                            if let Err(err) =
-                                update::op_ctx_task::start_relay_broadcast_to_streaming(
-                                    op_manager.clone(),
-                                    *id,
-                                    *key,
-                                    *stream_id,
-                                    *total_size,
-                                    sender_addr,
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    %key,
-                                    error = %err,
-                                    "UPDATE relay dispatch: start_relay_broadcast_to_streaming failed"
-                                );
-                            }
-                            return Ok(None);
-                        }
-                    }
-                } else {
-                    tracing::debug!(
-                        tx = %op.id(),
-                        ?op,
-                        "UPDATE: internal-source variant ignored"
-                    );
-                }
-                return Ok(None);
-            }
-            NetMessageV1::Subscribe(ref op) => {
-                // Forward only **terminal** Response messages to the
-                // originator's awaiting task. Other variants must NOT
-                // be forwarded — they would fill the capacity-1 reply
-                // channel.
-                if matches!(op, subscribe::SubscribeMsg::Response { .. })
-                    && try_forward_task_per_tx_reply(
-                        pending_op_result.as_ref(),
-                        NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
-                        "subscribe",
-                    )
-                {
-                    return Ok(None);
-                }
-
-                // Relay SUBSCRIBE dispatch. Originator loopback
-                // (`source_addr=None`) is mapped to
-                // `upstream_addr=own_addr` so the same
-                // `start_relay_subscribe` driver handles both.
-                let effective_upstream =
-                    source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
-                if let Some(upstream_addr) = effective_upstream {
-                    #[allow(clippy::wildcard_enum_match_arm)]
-                    match op {
-                        subscribe::SubscribeMsg::Request {
-                            id,
-                            instance_id,
-                            htl,
-                            visited,
-                            is_renewal,
-                        } => {
-                            if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
-                                op_manager.clone(),
-                                *id,
-                                *instance_id,
-                                *htl,
-                                visited.clone(),
-                                *is_renewal,
-                                upstream_addr,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    tx = %id,
-                                    %instance_id,
-                                    error = %err,
-                                    "SUBSCRIBE relay dispatch: start_relay_subscribe failed"
-                                );
-                            }
-                        }
-                        subscribe::SubscribeMsg::Unsubscribe { id, instance_id } => {
-                            subscribe::handle_unsubscribe_inbound(
-                                &op_manager,
-                                *id,
-                                *instance_id,
-                                source_addr,
-                            )
-                            .await;
-                        }
-                        _ => {
-                            // Response handled by bypass above;
-                            // ForwardingAck is a wire-only telemetry
-                            // hook (#3570) with no state mutation.
-                            tracing::debug!(
-                                tx = %op.id(),
-                                ?op,
-                                "SUBSCRIBE: non-dispatch variant ignored \
-                                 (Response already handled by bypass; \
-                                 ForwardingAck is no-op)"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::debug!(
-                        tx = %op.id(),
-                        ?op,
-                        "SUBSCRIBE: no own_addr available — pre-handshake \
-                         message ignored"
-                    );
-                }
-                return Ok(None);
-            }
-            // Non-transactional message types: process once and return immediately.
-            // These must NOT fall through to the post-loop "Dropping message" warning,
-            // which is only meant for operation retry exhaustion.
-            NetMessageV1::NeighborHosting { ref message } => {
-                let Some(source) = source_addr else {
-                    tracing::warn!(
-                        "Received NeighborHosting message without source address (pure network)"
-                    );
-                    return Ok(None);
-                };
+            } else {
                 tracing::debug!(
-                    from = %source,
-                    "Processing NeighborHosting message (pure network)"
+                    tx = %op.id(),
+                    ?op,
+                    "UPDATE: internal-source variant ignored"
                 );
-
-                // Note: In the simplified architecture (2026-01 refactor), we no longer
-                // attempt to establish subscriptions based on HostingAnnounce messages.
-                // Update propagation uses the neighbor hosting manager directly, and subscriptions
-                // are lease-based with automatic expiry.
-
-                // Resolve source SocketAddr to TransportPublicKey for neighbor hosting
-                let source_pub_key = op_manager
-                    .ring
-                    .connection_manager
-                    .get_peer_by_addr(source)
-                    .map(|pkl| pkl.pub_key().clone());
-                let Some(source_pub_key) = source_pub_key else {
-                    tracing::debug!(
-                        %source,
-                        "NeighborHosting: could not resolve source addr to pub_key, skipping"
-                    );
-                    return Ok(None);
-                };
-                let result = op_manager
-                    .neighbor_hosting
-                    .handle_message(&source_pub_key, message.clone());
-                if let Some(response) = result.response {
-                    // Send response back to sender
-                    let response_msg =
-                        NetMessage::V1(NetMessageV1::NeighborHosting { message: response });
-                    if let Err(err) = conn_manager.send(source, response_msg).await {
-                        tracing::error!(%err, %source, "Failed to send NeighborHosting response");
-                    }
-                }
-                // Proactive state sync: broadcast our state for shared contracts
-                // so the neighbor gets current state if they're stale after restart.
-                // Only sync contracts we're actively interested in (receiving updates
-                // or have downstream subscribers) — skip cached-only contracts.
-                for instance_id in result.overlapping_contracts {
-                    if let Some((key, state)) =
-                        get_contract_state_by_id(&op_manager, &instance_id).await
-                    {
-                        if !op_manager.ring.is_receiving_updates(&key)
-                            && !op_manager.ring.has_downstream_subscribers(&key)
-                        {
-                            continue;
-                        }
-                        tracing::debug!(
-                            contract = %key,
-                            peer = %source_pub_key,
-                            "Proximity cache overlap — syncing state to neighbor"
-                        );
-                        if let Err(e) = op_manager
-                            .notify_node_event(NodeEvent::SyncStateToPeer {
-                                key,
-                                new_state: state,
-                                target: source,
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                contract = %instance_id,
-                                error = %e,
-                                "Failed to emit SyncStateToPeer for proximity sync"
-                            );
-                        }
-                    }
-                }
-                return Ok(None);
             }
-            NetMessageV1::InterestSync { ref message } => {
-                let Some(source) = source_addr else {
-                    tracing::warn!("Received InterestSync message without source address");
-                    return Ok(None);
-                };
-                tracing::debug!(
-                    from = %source,
-                    "Processing InterestSync message"
-                );
-
-                // Handle interest synchronization for delta-based updates
-                if let Some(response) =
-                    handle_interest_sync_message(&op_manager, source, message.clone()).await
-                {
-                    let response_msg =
-                        NetMessage::V1(NetMessageV1::InterestSync { message: response });
-                    if let Err(err) = conn_manager.send(source, response_msg).await {
-                        tracing::error!(%err, %source, "Failed to send InterestSync response");
-                    }
-                }
-                return Ok(None);
-            }
-            NetMessageV1::ReadyState { ready } => {
-                let Some(source) = source_addr else {
-                    tracing::warn!("Received ReadyState message without source address");
-                    return Ok(None);
-                };
-                if ready {
-                    op_manager.ring.connection_manager.mark_peer_ready(source);
-                } else {
-                    op_manager
-                        .ring
-                        .connection_manager
-                        .mark_peer_not_ready(source);
-                }
-                tracing::debug!(
-                    from = %source,
-                    ready,
-                    "Processed ReadyState from peer"
-                );
-                return Ok(None);
-            }
-            NetMessageV1::Aborted(tx) => {
-                tracing::debug!(
-                    %tx,
-                    tx_type = ?tx.transaction_type(),
-                    "Received Aborted message, delegating to handle_aborted_op"
-                );
-                // Empty gateways: Aborted messages arrive over p2p connections, not
-                // from the gateway join path. The gateways list is only used by
-                // Connect retries; other operation types ignore it entirely.
-                if let Err(err) = handle_aborted_op(tx, &op_manager, &[]).await {
-                    tracing::error!(
-                        %tx,
-                        error = %err,
-                        "Error handling aborted operation"
-                    );
-                }
-                return Ok(None);
-            }
+            return Ok(None);
         }
-    }
+        NetMessageV1::Subscribe(ref op) => {
+            // Forward only **terminal** Response messages to the
+            // originator's awaiting task. Other variants must NOT
+            // be forwarded — they would fill the capacity-1 reply
+            // channel.
+            if matches!(op, subscribe::SubscribeMsg::Response { .. })
+                && try_forward_task_per_tx_reply(
+                    pending_op_result.as_ref(),
+                    NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
+                    "subscribe",
+                )
+            {
+                return Ok(None);
+            }
 
-    // If we reach here, retries were exhausted waiting for a concurrent operation to finish
-    tracing::warn!(
-        tx = %msg.id(),
-        tx_type = ?msg.id().transaction_type(),
-        "Dropping message after {MAX_RETRIES} retry attempts (operation busy)"
-    );
-    Ok(None)
-}
-
-/// Pure network result handling - no client notification logic
-async fn handle_pure_network_result(
-    tx: Option<Transaction>,
-    op_result: Result<Option<crate::operations::OpEnum>, OpError>,
-    _op_manager: &Arc<OpManager>,
-    _event_listener: &mut dyn NetEventRegister,
-) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError> {
-    tracing::debug!("Pure network result handling for transaction: {:?}", tx);
-
-    match &op_result {
-        Ok(Some(_op_res)) => {
-            // Log network operation completion
+            // Relay SUBSCRIBE dispatch. Originator loopback
+            // (`source_addr=None`) is mapped to
+            // `upstream_addr=own_addr` so the same
+            // `start_relay_subscribe` driver handles both.
+            let effective_upstream =
+                source_addr.or_else(|| op_manager.ring.connection_manager.get_own_addr());
+            if let Some(upstream_addr) = effective_upstream {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match op {
+                    subscribe::SubscribeMsg::Request {
+                        id,
+                        instance_id,
+                        htl,
+                        visited,
+                        is_renewal,
+                    } => {
+                        if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
+                            op_manager.clone(),
+                            *id,
+                            *instance_id,
+                            *htl,
+                            visited.clone(),
+                            *is_renewal,
+                            upstream_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %instance_id,
+                                error = %err,
+                                "SUBSCRIBE relay dispatch: start_relay_subscribe failed"
+                            );
+                        }
+                    }
+                    subscribe::SubscribeMsg::Unsubscribe { id, instance_id } => {
+                        subscribe::handle_unsubscribe_inbound(
+                            &op_manager,
+                            *id,
+                            *instance_id,
+                            source_addr,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        // Response handled by bypass above;
+                        // ForwardingAck is a wire-only telemetry
+                        // hook (#3570) with no state mutation.
+                        tracing::debug!(
+                            tx = %op.id(),
+                            ?op,
+                            "SUBSCRIBE: non-dispatch variant ignored \
+                             (Response already handled by bypass; \
+                             ForwardingAck is no-op)"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    tx = %op.id(),
+                    ?op,
+                    "SUBSCRIBE: no own_addr available — pre-handshake \
+                     message ignored"
+                );
+            }
+            return Ok(None);
+        }
+        // Non-transactional message types: process once and return immediately.
+        // These must NOT fall through to the post-loop "Dropping message" warning,
+        // which is only meant for operation retry exhaustion.
+        NetMessageV1::NeighborHosting { ref message } => {
+            let Some(source) = source_addr else {
+                tracing::warn!(
+                    "Received NeighborHosting message without source address (pure network)"
+                );
+                return Ok(None);
+            };
             tracing::debug!(
-                "Network operation completed successfully for transaction: {:?}",
-                tx
+                from = %source,
+                "Processing NeighborHosting message (pure network)"
             );
 
-            // Register completion event (pure network concern)
-            if let Some(tx_id) = tx {
-                // TODO: Register completion event properly
-                tracing::debug!("Network operation completed for transaction: {}", tx_id);
-            }
+            // Note: In the simplified architecture (2026-01 refactor), we no longer
+            // attempt to establish subscriptions based on HostingAnnounce messages.
+            // Update propagation uses the neighbor hosting manager directly, and subscriptions
+            // are lease-based with automatic expiry.
 
-            // TODO: Handle executor callbacks (network concern)
+            // Resolve source SocketAddr to TransportPublicKey for neighbor hosting
+            let source_pub_key = op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(source)
+                .map(|pkl| pkl.pub_key().clone());
+            let Some(source_pub_key) = source_pub_key else {
+                tracing::debug!(
+                    %source,
+                    "NeighborHosting: could not resolve source addr to pub_key, skipping"
+                );
+                return Ok(None);
+            };
+            let result = op_manager
+                .neighbor_hosting
+                .handle_message(&source_pub_key, message.clone());
+            if let Some(response) = result.response {
+                // Send response back to sender
+                let response_msg =
+                    NetMessage::V1(NetMessageV1::NeighborHosting { message: response });
+                if let Err(err) = conn_manager.send(source, response_msg).await {
+                    tracing::error!(%err, %source, "Failed to send NeighborHosting response");
+                }
+            }
+            // Proactive state sync: broadcast our state for shared contracts
+            // so the neighbor gets current state if they're stale after restart.
+            // Only sync contracts we're actively interested in (receiving updates
+            // or have downstream subscribers) — skip cached-only contracts.
+            for instance_id in result.overlapping_contracts {
+                if let Some((key, state)) =
+                    get_contract_state_by_id(&op_manager, &instance_id).await
+                {
+                    if !op_manager.ring.is_receiving_updates(&key)
+                        && !op_manager.ring.has_downstream_subscribers(&key)
+                    {
+                        continue;
+                    }
+                    tracing::debug!(
+                        contract = %key,
+                        peer = %source_pub_key,
+                        "Proximity cache overlap — syncing state to neighbor"
+                    );
+                    if let Err(e) = op_manager
+                        .notify_node_event(NodeEvent::SyncStateToPeer {
+                            key,
+                            new_state: state,
+                            target: source,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            contract = %instance_id,
+                            error = %e,
+                            "Failed to emit SyncStateToPeer for proximity sync"
+                        );
+                    }
+                }
+            }
+            return Ok(None);
         }
-        Ok(None) => {
-            tracing::debug!("Network operation returned no result");
-        }
-        Err(OpError::OpNotPresent(tx_id)) => {
-            // OpNotPresent means a response arrived for an operation that no longer exists.
-            // This is benign - it happens when:
-            // 1. An operation timed out before the response arrived
-            // 2. A late response arrives after a peer restart
-            // 3. The operation was already completed via another path
-            //
-            // We log at debug level and return Ok(None) to avoid propagating
-            // confusing "op not present" errors to clients.
+        NetMessageV1::InterestSync { ref message } => {
+            let Some(source) = source_addr else {
+                tracing::warn!("Received InterestSync message without source address");
+                return Ok(None);
+            };
             tracing::debug!(
-                tx = %tx_id,
-                "Network response arrived for non-existent operation (likely timed out or already completed)"
+                from = %source,
+                "Processing InterestSync message"
+            );
+
+            // Handle interest synchronization for delta-based updates
+            if let Some(response) =
+                handle_interest_sync_message(&op_manager, source, message.clone()).await
+            {
+                let response_msg = NetMessage::V1(NetMessageV1::InterestSync { message: response });
+                if let Err(err) = conn_manager.send(source, response_msg).await {
+                    tracing::error!(%err, %source, "Failed to send InterestSync response");
+                }
+            }
+            return Ok(None);
+        }
+        NetMessageV1::ReadyState { ready } => {
+            let Some(source) = source_addr else {
+                tracing::warn!("Received ReadyState message without source address");
+                return Ok(None);
+            };
+            if ready {
+                op_manager.ring.connection_manager.mark_peer_ready(source);
+            } else {
+                op_manager
+                    .ring
+                    .connection_manager
+                    .mark_peer_not_ready(source);
+            }
+            tracing::debug!(
+                from = %source,
+                ready,
+                "Processed ReadyState from peer"
             );
             return Ok(None);
         }
-        Err(e) => {
-            tracing::error!("Network operation failed: {}", e);
-            // TODO: Register error event properly
-            if let Some(tx_id) = tx {
-                tracing::debug!(
-                    "Network operation failed for transaction: {} with error: {}",
-                    tx_id,
-                    e
-                );
-            }
+        NetMessageV1::Aborted(tx) => {
+            // No-op after #1454 phase 6 retired the legacy mediator:
+            // CONNECT abort retry depended on `pop`-ing `OpEnum::Connect`
+            // from a DashMap that no production code writes to anymore.
+            // GET/PUT/UPDATE/SUBSCRIBE drivers own their own cancellation
+            // surface (`result_router_tx` publication is the externally
+            // observable result). Senders of `Aborted` come only from
+            // drivers themselves and are handled in-driver via the bypass.
+            tracing::debug!(
+                %tx,
+                tx_type = ?tx.transaction_type(),
+                "Received Aborted message — driver owns cancellation, ignoring"
+            );
+            Ok(None)
         }
     }
-
-    op_result
 }
 
 /// Handle incoming InterestSync messages for delta-based state synchronization.
@@ -2216,108 +2061,28 @@ pub async fn subscribe_with_id(
     subscribe::start_client_subscribe(op_manager, instance_id, client_tx).await
 }
 
-async fn handle_aborted_op(
+/// Handle a transaction whose work is being abandoned (transport
+/// handshake failure, orphaned-on-peer-prune, or a peer-sent `Aborted`
+/// wire message). After #1454 phase 6 retired the legacy `Operation`
+/// mediator the function has no work to do: every op type owns its own
+/// cancellation surface in the task-per-tx driver, and the CONNECT
+/// retry-via-gateway branch is driven by `start_client_connect` /
+/// `initial_join_procedure` rather than by a DashMap entry.
+///
+/// Retained as a no-op so the call sites in `p2p_protoc.rs`
+/// (orphaned-on-prune + transport handshake failure) keep compiling
+/// while the centralised abort path is unwired. Will be deleted in
+/// the follow-up slice once those call sites are removed.
+pub(crate) async fn handle_aborted_op(
     tx: Transaction,
-    op_manager: &OpManager,
-    gateways: &[PeerKeyLocation],
+    _op_manager: &OpManager,
+    _gateways: &[PeerKeyLocation],
 ) -> Result<(), OpError> {
-    use crate::util::IterExt;
-    match tx.transaction_type() {
-        TransactionType::Connect => {
-            // attempt to establish a connection failed, this could be a fatal error since the node
-            // is useless without connecting to the network, we will retry with exponential backoff
-            match op_manager.pop(&tx) {
-                Ok(Some(OpEnum::Connect(op)))
-                    if op_manager.ring.open_connections()
-                        < op_manager.ring.connection_manager.min_connections =>
-                {
-                    let gateway = op.gateway().cloned();
-                    if let Some(gateway) = gateway {
-                        // Clean up phantom location_for_peer entry left by should_accept's
-                        // record_pending_location (#3088). Without this, the gateway appears
-                        // permanently connected and initial_join_procedure never retries it.
-                        if let Some(peer_addr) = gateway.peer_addr.as_known() {
-                            op_manager
-                                .ring
-                                .connection_manager
-                                .prune_in_transit_connection(*peer_addr);
-
-                            let backoff_duration = {
-                                let mut backoff = op_manager.gateway_backoff.lock();
-                                backoff.record_failure(*peer_addr);
-                                backoff.remaining_backoff(*peer_addr)
-                            };
-
-                            if let Some(duration) = backoff_duration {
-                                // Cap the wait at GATEWAY_BACKOFF_POLL_CAP when the
-                                // node already has ring connections, matching the
-                                // policy in initial_join_procedure (issue #3304).
-                                // ±20% jitter to prevent thundering herd.
-                                let open_conns = op_manager.ring.open_connections();
-                                let effective = if open_conns > 0 {
-                                    let jitter_ms = crate::config::GlobalRng::random_range(
-                                        0u64..(connect::GATEWAY_BACKOFF_POLL_CAP.as_millis() / 5)
-                                            as u64,
-                                    );
-                                    let cap = connect::GATEWAY_BACKOFF_POLL_CAP.mul_f64(0.8)
-                                        + Duration::from_millis(jitter_ms);
-                                    duration.min(cap)
-                                } else {
-                                    duration
-                                };
-                                tracing::info!(
-                                    gateway = %gateway,
-                                    backoff_secs = duration.as_secs(),
-                                    effective_wait_secs = effective.as_secs(),
-                                    open_connections = open_conns,
-                                    "Gateway connection failed, waiting before retry"
-                                );
-                                // Use select! so suspend/isolation recovery can
-                                // wake us immediately via gateway_backoff_cleared,
-                                // matching the pattern in initial_join_procedure.
-                                tokio::select! {
-                                    _ = tokio::time::sleep(effective) => {},
-                                    _ = op_manager.gateway_backoff_cleared.notified() => {
-                                        tracing::info!(
-                                            gateway = %gateway,
-                                            "Gateway backoff cleared externally, retrying immediately"
-                                        );
-                                    },
-                                }
-                            }
-                        }
-
-                        tracing::debug!("Retrying connection to gateway {}", gateway);
-                        connect::join_ring_request(&gateway, op_manager, None).await?;
-                    }
-                }
-                Ok(Some(OpEnum::Connect(op))) => {
-                    // Clean up phantom location_for_peer entry (#3088)
-                    if let Some(peer_addr) = op.get_next_hop_addr() {
-                        op_manager
-                            .ring
-                            .connection_manager
-                            .prune_in_transit_connection(peer_addr);
-                    }
-                    if op_manager.ring.open_connections() == 0 && op_manager.ring.is_gateway() {
-                        tracing::warn!("Retrying joining the ring with an other gateway");
-                        if let Some(gateway) = gateways.iter().shuffle().next() {
-                            connect::join_ring_request(gateway, op_manager, None).await?
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        TransactionType::Get
-        | TransactionType::Put
-        | TransactionType::Update
-        | TransactionType::Subscribe => {
-            // No DashMap entry: each driver owns abort handling
-            // through its own cancellation surface. `result_router_tx`
-            // publication is the only externally observable result.
-        }
-    }
+    tracing::debug!(
+        %tx,
+        tx_type = ?tx.transaction_type(),
+        "handle_aborted_op: no-op after #1454 phase 6 (driver-owned cancellation)"
+    );
     Ok(())
 }
 
@@ -2483,20 +2248,6 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
     }
 }
 
-/// Trait to determine if an operation has completed, regardless of its specific type.
-pub trait IsOperationCompleted {
-    /// Returns true if the operation has completed (successfully or with error)
-    fn is_completed(&self) -> bool;
-}
-
-impl IsOperationCompleted for OpEnum {
-    fn is_completed(&self) -> bool {
-        match self {
-            OpEnum::Connect(op) => op.is_completed(),
-        }
-    }
-}
-
 /// Classify a `(TransactionType, OpOutcome)` pair into an optional `OpType` and success flag
 /// for dashboard recording. Returns `(None, false)` for CONNECT transactions (not contract ops).
 ///
@@ -2548,21 +2299,11 @@ fn classify_op_outcome(
     }
 }
 
-/// Check if an operation result indicates completion
-pub fn is_operation_completed(op_result: &Result<Option<OpEnum>, OpError>) -> bool {
-    match op_result {
-        // If we got an OpEnum, check its specific completion status using the trait
-        Ok(Some(op)) => op.is_completed(),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
-    use crate::operations::OpError;
     use rstest::rstest;
 
     // Hostname resolution tests
@@ -2745,17 +2486,6 @@ mod tests {
         assert_eq!(init_peer.location, location);
     }
 
-    // is_operation_completed tests - parametrized
-    #[rstest]
-    #[case::with_none(Ok(None), false)]
-    #[case::with_running_error(Err(OpError::OpNotAvailable(super::OpNotAvailable::Running)), false)]
-    fn test_is_operation_completed(
-        #[case] result: Result<Option<OpEnum>, OpError>,
-        #[case] expected: bool,
-    ) {
-        assert_eq!(is_operation_completed(&result), expected);
-    }
-
     // classify_op_outcome tests
     mod classify_op_outcome_tests {
         use super::super::{classify_op_outcome, network_status::OpType};
@@ -2804,139 +2534,19 @@ mod tests {
         }
     }
 
-    // Tests for `forward_pending_op_result_if_completed`.
+    // Tests for `try_forward_task_per_tx_reply`.
     //
-    // Exercises the callback-forwarding helper used by every branch
-    // of `handle_pure_network_message_v1`. It drives the
-    // `pending_op_result` channel from a completed op result back to
-    // a caller of `OpCtx::send_and_await`. These tests verify the
-    // helper forwards for every op variant and short-circuits in the
-    // negative cases.
+    // The bypass routes a reply directly to an awaiting
+    // `OpCtx::send_and_await` caller. These tests cover the
+    // helper's contract; end-to-end branch coverage lives in the
+    // per-driver tests.
     mod callback_forward_tests {
-        use super::super::{
-            OpError, OpNotAvailable, forward_pending_op_result_if_completed,
-            try_forward_task_per_tx_reply,
-        };
+        use super::super::try_forward_task_per_tx_reply;
         use crate::message::{MessageStats, NetMessage, NetMessageV1, Transaction};
-        use crate::operations::OpEnum;
-        use crate::operations::connect::{ConnectMsg, ConnectOp, ConnectState};
-
-        fn completed_connect_op() -> ConnectOp {
-            ConnectOp::with_state(ConnectState::Completed)
-        }
+        use crate::operations::connect::ConnectMsg;
 
         fn dummy_reply() -> NetMessage {
-            // We don't care about the payload — the helper only looks at
-            // `NetMessage::id()` for logging. Use the tx-only `Aborted`
-            // variant to avoid building an entire ConnectMsg payload.
             NetMessage::V1(NetMessageV1::Aborted(Transaction::new::<ConnectMsg>()))
-        }
-
-        #[tokio::test]
-        async fn forwards_reply_when_completed_and_sender_present() {
-            let op = completed_connect_op();
-            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
-            let reply = dummy_reply();
-            let expected_id = *reply.id();
-
-            forward_pending_op_result_if_completed(&op_result, Some(&tx), reply);
-
-            let received = rx.try_recv().expect("helper should forward the reply");
-            assert_eq!(*received.id(), expected_id);
-        }
-
-        #[tokio::test]
-        async fn no_forward_when_sender_absent() {
-            // Helper must not panic / block when no pending_op_result sender is wired.
-            let op = completed_connect_op();
-            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
-
-            forward_pending_op_result_if_completed(&op_result, None, dummy_reply());
-            // Nothing to assert beyond "did not panic".
-        }
-
-        #[tokio::test]
-        async fn no_forward_when_op_not_completed() {
-            // `Ok(None)` and OpError variants should not trigger a send even if
-            // a sender is present. This is the guard that keeps in-progress
-            // ops (e.g. `SendAndContinue`) from prematurely firing the callback.
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
-
-            let ok_none: Result<Option<OpEnum>, OpError> = Ok(None);
-            forward_pending_op_result_if_completed(&ok_none, Some(&tx), dummy_reply());
-            assert!(rx.try_recv().is_err(), "Ok(None) must not forward");
-
-            let err_running: Result<Option<OpEnum>, OpError> =
-                Err(OpError::OpNotAvailable(OpNotAvailable::Running));
-            forward_pending_op_result_if_completed(&err_running, Some(&tx), dummy_reply());
-            assert!(
-                rx.try_recv().is_err(),
-                "OpNotAvailable::Running must not forward"
-            );
-
-            let err_completed: Result<Option<OpEnum>, OpError> =
-                Err(OpError::OpNotAvailable(OpNotAvailable::Completed));
-            forward_pending_op_result_if_completed(&err_completed, Some(&tx), dummy_reply());
-            assert!(
-                rx.try_recv().is_err(),
-                "OpNotAvailable::Completed must not forward (no OpEnum payload)"
-            );
-        }
-
-        #[tokio::test]
-        async fn no_forward_when_op_in_progress() {
-            // A non-completed op state (WaitingForResponses) must not trigger
-            // the callback even though the op exists — this is the core guard
-            // that keeps mid-flight operations from prematurely terminating
-            // an `OpCtx::send_and_await` round-trip.
-            use crate::operations::connect::JoinerState;
-            use std::collections::HashSet;
-            use tokio::time::Instant;
-
-            let waiting = ConnectState::WaitingForResponses(JoinerState {
-                target_connections: 1,
-                observed_address: None,
-                accepted: HashSet::new(),
-                last_progress: Instant::now(),
-                started_without_address: true,
-            });
-            let op = ConnectOp::with_state(waiting);
-            assert!(
-                !op.is_completed(),
-                "precondition: WaitingForResponses must not be completed"
-            );
-            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
-            forward_pending_op_result_if_completed(&op_result, Some(&tx), dummy_reply());
-            assert!(
-                rx.try_recv().is_err(),
-                "in-progress op must not forward to pending_op_result"
-            );
-        }
-
-        #[tokio::test]
-        async fn no_hang_when_receiver_dropped() {
-            // Regression guard for the `try_send` channel-safety choice:
-            // if the `OpCtx::send_and_await` caller drops its receiver
-            // (e.g. cancelled, timed out) before the op completes, the
-            // reply side must not block the pure-network-message handler.
-            // With `try_send` the send fails with `Closed` and we log;
-            // with `.send().await` it would have succeeded but stranded
-            // the message. Either way the handler must make progress —
-            // the test asserts the helper returns promptly (the
-            // `#[tokio::test]` runtime would hang the whole test process
-            // on regression).
-            let op = completed_connect_op();
-            let op_result = Ok(Some(OpEnum::Connect(Box::new(op))));
-
-            let (tx, rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
-            drop(rx);
-
-            forward_pending_op_result_if_completed(&op_result, Some(&tx), dummy_reply());
-            // Returning at all is the assertion.
         }
 
         // ───────────────────────────────────────────────────────────
@@ -3024,22 +2634,28 @@ mod tests {
             const SOURCE: &str = include_str!("node.rs");
 
             // Locate the SUBSCRIBE branch of handle_pure_network_message_v1.
-            let subscribe_branch_anchor = "NetMessageV1::Subscribe(ref op) => {";
-            let branch_start = SOURCE.find(subscribe_branch_anchor).expect(
+            // Use a runtime-built needle so this test cannot self-match
+            // its own anchor string in the test source below.
+            let subscribe_branch_anchor: String =
+                ["NetMessageV1::", "Subscribe(ref op)", " => {"].concat();
+            let branch_start = SOURCE.find(&subscribe_branch_anchor).expect(
                 "SUBSCRIBE branch of handle_pure_network_message_v1 not found; \
                          the match arm has been renamed or moved — update this regression guard",
             );
 
-            // Slice a window large enough to contain the branch body up
-            // to (and including) the first `handle_op_request` call.
+            // Bound the window at the end-of-SUBSCRIBE-arm sentinel
+            // ("Non-transactional message types:" header that precedes
+            // the next match arm). After #1454 phase 6 there is no
+            // more `handle_op_request` to anchor against.
+            let next_variant_anchor: String = ["// Non-transactional", " message types:"].concat();
             let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<subscribe::SubscribeOp, _>")
-                .expect("SUBSCRIBE branch no longer calls handle_op_request — update guard")
+                .find(&next_variant_anchor)
+                .expect("end of SUBSCRIBE branch not found — update guard")
                 + branch_start;
             let window = &SOURCE[branch_start..window_end];
 
-            // The bypass helper MUST be invoked BEFORE the legacy
-            // handle_op_request call. If this assertion fails, either:
+            // The bypass helper MUST be invoked in the SUBSCRIBE branch.
+            // If this assertion fails, either:
             //   (a) the bypass was removed (regression — re-add it), or
             //   (b) the branch was restructured (update this guard).
             assert!(
@@ -3054,8 +2670,14 @@ mod tests {
             // filter, non-terminal messages like ForwardingAck fill the
             // capacity-1 reply channel and cause UnexpectedOpState
             // (commit 5cb6f37c).
+            let response_gate: String = [
+                "matches!(op, ",
+                "subscribe::SubscribeMsg::Response { .. }",
+                ")",
+            ]
+            .concat();
             assert!(
-                window.contains("matches!(op, subscribe::SubscribeMsg::Response { .. })"),
+                window.contains(&response_gate),
                 "SUBSCRIBE branch bypass is not gated on Response-only. \
                  Non-terminal messages (ForwardingAck, Unsubscribe) must NOT \
                  be forwarded to the task-per-tx channel — they would fill \
@@ -3895,9 +3517,10 @@ mod tests {
                  the match arm has been renamed or moved — update this guard",
             );
 
+            let next_variant_anchor = "NetMessageV1::Put(ref op) => {";
             let window_end = SOURCE[branch_start..]
-                .find("handle_op_request::<ConnectOp, _>")
-                .expect("Connect branch no longer calls handle_op_request — update guard")
+                .find(next_variant_anchor)
+                .expect("end of Connect branch not found — update guard")
                 + branch_start;
 
             &SOURCE[branch_start..window_end]
@@ -3955,7 +3578,7 @@ mod tests {
             // Locate the bypass `matches!` block specifically — the
             // dispatch gate further down does destructure
             // `ConnectMsg::Request { id, payload }`, which is fine.
-            let bypass_anchor = "if matches!(\n                    op,";
+            let bypass_anchor = "if matches!(\n                op,";
             let bypass_start = window
                 .find(bypass_anchor)
                 .expect("bypass `matches!` block not found in Connect branch — guard outdated");
@@ -3987,8 +3610,9 @@ mod tests {
         }
 
         /// Relay dispatch must be gated on `source_addr.is_some()` so
-        /// originator loop-back from `start_client_connect` falls
-        /// through to legacy.
+        /// originator loop-back from `start_client_connect` (which
+        /// cannot happen for CONNECT, but the guard documents the
+        /// invariant) is dropped rather than spawning a self-loop.
         #[test]
         fn connect_relay_dispatch_gated_on_source_addr() {
             let window = connect_branch_window();
@@ -3996,33 +3620,12 @@ mod tests {
             let dispatch_pos = window
                 .find(dispatch_anchor)
                 .expect("start_relay_connect not found in Connect branch");
-            // Look at ~400 chars preceding the dispatch call for the gate.
             let gate_start = dispatch_pos.saturating_sub(500);
             let gate_window = &window[gate_start..dispatch_pos];
             assert!(
                 gate_window.contains("source_addr"),
-                "CONNECT relay dispatch is not gated on source_addr. \
-                 Originator loop-back (source_addr.is_none()) must fall \
-                 through to legacy or the bypass."
-            );
-        }
-
-        /// Relay dispatch must be guarded by `!has_connect_op(id)` so
-        /// that GC-spawned retries with a pre-existing ConnectOp fall
-        /// through to legacy.
-        #[test]
-        fn connect_relay_dispatch_guarded_by_has_connect_op() {
-            let window = connect_branch_window();
-            let dispatch_pos = window
-                .find("start_relay_connect(")
-                .expect("start_relay_connect not found in Connect branch");
-            let gate_start = dispatch_pos.saturating_sub(500);
-            let gate_window = &window[gate_start..dispatch_pos];
-            assert!(
-                gate_window.contains("has_connect_op"),
-                "CONNECT relay dispatch is not guarded by has_connect_op. \
-                 Pre-registered ConnectOps (GC-spawned retries) must fall \
-                 through to legacy handle_op_request."
+                "CONNECT relay dispatch is not gated on source_addr — \
+                 originator loop-back must NOT spawn a relay driver."
             );
         }
 

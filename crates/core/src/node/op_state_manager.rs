@@ -57,6 +57,7 @@ macro_rules! check_id_op {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)] // Removed alongside `OpManager::pop` in the follow-up DashMap slice.
 pub(crate) enum OpNotAvailable {
     #[error("operation running")]
     Running,
@@ -571,6 +572,11 @@ impl OpManager {
             .await
     }
 
+    // Orphan after #1454 phase 6 (CONNECT impl Operation retirement).
+    // No production caller after the legacy mediator was deleted; kept
+    // alongside `Ops::connect` / `has_connect_op` until the DashMap is
+    // also removed in the follow-up slice.
+    #[allow(dead_code)]
     pub async fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
         // Check if operation is already completed - don't push back to HashMap
         if self.ops.completed.contains(&id) {
@@ -646,6 +652,10 @@ impl OpManager {
         None
     }
 
+    // Orphan after #1454 phase 6; only producer (the legacy
+    // `load_or_init` path) is gone. Removed alongside `Ops::connect`
+    // in the follow-up DashMap slice.
+    #[allow(dead_code)]
     pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
         if self.ops.completed.contains(id) {
             return Err(OpNotAvailable::Completed);
@@ -726,12 +736,11 @@ impl OpManager {
     // dispatch gates; gone with their DashMaps. Every wire variant
     // for those ops now spawns a driver unconditionally.
 
-    /// Relay CONNECT dispatch gate. `true` if a `ConnectOp` is
-    /// registered in `OpManager.ops.connect` for `id`. Used by
-    /// `node.rs` to distinguish a fresh inbound CONNECT Request
-    /// (no existing op → spawn the driver) from a within-relay
-    /// re-entry (existing op → fall through to legacy
-    /// `handle_op_request`).
+    // Orphan after the CONNECT legacy mediator was retired in #1454
+    // phase 6; the relay dispatch gate now relies solely on
+    // `active_relay_connect_txs`. Kept alongside `Ops::connect` until
+    // the DashMap is also removed in the follow-up slice.
+    #[allow(dead_code)]
     pub fn has_connect_op(&self, id: &Transaction) -> bool {
         self.ops.connect.contains_key(id)
     }
