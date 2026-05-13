@@ -49,9 +49,11 @@ impl OpEnum {
             OpEnum::Connect(op) => op,
         } {
             pub fn id(&self) -> &Transaction;
+            #[allow(dead_code)] // Pending removal alongside `OpEnum` itself in the mediator-retirement slice.
             pub fn outcome(&self) -> OpOutcome<'_>;
-            #[allow(dead_code)] // Removed alongside `OpEnum::Connect` in the follow-up DashMap slice.
+            #[allow(dead_code)]
             pub fn finalized(&self) -> bool;
+            #[allow(dead_code)]
             pub fn to_host_result(&self) -> HostResult;
         }
     }

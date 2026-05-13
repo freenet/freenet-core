@@ -16,7 +16,6 @@
 //! See [`../../architecture.md`](../../architecture.md) for a high-level overview of the node's role and the event loop interactions.
 
 use anyhow::Context;
-use either::Either;
 use freenet_stdlib::{
     client_api::{ClientRequest, ErrorKind},
     prelude::ContractInstanceId,
@@ -38,9 +37,8 @@ use crate::{
     contract::{Callback, ExecutorError, ExecutorToEventLoopChannel, NetworkContractHandler},
     local_node::Executor,
     message::{InnerMessage, NetMessage, NodeEvent, Transaction, TransactionType},
-    operations::{OpEnum, OpError, OpOutcome, connect, get, put, subscribe, update},
+    operations::{OpError, connect, get, put, subscribe, update},
     ring::{Location, PeerKeyLocation},
-    router::{RouteEvent, RouteOutcome},
     tracing::{EventRegister, NetEventLog, NetEventRegister},
 };
 use crate::{
@@ -516,10 +514,10 @@ impl InitPeerNode {
 
 async fn report_result(
     tx: Option<Transaction>,
-    op_result: Result<Option<OpEnum>, OpError>,
+    op_result: Result<(), OpError>,
     op_manager: &OpManager,
-    executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
-    event_listener: &mut dyn NetEventRegister,
+    _executor_callback: Option<ExecutorToEventLoopChannel<Callback>>,
+    _event_listener: &mut dyn NetEventRegister,
 ) {
     // Add UPDATE-specific debug logging at the start
     if let Some(tx_id) = tx {
@@ -529,89 +527,14 @@ async fn report_result(
     }
 
     match op_result {
-        Ok(Some(op_res)) => {
-            // Send to result router (skip for sub-operations and subscription renewals)
-            if let Some(transaction) = tx {
-                // Sub-operations (e.g., Subscribe spawned by PUT) don't notify clients directly;
-                // the parent operation handles the client response.
-                if transaction.is_sub_operation() {
-                    tracing::debug!(
-                        tx = %transaction,
-                        "Skipping client notification for sub-operation"
-                    );
-                } else {
-                    let host_result = op_res.to_host_result();
-                    // Await result delivery to ensure the client receives the response
-                    // before the operation is considered complete. This prevents timeout
-                    // issues where the operation completes but the response hasn't been
-                    // delivered through the channel chain yet.
-                    op_manager.send_client_result(transaction, host_result);
-                }
-            }
-
-            // check operations.rs:handle_op_result to see what's the meaning of each state
-            // in case more cases want to be handled when feeding information to the OpManager
-
-            // Record operation result for dashboard stats
-            let (classified_op_type, classified_success) =
-                classify_op_outcome(op_res.id().transaction_type(), op_res.outcome());
-            if let Some(op_type) = classified_op_type {
-                network_status::record_op_result(op_type, classified_success);
-            }
-
-            let route_event = match op_res.outcome() {
-                OpOutcome::ContractOpSuccess {
-                    target_peer,
-                    contract_location,
-                    first_response_time,
-                    payload_size,
-                    payload_transfer_time,
-                } => Some(RouteEvent {
-                    peer: target_peer.clone(),
-                    contract_location,
-                    outcome: RouteOutcome::Success {
-                        time_to_response_start: first_response_time,
-                        payload_size,
-                        payload_transfer_time,
-                    },
-                    op_type: classified_op_type,
-                }),
-                OpOutcome::ContractOpSuccessUntimed {
-                    target_peer,
-                    contract_location,
-                } => Some(RouteEvent {
-                    peer: target_peer.clone(),
-                    contract_location,
-                    outcome: RouteOutcome::SuccessUntimed,
-                    op_type: classified_op_type,
-                }),
-                OpOutcome::ContractOpFailure {
-                    target_peer,
-                    contract_location,
-                } => Some(RouteEvent {
-                    peer: target_peer.clone(),
-                    contract_location,
-                    outcome: RouteOutcome::Failure,
-                    op_type: classified_op_type,
-                }),
-                OpOutcome::Incomplete | OpOutcome::Irrelevant => None,
-            };
-            if let Some(event) = route_event {
-                if let Some(log_event) =
-                    NetEventLog::route_event(op_res.id(), &op_manager.ring, &event)
-                {
-                    event_listener
-                        .register_events(Either::Left(log_event))
-                        .await;
-                }
-                op_manager.ring.routing_finished(event);
-            }
-            if let Some(mut cb) = executor_callback {
-                cb.response(op_res).await;
-            }
-        }
-        Ok(None) => {
-            tracing::debug!(?tx, "No operation result found");
+        Ok(()) => {
+            // No legacy `OpEnum` to report. Task-per-tx drivers publish
+            // their own `HostResult` via `result_router_tx`, record
+            // route events through `record_relay_route_event` /
+            // `record_acceptor_outcome`, and handle dashboard
+            // classification inline. Nothing remains for this branch
+            // to do beyond the dispatch site's own logging.
+            tracing::debug!(?tx, "Network message dispatch finished");
         }
         Err(err) => {
             // Mark operation as completed and notify waiting clients of the error
@@ -724,7 +647,7 @@ async fn handle_pure_network_message<CB>(
     conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
-) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
+) -> Result<(), crate::node::OpError>
 where
     CB: NetworkBridge + Clone + 'static,
 {
@@ -836,7 +759,7 @@ async fn handle_pure_network_message_v1<CB>(
     conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
     pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
-) -> Result<Option<crate::operations::OpEnum>, crate::node::OpError>
+) -> Result<(), crate::node::OpError>
 where
     CB: NetworkBridge + Clone + 'static,
 {
@@ -876,7 +799,7 @@ where
                     NetMessage::V1(NetMessageV1::Connect(forwarded_op)),
                     "connect",
                 ) {
-                    return Ok(None);
+                    return Ok(());
                 }
             }
 
@@ -931,7 +854,7 @@ where
                      (Response/Rejected/ObservedAddress/ConnectFailed already handled by bypass)"
                 );
             }
-            return Ok(None);
+            return Ok(());
         }
         NetMessageV1::Put(ref op) => {
             // Forward only **terminal** Response/ResponseStreaming
@@ -948,7 +871,7 @@ where
                 NetMessage::V1(NetMessageV1::Put((*op).clone())),
                 "put",
             ) {
-                return Ok(None);
+                return Ok(());
             }
 
             // Relay PUT dispatch. `start_relay_put` handles
@@ -1046,7 +969,7 @@ where
                      message ignored"
                 );
             }
-            return Ok(None);
+            return Ok(());
         }
         NetMessageV1::Get(ref op) => {
             // Forward only **terminal** Response/ResponseStreaming
@@ -1061,7 +984,7 @@ where
                 NetMessage::V1(NetMessageV1::Get((*op).clone())),
                 "get",
             ) {
-                return Ok(None);
+                return Ok(());
             }
 
             // Relay GET dispatch. Originator loopback
@@ -1120,7 +1043,7 @@ where
                      message ignored"
                 );
             }
-            return Ok(None);
+            return Ok(());
         }
         NetMessageV1::Update(ref op) => {
             // UPDATE is fire-and-forget end-to-end — no upstream
@@ -1155,7 +1078,7 @@ where
                                 "UPDATE relay dispatch: start_relay_request_update failed"
                             );
                         }
-                        return Ok(None);
+                        return Ok(());
                     }
                     update::UpdateMsg::BroadcastTo {
                         id,
@@ -1180,7 +1103,7 @@ where
                                 "UPDATE relay dispatch: start_relay_broadcast_to failed"
                             );
                         }
-                        return Ok(None);
+                        return Ok(());
                     }
                     // Streaming relay UPDATE: claim stream → assemble
                     // → apply → BroadcastStateChange fans out.
@@ -1207,7 +1130,7 @@ where
                                 "UPDATE relay dispatch: start_relay_request_update_streaming failed"
                             );
                         }
-                        return Ok(None);
+                        return Ok(());
                     }
                     update::UpdateMsg::BroadcastToStreaming {
                         id,
@@ -1232,7 +1155,7 @@ where
                                 "UPDATE relay dispatch: start_relay_broadcast_to_streaming failed"
                             );
                         }
-                        return Ok(None);
+                        return Ok(());
                     }
                 }
             } else {
@@ -1242,7 +1165,7 @@ where
                     "UPDATE: internal-source variant ignored"
                 );
             }
-            return Ok(None);
+            return Ok(());
         }
         NetMessageV1::Subscribe(ref op) => {
             // Forward only **terminal** Response messages to the
@@ -1256,7 +1179,7 @@ where
                     "subscribe",
                 )
             {
-                return Ok(None);
+                return Ok(());
             }
 
             // Relay SUBSCRIBE dispatch. Originator loopback
@@ -1324,7 +1247,7 @@ where
                      message ignored"
                 );
             }
-            return Ok(None);
+            return Ok(());
         }
         // Non-transactional message types: process once and return immediately.
         // These must NOT fall through to the post-loop "Dropping message" warning,
@@ -1334,7 +1257,7 @@ where
                 tracing::warn!(
                     "Received NeighborHosting message without source address (pure network)"
                 );
-                return Ok(None);
+                return Ok(());
             };
             tracing::debug!(
                 from = %source,
@@ -1357,7 +1280,7 @@ where
                     %source,
                     "NeighborHosting: could not resolve source addr to pub_key, skipping"
                 );
-                return Ok(None);
+                return Ok(());
             };
             let result = op_manager
                 .neighbor_hosting
@@ -1404,12 +1327,12 @@ where
                     }
                 }
             }
-            return Ok(None);
+            return Ok(());
         }
         NetMessageV1::InterestSync { ref message } => {
             let Some(source) = source_addr else {
                 tracing::warn!("Received InterestSync message without source address");
-                return Ok(None);
+                return Ok(());
             };
             tracing::debug!(
                 from = %source,
@@ -1425,12 +1348,12 @@ where
                     tracing::error!(%err, %source, "Failed to send InterestSync response");
                 }
             }
-            return Ok(None);
+            return Ok(());
         }
         NetMessageV1::ReadyState { ready } => {
             let Some(source) = source_addr else {
                 tracing::warn!("Received ReadyState message without source address");
-                return Ok(None);
+                return Ok(());
             };
             if ready {
                 op_manager.ring.connection_manager.mark_peer_ready(source);
@@ -1445,7 +1368,7 @@ where
                 ready,
                 "Processed ReadyState from peer"
             );
-            return Ok(None);
+            return Ok(());
         }
         NetMessageV1::Aborted(tx) => {
             // No-op after #1454 phase 6 retired the legacy mediator:
@@ -1460,7 +1383,7 @@ where
                 tx_type = ?tx.transaction_type(),
                 "Received Aborted message — driver owns cancellation, ignoring"
             );
-            Ok(None)
+            Ok(())
         }
     }
 }
@@ -2248,56 +2171,10 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
     }
 }
 
-/// Classify a `(TransactionType, OpOutcome)` pair into an optional `OpType` and success flag
-/// for dashboard recording. Returns `(None, false)` for CONNECT transactions (not contract ops).
-///
-/// - `Irrelevant`: operation completed but without routing stats for this peer → success
-/// - `Incomplete`: operation never finalized → failure
-fn classify_op_outcome(
-    tx_type: TransactionType,
-    outcome: OpOutcome<'_>,
-) -> (Option<network_status::OpType>, bool) {
-    use network_status::OpType;
-    match (tx_type, outcome) {
-        (
-            TransactionType::Get,
-            OpOutcome::ContractOpSuccess { .. } | OpOutcome::ContractOpSuccessUntimed { .. },
-        ) => (Some(OpType::Get), true),
-        (TransactionType::Get, OpOutcome::ContractOpFailure { .. }) => (Some(OpType::Get), false),
-        (
-            TransactionType::Put,
-            OpOutcome::ContractOpSuccess { .. } | OpOutcome::ContractOpSuccessUntimed { .. },
-        ) => (Some(OpType::Put), true),
-        (TransactionType::Put, OpOutcome::ContractOpFailure { .. }) => (Some(OpType::Put), false),
-        (
-            TransactionType::Update,
-            OpOutcome::ContractOpSuccess { .. } | OpOutcome::ContractOpSuccessUntimed { .. },
-        ) => (Some(OpType::Update), true),
-        (TransactionType::Update, OpOutcome::ContractOpFailure { .. }) => {
-            (Some(OpType::Update), false)
-        }
-        (
-            TransactionType::Subscribe,
-            OpOutcome::ContractOpSuccess { .. } | OpOutcome::ContractOpSuccessUntimed { .. },
-        ) => (Some(OpType::Subscribe), true),
-        (TransactionType::Subscribe, OpOutcome::ContractOpFailure { .. }) => {
-            (Some(OpType::Subscribe), false)
-        }
-        // Irrelevant = completed successfully but without routing stats
-        // (e.g., UPDATE when stats.target is None, SUBSCRIBE when stats is None)
-        (TransactionType::Get, OpOutcome::Irrelevant) => (Some(OpType::Get), true),
-        (TransactionType::Put, OpOutcome::Irrelevant) => (Some(OpType::Put), true),
-        (TransactionType::Update, OpOutcome::Irrelevant) => (Some(OpType::Update), true),
-        (TransactionType::Subscribe, OpOutcome::Irrelevant) => (Some(OpType::Subscribe), true),
-        // Incomplete = operation never finalized
-        (TransactionType::Get, OpOutcome::Incomplete) => (Some(OpType::Get), false),
-        (TransactionType::Put, OpOutcome::Incomplete) => (Some(OpType::Put), false),
-        (TransactionType::Update, OpOutcome::Incomplete) => (Some(OpType::Update), false),
-        (TransactionType::Subscribe, OpOutcome::Incomplete) => (Some(OpType::Subscribe), false),
-        // CONNECT is not a contract operation
-        _ => (None, false),
-    }
-}
+// `classify_op_outcome` retired alongside the `OpEnum` mediator —
+// per-op success/failure recording is now done by drivers directly
+// via `record_relay_route_event` / `record_acceptor_outcome` and
+// dashboard counters in driver finalization paths.
 
 #[cfg(test)]
 mod tests {
@@ -2486,53 +2363,7 @@ mod tests {
         assert_eq!(init_peer.location, location);
     }
 
-    // classify_op_outcome tests
-    mod classify_op_outcome_tests {
-        use super::super::{classify_op_outcome, network_status::OpType};
-        use crate::message::TransactionType;
-        use crate::operations::OpOutcome;
-
-        #[test]
-        fn irrelevant_counted_as_success() {
-            let (op_type, success) =
-                classify_op_outcome(TransactionType::Update, OpOutcome::Irrelevant);
-            assert!(matches!(op_type, Some(OpType::Update)));
-            assert!(success);
-        }
-
-        #[test]
-        fn incomplete_counted_as_failure() {
-            let (op_type, success) =
-                classify_op_outcome(TransactionType::Get, OpOutcome::Incomplete);
-            assert!(matches!(op_type, Some(OpType::Get)));
-            assert!(!success);
-        }
-
-        #[test]
-        fn connect_skipped() {
-            let (op_type, _) = classify_op_outcome(TransactionType::Connect, OpOutcome::Irrelevant);
-            assert!(op_type.is_none());
-
-            let (op_type, _) = classify_op_outcome(TransactionType::Connect, OpOutcome::Incomplete);
-            assert!(op_type.is_none());
-        }
-
-        #[test]
-        fn subscribe_irrelevant_is_success() {
-            let (op_type, success) =
-                classify_op_outcome(TransactionType::Subscribe, OpOutcome::Irrelevant);
-            assert!(matches!(op_type, Some(OpType::Subscribe)));
-            assert!(success);
-        }
-
-        #[test]
-        fn put_incomplete_is_failure() {
-            let (op_type, success) =
-                classify_op_outcome(TransactionType::Put, OpOutcome::Incomplete);
-            assert!(matches!(op_type, Some(OpType::Put)));
-            assert!(!success);
-        }
-    }
+    // `classify_op_outcome` tests retired with the helper.
 
     // Tests for `try_forward_task_per_tx_reply`.
     //

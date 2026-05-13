@@ -679,6 +679,7 @@ impl Stream for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
 }
 
 impl ExecutorToEventLoopChannel<Callback> {
+    #[allow(dead_code)] // Pending removal alongside `OpEnum` in the mediator-retirement slice.
     pub async fn response(&mut self, result: OpEnum) {
         let tx_id = *result.id();
         if self.end.response_for_tx.send(result).await.is_err() {
@@ -692,6 +693,7 @@ impl ExecutorToEventLoopChannel<Callback> {
 
 pub(crate) struct Callback {
     /// sends the callback response to the executor
+    #[allow(dead_code)] // Pending removal alongside `OpEnum` in the mediator-retirement slice.
     response_for_tx: mpsc::Sender<OpEnum>,
 }
 
