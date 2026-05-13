@@ -98,7 +98,14 @@ jobs:
           sed "s/^version = \".*\"/version = \"$FDEV_VERSION\"/" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp
           mv crates/fdev/Cargo.toml.tmp crates/fdev/Cargo.toml
 
-          sed "s/freenet = { path = \"..\/core\", version = \".*\" }/freenet = { path = \"..\/core\", version = \"$VERSION\" }/" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp2
+          # Anchor on the version field, NOT a trailing ` }`. The line in
+          # crates/fdev/Cargo.toml carries a `, features = [...]` suffix so a
+          # pattern that requires the closing brace silently no-ops, leaving
+          # fdev's freenet-dep version pinned to the previous release (#4119).
+          # Mirror in `scripts/release.sh`; tests in
+          # `crates/fdev/tests/binstall_metadata.rs::release_sed_rewrite`
+          # (the `freenet_dep_*` cases) keep both copies in lockstep.
+          sed -E "s/(freenet = \\{ path = \"\\.\\.\\/core\", version = )\"[^\"]*\"/\\1\"$VERSION\"/" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp2
           mv crates/fdev/Cargo.toml.tmp2 crates/fdev/Cargo.toml
 
           # The fdev crate version diverged from the freenet release tag, so

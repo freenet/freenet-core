@@ -242,4 +242,117 @@ bin-dir = \"fdev.exe\"
         let after_second = run_sed(&[BRE_SCRIPT], &after_first);
         assert_eq!(after_first, after_second, "BRE rewrite must be idempotent");
     }
+
+    // Sed expressions that rewrite the `freenet = { path = "../core",
+    // version = "X.Y.Z", ... }` path-dep version inside fdev/Cargo.toml.
+    // Duplicated between `scripts/release.sh` (BRE) and
+    // `.github/workflows/release.yml` (ERE). Regression for issue #4119:
+    // the old ERE pattern tried to anchor on a trailing ` }`, which
+    // silently failed once the line grew a `, features = [...]` suffix
+    // and the freenet-dep version stayed pinned across releases.
+    const FREENET_DEP_BRE_SCRIPT: &str =
+        "s/\\(freenet = { path = \"..\\/core\", version = \\)\"[^\"]*\"/\\1\"NEW\"/";
+    const FREENET_DEP_ERE_SCRIPT: &str =
+        "s/(freenet = \\{ path = \"\\.\\.\\/core\", version = )\"[^\"]*\"/\\1\"NEW\"/";
+
+    const FREENET_DEP_FIXTURE_PLAIN: &str =
+        "freenet = { path = \"../core\", version = \"0.2.57\" }\n";
+    const FREENET_DEP_FIXTURE_WITH_FEATURES: &str =
+        "freenet = { path = \"../core\", version = \"0.2.57\", features = [\"testing\"] }\n";
+
+    fn expected_freenet_dep_plain() -> String {
+        FREENET_DEP_FIXTURE_PLAIN.replace("0.2.57", "NEW")
+    }
+
+    fn expected_freenet_dep_with_features() -> String {
+        FREENET_DEP_FIXTURE_WITH_FEATURES.replace("0.2.57", "NEW")
+    }
+
+    #[test]
+    fn release_sh_bre_rewrites_freenet_dep_plain() {
+        let out = run_sed(&[FREENET_DEP_BRE_SCRIPT], FREENET_DEP_FIXTURE_PLAIN);
+        assert_eq!(out, expected_freenet_dep_plain());
+    }
+
+    #[test]
+    fn release_sh_bre_rewrites_freenet_dep_with_features() {
+        // Regression for #4119: the path-dep line in fdev/Cargo.toml carries
+        // `features = ["testing"]`; the rewrite must succeed regardless of
+        // what trails after the version field.
+        let out = run_sed(&[FREENET_DEP_BRE_SCRIPT], FREENET_DEP_FIXTURE_WITH_FEATURES);
+        assert_eq!(out, expected_freenet_dep_with_features());
+    }
+
+    #[test]
+    fn release_yml_ere_rewrites_freenet_dep_plain() {
+        let out = run_sed(&["-E", FREENET_DEP_ERE_SCRIPT], FREENET_DEP_FIXTURE_PLAIN);
+        assert_eq!(out, expected_freenet_dep_plain());
+    }
+
+    #[test]
+    fn release_yml_ere_rewrites_freenet_dep_with_features() {
+        // Regression for #4119: the previous ERE anchored on a trailing
+        // ` }` and silently no-op'd against the `, features = [...]` suffix.
+        let out = run_sed(
+            &["-E", FREENET_DEP_ERE_SCRIPT],
+            FREENET_DEP_FIXTURE_WITH_FEATURES,
+        );
+        assert_eq!(out, expected_freenet_dep_with_features());
+    }
+
+    #[test]
+    fn release_sh_and_release_yml_freenet_dep_produce_identical_output() {
+        for fixture in [FREENET_DEP_FIXTURE_PLAIN, FREENET_DEP_FIXTURE_WITH_FEATURES] {
+            let bre_out = run_sed(&[FREENET_DEP_BRE_SCRIPT], fixture);
+            let ere_out = run_sed(&["-E", FREENET_DEP_ERE_SCRIPT], fixture);
+            assert_eq!(
+                bre_out, ere_out,
+                "scripts/release.sh and .github/workflows/release.yml must \
+                 produce identical freenet-dep rewrites — silent drift between \
+                 the two copies is what regressed #4119 in the first place"
+            );
+        }
+    }
+
+    #[test]
+    fn freenet_dep_rewrite_is_idempotent_when_version_unchanged() {
+        for fixture in [FREENET_DEP_FIXTURE_PLAIN, FREENET_DEP_FIXTURE_WITH_FEATURES] {
+            let after_first = run_sed(&[FREENET_DEP_BRE_SCRIPT], fixture);
+            let after_second = run_sed(&[FREENET_DEP_BRE_SCRIPT], &after_first);
+            assert_eq!(
+                after_first, after_second,
+                "freenet-dep BRE rewrite must be idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn fdev_cargo_toml_freenet_dep_line_is_rewritable() {
+        // Belt-and-braces: take the real fdev/Cargo.toml off disk and confirm
+        // the BRE and ERE rewrites both actually modify the version field.
+        // This is what release.sh / release.yml do at release time; a sed
+        // that silently no-ops here is what regressed #4119.
+        let manifest = std::fs::read_to_string("Cargo.toml")
+            .expect("fdev/Cargo.toml should be readable from the crate dir");
+        let bre_out = run_sed(&[FREENET_DEP_BRE_SCRIPT], &manifest);
+        assert_ne!(
+            bre_out, manifest,
+            "BRE rewrite must actually change the manifest — issue #4119 \
+             regressed because the pattern silently matched nothing"
+        );
+        assert!(
+            bre_out.contains("version = \"NEW\""),
+            "BRE rewrite must produce the new version literal"
+        );
+        let ere_out = run_sed(&["-E", FREENET_DEP_ERE_SCRIPT], &manifest);
+        assert_ne!(
+            ere_out, manifest,
+            "ERE rewrite must actually change the manifest — issue #4119 \
+             regressed because the pattern silently matched nothing"
+        );
+        assert!(
+            ere_out.contains("version = \"NEW\""),
+            "ERE rewrite must produce the new version literal"
+        );
+    }
 }
