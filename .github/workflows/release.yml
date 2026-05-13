@@ -35,6 +35,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      - name: Warn if RELEASE_PAT is not configured
+        env:
+          # Workflow secrets are not directly visible in `if:` expressions,
+          # so we expose RELEASE_PAT via env and check for emptiness inside
+          # the step. The value is never echoed.
+          RELEASE_PAT_PRESENT: ${{ secrets.RELEASE_PAT != '' }}
+        run: |
+          if [ "$RELEASE_PAT_PRESENT" != "true" ]; then
+            echo "::warning title=RELEASE_PAT not set::The release workflow can complete without RELEASE_PAT, but downstream workflows (CI on the bump PR, gateway-update.yml, release-announce.yml) will NOT fire automatically. GITHUB_TOKEN suppresses workflow-triggering events as an anti-recursion safeguard. Configure a RELEASE_PAT repo secret with 'repo' + 'workflow' scopes to make releases zero-touch. See issue #4118 and AGENTS.md → 'Release Workflow & RELEASE_PAT'."
+          else
+            echo "✅ RELEASE_PAT is configured. Downstream workflows will be triggered automatically."
+          fi
+
       - name: Validate version format
         id: validate
         run: |
