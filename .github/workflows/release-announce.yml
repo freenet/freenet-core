@@ -8,7 +8,7 @@
 #      MATRIX_ACCESS_TOKEN secrets.
 #
 #   2. The Freenet Official River room, by HMAC-signing a request to
-#      nova's release-agent at https://update.nova.locut.us/announce/river.
+#      nova's release-agent at https://nova.locut.us/release-agent/announce/river.
 #      The agent invokes `riverctl` locally as the user who owns the
 #      room signing key. Needs RELEASE_AGENT_HMAC_NOVA secret.
 #
@@ -154,13 +154,13 @@ jobs:
           SIG=$(printf '%s' "$BODY" \
             | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SECRET" \
             | awk '{print $NF}')
-          echo "Posting to https://update.nova.locut.us/announce/river"
+          echo "Posting to https://nova.locut.us/release-agent/announce/river"
           # riverctl can take up to ~180s on a cold cargo run; the agent's
           # internal probe is 1s and it returns 202 before the script
           # completes. The HTTP request itself returns fast.
           HTTP_STATUS=$(curl -sS -o /tmp/river-response.json -w '%{http_code}' \
             --connect-timeout 30 --max-time 30 \
-            -X POST 'https://update.nova.locut.us/announce/river' \
+            -X POST 'https://nova.locut.us/release-agent/announce/river' \
             -H 'Content-Type: application/json' \
             -H "X-Signature: $SIG" \
             --data-raw "$BODY")

@@ -76,3 +76,6 @@ worktrees/
 logs/
 .grepai/
 .codex
+
+# Local-only: release-agent binary staged for install.sh (built per-machine)
+scripts/release-agent/freenet-release-agent

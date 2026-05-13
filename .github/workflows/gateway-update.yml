@@ -93,15 +93,15 @@ jobs:
           # (no inputs available); honor explicit subset on workflow_dispatch.
           REQUESTED="${{ inputs.gateways || 'all' }}"
           if [[ "$REQUESTED" == "all" ]]; then
-            MATRIX='[{"name":"nova","url":"https://update.nova.locut.us"},{"name":"vega","url":"https://update.vega.locut.us"}]'
+            MATRIX='[{"name":"nova","url":"https://nova.locut.us/release-agent"},{"name":"vega","url":"http://vega.locut.us:9876"}]'
           else
             # Build the array by filtering the full list. Cheap, transparent,
             # easy to read in workflow logs.
             ITEMS="[]"
             for tag in $(echo "$REQUESTED" | tr ',' ' '); do
               case "$tag" in
-                nova) ITEMS=$(echo "$ITEMS" | jq -c '. + [{"name":"nova","url":"https://update.nova.locut.us"}]') ;;
-                vega) ITEMS=$(echo "$ITEMS" | jq -c '. + [{"name":"vega","url":"https://update.vega.locut.us"}]') ;;
+                nova) ITEMS=$(echo "$ITEMS" | jq -c '. + [{"name":"nova","url":"https://nova.locut.us/release-agent"}]') ;;
+                vega) ITEMS=$(echo "$ITEMS" | jq -c '. + [{"name":"vega","url":"http://vega.locut.us:9876"}]') ;;
                 *) echo "::error::Unknown gateway tag: $tag"; exit 1 ;;
               esac
             done
