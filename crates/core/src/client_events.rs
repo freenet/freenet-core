@@ -1472,8 +1472,7 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            // `subscribe_with_id` is client-initiated-only since #1454 Phase 2b;
-                            // no `is_renewal` parameter.
+                            // `subscribe_with_id` is client-initiated-only; no `is_renewal` parameter.
                             crate::node::subscribe_with_id(op_manager.clone(), key, None, Some(tx))
                                 .await
                                 .inspect_err(|err| {

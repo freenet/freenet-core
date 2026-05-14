@@ -17,10 +17,7 @@ use crate::{
 use crate::{
     client_events::{BoxedClient, combinator::ClientEventsCombinator},
     config::GlobalExecutor,
-    contract::{
-        self, ContractHandler, ContractHandlerChannel, ExecutorToEventLoopChannel,
-        NetworkEventListenerHalve, WaitingResolution, mediator_channels,
-    },
+    contract::{self, ContractHandler, ContractHandlerChannel, WaitingResolution},
     message::NodeEvent,
     node::NodeConfig,
     operations::connect,
@@ -37,7 +34,6 @@ pub(crate) struct NodeP2P {
     pub(super) location: Option<Location>,
     notification_channel: EventLoopNotificationsReceiver,
     client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
-    executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
     node_controller: tokio::sync::mpsc::Receiver<NodeEvent>,
     should_try_connect: bool,
     client_events_task: BoxFuture<'static, anyhow::Error>,
@@ -197,7 +193,6 @@ impl NodeP2P {
             self.op_manager.clone(),
             self.client_wait_for_transaction,
             self.notification_channel,
-            self.executor_listener,
             self.node_controller,
         );
 
@@ -424,14 +419,12 @@ impl NodeP2P {
         })
         .boxed();
 
-        let executor_listener = mediator_channels(op_manager.clone());
         Ok((
             NodeP2P {
                 conn_manager,
                 notification_channel,
                 client_wait_for_transaction: wait_for_event,
                 op_manager,
-                executor_listener,
                 node_controller: node_controller_rx,
                 should_try_connect: config.should_connect,
                 peer_id: None, // PeerId removed - using PeerKeyLocation instead

@@ -48,7 +48,7 @@ use super::{
 /// Test-only counter incremented every time a relay-CONNECT driver is
 /// spawned. Used by test_relay_driver_calls_per_op-style guards to
 /// confirm the dispatch site actually routed a fresh inbound Request
-/// through the task-per-tx driver vs. the legacy
+/// through the driver vs. the legacy
 /// `handle_op_request` path.
 #[cfg(any(test, feature = "testing"))]
 #[allow(dead_code)]
@@ -180,7 +180,7 @@ pub(crate) async fn start_client_connect(
         tx = %tx,
         target_connections,
         ttl,
-        "Initiating gateway connect (task-per-tx)"
+        "Initiating gateway connect"
     );
 
     let mut ctx = op_manager.op_ctx(tx);
@@ -594,7 +594,7 @@ pub(crate) async fn start_relay_connect(
             tx = %incoming_tx,
             %upstream_addr,
             phase = "relay_connect_dedup_reject",
-            "CONNECT relay (task-per-tx): duplicate Request for in-flight tx, dropping"
+            "CONNECT relay: duplicate Request for in-flight tx, dropping"
         );
         return Ok(());
     }
@@ -605,7 +605,7 @@ pub(crate) async fn start_relay_connect(
         ttl = payload.ttl,
         %upstream_addr,
         phase = "relay_connect_start",
-        "CONNECT relay (task-per-tx): spawning driver"
+        "CONNECT relay: spawning driver"
     );
 
     // Construct guard + bump counters BEFORE spawn so the dedup-set
@@ -642,7 +642,7 @@ async fn run_relay_connect(
             tx = %incoming_tx,
             error = %err,
             phase = "relay_connect_error",
-            "CONNECT relay (task-per-tx): driver returned error"
+            "CONNECT relay: driver returned error"
         );
     }
 
@@ -702,7 +702,7 @@ async fn drive_relay_connect(
                     tx = %incoming_tx,
                     desired_location = %state.request.desired_location,
                     %upstream_addr,
-                    "CONNECT relay (task-per-tx): gateway overloaded, rejecting request"
+                    "CONNECT relay: gateway overloaded, rejecting request"
                 );
                 if let Some(event) = NetEventLog::connect_rejected(
                     &incoming_tx,
@@ -802,7 +802,7 @@ async fn drive_relay_connect(
                                 tx = %incoming_tx,
                                 target = %addr,
                                 error = %e,
-                                "CONNECT relay (task-per-tx): failed to dispatch downstream Request"
+                                "CONNECT relay: failed to dispatch downstream Request"
                             );
                             None
                         }
@@ -812,7 +812,7 @@ async fn drive_relay_connect(
                     tracing::warn!(
                         tx = %incoming_tx,
                         next_peer = %next.pub_key(),
-                        "CONNECT relay (task-per-tx): next hop has no socket address; skipping forward"
+                        "CONNECT relay: next hop has no socket address; skipping forward"
                     );
                     None
                 }
@@ -876,7 +876,7 @@ async fn drive_relay_connect(
             tracing::debug!(
                 tx = %incoming_tx,
                 phase = "relay_connect_ttl_exit",
-                "CONNECT relay (task-per-tx): transaction timed out; exiting"
+                "CONNECT relay: transaction timed out; exiting"
             );
             return Ok(());
         }
@@ -892,7 +892,7 @@ async fn drive_relay_connect(
             other => {
                 tracing::warn!(
                     tx = %incoming_tx,
-                    "CONNECT relay (task-per-tx): unexpected message kind: {:?}",
+                    "CONNECT relay: unexpected message kind: {:?}",
                     other
                 );
                 continue;
@@ -915,7 +915,7 @@ async fn drive_relay_connect(
                     %upstream_addr,
                     acceptor_pub_key = %payload.acceptor.pub_key(),
                     forwarded_from = ?state.forwarded_to,
-                    "CONNECT relay (task-per-tx): forwarding Response upstream"
+                    "CONNECT relay: forwarding Response upstream"
                 );
                 let mut ctx = op_manager.op_ctx(incoming_tx);
                 ctx.send_fire_and_forget(
@@ -960,7 +960,7 @@ async fn drive_relay_connect(
                         tx = %incoming_tx,
                         failed_peer = ?failed_peer,
                         retry_peer = %peer.pub_key(),
-                        "CONNECT relay (task-per-tx): retrying with different uphill peer after rejection"
+                        "CONNECT relay: retrying with different uphill peer after rejection"
                     );
                     if let Some(addr) = peer.socket_addr() {
                         let mut ctx = op_manager.op_ctx(incoming_tx);
@@ -978,7 +978,7 @@ async fn drive_relay_connect(
                         tx = %incoming_tx,
                         failed_peer = ?failed_peer,
                         acceptor = %accept.response.acceptor.pub_key(),
-                        "CONNECT relay (task-per-tx): accepting locally after uphill rejection"
+                        "CONNECT relay: accepting locally after uphill rejection"
                     );
                     if let Some(event) = NetEventLog::connect_response_sent(
                         &incoming_tx,
@@ -1003,7 +1003,7 @@ async fn drive_relay_connect(
                         tx = %incoming_tx,
                         %upstream_addr,
                         failed_peer = ?failed_peer,
-                        "CONNECT relay (task-per-tx): forwarding rejection upstream (no retry peers)"
+                        "CONNECT relay: forwarding rejection upstream (no retry peers)"
                     );
                     if let Some(event) = NetEventLog::connect_rejected(
                         &incoming_tx,
@@ -1063,7 +1063,7 @@ async fn drive_relay_connect(
                                 tx = %incoming_tx,
                                 forwarded_to_addr = %fwd_addr,
                                 failed_acceptor = %failed_acceptor_addr,
-                                "CONNECT relay (task-per-tx): forwarding ConnectFailed downstream"
+                                "CONNECT relay: forwarding ConnectFailed downstream"
                             );
                             let mut ctx = op_manager.op_ctx(incoming_tx);
                             ctx.send_fire_and_forget(
@@ -1111,7 +1111,7 @@ async fn drive_relay_connect(
                         tx = %incoming_tx,
                         failed_acceptor = %failed_acceptor_addr,
                         retry_peer = %peer.pub_key(),
-                        "CONNECT relay (task-per-tx): re-routing to different peer after ConnectFailed"
+                        "CONNECT relay: re-routing to different peer after ConnectFailed"
                     );
                     if let Some(addr) = peer.socket_addr() {
                         let mut ctx = op_manager.op_ctx(incoming_tx);
@@ -1129,7 +1129,7 @@ async fn drive_relay_connect(
                         tx = %incoming_tx,
                         failed_acceptor = %failed_acceptor_addr,
                         acceptor = %accept.response.acceptor.pub_key(),
-                        "CONNECT relay (task-per-tx): accepting locally after ConnectFailed"
+                        "CONNECT relay: accepting locally after ConnectFailed"
                     );
                     if let Some(event) = NetEventLog::connect_response_sent(
                         &incoming_tx,
@@ -1154,7 +1154,7 @@ async fn drive_relay_connect(
                         tx = %incoming_tx,
                         %upstream_addr,
                         failed_acceptor = %failed_acceptor_addr,
-                        "CONNECT relay (task-per-tx): propagating ConnectFailed upstream (no re-route)"
+                        "CONNECT relay: propagating ConnectFailed upstream (no re-route)"
                     );
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
@@ -1175,7 +1175,7 @@ async fn drive_relay_connect(
                 // refactors notice.
                 tracing::warn!(
                     tx = %incoming_tx,
-                    "CONNECT relay (task-per-tx): unexpected Request on driver inbox; bypass logic regressed"
+                    "CONNECT relay: unexpected Request on driver inbox; bypass logic regressed"
                 );
             }
         }
@@ -1314,11 +1314,10 @@ mod tests {
         );
     }
 
-    /// Source-literal guard: relay driver runs the full re-entry
+    /// Source-literal guard: the relay driver runs the full re-entry
     /// state machine (Response/Rejected/ObservedAddress/ConnectFailed)
     /// on its inbox receiver. Removing any of these branches would
-    /// strand the corresponding re-entry on legacy `process_message`,
-    /// which is being retired in commit 4.
+    /// strand the corresponding re-entry.
     #[test]
     fn drive_relay_connect_handles_all_reentry_variants() {
         const SOURCE: &str = include_str!("op_ctx_task.rs");

@@ -90,7 +90,7 @@ pub mod dev_tool {
 
     // Test hooks: per-op driver call counters. Tests assert these
     // increment to confirm wire variants dispatch through their
-    // task-per-tx driver (not a local-cache shortcut or legacy path).
+    // driver (not a local-cache shortcut or legacy path).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::DRIVER_CALL_COUNT as GET_DRIVER_CALL_COUNT;
     #[cfg(any(test, feature = "testing"))]

@@ -38,15 +38,9 @@ use crate::transport::{
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
-    contract::{
-        ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
-        WaitingResolution,
-    },
+    contract::{ContractHandlerChannel, ExecutorTransactionStream, WaitingResolution},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
-    node::{
-        NetEventRegister, NodeConfig, OpManager, PeerId, handle_aborted_op,
-        process_message_decoupled,
-    },
+    node::{NetEventRegister, NodeConfig, OpManager, PeerId, process_message_decoupled},
     ring::{KnownPeerKeyLocation, PeerConnectionBackoff, PeerKeyLocation},
     tracing::NetEventLog,
 };
@@ -183,10 +177,9 @@ impl P2pBridge {
 
     /// Log transactions orphaned by a pruned peer connection.
     ///
-    /// Task-per-tx drivers own their own retry/cancellation surface
-    /// after #1454 — the orphan list is informational only, used by
-    /// callers to confirm prune occurred. No retry is dispatched
-    /// here.
+    /// Drivers own retry/cancellation; the orphan list is informational
+    /// only — used by callers to confirm prune occurred. No retry is
+    /// dispatched here.
     pub(crate) async fn handle_orphaned_transactions(
         &self,
         transactions: Vec<Transaction>,
@@ -608,14 +601,12 @@ impl P2pConnManager {
         op_manager: Arc<OpManager>,
         client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
         notification_channel: EventLoopNotificationsReceiver,
-        executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
         self.run_event_listener_with_socket::<UdpSocket>(
             op_manager,
             client_wait_for_transaction,
             notification_channel,
-            executor_listener,
             node_controller,
         )
         .await
@@ -636,7 +627,6 @@ impl P2pConnManager {
         op_manager: Arc<OpManager>,
         client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
         notification_channel: EventLoopNotificationsReceiver,
-        executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
         // Destructure self to avoid partial move issues
@@ -717,7 +707,7 @@ impl P2pConnManager {
             handshake_handler,
             node_controller,
             client_wait_for_transaction,
-            executor_listener,
+            ExecutorTransactionStream,
             conn_event_rx,
         );
 
@@ -1160,7 +1150,6 @@ impl P2pConnManager {
                                     let (callback, mut result) = mpsc::channel(10);
                                     let msg_clone = msg.clone();
                                     let bridge_sender = ctx.bridge.ev_listener_tx.clone();
-                                    let op_manager = ctx.bridge.op_manager.clone();
                                     let gateways = ctx.gateways.clone();
 
                                     // Mark gateway connections as transient to prevent
@@ -1229,17 +1218,6 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Connection attempt failed"
                                                 );
-                                                if let Err(err) =
-                                                    handle_aborted_op(tx, &op_manager, &gateways)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        tx = %tx,
-                                                        error = ?err,
-                                                        phase = "error",
-                                                        "Failed to propagate aborted operation"
-                                                    );
-                                                }
                                             }
                                             Ok(None) => {
                                                 tracing::error!(
@@ -1248,17 +1226,6 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Response channel closed before connection result received"
                                                 );
-                                                if let Err(err) =
-                                                    handle_aborted_op(tx, &op_manager, &gateways)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        tx = %tx,
-                                                        error = ?err,
-                                                        phase = "error",
-                                                        "Failed to propagate aborted operation"
-                                                    );
-                                                }
                                             }
                                             Err(_) => {
                                                 tracing::error!(
@@ -1267,17 +1234,6 @@ impl P2pConnManager {
                                                     phase = "timeout",
                                                     "Timeout waiting for connection establishment"
                                                 );
-                                                if let Err(err) =
-                                                    handle_aborted_op(tx, &op_manager, &gateways)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        tx = %tx,
-                                                        error = ?err,
-                                                        phase = "error",
-                                                        "Failed to propagate aborted operation"
-                                                    );
-                                                }
                                             }
                                         }
                                     });

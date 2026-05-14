@@ -96,27 +96,27 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use futures::{StreamExt, stream::FuturesUnordered};
+#[cfg(test)]
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, GlobalRng};
 use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NodeEvent, Transaction};
 use crate::node::OpManager;
-use crate::operations::{OpError, OpOutcome};
+use crate::operations::OpError;
 use crate::ring::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use crate::transport::TransportKeypair;
-use crate::util::{Contains, IterExt, time_source::InstantTimeSrc};
-use freenet_stdlib::client_api::HostResponse;
+use crate::util::{Contains, IterExt};
 
 use super::VisitedPeers;
 
 pub(crate) mod op_ctx_task;
 
+#[cfg(test)]
 const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 const RECENCY_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -306,7 +306,7 @@ pub(crate) struct ConnectResponse {
 
 /// State machine retained for in-file relay/joiner unit tests
 /// (`tests::*` in this file). Production CONNECT runs entirely on the
-/// task-per-tx drivers in `op_ctx_task.rs` and rebuilds `RelayState`
+/// drivers in `op_ctx_task.rs` and rebuilds `RelayState`
 /// in task locals; nothing constructs `ConnectState::Relaying` or
 /// `Completed` outside the test module.
 #[derive(Debug, Clone)]
@@ -412,8 +412,11 @@ pub(crate) struct RelayActions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ForwardAttempt {
+    #[cfg_attr(not(test), allow(dead_code))]
     peer: PeerKeyLocation,
+    #[cfg_attr(not(test), allow(dead_code))]
     desired: Location,
+    #[cfg_attr(not(test), allow(dead_code))]
     sent_at: Instant,
 }
 
@@ -1084,42 +1087,19 @@ impl JoinerState {
     }
 }
 
-/// Operation wrapper retained for in-file unit tests of the
-/// relay/joiner state machine. Production CONNECT runs entirely on the
-/// task-per-tx drivers in `op_ctx_task.rs` and stores routing state in
-/// task locals. The `ops.connect` DashMap still references this type
-/// as its value, but nothing writes to it after #1454 phase 6.
+/// Test-only fixture wrapping the relay/joiner state machine.
+#[cfg(test)]
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `recency` / `time_source` are seeded by `new_*` (test-only constructors).
 pub(crate) struct ConnectOp {
     pub(crate) id: Transaction,
     pub(crate) state: Option<ConnectState>,
-    pub(crate) first_hop: Option<Box<PeerKeyLocation>>,
-    pub(crate) desired_location: Option<Location>,
     recency: HashMap<PeerKeyLocation, Instant>,
     forward_attempts: HashMap<PeerKeyLocation, ForwardAttempt>,
     connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
-    time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
 }
 
-#[allow(dead_code)] // Constructors + getters used only by in-file unit tests.
+#[cfg(test)]
 impl ConnectOp {
-    /// Creates a ConnectOp with just a state, for unit-testing GC timeout logic.
-    #[cfg(test)]
-    pub(crate) fn with_state(state: ConnectState) -> Self {
-        use crate::util::time_source::InstantTimeSrc;
-        Self {
-            id: Transaction::new::<ConnectMsg>(),
-            state: Some(state),
-            first_hop: None,
-            desired_location: None,
-            recency: HashMap::new(),
-            forward_attempts: HashMap::new(),
-            connect_forward_estimator: Arc::new(RwLock::new(ConnectForwardEstimator::new())),
-            time_source: Arc::new(InstantTimeSrc::new()),
-        }
-    }
-
     fn record_forward_outcome(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
         self.forward_attempts.remove(peer);
         if !success {
@@ -1150,18 +1130,10 @@ impl ConnectOp {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    // Retained for in-file unit tests + the legacy
-    // `initiate_join_request` wrapper. Production joiner-side
-    // initiation flows through `prepare_join_request`. Pending
-    // deletion alongside the rest of `impl Operation for ConnectOp`.
-    #[allow(dead_code)]
     pub(crate) fn new_joiner(
         id: Transaction,
-        desired_location: Location,
         target_connections: usize,
         observed_address: Option<SocketAddr>,
-        gateway: Option<PeerKeyLocation>,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
     ) -> Self {
         let started_without_address = observed_address.is_none();
@@ -1175,22 +1147,13 @@ impl ConnectOp {
         Self {
             id,
             state: Some(state),
-            first_hop: gateway.map(Box::new),
-            desired_location: Some(desired_location),
             recency: HashMap::new(),
             forward_attempts: HashMap::new(),
             connect_forward_estimator,
-            time_source: Arc::new(InstantTimeSrc::new()),
         }
     }
 
-    /// Construct a new relay-side `ConnectOp` from an inbound
-    /// `Request`.
-    ///
-    /// Not called from production: fresh inbound `Request`s route
-    /// through `op_ctx_task::start_relay_connect`. Retained for
-    /// in-file unit tests that exercise `RelayState::handle_request`
-    /// semantics inline.
+    /// Construct a relay-side `ConnectOp` from an inbound `Request`.
     pub(crate) fn new_relay(
         id: Transaction,
         upstream_addr: SocketAddr,
@@ -1217,55 +1180,12 @@ impl ConnectOp {
         Self {
             id,
             state: Some(state),
-            first_hop: None,
-            desired_location: None,
             recency: HashMap::new(),
             forward_attempts: HashMap::new(),
             connect_forward_estimator,
-            time_source: Arc::new(InstantTimeSrc::new()),
         }
     }
 
-    pub(crate) fn is_completed(&self) -> bool {
-        matches!(self.state, Some(ConnectState::Completed))
-    }
-
-    pub(crate) fn id(&self) -> &Transaction {
-        &self.id
-    }
-
-    pub(crate) fn outcome(&self) -> OpOutcome<'_> {
-        OpOutcome::Irrelevant
-    }
-
-    pub(crate) fn finalized(&self) -> bool {
-        self.is_completed()
-    }
-
-    pub(crate) fn to_host_result(&self) -> HostResult {
-        Ok(HostResponse::Ok)
-    }
-
-    pub(crate) fn gateway(&self) -> Option<&PeerKeyLocation> {
-        self.first_hop.as_deref()
-    }
-
-    /// Get the next hop address if this operation is in a state that needs to send
-    /// an outbound message. For Connect, this is the first hop peer we're connecting through.
-    pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
-        self.first_hop.as_deref().and_then(|g| g.socket_addr())
-    }
-
-    /// Get the full target peer (including public key) for connection establishment.
-    /// For Connect operations, this returns the gateway peer.
-    pub(crate) fn get_target_peer(&self) -> Option<crate::ring::PeerKeyLocation> {
-        self.first_hop.as_deref().cloned()
-    }
-
-    // Retained for in-file unit tests. Production callers build the
-    // wire message via the free `prepare_join_request` helper and
-    // skip the legacy `ConnectOp` carrier.
-    #[allow(dead_code)]
     pub(crate) fn initiate_join_request(
         own: PeerKeyLocation,
         target: PeerKeyLocation,
@@ -1280,69 +1200,12 @@ impl ConnectOp {
 
         let op = ConnectOp::new_joiner(
             tx,
-            desired_location,
             target_connections,
             own.socket_addr(),
-            Some(target.clone()),
             connect_forward_estimator,
         );
 
         (tx, op, msg)
-    }
-
-    pub(crate) fn handle_response(
-        &mut self,
-        response: &ConnectResponse,
-        now: Instant,
-    ) -> Option<JoinerAcceptance> {
-        match self.state.as_mut() {
-            Some(ConnectState::WaitingForResponses(state)) => {
-                tracing::info!(
-                    acceptor_pub_key = %response.acceptor.pub_key(),
-                    acceptor_loc = ?response.acceptor.location(),
-                    target_connections = state.target_connections,
-                    accepted_count = state.accepted.len(),
-                    "connect: joiner received ConnectResponse"
-                );
-                let result = state.register_acceptance(response, now);
-                if let Some(new_acceptor) = &result.new_acceptor {
-                    self.recency.remove(&new_acceptor.peer);
-                }
-                tracing::info!(
-                    tx = %self.id,
-                    satisfied = result.satisfied,
-                    accepted_count = state.accepted.len(),
-                    target_connections = state.target_connections,
-                    "connect: register_acceptance result"
-                );
-                if result.satisfied {
-                    // INVARIANT: If the joiner started without knowing their external address,
-                    // they must have received ObservedAddress by the time the connect completes.
-                    // This catches bugs where ObservedAddress is not emitted (e.g., if the
-                    // transport layer prematurely fills in the address).
-                    debug_assert!(
-                        !state.started_without_address || state.observed_address.is_some(),
-                        "BUG: Connect completed but joiner never received ObservedAddress. \
-                         This indicates the transport layer may have prematurely filled in \
-                         the joiner's address, preventing ObservedAddress emission."
-                    );
-                    tracing::info!(
-                        tx = %self.id,
-                        elapsed_ms = self.id.elapsed().as_millis(),
-                        "Connect operation completed"
-                    );
-                    self.state = Some(ConnectState::Completed);
-                }
-                Some(result)
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn handle_observed_address(&mut self, address: SocketAddr, now: Instant) {
-        if let Some(ConnectState::WaitingForResponses(state)) = self.state.as_mut() {
-            state.update_observed_address(address, now);
-        }
     }
 
     pub(crate) fn handle_request<C: RelayContext>(
@@ -1732,8 +1595,8 @@ pub(crate) async fn gateway_version_probe(
 /// intervals lets `initial_join_procedure` notice when `min_connections`
 /// is reached without waiting for the full gateway backoff to expire.
 ///
-/// Also applied in `handle_aborted_op` for the same reason.  ±20% jitter is
-/// applied at each call site to prevent thundering herd.  See issue #3304.
+/// ±20% jitter is applied at each call site to prevent thundering herd.
+/// See issue #3304.
 pub(crate) const GATEWAY_BACKOFF_POLL_CAP: Duration = Duration::from_secs(30);
 
 pub(crate) async fn initial_join_procedure(
@@ -2224,9 +2087,7 @@ mod tests {
     fn expired_forward_attempts_are_cleared() {
         let mut op = ConnectOp::new_joiner(
             Transaction::new::<ConnectMsg>(),
-            Location::new(0.1),
             1,
-            None,
             None,
             Arc::new(RwLock::new(ConnectForwardEstimator::new())),
         );
@@ -2246,14 +2107,8 @@ mod tests {
     #[test]
     fn expired_forward_attempts_record_failures_in_estimator() {
         let estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
-        let mut op = ConnectOp::new_joiner(
-            Transaction::new::<ConnectMsg>(),
-            Location::new(0.1),
-            1,
-            None,
-            None,
-            estimator.clone(),
-        );
+        let mut op =
+            ConnectOp::new_joiner(Transaction::new::<ConnectMsg>(), 1, None, estimator.clone());
         let peer = make_peer(2000);
         op.forward_attempts.insert(
             peer.clone(),

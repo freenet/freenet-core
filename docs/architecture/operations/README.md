@@ -110,7 +110,7 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> AwaitingResponse : task-per-tx driver emits Request
+    [*] --> AwaitingResponse : driver emits Request
     AwaitingResponse --> Finished : acknowledgment received
 
     AwaitingResponse : contract, value, htl, subscribe flag;<br/>forwarding to peers
@@ -319,7 +319,7 @@ flowchart TB
     style Child fill:#cce5ff,stroke:#004085
 ```
 
-Each task-per-tx driver owns its own outcome publication
+Each driver owns its own outcome publication
 (`HostResult::Ok` on success, `HostResult::Err` on timeout/error).
 There is no central registry of pending children, no parent-parking
 branch, and no GC parent-propagation block. Failure isolation is the
@@ -327,7 +327,7 @@ driver's responsibility.
 
 **Code reference:** `Transaction::new_child_of` and
 `Transaction::is_sub_operation` in `crates/core/src/message.rs`;
-task-per-tx drivers in `crates/core/src/operations/{put,get,subscribe,update}/op_ctx_task.rs`.
+drivers in `crates/core/src/operations/{put,get,subscribe,update}/op_ctx_task.rs`.
 
 ## Error Handling
 

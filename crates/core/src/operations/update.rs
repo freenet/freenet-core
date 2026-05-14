@@ -1,7 +1,7 @@
 //! UPDATE operation: applies a state change to a contract and
 //! broadcasts to subscribers.
 //!
-//! Every UPDATE wire variant dispatches to a task-per-tx driver —
+//! Every UPDATE wire variant dispatches to a driver —
 //! `op_ctx_task::start_client_update`, `start_relay_request_update`,
 //! `start_relay_broadcast_to`, `start_relay_request_update_streaming`,
 //! and `start_relay_broadcast_to_streaming`. The wire-format types,
@@ -187,7 +187,7 @@ impl OpManager {
             "Auto-fetching contract from UPDATE sender (missing parameters)"
         );
 
-        // Spawn a targeted task-per-tx GET. The driver targets `sender_pkl`
+        // Spawn a targeted driver GET. The driver targets `sender_pkl`
         // for its first hop and falls back to `k_closest_potentially_hosting`
         // for any retries. Fire-and-forget — the side effect (contract cached
         // locally via `cache_contract_locally`) is what callers depend on.

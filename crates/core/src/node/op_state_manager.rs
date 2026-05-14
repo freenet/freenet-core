@@ -45,7 +45,7 @@ use super::{
 #[derive(Default)]
 struct Ops {
     // No per-op DashMaps remain. CONNECT, GET, PUT, UPDATE, and
-    // SUBSCRIBE all run on task-per-tx drivers that own state in task
+    // SUBSCRIBE all run on drivers that own state in task
     // locals; the only state retained here is the global completed /
     // under_progress sets used by the GC sweep.
     completed: DashSet<Transaction>,
@@ -119,8 +119,8 @@ pub(crate) struct OpManager {
     /// Backoff tracker for failed gateway connection attempts.
     /// Used to implement exponential backoff when retrying connections.
     pub gateway_backoff: Arc<Mutex<PeerConnectionBackoff>>,
-    /// Notifies `initial_join_procedure` and `handle_aborted_op` when gateway
-    /// backoff is cleared, so they can wake from backoff sleeps and retry immediately.
+    /// Notifies `initial_join_procedure` when gateway backoff is cleared,
+    /// so it can wake from backoff sleep and retry immediately.
     pub gateway_backoff_cleared: Arc<tokio::sync::Notify>,
     /// Addresses blocked by local policy. Used by the connect protocol to reject
     /// join requests from blocked peers at the routing level, allowing the uphill
@@ -135,7 +135,7 @@ pub(crate) struct OpManager {
     /// Maps contract instance ID to the timestamp (ms since epoch via GlobalSimulationTime)
     /// when the fetch was initiated, with a cooldown to avoid repeated fetch attempts.
     pub(crate) pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
-    /// Transactions with an active task-per-tx relay-GET driver at this
+    /// Transactions with an active driver relay-GET driver at this
     /// node. Populated by `start_relay_get` before spawn and removed by
     /// an RAII guard on the driver task. Consulted by the dispatch gate
     /// in `node.rs` to reject duplicate inbound Requests for a tx that
@@ -548,7 +548,7 @@ impl OpManager {
 
     /// Peek at the next hop address for an outbound initial request.
     ///
-    /// Always returns `None` — every op now runs on a task-per-tx
+    /// Always returns `None` — every op now runs on a driver
     /// driver that owns routing decisions in task locals, so there is
     /// no DashMap entry to consult here. Retained as a stable API
     /// surface for `p2p_protoc::handle_notification_msg`, which falls
@@ -694,10 +694,9 @@ impl OpManager {
         }
     }
 
-    /// Returns pending operation counts: [connect, put, get,
-    /// subscribe, update]. All slots are always 0 — every op runs on
-    /// task-per-tx drivers and the per-type DashMaps have been
-    /// retired. Retained for API stability with the home-page
+    /// Returns pending operation counts: [connect, put, get, subscribe,
+    /// update]. All slots are always 0 (operations run as standalone
+    /// driver tasks); retained for API stability with the home-page
     /// renderer and telemetry consumers.
     pub fn pending_op_counts(&self) -> [u32; 5] {
         [0; 5]
@@ -876,7 +875,7 @@ fn notify_transaction_timeout(
 // drivers expire their inflight guards naturally.
 
 // `record_connect_uphill_timeout` and the per-op GC-sweep CONNECT
-// branch are gone with `ops.connect`. The CONNECT task-per-tx driver
+// branch are gone with `ops.connect`. The CONNECT driver
 // (`start_relay_connect`) now owns its own uphill-timeout reporting
 // via the `Relay*InflightGuard` failure path; the GC sweep no longer
 // has a `ConnectOp` to inspect.
@@ -1066,7 +1065,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         }
                         continue;
                     }
-                    // Every op runs on a task-per-tx driver and owns
+                    // Every op runs on a driver and owns
                     // its own timeout reporting (via
                     // `Relay*InflightGuard` failure paths or
                     // `RetryLoopOutcome::Exhausted`). Nothing for the
@@ -1394,9 +1393,4 @@ mod tests {
         assert!(!waiters.contains_key(&id2));
         assert_eq!(waiters[&id1].len(), 1);
     }
-
-    // `record_connect_uphill_timeout_tests` retired in the
-    // ops.connect DashMap removal slice — the helper no longer
-    // exists (driver-owned acceptor outcome reporting in
-    // `start_relay_connect` replaces the GC-side hook).
 }

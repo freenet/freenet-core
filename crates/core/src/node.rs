@@ -683,7 +683,7 @@ where
 /// `OpCtx::send_and_await`. On a closed receiver (caller cancelled or
 /// timed out) the send fails and is logged; the handler still makes
 /// progress. See `.claude/rules/channel-safety.md`.
-fn try_forward_task_per_tx_reply(
+fn try_forward_driver_reply(
     pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
     reply: NetMessage,
     op_label: &'static str,
@@ -697,7 +697,7 @@ fn try_forward_task_per_tx_reply(
             %err,
             %tx_id,
             op = op_label,
-            "Failed to forward task-per-tx reply to OpCtx task"
+            "Failed to forward driver reply to OpCtx task"
         );
     }
     true
@@ -785,7 +785,7 @@ where
                     | connect::ConnectMsg::ConnectFailed { .. }
             ) {
                 let forwarded_op = fill_connect_response_acceptor_addr(op.clone(), source_addr);
-                if try_forward_task_per_tx_reply(
+                if try_forward_driver_reply(
                     pending_op_result.as_ref(),
                     NetMessage::V1(NetMessageV1::Connect(forwarded_op)),
                     "connect",
@@ -857,7 +857,7 @@ where
             if matches!(
                 op,
                 put::PutMsg::Response { .. } | put::PutMsg::ResponseStreaming { .. }
-            ) && try_forward_task_per_tx_reply(
+            ) && try_forward_driver_reply(
                 pending_op_result.as_ref(),
                 NetMessage::V1(NetMessageV1::Put((*op).clone())),
                 "put",
@@ -970,7 +970,7 @@ where
             if matches!(
                 op,
                 get::GetMsg::Response { .. } | get::GetMsg::ResponseStreaming { .. }
-            ) && try_forward_task_per_tx_reply(
+            ) && try_forward_driver_reply(
                 pending_op_result.as_ref(),
                 NetMessage::V1(NetMessageV1::Get((*op).clone())),
                 "get",
@@ -1164,7 +1164,7 @@ where
             // be forwarded — they would fill the capacity-1 reply
             // channel.
             if matches!(op, subscribe::SubscribeMsg::Response { .. })
-                && try_forward_task_per_tx_reply(
+                && try_forward_driver_reply(
                     pending_op_result.as_ref(),
                     NetMessage::V1(NetMessageV1::Subscribe((*op).clone())),
                     "subscribe",
@@ -1362,13 +1362,8 @@ where
             return Ok(());
         }
         NetMessageV1::Aborted(tx) => {
-            // No-op after #1454 phase 6 retired the legacy mediator:
-            // CONNECT abort retry depended on `pop`-ing `OpEnum::Connect`
-            // from a DashMap that no production code writes to anymore.
-            // GET/PUT/UPDATE/SUBSCRIBE drivers own their own cancellation
-            // surface (`result_router_tx` publication is the externally
-            // observable result). Senders of `Aborted` come only from
-            // drivers themselves and are handled in-driver via the bypass.
+            // Drivers own their own cancellation; `Aborted` senders are
+            // drivers themselves and the bypass handles in-driver delivery.
             tracing::debug!(
                 %tx,
                 tx_type = ?tx.transaction_type(),
@@ -1975,31 +1970,6 @@ pub async fn subscribe_with_id(
     subscribe::start_client_subscribe(op_manager, instance_id, client_tx).await
 }
 
-/// Handle a transaction whose work is being abandoned (transport
-/// handshake failure, orphaned-on-peer-prune, or a peer-sent `Aborted`
-/// wire message). After #1454 phase 6 retired the legacy `Operation`
-/// mediator the function has no work to do: every op type owns its own
-/// cancellation surface in the task-per-tx driver, and the CONNECT
-/// retry-via-gateway branch is driven by `start_client_connect` /
-/// `initial_join_procedure` rather than by a DashMap entry.
-///
-/// Retained as a no-op so the call sites in `p2p_protoc.rs`
-/// (orphaned-on-prune + transport handshake failure) keep compiling
-/// while the centralised abort path is unwired. Will be deleted in
-/// the follow-up slice once those call sites are removed.
-pub(crate) async fn handle_aborted_op(
-    tx: Transaction,
-    _op_manager: &OpManager,
-    _gateways: &[PeerKeyLocation],
-) -> Result<(), OpError> {
-    tracing::debug!(
-        %tx,
-        tx_type = ?tx.transaction_type(),
-        "handle_aborted_op: no-op after #1454 phase 6 (driver-owned cancellation)"
-    );
-    Ok(())
-}
-
 /// The identifier of a peer in the network: a known public key and socket address.
 ///
 /// This is a type alias for [`ring::KnownPeerKeyLocation`], which bundles a peer's
@@ -2161,11 +2131,6 @@ pub async fn run_network_node(mut node: Node) -> anyhow::Result<()> {
         }
     }
 }
-
-// `classify_op_outcome` retired alongside the `OpEnum` mediator —
-// per-op success/failure recording is now done by drivers directly
-// via `record_relay_route_event` / `record_acceptor_outcome` and
-// dashboard counters in driver finalization paths.
 
 #[cfg(test)]
 mod tests {
@@ -2354,16 +2319,14 @@ mod tests {
         assert_eq!(init_peer.location, location);
     }
 
-    // `classify_op_outcome` tests retired with the helper.
-
-    // Tests for `try_forward_task_per_tx_reply`.
+    // Tests for `try_forward_driver_reply`.
     //
     // The bypass routes a reply directly to an awaiting
     // `OpCtx::send_and_await` caller. These tests cover the
     // helper's contract; end-to-end branch coverage lives in the
     // per-driver tests.
     mod callback_forward_tests {
-        use super::super::try_forward_task_per_tx_reply;
+        use super::super::try_forward_driver_reply;
         use crate::message::{MessageStats, NetMessage, NetMessageV1, Transaction};
         use crate::operations::connect::ConnectMsg;
 
@@ -2372,7 +2335,7 @@ mod tests {
         }
 
         // ───────────────────────────────────────────────────────────
-        // Tests for `try_forward_task_per_tx_reply`.
+        // Tests for `try_forward_driver_reply`.
         //
         // The bypass routes a reply directly to an awaiting
         // `OpCtx::send_and_await` caller. These tests cover the
@@ -2386,7 +2349,7 @@ mod tests {
             let reply = dummy_reply();
             let expected_id = *reply.id();
 
-            let taken = try_forward_task_per_tx_reply(Some(&tx), reply, "subscribe");
+            let taken = try_forward_driver_reply(Some(&tx), reply, "subscribe");
             assert!(taken, "callback present → bypass must be taken");
 
             let received = rx
@@ -2400,7 +2363,7 @@ mod tests {
             // No callback registered → caller must fall through to legacy
             // `handle_op_request`. The helper must not panic and must
             // return `false`.
-            let taken = try_forward_task_per_tx_reply(None, dummy_reply(), "subscribe");
+            let taken = try_forward_driver_reply(None, dummy_reply(), "subscribe");
             assert!(!taken, "no callback → bypass must not be taken");
         }
 
@@ -2421,7 +2384,7 @@ mod tests {
             let (tx, rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
             drop(rx);
 
-            let taken = try_forward_task_per_tx_reply(Some(&tx), dummy_reply(), "subscribe");
+            let taken = try_forward_driver_reply(Some(&tx), dummy_reply(), "subscribe");
             assert!(
                 taken,
                 "callback present but receiver dropped → bypass still taken"
@@ -2430,7 +2393,7 @@ mod tests {
 
         /// Pin the bypass call site. Without this regression guard a
         /// future refactor could delete the
-        /// `try_forward_task_per_tx_reply` invocation in the SUBSCRIBE
+        /// `try_forward_driver_reply` invocation in the SUBSCRIBE
         /// branch of `handle_pure_network_message_v1` and the unit tests
         /// on the helper itself would still pass — because unit coverage
         /// on the helper only proves the helper works, not that it's
@@ -2440,7 +2403,7 @@ mod tests {
         /// This test reads the `node.rs` source at compile time via
         /// `include_str!` and asserts that the SUBSCRIBE branch of
         /// `handle_pure_network_message_v1` invokes
-        /// `try_forward_task_per_tx_reply` before running
+        /// `try_forward_driver_reply` before running
         /// `handle_op_request`. A refactor that deletes the bypass call
         /// will fail this test at the unit-test level (review finding
         /// Testing #1).
@@ -2467,8 +2430,7 @@ mod tests {
 
             // Bound the window at the end-of-SUBSCRIBE-arm sentinel
             // ("Non-transactional message types:" header that precedes
-            // the next match arm). After #1454 phase 6 there is no
-            // more `handle_op_request` to anchor against.
+            // the next match arm).
             let next_variant_anchor: String = ["// Non-transactional", " message types:"].concat();
             let window_end = SOURCE[branch_start..]
                 .find(&next_variant_anchor)
@@ -2481,9 +2443,9 @@ mod tests {
             //   (a) the bypass was removed (regression — re-add it), or
             //   (b) the branch was restructured (update this guard).
             assert!(
-                window.contains("try_forward_task_per_tx_reply("),
+                window.contains("try_forward_driver_reply("),
                 "SUBSCRIBE branch no longer calls \
-                 try_forward_task_per_tx_reply before relay dispatch. \
+                 try_forward_driver_reply before relay dispatch. \
                  Either restore the bypass or update this regression \
                  guard if the branch was legitimately refactored."
             );
@@ -2502,7 +2464,7 @@ mod tests {
                 window.contains(&response_gate),
                 "SUBSCRIBE branch bypass is not gated on Response-only. \
                  Non-terminal messages (ForwardingAck, Unsubscribe) must NOT \
-                 be forwarded to the task-per-tx channel — they would fill \
+                 be forwarded to the driver channel — they would fill \
                  the capacity-1 reply slot and block the real Response."
             );
         }
@@ -2518,7 +2480,7 @@ mod tests {
             tx.try_send(dummy_reply())
                 .expect("capacity-1 channel should accept first message");
 
-            let taken = try_forward_task_per_tx_reply(Some(&tx), dummy_reply(), "subscribe");
+            let taken = try_forward_driver_reply(Some(&tx), dummy_reply(), "subscribe");
             assert!(
                 taken,
                 "callback present but channel full → bypass still taken"
@@ -2540,14 +2502,14 @@ mod tests {
         // for the concrete op type and reconstructs the same variant before
         // handing it to `forward_pending_op_result_if_completed`. An
         // end-to-end integration test that spins up a node and exercises
-        // `OpCtx::send_and_await` for each op kind belongs in Phase 2b,
-        // where the first real production caller is added.
+        // `OpCtx::send_and_await` for each op kind belongs alongside
+        // the per-op driver suites.
 
         // ───────────────────────────────────────────────────────────
         // Regression tests for the subscribe-branch message-type
         // filter added in the ForwardingAck fix (5cb6f37c).
         //
-        // The bug: `try_forward_task_per_tx_reply` was called for ALL
+        // The bug: `try_forward_driver_reply` was called for ALL
         // subscribe message types (including ForwardingAck). A relay
         // peer's ForwardingAck would fill the capacity-1 reply
         // channel, causing the task to receive it instead of the
@@ -2564,13 +2526,13 @@ mod tests {
         /// Helper: simulate the filtering logic from the SUBSCRIBE
         /// branch of `handle_pure_network_message_v1`. Returns
         /// `true` if the message would be forwarded to the
-        /// task-per-tx channel (and the branch would return early).
+        /// driver channel (and the branch would return early).
         fn subscribe_branch_would_forward(
             op: &SubscribeMsg,
             callback: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
         ) -> bool {
             matches!(op, SubscribeMsg::Response { .. })
-                && try_forward_task_per_tx_reply(
+                && try_forward_driver_reply(
                     callback,
                     NetMessage::V1(NetMessageV1::Subscribe(op.clone())),
                     "subscribe",
@@ -2677,7 +2639,7 @@ mod tests {
 
         // ───────────────────────────────────────────────────────────
         // Regression guard: PUT branch of handle_pure_network_message_v1
-        // must call try_forward_task_per_tx_reply before relay dispatch,
+        // must call try_forward_driver_reply before relay dispatch,
         // gated on Response|ResponseStreaming only.
         // ───────────────────────────────────────────────────────────
 
@@ -2701,15 +2663,15 @@ mod tests {
             let window = &SOURCE[branch_start..window_end];
 
             assert!(
-                window.contains("try_forward_task_per_tx_reply("),
-                "PUT branch no longer calls try_forward_task_per_tx_reply. \
+                window.contains("try_forward_driver_reply("),
+                "PUT branch no longer calls try_forward_driver_reply. \
                  Restore the bypass or update this regression guard."
             );
 
             assert!(
                 window.contains("put::PutMsg::Response { .. }"),
                 "PUT branch bypass is not gated on Response. \
-                 Non-terminal messages must NOT be forwarded to the task-per-tx channel."
+                 Non-terminal messages must NOT be forwarded to the driver channel."
             );
 
             assert!(
@@ -2729,7 +2691,7 @@ mod tests {
             let dashmap_gate_needle = format!("has{}_op", "_put");
             assert!(
                 !window.contains(&dashmap_gate_needle),
-                "PUT branch must not gate dispatch on the retired DashMap existence check"
+                "PUT branch must not gate dispatch on per-op DashMap existence"
             );
         }
 
@@ -2753,7 +2715,7 @@ mod tests {
             matches!(
                 op,
                 PutMsg::Response { .. } | PutMsg::ResponseStreaming { .. }
-            ) && try_forward_task_per_tx_reply(
+            ) && try_forward_driver_reply(
                 callback,
                 NetMessage::V1(NetMessageV1::Put(op.clone())),
                 "put",
@@ -2856,7 +2818,7 @@ mod tests {
         //
         // Two dispatch layers:
         //   1. Reply bypass: terminal Response/ResponseStreaming for
-        //      an active client driver → `try_forward_task_per_tx_reply`.
+        //      an active client driver → `try_forward_driver_reply`.
         //   2. Relay dispatch: `GetMsg::Request` →  `start_relay_get`,
         //      with originator loopback mapped to `upstream=own_addr`.
         // ───────────────────────────────────────────────────────────
@@ -2880,14 +2842,14 @@ mod tests {
 
             // Reply bypass must precede relay dispatch.
             assert!(
-                window.contains("try_forward_task_per_tx_reply("),
-                "GET branch no longer calls try_forward_task_per_tx_reply \
+                window.contains("try_forward_driver_reply("),
+                "GET branch no longer calls try_forward_driver_reply \
                  before relay dispatch. Restore the bypass."
             );
             assert!(
                 window.contains("get::GetMsg::Response { .. }"),
                 "GET branch bypass is not gated on Response. \
-                 Non-terminal messages must NOT be forwarded to the task-per-tx channel."
+                 Non-terminal messages must NOT be forwarded to the driver channel."
             );
             assert!(
                 window.contains("get::GetMsg::ResponseStreaming { .. }"),
@@ -2921,20 +2883,20 @@ mod tests {
             let dashmap_gate_needle = format!("has{}_op", "_get");
             assert!(
                 !window.contains(&dashmap_gate_needle),
-                "GET branch must NOT gate on the retired DashMap existence check"
+                "GET branch must NOT gate on per-op DashMap existence"
             );
 
             // Bypass must precede relay dispatch in source order
             // (terminal-reply fast path has priority).
             let bypass_pos = window
-                .find("try_forward_task_per_tx_reply(")
-                .expect("try_forward_task_per_tx_reply not found in GET branch");
+                .find("try_forward_driver_reply(")
+                .expect("try_forward_driver_reply not found in GET branch");
             let relay_pos = window
                 .find("start_relay_get(")
                 .expect("start_relay_get not found in GET branch");
             assert!(
                 bypass_pos < relay_pos,
-                "Reply bypass (try_forward_task_per_tx_reply) must \
+                "Reply bypass (try_forward_driver_reply) must \
                  appear BEFORE relay dispatch (start_relay_get) — \
                  swapping order would break the terminal-reply fast \
                  path."
@@ -2983,7 +2945,7 @@ mod tests {
                 );
             }
 
-            // Negative pins for the retired legacy fallthrough: composing
+            // Negative pins for the fallthrough: composing
             // needles at runtime so this test's source doesn't trip its
             // own assertion.
             let legacy_call = ["handle_op_request::<update::", "UpdateOp", ", _>"].concat();
@@ -3066,7 +3028,7 @@ mod tests {
             let dashmap_gate_needle = format!("has{}_op", "_put");
             assert!(
                 !window.contains(&dashmap_gate_needle),
-                "PUT branch must NOT gate on the retired DashMap existence check"
+                "PUT branch must NOT gate on per-op DashMap existence"
             );
         }
 
@@ -3135,14 +3097,14 @@ mod tests {
             // Terminal-reply bypass must still be present (gated on
             // SubscribeMsg::Response).
             assert!(
-                window.contains("try_forward_task_per_tx_reply("),
-                "SUBSCRIBE branch no longer calls try_forward_task_per_tx_reply \
+                window.contains("try_forward_driver_reply("),
+                "SUBSCRIBE branch no longer calls try_forward_driver_reply \
                  before relay dispatch — restore it."
             );
             assert!(
                 window.contains("subscribe::SubscribeMsg::Response { .. }"),
                 "SUBSCRIBE branch bypass is not gated on Response. \
-                 Non-terminal messages must NOT be forwarded to the task-per-tx channel."
+                 Non-terminal messages must NOT be forwarded to the driver channel."
             );
 
             // Relay dispatch must call start_relay_subscribe and route
@@ -3178,20 +3140,20 @@ mod tests {
             let dashmap_gate_needle = format!("has{}_op", "_subscribe");
             assert!(
                 !window.contains(&dashmap_gate_needle),
-                "SUBSCRIBE branch must NOT gate on the retired DashMap existence check"
+                "SUBSCRIBE branch must NOT gate on per-op DashMap existence"
             );
 
             // Bypass must precede relay dispatch in source order
             // (terminal-reply fast path has priority).
             let bypass_pos = window
-                .find("try_forward_task_per_tx_reply(")
-                .expect("try_forward_task_per_tx_reply not found in SUBSCRIBE branch");
+                .find("try_forward_driver_reply(")
+                .expect("try_forward_driver_reply not found in SUBSCRIBE branch");
             let relay_pos = window
                 .find("start_relay_subscribe(")
                 .expect("start_relay_subscribe not found in SUBSCRIBE branch");
             assert!(
                 bypass_pos < relay_pos,
-                "SUBSCRIBE bypass (try_forward_task_per_tx_reply) must appear \
+                "SUBSCRIBE bypass (try_forward_driver_reply) must appear \
                  BEFORE relay dispatch (start_relay_subscribe). Swapping order \
                  would break the client-driver terminal-reply fast path."
             );

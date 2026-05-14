@@ -13,7 +13,7 @@
 //! `complete_local_subscription`, `wait_for_contract_with_timeout`),
 //! the inbound `Unsubscribe` handler, and
 //! `register_downstream_subscriber` survive here because the
-//! task-per-tx drivers consume them.
+//! drivers consume them.
 
 use either::Either;
 
@@ -83,7 +83,7 @@ pub(super) async fn wait_for_contract_with_timeout(
 /// a subscribe request based on the node's current ring state and contract
 /// availability.
 ///
-/// This type exists so all task-per-tx subscribe entry points
+/// This type exists so all driver subscribe entry points
 /// (`op_ctx_task::run_client_subscribe`,
 /// `op_ctx_task::run_renewal_subscribe`,
 /// `op_ctx_task::run_executor_subscribe`) share the "which peer, or
@@ -130,7 +130,7 @@ pub(super) enum InitialRequest {
 /// Compute the initial "where do we send this subscribe, or do we complete
 /// locally?" decision for a subscribe request.
 ///
-/// All task-per-tx subscribe entry points (`op_ctx_task::run_client_subscribe`,
+/// All driver subscribe entry points (`op_ctx_task::run_client_subscribe`,
 /// `run_renewal_subscribe`, `run_executor_subscribe`) reuse the same ring
 /// lookup / fallback / local-completion logic via this helper. The helper is
 /// pure modulo telemetry emission: it calls `NetEventLog::subscribe_request`
@@ -266,7 +266,7 @@ pub(super) async fn prepare_initial_request(
     );
 
     // Emit telemetry for subscribe request initiation so both legacy and
-    // task-per-tx paths produce identical `NetEventLog::subscribe_request`
+    // driver paths produce identical `NetEventLog::subscribe_request`
     // events.
     if let Some(event) = NetEventLog::subscribe_request(
         &id,

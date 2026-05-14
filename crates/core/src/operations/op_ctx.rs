@@ -1,4 +1,4 @@
-//! Per-transaction execution context for the task-per-tx model.
+//! Per-transaction execution context for the driver model.
 //!
 //! Ships the `OpCtx` struct and its `send_and_await` round-trip
 //! primitive. Each transaction is owned and driven by a single
@@ -13,7 +13,7 @@ use crate::message::{MessageStats, NetMessage, Transaction};
 use crate::node::OpExecutionPayload;
 use crate::operations::OpError;
 
-/// Per-transaction execution context for the task-per-tx model.
+/// Per-transaction execution context for the driver model.
 ///
 /// An `OpCtx` binds a single [`Transaction`] to the channel used to
 /// drive its network round-trip through the event loop. The context
@@ -181,7 +181,7 @@ impl OpCtx {
     /// there's no self-connection. Routing it through `InboundMessage`
     /// lands at `handle_pure_network_message_v1`'s PUT bypass and
     /// forwards to the originator's `pending_op_results` waiter via
-    /// `try_forward_task_per_tx_reply`.
+    /// `try_forward_driver_reply`.
     pub async fn send_local_loopback(&mut self, msg: NetMessage) -> Result<(), OpError> {
         debug_assert_eq!(
             msg.id(),
@@ -207,7 +207,7 @@ impl OpCtx {
     /// kicks off side work. Installing the waiter first closes a race
     /// where a fast downstream reply would land on the event loop
     /// before `handle_op_execution` has inserted the callback —
-    /// `try_forward_task_per_tx_reply` would then drop the reply as
+    /// `try_forward_driver_reply` would then drop the reply as
     /// `OpNotPresent`.
     ///
     /// Await the returned receiver to get the terminal reply:
@@ -260,7 +260,7 @@ impl OpCtx {
     ///
     /// # When the bypass forwards multiple replies
     ///
-    /// `node::try_forward_task_per_tx_reply` calls `try_send` on the
+    /// `node::try_forward_driver_reply` calls `try_send` on the
     /// stored callback. With a capacity > 1 channel, multiple inbound
     /// replies for the same tx land in the channel without dropping each
     /// other (capacity-1 callers would receive only the first because the
@@ -503,7 +503,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     attempt = attempt_count,
                     outcome = "wire_error",
                     error = %err,
-                    "{op_label} (task-per-tx): send_and_await failed; advancing"
+                    "{op_label}: send_and_await failed; advancing"
                 );
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
@@ -521,7 +521,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     attempt = attempt_count,
                     outcome = "timeout",
                     timeout_secs = attempt_timeout.as_secs(),
-                    "{op_label} (task-per-tx): attempt timed out; advancing"
+                    "{op_label}: attempt timed out; advancing"
                 );
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
@@ -544,7 +544,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     attempt_tx = %attempt_tx,
                     attempt = attempt_count,
                     outcome = "retry",
-                    "{op_label} (task-per-tx): peer indicated retry; advancing"
+                    "{op_label}: peer indicated retry; advancing"
                 );
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
@@ -560,7 +560,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     tx = %client_tx,
                     attempt_tx = %attempt_tx,
                     attempt = attempt_count,
-                    "{op_label} (task-per-tx): unexpected terminal reply"
+                    "{op_label}: unexpected terminal reply"
                 );
                 return RetryLoopOutcome::Unexpected;
             }
