@@ -218,6 +218,36 @@ mod messages {
             id: Transaction,
             contract_key: ContractKey,
         },
+
+        /// Terminal failure delivered to the originator's driver via the
+        /// same `pending_op_results` bypass as `Response`. Carries the
+        /// contract-side or local-validation reason as a string so the
+        /// originator's `start_client_put` can publish ONE
+        /// `HostResult::Err(OperationError { cause })` instead of:
+        ///
+        ///   * burning the retry budget on a deterministic failure
+        ///     (issue #4111: each retry repeats the same failing
+        ///     `put_contract` call locally), and
+        ///
+        ///   * racing the genuine error message against a misleading
+        ///     `"failed notifying, channel closed"` synthesised by the
+        ///     retry loop when the per-attempt callback closes early.
+        ///
+        /// Constructed by `run_relay_put` in the originator-loopback
+        /// failure path. The relay-side error path is unaffected — when
+        /// the failure is on a different node, the result of
+        /// `drive_relay_put` is reported via the normal upstream
+        /// reply channel, not this variant.
+        Error {
+            id: Transaction,
+            /// Human-readable failure reason. Caller already has the
+            /// `Transaction` for correlation; the `cause` is what we
+            /// surface to the client. Kept as `String` (not
+            /// `ClientError` / `OpError`) so the wire variant stays
+            /// dependency-free for `bincode` and so future serde-incompat
+            /// changes in those types do not break wire compatibility.
+            cause: String,
+        },
     }
 
     impl InnerMessage for PutMsg {
@@ -227,7 +257,8 @@ mod messages {
                 | Self::Response { id, .. }
                 | Self::RequestStreaming { id, .. }
                 | Self::ResponseStreaming { id, .. }
-                | Self::ForwardingAck { id, .. } => id,
+                | Self::ForwardingAck { id, .. }
+                | Self::Error { id, .. } => id,
             }
         }
 
@@ -240,6 +271,10 @@ mod messages {
                 }
                 Self::ResponseStreaming { key, .. } => Some(Location::from(key.id())),
                 Self::ForwardingAck { contract_key, .. } => Some(Location::from(contract_key.id())),
+                // No contract key in the failure envelope — the originator
+                // already knows the key it requested; the failure is keyed
+                // by tx only.
+                Self::Error { .. } => None,
             }
         }
     }
@@ -289,6 +324,9 @@ mod messages {
                 Self::ForwardingAck { id, contract_key } => {
                     write!(f, "PutForwardingAck(id: {}, key: {})", id, contract_key)
                 }
+                Self::Error { id, cause } => {
+                    write!(f, "PutError(id: {}, cause: {})", id, cause)
+                }
             }
         }
     }
@@ -323,6 +361,65 @@ mod tests {
             display.contains("PutResponse"),
             "Display should contain message type name"
         );
+    }
+
+    /// Issue #4111: `PutMsg::Error` is the wire variant that the
+    /// originator-loopback failure path emits through `send_local_loopback`
+    /// so the originator's retry-loop classifier sees a terminal failure
+    /// once instead of retrying through a closed reply channel.
+    /// Verifies `id()` and Display work for the new variant.
+    #[test]
+    fn put_msg_error_id_and_display() {
+        let tx = Transaction::new::<PutMsg>();
+        let msg = PutMsg::Error {
+            id: tx,
+            cause: "contract rejected: version must be higher".into(),
+        };
+        assert_eq!(*msg.id(), tx, "id() should return the transaction ID");
+        let display = format!("{}", msg);
+        assert!(display.contains("PutError"), "Display tag");
+        assert!(display.contains("version must be higher"), "Display cause");
+    }
+
+    /// Issue #4111: wire-format round-trip for `PutMsg::Error`. The
+    /// variant rides the same `NetMessage::V1(Put)` envelope as every
+    /// other reply, so `bincode` must encode + decode it intact.
+    #[test]
+    fn put_msg_error_serde_roundtrip() {
+        let tx = Transaction::new::<PutMsg>();
+        let cause = "execution error: invalid contract update".to_string();
+        let msg = PutMsg::Error {
+            id: tx,
+            cause: cause.clone(),
+        };
+
+        let serialized = bincode::serialize(&msg).expect("serialize");
+        let deserialized: PutMsg = bincode::deserialize(&serialized).expect("deserialize");
+
+        match deserialized {
+            PutMsg::Error {
+                id,
+                cause: decoded_cause,
+            } => {
+                assert_eq!(id, tx);
+                assert_eq!(decoded_cause, cause);
+            }
+            other => panic!("Expected Error, got {other}"),
+        }
+    }
+
+    /// Issue #4111: the `Error` variant has no associated contract
+    /// key — the originator already knows the key it requested, and
+    /// the failure is keyed by tx only. Pin this so `requested_location`
+    /// doesn't gain a phantom location later.
+    #[test]
+    fn put_msg_error_has_no_requested_location() {
+        let tx = Transaction::new::<PutMsg>();
+        let msg = PutMsg::Error {
+            id: tx,
+            cause: "x".into(),
+        };
+        assert!(msg.requested_location().is_none());
     }
 
     #[test]
