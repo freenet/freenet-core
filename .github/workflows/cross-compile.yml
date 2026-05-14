@@ -454,7 +454,14 @@ jobs:
 
       - name: Upload binaries to release
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Coalesce on RELEASE_PAT so the `gh release edit --draft=false`
+          # below fires a `release.published` event that downstream workflows
+          # (`gateway-update.yml`, `release-announce.yml`) can react to.
+          # GITHUB_TOKEN suppresses workflow-triggering events as an
+          # anti-recursion safeguard, which broke the v0.2.57 release
+          # cascade and required manual `workflow_dispatch`. See issue #4118
+          # and `AGENTS.md` → "Release Workflow & RELEASE_PAT".
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           # Extract the tag name (e.g., v0.1.30)
           TAG_NAME="${GITHUB_REF#refs/tags/}"

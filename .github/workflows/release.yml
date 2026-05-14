@@ -35,6 +35,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      - name: Warn if RELEASE_PAT is not configured
+        env:
+          # Workflow secrets are not directly visible in `if:` expressions,
+          # so we expose RELEASE_PAT via env and check for emptiness inside
+          # the step. The value is never echoed.
+          RELEASE_PAT_PRESENT: ${{ secrets.RELEASE_PAT != '' }}
+        run: |
+          if [ "$RELEASE_PAT_PRESENT" != "true" ]; then
+            echo "::warning title=RELEASE_PAT not set::The release workflow can complete without RELEASE_PAT, but downstream workflows (CI on the bump PR, gateway-update.yml, release-announce.yml) will NOT fire automatically. GITHUB_TOKEN suppresses workflow-triggering events as an anti-recursion safeguard. Configure a RELEASE_PAT repo secret with 'repo' + 'workflow' scopes to make releases zero-touch. See issue #4118 and AGENTS.md → 'Release Workflow & RELEASE_PAT'."
+          else
+            echo "✅ RELEASE_PAT is configured. Downstream workflows will be triggered automatically."
+          fi
+
       - name: Validate version format
         id: validate
         run: |
@@ -192,7 +205,10 @@ jobs:
 
       - name: Wait for PR to be merged
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read-only polling; coalescing for consistency across release.yml
+          # so a future refactor that adds a write-action here can't silently
+          # fall back to GITHUB_TOKEN and break the cascade.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           PR_NUMBER="${{ needs.update_versions.outputs.pr_number }}"
           # 60 min budget. Was 30 min when the release merge_group skipped
@@ -291,6 +307,12 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          # `token:` is what `git push` uses later in this job to push the
+          # `v$VERSION` tag. The tag push MUST use RELEASE_PAT (when set)
+          # so it fires the `tag` event that triggers `cross-compile.yml`.
+          # Tags pushed with `GITHUB_TOKEN` are suppressed by GitHub's
+          # anti-recursion safeguard (same root cause as #4118).
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Pull latest changes
         run: git pull origin main
@@ -298,7 +320,10 @@ jobs:
       - name: Generate release notes
         id: release_notes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read-only `gh release list` + `gh api`; coalescing for consistency
+          # so future event-emitting additions to this step don't silently
+          # regress to GITHUB_TOKEN.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
 
@@ -331,7 +356,11 @@ jobs:
       - name: Create GitHub release
         if: ${{ !inputs.dry_run }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The release is created with `--draft`, so no `release.published`
+          # event fires here. Coalescing for defense-in-depth: if `--draft`
+          # is ever dropped, this site must already be on RELEASE_PAT or the
+          # cascade silently breaks.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
           gh release create "v$VERSION" \

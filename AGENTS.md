@@ -170,6 +170,86 @@ docs/architecture/    # Design docs
 | DST testing | `.claude/rules/testing.md` |
 | Deployment | `.claude/rules/deployment.md` |
 
+## Release Workflow & RELEASE_PAT
+
+The release pipeline (`.github/workflows/release.yml` →
+`.github/workflows/cross-compile.yml` → downstream `gateway-update.yml` /
+`release-announce.yml`) relies on a `RELEASE_PAT` repo secret to fire
+all the workflow events that make releases zero-touch.
+
+### Why a PAT is required
+
+GitHub's `GITHUB_TOKEN` deliberately suppresses workflow-triggering
+events as an anti-recursion safeguard:
+
+> When you use the repository's `GITHUB_TOKEN` to perform tasks,
+> events triggered by the `GITHUB_TOKEN` will not create a new
+> workflow run.
+
+That means any `gh` call inside a workflow that *should* wake up
+another workflow has to authenticate with a personal access token
+(PAT) instead. Two concrete failure modes hit the v0.2.57 release:
+
+1. **Bump PR has 0 check-runs.** `release.yml` opens the
+   `release/vX.Y.Z` PR via `gh pr create`. With `GITHUB_TOKEN`, no
+   `pull_request` event fires, so `ci.yml` never runs and the PR's
+   required checks never go green. Workaround was
+   `gh pr close && gh pr reopen`, which broke `wait_for_pr` polling.
+
+2. **`release.published` doesn't fire downstream workflows.**
+   `cross-compile.yml`'s `attach-to-release` job ends with
+   `gh release edit --draft=false`. With `GITHUB_TOKEN`, the
+   `release.published` event is suppressed, so `gateway-update.yml`
+   and `release-announce.yml` don't auto-fire. v0.2.57 had to trigger
+   them manually via `workflow_dispatch`.
+
+### Configuring the secret
+
+`RELEASE_PAT` must be a fine-grained (or classic) personal access
+token with at minimum:
+
+- **`repo`** (Contents: read/write, Pull requests: read/write,
+  Metadata: read) for `gh pr create`, `gh release edit`, and push of
+  release branches.
+- **`workflow`** required for any token that lands on
+  `.github/workflows/`-adjacent code paths.
+
+Add it under
+**Settings → Secrets and variables → Actions → Repository secrets**
+as `RELEASE_PAT`. Both `release.yml` and `cross-compile.yml`
+coalesce on it. The coalesce appears in two forms:
+
+```yaml
+# for actions/checkout (controls what `git push` uses later):
+- uses: actions/checkout@v6
+  with:
+    token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+# for `gh` CLI steps:
+env:
+  GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+```
+
+When the secret is missing the workflows degrade gracefully: they
+still complete, but the bump-PR CI, the tag-push → cross-compile
+trigger, and the release-published cascade won't auto-fire and a
+human has to intervene. `release.yml` emits a GitHub `::warning::`
+on every run that's missing the secret, so the gap is visible
+early.
+
+`.github/workflows/check-token-coalesce.yml` runs on every PR and
+fails if any new event-emitting step regresses to bare
+`GITHUB_TOKEN` / `github.token` — see issue #4118 for the regression
+class this guard prevents.
+
+### Maintenance
+
+The PAT belongs to a maintainer's account (currently @sanity). Rotate
+it on the GitHub PAT expiry schedule, and update the `RELEASE_PAT`
+secret in the freenet-core repo when you do. If `release.yml` prints
+the "RELEASE_PAT not set" warning unexpectedly, the secret has
+expired and the same rotation procedure applies.
+
 ## External Resources
 
 - API docs: https://docs.rs/freenet
