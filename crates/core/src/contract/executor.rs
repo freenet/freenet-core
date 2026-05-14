@@ -343,15 +343,9 @@ impl Display for OperationMode {
     }
 }
 
-// `ComposeNetworkMessage`, `op_request`, `UpdateContract`,
-// `SubscribeContract`, and the executor → event-loop mediator
-// (`op_request_channel`/`run_op_request_mediator`/`OpRequestSender`)
-// are all retired. Executor auto-subscribe now calls
-// `subscribe::run_executor_subscribe` directly; UPDATEs flow through
-// `start_client_update`. No executor ever writes to the event loop
-// through the legacy mediator path.
+// Executor auto-subscribe calls `subscribe::run_executor_subscribe`
+// directly; UPDATEs flow through `start_client_update`.
 
-/// Empty stub for the now-retired executor → event-loop mediator
 /// Empty stream used to fill the executor-transaction slot in
 /// `priority_select::PrioritySelectStream`. Never yields.
 pub(crate) struct ExecutorTransactionStream;

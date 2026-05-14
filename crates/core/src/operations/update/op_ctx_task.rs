@@ -66,7 +66,7 @@ pub static RELAY_UPDATE_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
 /// Counter: number of times `start_relay_request_update_streaming` or
 /// `start_relay_broadcast_to_streaming` was invoked. Used by dispatch
 /// gate pin tests to prove streaming relays route through the
-/// task-per-tx driver rather than `handle_op_request`.
+/// driver rather than `handle_op_request`.
 #[cfg(any(test, feature = "testing"))]
 pub static RELAY_UPDATE_STREAMING_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -102,7 +102,7 @@ pub(crate) async fn start_client_update(
     tracing::debug!(
         tx = %client_tx,
         contract = %key,
-        "update (task-per-tx): spawning client-initiated task"
+        "update: spawning client-initiated task"
     );
 
     // Spawn the driver. Same fire-and-forget rationale as PUT's
@@ -184,7 +184,7 @@ async fn drive_client_update(
                 tracing::debug!(
                     %key,
                     peer = %pub_key,
-                    "update (task-per-tx): proximity cache neighbor not connected, trying next"
+                    "update: proximity cache neighbor not connected, trying next"
                 );
             }
         }
@@ -195,7 +195,7 @@ async fn drive_client_update(
             %key,
             target = ?proximity_neighbor.socket_addr(),
             proximity_neighbors_found = proximity_neighbors.len(),
-            "update (task-per-tx): using proximity cache neighbor as target"
+            "update: using proximity cache neighbor as target"
         );
         Some(proximity_neighbor)
     } else {
@@ -210,7 +210,7 @@ async fn drive_client_update(
             tracing::debug!(
                 tx = %client_tx,
                 %key,
-                "update (task-per-tx): no remote peers, handling locally"
+                "update: no remote peers, handling locally"
             );
 
             let is_hosting = op_manager.ring.is_hosting_contract(&key);
@@ -218,7 +218,7 @@ async fn drive_client_update(
                 tracing::error!(
                     contract = %key,
                     phase = "error",
-                    "update (task-per-tx): cannot update contract on isolated node — not hosted"
+                    "update: cannot update contract on isolated node — not hosted"
                 );
                 return Err(OpError::RingError(RingError::NoHostingPeers(*key.id())));
             }
@@ -246,7 +246,7 @@ async fn drive_client_update(
                         contract = %key,
                         error = %err,
                         phase = "ring_state_store_inconsistency",
-                        "update (task-per-tx): is_hosting_contract reports true \
+                        "update: is_hosting_contract reports true \
                          but state_store has no params for this contract; cannot \
                          auto-fetch (no remote target) — the ring/state-store \
                          divergence must be repaired by a re-PUT or a manual \
@@ -269,13 +269,13 @@ async fn drive_client_update(
                 tracing::debug!(
                     tx = %client_tx,
                     %key,
-                    "update (task-per-tx): local update resulted in no change"
+                    "update: local update resulted in no change"
                 );
             } else {
                 tracing::debug!(
                     tx = %client_tx,
                     %key,
-                    "update (task-per-tx): local-only update complete"
+                    "update: local-only update complete"
                 );
             }
 
@@ -299,7 +299,7 @@ async fn drive_client_update(
                         tx = %client_tx,
                         %key,
                         target_pub_key = %target.pub_key(),
-                        "update (task-per-tx): target peer has no socket address"
+                        "update: target peer has no socket address"
                     );
                     return Err(OpError::RingError(RingError::NoHostingPeers(*key.id())));
                 }
@@ -309,7 +309,7 @@ async fn drive_client_update(
                 tx = %client_tx,
                 %key,
                 target_peer = %target_addr,
-                "update (task-per-tx): applying locally before forwarding"
+                "update: applying locally before forwarding"
             );
 
             let local_apply = super::update_contract(
@@ -371,7 +371,7 @@ async fn drive_client_update(
                             error = %err,
                             target = %target_addr,
                             phase = "auto_fetch_originator",
-                            "update (task-per-tx): originator has no contract \
+                            "update: originator has no contract \
                              code/params for this contract; triggering \
                              auto-fetch from target and asking client to retry"
                         );
@@ -397,7 +397,7 @@ async fn drive_client_update(
                         contract = %key,
                         error = %err,
                         phase = "error",
-                        "update (task-per-tx): failed to apply update locally before forwarding"
+                        "update: failed to apply update locally before forwarding"
                     );
                     return Err(err);
                 }
@@ -435,7 +435,7 @@ async fn drive_client_update(
                 tx = %client_tx,
                 %key,
                 target_peer = %target_addr,
-                "update (task-per-tx): forwarded to target, operation complete"
+                "update: forwarded to target, operation complete"
             );
 
             let host_result: HostResult = Ok(HostResponse::ContractResponse(
@@ -461,7 +461,7 @@ fn classify_update_outcome_for_op_stats(outcome: &DriverOutcome) -> bool {
 
 fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: DriverOutcome) {
     // Dashboard op_stats UPDATE counter (issue #4010). The legacy
-    // `report_result` recording path is bypassed for task-per-tx
+    // `report_result` recording path is bypassed for driver
     // terminal replies (see `node::record_op_result` rustdoc), so
     // every terminal outcome must be recorded here.
     //
@@ -490,7 +490,7 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
             tracing::warn!(
                 tx = %client_tx,
                 error = %err,
-                "update (task-per-tx): infrastructure error; publishing synthesized client error"
+                "update: infrastructure error; publishing synthesized client error"
             );
             let synthesized: HostResult = Err(ErrorKind::OperationError {
                 cause: format!("UPDATE failed: {err}").into(),
@@ -554,7 +554,7 @@ pub(crate) async fn start_relay_request_update(
             %key,
             %sender_addr,
             phase = "relay_update_dedup_reject",
-            "UPDATE relay (task-per-tx): duplicate RequestUpdate for in-flight tx, dropping"
+            "UPDATE relay: duplicate RequestUpdate for in-flight tx, dropping"
         );
         return Ok(());
     }
@@ -564,7 +564,7 @@ pub(crate) async fn start_relay_request_update(
         %key,
         %sender_addr,
         phase = "relay_update_request_start",
-        "UPDATE relay (task-per-tx): spawning RequestUpdate driver"
+        "UPDATE relay: spawning RequestUpdate driver"
     );
 
     // Construct guard + bump counters BEFORE spawn so the dedup-set
@@ -617,7 +617,7 @@ pub(crate) async fn start_relay_broadcast_to(
             %key,
             %sender_addr,
             phase = "relay_update_dedup_reject",
-            "UPDATE relay (task-per-tx): duplicate BroadcastTo for in-flight tx, dropping"
+            "UPDATE relay: duplicate BroadcastTo for in-flight tx, dropping"
         );
         return Ok(());
     }
@@ -627,7 +627,7 @@ pub(crate) async fn start_relay_broadcast_to(
         %key,
         %sender_addr,
         phase = "relay_update_broadcast_start",
-        "UPDATE relay (task-per-tx): spawning BroadcastTo driver"
+        "UPDATE relay: spawning BroadcastTo driver"
     );
 
     // See `start_relay_request_update` — guard pre-spawn closes the
@@ -696,7 +696,7 @@ async fn run_relay_request_update(
             %key,
             error = %err,
             phase = "relay_update_request_error",
-            "UPDATE relay (task-per-tx): RequestUpdate driver returned error"
+            "UPDATE relay: RequestUpdate driver returned error"
         );
     }
 }
@@ -727,7 +727,7 @@ async fn run_relay_broadcast_to(
             %key,
             error = %err,
             phase = "relay_update_broadcast_error",
-            "UPDATE relay (task-per-tx): BroadcastTo driver returned error"
+            "UPDATE relay: BroadcastTo driver returned error"
         );
     }
 }
@@ -757,7 +757,7 @@ async fn drive_relay_request_update(
         %key,
         executing_peer = ?executing_addr,
         request_sender = %sender_addr,
-        "UPDATE relay (task-per-tx): processing RequestUpdate"
+        "UPDATE relay: processing RequestUpdate"
     );
 
     // ── Step 1: do we host the contract locally? ──────────────────────────
@@ -824,13 +824,13 @@ async fn drive_relay_request_update(
             tracing::debug!(
                 tx = %incoming_tx,
                 %key,
-                "UPDATE relay (task-per-tx): yielded no state change, skipping broadcast"
+                "UPDATE relay: yielded no state change, skipping broadcast"
             );
         } else {
             tracing::debug!(
                 tx = %incoming_tx,
                 %key,
-                "UPDATE relay (task-per-tx): RequestUpdate succeeded, state changed"
+                "UPDATE relay: RequestUpdate succeeded, state changed"
             );
         }
         // No `Finished`/`ReceivedRequest` bookkeeping: relay driver owns
@@ -865,7 +865,7 @@ async fn drive_relay_request_update(
                 connection_count,
                 peer_addr = %sender_addr,
                 phase = "error",
-                "UPDATE relay (task-per-tx): contract not local and no peers to forward to"
+                "UPDATE relay: contract not local and no peers to forward to"
             );
             if let Some(event) = NetEventLog::update_failure(
                 &incoming_tx,
@@ -886,7 +886,7 @@ async fn drive_relay_request_update(
                 tx = %incoming_tx,
                 %key,
                 target_pub_key = %forward_target.pub_key(),
-                "UPDATE relay (task-per-tx): forward target has no socket address"
+                "UPDATE relay: forward target has no socket address"
             );
             return Err(OpError::RingError(RingError::NoHostingPeers(*key.id())));
         }
@@ -896,7 +896,7 @@ async fn drive_relay_request_update(
         tx = %incoming_tx,
         %key,
         next_peer = %forward_addr,
-        "UPDATE relay (task-per-tx): forwarding to peer that might have contract"
+        "UPDATE relay: forwarding to peer that might have contract"
     );
 
     // Telemetry: relay forwarding update request.
@@ -929,7 +929,7 @@ async fn drive_relay_request_update(
             %key,
             target = %forward_addr,
             error = %err,
-            "UPDATE relay (task-per-tx): forward send failed"
+            "UPDATE relay: forward send failed"
         );
         return Err(err);
     }
@@ -975,7 +975,7 @@ async fn drive_relay_broadcast_to(
             tracing::debug!(
                 contract = %key,
                 delta_size = bytes.len(),
-                "UPDATE relay (task-per-tx): received delta broadcast"
+                "UPDATE relay: received delta broadcast"
             );
             (
                 UpdateData::Delta(StateDelta::from(bytes.clone())),
@@ -986,7 +986,7 @@ async fn drive_relay_broadcast_to(
             tracing::debug!(
                 contract = %key,
                 state_size = bytes.len(),
-                "UPDATE relay (task-per-tx): received full state broadcast"
+                "UPDATE relay: received full state broadcast"
             );
             (UpdateData::State(State::from(bytes.clone())), bytes.clone())
         }
@@ -1024,7 +1024,7 @@ async fn drive_relay_broadcast_to(
         tracing::debug!(
             tx = %incoming_tx,
             %key,
-            "UPDATE relay (task-per-tx): BroadcastTo skipped — duplicate payload (dedup hit)"
+            "UPDATE relay: BroadcastTo skipped — duplicate payload (dedup hit)"
         );
         return Ok(());
     }
@@ -1070,7 +1070,7 @@ async fn drive_relay_broadcast_to(
                     sender = %sender_addr,
                     error = %err,
                     event = "delta_apply_failed",
-                    "UPDATE relay (task-per-tx): delta apply failed, sending ResyncRequest"
+                    "UPDATE relay: delta apply failed, sending ResyncRequest"
                 );
 
                 if let Some(sender_pkl) = op_manager
@@ -1089,7 +1089,7 @@ async fn drive_relay_broadcast_to(
                     contract = %key,
                     target = %sender_addr,
                     event = "resync_request_sent",
-                    "UPDATE relay (task-per-tx): sending ResyncRequest after delta failure"
+                    "UPDATE relay: sending ResyncRequest after delta failure"
                 );
                 if let Err(e) = op_manager
                     .notify_node_event(NodeEvent::SendInterestMessage {
@@ -1101,7 +1101,7 @@ async fn drive_relay_broadcast_to(
                     tracing::warn!(
                         tx = %incoming_tx,
                         error = %e,
-                        "UPDATE relay (task-per-tx): failed to send ResyncRequest"
+                        "UPDATE relay: failed to send ResyncRequest"
                     );
                 }
             } else if !err.is_contract_exec_rejection() {
@@ -1116,7 +1116,7 @@ async fn drive_relay_broadcast_to(
     tracing::debug!(
         tx = %incoming_tx,
         %key,
-        "UPDATE relay (task-per-tx): BroadcastTo applied"
+        "UPDATE relay: BroadcastTo applied"
     );
 
     // ── Step 5: telemetry — broadcast applied ─────────────────────────────
@@ -1135,13 +1135,13 @@ async fn drive_relay_broadcast_to(
         tracing::debug!(
             tx = %incoming_tx,
             %key,
-            "UPDATE relay (task-per-tx): BroadcastTo produced no change, ending propagation"
+            "UPDATE relay: BroadcastTo produced no change, ending propagation"
         );
         return Ok(());
     }
 
     tracing::debug!(
-        "UPDATE relay (task-per-tx): contract {} @ {:?} updated via BroadcastTo",
+        "UPDATE relay: contract {} @ {:?} updated via BroadcastTo",
         key,
         self_location.location()
     );
@@ -1230,7 +1230,7 @@ pub(crate) async fn start_relay_request_update_streaming(
             %key,
             %sender_addr,
             phase = "relay_update_streaming_dedup_reject",
-            "UPDATE relay (task-per-tx streaming): duplicate RequestUpdateStreaming for in-flight tx, dropping"
+            "UPDATE relay (driver streaming): duplicate RequestUpdateStreaming for in-flight tx, dropping"
         );
         return Ok(());
     }
@@ -1242,7 +1242,7 @@ pub(crate) async fn start_relay_request_update_streaming(
         %stream_id,
         total_size,
         phase = "relay_update_streaming_request_start",
-        "UPDATE relay (task-per-tx streaming): spawning RequestUpdateStreaming driver"
+        "UPDATE relay (driver streaming): spawning RequestUpdateStreaming driver"
     );
 
     // Guard pre-spawn (see `start_relay_request_update` rationale).
@@ -1285,7 +1285,7 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
             %key,
             %sender_addr,
             phase = "relay_update_streaming_dedup_reject",
-            "UPDATE relay (task-per-tx streaming): duplicate BroadcastToStreaming for in-flight tx, dropping"
+            "UPDATE relay (driver streaming): duplicate BroadcastToStreaming for in-flight tx, dropping"
         );
         return Ok(());
     }
@@ -1297,7 +1297,7 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
         %stream_id,
         total_size,
         phase = "relay_update_streaming_broadcast_start",
-        "UPDATE relay (task-per-tx streaming): spawning BroadcastToStreaming driver"
+        "UPDATE relay (driver streaming): spawning BroadcastToStreaming driver"
     );
 
     RELAY_UPDATE_STREAMING_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1363,7 +1363,7 @@ async fn run_relay_request_update_streaming(
             %key,
             error = %err,
             phase = "relay_update_streaming_request_error",
-            "UPDATE relay (task-per-tx streaming): RequestUpdateStreaming driver returned error"
+            "UPDATE relay (driver streaming): RequestUpdateStreaming driver returned error"
         );
     }
 }
@@ -1394,7 +1394,7 @@ async fn run_relay_broadcast_to_streaming(
             %key,
             error = %err,
             phase = "relay_update_streaming_broadcast_error",
-            "UPDATE relay (task-per-tx streaming): BroadcastToStreaming driver returned error"
+            "UPDATE relay (driver streaming): BroadcastToStreaming driver returned error"
         );
     }
 }
@@ -1425,7 +1425,7 @@ async fn drive_relay_request_update_streaming(
         contract = %key,
         %stream_id,
         total_size,
-        "UPDATE relay (task-per-tx streaming): processing RequestUpdateStreaming"
+        "UPDATE relay (driver streaming): processing RequestUpdateStreaming"
     );
 
     // Step 1: claim stream.
@@ -1439,7 +1439,7 @@ async fn drive_relay_request_update_streaming(
             tracing::debug!(
                 tx = %incoming_tx,
                 %stream_id,
-                "UPDATE relay (task-per-tx streaming): RequestUpdateStreaming skipped — stream already claimed (dedup)"
+                "UPDATE relay (driver streaming): RequestUpdateStreaming skipped — stream already claimed (dedup)"
             );
             return Ok(());
         }
@@ -1448,7 +1448,7 @@ async fn drive_relay_request_update_streaming(
                 tx = %incoming_tx,
                 %stream_id,
                 error = %e,
-                "UPDATE relay (task-per-tx streaming): failed to claim stream from orphan registry"
+                "UPDATE relay (driver streaming): failed to claim stream from orphan registry"
             );
             return Err(OpError::OrphanStreamClaimFailed);
         }
@@ -1462,7 +1462,7 @@ async fn drive_relay_request_update_streaming(
                 %stream_id,
                 assembled_size = data.len(),
                 expected_size = total_size,
-                "UPDATE relay (task-per-tx streaming): stream assembled"
+                "UPDATE relay (driver streaming): stream assembled"
             );
             data
         }
@@ -1471,7 +1471,7 @@ async fn drive_relay_request_update_streaming(
                 tx = %incoming_tx,
                 %stream_id,
                 error = %e,
-                "UPDATE relay (task-per-tx streaming): failed to assemble stream"
+                "UPDATE relay (driver streaming): failed to assemble stream"
             );
             return Err(OpError::StreamCancelled);
         }
@@ -1484,7 +1484,7 @@ async fn drive_relay_request_update_streaming(
             tracing::error!(
                 tx = %incoming_tx,
                 error = %e,
-                "UPDATE relay (task-per-tx streaming): failed to deserialize UpdateStreamingPayload"
+                "UPDATE relay (driver streaming): failed to deserialize UpdateStreamingPayload"
             );
             return Err(OpError::invalid_transition(incoming_tx));
         }
@@ -1533,13 +1533,13 @@ async fn drive_relay_request_update_streaming(
         tracing::debug!(
             tx = %incoming_tx,
             %key,
-            "UPDATE relay (task-per-tx streaming): RequestUpdateStreaming succeeded, state changed"
+            "UPDATE relay (driver streaming): RequestUpdateStreaming succeeded, state changed"
         );
     } else {
         tracing::debug!(
             tx = %incoming_tx,
             %key,
-            "UPDATE relay (task-per-tx streaming): RequestUpdateStreaming yielded no state change"
+            "UPDATE relay (driver streaming): RequestUpdateStreaming yielded no state change"
         );
     }
 
@@ -1576,7 +1576,7 @@ async fn drive_relay_broadcast_to_streaming(
         %stream_id,
         total_size,
         sender = %sender_addr,
-        "UPDATE relay (task-per-tx streaming): processing BroadcastToStreaming"
+        "UPDATE relay (driver streaming): processing BroadcastToStreaming"
     );
 
     // Step 1: claim stream.
@@ -1590,7 +1590,7 @@ async fn drive_relay_broadcast_to_streaming(
             tracing::debug!(
                 tx = %incoming_tx,
                 %stream_id,
-                "UPDATE relay (task-per-tx streaming): BroadcastToStreaming skipped — stream already claimed (dedup)"
+                "UPDATE relay (driver streaming): BroadcastToStreaming skipped — stream already claimed (dedup)"
             );
             return Ok(());
         }
@@ -1599,7 +1599,7 @@ async fn drive_relay_broadcast_to_streaming(
                 tx = %incoming_tx,
                 %stream_id,
                 error = %e,
-                "UPDATE relay (task-per-tx streaming): failed to claim stream from orphan registry (broadcast)"
+                "UPDATE relay (driver streaming): failed to claim stream from orphan registry (broadcast)"
             );
             return Err(OpError::OrphanStreamClaimFailed);
         }
@@ -1613,7 +1613,7 @@ async fn drive_relay_broadcast_to_streaming(
                 %stream_id,
                 assembled_size = data.len(),
                 expected_size = total_size,
-                "UPDATE relay (task-per-tx streaming): stream assembled (broadcast)"
+                "UPDATE relay (driver streaming): stream assembled (broadcast)"
             );
             data
         }
@@ -1622,7 +1622,7 @@ async fn drive_relay_broadcast_to_streaming(
                 tx = %incoming_tx,
                 %stream_id,
                 error = %e,
-                "UPDATE relay (task-per-tx streaming): failed to assemble stream (broadcast)"
+                "UPDATE relay (driver streaming): failed to assemble stream (broadcast)"
             );
             return Err(OpError::StreamCancelled);
         }
@@ -1635,7 +1635,7 @@ async fn drive_relay_broadcast_to_streaming(
             tracing::error!(
                 tx = %incoming_tx,
                 error = %e,
-                "UPDATE relay (task-per-tx streaming): failed to deserialize BroadcastStreamingPayload"
+                "UPDATE relay (driver streaming): failed to deserialize BroadcastStreamingPayload"
             );
             return Err(OpError::invalid_transition(incoming_tx));
         }
@@ -1674,7 +1674,7 @@ async fn drive_relay_broadcast_to_streaming(
         tracing::debug!(
             tx = %incoming_tx,
             %key,
-            "UPDATE relay (task-per-tx streaming): BroadcastToStreaming skipped — duplicate payload (dedup hit)"
+            "UPDATE relay (driver streaming): BroadcastToStreaming skipped — duplicate payload (dedup hit)"
         );
         return Ok(());
     }
@@ -1755,7 +1755,7 @@ async fn drive_relay_broadcast_to_streaming(
         tracing::debug!(
             tx = %incoming_tx,
             %key,
-            "UPDATE relay (task-per-tx streaming): BroadcastToStreaming produced no change"
+            "UPDATE relay (driver streaming): BroadcastToStreaming produced no change"
         );
         return Ok(());
     }
@@ -1764,7 +1764,7 @@ async fn drive_relay_broadcast_to_streaming(
     tracing::debug!(
         tx = %incoming_tx,
         %key,
-        "UPDATE relay (task-per-tx streaming): BroadcastToStreaming applied (state changed)"
+        "UPDATE relay (driver streaming): BroadcastToStreaming applied (state changed)"
     );
 
     let op_mgr = op_manager.clone();
@@ -2402,7 +2402,7 @@ mod tests {
     }
 
     /// Issue #4010: `deliver_outcome` must record the UPDATE outcome to
-    /// the dashboard `op_stats.updates` counter (the task-per-tx bypass
+    /// the dashboard `op_stats.updates` counter (the driver bypass
     /// at `handle_pure_network_message_v1` skips the legacy
     /// `report_result` recording path) and gate the call on
     /// `!client_tx.is_sub_operation()` for parity with SUBSCRIBE.
@@ -2417,7 +2417,7 @@ mod tests {
         assert!(
             body.contains("record_op_result"),
             "deliver_outcome must call record_op_result so the dashboard \
-             UPDATE counter advances on task-per-tx terminal replies. \
+             UPDATE counter advances on driver terminal replies. \
              Issue #4010."
         );
         assert!(

@@ -2,7 +2,7 @@
 //! given radius cache a copy of the contract and its current value,
 //! and broadcast updates to subscribers.
 //!
-//! Every PUT wire variant dispatches to a task-per-tx driver —
+//! Every PUT wire variant dispatches to a driver —
 //! `op_ctx_task::start_client_put`, `start_relay_put`, and
 //! `start_relay_put_streaming`. The wire-format types
 //! (`PutMsg`, `PutStreamingPayload`), the originator finalization
@@ -346,35 +346,25 @@ mod tests {
         }
     }
 
-    /// Pin: PUT GC speculative retry block MUST NOT come back.
-    /// `op_state_manager.rs` should no longer contain the
-    /// `put_retry_candidates` accumulator or the `put_retried` map.
+    /// Pin: the PUT GC speculative retry accumulator and retry-count
+    /// map must not return. Their reintroduction risks the per-tx
+    /// DashMap leak the surrounding code was rebuilt to avoid.
     #[test]
     fn put_gc_speculative_retry_block_must_stay_deleted() {
         let src = include_str!("../node/op_state_manager.rs");
         assert!(
             !src.contains("put_retry_candidates"),
-            "PUT GC speculative retry block was retired in PR #3964 — \
-             reintroduction risks the Phase 3a DashMap leak interaction"
+            "`put_retry_candidates` accumulator must stay deleted"
         );
         assert!(
             !src.contains("put_retried"),
-            "PUT GC retry-count map was retired in PR #3964"
+            "`put_retried` retry-count map must stay deleted"
         );
     }
 
-    /// Pin: `OpManager::completed` MUST keep removing the per-type
-    /// DashMap entry for the remaining DashMap-backed op (Connect).
-    /// GET, PUT, UPDATE and SUBSCRIBE no longer have DashMap entries.
-    /// Without this the per-tx DashMap leak comes back for Connect.
-    /// Pin: `OpManager::completed` must not touch any per-op
-    /// DashMap. The legacy `self.ops.{connect,get,put,update,subscribe}`
-    /// maps were retired across the #1454 phases; the surviving
-    /// completion side effects are limited to the global
+    /// Pin: `OpManager::completed` must not touch any per-op DashMap.
+    /// The surviving completion side effects are limited to the global
     /// `under_progress` / `completed` sets and the `request_router`.
-    /// Reintroducing a per-op map here is a regression that would
-    /// resurrect the per-tx DashMap leak this test originally
-    /// guarded against.
     #[test]
     fn completed_must_not_touch_per_op_dashmaps() {
         let src = include_str!("../node/op_state_manager.rs");
@@ -386,7 +376,7 @@ mod tests {
             .expect("OpManager::completed closing brace not found")
             + fn_start;
         let body = &src[fn_start..fn_end];
-        for retired in [
+        for forbidden in [
             "self.ops.connect",
             "self.ops.put",
             "self.ops.get",
@@ -394,22 +384,22 @@ mod tests {
             "self.ops.update",
         ] {
             assert!(
-                !body.contains(retired),
-                "OpManager::completed must not reference `{retired}` — the corresponding DashMap was retired"
+                !body.contains(forbidden),
+                "OpManager::completed must not reference `{forbidden}`"
             );
         }
     }
 
-    /// Pin: legacy ForwardingAck senders MUST NOT come back. The
-    /// relay drivers omit them (would race the capacity-1 reply
-    /// waiter), and the consumer is a no-op (PR #3964).
+    /// Pin: ForwardingAck senders must not return. Relay drivers omit
+    /// them (would race the capacity-1 reply waiter) and the consumer
+    /// is a no-op.
     #[test]
     fn put_forwarding_ack_senders_must_stay_deleted() {
         let src = include_str!("put.rs");
         let needle = format!("NetMessage::from({}::ForwardingAck", "PutMsg",);
         assert!(
             !src.contains(&needle),
-            "ForwardingAck senders retired in PR #3964"
+            "ForwardingAck senders must not be reintroduced"
         );
     }
 }

@@ -1826,7 +1826,7 @@ fn peer_detail_html(address_str: &str) -> String {
                 // either contains the rendered curve or a per-metric
                 // "awaiting data" placeholder — empty slots are NOT hidden,
                 // because hiding them silently rotted unobserved when the
-                // task-per-tx migration stopped feeding the response-time
+                // migration stopped feeding the response-time
                 // and transfer-rate estimators (the `Failure Probability`-only
                 // dashboard regression that surfaced this code path).
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
@@ -1984,7 +1984,7 @@ fn peer_detail_html(address_str: &str) -> String {
 /// yet — a titled placeholder. The placeholder keeps the slot visible so
 /// users can always see every component of a routing prediction even when
 /// some estimators have not yet received feedback. Hiding empty charts
-/// masked the data-collection regression in the task-per-tx migration
+/// masked the data-collection regression in the migration
 /// that fed only `failure_estimator` and left `response_start_time` and
 /// `transfer_rate` permanently empty.
 #[allow(clippy::too_many_arguments)]
@@ -3182,7 +3182,7 @@ mod tests {
     /// placeholder so all three prediction-component slots
     /// (Failure Probability, Response Time, Transfer Rate) stay
     /// visible on the peer dashboard. The previous behaviour hid the
-    /// chart entirely, which masked the task-per-tx data-collection
+    /// chart entirely, which masked the driver data-collection
     /// regression that left response-time/transfer-rate estimators
     /// permanently empty (Failure-Probability-only dashboard).
     #[test]
@@ -3215,7 +3215,7 @@ mod tests {
     /// `build_estimator_chart_or_placeholder` for all three
     /// prediction-component slots (Failure Probability, Response Time,
     /// Transfer Rate). Hiding empty slots previously masked the
-    /// task-per-tx data-collection regression for months — keeping every
+    /// driver data-collection regression for months — keeping every
     /// slot visible makes future regressions detectable on sight.
     /// Source-scrape rather than HTML-grep because the visible-when-empty
     /// behaviour depends on a router_snapshot being present, and the

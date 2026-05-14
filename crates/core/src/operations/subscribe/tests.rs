@@ -118,10 +118,10 @@ fn subscribe_dispatch_routes_unsubscribe_to_inbound_handler() {
     );
 }
 
-/// Pin: `SubscribeMsg::ForwardingAck` wire-format compatibility. Survives
-/// Phase 5 final as a telemetry-only handler (no production reader after the
-/// retry block was retired). This serde round-trip guards against accidental
-/// bincode-discriminant shifts that would break cross-version compatibility.
+/// Pin: `SubscribeMsg::ForwardingAck` wire-format compatibility. The
+/// variant has no production reader, but a serde round-trip guards
+/// against bincode-discriminant shifts that would break cross-version
+/// compatibility.
 #[test]
 fn subscribe_forwarding_ack_serde_roundtrip() {
     let id = Transaction::new::<SubscribeMsg>();

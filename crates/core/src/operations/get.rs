@@ -1,4 +1,4 @@
-// Every GET wire variant dispatches to a task-per-tx driver —
+// Every GET wire variant dispatches to a driver —
 // `op_ctx_task::start_client_get`, `start_relay_get`,
 // `start_sub_op_get`, and `start_targeted_sub_op_get`. The
 // wire-format types (`GetMsg`, `GetMsgResult`,
@@ -26,7 +26,7 @@ pub(crate) struct GetResult {
 
 impl GetResult {
     /// Construct a `GetResult` directly from its fields. Used by the
-    /// task-per-tx sub-op GET driver, which assembles the result from
+    /// driver sub-op GET driver, which assembles the result from
     /// the wire-level terminal reply.
     pub(crate) fn new(state: WrappedState, contract: Option<ContractContainer>) -> Self {
         Self { state, contract }

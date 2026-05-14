@@ -306,7 +306,7 @@ pub(crate) struct ConnectResponse {
 
 /// State machine retained for in-file relay/joiner unit tests
 /// (`tests::*` in this file). Production CONNECT runs entirely on the
-/// task-per-tx drivers in `op_ctx_task.rs` and rebuilds `RelayState`
+/// drivers in `op_ctx_task.rs` and rebuilds `RelayState`
 /// in task locals; nothing constructs `ConnectState::Relaying` or
 /// `Completed` outside the test module.
 #[derive(Debug, Clone)]
@@ -1595,8 +1595,8 @@ pub(crate) async fn gateway_version_probe(
 /// intervals lets `initial_join_procedure` notice when `min_connections`
 /// is reached without waiting for the full gateway backoff to expire.
 ///
-/// Also applied in `handle_aborted_op` for the same reason.  ±20% jitter is
-/// applied at each call site to prevent thundering herd.  See issue #3304.
+/// ±20% jitter is applied at each call site to prevent thundering herd.
+/// See issue #3304.
 pub(crate) const GATEWAY_BACKOFF_POLL_CAP: Duration = Duration::from_secs(30);
 
 pub(crate) async fn initial_join_procedure(

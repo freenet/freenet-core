@@ -3207,8 +3207,8 @@ mod tests {
         assert_eq!(cm.connection_count(), 1);
     }
 
-    /// Verify that prune_in_transit_connection clears the phantom entry directly,
-    /// as called from handle_aborted_op (Fix 2 of #3088).
+    /// Verify that `prune_in_transit_connection` clears the phantom
+    /// entry directly (Fix 2 of #3088).
     #[test]
     fn test_prune_in_transit_clears_phantom_location() {
         let cm = make_connection_manager(Some(make_addr(8000)), 5, 20, false);

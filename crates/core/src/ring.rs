@@ -2010,8 +2010,8 @@ impl Ring {
             // backoff state, and clears stale pending reservations for gateways.
             // Used during isolation recovery to ensure all gateways are retryable
             // when the node has zero ring connections (#3319).
-            // Wakes all tasks sleeping on gateway backoff (initial_join_procedure
-            // and any handle_aborted_op retries) so they can retry immediately.
+            // Wakes any task sleeping on gateway backoff
+            // (`initial_join_procedure`) so it can retry immediately.
             let reset_all_backoff = || {
                 self.reset_all_connection_backoff();
                 op_manager.gateway_backoff.lock().clear();

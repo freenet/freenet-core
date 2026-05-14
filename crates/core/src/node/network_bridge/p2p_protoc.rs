@@ -177,10 +177,9 @@ impl P2pBridge {
 
     /// Log transactions orphaned by a pruned peer connection.
     ///
-    /// Task-per-tx drivers own their own retry/cancellation surface
-    /// after #1454 — the orphan list is informational only, used by
-    /// callers to confirm prune occurred. No retry is dispatched
-    /// here.
+    /// Drivers own retry/cancellation; the orphan list is informational
+    /// only — used by callers to confirm prune occurred. No retry is
+    /// dispatched here.
     pub(crate) async fn handle_orphaned_transactions(
         &self,
         transactions: Vec<Transaction>,

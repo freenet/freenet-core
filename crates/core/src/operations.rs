@@ -27,17 +27,12 @@ pub(crate) mod visited_peers;
 pub(crate) use op_ctx::OpCtx;
 pub(crate) use visited_peers::VisitedPeers;
 
-// `OpEnum` and its delegate-dispatch surface are retired:
-//   - `Connect`: no producer after `OpManager::pop` was removed in
-//     the `ops.connect` DashMap slice.
-//   - `Get`/`Put`/`Update`/`Subscribe`: retired alongside their
-//     respective DashMaps in earlier #1454 slices.
 // Driver finalization paths publish `HostResult` directly via
 // `result_router_tx` (see `op_ctx_task::*`); no central carrier
 // is required.
 
 #[derive(Debug)]
-#[allow(dead_code)] // Surface kept for the CONNECT carrier + post-#1454 phase-5 final tests.
+#[allow(dead_code)]
 pub(crate) enum OpOutcome<'a> {
     /// An op which involves a contract completed successfully.
     ContractOpSuccess {
@@ -94,8 +89,6 @@ pub(crate) enum OpError {
     NotificationError,
     #[error("notification channel error: {0}")]
     NotificationChannelError(String),
-    // Orphan after #1454 phase 6 (no remaining producers); kept in
-    // case a future re-introduction of an Op trait wants them back.
     #[allow(dead_code)]
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
@@ -178,68 +171,6 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
             );
         }
     }
-}
-
-/// Set up subscription forwarding at a relay node during GET response propagation.
-///
-/// Relay nodes only set up forwarding (upstream/downstream registration) -- they
-/// do NOT call `ring.subscribe()` or `announce_contract_hosted()`, which would
-/// cause a subscription storm.
-///
-/// Registers:
-/// 1. Upstream peer (response sender) as interest source for Unsubscribe routing
-/// 2. Downstream peer (GET requester) as downstream subscriber for UPDATE propagation
-// Sole caller (legacy GET relay `process_message::Response{Found}` branch)
-// retired in #1454 phase 5 final (GET slice). The task-per-tx GET relay
-// driver inlines its own subscription-forwarding side effect path. This
-// helper is kept for symmetry with similar relay-side helpers and as
-// reference for any future legacy-style relay reintroduction.
-#[allow(dead_code)]
-pub(crate) async fn setup_subscription_forwarding_at_relay(
-    op_manager: &OpManager,
-    key: &ContractKey,
-    tx: &crate::message::Transaction,
-    upstream_response_addr: std::net::SocketAddr,
-    downstream_requester_addr: std::net::SocketAddr,
-) {
-    // Register upstream peer (response sender) as interest source
-    if let Some(upstream_pkl) = op_manager
-        .ring
-        .connection_manager
-        .get_peer_by_addr(upstream_response_addr)
-    {
-        let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
-        op_manager
-            .interest_manager
-            .register_peer_interest(key, peer_key, None, true);
-    } else {
-        tracing::debug!(
-            tx = %tx,
-            contract = %key,
-            upstream = %upstream_response_addr,
-            "Piggyback relay: upstream peer not in ring, skipping interest registration"
-        );
-    }
-
-    // Register downstream peer (GET requester) as downstream subscriber
-    subscribe::register_downstream_subscriber(
-        op_manager,
-        key,
-        downstream_requester_addr,
-        None,
-        None,
-        tx,
-        " (relay, piggybacked on GET response)",
-    )
-    .await;
-
-    tracing::debug!(
-        tx = %tx,
-        contract = %key,
-        upstream = %upstream_response_addr,
-        downstream = %downstream_requester_addr,
-        "Set up subscription forwarding at relay via GET piggyback"
-    );
 }
 
 /// Complete subscription at the originator node via GET piggyback.
@@ -347,16 +278,13 @@ pub(crate) async fn broadcast_change_interests(
 }
 
 /// Initiates a subscription after a PUT or GET, routing through the
-/// task-per-tx subscribe driver.
+/// subscribe driver as a fire-and-forget background task.
 ///
 /// `blocking` is accepted for API stability (callers may inspect it for
-/// telemetry), but post-#1454 sub-op SUBSCRIBE migration it has no
-/// behavioral effect: the subscribe runs as a fire-and-forget background
-/// task in either case. The legacy `SubOperationTracker`-based blocking
-/// semantics (parent waits for child via tracker DashMap) are retired —
-/// task-per-tx PUT/GET drivers handle blocking by `await`ing
-/// `subscribe::run_client_subscribe` inline (see `maybe_subscribe_child`
-/// in `put/op_ctx_task.rs` and `get/op_ctx_task.rs`).
+/// telemetry) but has no behavioral effect here: PUT/GET drivers that
+/// want to wait for completion `await` `subscribe::run_client_subscribe`
+/// inline (see `maybe_subscribe_child` in `put/op_ctx_task.rs` and
+/// `get/op_ctx_task.rs`).
 pub(super) fn start_subscription_request(
     op_manager: &OpManager,
     parent_tx: Transaction,
@@ -370,7 +298,7 @@ pub(super) fn start_subscription_request(
         %child_tx,
         %key,
         blocking,
-        "spawning child subscription operation (task-per-tx driver)"
+        "spawning child subscription operation (driver)"
     );
 
     // `run_client_subscribe` requires `Arc<OpManager>`. Callers on
@@ -897,20 +825,10 @@ mod streaming_tests {
 }
 
 #[cfg(test)]
-mod sub_op_subscribe_migration_pin_tests {
-    //! Pin tests for the #1454 sub-op SUBSCRIBE migration.
-    //!
-    //! These tests scrape the source of `start_subscription_request` to
-    //! prove that:
-    //! 1. The legacy `subscribe::request_subscribe` driver and the legacy
-    //!    `expect_and_register_sub_operation` registration call are gone
-    //!    from the production sub-op SUBSCRIBE entry point.
-    //! 2. The function spawns the task-per-tx
-    //!    `subscribe::run_client_subscribe` driver instead.
-    //!
-    //! If a future refactor reintroduces the legacy paths, these tests
-    //! will fail loudly and force a re-evaluation against the rationale
-    //! recorded in `.claude/rules/operations.md`.
+mod sub_op_subscribe_pin_tests {
+    //! Pin tests that prove `start_subscription_request` spawns
+    //! `subscribe::run_client_subscribe` and does not register with a
+    //! sub-operation tracker.
 
     fn extract_start_subscription_request_body() -> &'static str {
         let src = include_str!("operations.rs");
@@ -950,14 +868,12 @@ mod sub_op_subscribe_migration_pin_tests {
     }
 
     #[test]
-    fn start_subscription_request_does_not_call_legacy_request_subscribe() {
+    fn start_subscription_request_uses_run_client_subscribe() {
         let body = extract_start_subscription_request_body();
         assert!(
             !body.contains("subscribe::request_subscribe"),
-            "`start_subscription_request` must NOT route through the \
-             legacy `subscribe::request_subscribe` driver — sub-op \
-             SUBSCRIBE migrated to `subscribe::run_client_subscribe` \
-             (see #1454 follow-up)."
+            "`start_subscription_request` must route through \
+             `subscribe::run_client_subscribe`, not `request_subscribe`."
         );
     }
 
@@ -966,25 +882,23 @@ mod sub_op_subscribe_migration_pin_tests {
         let body = extract_start_subscription_request_body();
         assert!(
             !body.contains("expect_and_register_sub_operation"),
-            "`start_subscription_request` must NOT call \
-             `expect_and_register_sub_operation` — `SubOperationTracker` \
-             was deleted in #1454 Phase 3c. Reintroducing it would be a \
-             regression."
+            "`start_subscription_request` must NOT register with a \
+             sub-operation tracker."
         );
         assert!(
             !body.contains("sub_operation_failed"),
             "`start_subscription_request` must NOT propagate failures \
-             via `sub_operation_failed` — the task-per-tx subscribe \
-             driver publishes its own `HostResult::Err`."
+             via `sub_operation_failed` — the subscribe driver \
+             publishes its own `HostResult::Err`."
         );
     }
 
     #[test]
-    fn start_subscription_request_spawns_task_per_tx_driver() {
+    fn start_subscription_request_spawns_driver_driver() {
         let body = extract_start_subscription_request_body();
         assert!(
             body.contains("subscribe::run_client_subscribe"),
-            "`start_subscription_request` must spawn the task-per-tx \
+            "`start_subscription_request` must spawn the driver \
              subscribe driver `subscribe::run_client_subscribe` — \
              matches the `maybe_subscribe_child` pattern in \
              `put/op_ctx_task.rs` and `get/op_ctx_task.rs`."

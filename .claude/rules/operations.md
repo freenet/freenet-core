@@ -10,13 +10,9 @@ paths:
 
 Every operation runs as a task-per-transaction driver: each `Transaction`
 is owned and driven by a single spawned task; state lives in task
-locals. The `Operation` trait and the legacy `process_message` /
-`load_or_init` / `handle_op_request` / `handle_op_result` mediator
-path are all gone. `OpEnum`, every per-op DashMap (`ops.connect`,
-`ops.get`, `ops.put`, `ops.update`, `ops.subscribe`) and the
-`OpManager::push` / `pop` / `has_*_op` accessors that fed them are
-gone too. Drivers publish their own `HostResult` via
-`result_router_tx` and own routing/retry state in task locals.
+locals. Drivers publish their own `HostResult` via `result_router_tx`
+and own routing/retry state in task locals. `OpManager` carries no
+per-op DashMaps.
 
 Driver entry points:
 
@@ -47,24 +43,16 @@ for every inbound wire message. Pattern per op:
    `upstream_addr=own_addr` for GET/PUT/SUBSCRIBE so the same driver
    handles both relay hops and originator loopback. UPDATE has no
    loopback (fire-and-forget end-to-end).
-3. **No legacy fallthrough.** Every wire variant either bypasses to a
-   waiter, dispatches a driver, or hits a dedicated free-function
-   handler (e.g. `handle_unsubscribe_inbound`, `ForwardingAck` no-op).
-   The legacy `handle_op_request` mediator was deleted in the CONNECT
-   phase 6 slice — any inbound message that does not match a bypass or
-   relay-dispatch rule is dropped with a debug log.
+3. **No fallthrough.** Every wire variant either bypasses to a waiter,
+   dispatches a driver, or hits a dedicated free-function handler (e.g.
+   `handle_unsubscribe_inbound`, `ForwardingAck` no-op). Anything else
+   is dropped with a debug log.
 
-## OpEnum and DashMaps
+## Test fixtures
 
-- `OpEnum` and every per-op DashMap (`ops.{connect,get,put,update,
-  subscribe}`) are gone. No production code path writes to them.
-- `OpManager::push` / `pop` / `has_*_op` / `OpNotAvailable` are all
-  retired.
-- `pending_op_counts()` returns `[0; 5]` — kept for telemetry API
-  stability; every slot is always 0.
-- `ConnectOp` itself survives as a test-only fixture (the
-  `handle_request` state-machine helper backs the relay driver's
-  decision logic). It has no central carrier.
+`ConnectOp` survives only as a `#[cfg(test)]` fixture wrapping
+`RelayState::handle_request`. Production CONNECT runs entirely on the
+drivers in `connect/op_ctx_task.rs`.
 
 ## Critical Invariant: Initialize-Before-Send
 
@@ -204,18 +192,12 @@ CORRECT:
 
 ## Error Handling
 
-### WHEN encountering OpNotPresent
+### WHEN a reply arrives with no waiter
 
 ```
-This is usually benign (duplicate message, already completed)
-→ Log at debug level
-→ Return Ok(None)
-→ Do NOT treat as error
+Benign (duplicate message, already completed). Drop with a debug log
+at the dispatch site. Do NOT treat as an error.
 ```
-
-`load_or_init` is gone. Any reply that does not match a bypass or a
-relay-dispatch rule is dropped silently in the dispatch site — that is
-the new equivalent of the old `OpNotPresent` outcome.
 
 ### WHEN encountering InvalidStateTransition
 

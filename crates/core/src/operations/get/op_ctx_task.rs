@@ -54,7 +54,7 @@ use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT}
 
 /// Test-only counter that increments every time `start_client_get` is
 /// called. Used by integration tests to verify that a GET actually
-/// routed through the task-per-tx driver rather than being satisfied
+/// routed through the driver rather than being satisfied
 /// by the `client_events.rs` local-cache shortcut.
 #[cfg(any(test, feature = "testing"))]
 pub static DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
@@ -62,7 +62,7 @@ pub static DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
 
 /// Test-only counter that increments every time `start_relay_get` is
 /// called. Used by integration tests to verify that relay dispatch
-/// actually routed a fresh inbound Request through the task-per-tx
+/// actually routed a fresh inbound Request through the driver
 /// driver (and not through the legacy `handle_op_request` path that
 /// continues to serve originator loop-back, GC-spawned retries, and
 /// `start_targeted_op` UPDATE-triggered auto-fetches).
@@ -123,7 +123,7 @@ pub(crate) async fn start_client_get(
     tracing::debug!(
         tx = %client_tx,
         contract = %instance_id,
-        "get (task-per-tx): spawning client-initiated task"
+        "get: spawning client-initiated task"
     );
 
     // Fire-and-forget spawn; same rationale as PUT 3a's `start_client_put`.
@@ -382,7 +382,7 @@ async fn drive_client_get_inner(
                             tracing::warn!(
                                 %key,
                                 error = %e,
-                                "get (task-per-tx): stream assembly failed — \
+                                "get: stream assembly failed — \
                                  state will not be cached locally"
                             );
                             // Assembly failed → don't emit a transfer-rate
@@ -397,7 +397,7 @@ async fn drive_client_get_inner(
                     } else {
                         tracing::warn!(
                             %key,
-                            "get (task-per-tx): current_target has no socket_addr; \
+                            "get: current_target has no socket_addr; \
                              cannot claim orphan stream"
                         );
                     }
@@ -434,10 +434,8 @@ async fn drive_client_get_inner(
                 && !op_manager.ring.is_subscribed(&reply_key)
             {
                 let path_label = match &terminal {
-                    Terminal::Streaming { .. } => "streaming (task-per-tx)",
-                    Terminal::InlineFound { .. } | Terminal::LocalCompletion => {
-                        "non-streaming (task-per-tx)"
-                    }
+                    Terminal::Streaming { .. } => "streaming",
+                    Terminal::InlineFound { .. } | Terminal::LocalCompletion => "non-streaming",
                 };
                 crate::operations::auto_subscribe_on_get_response(
                     op_manager,
@@ -496,7 +494,7 @@ async fn drive_client_get_inner(
                             tx = %client_tx,
                             sent_at_elapsed_secs = sent.elapsed().as_secs_f64(),
                             received_at_elapsed_secs = received.elapsed().as_secs_f64(),
-                            "get (task-per-tx): received < sent on winning attempt; \
+                            "get: received < sent on winning attempt; \
                              falling back to SuccessUntimed"
                         );
                         None
@@ -649,10 +647,7 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
             result: GetMsgResult::Found { value, .. },
             ..
         })) => {
-            tracing::warn!(
-                ?value,
-                "get (task-per-tx): Response{{Found}} arrived without state"
-            );
+            tracing::warn!(?value, "get: Response{{Found}} arrived without state");
             AttemptOutcome::Unexpected
         }
         NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
@@ -787,7 +782,7 @@ async fn build_host_response(
         _ => {
             tracing::warn!(
                 contract = %instance_id,
-                "get (task-per-tx): terminal reply classified success but local \
+                "get: terminal reply classified success but local \
                  store lookup returned no state; synthesizing client error"
             );
             Err(ErrorKind::OperationError {
@@ -876,7 +871,7 @@ async fn cache_contract_locally(
     let put_persisted = if state_matches {
         tracing::debug!(
             %key,
-            "get (task-per-tx): local state matches, skipping redundant PutQuery"
+            "get: local state matches, skipping redundant PutQuery"
         );
         false
     } else if let Some(contract_code) = contract {
@@ -899,7 +894,7 @@ async fn cache_contract_locally(
                 tracing::warn!(
                     %key,
                     %err,
-                    "get (task-per-tx): PutQuery rejected by executor"
+                    "get: PutQuery rejected by executor"
                 );
                 false
             }
@@ -907,7 +902,7 @@ async fn cache_contract_locally(
                 tracing::warn!(
                     %key,
                     ?other,
-                    "get (task-per-tx): PutQuery returned unexpected event"
+                    "get: PutQuery returned unexpected event"
                 );
                 false
             }
@@ -915,7 +910,7 @@ async fn cache_contract_locally(
                 tracing::warn!(
                     %key,
                     %err,
-                    "get (task-per-tx): PutQuery failed"
+                    "get: PutQuery failed"
                 );
                 false
             }
@@ -926,7 +921,7 @@ async fn cache_contract_locally(
         // isn't gated on the write path.
         tracing::debug!(
             %key,
-            "get (task-per-tx): skipping local cache — contract code missing"
+            "get: skipping local cache — contract code missing"
         );
         false
     };
@@ -976,17 +971,17 @@ async fn cache_contract_locally(
 ///
 /// Mirrors the originator-side streaming branch of the legacy
 /// `process_message` at `get.rs:2721-3196`. The driver is the only
-/// place this can run for task-per-tx GETs because the bypass at
+/// place this can run for driver GETs because the bypass at
 /// `node.rs::handle_pure_network_message_v1` forwards the
 /// `ResponseStreaming` envelope to the driver before
 /// `handle_op_request` — `process_message` never executes on the
-/// originator for task-per-tx ops (`load_or_init` would return
+/// originator for driver ops (`load_or_init` would return
 /// `OpNotPresent`).
 ///
 /// `peer_addr` is the sender's transport address — currently we
 /// use `driver.current_target.socket_addr()`, which is accurate for
 /// single-hop responses. Multi-hop (where a relay answers on behalf
-/// of a further peer) is not yet supported by the task-per-tx driver;
+/// of a further peer) is not yet supported by the driver;
 /// see #3883.
 async fn assemble_and_cache_stream(
     op_manager: &OpManager,
@@ -1146,7 +1141,7 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
             tracing::warn!(
                 tx = %client_tx,
                 error = %err,
-                "get (task-per-tx): infrastructure error; publishing synthesized client error"
+                "get: infrastructure error; publishing synthesized client error"
             );
             let synthesized: HostResult = Err(ErrorKind::OperationError {
                 cause: format!("GET failed: {err}").into(),
@@ -1157,7 +1152,7 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
     }
 }
 
-// ── Sub-operation GET task-per-tx driver ────────────────────────────────────
+// ── Sub-operation GET driver ────────────────────────────────────
 //
 // Entry point for node-internal GETs that have no client (executor's
 // `local_state_or_from_network` and subscribe's `fetch_contract_if_missing`).
@@ -1197,7 +1192,7 @@ pub(crate) fn start_sub_op_get(
     tracing::debug!(
         %tx,
         contract = %instance_id,
-        "get (task-per-tx): spawning sub-op task"
+        "get: spawning sub-op task"
     );
 
     GlobalExecutor::spawn(run_sub_op_get(
@@ -1236,7 +1231,7 @@ pub(crate) fn start_targeted_sub_op_get(
         %tx,
         contract = %instance_id,
         ?target,
-        "get (task-per-tx): spawning targeted sub-op task (UPDATE auto-fetch)"
+        "get: spawning targeted sub-op task (UPDATE auto-fetch)"
     );
 
     GlobalExecutor::spawn(run_sub_op_get(
@@ -1285,19 +1280,19 @@ async fn run_sub_op_get(
             SubOpGetOutcome::Found(_) => tracing::info!(
                 %tx,
                 contract = %instance_id,
-                "get (task-per-tx targeted sub-op): UPDATE auto-fetch succeeded"
+                "get (driver targeted sub-op): UPDATE auto-fetch succeeded"
             ),
             SubOpGetOutcome::NotFound(cause) => tracing::warn!(
                 %tx,
                 contract = %instance_id,
                 cause,
-                "get (task-per-tx targeted sub-op): UPDATE auto-fetch did not find state"
+                "get (driver targeted sub-op): UPDATE auto-fetch did not find state"
             ),
             SubOpGetOutcome::Infra(err) => tracing::warn!(
                 %tx,
                 contract = %instance_id,
                 error = %err,
-                "get (task-per-tx targeted sub-op): UPDATE auto-fetch hit infra error"
+                "get (driver targeted sub-op): UPDATE auto-fetch hit infra error"
             ),
         }
     }
@@ -1403,7 +1398,7 @@ async fn drive_sub_op_get(
                             tracing::warn!(
                                 %key,
                                 error = %e,
-                                "get (task-per-tx sub-op): stream assembly failed"
+                                "get (driver sub-op): stream assembly failed"
                             );
                         }
                     } else {
@@ -1413,7 +1408,7 @@ async fn drive_sub_op_get(
                         // the breadcrumb so operators can correlate to the failure.
                         tracing::warn!(
                             %key,
-                            "get (task-per-tx sub-op): current_target has no socket_addr; \
+                            "get (driver sub-op): current_target has no socket_addr; \
                              cannot claim orphan stream"
                         );
                     }
@@ -1464,10 +1459,10 @@ fn missing_state_cause(instance_id: &ContractInstanceId) -> String {
     )
 }
 
-// ── Relay GET task-per-tx driver (#3883) ────────────────────────────────────
+// ── Relay GET driver (#3883) ────────────────────────────────────
 //
 // `start_relay_get` is the entry point for the relay (non-originator) GET
-// task-per-tx driver.  It is called from `node.rs` dispatch (commit 2) when
+// driver.  It is called from `node.rs` dispatch (commit 2) when
 // an incoming `GetMsg::Request` arrives with `source_addr.is_some()` — i.e.
 // from a real remote peer rather than the originator's own loop-back.
 //
@@ -1485,7 +1480,7 @@ fn missing_state_cause(instance_id: &ContractInstanceId) -> String {
 // This entire section is dead code in commit 1 — node.rs dispatch is not
 // changed until commit 2.
 
-/// Start a relay (non-originator) GET task-per-tx driver.
+/// Start a relay (non-originator) GET driver.
 ///
 /// Called from `node.rs` dispatch when an incoming `GetMsg::Request`
 /// arrives from a remote peer (`source_addr.is_some()`).  The driver
@@ -1521,7 +1516,7 @@ pub(crate) async fn start_relay_get(
 ) -> Result<(), OpError> {
     // Test-only: count relay driver invocations so regression tests can
     // assert the dispatch gate in node.rs actually routed a fresh inbound
-    // Request through the task-per-tx driver rather than the legacy
+    // Request through the driver rather than the legacy
     // `handle_op_request` fallthrough (phase-3b loopback, GC retries,
     // `start_targeted_op`).
     #[cfg(any(test, feature = "testing"))]
@@ -1540,7 +1535,7 @@ pub(crate) async fn start_relay_get(
             %instance_id,
             %upstream_addr,
             phase = "relay_dedup_reject",
-            "GET relay (task-per-tx): duplicate Request for in-flight tx, dropping"
+            "GET relay: duplicate Request for in-flight tx, dropping"
         );
         return Ok(());
     }
@@ -1551,7 +1546,7 @@ pub(crate) async fn start_relay_get(
         htl,
         %upstream_addr,
         phase = "relay_start",
-        "GET relay (task-per-tx): spawning driver"
+        "GET relay: spawning driver"
     );
 
     GlobalExecutor::spawn(run_relay_get(
@@ -1623,7 +1618,7 @@ async fn run_relay_get(
             %instance_id,
             error = %err,
             phase = "relay_infra_error",
-            "GET relay (task-per-tx): infrastructure error in driver"
+            "GET relay: infrastructure error in driver"
         );
     }
 
@@ -1691,7 +1686,7 @@ async fn drive_relay_get(
                 %instance_id,
                 error = %err,
                 phase = "relay_inner_error",
-                "GET relay (task-per-tx): inner driver returned error; sending NotFound upstream"
+                "GET relay: inner driver returned error; sending NotFound upstream"
             );
             // On infrastructure error, send NotFound upstream so the upstream
             // doesn't time out waiting for us.
@@ -1785,7 +1780,7 @@ fn relay_advance_to_next_peer(
 ) -> Option<(PeerKeyLocation, SocketAddr)> {
     // Legacy relay does NOT retry alternative peers at each hop — it
     // forwards once and bubbles back whatever downstream returned. The
-    // phase-5 task-per-tx migration introduced a 3-peer retry loop here
+    // phase-5 migration introduced a 3-peer retry loop here
     // that compounded fan-out to 3^HTL per origination under virtual
     // time (ci-fault-loss run 24602255580 showed 16.9M spawns in 95s
     // with single-use tx reuse still in place). Cap at 1 to match
@@ -1913,7 +1908,7 @@ async fn drive_relay_get_inner(
             %upstream_addr,
             htl = 0,
             phase = "not_found",
-            "GET relay (task-per-tx): HTL exhausted — sending NotFound upstream"
+            "GET relay: HTL exhausted — sending NotFound upstream"
         );
         if let Some(event) = crate::tracing::NetEventLog::get_not_found(
             &incoming_tx,
@@ -1947,7 +1942,7 @@ async fn drive_relay_get_inner(
             %instance_id,
             contract = %key,
             phase = "complete",
-            "GET relay (task-per-tx): contract found locally (active interest) — sending Found upstream"
+            "GET relay: contract found locally (active interest) — sending Found upstream"
         );
 
         // Register interest for the requester (mirrors get.rs:1447-1476).
@@ -1959,7 +1954,7 @@ async fn drive_relay_get_inner(
                 None,
                 None,
                 &incoming_tx,
-                " (relay task-per-tx, piggybacked on GET)",
+                " (relay loopback, piggybacked on GET)",
             )
             .await;
         } else if let Some(pkl) = op_manager
@@ -2023,7 +2018,7 @@ async fn drive_relay_get_inner(
                         tx = %incoming_tx,
                         %instance_id,
                         contract = %key,
-                        "GET relay (task-per-tx): all peers exhausted — serving local fallback"
+                        "GET relay: all peers exhausted — serving local fallback"
                     );
                     // Relay path: is_client_requester=false (see top-of-loop
                     // rationale).
@@ -2045,7 +2040,7 @@ async fn drive_relay_get_inner(
                         %instance_id,
                         %upstream_addr,
                         phase = "not_found",
-                        "GET relay (task-per-tx): all peers exhausted — sending NotFound upstream"
+                        "GET relay: all peers exhausted — sending NotFound upstream"
                     );
                     if let Some(event) = crate::tracing::NetEventLog::get_not_found(
                         &incoming_tx,
@@ -2066,7 +2061,7 @@ async fn drive_relay_get_inner(
 
         // NOTE: legacy path sends a ForwardingAck upstream before forwarding
         // downstream so the upstream's GC can extend its timer on slow
-        // multi-hop chains. In the task-per-tx relay driver we OMIT that
+        // multi-hop chains. In the driver relay driver we OMIT that
         // ack: the ack carried `incoming_tx` (which equals the upstream's
         // `attempt_tx` on a relay-to-relay hop), so it matched the
         // upstream's capacity-1 `pending_op_results` waiter and arrived
@@ -2088,7 +2083,7 @@ async fn drive_relay_get_inner(
             target = %peer,
             target_addr = %peer_addr,
             phase = "forward",
-            "GET relay (task-per-tx): forwarding request to downstream peer"
+            "GET relay: forwarding request to downstream peer"
         );
 
         // Emit get_request telemetry for the relay forward.
@@ -2152,7 +2147,7 @@ async fn drive_relay_get_inner(
                     tx = %incoming_tx,
                     target = %peer,
                     error = %err,
-                    "GET relay (task-per-tx, loopback): \
+                    "GET relay (loopback, loopback): \
                      send_fire_and_forget failed"
                 );
                 // Fall through to NotFound — client driver waiter
@@ -2176,7 +2171,7 @@ async fn drive_relay_get_inner(
                     tx = %incoming_tx,
                     target = %peer,
                     error = %err,
-                    "GET relay (task-per-tx): send_to_and_await failed; advancing to next peer"
+                    "GET relay: send_to_and_await failed; advancing to next peer"
                 );
                 // Feed the relay's failed peer choice into the local Router
                 // so future routing decisions de-prioritize this peer. Without
@@ -2198,7 +2193,7 @@ async fn drive_relay_get_inner(
                     tx = %incoming_tx,
                     target = %peer,
                     timeout_secs = OPERATION_TTL.as_secs(),
-                    "GET relay (task-per-tx): attempt timed out; advancing to next peer"
+                    "GET relay: attempt timed out; advancing to next peer"
                 );
                 crate::operations::record_relay_route_event(
                     op_manager,
@@ -2224,7 +2219,7 @@ async fn drive_relay_get_inner(
                     %instance_id,
                     contract = %key,
                     phase = "relay_found",
-                    "GET relay (task-per-tx): downstream returned Found — caching locally and bubbling upstream"
+                    "GET relay: downstream returned Found — caching locally and bubbling upstream"
                 );
 
                 // Cache locally (relay opportunistically caches forwarded
@@ -2276,7 +2271,7 @@ async fn drive_relay_get_inner(
                     tx = %incoming_tx,
                     %instance_id,
                     target = %peer,
-                    "GET relay (task-per-tx): downstream returned ResponseStreaming — \
+                    "GET relay: downstream returned ResponseStreaming — \
                      streaming relay forwarding not yet implemented (port plan §7); \
                      trying next peer"
                 );
@@ -2291,7 +2286,7 @@ async fn drive_relay_get_inner(
                 tracing::warn!(
                     tx = %incoming_tx,
                     %instance_id,
-                    "GET relay (task-per-tx): unexpected LocalCompletion (Request-echo) — trying next peer"
+                    "GET relay: unexpected LocalCompletion (Request-echo) — trying next peer"
                 );
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -2306,7 +2301,7 @@ async fn drive_relay_get_inner(
                 tracing::debug!(
                     tx = %incoming_tx,
                     target = %peer,
-                    "GET relay (task-per-tx): downstream returned NotFound; advancing to next peer"
+                    "GET relay: downstream returned NotFound; advancing to next peer"
                 );
                 crate::operations::record_relay_route_event(
                     op_manager,
@@ -2328,7 +2323,7 @@ async fn drive_relay_get_inner(
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %peer,
-                    "GET relay (task-per-tx): unexpected reply variant; advancing to next peer"
+                    "GET relay: unexpected reply variant; advancing to next peer"
                 );
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -2662,7 +2657,7 @@ mod tests {
     /// against the incoming `value`, and skips the `PutQuery` entirely
     /// when they match. This prevents re-invoking `update_state()` on
     /// contracts that implement idempotency checks (see #2018). The
-    /// task-per-tx driver's `cache_contract_locally` must replicate
+    /// driver's `cache_contract_locally` must replicate
     /// this idempotency short-circuit.
     #[test]
     fn cache_contract_locally_has_state_matches_short_circuit() {
@@ -3032,7 +3027,7 @@ mod tests {
     /// 3^HTL spawns per origination, observed as 6.8M spawns and 63GB
     /// RSS in workflow runs 24600168871 / 24600634908 / 24601267577.
     ///
-    /// Fix: drop the ack entirely from the task-per-tx relay driver.
+    /// Fix: drop the ack entirely from the driver relay driver.
     /// Upstream's `send_to_and_await` still has OPERATION_TTL (60s) to
     /// receive the real Response, which is what legacy effectively had
     /// minus the ack-driven timer extension.
@@ -3299,12 +3294,12 @@ mod tests {
         );
     }
 
-    // ── R7 (superseded): ForwardingAck removed from task-per-tx relay ──────
+    // ── R7 (superseded): ForwardingAck removed from driver relay ──────
     //
     // Superseded by `relay_driver_does_not_send_forwarding_ack` (T6
     // rewrite). The original latch logic was pinned here to ensure the
     // ack fired exactly once per relay invocation, which was the legacy
-    // behavior. In the task-per-tx migration the ack's `id` collides
+    // behavior. In the migration the ack's `id` collides
     // with the upstream relay driver's `attempt_tx` on its capacity-1
     // `pending_op_results` waiter — causing 3^HTL spawn amplification.
     // The ack is now never sent; see the T6 test for the invariant.
@@ -3727,7 +3722,7 @@ mod tests {
     /// Regression guard for the relay hosting-cache taint bug caught in
     /// PR #3896 review. The legacy GET branch gates `mark_local_client_access`
     /// on `is_original_requester = upstream_addr.is_none()` (see
-    /// `get.rs:2260-2262, :2353-2355, :3056-3058`). The task-per-tx driver
+    /// `get.rs:2260-2262, :2353-2355, :3056-3058`). The driver
     /// MUST respect that gate: relay peers that merely cache a forwarded
     /// Found must NOT set the sticky `local_client_access` flag, or they
     /// permanently pay subscription-renewal cost for contracts no client
