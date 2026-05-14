@@ -1975,31 +1975,6 @@ pub async fn subscribe_with_id(
     subscribe::start_client_subscribe(op_manager, instance_id, client_tx).await
 }
 
-/// Handle a transaction whose work is being abandoned (transport
-/// handshake failure, orphaned-on-peer-prune, or a peer-sent `Aborted`
-/// wire message). After #1454 phase 6 retired the legacy `Operation`
-/// mediator the function has no work to do: every op type owns its own
-/// cancellation surface in the task-per-tx driver, and the CONNECT
-/// retry-via-gateway branch is driven by `start_client_connect` /
-/// `initial_join_procedure` rather than by a DashMap entry.
-///
-/// Retained as a no-op so the call sites in `p2p_protoc.rs`
-/// (orphaned-on-prune + transport handshake failure) keep compiling
-/// while the centralised abort path is unwired. Will be deleted in
-/// the follow-up slice once those call sites are removed.
-pub(crate) async fn handle_aborted_op(
-    tx: Transaction,
-    _op_manager: &OpManager,
-    _gateways: &[PeerKeyLocation],
-) -> Result<(), OpError> {
-    tracing::debug!(
-        %tx,
-        tx_type = ?tx.transaction_type(),
-        "handle_aborted_op: no-op after #1454 phase 6 (driver-owned cancellation)"
-    );
-    Ok(())
-}
-
 /// The identifier of a peer in the network: a known public key and socket address.
 ///
 /// This is a type alias for [`ring::KnownPeerKeyLocation`], which bundles a peer's

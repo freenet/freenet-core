@@ -43,10 +43,7 @@ use crate::{
         WaitingResolution,
     },
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
-    node::{
-        NetEventRegister, NodeConfig, OpManager, PeerId, handle_aborted_op,
-        process_message_decoupled,
-    },
+    node::{NetEventRegister, NodeConfig, OpManager, PeerId, process_message_decoupled},
     ring::{KnownPeerKeyLocation, PeerConnectionBackoff, PeerKeyLocation},
     tracing::NetEventLog,
 };
@@ -1160,7 +1157,6 @@ impl P2pConnManager {
                                     let (callback, mut result) = mpsc::channel(10);
                                     let msg_clone = msg.clone();
                                     let bridge_sender = ctx.bridge.ev_listener_tx.clone();
-                                    let op_manager = ctx.bridge.op_manager.clone();
                                     let gateways = ctx.gateways.clone();
 
                                     // Mark gateway connections as transient to prevent
@@ -1229,17 +1225,6 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Connection attempt failed"
                                                 );
-                                                if let Err(err) =
-                                                    handle_aborted_op(tx, &op_manager, &gateways)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        tx = %tx,
-                                                        error = ?err,
-                                                        phase = "error",
-                                                        "Failed to propagate aborted operation"
-                                                    );
-                                                }
                                             }
                                             Ok(None) => {
                                                 tracing::error!(
@@ -1248,17 +1233,6 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Response channel closed before connection result received"
                                                 );
-                                                if let Err(err) =
-                                                    handle_aborted_op(tx, &op_manager, &gateways)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        tx = %tx,
-                                                        error = ?err,
-                                                        phase = "error",
-                                                        "Failed to propagate aborted operation"
-                                                    );
-                                                }
                                             }
                                             Err(_) => {
                                                 tracing::error!(
@@ -1267,17 +1241,6 @@ impl P2pConnManager {
                                                     phase = "timeout",
                                                     "Timeout waiting for connection establishment"
                                                 );
-                                                if let Err(err) =
-                                                    handle_aborted_op(tx, &op_manager, &gateways)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        tx = %tx,
-                                                        error = ?err,
-                                                        phase = "error",
-                                                        "Failed to propagate aborted operation"
-                                                    );
-                                                }
                                             }
                                         }
                                     });
