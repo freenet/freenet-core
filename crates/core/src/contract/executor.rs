@@ -1,5 +1,5 @@
 //! Executes WASM contract and delegate code within a sandboxed environment (`WasmRuntime`).
-//! Communicates with the `ContractHandler` and potentially the `OpManager` (via `ExecutorToEventLoopChannel`).
+//! Communicates with the `ContractHandler`.
 //! See `architecture.md`.
 
 use std::collections::{HashMap, HashSet};
@@ -352,42 +352,17 @@ impl Display for OperationMode {
 // through the legacy mediator path.
 
 /// Empty stub for the now-retired executor → event-loop mediator
-/// channel. Retained as a generic-param placeholder for
-/// `priority_select::PrioritySelectStream` so the event loop's
-/// `executor_transaction_handler` slot keeps the same shape; the
-/// inner channel is never written to and the `Stream` impl yields
-/// `Pending` forever.
-pub(crate) struct ExecutorToEventLoopChannel<End: sealed::ChannelHalve> {
-    _end: End,
-}
+/// Empty stream used to fill the executor-transaction slot in
+/// `priority_select::PrioritySelectStream`. Never yields.
+pub(crate) struct ExecutorTransactionStream;
 
-pub(crate) fn mediator_channels(
-    _op_manager: Arc<OpManager>,
-) -> ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
-    ExecutorToEventLoopChannel {
-        _end: NetworkEventListenerHalve {},
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) struct NetworkEventListenerHalve {}
-
-mod sealed {
-    use super::NetworkEventListenerHalve;
-    pub trait ChannelHalve {}
-    impl ChannelHalve for NetworkEventListenerHalve {}
-}
-
-impl futures::Stream for ExecutorToEventLoopChannel<NetworkEventListenerHalve> {
+impl futures::Stream for ExecutorTransactionStream {
     type Item = crate::message::Transaction;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        // No writer ever sends through this channel; stay Pending so
-        // the priority-select stream never fires the executor-transaction
-        // arm.
         std::task::Poll::Pending
     }
 }

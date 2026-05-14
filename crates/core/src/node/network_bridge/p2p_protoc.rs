@@ -38,10 +38,7 @@ use crate::transport::{
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
-    contract::{
-        ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
-        WaitingResolution,
-    },
+    contract::{ContractHandlerChannel, ExecutorTransactionStream, WaitingResolution},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     node::{NetEventRegister, NodeConfig, OpManager, PeerId, process_message_decoupled},
     ring::{KnownPeerKeyLocation, PeerConnectionBackoff, PeerKeyLocation},
@@ -605,14 +602,12 @@ impl P2pConnManager {
         op_manager: Arc<OpManager>,
         client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
         notification_channel: EventLoopNotificationsReceiver,
-        executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
         self.run_event_listener_with_socket::<UdpSocket>(
             op_manager,
             client_wait_for_transaction,
             notification_channel,
-            executor_listener,
             node_controller,
         )
         .await
@@ -633,7 +628,6 @@ impl P2pConnManager {
         op_manager: Arc<OpManager>,
         client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
         notification_channel: EventLoopNotificationsReceiver,
-        executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
         // Destructure self to avoid partial move issues
@@ -714,7 +708,7 @@ impl P2pConnManager {
             handshake_handler,
             node_controller,
             client_wait_for_transaction,
-            executor_listener,
+            ExecutorTransactionStream,
             conn_event_rx,
         );
 

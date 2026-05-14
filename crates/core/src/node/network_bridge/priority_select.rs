@@ -13,10 +13,7 @@ use crate::contract::WaitingTransaction;
 
 use super::OpExecutionPayload;
 use super::p2p_protoc::ConnEvent;
-use crate::contract::{
-    ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
-    WaitingResolution,
-};
+use crate::contract::{ContractHandlerChannel, ExecutorTransactionStream, WaitingResolution};
 use crate::dev_tool::Transaction;
 use crate::message::{NetMessage, NodeEvent};
 // Re-export P2pBridgeEvent from p2p_protoc
@@ -47,7 +44,7 @@ pub(super) enum SelectResult {
 pub(super) type ProductionPrioritySelectStream = PrioritySelectStream<
     super::handshake::HandshakeHandler,
     ContractHandlerChannel<WaitingResolution>,
-    ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
+    ExecutorTransactionStream,
 >;
 
 /// Generic stream-based priority select that owns simple Receivers as streams

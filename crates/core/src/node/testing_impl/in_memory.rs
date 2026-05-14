@@ -18,7 +18,6 @@ use crate::{
     contract::{
         self, ContractHandler, MemoryContractHandler, MockWasmContractHandler,
         MockWasmHandlerBuilder, SimulationContractHandler, SimulationHandlerBuilder,
-        mediator_channels,
     },
     node::{
         EventLoopExitReason, NetEventRegister,
@@ -98,8 +97,6 @@ impl<ER> Builder<ER> {
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
 
-        let executor_listener = mediator_channels(op_manager.clone());
-
         let contract_handler = MemoryContractHandler::build(
             ch_channel,
             op_manager.clone(),
@@ -161,7 +158,6 @@ impl<ER> Builder<ER> {
                 op_manager,
                 wait_for_event,
                 notification_channel,
-                executor_listener,
                 node_controller_rx,
             )
             .instrument(parent_span)
@@ -222,8 +218,6 @@ impl<ER> Builder<ER> {
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
-
-        let executor_listener = mediator_channels(op_manager.clone());
 
         // Use SimulationContractHandler with shared in-memory storage
         let contract_handler = SimulationContractHandler::build(
@@ -290,7 +284,6 @@ impl<ER> Builder<ER> {
                 op_manager,
                 wait_for_event,
                 notification_channel,
-                executor_listener,
                 node_controller_rx,
             )
             .instrument(parent_span)
@@ -349,8 +342,6 @@ impl<ER> Builder<ER> {
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
-
-        let executor_listener = mediator_channels(op_manager.clone());
 
         // Use MockWasmContractHandler — exercises the production ContractExecutor code path
         let contract_handler = MockWasmContractHandler::build(
@@ -417,7 +408,6 @@ impl<ER> Builder<ER> {
                 op_manager,
                 wait_for_event,
                 notification_channel,
-                executor_listener,
                 node_controller_rx,
             )
             .instrument(parent_span)
