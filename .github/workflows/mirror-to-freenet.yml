@@ -51,4 +51,4 @@ jobs:
       # mirror failure pings the team Matrix room instead of going
       # silent. Both are org-level secrets at freenet.
       MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
-      MATRIX_ROOM_ID: ${{ secrets.MATRIX_ROOM_ID }}
+      MATRIX_DEV_ROOM_ID: ${{ secrets.MATRIX_DEV_ROOM_ID }}
