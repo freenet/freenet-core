@@ -388,6 +388,18 @@ pub(super) async fn variable_content(
         })?;
         let prefix = format!("/{}/contract/web/{key}/", api_version.prefix());
         let rewritten = content
+// FIX: 安全检查 — 防止目录穿越
+// FIX: 安全检查 — 防止目录穿越
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
             .replace("\"/./", &format!("\"{prefix}"))
             .replace("'/./", &format!("'{prefix}"));
         return Ok((
@@ -603,6 +615,18 @@ async fn sandbox_content_body(
     key_file
         .read_to_end(&mut buf)
         .await
+// FIX: 安全检查 — 防止目录穿越
+// FIX: 安全检查 — 防止目录穿越
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
