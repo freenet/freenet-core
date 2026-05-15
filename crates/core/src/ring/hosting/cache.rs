@@ -12,7 +12,9 @@
 //! 4. **Access type tracking**: Records how contract was accessed (GET/PUT/SUBSCRIBE)
 
 use freenet_stdlib::prelude::ContractKey;
+use lru::LruCache;
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -20,6 +22,17 @@ use crate::util::time_source::TimeSource;
 
 /// Default hosting cache budget: 100MB
 pub const DEFAULT_HOSTING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Maximum number of contract keys retained in the local-client-access
+/// history. Independent of the main hosting LRU so the access flag survives
+/// byte-budget eviction (fixes the "first GET against a self-hosted contract
+/// after LRU eviction falls through to network routing and hangs" bug).
+///
+/// Sized large relative to the realistic per-node contract count so an active
+/// gateway never silently rolls a contract out of access history. Each entry
+/// is one ContractKey + LRU bookkeeping, on the order of ~100 bytes, so the
+/// cap costs <500 KB even at full occupancy.
+pub const LOCAL_ACCESS_HISTORY_CAPACITY: usize = 4096;
 
 /// Multiplier for TTL relative to subscription renewal interval.
 /// Gives this many renewal attempts before eviction if renewals keep failing.
@@ -99,6 +112,18 @@ pub struct HostingCache<T: TimeSource> {
     lru_order: VecDeque<ContractKey>,
     /// Contract metadata indexed by key
     contracts: HashMap<ContractKey, HostedContract>,
+    /// Contracts ever accessed by a local client, independent of the main
+    /// byte-budget LRU. Holds the key + last access instant; the LRU here
+    /// is bounded by [`LOCAL_ACCESS_HISTORY_CAPACITY`] so an active gateway
+    /// never silently drops a contract out of access history.
+    ///
+    /// Exists because the main `contracts` LRU evicts under byte-budget
+    /// pressure, but the local-access flag must survive eviction for the
+    /// `is_locally_hosted` shortcut in `client_events::serve_get` to fire
+    /// on cold GETs of self-hosted contracts. Without this, the first GET
+    /// after eviction falls through to network routing of a GetOp that has
+    /// nowhere to go for a contract no other peer subscribes to.
+    local_access_history: LruCache<ContractKey, Instant>,
     /// Time source for testability
     time_source: T,
 }
@@ -112,6 +137,10 @@ impl<T: TimeSource> HostingCache<T> {
             min_ttl,
             lru_order: VecDeque::new(),
             contracts: HashMap::new(),
+            local_access_history: LruCache::new(
+                NonZeroUsize::new(LOCAL_ACCESS_HISTORY_CAPACITY)
+                    .expect("LOCAL_ACCESS_HISTORY_CAPACITY is non-zero"),
+            ),
             time_source,
         }
     }
@@ -205,20 +234,37 @@ impl<T: TimeSource> HostingCache<T> {
     }
 
     /// Mark a contract as accessed by a local client (HTTP/WebSocket).
-    /// No-op if the contract is not in the cache.
+    ///
+    /// Always records the access in `local_access_history` (bounded LRU,
+    /// survives main-cache eviction). If the contract is also currently in
+    /// the main cache, updates the inline flag and timestamp too.
     pub fn mark_local_client_access(&mut self, key: &ContractKey) {
+        let now = self.time_source.now();
+        self.local_access_history.put(*key, now);
         if let Some(existing) = self.contracts.get_mut(key) {
             existing.local_client_access = true;
-            existing.local_client_last_access = Some(self.time_source.now());
+            existing.local_client_last_access = Some(now);
         }
     }
 
     /// Check if a contract was accessed by a local client.
+    ///
+    /// Precedence:
+    /// 1. **Main cache present**: the entry's `local_client_access` flag is
+    ///    authoritative. A relay-only re-cache after eviction lands with
+    ///    `local_client_access = false`, and that false reading must win to
+    ///    avoid serving stale forwarded state as if it were locally-owned
+    ///    (preserves the `test_eviction_clears_local_client_access` intent).
+    /// 2. **Main cache missing**: fall back to the access history. This is
+    ///    the post-eviction path that lets the `is_locally_hosted` gate keep
+    ///    firing for self-hosted contracts whose main-cache entry was
+    ///    evicted under byte-budget pressure but whose state is still on
+    ///    disk via the executor.
     pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
-        self.contracts
-            .get(key)
-            .map(|c| c.local_client_access)
-            .unwrap_or(false)
+        if let Some(c) = self.contracts.get(key) {
+            return c.local_client_access;
+        }
+        self.local_access_history.contains(key)
     }
 
     /// Check if a contract was accessed by a local client within the given duration.
@@ -793,6 +839,104 @@ mod tests {
         assert!(
             cache.has_recent_local_client_access(&key, lease),
             "Re-marking should refresh the age gate"
+        );
+    }
+
+    /// Regression test: after a contract is evicted from the main byte-budget
+    /// LRU, `has_local_client_access` must still return true for contracts
+    /// that were once locally accessed. Without the local-access history,
+    /// the first GET against a self-hosted contract after eviction silently
+    /// fell through to network routing (180s timeout in the field —
+    /// freenet-stdlib mirror demo, 2026-05-14).
+    #[test]
+    fn test_local_client_access_persists_across_main_lru_eviction() {
+        // Tight budget so we can force eviction; short min_ttl so the
+        // eviction loop allows it.
+        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let evicted_key = make_key(1);
+        let new_key = make_key(2);
+
+        // Host a contract and mark it as locally accessed (as a remote-client
+        // GET against a self-hosted contract would).
+        cache.record_access(evicted_key, 150, AccessType::Get);
+        cache.mark_local_client_access(&evicted_key);
+        assert!(cache.has_local_client_access(&evicted_key));
+        assert!(cache.contains(&evicted_key));
+
+        // Advance past TTL so eviction is allowed, then add a second contract
+        // that won't fit alongside the first. The first must be evicted.
+        time.advance_time(Duration::from_secs(61));
+        let result = cache.record_access(new_key, 150, AccessType::Get);
+        assert_eq!(
+            result.evicted,
+            vec![evicted_key],
+            "first contract must be evicted to make room",
+        );
+        assert!(
+            !cache.contains(&evicted_key),
+            "evicted_key must be gone from the main cache",
+        );
+
+        // The bug fix: even though the main-cache entry was evicted, the
+        // local-access history retains the key so the `is_locally_hosted`
+        // gate in client_events::serve_get can still fire on the next GET.
+        assert!(
+            cache.has_local_client_access(&evicted_key),
+            "has_local_client_access must remain true after main-LRU eviction \
+             so the local-cache shortcut in client_events::serve_get can fire \
+             for self-hosted contracts on cold GETs",
+        );
+
+        // Negative control: a contract never marked still returns false.
+        let never_marked = make_key(3);
+        assert!(!cache.has_local_client_access(&never_marked));
+    }
+
+    /// The local-access history is bounded by `LOCAL_ACCESS_HISTORY_CAPACITY`
+    /// so it can't grow without limit from external pressure. Once full, the
+    /// LRU drops the least-recently-marked key. ContractKey equality is
+    /// instance-id-only (see freenet-stdlib::ContractKey::PartialEq), so the
+    /// test varies instance bytes to generate truly distinct keys.
+    #[test]
+    fn test_local_access_history_capacity_is_bounded() {
+        // Helper to generate a key whose instance id uniquely encodes `i`.
+        // Spreads i across the first 4 instance bytes so a 4097-iteration
+        // loop produces 4097 distinct keys (instance equality is what
+        // ContractKey hashes on).
+        fn key_for(i: u32) -> ContractKey {
+            let mut instance = [0u8; 32];
+            instance[..4].copy_from_slice(&i.to_le_bytes());
+            ContractKey::from_id_and_code(
+                ContractInstanceId::new(instance),
+                CodeHash::new([0u8; 32]),
+            )
+        }
+
+        let (mut cache, _) = make_cache(10_000_000, Duration::from_secs(60));
+        let cap = LOCAL_ACCESS_HISTORY_CAPACITY as u32;
+
+        // Mark exactly cap + 1 distinct keys. The first one inserted (i=0)
+        // must be the one the LRU evicts once we overflow.
+        for i in 0..=cap {
+            cache.mark_local_client_access(&key_for(i));
+        }
+
+        assert!(
+            !cache.has_local_client_access(&key_for(0)),
+            "Oldest entry in local-access history must be evicted once \
+             capacity is exceeded (bounded growth invariant)",
+        );
+
+        // Most recently marked entry stays.
+        assert!(
+            cache.has_local_client_access(&key_for(cap)),
+            "Newest entry must remain in local-access history",
+        );
+
+        // An intermediate entry near the newest end stays.
+        assert!(
+            cache.has_local_client_access(&key_for(cap - 1)),
+            "Recently-marked entries must remain in local-access history",
         );
     }
 }

@@ -2671,15 +2671,24 @@ mod tests {
         );
     }
 
-    /// Marking and querying unknown contracts should be no-ops (no panic).
+    /// Marking an unknown (not-in-main-cache) contract records the access in
+    /// the local-access history so subsequent `has_local_client_access`
+    /// queries return true. This is the documented post-fix behavior — the
+    /// old no-op behavior caused the `is_locally_hosted` shortcut in
+    /// `client_events::serve_get` to never fire for evicted-but-still-on-disk
+    /// contracts, forcing cold GETs into network routing.
     #[test]
-    fn test_local_client_access_unknown_contract() {
+    fn test_local_client_access_unknown_contract_records_in_history() {
         let manager = HostingManager::new();
         let contract = make_contract_key(1);
 
         assert!(!manager.has_local_client_access(&contract));
-        manager.mark_local_client_access(&contract); // no-op, not in cache
-        assert!(!manager.has_local_client_access(&contract));
+        manager.mark_local_client_access(&contract);
+        assert!(
+            manager.has_local_client_access(&contract),
+            "mark_local_client_access on an unknown contract must record in \
+             access history so the local-cache shortcut can fire"
+        );
     }
 
     /// The local_client_access flag should be sticky -- once set, it should

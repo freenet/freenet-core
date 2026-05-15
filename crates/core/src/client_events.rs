@@ -1096,14 +1096,19 @@ async fn process_open_request(
                             }
                         }
 
-                        // Serve from local cache only if the local user requested
-                        // this contract (not just relay-cached).
+                        // Serve from local cache only if a local client ever
+                        // accessed this contract (i.e. we hosted it on their
+                        // behalf rather than just relay-caching state from
+                        // network forwarding). `has_local_client_access` is
+                        // backed by an LRU history that survives main-cache
+                        // byte-budget eviction; the older `is_hosting_contract
+                        // && has_local_client_access` gate dropped to false
+                        // the moment the main LRU evicted the entry, forcing
+                        // cold GETs into network routing of a GetOp that may
+                        // have no remote subscribers.
                         let is_locally_hosted = full_key
                             .as_ref()
-                            .map(|k| {
-                                op_manager.ring.is_hosting_contract(k)
-                                    && op_manager.ring.has_local_client_access(k)
-                            })
+                            .map(|k| op_manager.ring.has_local_client_access(k))
                             .unwrap_or(false);
 
                         // Return local cache if we have valid state AND any of:
