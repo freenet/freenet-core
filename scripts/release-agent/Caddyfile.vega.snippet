@@ -1,0 +1,31 @@
+# vega.locut.us: TLS termination for the release-agent on port 8443.
+#
+# Background: vega already hosts ghostkey-api (gkapi.freenet.org) bound
+# to :80 and :443. Caddy cannot also own those ports, so the release-
+# agent reverse-proxy listens on :8443 with the dedicated Let's Encrypt
+# certificate for vega.locut.us (obtained via certbot --webroot during
+# the v0.2.57 setup).
+#
+# Install path on vega: /etc/caddy/Caddyfile
+
+{
+    # Disable automatic HTTP→HTTPS redirects and the implicit :80
+    # listener. ghostkey-api owns :80 (for the ACME http-01 challenge
+    # on gkapi.freenet.org) and :443 on this host, so Caddy must not
+    # try to bind either.
+    auto_https off
+}
+
+https://vega.locut.us:8443 {
+    tls /etc/letsencrypt/live/vega.locut.us/fullchain.pem /etc/letsencrypt/live/vega.locut.us/privkey.pem
+
+    # `handle_path` strips the /release-agent prefix before the
+    # reverse-proxy, so the agent sees /update, /version, /healthz.
+    handle_path /release-agent/* {
+        reverse_proxy 127.0.0.1:9876
+    }
+
+    handle {
+        respond "vega.locut.us release-agent" 200
+    }
+}

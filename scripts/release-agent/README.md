@@ -12,6 +12,8 @@ in `crates/release-agent/`. Tracked in
 | `sudoers.freenet-release-agent` | `/etc/sudoers.d/` (mode 0440) | NOPASSWD only for `gateway-auto-update.sh --force` |
 | `config.example.toml` | `/etc/freenet-release-agent/config.toml` | Per-gateway config; **dry_run = true** by default |
 | `Caddyfile.snippet` | merge into your Caddy config | TLS-terminated public hostname (`update.<host>.locut.us`) |
+| `Caddyfile.vega.snippet` | `/etc/caddy/Caddyfile` on vega | Variant for vega: ghostkey-api owns :80/:443, so Caddy listens on `:8443` with the dedicated LE cert at `/etc/letsencrypt/live/vega.locut.us/` and `auto_https off`. |
+| `reload-caddy.sh` | `/etc/letsencrypt/renewal-hooks/deploy/reload-caddy.sh` on vega (mode 0755) | Certbot deploy hook: re-applies `ssl-cert` group ownership on rotated cert files, then `systemctl reload caddy`. Scoped to `RENEWED_LINEAGE=*/vega.locut.us` so it leaves the gkapi cert renewal alone. |
 | `install.sh` | run once on the gateway | Wires all of the above |
 
 ## Privilege model
