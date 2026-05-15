@@ -317,7 +317,7 @@ pub struct InterestManager<T: TimeSource> {
     pending_removals: DashMap<PeerKey, Instant>,
 }
 
-impl<T: TimeSource> InterestManager<T> {
+impl<T: TimeSource + Sync> InterestManager<T> {
     /// Create a new interest manager with the given time source.
     pub fn new(time_source: T) -> Self {
         Self {
@@ -385,10 +385,16 @@ impl<T: TimeSource> InterestManager<T> {
         is_upstream: bool,
     ) -> bool {
         let now = self.time_source.now();
-        let mut entry = self.interested_peers.entry(*contract).or_default();
-        let is_new = !entry.contains_key(&peer);
-
-        entry.insert(peer.clone(), PeerInterest::new(summary, is_upstream, now));
+        // Release the `interested_peers` shard guard before touching
+        // `peer_contracts` and `index_contract_hash` — those acquire their
+        // own DashMap shards, so holding the first guard across them
+        // serializes unrelated callers (clippy: `significant_drop_tightening`).
+        let is_new = {
+            let mut entry = self.interested_peers.entry(*contract).or_default();
+            let is_new = !entry.contains_key(&peer);
+            entry.insert(peer.clone(), PeerInterest::new(summary, is_upstream, now));
+            is_new
+        };
 
         // Maintain reverse index for O(1) peer disconnect cleanup
         self.peer_contracts
@@ -636,9 +642,15 @@ impl<T: TimeSource> InterestManager<T> {
     /// Register that we're hosting a contract locally.
     /// Returns true if this caused us to become interested (wasn't interested before).
     pub fn register_local_hosting(&self, contract: &ContractKey) -> bool {
-        let mut entry = self.local_interests.entry(*contract).or_default();
-        let was_interested = entry.is_interested();
-        entry.hosting = true;
+        // Drop the local_interests shard guard before index_contract_hash
+        // (which acquires a separate DashMap) so unrelated lookups don't
+        // serialize behind us (clippy: `significant_drop_tightening`).
+        let was_interested = {
+            let mut entry = self.local_interests.entry(*contract).or_default();
+            let was = entry.is_interested();
+            entry.hosting = true;
+            was
+        };
         self.index_contract_hash(contract);
         !was_interested
     }
@@ -664,8 +676,11 @@ impl<T: TimeSource> InterestManager<T> {
     /// Add a local client subscription.
     /// Returns true if this caused us to become interested.
     pub fn add_local_client(&self, contract: &ContractKey) -> bool {
-        let mut entry = self.local_interests.entry(*contract).or_default();
-        let became_interested = entry.add_client();
+        // Same drop-before-index pattern as register_local_hosting.
+        let became_interested = {
+            let mut entry = self.local_interests.entry(*contract).or_default();
+            entry.add_client()
+        };
         self.index_contract_hash(contract);
         became_interested
     }
@@ -690,8 +705,11 @@ impl<T: TimeSource> InterestManager<T> {
     /// Add a downstream subscriber.
     /// Returns true if this caused us to become interested.
     pub fn add_downstream_subscriber(&self, contract: &ContractKey) -> bool {
-        let mut entry = self.local_interests.entry(*contract).or_default();
-        let became_interested = entry.add_downstream();
+        // Same drop-before-index pattern as register_local_hosting.
+        let became_interested = {
+            let mut entry = self.local_interests.entry(*contract).or_default();
+            entry.add_downstream()
+        };
         self.index_contract_hash(contract);
         became_interested
     }

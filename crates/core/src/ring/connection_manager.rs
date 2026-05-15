@@ -708,24 +708,33 @@ impl ConnectionManager {
     /// is fully established. The entry is removed automatically if the handshake fails
     /// via `prune_in_transit_connection`.
     pub fn record_pending_location(&self, addr: SocketAddr, location: Location) {
-        let mut locations = self.location_for_peer.write();
-        let entry = locations.entry(addr);
-        match entry {
-            Entry::Occupied(_) => {
-                tracing::debug!(
-                    addr = %addr,
-                    peer_location = %location,
-                    "record_pending_location: location already known"
-                );
+        // Perform the mutation under the write lock, then drop the lock
+        // before emitting tracing. The tracing macro can be non-trivial
+        // (subscriber appender + format work) and holding `location_for_peer`
+        // across it serializes unrelated callers (clippy:
+        // `significant_drop_tightening`).
+        let already_known = {
+            let mut locations = self.location_for_peer.write();
+            match locations.entry(addr) {
+                Entry::Occupied(_) => true,
+                Entry::Vacant(v) => {
+                    v.insert(location);
+                    false
+                }
             }
-            Entry::Vacant(v) => {
-                tracing::debug!(
-                    addr = %addr,
-                    peer_location = %location,
-                    "record_pending_location: registering advertised location for peer"
-                );
-                v.insert(location);
-            }
+        };
+        if already_known {
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                "record_pending_location: location already known"
+            );
+        } else {
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                "record_pending_location: registering advertised location for peer"
+            );
         }
     }
 
@@ -826,17 +835,22 @@ impl ConnectionManager {
         // (location_for_peer → connections_by_location) and avoids deadlock with
         // prune_connection which acquires them in the same order with write locks.
         let location = *self.location_for_peer.read().get(&addr)?;
-        let connections = self.connections_by_location.read();
-        if let Some(conns) = connections.get(&location) {
-            if let Some(conn) = conns.first() {
-                tracing::debug!(
-                    requested_addr = %addr,
-                    resolved_via = "location_for_peer",
-                    location = %location,
-                    "get_peer_by_addr: resolved via location_for_peer fallback"
-                );
-                return Some(conn.location.clone());
-            }
+        // Materialize the resolved PeerKeyLocation under the read lock, then
+        // drop the guard before emitting tracing (clippy:
+        // `significant_drop_tightening`).
+        let resolved = self
+            .connections_by_location
+            .read()
+            .get(&location)
+            .and_then(|conns| conns.first().map(|conn| conn.location.clone()));
+        if let Some(resolved) = resolved {
+            tracing::debug!(
+                requested_addr = %addr,
+                resolved_via = "location_for_peer",
+                location = %location,
+                "get_peer_by_addr: resolved via location_for_peer fallback"
+            );
+            return Some(resolved);
         }
 
         None
@@ -979,9 +993,15 @@ impl ConnectionManager {
     /// Sets the own address unconditionally.
     /// Used when a peer behind NAT learns their external address from ObservedAddress.
     pub fn set_own_addr(&self, addr: SocketAddr) {
-        let mut own_addr = self.own_addr.lock();
-        let old_addr = *own_addr;
-        *own_addr = Some(addr);
+        // Release the own_addr lock before notifying network_status and emitting
+        // tracing — neither needs the guard, and holding it across them serializes
+        // unrelated callers under load (clippy: `significant_drop_tightening`).
+        let old_addr = {
+            let mut own_addr = self.own_addr.lock();
+            let old = *own_addr;
+            *own_addr = Some(addr);
+            old
+        };
         crate::node::network_status::set_external_address(addr);
         tracing::debug!(
             old_addr = ?old_addr,
@@ -1119,7 +1139,7 @@ impl ConnectionManager {
             let mut cbl = self.connections_by_location.write();
             cbl.entry(loc)
                 .or_default()
-                .push(Connection::new(PeerKeyLocation::new(pub_key.clone(), addr)));
+                .push(Connection::new(PeerKeyLocation::new(pub_key, addr)));
         }
 
         // Verify the insertion actually persisted — detect silent state corruption.
@@ -1189,22 +1209,31 @@ impl ConnectionManager {
         loc_for_peer.insert(new_addr, loc);
         drop(loc_for_peer);
 
-        let mut cbl = self.connections_by_location.write();
-        let entry = cbl.entry(loc).or_default();
-        if let Some(conn) = entry
-            .iter_mut()
-            .find(|conn| conn.location.socket_addr() == Some(old_addr))
-        {
-            // Update the public key and address to match the new peer
-            conn.location.pub_key = new_pub_key.clone();
-            conn.location.set_addr(new_addr);
-        } else {
+        // Hold the cbl write lock only for the actual mutation; drop it
+        // before the optional tracing::warn! and before acquiring
+        // connected_since / peer_health (clippy: `significant_drop_tightening`).
+        let missing_entry = {
+            let mut cbl = self.connections_by_location.write();
+            let entry = cbl.entry(loc).or_default();
+            if let Some(conn) = entry
+                .iter_mut()
+                .find(|conn| conn.location.socket_addr() == Some(old_addr))
+            {
+                // Update the public key and address to match the new peer
+                conn.location.pub_key = new_pub_key;
+                conn.location.set_addr(new_addr);
+                false
+            } else {
+                entry.push(Connection::new(PeerKeyLocation::new(new_pub_key, new_addr)));
+                true
+            }
+        };
+        if missing_entry {
             tracing::warn!(
                 old_addr = %old_addr,
                 peer_location = %loc,
                 "update_peer_identity: connection entry missing; creating placeholder"
             );
-            entry.push(Connection::new(PeerKeyLocation::new(new_pub_key, new_addr)));
         }
 
         // Migrate connected_since and peer_health to the new address.
@@ -1414,7 +1443,12 @@ impl ConnectionManager {
     }
 
     pub fn has_connection_or_pending(&self, addr: SocketAddr) -> bool {
-        if let Some(loc) = self.location_for_peer.read().get(&addr).copied() {
+        // Drop the location_for_peer read-lock before acquiring connections_by_location
+        // to avoid holding two read-locks across the dependent lookup (clippy:
+        // `significant_drop_in_scrutinee`). The two structures are independently
+        // synchronized; nothing relies on observing them under a single lock.
+        let loc = self.location_for_peer.read().get(&addr).copied();
+        if let Some(loc) = loc {
             // Verify the location_for_peer entry has a backing established connection.
             // Without this check, stale entries from failed connect operations block the
             // bootstrap loop from retrying gateways (#3244).

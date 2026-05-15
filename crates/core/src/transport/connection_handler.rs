@@ -235,7 +235,7 @@ pub struct InboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     new_connection_notifier: mpsc::Receiver<PeerConnection<S, TS>>,
 }
 
-impl<S, TS: TimeSource> InboundConnectionHandler<S, TS> {
+impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
     pub async fn next_connection(&mut self) -> Option<PeerConnection<S, TS>> {
         self.new_connection_notifier.recv().await
     }
@@ -1890,7 +1890,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             let remote_conn = RemoteConnection {
                 outbound_symmetric_key: outbound_key,
                 remote_addr,
-                sent_tracker: sent_tracker.clone(),
+                sent_tracker,
                 last_packet_id: Arc::new(AtomicU32::new(0)),
                 inbound_packet_recv: inbound_packet_rx,
                 inbound_symmetric_key: inbound_key,
@@ -1993,7 +1993,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     &decrypted_intro_packet.data()[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
                 let outbound_key =
                     Aes128Gcm::new_from_slice(outbound_key_bytes).expect("correct length");
-                *outbound_sym_key = Some(outbound_key.clone());
+                *outbound_sym_key = Some(outbound_key);
                 // Got remote's key, now we can send ACK with our key
                 *state = HandshakePhase::RemoteInbound;
                 return Ok(());

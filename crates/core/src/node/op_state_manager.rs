@@ -1054,8 +1054,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     });
                 }
 
-                let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
-                for tx in old_missing.drain(..) {
+                let old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
+                for tx in old_missing {
                     if let Some(tx) = ops.completed.remove(&tx) {
                         if cfg!(feature = "trace-ot") {
                             let op_type = tx.transaction_type().description();

@@ -540,7 +540,7 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
 
 impl<R, S> Executor<R, S>
 where
-    S: StateStorage + Send + 'static,
+    S: StateStorage + Send + Sync + 'static,
     <S as StateStorage>::Error: Into<anyhow::Error>,
 {
     /// Create a new Executor with optional network operation support.

@@ -736,7 +736,7 @@ impl ContractExecutor for RuntimePool {
 #[allow(private_bounds)]
 impl<R, S> Executor<R, S>
 where
-    R: crate::wasm_runtime::ContractRuntimeBridge,
+    R: crate::wasm_runtime::ContractRuntimeBridge + Send + Sync,
     S: crate::wasm_runtime::StateStorage + Send + Sync + 'static,
     <S as crate::wasm_runtime::StateStorage>::Error: Into<anyhow::Error>,
 {
@@ -2547,7 +2547,7 @@ impl Executor<Runtime> {
         Executor::new(
             state_store,
             move || {
-                if let Err(error) = crate::util::set_cleanup_on_exit(config.paths().clone()) {
+                if let Err(error) = crate::util::set_cleanup_on_exit(config.paths()) {
                     tracing::error!("Failed to set cleanup on exit: {error}");
                 }
                 Ok(())
@@ -3045,8 +3045,7 @@ impl Executor<Runtime> {
             .state_store
             .get(&key)
             .await
-            .map_err(ExecutorError::other)?
-            .clone();
+            .map_err(ExecutorError::other)?;
 
         let updates = vec![update];
 

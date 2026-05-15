@@ -637,9 +637,7 @@ impl RelayState {
                                         self_loc.pub_key().clone(),
                                     );
                                     actions.accept = Some(AcceptOutcome {
-                                        response: ConnectResponse {
-                                            acceptor: acceptor.clone(),
-                                        },
+                                        response: ConnectResponse { acceptor },
                                         joiner: self.request.joiner.clone(),
                                     });
                                     tracing::info!(
@@ -693,9 +691,7 @@ impl RelayState {
             let acceptor = PeerKeyLocation::with_unknown_addr(self_loc.pub_key().clone());
             let dist = ring_distance(self_loc.location(), self.request.joiner.location());
             actions.accept = Some(AcceptOutcome {
-                response: ConnectResponse {
-                    acceptor: acceptor.clone(),
-                },
+                response: ConnectResponse { acceptor },
                 joiner: self.request.joiner.clone(),
             });
             // Response is routed hop-by-hop via upstream_addr, no target embedded in message
